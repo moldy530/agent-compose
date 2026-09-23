@@ -9,7 +9,7 @@
     "endedAt": "2026-09-01T13:00:04.000Z"
   },
   "document": {
-    "trace_version": 4,
+    "trace_version": 5,
     "flow": "flow.publish",
     "execution_id": "exec_failed",
     "status": "failed",
@@ -138,7 +138,7 @@
                   {
                     "key": "agentcompose.trace_version",
                     "value": {
-                      "intValue": "4"
+                      "intValue": "5"
                     }
                   },
                   {

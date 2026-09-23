@@ -9,7 +9,7 @@
     "endedAt": "2026-09-01T09:30:00.000Z"
   },
   "document": {
-    "trace_version": 4,
+    "trace_version": 5,
     "flow": "flow.approve",
     "execution_id": "exec_unreadable_clock",
     "status": "completed",
@@ -133,7 +133,7 @@
                   {
                     "key": "agentcompose.trace_version",
                     "value": {
-                      "intValue": "4"
+                      "intValue": "5"
                     }
                   }
                 ],

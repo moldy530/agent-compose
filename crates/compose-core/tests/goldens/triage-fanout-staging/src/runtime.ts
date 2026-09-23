@@ -80,6 +80,7 @@
 
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -93,6 +94,7 @@ import {
   ReplayDivergence,
   closeSession,
   dataRoot,
+  effectKey,
   journalExists,
   journaled,
   latchDivergence,
@@ -114,6 +116,8 @@ import type {
   EffectSlot,
   ExecutionRow,
   Journal,
+  Lineage,
+  LineageAdmission,
 } from "./journal.ts";
 
 export {
@@ -142,6 +146,8 @@ export type {
   JournalBinding,
   JournalProvider,
   JournalRecord,
+  Lineage,
+  LineageAdmission,
 } from "./journal.ts";
 
 // ---------------------------------------------------------------------------
@@ -923,9 +929,10 @@ export interface RunContext {
    * read the moment the join returns, and the join never waits for such a
    * delivery (D94), so a record it pushed would be on the node's entry or not
    * depending on when the sink answered. See [`runMap`], and `docs/trace.md`
-   * §5.1. A detached `flow.*` delivery's own nodes keep collectors of their
-   * own, and what they collect ships on the delivery's envelope instead
-   * ([`collectDetached`], PRD resolved q64).
+   * §5.1. A detached `flow.*` dispatch never reaches this context at all: it
+   * starts a child execution whose nodes keep collectors of their own, and what
+   * they collect is on the child's own trace ([`dispatchChild`], PRD resolved
+   * q65).
    *
    * Mutable behind a `readonly` field on purpose: the field is the channel, and
    * what flows through it is appended by whoever runs an op.
@@ -1002,6 +1009,39 @@ export interface RunContext {
    * of the *invocation* rather than a dependency of the graph.
    */
   readonly effects?: EffectRecorder;
+  /**
+   * The permits a **detached `flow.*`** dispatch's child execution starts under
+   * (Decision D28, PRD resolved q65) — on that dispatch's context and on no
+   * other.
+   *
+   * [`runMap`] takes every other dispatch's permits itself, before it runs the
+   * route. A child's it hands over instead, for two reasons that are one: the
+   * child's lifecycle row is begun the moment the dispatch is issued — before
+   * any permit — so that a process which stops with the child still queued
+   * leaves a row to recover rather than work nothing records; and the
+   * generation that *runs* the child is the one that has to hold the permits,
+   * which is not always the dispatch that asked (a second arrival at a child
+   * already running joins it, holding nothing). See [`dispatchChild`].
+   */
+  readonly admission?: ChildAdmission;
+}
+
+/**
+ * How one child execution is admitted under its map node's bounds (Decision
+ * D28): wait for the permits, and answer the call that gives them back.
+ *
+ * Two makers, one per way a child's generation starts. [`runMap`]'s draws on the
+ * node's own [`Admission`], behind every joined instance of the call that issued
+ * the dispatch (grammar 8.6 rule 7); a recovery's, for a child no parent will
+ * re-issue, rebuilds the same gates from what the child's lineage recorded
+ * ([`recoveredAdmission`]). Either way the permits are taken as a `"detached"`
+ * waiter and held until the child settles.
+ */
+export interface ChildAdmission {
+  /** What the child's lineage records of the bound (`docs/durability.md` §3.5). */
+  readonly bounds: LineageAdmission;
+  /** Wait for both permits; answer the release. */
+  acquire(): Promise<() => void>;
 }
 
 /**
@@ -2162,9 +2202,9 @@ export async function callModel(
     // `agent.*` has none by construction (D94, and see [`runMap`]) — so its
     // record holds an empty list, and a `served` inferred from that tail would
     // fail a resume of a composition nobody had touched. (A detached `flow.*`
-    // delivery's calls are made by its own nodes, into their own collectors,
-    // and reach the envelope it ships when it settles — PRD resolved q64, and
-    // see [`collectDetached`].)
+    // dispatch is a child execution whose calls are made by its own nodes, into
+    // their own collectors, and reach its own trace — PRD resolved q65, and see
+    // [`dispatchChild`].)
     const served = held.calls[held.calls.length - 1] ?? held.served;
     if (served === undefined) {
       throw new ReplayDivergence(
@@ -9452,8 +9492,13 @@ export function route(
  * removed, renamed, or given a different meaning. Adding a field is not a bump —
  * `docs/trace.md`'s *Stability* section is the contract, and it is what a reader
  * is entitled to rely on.
+ *
+ * `5` is PRD resolved q65's: a detached `flow.*` dispatch now starts a **child
+ * execution**, whose envelope carries the child's own id in `execution_id` where
+ * the one-release-old detached envelope carried its parent's — a field whose
+ * value changed meaning, which `docs/trace.md` §10.3.4 records.
  */
-export const TRACE_VERSION = 4;
+export const TRACE_VERSION = 5;
 
 /**
  * One run's whole trace, as a surface delivers it (`docs/trace.md`).
@@ -9474,42 +9519,46 @@ export interface TraceDocument {
   /** [`TRACE_VERSION`]: the format the `entries` below are written in. */
   readonly trace_version: number;
   /**
-   * `true` on the envelope a **detached `flow.*` delivery** ships of its own when
-   * it settles, and absent on every other — never `false` (PRD resolved q64,
-   * `docs/trace.md` §1.4, §2).
+   * `true` on the envelope of a **child execution** — one a detached `flow.*`
+   * dispatch started — and absent on every other, never `false` (PRD resolved
+   * q64, q65, `docs/trace.md` §1.4, §2).
    *
-   * The second event class of the trace sink. A detached delivery runs real
-   * nodes under its parent's execution id, past the join and under its own
-   * signal, and the parent's entry carries only the stub `"detached"` record
-   * (Decision D94, `docs/trace.md` §5.1); this envelope is where everything the
-   * delivery did is written instead. See [`detachedTraceDocument`].
+   * The first of the three lineage fields. A child execution is an ordinary
+   * execution in every way the sink can see — it settles, and ships one envelope
+   * on its own ledger — and its head is what says where it came from: its
+   * parent's entry carries only the stub `"detached"` record (Decision D94,
+   * `docs/trace.md` §5.1), and this is the envelope that record points at. See
+   * [`traceDocument`], the one writer of the head.
    */
   readonly detached?: true;
   /**
-   * The execution a detached delivery ran under, on the envelope that carries
-   * [`detached`][`TraceDocument.detached`] and on no other.
+   * The execution whose detached dispatch started this one, on the envelope
+   * that carries [`detached`][`TraceDocument.detached`] and on no other.
    *
-   * The same id as `execution_id` below, and deliberately so: a detached
-   * delivery is not an execution of its own (PRD resolved q64 — no execution
-   * row, no journal of its own), so the execution its entries belong to *is*
-   * its parent's. It is written out anyway because it is half of the pair a
-   * receiver dedupes on, and a reader joining the two envelopes should not have
-   * to know that one field doubles as the other.
+   * Never equal to `execution_id` below: the child is an execution of its own
+   * (PRD resolved q65), whose id is derived from this one and the key beside it
+   * ([`childExecutionId`]). It is half of the pair a reader joins the parent's
+   * stub record to this envelope on.
    */
   readonly parent_execution?: string;
   /**
-   * The grammar 9.4 key of the dispatch that issued a detached delivery, on the
-   * envelope that carries [`detached`][`TraceDocument.detached`] and on no other.
+   * The grammar 9.4 key of the dispatch that started this child execution, on
+   * the envelope that carries [`detached`][`TraceDocument.detached`] and on no
+   * other.
    *
    * Byte for byte the `idempotencyKey` of the parent's stub `"detached"`
    * [`DispatchRecord`], so the join between the parent's entry and this
    * envelope is string equality — the key gains a *reader*, not a carrier
-   * (grammar 9.4's carriers are unchanged).
+   * (grammar 9.4's carriers are unchanged) — and the second thing
+   * [`childExecutionId`] derives the child's id from.
    */
   readonly idempotency_key?: string;
   /** The flow that was run, as its typed address (grammar 2.2). */
   readonly flow: string;
-  /** The execution the entries belong to (grammar 4.1's `execution.id`). */
+  /**
+   * The execution the entries belong to (grammar 4.1's `execution.id`) — on a
+   * child execution's envelope, the child's own.
+   */
   readonly execution_id: string;
   /**
    * How the run ended: with an answer, without one, or holding a pause.
@@ -9776,6 +9825,11 @@ export interface DispatchRecord {
    * recorded for every dispatch because it is the same derivation either way,
    * and because it is the one place the flattened instance path of a nested
    * fan-out is observable at all.
+   *
+   * On a detached dispatch to a `flow.*` it is also the **link** to the child
+   * execution the dispatch started (PRD resolved q65): that execution's id is
+   * derived from this key and the parent's ([`childExecutionId`]), and its
+   * envelope carries this key byte for byte as its `idempotency_key`.
    */
   readonly idempotencyKey: string;
   /**
@@ -9786,7 +9840,8 @@ export interface DispatchRecord {
    * record is: this record is written when the dispatch is *issued* (Decision
    * D94), before the instance it names has run a node, and the join never comes
    * back for it. So a detached dispatch carries no `inner` whatever its target
-   * is — see `docs/trace.md` §5.
+   * is — see `docs/trace.md` §5. A detached `flow.*`'s trace is its child
+   * execution's own, on that execution's own envelope.
    */
   readonly inner?: readonly TraceEntry[];
   /**
@@ -10412,11 +10467,11 @@ export interface Instantiation {
    * aborts, so what is left in flight inside is one abandoned activity rather
    * than the whole rest of the instance.
    *
-   * A **detached** dispatch supplies it too, and it is the delivery's own signal
-   * — the one nothing aborts (Decision D94, and see [`runMap`]) — so an instance
-   * reached that way runs to quiescence exactly as its sink does. Quiescence is
-   * something it can always *reach*, because the one construct that could stop
-   * an instance short of it while nothing is waiting is refused at build time: a
+   * A **detached** dispatch to a `flow.*` never instantiates through here: it
+   * starts a child execution, a `runFlow` of its own with no deadline but the
+   * nodes' own (PRD resolved q65, [`dispatchChild`]). Quiescence is something
+   * that child can always *reach*, because the one construct that could stop an
+   * instance short of it while nothing is waiting is refused at build time: a
    * detached dispatch reaching a `human` node is a validation error
    * (Decision D118).
    */
@@ -10669,6 +10724,80 @@ function retire(key: string, admission: Admission): void {
   if (admission.outstanding <= 0 && admissions.get(key) === admission) {
     admissions.delete(key);
   }
+}
+
+/**
+ * The permits a child execution [`runMap`] issued starts under: this call's
+ * node gates, taken behind every joined instance of the call and as a
+ * `"detached"` waiter — exactly what the call takes for any other detached
+ * dispatch ([`ChildAdmission`]).
+ *
+ * Counting the dispatch in and out of the node's [`Admission`] stays
+ * [`runMap`]'s: it counted every planned instance when it began, and retires
+ * each when its dispatch settles — this one included, whichever generation of
+ * the child ended up holding the permits.
+ */
+function nodeAdmission(
+  behind: Promise<void>,
+  route: Gate,
+  node: Gate,
+  bounds: LineageAdmission,
+): ChildAdmission {
+  return {
+    bounds,
+    async acquire() {
+      await behind;
+      await route.acquire("detached");
+      await node.acquire("detached");
+      return () => {
+        node.release();
+        route.release();
+      };
+    },
+  };
+}
+
+/**
+ * The permits a **recovered** child starts under, where no parent will re-issue
+ * its dispatch: the gates of the map node that issued it, rebuilt from what its
+ * lineage recorded (`docs/durability.md` §6.1, Decision D28).
+ *
+ * Found by the key [`runMap`] uses, so every child a recovery resumes from one
+ * node draws on one set of gates — a `max_concurrency: 1` fan-out whose process
+ * stopped with one child running and three queued restarts with one running and
+ * three queued, rather than four at once. The dispatch is counted into that
+ * [`Admission`] when it asks and out of it when it gives the permits back, as a
+ * dispatch of the node's own would be. Only a child whose parent has **settled**
+ * is admitted this way — so no joined instance of that node can ever be
+ * waiting, and the queue discipline [`runMap`] keeps is kept by there being
+ * nobody to get ahead of.
+ */
+function recoveredAdmission(bounds: LineageAdmission): ChildAdmission {
+  return {
+    bounds,
+    async acquire() {
+      let held = admissions.get(bounds.node);
+      if (held === undefined) {
+        held = { node: new Gate(bounds.nodeBound), routes: new Map(), outstanding: 0 };
+        admissions.set(bounds.node, held);
+      }
+      const entry = held;
+      entry.outstanding += 1;
+      let gate = entry.routes.get(bounds.route);
+      if (gate === undefined) {
+        gate = new Gate(Math.min(bounds.routeBound, bounds.nodeBound));
+        entry.routes.set(bounds.route, gate);
+      }
+      const route = gate;
+      await route.acquire("detached");
+      await entry.node.acquire("detached");
+      return () => {
+        entry.node.release();
+        route.release();
+        retire(bounds.node, entry);
+      };
+    },
+  };
 }
 
 /** `on_item_error:` — per item, and map-wide (grammar 8.6 rule 10, D73). */
@@ -11011,6 +11140,23 @@ export async function runMap(
   plan: MapPlan,
   context: RunContext,
 ): Promise<NodeAnswer> {
+  // **A dispatch that cannot be issued fails the node that would issue it**
+  // (grammar 8.6 rule 7: the map's own `on_error:` "still covers the node's own
+  // failures, including a dispatch that could not be issued at all"). On a
+  // worker a detached `flow.*` dispatch is one: its child execution would be
+  // begun, journaled and recovered by the journal's single writer, and a worker
+  // is not it ([`childrenBeginHere`]). So the node fails here — before anything
+  // is dispatched, before a permit is counted, before any stub record says a
+  // dispatch was issued — and the failure is the node's, on its trace entry and
+  // under its `retry:` and `on_error:`, travelling home with the placed node
+  // like any other rather than dying on the worker's stderr.
+  if (!childrenBeginHere) {
+    const refused = plan.instances.find((instance) => startsChild(instance.route));
+    if (refused !== undefined) {
+      plan.records.length = 0;
+      throw new ChildOnAWorker(refused.route.target, refused.site.idempotencyKey);
+    }
+  }
   const admission = admit(map, plan);
   const node = admission.node;
   const gateOf = (route: MapRoute): Gate => {
@@ -11128,9 +11274,9 @@ export async function runMap(
       // observes — `outcome: "detached"` and `attempts: 0` are already that
       // statement, and an entry that carried the delivery's model call beside
       // them would contradict both. So nothing the delivery does is handed to
-      // the node's collectors — and where the delivery is a `flow.*`, what it
-      // does is collected by one of its own instead, which is `collector`
-      // below and PRD resolved q64.
+      // the node's collectors — and where the delivery is a `flow.*`, it is a
+      // child execution with collectors, a journal and a trace of its own
+      // ([`dispatchChild`], PRD resolved q65).
       const delivery: RunContext = {
         ...scoped,
         signal: new AbortController().signal,
@@ -11140,27 +11286,48 @@ export async function runMap(
         toolDispatches: undefined,
       };
       // And off the **quiescence** reading, which is the same statement about a
-      // third reader. A `flow.*` sink runs its own nodes under this execution's
-      // id, so a parking webhook that waited for them would wait for exactly the
-      // work rule 7 says nothing waits for — a subscriber told about a pause it
-      // could have answered when the delivery finally released (see
-      // [`inFlight`], [`quiescent`], and `src/serve.ts`'s `parking`). The mark
-      // goes down before the delivery is issued, so a sink that reaches its first
-      // node in this tick is already inside it, and comes off however the
-      // delivery ends — including before `route.run` is reached.
+      // third reader. An `agent.*` sink runs under this execution's id, and so
+      // does every subflow its model calls from its `tools:` — so a parking
+      // webhook that waited for them would wait for exactly the work rule 7
+      // says nothing waits for, a subscriber told about a pause it could have
+      // answered when the delivery finally released (see [`inFlight`],
+      // [`quiescent`], and `src/serve.ts`'s `parking`). The mark goes down
+      // before the delivery is issued, so a sink that reaches its first node in
+      // this tick is already inside it, and comes off however the delivery ends
+      // — including before `route.run` is reached. (A `flow.*` sink's nodes run
+      // under the child execution's own id, which this execution's reading
+      // never counted in the first place.)
       const undetach = detaching(scoped.execution.id, site.path.join("/"));
-      // **The delivery's own collector, from dispatch to settlement** (PRD
-      // resolved q64). Opened in the same tick the stub record above is written
-      // and settled where the quiescence mark comes off, so it spans exactly
-      // the delivery's life — and it is the delivery's alone: it reads what the
-      // instance answered or failed with, and writes nothing the map node's
-      // entry reads. Only a `flow.*` has one, because only a `flow.*` runs
-      // nodes that make entries; see [`collectDetached`].
-      const collector = collectDetached(scoped.execution.id, route.target, site);
-      let answered: NodeAnswer | undefined;
-      let raised: { readonly error: unknown } | undefined;
       const delivering = (async () => {
         try {
+          // **A child execution is issued now and admitted inside** (PRD
+          // resolved q65, D28). `route.run` is [`dispatchChild`] for a `flow.*`
+          // sink, and it is called in this tick — before any `await` — so the
+          // child is on the process's books ([`childrenSettled`]) from the moment
+          // its stub record above says it was issued, and its lifecycle row is
+          // begun before it waits for anything. A child still queued for a
+          // permit when its process stops is then an open row to recover, not
+          // work that existed only in memory. The permits it waits for are this
+          // node's, taken exactly as the branch below takes them — behind the
+          // join, as a `"detached"` waiter — by whichever generation of the
+          // child actually runs, and held until it settles; it answers then, or
+          // at once where the child already ran.
+          if (startsChild(route)) {
+            await route.run(
+              instance.input,
+              {
+                ...delivery,
+                admission: nodeAdmission(joinedAdmitted, gate, node, {
+                  node: plan.admission,
+                  nodeBound: map.maxConcurrency,
+                  route: routeKey(map, route),
+                  routeBound: Math.min(route.maxConcurrency, map.maxConcurrency),
+                }),
+              },
+              site,
+            );
+            return;
+          }
           // `max_concurrency` is an **admission** bound over every in-flight
           // dispatch, detached included (grammar 8.6's key table, D28): a
           // detached delivery waits for a node permit to *start*, exactly as a
@@ -11174,24 +11341,14 @@ export async function runMap(
           await gate.acquire("detached");
           await node.acquire("detached");
           try {
-            answered = await route.run(instance.input, delivery, site);
+            await route.run(instance.input, delivery, site);
           } finally {
             node.release();
             gate.release();
-            retire(plan.admission, admission);
           }
-        } catch (error) {
-          raised = { error };
-          throw error;
         } finally {
+          retire(plan.admission, admission);
           undetach();
-          // **Settled**: the mark just came off, however the delivery ended.
-          // What the collector does with that is downstream of it and cannot
-          // reach back — it neither throws nor is awaited — so nothing about a
-          // delivery's own trace can delay or fail the enclosing flow instance
-          // (grammar 8.6 rule 7), and the swallow below still sees the
-          // delivery's own error rather than one of the collector's.
-          collector?.settle(answered, raised);
         }
       })().catch((error: unknown) => {
         // Nothing it does can fail the enclosing flow instance, which is what an
@@ -11207,6 +11364,11 @@ export async function runMap(
         // Latched rather than rethrown, because there is nothing here to throw
         // to: [`latchDivergence`] names the two readers that fail the execution
         // on it.
+        //
+        // A child execution never reaches here with one: its divergence is its
+        // own — its row stays open for a build that agrees with its record,
+        // exactly as any execution's does — and [`dispatchChild`] answers
+        // whatever became of it (PRD resolved q65).
         const diverged = divergenceOf(error);
         if (diverged !== undefined) latchDivergence(scoped.execution.id, diverged);
       });
@@ -11215,7 +11377,15 @@ export async function runMap(
       // this promise is read by [`settleDetached`] alone, on the one way out
       // where a delivery with no record is a delivery that happens **twice**
       // (see there, and `docs/durability.md` §3.2).
-      holdDelivery(scoped.execution.id, delivering);
+      //
+      // **Except a child execution's**, which is not this execution's to hold
+      // at all (PRD resolved q65). Its effects are journaled under its own id,
+      // so walking away from it in flight is not an effect this execution's
+      // resume re-issues; its divergence is its own, so there is nothing for
+      // this execution to latch; and waiting for it would be the enclosing run
+      // waiting out work rule 7 says it never waits for. What waits for a child
+      // is the *process* — `src/cli.ts` before it exits ([`childrenSettled`]).
+      if (!startsChild(route)) holdDelivery(scoped.execution.id, delivering);
       continue;
     }
 
@@ -11362,7 +11532,8 @@ export async function runMap(
 }
 
 /**
- * Every detached `map` delivery still in flight, by execution.
+ * Every detached `map` delivery still in flight, by execution — every one but a
+ * child execution, which is its own (see [`startsChild`]).
  *
  * A `Set` per execution because a fan-out dispatches many and each settles on
  * its own, and keyed by execution because that is the scope the one reader cares
@@ -11390,7 +11561,9 @@ function holdDelivery(execution: string, delivery: Promise<void>): void {
 
 /**
  * Wait for the detached deliveries of an execution whose row **stays open**
- * (`docs/durability.md` §3.2).
+ * (`docs/durability.md` §3.2) — its `agent.*` and `tool.*` sinks, whose effects
+ * are journaled under this execution's own id. A `flow.*` sink is a child
+ * execution with a record of its own, and is never one of these.
  *
  * Grammar 8.6 rule 7 says nothing a detached delivery does may delay the
  * enclosing flow instance, and nothing here does: the join returned long ago,
@@ -11421,181 +11594,561 @@ export async function settleDetached(execution: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// A detached delivery's own trace (PRD resolved q64, `docs/trace.md` §1.4, §2)
+// Child executions (PRD resolved q65, `docs/durability.md` §3.2, §3.5, §6)
 // ---------------------------------------------------------------------------
 
 /**
- * One detached `flow.*` delivery, **settled**: everything it did, and how it
- * ended (PRD resolved q64).
+ * Whether a `map` route's detached dispatches start **child executions**.
  *
- * The two halves of the ruling meet here and are easy to mistake for each other,
- * so both are stated. **What D94 settled stays settled**: the map node's entry
- * carries the stub `"detached"` record and nothing else of this, because that
- * entry is written when the join finishes and a fuller one would be
- * nondeterministic (`docs/trace.md` §5.1). **What was never asked is answered
- * here**: the delivery itself ran real nodes under its parent's execution id,
- * and the moment it settles is a moment the runtime knows — the quiescence mark
- * coming off ([`detaching`]) — so its trace is a finished record at that moment
- * and nothing about it depends on scheduling.
- *
- * It is not an execution and does not become one: no lifecycle row, no journal
- * of its own, no recovery identity beyond what grammar 9.4 delivery recovery
- * already gives it. Its effects stay journaled under the parent's id, which is
- * why `parentExecution` is the only execution this names.
+ * A detached dispatch to a `flow.*` does, and no other dispatch does (PRD
+ * resolved q65). A `flow.*` is the one target that runs *nodes*, and a detached
+ * one outlives everything around it — the join counted it at issue (Decision
+ * D94), and it runs on past its map node, its flow instance and, routinely, its
+ * whole execution. What outlives the execution that started it needs an identity
+ * of its own to be journaled, recovered and exported under, and this is where
+ * one is given. The emitted `route.run` of such a route is [`dispatchChild`]
+ * (`src/graph.ts`); an `agent.*` or `tool.*` sink stays a delivery of the
+ * execution that issued it, journaled at the dispatch's own site in that
+ * execution's record (`docs/durability.md` §3.2).
  */
-export interface DetachedSettlement {
-  /** The execution the delivery ran under — its parent's id. */
-  readonly parentExecution: string;
-  /**
-   * The grammar 9.4 key of the dispatch that issued it: the parent's stub
-   * record's `idempotencyKey`, byte for byte.
-   */
-  readonly idempotencyKey: string;
-  /** The `flow.*` the delivery instantiated, as its typed address. */
+function startsChild(route: MapRoute): boolean {
+  return route.detach && route.target.startsWith("flow.");
+}
+
+/**
+ * A child execution's id: `exec_` and a UUID derived from the execution whose
+ * detached dispatch started it and that dispatch's grammar 9.4 key (PRD resolved
+ * q65).
+ *
+ * **Derived, never minted**, because one dispatch has to name one child in every
+ * generation. A recovered parent that re-issues its detached dispatch finds the
+ * journal of the child its dead generation started, and the child replays to its
+ * frontier rather than beginning a second time. The key is what makes that true
+ * in both directions: it is *positional* (grammar 9.4), so a repeated attempt at
+ * one dispatch — a replay, a map node's own `retry:` — derives it again, and it
+ * is distinct per dispatch site, so two dispatches never name one child. The
+ * idempotency key's third reader, beside a sink's dedupe and a trace reader's
+ * join: the carriers grammar 9.4 lists do not move.
+ *
+ * **The shape is every other execution id's** — `exec_` and a 36-character UUID
+ * — so the MySQL journal's one bound on an id (`docs/durability.md` §10), and
+ * every reader that knows an execution id when it sees one, read it as they read
+ * a minted one. The UUID is version 8, RFC 9562's for an id whose bits the
+ * application lays out, over SHA-256 — the hash `src/otlp.ts` derives its trace
+ * and span ids with — of `agent-compose/execution/v1`, the parent's id and the
+ * key, newline-separated. The domain string keeps this digest apart from every
+ * other one this project takes over the same inputs, and carries a version so
+ * that a later derivation cannot silently name one child two ways across a
+ * release.
+ */
+export function childExecutionId(parent: string, idempotencyKey: string): string {
+  const hex = createHash("sha256")
+    .update(`agent-compose/execution/v1\n${parent}\n${idempotencyKey}`, "utf8")
+    .digest("hex");
+  // The version nibble is `8`, and the variant's two high bits are `10`: the
+  // remaining 122 bits are the digest's own.
+  const variant = ((parseInt(hex.charAt(16), 16) & 0x3) | 0x8).toString(16);
+  return `exec_${hex.slice(0, 8)}-${hex.slice(8, 12)}-8${hex.slice(13, 16)}-${variant}${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+
+/**
+ * One child execution, as the process that runs it is handed it (PRD resolved
+ * q65).
+ *
+ * Everything here is what an ordinary invocation is — a flow, its inputs, a
+ * session — plus the [`Lineage`] that says which dispatch started it, and
+ * whether the journal already holds it.
+ */
+export interface ChildExecution {
+  /** Its id: [`childExecutionId`] of the lineage below. */
+  readonly id: string;
+  /** The `flow.*` the dispatch targeted, as its typed address. */
   readonly flow: string;
   /**
-   * How it ended. Two of the envelope's three: a detached dispatch reaching a
-   * `human` node is refused at build time (Decision D118), so no delivery can
-   * end holding a pause.
+   * What the dispatch bound for it — or, for a child the journal already
+   * holds, the inputs its lifecycle row recorded.
+   *
+   * Run as bound, and **not** parsed again against the flow's `inputs:`: that
+   * schema guards an invocation's boundary (grammar 13.2), and a dispatch is
+   * not one — grammar 8.6 rule 12 checks what a `map` binds against its
+   * target's fields at build time, and a joined dispatch of the same target
+   * runs on exactly this ([`runSubflow`]). A detached one runs on it too, so
+   * `detach:` cannot decide whether one dispatch's input is valid (Decision
+   * D150; `src/graph.ts`'s `runFlow`).
    */
-  readonly status: "completed" | "failed";
-  /** What stopped a delivery that failed, in the `<error name>: <message>` shape. */
-  readonly error?: string;
+  readonly inputs: unknown;
   /**
-   * The instance's own entries, ordered as any instance's are — the trace a
-   * joined dispatch would have carried under `DispatchRecord.inner`, with its
-   * model calls, store records, harness runs and its own dispatches on them.
+   * The session its `scope: session` stores key off: its parent's, because a
+   * detached dispatch is made inside the session its parent was invoked under
+   * (grammar 11.3) and nothing about being detached moves it.
    */
-  readonly entries: readonly TraceEntry[];
-  /** When the delivery was issued, as an ISO 8601 instant. */
-  readonly dispatchedAt: string;
-  /** When it settled — the quiescence mark came off — as an ISO 8601 instant. */
-  readonly settledAt: string;
+  readonly sessionKey: string;
+  /**
+   * What its lifecycle row names as the trigger: its **parent's**. The one
+   * reader of that field is the `auth:` the status and resume routes enforce
+   * (`src/serve.ts`, grammar 13.3), and whoever may read the execution that
+   * dispatched this one may read what it dispatched — while a child reachable
+   * with no credential beside a parent that demands one would be a route around
+   * the parent's `auth:`.
+   */
+  readonly trigger: string;
+  /** The dispatch that started it. */
+  readonly lineage: Lineage;
+  /**
+   * Whether the journal already held it before this dispatch reached it — an
+   * earlier generation's row, or the records an earlier build journaled under
+   * its parent — so this is a generation to replay to its frontier rather than
+   * one to begin (PRD resolved q29). A first dispatch's child is `false`, though
+   * its row is already down by the time it is handed over ([`dispatchChild`]):
+   * that row holds nothing to replay.
+   */
+  readonly resume: boolean;
 }
 
 /**
- * Who is told when a detached `flow.*` delivery settles.
- *
- * Process-wide rather than per execution, because a delivery outlives the
- * `runFlow` that issued it (D94: the join never waits for it) and the one thing
- * that has to hear about it — the trace sink — is the deployment's standing
- * subscription rather than a request's. `src/serve.ts` subscribes for as long as
- * its app lives, and `src/cli.ts` for as long as one command runs and sends.
+ * How this process runs one child execution: answering what it produced once it
+ * has settled, or rejecting with what stopped it — `runFlow`'s own contract,
+ * because it *is* a `runFlow` (`src/graph.ts`'s `runChildFlow`).
  */
-const detachedListeners = new Set<(settled: DetachedSettlement) => void>();
+export type ChildRunner = (child: ChildExecution) => Promise<unknown>;
 
 /**
- * Be told of every detached `flow.*` delivery that settles in this process, and
- * answer the unsubscribe (PRD resolved q64).
+ * The runner a detached dispatch starts its child with.
  *
- * A listener is called **after** the delivery settled and is never awaited: what
- * it does with the settlement — journal an export, send it — is downstream of
- * the delivery and of the flow instance that issued it, which is grammar 8.6
- * rule 7's "nothing it does can delay the enclosing flow instance" kept true of
- * one more thing. A listener that throws is its own problem and nobody else's.
+ * `src/graph.ts` hosts the plain one when it loads — a `runFlow` with nothing
+ * owed at its close — and a process that owes a child something more hosts its
+ * own over it for as long as it does: `src/serve.ts`, which tracks the child on
+ * its status route and ships its trace from the hook that closes its row, and
+ * `src/cli.ts`, which ships it after the command has reported.
  */
-export function watchDetachedSettlements(
-  listener: (settled: DetachedSettlement) => void,
-): () => void {
-  detachedListeners.add(listener);
+let childRunner: ChildRunner | undefined;
+
+/**
+ * Host the runner this process starts child executions with, and answer the
+ * call that puts the one before it back.
+ *
+ * Nested rather than replaced, so a command that hosts its own for one run
+ * leaves the process exactly as it found it.
+ */
+export function hostChildren(runner: ChildRunner): () => void {
+  const previous = childRunner;
+  childRunner = runner;
   return () => {
-    detachedListeners.delete(listener);
+    if (childRunner === runner) childRunner = previous;
   };
 }
 
 /**
- * A detached delivery's own trace collector, from dispatch to settlement — or
- * `undefined` for a target that makes no entries (PRD resolved q64).
- *
- * **Only a `flow.*` has one.** The ruling's second event class is one POST per
- * settled detached `flow.*` delivery, because a `flow.*` is the one target that
- * runs *nodes*: its instance is a run of its own graph, every node in it files
- * an entry through its own [`runNode`] collectors, and those entries are what
- * [`runSubflow`] answers with (or a [`SubflowFailure`] carries). An `agent.*` or
- * a `tool.*` sink runs no node and has no entry to put anything on, so its
- * account stays the stub record D94 gives it.
- *
- * **Nothing it collects reaches the map node's entry.** The delivery runs under
- * a context whose node collectors are cut ([`runMap`]), and this reads only what
- * the instance itself answered — so the stub record `docs/trace.md` §5.1
- * describes stays the parent's whole account, and this is a second account
- * written somewhere else.
- *
- * **A divergence settles nothing.** A delivery that met a
- * [`ReplayDivergence`] did not end: the record and this build disagree about
- * it, the execution is held open for a build that agrees (PRD resolved q29,
- * [`latchDivergence`]), and a replay will run it again. Shipping an envelope for
- * it would be announcing an outcome the execution does not have, which is the
- * sentence "a divergence fires nothing" refuses.
+ * One child execution this process has on its books: from the moment its
+ * dispatch was issued — or its recovery began — until it has settled.
  */
-function collectDetached(
-  execution: string,
-  target: string,
-  site: DispatchSite,
-):
-  | { settle(answer: NodeAnswer | undefined, raised: { readonly error: unknown } | undefined): void }
-  | undefined {
-  if (!target.startsWith("flow.")) return undefined;
-  const dispatchedAt = new Date().toISOString();
-  return {
-    settle(answer, raised) {
+interface SupervisedChild {
+  /**
+   * Settles once the child's lifecycle row is down, or it is known there is
+   * nothing to begin — its row already closed, or the attempt refused — and
+   * never rejects. What an execution closing its own row waits on for the
+   * children it dispatched ([`childrenBegun`]).
+   */
+  readonly begun: Promise<void>;
+  /** Settles once the child has, and never rejects ([`superviseChild`]). */
+  readonly settled: Promise<void>;
+}
+
+/**
+ * Every child execution this process has on its books, by id — **issued** ones
+ * still waiting for a permit as well as running ones.
+ *
+ * **What makes one dispatch one child in one process**, and the reconciliation
+ * `docs/durability.md` §6.1 describes. One child can be reached twice in one
+ * process — a map node's own `retry:` re-issues its dispatches at the same
+ * paths, and a `resume` of a parent re-issues a dispatch whose child is already
+ * open — and both arrivals derive the same id. Two generations of one execution
+ * beside each other would interleave two runs' live effects into one record, so
+ * the second arrival **joins** the first rather than opening the journal again
+ * ([`superviseChild`]). The entry goes in synchronously, before anything is
+ * awaited, so there is no gap for a second arrival to fall through.
+ *
+ * It is also the set a process about to end drains ([`childrenSettled`]), and
+ * that is why a child is on it **from issue** rather than from admission: a
+ * dispatch still queued behind its node's `max_concurrency:` is work this
+ * process started, and a process that ended because only the running ones were
+ * counted would end under it (PRD resolved q65: the process does not end under
+ * a child it started).
+ *
+ * Across processes the rule is the journal's own: one process at a time writes a
+ * project's journal (`docs/durability.md` §2.1, PRD resolved q42).
+ */
+const runningChildren = new Map<string, SupervisedChild>();
+
+/**
+ * Put one child execution on this process's books and see it through — or join
+ * the one already there under its id.
+ *
+ * Three steps, in an order that is the point. `prepare` reads what the child
+ * is — from the dispatch and the journal — **begins its lifecycle row** where
+ * there is none, and answers nothing where there is nothing to run: a child
+ * whose row has already closed ran to its end in an earlier generation, and a
+ * dispatch of it is delivered (PRD resolved q28: nothing resumes a settled
+ * execution). Only then is the child **admitted** — its node's permits, taken by
+ * this generation and held until it settles (Decision D28) — so a process that
+ * stops while it waits leaves an open row with the child's cause on it, which a
+ * restart recovers (`docs/durability.md` §6.1). And then it **runs**, on the
+ * runner this process hosts.
+ *
+ * **It never rejects.** A child that failed failed on its own — its row says so,
+ * its trace ships its outcome, and the one line below says so on stderr for a
+ * reader who has only this process's output — and none of that is its parent's
+ * (grammar 8.6 rule 7). A divergence is included: a child's record that no
+ * longer describes this build holds *the child* open, exactly as it would any
+ * execution (`docs/durability.md` §7).
+ */
+function superviseChild(
+  id: string,
+  prepare: () => Promise<ChildExecution | undefined>,
+  admission: ChildAdmission | undefined,
+): SupervisedChild {
+  const held = runningChildren.get(id);
+  if (held !== undefined) return held;
+  let child: ChildExecution | undefined;
+  const preparing = (async () => {
+    child = await prepare();
+  })();
+  const settled = (async () => {
+    try {
+      await preparing;
+      const handed = child;
+      if (handed === undefined) return;
+      const release = admission === undefined ? undefined : await admission.acquire();
       try {
-        if (raised !== undefined && divergenceOf(raised.error) !== undefined) return;
-        const settled: DetachedSettlement = {
-          parentExecution: execution,
-          idempotencyKey: site.idempotencyKey,
-          flow: target,
-          status: raised === undefined ? "completed" : "failed",
-          ...(raised === undefined ? {} : { error: describe(raised.error) }),
-          // The instance's trace: on the answer where it reached quiescence, on
-          // the failure where it did not — the same two places a joined
-          // dispatch's record reads it from, so the two accounts of one
-          // instance cannot be assembled differently.
-          entries:
-            raised === undefined ? (answer?.inner ?? []) : (traceOf(raised.error) ?? []),
-          dispatchedAt,
-          settledAt: new Date().toISOString(),
-        };
-        for (const listener of [...detachedListeners]) {
-          try {
-            listener(settled);
-          } catch {
-            // A listener's failure is its own (see [`watchDetachedSettlements`]).
-          }
+        const runner = childRunner;
+        if (runner === undefined) {
+          // Unreachable in an emitted project, whose `src/graph.ts` hosts the
+          // plain runner as it loads; said rather than assumed for an ejected
+          // module graph that reaches this without it.
+          throw new Error("no runner is hosted for child executions in this process");
         }
-      } catch {
-        // Nothing here may reach the delivery's own promise: the swallow in
-        // [`runMap`] is reading *its* error, and one raised by the account of it
-        // would be misread there as the delivery's.
+        await runner(handed);
+      } finally {
+        release?.();
       }
+    } catch (error) {
+      const known = child;
+      process.stderr.write(
+        `the child execution \`${id}\`${
+          known === undefined
+            ? ""
+            : ` (\`${known.flow}\`, started by the detached dispatch \`${known.lineage.idempotencyKey}\`)`
+        } did not complete: ${describe(error)}\n`,
+      );
+    }
+  })();
+  const supervised: SupervisedChild = {
+    begun: preparing.then(
+      () => undefined,
+      () => undefined,
+    ),
+    settled,
+  };
+  runningChildren.set(id, supervised);
+  void settled.finally(() => {
+    if (runningChildren.get(id) === supervised) runningChildren.delete(id);
+  });
+  return supervised;
+}
+
+/**
+ * Start the child execution one detached `flow.*` dispatch names — or join it,
+ * or find it already ran — and answer when it has settled (PRD resolved q65).
+ *
+ * The emitted `route.run` of every detached route to a `flow.*` (`src/graph.ts`,
+ * [`startsChild`]), called by [`runMap`] in the tick the dispatch is issued and
+ * handed the node's permits to take rather than holding them: the child's row is
+ * begun **first**, and the permits are taken by the generation that runs it —
+ * Decision D28's admission bound covers a child exactly as it covered the
+ * delivery the child replaces, so this answers when the child settles and the
+ * permits go back then ([`superviseChild`]). The **join** moves nothing
+ * (Decision D94): the map node's stub `"detached"` record was written the
+ * moment this was issued, and nothing here writes to the node's entry, its
+ * channels or its outcome — the answer is empty, and what became of the child is
+ * the child's.
+ *
+ * Three ways a dispatch finds its child, told apart by the child's lifecycle
+ * row:
+ *
+ *  * **none** — a first dispatch. The child's row is begun at once — its lineage,
+ *    its admission bound, its parent's session and trigger, the inputs the
+ *    dispatch bound — and the child runs once it is admitted;
+ *  * **open** — the child began in an earlier generation and did not settle: a
+ *    recovered parent re-issuing the dispatch, or a `resume` of one. The child
+ *    replays to its frontier under the inputs its row recorded, its model not
+ *    asked again for anything the record holds;
+ *  * **closed** — the child already ran to its end. Nothing runs, and the
+ *    dispatch is delivered: a settled execution is never resumed.
+ *
+ * A dispatch whose child is already on this process's books joins it instead
+ * ([`runningChildren`]), holding no permit of its own.
+ *
+ * **The parent does not close under an unbegun child.** Its row closing is the
+ * one moment after which nothing re-issues this dispatch, so the begin is noted
+ * against the parent and [`settleExecution`] waits for it — for the row, a
+ * journal write, and never for the child's work or its permit
+ * ([`childrenBegun`]).
+ *
+ * **On a worker it begins nothing** ([`childrenBeginHere`]): the child's row,
+ * records and recovery are the hub's to write, and a worker is not the hub.
+ * [`runMap`] refuses such a dispatch before it is issued; one reached here some
+ * other way is refused by name ([`ChildOnAWorker`]) before any journal is.
+ */
+export async function dispatchChild(
+  flow: string,
+  input: unknown,
+  site: DispatchSite,
+  admission?: ChildAdmission,
+): Promise<NodeAnswer> {
+  const lineage: Lineage = {
+    parent: site.execution.id,
+    idempotencyKey: site.idempotencyKey,
+    ...(site.execution.item_index === undefined ? {} : { itemIndex: site.execution.item_index }),
+    ...(admission === undefined ? {} : { admission: admission.bounds }),
+  };
+  const id = childExecutionId(lineage.parent, lineage.idempotencyKey);
+  const supervised = superviseChild(
+    id,
+    async () => {
+      if (!childrenBeginHere) throw new ChildOnAWorker(flow, lineage.idempotencyKey);
+      const journal = await openJournal();
+      const row = await journal.execution(id);
+      if (row !== undefined) return row.status === "open" ? childOf(row) : undefined;
+      const adopted = await adoptDelivery(journal, lineage, id, site.path.join("/"));
+      const parent = await journal.execution(lineage.parent);
+      const child: ChildExecution = {
+        id,
+        flow,
+        inputs: input,
+        sessionKey: site.execution.session_key,
+        trigger: parent?.trigger ?? "manual",
+        lineage,
+        resume: adopted,
+      };
+      // **Begun now, before it waits for anything** — the row `runFlow` would
+      // begin when the child runs, written in the dispatch's own tick of work
+      // instead. `begin` is a no-op on a row that is already there, so the
+      // generation that runs the child begins it again for nothing.
+      await journal.begin({
+        id,
+        flow,
+        trigger: child.trigger,
+        inputs: (input ?? {}) as Record<string, unknown>,
+        sessionKey: child.sessionKey,
+        lineage,
+        status: "open",
+        journalVersion: JOURNAL_VERSION,
+        startedAt: new Date().toISOString(),
+      });
+      return child;
     },
+    admission,
+  );
+  noteChildBegin(lineage.parent, supervised.begun);
+  await supervised.settled;
+  return { output: {} };
+}
+
+/**
+ * Resume one open child execution the journal holds — or join it where this
+ * process already has it on its books — and answer when it has settled.
+ *
+ * What `src/serve.ts`'s recovery calls for an open row that carries a lineage
+ * **whose parent has settled** — the crash PRD resolved q65 was ratified from:
+ * "nothing resumes a settled execution" used to mean nothing resumed the
+ * delivery that outlived it, and now the child is resumed as the open execution
+ * it is. It is admitted under the bound its dispatch was issued under, rebuilt
+ * from its lineage ([`recoveredAdmission`]), so a fan-out the process stopped in
+ * the middle of resumes as bounded as it ran. A child whose parent is open too
+ * is not resumed here: the parent's replay re-issues its dispatch, which
+ * resumes it behind that node's join exactly as the first generation ran it
+ * (`docs/durability.md` §6.1).
+ */
+export function resumeChild(row: ExecutionRow): Promise<void> {
+  const bounds = row.lineage?.admission;
+  return superviseChild(
+    row.id,
+    async () => childOf(row),
+    bounds === undefined ? undefined : recoveredAdmission(bounds),
+  ).settled;
+}
+
+/**
+ * The lifecycle-row begins of the child executions each execution has
+ * dispatched and not yet seen begun, by the parent's id.
+ */
+const childBegins = new Map<string, Set<Promise<void>>>();
+
+/** Note one child's begin against the execution that dispatched it. */
+function noteChildBegin(parent: string, begun: Promise<void>): void {
+  let held = childBegins.get(parent);
+  if (held === undefined) {
+    held = new Set();
+    childBegins.set(parent, held);
+  }
+  held.add(begun);
+  void begun.finally(() => {
+    const still = childBegins.get(parent);
+    if (still === undefined) return;
+    still.delete(begun);
+    if (still.size === 0) childBegins.delete(parent);
+  });
+}
+
+/**
+ * Wait until every child execution `execution` dispatched has its lifecycle row
+ * begun — or is known to need none.
+ *
+ * What [`settleExecution`] waits on before it closes a row, because a closed row
+ * is one nothing replays: a child whose begin had not landed when its parent
+ * closed would have no row, and no parent left to re-issue it — the work
+ * existing only in the memory of a process that may be about to stop. It is a
+ * wait for a **journal write** and nothing more: not for the child's permit,
+ * not for its work (grammar 8.6 rule 7 — the child is an execution its parent
+ * does not wait for), and nothing in it rejects.
+ */
+async function childrenBegun(execution: string): Promise<void> {
+  for (;;) {
+    const held = childBegins.get(execution);
+    if (held === undefined || held.size === 0) return;
+    await Promise.all([...held]);
+  }
+}
+
+/** An open child's lifecycle row, as the generation that resumes it runs it. */
+function childOf(row: ExecutionRow): ChildExecution | undefined {
+  const lineage = row.lineage;
+  // Unreachable from either caller — both ask about a row a lineage names — and
+  // said as nothing rather than as a child with no cause.
+  if (lineage === undefined) return undefined;
+  return {
+    id: row.id,
+    flow: row.flow,
+    // The invocation a resume replays is the one the row recorded (PRD resolved
+    // q29), not one a re-issued dispatch rebuilt: the two are the same by
+    // determinism, and the row is what a divergence is measured against.
+    inputs: row.inputs,
+    sessionKey: row.sessionKey,
+    trigger: row.trigger,
+    lineage,
+    resume: true,
   };
 }
 
 /**
- * The envelope a settled detached delivery ships (PRD resolved q64,
- * `docs/trace.md` §2).
+ * Wait until this process has no child execution on its books — none running,
+ * and none issued and still waiting for a permit.
  *
- * The same [`TraceDocument`] every other surface carries, headed by the three
- * fields only this one has: `detached: true`, `parent_execution`, and the
- * grammar 9.4 `idempotency_key` — which is the parent's stub record's key, so a
- * receiver joins the two by string equality and dedupes on
- * `(parent_execution, idempotency_key)` across the re-shipping a recovery does.
- * `execution_id` is the parent's id too, because the entries belong to the
- * execution they ran under and a detached delivery is not one of its own.
+ * What a process that is about to **end** waits on — `src/cli.ts`, after its run
+ * has reported — because a child killed mid-effect is an effect with no record,
+ * which the generation that resumes the child issues a second time, and a child
+ * still queued is work the command started and has not done. Not what any
+ * *execution* waits on: grammar 8.6 rule 7 is that nothing a detached dispatch
+ * does can delay the flow instance that issued it, and a child is exactly that.
  *
- * Written in one place because two writers would drift: the head's key order is
- * what a reader reading the bytes sees first, and the version leads it as it
- * leads every envelope.
+ * Re-reads the set until it is empty, because a child may start children of its
+ * own; nothing in it rejects ([`superviseChild`]). A queued child is on the set
+ * from the tick its dispatch was issued ([`runningChildren`]), so the moment one
+ * child settles and hands its permit to the next is not a moment the set is
+ * empty.
  */
-export function detachedTraceDocument(settled: DetachedSettlement): TraceDocument {
+export async function childrenSettled(): Promise<void> {
+  for (;;) {
+    const held = [...runningChildren.values()].map((child) => child.settled);
+    if (held.length === 0) return;
+    await Promise.all(held);
+  }
+}
+
+/**
+ * Carry a detached delivery's effects over from its parent's record into the
+ * child's, where a build before PRD resolved q65 journaled them there — and
+ * answer whether there were any (`docs/durability.md` §11.2).
+ *
+ * **What an older journal holds, and why it is not left there.** Before the
+ * ruling a detached `flow.*` delivery ran under its parent's id, so every effect
+ * it made while its parent's session was open is on the parent's record, at the
+ * dispatch's own instance path. This build runs the same delivery as a child
+ * execution with a record of its own, and a parent an older build left open —
+ * parked at a `human` pause, or killed — re-issues the dispatch when it is
+ * resumed. Beginning the child empty would re-issue every one of those effects
+ * live: a second model call, a second review posted, the exact failure the
+ * journal exists to prevent.
+ *
+ * So the records move with the delivery. A child's sites are rooted at its own
+ * flow, and the old ones are the same sites with the dispatch's path in front of
+ * them, so each is re-keyed by stripping that prefix — the ordinals were counted
+ * per site and a bijection of sites keeps every one of them — and appended under
+ * the child's id, its refusal mark with it. The child then begins as a
+ * **resuming** generation and replays them to its frontier.
+ *
+ * Exact rather than heuristic: under this build nothing writes to a parent's
+ * record at a detached `flow.*` dispatch's site at all (the child's effects are
+ * its own), so any record there is one an older build wrote. A request identity
+ * that named the parent — a `scope: execution` store's partition is the
+ * execution's — no longer matches what the child asks, and replays as the
+ * divergence it is (`docs/durability.md` §7): the resume *fails* rather than
+ * re-issuing, which is §11.3's line between a compatible change and a bump.
+ *
+ * Idempotent: an append is a no-op on a key the child already holds, so a
+ * process that dies part way through leaves a prefix the next dispatch completes.
+ */
+async function adoptDelivery(
+  journal: Journal,
+  lineage: Lineage,
+  child: string,
+  site: string,
+): Promise<boolean> {
+  const inside = `${site}/`;
+  let adopted = false;
+  for (const record of await journal.effectsUnder(lineage.parent, site)) {
+    if (!record.site.startsWith(inside)) continue;
+    const moved = record.site.slice(inside.length);
+    const key = effectKey(moved, record.kind, record.ordinal);
+    await journal.append({ ...record, execution: child, site: moved, key });
+    if (record.refused) await journal.refuse(child, key);
+    adopted = true;
+  }
+  return adopted;
+}
+
+/**
+ * The trace envelope one settled execution ships (`docs/trace.md` §2), and the
+ * one writer of it.
+ *
+ * `src/delivery.ts` ships it to the sink and `src/cli.ts` writes it as the trace
+ * file, and both go through here because the head is what a reader reads first
+ * and two writers would drift on it. A **child execution** — one a detached
+ * `flow.*` dispatch started (PRD resolved q65) — carries its [`Lineage`] as
+ * three more fields at the head, in this order after the version: `detached`,
+ * `parent_execution`, `idempotency_key`. Every other envelope carries none of
+ * them, never `detached: false`.
+ */
+export function traceDocument(settled: {
+  readonly execution: string;
+  readonly flow: string;
+  readonly status: "completed" | "failed" | "interrupted";
+  readonly error?: string;
+  readonly entries: readonly TraceEntry[];
+  readonly lineage?: Lineage;
+}): TraceDocument {
+  const lineage = settled.lineage;
   return {
     trace_version: TRACE_VERSION,
-    detached: true,
-    parent_execution: settled.parentExecution,
-    idempotency_key: settled.idempotencyKey,
+    ...(lineage === undefined
+      ? {}
+      : {
+          detached: true,
+          parent_execution: lineage.parent,
+          idempotency_key: lineage.idempotencyKey,
+        }),
     flow: settled.flow,
-    execution_id: settled.parentExecution,
+    execution_id: settled.execution,
     status: settled.status,
     ...(settled.error === undefined ? {} : { error: settled.error }),
     entries: settled.entries,
@@ -11603,28 +12156,28 @@ export function detachedTraceDocument(settled: DetachedSettlement): TraceDocumen
 }
 
 /**
- * Which of the trace sink's two event classes one delivery row carries (PRD
- * resolved q64, `docs/trace.md` §1.4): `"execution"` for an execution's own
- * export, `"detached"` for the envelope a detached `flow.*` delivery under it
- * shipped, and `undefined` for a row that is not a sink's or whose body cannot
- * be read as either.
+ * What one `trace_sink` row on an execution's ledger is: `"export"` for the
+ * execution's own settled trace — a child execution's, lineage head and all,
+ * included — `"legacy"` for the envelope a detached `flow.*` delivery shipped
+ * onto its **parent's** ledger under the release before PRD resolved q65, and
+ * `undefined` for a row that is not a sink's or whose body cannot be read.
  *
- * [`detachedTraceDocument`]'s reader, beside it so the two cannot drift. Read
- * off the body, because that is the one place the ledger records the
- * difference: both are `trace_sink` rows of `settled` events on one execution,
- * and the journal gains no column for it (`docs/durability.md` §3.7). Under
- * `format: envelope` the head says which it is; under `format: otlp` the
- * delivery's root span carries `agentcompose.detached` (§12.5).
+ * Only a journal an older build wrote holds a `"legacy"` row: that release ran a
+ * detached delivery under its parent's id, so its envelope rode the parent's
+ * ledger with `parent_execution` equal to the execution whose ledger it is on.
+ * This build ships a child's envelope on the child's own ledger, where
+ * `parent_execution` names somebody else, so the head says which is which on
+ * both `format:`s — the envelope's own fields, and under `format: otlp` the
+ * root span's `agentcompose.parent_execution`.
  *
  * Two readers ask, and each resolves "cannot tell" in its own direction: a
  * settle's once-per-execution guard counts only a row known to be the export
  * (`src/delivery.ts`'s `executionExport`), because a trace exported twice is a
  * collector's duplicate and one exported never is lost; and
- * [`executionReport`] leaves out only a row known to be a delivery's envelope,
- * because every other row on the ledger is one the report published before
- * the ruling and still does.
+ * [`executionReport`] leaves out only a row known to be a legacy envelope,
+ * which was never one of the execution's lifecycle events.
  */
-export function traceSinkClass(record: DeliveryRecord): "execution" | "detached" | undefined {
+export function traceSinkClass(record: DeliveryRecord): "export" | "legacy" | undefined {
   if (record.kind !== "trace_sink") return undefined;
   let body: unknown;
   try {
@@ -11635,14 +12188,18 @@ export function traceSinkClass(record: DeliveryRecord): "execution" | "detached"
   if (typeof body !== "object" || body === null) return undefined;
   const held = body as {
     readonly detached?: unknown;
+    readonly parent_execution?: unknown;
     readonly execution_id?: unknown;
     readonly resourceSpans?: unknown;
   };
   // The envelope: its head says which it is.
   if (typeof held.execution_id === "string") {
-    return held.detached === true ? "detached" : "execution";
+    return held.detached === true && held.parent_execution === record.execution
+      ? "legacy"
+      : "export";
   }
-  // OTLP/JSON: the detached delivery's root span is the one that says so.
+  // OTLP/JSON: the legacy envelope's root span names this ledger's execution as
+  // its own parent.
   const resources = Array.isArray(held.resourceSpans) ? (held.resourceSpans as unknown[]) : [];
   const scopes = (resources[0] as { readonly scopeSpans?: unknown } | null | undefined)
     ?.scopeSpans;
@@ -11650,20 +12207,21 @@ export function traceSinkClass(record: DeliveryRecord): "execution" | "detached"
     ? (scopes[0] as { readonly spans?: unknown } | null | undefined)?.spans
     : undefined;
   if (!Array.isArray(spans)) return undefined;
-  const detached = spans.some((span: unknown) => {
+  const legacy = spans.some((span: unknown) => {
     const attributes = (span as { readonly attributes?: unknown } | null | undefined)?.attributes;
+    if (!Array.isArray(attributes)) return false;
+    const valueOf = (key: string): Record<string, unknown> | null | undefined =>
+      (
+        attributes.find(
+          (attribute: unknown) => (attribute as { readonly key?: unknown } | null)?.key === key,
+        ) as { readonly value?: Record<string, unknown> | null } | undefined
+      )?.value;
     return (
-      Array.isArray(attributes) &&
-      attributes.some((attribute: unknown) => {
-        const pair = attribute as
-          | { readonly key?: unknown; readonly value?: { readonly boolValue?: unknown } | null }
-          | null
-          | undefined;
-        return pair?.key === "agentcompose.detached" && pair.value?.boolValue === true;
-      })
+      valueOf("agentcompose.detached")?.["boolValue"] === true &&
+      valueOf("agentcompose.parent_execution")?.["stringValue"] === record.execution
     );
   });
-  return detached ? "detached" : "execution";
+  return legacy ? "legacy" : "export";
 }
 
 /** A failed item, carrying how many attempts its policy made. */
@@ -12311,6 +12869,42 @@ export function dispatchPausesHome(): void {
 }
 
 /**
+ * Whether this process may **begin** a child execution (PRD resolved q65).
+ *
+ * Every process may but one: `./worker-node.ts`, which turns it off before
+ * anything runs. A worker runs one dispatch of an execution the hub journals,
+ * and a child execution is begun, journaled, recovered and exported through
+ * the journal's single writer — the hub (`docs/distributed.md` §3.3, PRD
+ * resolved q42) — which a worker is not and cannot stand in for. A worker
+ * reaches a detached `flow.*` dispatch only through a flow a placed agent
+ * attaches as a tool (grammar 14.1 rule 4 runs it in the agent's process), and
+ * there the dispatch cannot be issued: [`runMap`] fails the map node that would
+ * have issued it, by name, before anything is dispatched — the failure grammar
+ * 8.6 rule 7 leaves to that node's own `on_error:` — rather than beginning a
+ * child nobody can recover on a journal nobody reads.
+ */
+let childrenBeginHere = true;
+
+/** See [`childrenBeginHere`]. Called by `./worker-node.ts` before anything runs. */
+export function refuseChildExecutions(): void {
+  childrenBeginHere = false;
+}
+
+/**
+ * A detached `flow.*` dispatch reached on a worker, where no child execution
+ * can begin (PRD resolved q42, q65, [`childrenBeginHere`]) — the map node's own
+ * failure, because the dispatch could not be issued (grammar 8.6 rule 7).
+ */
+export class ChildOnAWorker extends Error {
+  constructor(flow: string, idempotencyKey: string) {
+    super(
+      `\`${flow}\` is dispatched with \`detach: true\` (key \`${idempotencyKey}\`) inside a placed node, on the worker running it, and a detached \`flow.*\` dispatch starts a child execution — which the hub alone begins, journals and recovers, as the single writer of this deployment's journal (docs/distributed.md §3.3, PRD resolved q42, q65). It could not be issued, so the map node that would have issued it fails, and its \`on_error:\` decides what follows (grammar 8.6 rule 7). Drop \`detach:\` so the dispatch is joined inside the placed node, or dispatch the flow from a flow the hub runs rather than from one a placed agent attaches as a tool (grammar 14.1 rule 4)`,
+    );
+    this.name = "ChildOnAWorker";
+  }
+}
+
+/**
  * Open the pause registry for one execution, saying whether it can be resumed.
  *
  * Called by [`runFlow`] at the top of every run, before the graph is streamed,
@@ -12456,16 +13050,18 @@ export function watchHumanPauses(execution: string, listener: () => void): () =>
  * A **detached** dispatch is absent (grammar 8.6 rule 7), and keeping it absent
  * takes bookkeeping rather than silence. Nothing waits for a delivery and
  * Decision D118 refuses a `human` node under one, so it can open no pause — but
- * its *sink* is a graph like any other: a `flow.*` reached that way runs its
- * nodes under this execution's id ([`runSubflow`] is handed `site.execution`),
- * and every one of them would register here. Counting them would hold a parking
- * webhook back for the whole of work the flow instance itself does not wait for
- * — a `map` with `detach: true` to a flow whose `http:` node carries a
- * thirty-minute budget would keep a subscriber from being told about a pause it
- * could answer at once, which is rule 7's "nothing it does can delay the
- * enclosing flow instance" broken at the one surface that reads this map.
- * [`detaching`] marks the delivery's whole subtree and [`working`] reads the
- * mark.
+ * an `agent.*` sink is a node's work like any other, and a `flow.*` in its
+ * `tools:` runs its nodes under this execution's id, every one of which would
+ * register here. Counting them would hold a parking webhook back for the whole
+ * of work the flow instance itself does not wait for — a subscriber kept from
+ * being told about a pause it could answer at once, which is rule 7's "nothing
+ * it does can delay the enclosing flow instance" broken at the one surface that
+ * reads this map. [`detaching`] marks the delivery's whole subtree and
+ * [`working`] reads the mark. A detached **`flow.*`** sink needs no mark: it is a
+ * child execution whose nodes register under its own id (PRD resolved q65), so
+ * this execution's reading never counted them, and the child is a quiescence
+ * unit of its own — one that never parks, because D118 refuses the `human` node
+ * it would park on.
  */
 const inFlight = new Map<string, Map<string, number>>();
 
@@ -12477,10 +13073,11 @@ const quietWatchers = new Map<string, Set<() => void>>();
  * under.
  *
  * A delivery's work is named the way a pause is (grammar 9.4): the dispatch's
- * instance path is a prefix of every site inside its sink — the nodes of a
- * `flow.*` it instantiates, and the subflows an `agent.*` reached that way calls
- * from its `tools:`. So one entry answers for a whole subtree, and nothing has
- * to be threaded across a boundary that rebuilds its context from `$run`.
+ * instance path is a prefix of every site inside its sink — the subflows an
+ * `agent.*` reached that way calls from its `tools:`. So one entry answers for a
+ * whole subtree, and nothing has to be threaded across a boundary that rebuilds
+ * its context from `$run`. (A `flow.*` sink's nodes are a child execution's, and
+ * are never under this execution's id to be marked.)
  *
  * Counted for [`working`]'s reason and one of its own: a node `retry:` that
  * re-executes a `map` issues the next attempt's deliveries at the very paths the
@@ -13690,32 +14287,51 @@ export interface ExecutionOpening {
    * to the frontier and then writes past it (resolved q29).
    */
   readonly resuming?: boolean;
+  /**
+   * What started a **child execution** — the detached `flow.*` dispatch, its
+   * key and its item index — where one did (PRD resolved q65, [`Lineage`]).
+   *
+   * Written onto the lifecycle row when the child begins, and nowhere else: a
+   * generation that resumes a child reads it back off the row it recorded,
+   * which is what [`openExecution`] answers with.
+   */
+  readonly lineage?: Lineage;
 }
 
 /**
- * Begin journaling one execution, and answer with the journal it will use.
+ * Begin journaling one execution, and answer with the lineage its row carries —
+ * `undefined` for every execution a trigger or a command started.
  *
  * Called before the graph is streamed, so a record exists for an execution the
  * process may die in the middle of — which is the whole point: a lifecycle row
  * with `status: "open"` is what `serve`'s recovery and `agent-compose resume`
  * enumerate.
  *
- * Every instance nested inside the run — a `flow:` node's, a `map`'s dispatch,
- * a subflow a model called — finds this session by execution id rather than by
- * being handed it, exactly as the wait board is found ([`openHumanWaits`]).
+ * Every instance nested inside the run — a `flow:` node's, a `map`'s joined
+ * dispatch, a subflow a model called — finds this session by execution id rather
+ * than by being handed it, exactly as the wait board is found
+ * ([`openHumanWaits`]). A detached `flow.*` dispatch is the one instantiation
+ * that does not: it begins a child execution with a session of its own
+ * ([`dispatchChild`], PRD resolved q65).
+ *
+ * **One generation of one execution per process.** A second opener of an id
+ * this process already holds open would interleave two runs' live effects into
+ * one record, so it is refused by name rather than let in. The reconciliation
+ * that keeps a child from reaching here twice is [`dispatchChild`]'s, and this is
+ * the guard beneath it.
  */
-export async function openExecution(opening: ExecutionOpening): Promise<void> {
-  const journal = await openJournal();
-  const resuming = opening.resuming === true;
-  if (resuming) {
-    const row = await journal.execution(opening.execution);
-    if (row !== undefined && row.journalVersion !== JOURNAL_VERSION) {
-      throw new Error(
-        `\`${opening.execution}\` was journaled at version ${row.journalVersion} and this build reads version ${JOURNAL_VERSION}: a journal is read by the compiler release that wrote it (\`docs/durability.md\` §11)`,
-      );
-    }
-  } else {
-    await journal.begin({
+export async function openExecution(opening: ExecutionOpening): Promise<Lineage | undefined> {
+  if (openedExecutions.has(opening.execution)) {
+    throw new Error(
+      `\`${opening.execution}\` is already running in this process, and one execution has one generation at a time: a second would write a second run's effects into its record (\`docs/durability.md\` §2.1)`,
+    );
+  }
+  openedExecutions.add(opening.execution);
+  try {
+    const journal = await openJournal();
+    const resuming = opening.resuming === true;
+    let lineage = opening.lineage;
+    const begun = {
       id: opening.execution,
       flow: opening.flow,
       trigger: opening.trigger,
@@ -13723,14 +14339,44 @@ export async function openExecution(opening: ExecutionOpening): Promise<void> {
       sessionKey: opening.sessionKey,
       ...(opening.callback === undefined ? {} : { callback: opening.callback }),
       ...(opening.traceparent === undefined ? {} : { traceparent: opening.traceparent }),
-      status: "open",
+      ...(opening.lineage === undefined ? {} : { lineage: opening.lineage }),
+      status: "open" as const,
       journalVersion: JOURNAL_VERSION,
       startedAt: new Date().toISOString(),
-    });
+    };
+    if (resuming) {
+      const row = await journal.execution(opening.execution);
+      if (row !== undefined && row.journalVersion !== JOURNAL_VERSION) {
+        throw new Error(
+          `\`${opening.execution}\` was journaled at version ${row.journalVersion} and this build reads version ${JOURNAL_VERSION}: a journal is read by the compiler release that wrote it (\`docs/durability.md\` §11)`,
+        );
+      }
+      lineage = row?.lineage ?? lineage;
+      // The one resuming generation with no row to resume: a child whose records
+      // an older build journaled under its parent, carried over before it began
+      // (`docs/durability.md` §11.2). It consumes them like any resume and needs
+      // the row every execution has.
+      if (row === undefined && opening.lineage !== undefined) await journal.begin(begun);
+    } else {
+      await journal.begin(begun);
+    }
+    openSession(opening.execution, journal, resuming);
+    settledJournals.set(opening.execution, journal);
+    return lineage;
+  } catch (error) {
+    openedExecutions.delete(opening.execution);
+    throw error;
   }
-  openSession(opening.execution, journal, resuming);
-  settledJournals.set(opening.execution, journal);
 }
+
+/**
+ * Every execution this process has opened and not yet closed, by id — the set
+ * [`openExecution`]'s one-generation guard reads.
+ *
+ * Added to synchronously, before anything is awaited, so two openers racing for
+ * one id in one tick cannot both find it empty.
+ */
+const openedExecutions = new Set<string>();
 
 /**
  * Record how one execution ended — or that it has not ended at all.
@@ -13755,11 +14401,18 @@ export async function openExecution(opening: ExecutionOpening): Promise<void> {
  *  * **anything else** — `failed`. A composition's own error policy has already
  *    decided this run; replaying it would re-derive the same failure from the
  *    same record.
+ *
+ * A row that closes waits first for the lifecycle rows of the child executions
+ * this execution dispatched ([`childrenBegun`], PRD resolved q65): once it is
+ * closed nothing replays it, so nothing would re-issue a dispatch whose child
+ * had not been begun yet. A row that stays open needs no such wait — the
+ * generation that resumes it re-issues every dispatch it made.
  */
 export async function settleExecution(execution: string, error?: unknown): Promise<void> {
   const journal = settledJournals.get(execution);
   if (journal === undefined) return;
   if (staysOpen(execution, error)) return;
+  await childrenBegun(execution);
   if (error === undefined) {
     await journal.end(execution, "completed");
     return;
@@ -13779,9 +14432,11 @@ export async function settleExecution(execution: string, error?: unknown): Promi
  * resumes tomorrow — is one no test of either function alone would catch.
  *
  * Read off the **latch** as well as off the error, because the one divergence
- * that has no error to travel on is a detached delivery's (see
- * [`latchDivergence`]): a run whose only divergence was raised there is not one
- * to be closed `completed` either.
+ * that has no error to travel on is a detached `agent.*` or `tool.*`
+ * delivery's (see [`latchDivergence`]): a run whose only divergence was raised
+ * there is not one to be closed `completed` either. A detached `flow.*` is a
+ * child execution, whose divergence holds *its* row open and never this one's
+ * (PRD resolved q65).
  */
 export function staysOpen(execution: string, error?: unknown): boolean {
   if (divergenceOf(error) !== undefined || latchedDivergence(execution) !== undefined) return true;
@@ -13797,6 +14452,7 @@ const settledJournals = new Map<string, Journal>();
 /** Release one execution's journaling state. The file stays the project's. */
 export function closeExecution(execution: string): void {
   settledJournals.delete(execution);
+  openedExecutions.delete(execution);
   closeSession(execution);
 }
 
@@ -13980,17 +14636,16 @@ export interface ReportedExecution {
  * them. No credential appears in it, and neither does a delivered body: what is
  * published is what happened.
  *
- * **A detached delivery's envelope is not on it** (PRD resolved q64). That row
- * rides this execution's ledger only because a detached delivery has no ledger
- * of its own (`docs/durability.md` §3.7): it is not this execution's lifecycle
- * event, and it is journaled while the execution is still running or parked —
- * so publishing it would put a `settled` delivery, and the sink's address, on
- * the report of a run that has not settled, in the `parked` and `settled`
- * webhooks a callback receiver is sent. The report is the one grammar 13.3
- * states, and the ruling moved no wire: the rows this leaves out are exactly
- * the ones [`traceSinkClass`] knows to be a delivery's envelope, which stay on
- * the ledger and are worked on its schedule like any other row — they are
- * left out of this document, not out of the journal.
+ * **A child execution's report is its own** (PRD resolved q65): it ships its
+ * envelope onto its own ledger, so nothing it does reaches its parent's
+ * `deliveries`. The one row this leaves out is one a journal written before the
+ * ruling may still hold — the envelope a detached `flow.*` delivery shipped onto
+ * its *parent's* ledger then, while the parent was still running or parked. It
+ * was never one of the parent's lifecycle events, and publishing it would put a
+ * `settled` delivery and the sink's address on the report of a run that has not
+ * settled, in the webhooks a callback receiver is sent. [`traceSinkClass`] is
+ * what knows one; it stays on the ledger and is worked on its schedule like any
+ * other row, left out of this document and not out of the journal.
  */
 export async function executionReport(
   execution: ReportedExecution,
@@ -13998,7 +14653,7 @@ export async function executionReport(
   let delivered: readonly DeliveryRecord[] = [];
   try {
     delivered = (await deliveriesOf(execution.id)).filter(
-      (record) => traceSinkClass(record) !== "detached",
+      (record) => traceSinkClass(record) !== "legacy",
     );
   } catch {
     // A journal this process cannot read is not a reason to refuse the report:

@@ -23,7 +23,10 @@ import { Client } from "pg";
  * created by this release or a later one, so there is no older file whose
  * columns have to be probed for. (The SQLite arm's `PRAGMA table_info` walks
  * exist because there *are* older files.) A column added here in a later release
- * is the case to read §11.2 twice for, exactly as it is there.
+ * is the case to read §11.2 twice for, exactly as it is there. A **table** added
+ * in one is not: `lineage` (PRD resolved q65) arrived after this schema first
+ * shipped, and `IF NOT EXISTS` is the whole of its migration into a database an
+ * earlier build created.
  *
  * **`COLLATE "C"` on every column a statement compares or orders by**, and that
  * is a correctness choice rather than a preference. A journal key is
@@ -102,6 +105,13 @@ CREATE TABLE IF NOT EXISTS dispatches (
   settled_at    TEXT,
   detail        TEXT,
   PRIMARY KEY (execution, wait)
+);
+CREATE TABLE IF NOT EXISTS lineage (
+  execution       TEXT COLLATE "C" PRIMARY KEY,
+  parent          TEXT COLLATE "C" NOT NULL,
+  idempotency_key TEXT COLLATE "C" NOT NULL,
+  item_index      INTEGER,
+  admission       TEXT
 );
 CREATE INDEX IF NOT EXISTS effects_of_execution ON effects (execution);
 CREATE INDEX IF NOT EXISTS executions_by_status ON executions (status, started_at);

@@ -9,7 +9,7 @@
     "endedAt": "2026-09-01T15:10:00.000Z"
   },
   "document": {
-    "trace_version": 4,
+    "trace_version": 5,
     "flow": "flow.assisted",
     "execution_id": "exec_parked",
     "status": "interrupted",
@@ -147,7 +147,7 @@
                   {
                     "key": "agentcompose.trace_version",
                     "value": {
-                      "intValue": "4"
+                      "intValue": "5"
                     }
                   },
                   {

@@ -647,7 +647,11 @@ Root identifier meanings:
   `execution.item_index` (integer; the source-item index of the **innermost**
   enclosing `map` dispatch — present in that map's own per-item expressions and
   everywhere inside the instance it dispatches, and **absent** anywhere else,
-  which is the fourth case of the absent-value rule below).
+  which is the fourth case of the absent-value rule below). Inside a **child
+  execution** — the instance a detached `flow.*` dispatch starts (§8.6 rule 7) —
+  `execution.id` is the child's own id, and `execution.session_key` and
+  `execution.item_index` are the dispatch's, as they are inside any dispatched
+  instance (Decision [D150](#d150-a-detached-flow-dispatch-starts-a-child-execution)).
 - **`payload`** — the trigger payload; shape per trigger type (§13).
 - **`<node>.output`** — a node's node-scoped output object (PRD 5.7 tier 1).
 - **`<as-name>`** — the per-item binding of a `map` (`item` unless renamed with
@@ -1493,7 +1497,12 @@ Written, it must name something: `workspace: ""` is a compile error and a
 directory the runtime happened to be started in and a bound nobody wrote is not a
 bound. **Omitting** it is the way to take the default — one fresh directory per
 execution, shared by every built-in of that execution that took it, removed when
-the execution settles.
+the execution settles. A **child execution** — what a detached `flow.*` dispatch
+starts (§8.6 rule 7) — is an execution of its own, so its built-ins take a fresh
+directory of the child's rather than sharing its parent's, which is removed when
+the parent settles; a file handed on to a detached flow goes through a
+`workspace:` both bindings name (Decision
+[D150](#d150-a-detached-flow-dispatch-starts-a-child-execution)).
 
 **`timeout:` defaults to 120s**, which is a bound chosen to be longer than a
 build step and shorter than a wedged process: a model that wanted longer says so,
@@ -2739,6 +2748,24 @@ A **route** object takes `node` (required) plus optional `max_concurrency`,
      the default is `false` and PRD 5.6 makes a failed enqueue a surfaced
      failure otherwise.
 
+   A detached dispatch whose target is a **`flow.*`** starts a **child
+   execution**: an execution of its own rather than an instance inside this
+   one, whose `execution.id` is derived from this execution's id and the
+   dispatch's idempotency key (§9.4), so one dispatch names one child however
+   many times it is issued. The child is journaled, recovered and traced as an
+   execution — its cause, the dispatch, recorded beside it — and it outlives the
+   join by construction, which is what the three clauses above already
+   promised about the dispatch; none of them moves (Decision
+   [D150](#d150-a-detached-flow-dispatch-starts-a-child-execution)). Being an
+   execution, it has an execution's own lifetimes: a `scope: execution` store
+   it reaches addresses **the child's** partition, which begins empty and dies
+   with the child — not its parent's, whose partition dies when the parent
+   settles (§11.3) — and a built-in tool that names no `workspace:` works in
+   **the child's** own workspace, for the same reason (§6.1). It runs on the
+   inputs the dispatch bound, as any dispatched
+   instance does: the target's `inputs:` guards an invocation's boundary
+   (§13.2), and rule 12 below is what checked the binding.
+
    A detached dispatch's target MUST NOT **reach** a `human` node, in the sense
    §7.7 fixes — which includes a `human` node inside a flow the target
    instantiates and inside a flow attached to an agent it reaches. The three
@@ -3755,6 +3782,13 @@ and 5.8 name the key `execution_id + node + item_index`; this section fixes what
 single execution (Decision
 [D104](#d104-the-idempotency-key-is-the-flattened-instance-path)).
 
+The key of a detached dispatch to a **`flow.*`** is read for one thing more,
+and no carrier moves for it: it is half of what the **child execution** that
+dispatch starts takes its id from, beside the parent's `execution.id` (§8.6 rule
+7, Decision [D150](#d150-a-detached-flow-dispatch-starts-a-child-execution)). Both properties below are what that reading relies on — a
+repeated attempt at the dispatch derives the key again, and so names the child
+it already started, and two dispatches never share one.
+
 An **effect site** is where an effect is issued: a store node, or a `map` node
 paired with one source-item index on a detached route. Its **frame** is
 
@@ -4172,6 +4206,15 @@ position, so it accepts `provider.*` and nothing else (§2.3).
   by default (§13.2) and therefore satisfy the check statically; supplying the
   value is a run-time requirement (`--session`), checked at run start like
   env-ref presence (§4.3) rather than at validate time.
+- `scope: execution` is partitioned by `execution.id` and dies with that
+  execution. Inside a **child execution** — what a detached `flow.*` dispatch
+  starts (§8.6 rule 7) — that is the child's own id, so an execution-scoped store
+  the child reaches is the **child's** partition: it begins empty, sees nothing
+  its parent wrote, and dies with the child. A `scope: session` or
+  `scope: global` store is shared across the two exactly as it is across any two
+  executions of one session or one project, which is what a parent that hands
+  work on to a detached flow through a store should declare (Decision
+  [D150](#d150-a-detached-flow-dispatch-starts-a-child-execution)).
 
 ### 11.4 Store-op nodes
 
@@ -10288,6 +10331,93 @@ because `TEXT` stops at 64 KiB and a `value:` does not. The contract is a
 conformance suite run against SQLite always and against real servers in CI, the
 way the journal's is (PRD resolved q62). *PRD 5.8, 5.10, 5.12, resolved q9, q13,
 q45, q62, q63; §11.3, §11.4, §11.5, §14.1, §14.3, §4.3.*
+
+### D150. A detached `flow.*` dispatch starts a child execution
+
+A `map` route with `detach: true` whose target is a `flow.*` does not run the
+flow as an instance inside the execution that dispatched it: it starts a **child
+execution**. The child's `execution.id` is derived from the parent's id and the
+dispatch's §9.4 idempotency key; its `execution.session_key` and
+`execution.item_index` are the dispatch's, as inside any dispatched instance
+(§4.1, [D115](#d115-executionitem_index-is-absent-where-no-map-dispatch-encloses-the-expression));
+and it is journaled, recovered and traced as an execution of its own, with its
+cause — the parent and the key — recorded beside it. Nothing about the join
+moves: rule 7's three clauses and
+[D94](#d94-a-detached-dispatch-is-resolved-at-dispatch) stand as written, the
+parent's trace keeps its stub record, and the checks that bound a detached
+dispatch —
+[D118](#d118-a-detached-dispatch-reaches-no-human-node)'s interrupt-freedom and
+§8.6's `local`-only rule — are unchanged.
+
+**Rationale**: PRD resolved q65. Before it, a detached `flow.*` ran as an
+instance under its parent's id, which made its record the parent's — and the
+parent's journal session closes when the parent settles, which is exactly the
+moment a detached dispatch exists to outlive. So in the common case the work a
+detached flow did was executed live and recorded nowhere, and a crash in the
+middle of it lost the work as well as the record, because nothing resumes a
+settled execution. The ruling's ontology is the fix: **every execution has a
+cause — a trigger, or a detached dispatch from another execution's node** — and
+what outlives the join needs an identity to outlive it with. A *joined* instance
+ends inside its parent's lifetime, so its account stays inline, exactly as it
+was.
+
+**The id is derived, never minted**, because one dispatch has to name one child
+in every generation: a recovered parent re-issues its detached dispatch when it
+replays, and a map node's own `retry:` re-issues it at the same path. §9.4's key
+is already the thing with both properties that requires — a repeated attempt
+reuses it and distinct dispatches never share it — so the key gains a *reader*
+and its carriers do not move. A minted id would have made a replay mint a second
+child and run the work twice, which is the failure the journal exists to prevent.
+
+**Nothing an author writes changes**, which is why this is a decision about
+what the construct *is* rather than a new key: no field is added to `map:`, no
+check moves, and a composition valid before is valid now with the same meaning
+at the join. What moves is below the grammar — the child's journal, recovery
+and export are `docs/durability.md` §3.2 and §6.1's and `docs/trace.md` §1.4's
+— and **three things a flow observes from inside**, every one because
+`execution.id` now names the child and every one keyed by it:
+
+* `execution.id` itself, in CEL;
+* the partition of a **`scope: execution` store** (§11.3), which is keyed by that
+  id. A detached flow's execution-scoped store is now the child's own — empty
+  when the child begins, dying with the child — where before it was its
+  parent's. The earlier reading was never one an author could rely on: the
+  parent's partition dies when the parent settles, and a detached flow exists to
+  outlive exactly that moment, so what it read there depended on whether it ran
+  before or after its parent's release. A composition that hands data on to a
+  detached flow through a store declares `scope: session` or `scope: global`,
+  whose partitions the child shares with its parent (it runs under the parent's
+  session);
+* the **default workspace of a built-in tool** (§6.1) — the directory a
+  `builtin.files` or `builtin.bash` binding that names no `workspace:` works in,
+  which is the execution's own and keyed by that id. A detached flow's built-ins
+  now start in a fresh, empty directory of the child's, removed when the child
+  settles, where before they shared the parent's — and, for the store's reason,
+  that sharing was never reliable: the parent's workspace is removed when the
+  parent settles, so a file the parent wrote was there or not depending on
+  whether the detached flow read it before or after that release. A composition
+  that hands a file on to a detached flow names the directory in a `workspace:`
+  both bindings share.
+
+These three are the ruling's "journaled, recovered and exported like any
+execution" read through the per-execution lifetimes §11.3 and §6.1 already
+give an execution, rather than rulings of their own. PRD resolved q65 does not
+enumerate them — they were derived when the ruling was implemented — so they
+are **stated here so they are read rather than inferred**, and they are the
+part of this entry the owner has yet to confirm in the PRD's own words: an
+answer there that kept any of them the parent's would amend this list, not the
+ruling.
+
+A child also runs on the inputs its dispatch **bound**, not on those inputs
+re-parsed by the target's `inputs:`: that schema guards an invocation (§13.2), a
+dispatch is not one, §8.6 rule 12 checked the binding at build time, and a
+joined dispatch of the same target runs on exactly what it was bound — so
+whether one dispatch's input is accepted cannot depend on `detach:`. *PRD 5.6,
+5.8, resolved q28, q29, q42, q64, q65; §4.1, §8.6 rule 7, §9.4, §11.3,
+[D35](#d35-scope-is-required-on-store-definitions),
+[D94](#d94-a-detached-dispatch-is-resolved-at-dispatch),
+[D104](#d104-the-idempotency-key-is-the-flattened-instance-path),
+[D118](#d118-a-detached-dispatch-reaches-no-human-node).*
 
 ## Appendix B — Editor integration
 

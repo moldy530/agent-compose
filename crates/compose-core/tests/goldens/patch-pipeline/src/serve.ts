@@ -160,7 +160,6 @@ import {
   beingWorked,
   blankSinkCredentials,
   insisting,
-  journalDetachedTrace,
   message,
   pause,
   retrySchedule,
@@ -170,13 +169,14 @@ import {
   sinkConfigured,
   workDelivery,
 } from "./delivery.ts";
-import { type CompiledFlow, type FlowRun, flows, runFlow } from "./graph.ts";
+import { type CompiledFlow, type FlowRun, flows, runChildFlow, runFlow } from "./graph.ts";
 import { mountWorkerRoutes, placementWaits, watchPlacementWaits } from "./mesh.ts";
 import {
   deliverHumanAnswer,
   deliveriesOf,
   executionReport,
   exhaustRecordedDelivery,
+  hostChildren,
   humanWaits,
   intendDelivery,
   journaledExecution,
@@ -185,8 +185,8 @@ import {
   recordDeliveryAttempt,
   refuseDelivery,
   refuseRecordedDelivery,
+  resumeChild,
   undeliveredDeliveries,
-  watchDetachedSettlements,
   watchHumanPauses,
   watchQuiescence,
 } from "./runtime.ts";
@@ -385,20 +385,20 @@ export function createApp(): FastifyInstance {
     });
   }
 
-  // The sink's second event class (PRD resolved q64): every detached `flow.*`
-  // delivery that settles in this process ships its own envelope. Subscribed
-  // **before** the recovery hook below, because a recovered execution re-runs
-  // the detached deliveries its dead generation left in flight and each of them
-  // re-ships on its own settlement — at-least-once, deduped by a receiver on
-  // `(parent_execution, idempotency_key)`. And let go of when the app closes,
-  // so an ejected caller that builds a second app in one process does not ship
-  // every envelope twice.
-  if (sinkConfigured()) {
-    const unwatch = watchDetachedSettlements(exportingDetached);
-    app.addHook("onClose", async () => {
-      unwatch();
-    });
-  }
+  // **Child executions are this app's executions** (PRD resolved q65): every
+  // one a detached `flow.*` dispatch starts in this process — under a request's
+  // execution or a recovered one — is tracked on the same map, answers on the
+  // same status route by its own id, and ships its own trace from the hook that
+  // closes its own row ([`trackChild`]). Hosted **before** the recovery hook
+  // below, because recovery is one of the ways a child starts here: an open
+  // child is resumed — natively where its parent has settled, and through its
+  // recovered parent's re-issued dispatch where the parent is open too. And let
+  // go of when the app closes, so an ejected caller that builds a second app in
+  // one process tracks a child on the map of the app that is still serving.
+  const unhost = hostChildren((child) => trackChild(executions, child));
+  app.addHook("onClose", async () => {
+    unhost();
+  });
 
   // Recovery, on the hook Fastify runs **before** the server accepts a
   // connection: `onReady` is awaited by `listen`, so every execution the
@@ -1004,6 +1004,7 @@ async function recoverExecutions(executions: Map<string, Execution>): Promise<vo
     process.stderr.write(`this project's journal could not be read: ${message(error)}\n`);
     return;
   }
+  const stillOpen = new Set(open.map((row) => row.id));
   for (const row of open) {
     // One generation of one execution per process. Nothing can be running yet —
     // this hook is what runs before the first connection — so the guard is a
@@ -1018,6 +1019,35 @@ async function recoverExecutions(executions: Map<string, Execution>): Promise<vo
       process.stderr.write(
         `\`${row.id}\` was running \`${row.flow}\`, which this build does not declare: it stays open in the journal\n`,
       );
+      continue;
+    }
+    // A **child execution** (PRD resolved q65) is recovered one of two ways,
+    // decided by its parent's row (`docs/durability.md` §6.1).
+    //
+    // Where the parent is **open** too, the parent's replay is what resumes it:
+    // the replay reaches the detached dispatch again and re-issues it, and the
+    // dispatch finds the child's open row and resumes it — admitted behind that
+    // node's join, under its bounds, exactly as the first generation ran it.
+    // Resuming it here as well would put it in front of the parent's own joined
+    // instances in that node's permit queue, delaying the parent on work grammar
+    // 8.6 rule 7 says it never waits for.
+    //
+    // Where the parent has **settled** — the crash the ruling was ratified from
+    // — nothing will re-issue it, so it is resumed natively, admitted under the
+    // bound its lineage recorded (`runtime.resumeChild`): a fan-out stopped with
+    // one child running and three still queued restarts one at a time, not four
+    // at once. Either way its own runner puts it on this map ([`trackChild`]); it
+    // announced no pauses, because it holds none (Decision D118), and it has no
+    // callback of its own to owe.
+    if (row.lineage !== undefined) {
+      if (stillOpen.has(row.lineage.parent)) {
+        process.stderr.write(
+          `recovered ${row.id} (${row.flow}), for its open parent ${row.lineage.parent} to re-issue\n`,
+        );
+        continue;
+      }
+      void resumeChild(row);
+      process.stderr.write(`recovered ${row.id} (${row.flow})\n`);
       continue;
     }
     // The pauses this execution's earlier generations already announced, read
@@ -1106,6 +1136,55 @@ function resumeInto(
     .finally(unwatch);
   executions.set(row.id, execution);
   return execution;
+}
+
+/**
+ * Run one child execution in this app, tracked like any execution it serves —
+ * the runner [`createApp`] hosts for the whole of its life (PRD resolved q65).
+ *
+ * A child is an execution in every way this app's surfaces can see. It is on
+ * [`createApp`]'s map under its own id, so `GET /executions/:id` answers it with
+ * its own report, guarded by the `auth:` of the trigger its lifecycle row names
+ * — its parent's (`runtime.ChildExecution.trigger`). Its row closes through
+ * [`closed`], so its trace export is journaled on **its own** ledger before the
+ * row closes, exactly as a request's is, headed by its lineage
+ * (`./delivery.ts`'s `shipTrace` reads that off the row). And nothing about it
+ * reaches its parent's entry: the parent's report and its webhooks are what
+ * they were.
+ *
+ * What it does **not** have is a callback or a pause: no request asked to be
+ * told about it, and Decision D118 refuses the `human` node it would park on —
+ * so no parking watch is taken, and [`closed`]'s webhook half is the no-op it
+ * is for any execution nobody subscribed to.
+ *
+ * Answers the run itself, so what stopped a child that did not complete reaches
+ * the one line the child machinery writes about it (`runtime.dispatchChild`) as
+ * well as this app's report.
+ */
+function trackChild(
+  executions: Map<string, Execution>,
+  child: runtime.ChildExecution,
+): Promise<FlowRun> {
+  const execution: Execution = {
+    id: child.id,
+    flow: child.flow,
+    trigger: child.trigger,
+    status: "running",
+    // A resumed child is a replay on its way back to its frontier, exactly as a
+    // recovered execution is; it holds no pause for the window to be about.
+    recovering: child.resume,
+    parked: false,
+    reported: new Set<string>(),
+    deliveries: Promise.resolve(),
+    announced: false,
+    settled: Promise.resolve(),
+  };
+  const run = runChildFlow(child, (produced, error) => closed(execution, produced, error));
+  execution.settled = settling(execution, run).then(() => {
+    execution.recovering = false;
+  });
+  executions.set(child.id, execution);
+  return run;
 }
 
 /** Start the run, and record what it does when it stops. */
@@ -1409,23 +1488,6 @@ function shipping(
     });
   execution.deliveries = journaled.then(() => undefined);
   return journaled;
-}
-
-/**
- * Journal a settled detached `flow.*` delivery's own envelope and set its
- * schedule going (PRD resolved q64, `docs/trace.md` §1.4).
- *
- * The listener [`createApp`] subscribes with, and it is [`shipping`]'s sibling
- * on the same ledger: the intent is journaled under the execution the delivery
- * ran under, and the attempts are set going after it lands and are not awaited.
- * Nothing waits for any of it — the delivery has already settled, the flow
- * instance that issued it never waited for it (grammar 8.6 rule 7), and a sink
- * that is down costs this envelope a retry exactly as it costs the parent's.
- */
-function exportingDetached(settled: runtime.DetachedSettlement): void {
-  void journalDetachedTrace(settled).then((record) => {
-    if (record !== undefined) void workDelivery(record, sinkAuth(), true);
-  });
 }
 
 /**
@@ -2068,6 +2130,13 @@ function strings(held: unknown): Record<string, string> {
  * The readiness line is one JSON object on stdout, before anything else is
  * written there — `{"base_url":"http://127.0.0.1:8787"}` — so a caller that asked
  * for `--port 0` learns which port it got without guessing and without racing.
+ *
+ * **A signal ends the process with its executions in flight**, child executions
+ * included, and that is the durability contract rather than a gap in it
+ * (`docs/durability.md` §6.1): every one of them is an open row in the journal,
+ * so the next start recovers each — a child whose parent had already settled
+ * among them — and replays it to its frontier. What a stop costs is the one
+ * effect each was in the middle of, which is §2's window for any execution.
  */
 export async function serve(options: ServeOptions = {}): Promise<FastifyInstance> {
   const app = createApp();

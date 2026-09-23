@@ -44,6 +44,8 @@
 // Output: one JSON object of observations; the expectations live in the Rust
 // test that reads it (`generated_code_gates.rs`).
 
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
@@ -58,6 +60,22 @@ if (project === undefined) {
 const runtime = await import(pathToFileURL(path.resolve(project, "src/runtime.ts")).href);
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Wait for `promise`, or fail naming `what` once `ms` have passed.
+ *
+ * What turns "this never settled" into a failure with a sentence rather than a
+ * runner that sits until CI's own timeout kills it: a regression in what joins
+ * or drains a child execution shows up as a promise that never resolves, and
+ * the section that waits on it has to be able to say which one.
+ */
+const within = (promise, what, ms = 10_000) => {
+  let timer;
+  const expired = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} did not settle within ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
+};
 
 /** A sleep that a node's deadline can cut short, the way a real activity's does. */
 const naps = (ms, signal) =>
@@ -1275,48 +1293,99 @@ const observed = {};
   ]);
 }
 
-// --- A detached `flow.*` delivery's own collector (PRD resolved q64) -------
+// --- A detached `flow.*` dispatch starts a child execution (PRD resolved q65) -
 //
-// The ruling's two halves, from inside. The map node's entry keeps exactly the
-// stub `"detached"` record and nothing the delivery did — its model call, its
-// store op — because the delivery's context carries none of the node's
-// collectors (D94, `docs/trace.md` §5.1). What the delivery did is collected by
-// a collector of its own, from dispatch to settlement, and handed to whoever
-// `watchDetachedSettlements` subscribed once the quiescence mark comes off —
-// which is after the map node has returned, because the join never waits.
+// The ruling, from inside. A detached dispatch to a `flow.*` does not run under
+// its parent: the route's `run` is `runtime.dispatchChild` — exactly what
+// `codegen::graph` emits for such a route — which derives the child's id from
+// the parent's and the dispatch's grammar 9.4 key and hands a **child
+// execution** to the runner the process hosts: in a compiled project a
+// `runFlow` of its own, with a journal session, a lifecycle row and an export
+// of its own. The parent's entry keeps exactly the stub `"detached"` record and
+// nothing the child did (D94, `docs/trace.md` §5.1), and the join returns
+// before any child settles (grammar 8.6 rule 7).
 //
 // Driven through `runNode`, because the parent's *entry* is half of what is
-// asserted and only a node execution makes one. Every shape of settlement is
-// here: a `flow.*` that completed (its instance's trace on the answer), one that
-// failed (its trace on the `SubflowFailure`), one that met a divergence (which
-// settles nothing: q29's "a divergence fires nothing"), and a `tool.*` sink,
-// which runs no nodes and so has no envelope of its own to ship.
+// asserted and only a node execution makes one; and with a runner of this
+// section's own hosted, because what a child is **handed** — its id, its
+// lineage, its parent's session and trigger, whether it resumes — is the claim,
+// and a gate on each child is what lets the section ask what happens while one
+// is still running: a second dispatch of the same child, and a recovery that
+// reaches it from its row, **join** it rather than starting a second generation
+// (the in-process half of `docs/durability.md` §6.1's reconciliation), and a
+// process waiting on `childrenSettled` waits for it. The journal is a scratch
+// one, because a child's lifecycle row is what tells a first dispatch from a
+// re-issued one and from one whose child already settled.
 {
-  const settlements = [];
-  const unwatch = runtime.watchDetachedSettlements((settled) => settlements.push(settled));
-  // A listener that throws is its own problem: the one after it still hears,
-  // and nothing reaches the delivery or the flow instance.
-  const unwatchLoud = runtime.watchDetachedSettlements(() => {
-    throw new Error("a listener that throws");
+  // Read by `dataRoot()` when the journal is first opened, which nothing above
+  // this section does.
+  process.env["AGENT_COMPOSE_DATA_DIR"] = fs.mkdtempSync(
+    path.join(os.tmpdir(), "map-dispatch-children-"),
+  );
+  const parent = "exec_children";
+  const session = "sess_children";
+  const keyOf = (index) => `${parent}/hand_off/0/${index}`;
+  const lineageOf = (index) => ({ parent, idempotencyKey: keyOf(index), itemIndex: index });
+  const journal = await runtime.openJournal();
+  const rowOf = (index, flow, inputs) => ({
+    id: runtime.childExecutionId(parent, keyOf(index)),
+    flow,
+    trigger: "on_request",
+    inputs,
+    sessionKey: session,
+    lineage: lineageOf(index),
+    status: "open",
+    journalVersion: runtime.JOURNAL_VERSION,
+    startedAt: new Date().toISOString(),
+  });
+  // The parent's own row, so the trigger a child inherits is one the section
+  // chose rather than the `manual` a row-less parent falls back to.
+  await journal.begin({
+    id: parent,
+    flow: "flow.probe",
+    trigger: "on_request",
+    inputs: {},
+    sessionKey: session,
+    status: "open",
+    journalVersion: runtime.JOURNAL_VERSION,
+    startedAt: new Date().toISOString(),
+  });
+  // Item 3's child already ran to its end in an earlier generation, so its
+  // dispatch runs nothing; item 4's began and never settled, so its dispatch
+  // resumes it under the inputs its row recorded rather than the ones the
+  // re-issued dispatch bound.
+  await journal.begin(rowOf(3, "flow.settled", { kind: "settled" }));
+  await journal.end(runtime.childExecutionId(parent, keyOf(3)), "completed");
+  await journal.begin(rowOf(4, "flow.reopened", { subject: "as recorded" }));
+
+  // Every child handed over waits at a gate until the section opens them all —
+  // **every** child, a second generation of one id included. A gate keyed by id
+  // would let a second generation (the regression the join exists to prevent)
+  // replace the first one's gate, leaving that first run waiting for ever: the
+  // section would hang instead of reporting `handed` with one child too many.
+  // A child handed over after the gates opened is not held at all.
+  const handed = [];
+  const finished = [];
+  const gates = [];
+  let opened = false;
+  const unhost = runtime.hostChildren(async (child) => {
+    handed.push(child);
+    if (!opened) await new Promise((open) => gates.push(open));
+    finished.push(child.id);
+    if (child.flow === "flow.broken") throw new Error("cannot file");
+    return { output: {} };
   });
   const called = (model) => ({ model, servedBy: model, fallback: 0, failovers: [] });
-  const innerEntry = (flow, node, outcome, extra = {}) => ({
-    step: 1,
-    flow,
-    node,
-    traversal: 0,
-    outcome,
-    attempts: 1,
-    ...extra,
-  });
-  // Every delivery tries to reach the node's collectors, the way an activity
-  // run under the node's own context would. The context it is handed must
-  // hold none of them, so each push below is one that has nowhere to land.
-  const leaky = (context) => {
-    context.modelCalls?.push(called("model.leaked"));
-    context.storeRecords?.push({ store: "store.leaked", op: "get" });
-    context.toolDispatches?.push({ index: 99, target: "flow.leaked" });
-  };
+  // Exactly what `codegen::graph` emits for a detached `flow.*` route: the
+  // dispatch site, and the node's admission for the child to be admitted under.
+  const child = (tag, target) =>
+    route({
+      tag,
+      detach: true,
+      target,
+      writes: [],
+      run: (input, context, site) => runtime.dispatchChild(target, input, site, context.admission),
+    });
   const map = descriptor({
     node: "hand_off",
     maxConcurrency: 8,
@@ -1331,89 +1400,114 @@ const observed = {};
           return { output: {}, models: [call] };
         },
       }),
-      route({
-        tag: "review",
-        detach: true,
-        target: "flow.review",
-        writes: [],
-        run: async (_input, context) => {
-          leaky(context);
-          await sleep(120);
-          return {
-            output: {},
-            inner: [
-              innerEntry("flow.review", "judge", "completed", {
-                writes: [],
-                models: [called("model.local")],
-              }),
-            ],
-          };
-        },
-      }),
-      route({
-        tag: "broken",
-        detach: true,
-        target: "flow.broken",
-        writes: [],
-        run: async (_input, context) => {
-          leaky(context);
-          await sleep(80);
-          throw new runtime.SubflowFailure(
-            "flow.broken",
-            "did not run to quiescence",
-            [
-              innerEntry("flow.broken", "judge", "completed", {
-                writes: [],
-                models: [called("model.local")],
-              }),
-              innerEntry("flow.broken", "file", "failed", { error: "Error: cannot file" }),
-            ],
-            new Error("cannot file"),
-          );
-        },
-      }),
-      route({
-        tag: "diverged",
-        detach: true,
-        target: "flow.diverged",
-        writes: [],
-        run: async () => {
-          await sleep(40);
-          throw new runtime.ReplayDivergence(
-            { key: "k", site: "exec_trace_q64/hand_off/0/3", kind: "model", ordinal: 0 },
-            "a probe",
-          );
-        },
-      }),
+      child("review", "flow.review"),
+      child("broken", "flow.broken"),
+      child("settled", "flow.settled"),
+      child("reopened", "flow.reopened"),
       route({
         tag: "sink",
         detach: true,
         target: "tool.sink",
         writes: [],
-        run: async (_input, context) => {
-          leaky(context);
-          return { output: { receipt: "sent" } };
-        },
+        run: async () => ({ output: { receipt: "sent" } }),
       }),
     ],
   });
   const node = mapNode(
     map,
-    [{ kind: "joined" }, { kind: "review" }, { kind: "broken" }, { kind: "diverged" }, { kind: "sink" }],
-    { id: "exec_trace_q64" },
+    [
+      { kind: "joined" },
+      { kind: "review", subject: "a" },
+      { kind: "broken", subject: "b" },
+      { kind: "settled" },
+      { kind: "reopened", subject: "as re-bound" },
+      { kind: "sink" },
+    ],
+    { id: parent },
   );
+  node.state.$run = { ...node.state.$run, execution: { id: parent, session_key: session } };
   const entry = entryOf(await runtime.runNode(node.descriptor, node.state));
-  const heardAtReturn = settlements.length;
-  await runtime.settleDetached("exec_trace_q64");
-  // `settleDetached` returns as the last delivery's promise does, and a
-  // settlement is announced in that promise's own `finally` — so by here every
-  // one that is going to be heard has been.
-  unwatch();
-  unwatchLoud();
-  const byKey = Object.fromEntries(settlements.map((held) => [held.idempotencyKey, held]));
-  const review = byKey["exec_trace_q64/hand_off/0/1"];
-  const broken = byKey["exec_trace_q64/hand_off/0/2"];
-  observed.detachedCollector = {
+  const finishedAtReturn = finished.length;
+
+  // The three children that run are handed over once their journal reads are
+  // done, which is after the join returned: wait for them, not for a guess.
+  for (let waited = 0; handed.length < 3 && waited < 200; waited += 1) await sleep(25);
+
+  // While the review is still running: its dispatch re-issued — a recovered
+  // parent replaying to it — and its row recovered, the two directions a
+  // restarted `serve` reaches one open child from at once. Both join.
+  const reviewId = runtime.childExecutionId(parent, keyOf(1));
+  const reissued = runtime.dispatchChild(
+    "flow.review",
+    { kind: "review", subject: "a" },
+    {
+      execution: { id: parent, session_key: session, item_index: 1 },
+      path: ["hand_off/0/1"],
+      idempotencyKey: keyOf(1),
+    },
+  );
+  const recovered = runtime.resumeChild(rowOf(1, "flow.review", { kind: "review", subject: "a" }));
+  let joinedSettled = false;
+  void Promise.all([reissued, recovered]).then(() => {
+    joinedSettled = true;
+  });
+  let drained = false;
+  const draining = runtime.childrenSettled().then(() => {
+    drained = true;
+  });
+  await sleep(60);
+  const whileRunning = { handed: handed.length, joinedSettled, drained, finished: finished.length };
+
+  // The failed child's one line, which is the whole of what a failure costs the
+  // process that ran it: nothing rejects, and nothing reaches the parent.
+  const written = [];
+  const write = process.stderr.write;
+  process.stderr.write = (chunk) => {
+    written.push(String(chunk));
+    return true;
+  };
+  try {
+    opened = true;
+    for (const open of gates) open();
+    await within(draining, "`childrenSettled` after every gate opened");
+    await within(reissued, "the re-issued dispatch of a running child");
+    await within(recovered, "the recovery that reached a running child");
+  } finally {
+    process.stderr.write = write;
+  }
+  unhost();
+  const innerEntry = (flow, node, outcome, extra = {}) => ({
+    step: 1,
+    flow,
+    node,
+    traversal: 0,
+    outcome,
+    attempts: 1,
+    ...extra,
+  });
+  const brokenId = runtime.childExecutionId(parent, keyOf(2));
+  const document = runtime.traceDocument({
+    execution: reviewId,
+    flow: "flow.review",
+    status: "completed",
+    entries: [innerEntry("flow.review", "judge", "completed", { writes: [], models: [called("model.local")] })],
+    lineage: lineageOf(1),
+  });
+  const failedDocument = runtime.traceDocument({
+    execution: brokenId,
+    flow: "flow.broken",
+    status: "failed",
+    error: "SubflowFailure: cannot file",
+    entries: [innerEntry("flow.broken", "file", "failed", { error: "Error: cannot file" })],
+    lineage: lineageOf(2),
+  });
+  const plainDocument = runtime.traceDocument({
+    execution: parent,
+    flow: "flow.probe",
+    status: "completed",
+    entries: [],
+  });
+  observed.childExecutions = {
     parent: {
       models: (entry.models ?? []).map((call) => call.model),
       stores: entry.stores ?? null,
@@ -1427,62 +1521,189 @@ const observed = {};
         inner: record.inner ?? null,
       })),
     },
-    heardAtReturn,
-    heard: settlements.map((held) => held.idempotencyKey).sort(),
-    review: {
-      parentExecution: review.parentExecution,
-      flow: review.flow,
-      status: review.status,
-      error: review.error ?? null,
-      entries: review.entries.map((held) => [held.node, held.outcome, (held.models ?? []).length]),
-      ordered: Date.parse(review.dispatchedAt) <= Date.parse(review.settledAt),
-    },
-    broken: {
-      status: broken.status,
-      error: broken.error,
-      entries: broken.entries.map((held) => [held.node, held.outcome]),
-    },
-    document: runtime.detachedTraceDocument(review),
-    failedDocument: runtime.detachedTraceDocument(broken),
+    finishedAtReturn,
+    handed: handed
+      .map((held) => ({
+        id: held.id,
+        flow: held.flow,
+        inputs: held.inputs,
+        sessionKey: held.sessionKey,
+        trigger: held.trigger,
+        lineage: held.lineage,
+        resume: held.resume,
+      }))
+      .sort((one, other) => one.lineage.idempotencyKey.localeCompare(other.lineage.idempotencyKey)),
+    whileRunning,
+    handedAtEnd: handed.length,
+    failure: written.join(""),
+    distinct: [
+      runtime.childExecutionId(parent, keyOf(1)) !== runtime.childExecutionId(parent, keyOf(2)),
+      runtime.childExecutionId(parent, keyOf(1)) !== runtime.childExecutionId("exec_other", keyOf(1)),
+      runtime.childExecutionId(parent, keyOf(1)) === runtime.childExecutionId(parent, keyOf(1)),
+    ],
+    document,
+    failedDocument,
+    plainDocument,
   };
 
-  // Which event class a sink row carries, read back off the bytes each
-  // `format:` writes (`runtime.traceSinkClass`). One reader with two callers:
-  // a settle's once-per-execution guard counts only a row known to be the
-  // execution's export, and the status route's report — the body every
-  // lifecycle webhook carries — leaves out only a row known to be a delivery's
-  // envelope. So a body that cannot be read is neither, and a callback row is
-  // not a sink's whatever it holds.
+  // Whose export one `trace_sink` row is, read back off the bytes each
+  // `format:` writes (`runtime.traceSinkClass`). One reader with two callers: a
+  // settle's once-per-execution guard counts only a row known to be the
+  // execution's own export, and the status route's report leaves out only a
+  // row known to be the envelope a build before q65 shipped onto a **parent's**
+  // ledger for a detached delivery. A child's export, on the child's own
+  // ledger, is an export like any other; a body that cannot be read is neither,
+  // and a callback row is not a sink's whatever it holds.
   const otlp = await import(pathToFileURL(path.resolve(project, "src/otlp.ts")).href);
-  const exportOf = (document) =>
+  const exportOf = (held) =>
     JSON.stringify(
-      otlp.exportRequest(document, {
+      otlp.exportRequest(held, {
         target: "local",
         artifact: "sha256:0",
         compiler: "0.0.0",
-        startedAt: review.dispatchedAt,
-        endedAt: review.settledAt,
+        startedAt: "2026-09-01T10:00:00.000Z",
+        endedAt: "2026-09-01T10:00:01.000Z",
       }),
     );
-  const parentDocument = {
-    trace_version: runtime.TRACE_VERSION,
-    flow: "flow.dispatch",
-    execution_id: "exec_trace_q64",
+  const legacy = {
+    trace_version: 4,
+    detached: true,
+    parent_execution: parent,
+    idempotency_key: keyOf(1),
+    flow: "flow.review",
+    execution_id: parent,
     status: "completed",
     entries: [],
   };
-  const classOf = (body, kind = "trace_sink") =>
-    runtime.traceSinkClass({ kind, body }) ?? null;
-  observed.detachedCollector.sinkClass = {
-    envelopeExport: classOf(JSON.stringify(parentDocument)),
-    envelopeDetached: classOf(JSON.stringify(runtime.detachedTraceDocument(review))),
-    otlpExport: classOf(exportOf(parentDocument)),
-    otlpDetached: classOf(exportOf(runtime.detachedTraceDocument(broken))),
-    unreadable: classOf("{not json"),
-    notAnObject: classOf("42"),
-    noSpans: classOf(JSON.stringify({ resourceSpans: [] })),
-    callback: classOf(JSON.stringify(runtime.detachedTraceDocument(review)), "callback"),
+  const classOf = (body, execution, kind = "trace_sink") =>
+    runtime.traceSinkClass({ kind, execution, body }) ?? null;
+  observed.childExecutions.sinkClass = {
+    envelopeExport: classOf(JSON.stringify(plainDocument), parent),
+    envelopeChild: classOf(JSON.stringify(document), reviewId),
+    envelopeLegacy: classOf(JSON.stringify(legacy), parent),
+    otlpExport: classOf(exportOf(plainDocument), parent),
+    otlpChild: classOf(exportOf(failedDocument), brokenId),
+    otlpLegacy: classOf(exportOf(legacy), parent),
+    unreadable: classOf("{not json", parent),
+    notAnObject: classOf("42", parent),
+    noSpans: classOf(JSON.stringify({ resourceSpans: [] }), parent),
+    callback: classOf(JSON.stringify(legacy), parent, "callback"),
   };
+
+  // --- …a queued child is on the books, and in the journal, from issue --------
+  //
+  // (PRD resolved q65, Decision D28.) `max_concurrency: 1` over two detached
+  // children, so the second waits for the first's permit. From the moment the
+  // join returns both are **begun** — two open rows, each with its lineage and
+  // the bound it was issued under — though only one has been handed to a
+  // runner: a process that stops now leaves both to recover, rather than one row
+  // and a dispatch that existed only in memory. And `childrenSettled` waits for
+  // both across the moment the first settles and hands its permit on — which is
+  // exactly when a drain that counted only *running* children found nothing left
+  // and let its process exit under the second.
+  {
+    const queuedParent = "exec_queued";
+    const queuedKey = (index) => `${queuedParent}/fan/0/${index}`;
+    const queuedHanded = [];
+    const queuedGates = new Map();
+    const unhostQueued = runtime.hostChildren(async (held) => {
+      queuedHanded.push(held.lineage.itemIndex);
+      await new Promise((open) => queuedGates.set(held.lineage.itemIndex, open));
+      return { output: {} };
+    });
+    const queued = descriptor({
+      node: "fan",
+      maxConcurrency: 1,
+      routes: [child(undefined, "flow.queued")],
+    });
+    const node = mapNode(queued, [{ subject: "first" }, { subject: "second" }], {
+      id: queuedParent,
+    });
+    node.state.$run = {
+      ...node.state.$run,
+      execution: { id: queuedParent, session_key: session },
+    };
+    const queuedEntry = entryOf(await runtime.runNode(node.descriptor, node.state));
+    for (let waited = 0; queuedHanded.length < 1 && waited < 200; waited += 1) await sleep(25);
+    // Room for a second child to be handed over, were the bound not holding.
+    await sleep(80);
+    const rowsAtIssue = [];
+    for (const index of [0, 1]) {
+      const row = await journal.execution(runtime.childExecutionId(queuedParent, queuedKey(index)));
+      rowsAtIssue.push(row === undefined ? null : { status: row.status, lineage: row.lineage });
+    }
+    const handedWhileFirstRan = [...queuedHanded];
+    let queuedDrained = false;
+    const queuedDraining = runtime.childrenSettled().then(() => {
+      queuedDrained = true;
+    });
+    // The first settles, and its permit goes to the second.
+    queuedGates.get(handedWhileFirstRan[0])?.();
+    for (let waited = 0; queuedHanded.length < 2 && waited < 200; waited += 1) await sleep(25);
+    await sleep(30);
+    const drainedWhileSecondRan = queuedDrained;
+    for (const open of queuedGates.values()) open();
+    await within(queuedDraining, "`childrenSettled` over a child that had been queued");
+    unhostQueued();
+    observed.queuedChildren = {
+      dispatches: queuedEntry.dispatches.map((record) => [record.index, record.outcome]),
+      rowsAtIssue,
+      handedWhileFirstRan: handedWhileFirstRan.length,
+      handedAtEnd: [...queuedHanded].sort(),
+      drainedWhileSecondRan,
+    };
+  }
+
+  // --- …and a recovered child is admitted under the bound it was issued under --
+  //
+  // (`docs/durability.md` §6.1.) Three open children of one settled parent, each
+  // recording `max_concurrency: 1`, resumed at once — what a `serve` start does
+  // with the rows a stop left. They start **one at a time**, on gates rebuilt
+  // from what their lineage recorded, and every one of them runs.
+  {
+    const recoveredParent = "exec_recovered_parent";
+    const bounds = { node: `${recoveredParent}/fan`, nodeBound: 1, route: "0", routeBound: 1 };
+    const rowFor = (index) => ({
+      id: runtime.childExecutionId(recoveredParent, `${recoveredParent}/fan/0/${index}`),
+      flow: "flow.queued",
+      trigger: "manual",
+      inputs: { subject: `recovered ${index}` },
+      sessionKey: "",
+      lineage: {
+        parent: recoveredParent,
+        idempotencyKey: `${recoveredParent}/fan/0/${index}`,
+        itemIndex: index,
+        admission: bounds,
+      },
+      status: "open",
+      journalVersion: runtime.JOURNAL_VERSION,
+      startedAt: new Date().toISOString(),
+    });
+    const running = new Set();
+    let peak = 0;
+    const recoveredHanded = [];
+    const recoveredGates = [];
+    const unhostRecovered = runtime.hostChildren(async (held) => {
+      recoveredHanded.push(held.lineage.itemIndex);
+      running.add(held.id);
+      peak = Math.max(peak, running.size);
+      await new Promise((open) => recoveredGates.push(open));
+      running.delete(held.id);
+      return { output: {} };
+    });
+    const resumed = [0, 1, 2].map((index) => runtime.resumeChild(rowFor(index)));
+    for (let opened = 0; opened < 3; opened += 1) {
+      for (let waited = 0; recoveredGates.length <= opened && waited < 200; waited += 1) {
+        await sleep(25);
+      }
+      // Room for another child to start beside this one, were the bound not held.
+      await sleep(40);
+      recoveredGates[opened]?.();
+    }
+    await within(Promise.all(resumed), "three recovered children, admitted one at a time");
+    unhostRecovered();
+    observed.recoveredChildren = { peak, handed: [...recoveredHanded].sort() };
+  }
 }
 
 // --- Grammar 9.3 level 1, and D79's outermost-wins --------------------------
@@ -1498,6 +1719,65 @@ const observed = {};
       { timeoutMs: 10_000, retry: { max: 1, backoffMs: 1, multiplier: 1, jitter: false }, onError: "skip" },
     ),
     plain: runtime.effectivePolicy({ onError: "fail", timeoutMs: 1 }, false, { timeoutMs: 10_000 }),
+  };
+}
+
+// --- A worker issues no child execution (PRD resolved q42, q65) --------------
+//
+// **Last**, because both switches it turns on are the process's and are never
+// turned off: a worker runs one dispatch and exits (`./worker-node.ts`), and it
+// turns them on before anything runs. A worker reaches a detached `flow.*`
+// dispatch only inside a flow a placed agent attaches as a tool (grammar 14.1
+// rule 4), and a child execution is begun, journaled and recovered by the hub —
+// the journal's single writer — which a worker is not. So the dispatch **cannot
+// be issued**, which grammar 8.6 rule 7 makes the map node's own failure: the
+// node fails by name before it dispatches anything — no stub record claiming a
+// dispatch was made — and its `on_error:` decides what follows (`skip`, here,
+// so the entry is what a reader of the trace is shown). No child is handed to
+// any runner and no row is written to the journal this process can see. And
+// the journal a worker binds is the one every open in its process answers
+// with, so no path reaches a second journal beside the hub's.
+{
+  const journals = await import(pathToFileURL(path.resolve(project, "src/journal.ts")).href);
+  const parent = "exec_on_a_worker";
+  const key = `${parent}/hand_off/0/0`;
+  const handed = [];
+  const unhost = runtime.hostChildren(async (child) => {
+    handed.push(child.id);
+    return { output: {} };
+  });
+  runtime.refuseChildExecutions();
+  const onAWorker = descriptor({
+    node: "hand_off",
+    routes: [
+      route({
+        detach: true,
+        target: "flow.review",
+        writes: [],
+        run: (input, context, site) =>
+          runtime.dispatchChild("flow.review", input, site, context.admission),
+      }),
+    ],
+  });
+  const node = mapNode(onAWorker, [{ subject: "a" }], { policy: { onError: "skip" }, id: parent });
+  const entry = entryOf(
+    await within(runtime.runNode(node.descriptor, node.state), "a map node on a worker"),
+  );
+  // Room for a child to be handed over, had the dispatch been issued anyway.
+  await sleep(60);
+  unhost();
+  // The scratch journal the child-execution section opened is still this
+  // process's, so a row begun for the child would be there.
+  const row = await (await runtime.openJournal()).execution(runtime.childExecutionId(parent, key));
+  const dispatchJournal = { close: () => Promise.resolve() };
+  journals.hostJournal(dispatchJournal);
+  observed.onAWorker = {
+    outcome: entry.outcome,
+    error: entry.error ?? null,
+    dispatches: entry.dispatches ?? null,
+    handed,
+    row: row ?? null,
+    hosted: (await runtime.openJournal()) === dispatchJournal,
   };
 }
 

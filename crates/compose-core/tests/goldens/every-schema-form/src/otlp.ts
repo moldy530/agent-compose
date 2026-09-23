@@ -172,15 +172,38 @@ export interface ExportContext {
   readonly artifact: string;
   /** `COMPILER_VERSION` — the agent-compose release that emitted this module. */
   readonly compiler: string;
-  /**
-   * When the execution opened, as an ISO 8601 instant — or, for a detached
-   * delivery's envelope, when the delivery was issued.
-   */
+  /** When the execution opened, as an ISO 8601 instant. */
   readonly startedAt: string;
-  /** When it settled — the execution, or the detached delivery — as an ISO 8601 instant. */
+  /** When it settled, as an ISO 8601 instant. */
   readonly endedAt: string;
-  /** The inbound `traceparent` this execution was started by, where there was one. */
+  /**
+   * The inbound `traceparent` this execution was started by, where there was
+   * one — for a **child execution**, the one the execution at the head of its
+   * lineage ([`root`][`ExportContext.root`]) was started by, whose trace the
+   * child's export joins (`docs/trace.md` §12.2).
+   */
   readonly parent?: TraceParent;
+  /**
+   * For a **child execution**, the execution at the head of its lineage: the
+   * one a trigger or a command started, which every child descended from it —
+   * a child's child included — is exported into the trace of (`docs/trace.md`
+   * §12.2, PRD resolved q65).
+   *
+   * Carried here rather than read off the envelope because the envelope names
+   * only the **immediate** parent (`parent_execution`), and one hop is not
+   * enough: a child's export lands in the trace its parent's export lands in,
+   * and a parent that is itself a child landed in *its* parent's. So a
+   * grandchild's trace is the root's, not the one its parent's id would
+   * derive — which is a trace nothing else exports into, holding a span whose
+   * parent is in another trace. `src/delivery.ts` walks the lifecycle rows up
+   * to the head and passes it.
+   *
+   * Absent on an execution a trigger or a command started — it is its own head
+   * — and, on a child, read as its parent: a child whose parent a trigger
+   * started has that parent as its head, which is every child a conformance
+   * fixture written before this field describes.
+   */
+  readonly root?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -207,11 +230,12 @@ const SCOPE_NAME = "agent-compose";
  *  * a **flow-as-tool** call links the model-call span to the dispatch span that
  *    answered it (resolved q51's `span links`).
  *
- * A **detached delivery's** envelope (PRD resolved q64) is the same tree rooted
- * one step further in: its root is the delivery rather than the execution, hung
- * off the parent execution's root span in the parent's trace, and it carries the
- * envelope's head — `detached`, `parent_execution`, `idempotency_key` — as
- * attributes (`docs/trace.md` §12.2, §12.5).
+ * A **child execution's** envelope (PRD resolved q64, q65) is the same tree
+ * under its own execution id, hung off its **parent** execution's root span in
+ * the trace its parent's export lands in — the trace of the execution at the
+ * head of its lineage — and it carries the envelope's lineage head —
+ * `detached`, `parent_execution`, `idempotency_key` — as root attributes
+ * (`docs/trace.md` §12.2, §12.5).
  *
  * What is deliberately **not** carried is payload: `StoreRecord.answer` and
  * `ToolCallRecord.result` are in the envelope and are not mapped to attributes.
@@ -224,7 +248,17 @@ export function exportRequest(
   document: TraceDocument,
   context: ExportContext,
 ): ExportTraceServiceRequest {
-  const traceId = context.parent?.traceId ?? traceIdOf(document.execution_id);
+  // **A child execution's export lands in the trace its parent's export lands
+  // in** (PRD resolved q64, q65, `docs/trace.md` §12.2), since a collector files
+  // a child under the run that dispatched it rather than beside it. Down a chain
+  // of children that is one trace, the **head's**: the caller's, where a valid
+  // `traceparent` started the execution at the head of the lineage — which is
+  // the one `context.parent` carries for a child — and otherwise the one the
+  // head's id derives. The head is `context.root`; a child with none named is
+  // one whose parent is its head.
+  const lineage = document.detached === true ? document.parent_execution : undefined;
+  const head = lineage === undefined ? document.execution_id : (context.root ?? lineage);
+  const traceId = context.parent?.traceId ?? traceIdOf(head);
   // The window's own start is the one instant with nothing earlier to fall back
   // to, so an unreadable one falls back to the epoch; every other instant in
   // this file falls back to a point inside the window instead.
@@ -233,25 +267,17 @@ export function exportRequest(
   const emitted: OtlpSpan[] = [];
   const state: Emission = { document, context, traceId, window, spans: emitted };
 
-  // **A detached delivery's envelope is rooted where it ran** (PRD resolved
-  // q64, `docs/trace.md` §12.2). Its `execution_id` is its parent's, so the
-  // trace id above is the parent's trace — the delivery's spans land in the
-  // trace its parent's export lands in — and three things change beside it:
-  //
-  //  * the root's key is the delivery's `idempotency_key` rather than the
-  //    execution id, so its span id cannot be the parent's root's, which the
-  //    same execution id and kind word would otherwise derive;
-  //  * the root hangs off the **parent's root span**, whose id is a function of
-  //    the execution id alone and so is known here without the parent's export
-  //    in hand: a detached delivery ran under that execution, past its join;
-  //  * the entries' instance paths hang off the dispatch's own path, which the
-  //    key is (grammar 9.4) — exactly as a joined dispatch's `inner` does.
-  const detached = document.detached === true ? document.idempotency_key : undefined;
-  const rootKey = detached ?? document.execution_id;
+  // …and its root **hangs off the parent's root span**, whose id is a function
+  // of the parent's execution id alone (the root key below) and so is known
+  // here without the parent's export in hand. Not the caller's span: the
+  // caller started the parent, and the parent's dispatch started this. Every
+  // other id is this execution's own — the child has an execution id of its
+  // own, so nothing it exports can take an id of its parent's.
+  const rootKey = document.execution_id;
   const rootId = spanIdOf(document.execution_id, "execution", rootKey);
   const rootParent =
-    detached !== undefined
-      ? spanIdOf(document.execution_id, "execution", document.execution_id)
+    lineage !== undefined
+      ? spanIdOf(lineage, "execution", lineage)
       : context.parent?.spanId;
   emitted.push({
     traceId,
@@ -267,18 +293,15 @@ export function exportRequest(
       text("agentcompose.status", document.status),
       integer("agentcompose.trace_version", document.trace_version),
       ...(document.error === undefined ? [] : [text("agentcompose.error", document.error)]),
-      // The envelope's head, read onto the root span: how a collector tells the
-      // sink's two event classes apart, and the pair it dedupes a re-shipped
-      // delivery on.
-      ...(detached === undefined
+      // The envelope's lineage head, read onto the root span: how a collector
+      // tells a child execution from one a trigger started, and the pair it
+      // joins the child to its parent's stub dispatch record on.
+      ...(lineage === undefined
         ? []
         : [
             { key: "agentcompose.detached", value: { boolValue: true } },
-            text(
-              "agentcompose.parent_execution",
-              document.parent_execution ?? document.execution_id,
-            ),
-            text("agentcompose.idempotency_key", detached),
+            text("agentcompose.parent_execution", lineage),
+            text("agentcompose.idempotency_key", document.idempotency_key ?? ""),
           ]),
     ],
     events: [],

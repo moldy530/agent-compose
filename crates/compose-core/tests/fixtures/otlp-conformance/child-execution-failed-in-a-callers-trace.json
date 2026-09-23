@@ -1,6 +1,6 @@
 {
-  "name": "detached-delivery-failed-in-a-callers-trace",
-  "about": "A detached `flow.*` delivery that failed (PRD resolved q64), under a parent a caller traced into with a W3C `traceparent`. The envelope ships anyway, its outcome on it: the root is `code: 2` with the envelope's `error` as its message, and the aborting entry is last. The caller's trace id is adopted, as the parent's own export adopts it (§12.3) — but the root hangs off the **parent execution's** root span rather than off the caller's span, because the delivery ran under that execution: the caller started the parent, not the delivery.",
+  "name": "child-execution-failed-in-a-callers-trace",
+  "about": "A child execution that failed (PRD resolved q65), under a parent a caller traced into with a W3C `traceparent`. The envelope ships anyway, its outcome on it: the root is `code: 2` with the envelope's `error` as its message, and the aborting entry is last. The caller's trace id is adopted, as the parent's own export adopts it (§12.3) — a child's export is handed its parent's `traceparent` — but the root hangs off the **parent execution's** root span rather than off the caller's span, because the parent's dispatch started the child: the caller started the parent, not the child.",
   "context": {
     "target": "local",
     "artifact": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
@@ -14,12 +14,12 @@
     }
   },
   "document": {
-    "trace_version": 4,
+    "trace_version": 5,
     "detached": true,
     "parent_execution": "exec_parent",
     "idempotency_key": "exec_parent/review/0/1",
     "flow": "flow.review_and_file",
-    "execution_id": "exec_parent",
+    "execution_id": "exec_9381c4ad-35c6-83a8-a6d3-214091810adb",
     "status": "failed",
     "error": "SubflowFailure: the instance of `flow.review_and_file` did not run to quiescence: NodeFailure: `file` failed: `${OPS_BIN}/false` exited with 1",
     "entries": [
@@ -123,7 +123,7 @@
             "spans": [
               {
                 "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
-                "spanId": "be4406e344f0c6e1",
+                "spanId": "d514d1170fa6932a",
                 "parentSpanId": "f9f5328d4c329dfb",
                 "name": "flow.review_and_file",
                 "kind": 1,
@@ -133,7 +133,7 @@
                   {
                     "key": "agentcompose.execution.id",
                     "value": {
-                      "stringValue": "exec_parent"
+                      "stringValue": "exec_9381c4ad-35c6-83a8-a6d3-214091810adb"
                     }
                   },
                   {
@@ -151,7 +151,7 @@
                   {
                     "key": "agentcompose.trace_version",
                     "value": {
-                      "intValue": "4"
+                      "intValue": "5"
                     }
                   },
                   {
@@ -188,8 +188,8 @@
               },
               {
                 "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
-                "spanId": "2d4ca775896aa75c",
-                "parentSpanId": "be4406e344f0c6e1",
+                "spanId": "1ae718c51457b9af",
+                "parentSpanId": "d514d1170fa6932a",
                 "name": "judge",
                 "kind": 1,
                 "startTimeUnixNano": "1788256801000000000",
@@ -198,7 +198,7 @@
                   {
                     "key": "agentcompose.instance_path",
                     "value": {
-                      "stringValue": "exec_parent/review/0/1/judge/0"
+                      "stringValue": "exec_9381c4ad-35c6-83a8-a6d3-214091810adb/judge/0"
                     }
                   },
                   {
@@ -272,8 +272,8 @@
               },
               {
                 "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
-                "spanId": "abe6a509da10c6ad",
-                "parentSpanId": "2d4ca775896aa75c",
+                "spanId": "22e5ad902d944449",
+                "parentSpanId": "1ae718c51457b9af",
                 "name": "model.local",
                 "kind": 3,
                 "startTimeUnixNano": "1788256801000000000",
@@ -318,8 +318,8 @@
               },
               {
                 "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
-                "spanId": "feb479cb3d39f68f",
-                "parentSpanId": "be4406e344f0c6e1",
+                "spanId": "4ff547402f9a462f",
+                "parentSpanId": "d514d1170fa6932a",
                 "name": "file",
                 "kind": 1,
                 "startTimeUnixNano": "1788256801000000000",
@@ -328,7 +328,7 @@
                   {
                     "key": "agentcompose.instance_path",
                     "value": {
-                      "stringValue": "exec_parent/review/0/1/file/0"
+                      "stringValue": "exec_9381c4ad-35c6-83a8-a6d3-214091810adb/file/0"
                     }
                   },
                   {

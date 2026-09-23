@@ -565,6 +565,73 @@ export interface DispatchRow {
 /** How an execution ended, or that it has not. */
 export type ExecutionStatus = "open" | "completed" | "failed";
 
+/**
+ * A **child execution**'s cause: the detached `flow.*` dispatch that started it
+ * (PRD resolved q65, `docs/durability.md` §3.5).
+ *
+ * Every execution has a cause — a trigger, or a detached dispatch from another
+ * execution's node — and this is the second. It is recorded beside the
+ * lifecycle row rather than inferred, because two readers need it long after the
+ * dispatch that started the child is gone: a `serve` that recovers the child
+ * after its parent has settled (the export it ships is headed by these, and the
+ * child's `execution.item_index` is the last of them), and a reader of the
+ * journal asking where an execution came from.
+ */
+export interface Lineage {
+  /** The execution whose detached dispatch started this one. */
+  readonly parent: string;
+  /**
+   * The grammar 9.4 key of that dispatch — byte for byte the `idempotencyKey`
+   * of the stub `"detached"` record on the parent's trace entry, and one of the
+   * two things this execution's id is derived from (`runtime.childExecutionId`).
+   */
+  readonly idempotencyKey: string;
+  /**
+   * The source-item index the dispatch carried, which is grammar 4.1's
+   * `execution.item_index` everywhere inside the instance a `map` dispatches —
+   * and a child execution *is* that instance.
+   */
+  readonly itemIndex?: number;
+  /**
+   * The admission bound the dispatch was issued under (Decision D28), so a
+   * generation that resumes the child **without** its parent's dispatch in
+   * front of it still starts it under that bound (`docs/durability.md` §6.1).
+   *
+   * A child's row is begun the moment its dispatch is issued — before it has a
+   * permit, which it may wait for behind its siblings — so that a process which
+   * stops with the child still queued leaves an open row to recover rather than
+   * work nothing records (PRD resolved q65). A recovery that then started every
+   * such child at once would run a `max_concurrency: 1` fan-out all together,
+   * which is the number the author wrote down to prevent. Absent on a row a
+   * dispatch with no bound to carry began — a driver calling the runtime
+   * directly — which a recovery starts as it finds it.
+   */
+  readonly admission?: LineageAdmission;
+}
+
+/**
+ * The permits one detached `flow.*` dispatch was counted against, as its child's
+ * lineage records them (Decision D28, [`Lineage.admission`]).
+ *
+ * The two gates `runtime.runMap` admits every dispatch through: the map
+ * **node**'s `max_concurrency:`, and the **route**'s own bound beneath it. Each
+ * is named by the key that runtime gives it, so every child recovered from one
+ * node draws on one set of gates — the same set a re-run of that node would.
+ */
+export interface LineageAdmission {
+  /**
+   * The map node the dispatch counted against: its execution's id, the
+   * enclosing instance's path and the node id (`runtime.MapPlan.admission`).
+   */
+  readonly node: string;
+  /** That node's `max_concurrency:`. */
+  readonly nodeBound: number;
+  /** The route, by its position in the node's descriptor (`runtime.routeKey`). */
+  readonly route: string;
+  /** That route's own bound: its `max_concurrency:`, never more than the node's. */
+  readonly routeBound: number;
+}
+
 /** One execution's lifecycle row (`docs/durability.md` §3.5). */
 export interface ExecutionRow {
   readonly id: string;
@@ -613,6 +680,20 @@ export interface ExecutionRow {
    * reading rather than two.
    */
   readonly traceparent?: string;
+  /**
+   * What started a **child execution** — the detached dispatch, its key and its
+   * item index — and absent on every execution a trigger or a command started
+   * (PRD resolved q65, [`Lineage`]).
+   *
+   * Held in a table of its own beside `executions` rather than as columns of
+   * it, and that is a compatibility decision (`docs/durability.md` §11.2): a
+   * whole table is what `CREATE TABLE IF NOT EXISTS` adds to a journal an older
+   * build wrote, on every backend, with no column probe on any of them. It is
+   * written **before** the lifecycle row, so a process that dies between the
+   * two leaves a lineage row nothing reads rather than a child execution that
+   * has forgotten its parent.
+   */
+  readonly lineage?: Lineage;
   readonly status: ExecutionStatus;
   readonly journalVersion: number;
   readonly startedAt: string;
@@ -917,6 +998,25 @@ interface JournalDriver {
  */
 const INSERTION_ORDER = "insertion_order ASC";
 
+/**
+ * How a lifecycle row is read: the `executions` row, and the child execution's
+ * cause beside it where it has one (PRD resolved q65, [`Lineage`]).
+ *
+ * A `LEFT JOIN`, because every execution a trigger or a command started has no
+ * `lineage` row at all and is read exactly as it was before the table existed.
+ * The four columns are aliased rather than selected with `lineage.*`, so no
+ * name of that table can shadow one of `executions`' on a driver that keys a
+ * row by column name. One spelling of the statement for both readers
+ * ([`SqlJournal.execution`], [`SqlJournal.openExecutions`]), so the two cannot
+ * come to read a row differently.
+ */
+const WITH_LINEAGE = `SELECT executions.*,
+         lineage.parent AS lineage_parent,
+         lineage.idempotency_key AS lineage_key,
+         lineage.item_index AS lineage_item_index,
+         lineage.admission AS lineage_admission
+       FROM executions LEFT JOIN lineage ON lineage.execution = executions.id`;
+
 /** `ON CONFLICT … DO NOTHING`, which SQLite and Postgres both speak. */
 function standardConflict(target: string, _noop: string): string {
   return `ON CONFLICT ${target} DO NOTHING`;
@@ -1003,8 +1103,29 @@ class SqlJournal implements Journal {
   }
 
   begin(row: ExecutionRow): Promise<void> {
-    return this.#serial(() =>
-      this.#run(
+    return this.#serial(async () => {
+      // A child execution's cause goes down **first** (PRD resolved q65): a
+      // process that dies between the two statements leaves a lineage row no
+      // lifecycle row reads — which the re-dispatch that begins the child again
+      // finds already holding the same values — rather than a child execution that
+      // has forgotten which dispatch started it. Both are no-ops on a row that
+      // is already there, so beginning one execution twice is beginning it once.
+      const lineage = row.lineage;
+      if (lineage !== undefined) {
+        await this.#run(
+          `INSERT INTO lineage (execution, parent, idempotency_key, item_index, admission)
+           VALUES (?, ?, ?, ?, ?)
+           ${this.#conflict("(execution)", "execution = execution")}`,
+          [
+            row.id,
+            lineage.parent,
+            lineage.idempotencyKey,
+            lineage.itemIndex ?? null,
+            lineage.admission === undefined ? null : JSON.stringify(lineage.admission),
+          ],
+        );
+      }
+      await this.#run(
         `INSERT INTO executions
            (id, flow, trigger_kind, inputs, session_key, callback, traceparent, status, journal_version, started_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1021,8 +1142,8 @@ class SqlJournal implements Journal {
           row.journalVersion,
           row.startedAt,
         ],
-      ),
-    );
+      );
+    });
   }
 
   end(id: string, status: Exclude<ExecutionStatus, "open">, error?: string): Promise<void> {
@@ -1041,14 +1162,14 @@ class SqlJournal implements Journal {
   }
 
   async #execution(id: string): Promise<ExecutionRow | undefined> {
-    const found = await this.#one("SELECT * FROM executions WHERE id = ?", [id]);
+    const found = await this.#one(`${WITH_LINEAGE} WHERE executions.id = ?`, [id]);
     return found === undefined ? undefined : executionOf(found);
   }
 
   openExecutions(): Promise<readonly ExecutionRow[]> {
     return this.#serial(async () => {
       const rows = await this.#all(
-        "SELECT * FROM executions WHERE status = 'open' ORDER BY started_at ASC, id ASC",
+        `${WITH_LINEAGE} WHERE executions.status = 'open' ORDER BY executions.started_at ASC, executions.id ASC`,
       );
       return rows.map((row) => executionOf(row));
     });
@@ -1513,6 +1634,19 @@ CREATE TABLE IF NOT EXISTS dispatches (
   detail        TEXT,
   PRIMARY KEY (execution, wait)
 );
+-- A child execution's cause (PRD resolved q65, \`docs/durability.md\` §3.5): one
+-- row per execution a detached \`flow.*\` dispatch started, none for any other.
+-- A table of its own rather than columns of \`executions\`, so a journal an older
+-- build wrote grows it by the \`IF NOT EXISTS\` above and no probe below.
+-- \`admission\` is the map node's bound the dispatch was issued under, as JSON
+-- (§6.1): what a recovery starts the child under when no parent re-issues it.
+CREATE TABLE IF NOT EXISTS lineage (
+  execution       TEXT PRIMARY KEY,
+  parent          TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  item_index      INTEGER,
+  admission       TEXT
+);
 CREATE INDEX IF NOT EXISTS effects_of_execution ON effects (execution);
 CREATE INDEX IF NOT EXISTS executions_by_status ON executions (status, started_at);
 CREATE INDEX IF NOT EXISTS deliveries_by_status ON deliveries (status, intended_at);
@@ -1827,6 +1961,10 @@ function executionOf(row: Row): ExecutionRow {
   const error = held["error"];
   const callback = held["callback"];
   const traceparent = held["traceparent"];
+  const parent = held["lineage_parent"];
+  const key = held["lineage_key"];
+  const itemIndex = held["lineage_item_index"];
+  const admission = admissionOf(held["lineage_admission"]);
   return {
     id: String(held["id"]),
     flow: String(held["flow"]),
@@ -1837,12 +1975,56 @@ function executionOf(row: Row): ExecutionRow {
     ...(traceparent === null || traceparent === undefined
       ? {}
       : { traceparent: String(traceparent) }),
+    // Absent on every execution a trigger or a command started, which has no
+    // `lineage` row for the join to find (see [`WITH_LINEAGE`]).
+    ...(parent === null || parent === undefined || key === null || key === undefined
+      ? {}
+      : {
+          lineage: {
+            parent: String(parent),
+            idempotencyKey: String(key),
+            ...(itemIndex === null || itemIndex === undefined
+              ? {}
+              : { itemIndex: Number(itemIndex) }),
+            ...(admission === undefined ? {} : { admission }),
+          },
+        }),
     status: String(held["status"]) as ExecutionStatus,
     journalVersion: Number(held["journal_version"]),
     startedAt: String(held["started_at"]),
     ...(endedAt === null || endedAt === undefined ? {} : { endedAt: String(endedAt) }),
     ...(error === null || error === undefined ? {} : { error: String(error) }),
   };
+}
+
+/**
+ * A child's recorded admission bound, read back off its `lineage` row
+ * ([`Lineage.admission`]) — or `undefined` where the row carries none, or one
+ * this build cannot read as the four fields it writes.
+ *
+ * Read defensively rather than trusted, because what it decides is only *how
+ * many* recovered children start at once, and a value that cannot be read is
+ * better recovered unbounded — as a child with no recorded bound is — than not
+ * recovered at all: an open row nothing resumes is the loss the row exists to
+ * prevent.
+ */
+function admissionOf(held: unknown): LineageAdmission | undefined {
+  if (held === null || held === undefined) return undefined;
+  try {
+    const parsed = JSON.parse(String(held)) as Partial<Record<keyof LineageAdmission, unknown>>;
+    const { node, nodeBound, route, routeBound } = parsed;
+    if (
+      typeof node !== "string" ||
+      typeof route !== "string" ||
+      typeof nodeBound !== "number" ||
+      typeof routeBound !== "number"
+    ) {
+      return undefined;
+    }
+    return { node, nodeBound, route, routeBound };
+  } catch {
+    return undefined;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2043,6 +2225,28 @@ export function openJournal(): Promise<Journal> {
     opening = undefined;
   });
   return opening;
+}
+
+/**
+ * Answer every [`openJournal`] in this process with `journal`, rather than with
+ * the project's own.
+ *
+ * Called by `./worker-node.ts`, before anything runs, and by nothing else. A
+ * worker runs one dispatch of an execution the **hub** journals, and the hub is
+ * the single writer (`docs/distributed.md` §3.3, PRD resolved q42): the journal
+ * a worker's code may reach is the dispatch's own — the history the hub handed
+ * over and the stream of effects going home — and never the project's journal
+ * as this process's data directory or environment would bind it. Installing the
+ * dispatch's journal as the session is not enough on its own: a session is
+ * found by execution id, and a path that opens the journal *by name* — a
+ * detached `flow.*` dispatch beginning a child execution (PRD resolved q65) is
+ * one — would otherwise open a second journal beside the hub's, on a file the
+ * hub never reads or a server whose writer guard the hub is holding. Bound
+ * here, every such path meets the dispatch journal, which refuses by name each
+ * operation that is the hub's.
+ */
+export function hostJournal(journal: Journal): void {
+  opening = Promise.resolve(journal);
 }
 
 /**
@@ -2406,8 +2610,10 @@ export class EffectRecorder {
    */
   async claim(kind: EffectKind, request: unknown): Promise<EffectSlot> {
     // A divergence raised where nothing could carry it out — a detached `map`
-    // delivery, whose whole point is that the flow instance does not wait for it
-    // (grammar 8.6 rule 7) — belongs to the **execution** rather than to that
+    // delivery to an `agent.*` or a `tool.*`, whose whole point is that the flow
+    // instance does not wait for it (grammar 8.6 rule 7; a detached `flow.*` is a
+    // child execution, whose divergence is its own) — belongs to the
+    // **execution** rather than to that
     // branch: resolved q29 makes a divergence un-absorbable "by `retry:`,
     // `on_error:`, `on_item_error:`, or any policy at any nesting depth", and
     // `detach: true` is a policy. Re-raised at the next effect any branch of this
@@ -2750,10 +2956,12 @@ const latched = new Map<string, ReplayDivergence>();
 /**
  * Hold a divergence raised on a branch **nothing awaits**.
  *
- * There is exactly one such branch: a detached `map` delivery, whose `.catch` is
- * the one place in this runtime where a failure legitimately stops travelling
- * (grammar 8.6 rule 7 — "nothing it does can delay the enclosing flow
- * instance"). A [`ReplayDivergence`] is the one failure that may not stop there:
+ * There is exactly one such branch: a detached `map` delivery to an `agent.*` or
+ * a `tool.*`, whose `.catch` is the one place in this runtime where a failure
+ * legitimately stops travelling (grammar 8.6 rule 7 — "nothing it does can delay
+ * the enclosing flow instance"). A detached `flow.*` is not one: it is a child
+ * execution, and a divergence inside it holds the child open, as it would any
+ * execution. A [`ReplayDivergence`] is the one failure that may not stop there:
  * resolved q29 makes it un-absorbable by any policy at any nesting depth, and
  * swallowing it would report a resume as complete while a delivery the record
  * claims to hold was never made.
@@ -2889,7 +3097,10 @@ import { Client } from "pg";
  * created by this release or a later one, so there is no older file whose
  * columns have to be probed for. (The SQLite arm's `PRAGMA table_info` walks
  * exist because there *are* older files.) A column added here in a later release
- * is the case to read §11.2 twice for, exactly as it is there.
+ * is the case to read §11.2 twice for, exactly as it is there. A **table** added
+ * in one is not: `lineage` (PRD resolved q65) arrived after this schema first
+ * shipped, and `IF NOT EXISTS` is the whole of its migration into a database an
+ * earlier build created.
  *
  * **`COLLATE "C"` on every column a statement compares or orders by**, and that
  * is a correctness choice rather than a preference. A journal key is
@@ -2968,6 +3179,13 @@ CREATE TABLE IF NOT EXISTS dispatches (
   settled_at    TEXT,
   detail        TEXT,
   PRIMARY KEY (execution, wait)
+);
+CREATE TABLE IF NOT EXISTS lineage (
+  execution       TEXT COLLATE "C" PRIMARY KEY,
+  parent          TEXT COLLATE "C" NOT NULL,
+  idempotency_key TEXT COLLATE "C" NOT NULL,
+  item_index      INTEGER,
+  admission       TEXT
 );
 CREATE INDEX IF NOT EXISTS effects_of_execution ON effects (execution);
 CREATE INDEX IF NOT EXISTS executions_by_status ON executions (status, started_at);

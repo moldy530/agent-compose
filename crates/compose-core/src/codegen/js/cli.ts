@@ -136,20 +136,28 @@ import {
   CallbackRetryError,
   blankSinkCredentials,
   insisting,
-  journalDetachedTrace,
   shipTrace,
   sinkAuth,
   sinkConfigured,
   workDelivery,
 } from "./delivery.ts";
-import { type CompiledFlow, type FlowRun, flows, runFlow, sessionRefusal } from "./graph.ts";
+import {
+  type CompiledFlow,
+  type FlowRun,
+  flows,
+  runChildFlow,
+  runFlow,
+  sessionRefusal,
+} from "./graph.ts";
 import {
   TRACE_VERSION,
+  childrenSettled,
   closeHumanWaits,
   deliverHumanAnswer,
   deliveriesOf,
   divergenceOf,
   executionReport,
+  hostChildren,
   humanWaitEnded,
   humanWaits,
   intendDelivery,
@@ -159,7 +167,7 @@ import {
   journaledExecution,
   openExecutions,
   releaseJournal,
-  watchDetachedSettlements,
+  traceDocument,
   watchHumanPauses,
 } from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
@@ -364,6 +372,11 @@ async function resumeVerb(argv: readonly string[]): Promise<number> {
     // has one; a resume of an `http` execution may, and finishing one here is
     // the one place outside `serve` where such a row closes.
     ...(row.callback === undefined ? {} : { callback: row.callback }),
+    // …and what started it, where a detached dispatch did: a child execution
+    // resumed by hand is still a child — it runs on the inputs its dispatch
+    // bound, never parsed again (Decision D150), and its trace file is headed
+    // so (PRD resolved q65, `docs/trace.md` §2).
+    ...(row.lineage === undefined ? {} : { lineage: row.lineage }),
   });
 }
 
@@ -380,6 +393,12 @@ interface Job {
   readonly trigger?: string;
   /** Where its `settled` webhook goes, for a `resume` that closes one. */
   readonly callback?: string;
+  /**
+   * What started it, for a `resume` of a child execution (PRD resolved q65):
+   * handed to `runFlow`, which runs it as the child it is, and to the trace file
+   * it heads.
+   */
+  readonly lineage?: runtime.Lineage;
 }
 
 /**
@@ -397,36 +416,42 @@ async function execute(job: Job): Promise<number> {
   // after the run has reported: PRD resolved q50 puts the sink "wherever
   // executions settle, `run` included", and never in front of the answer.
   const exported: { record?: runtime.DeliveryRecord } = {};
-  // …and the sink's second event class (PRD resolved q64): the envelope every
-  // detached `flow.*` delivery ships when it settles. Journaled from the moment
-  // each one settles and sent here, after the answer, exactly as the run's own
-  // export is. A delivery still in flight when this command exits is one the
-  // command's exit ends — `detach: true` promises that nothing waits for it —
-  // so what this can ship is what settled while the command was still here.
-  const detached: Promise<runtime.DeliveryRecord | undefined>[] = [];
-  const unwatch = sinkConfigured()
-    ? watchDetachedSettlements((settled) => {
-        detached.push(journalDetachedTrace(settled));
-      })
-    : () => {};
+  // …and the exports of the **child executions** this run's detached `flow.*`
+  // dispatches start (PRD resolved q65). Each is an execution of its own that
+  // settles and exports like this one — onto its own ledger, from the hook that
+  // closes its own row — and is sent here after this run's, for the reason this
+  // run's is sent after its answer.
+  const children: runtime.DeliveryRecord[] = [];
+  const unhost = hostChildren((child) =>
+    runChildFlow(
+      child,
+      sinkConfigured()
+        ? async (produced, error) => {
+            const record = await journalExport(child.id, child.flow, produced, error);
+            if (record !== undefined) children.push(record);
+          }
+        : undefined,
+    ),
+  );
   try {
     const code = await executing(job, exported);
     await shipped(exported.record);
-    // **Drained, not snapshotted.** "Still here" lasts until this command
-    // returns, and the sending below is part of that: each POST can take an
-    // attempt's ten seconds (`docs/durability.md` §3.7), and a delivery that
-    // settles during one of them is one this command was still here for. So the
-    // subscription stays open while it sends, the list is re-read after every
-    // POST, and it is let go of only once nothing is left unsent — which is a
-    // check and a return with no `await` between them, so no settlement can land
-    // in a gap between "nothing left" and "stopped listening" and be dropped
-    // with no row, no POST and no word on stderr.
-    for (let sent = 0; sent < detached.length; sent += 1) {
-      await shipped(await detached[sent]);
-    }
+    // **This process does not end under a child execution.** A child is not
+    // this run's to wait for — nothing a detached dispatch does can delay the
+    // flow instance that issued it (grammar 8.6 rule 7), and the run above has
+    // already reported — but it is this *process*'s: `run` ends by
+    // `process.exit`, and a child killed in the middle of an effect is an effect
+    // with no record, which the generation that resumes it issues a second time
+    // (`docs/durability.md` §6.2). So the command stays until every child it
+    // started has settled — one still queued behind its node's
+    // `max_concurrency:` included, which is on the process's books from the
+    // moment its dispatch was issued, and every child *they* started, which is
+    // what `childrenSettled` re-reads for — and then sends what each exported.
+    await childrenSettled();
+    for (const record of children) await shipped(record);
     return code;
   } finally {
-    unwatch();
+    unhost();
   }
 }
 
@@ -504,6 +529,13 @@ async function executing(
     resumable: asking,
     ...(job.trigger === undefined ? {} : { trigger: job.trigger }),
     ...(job.resuming ? { resume: true } : {}),
+    // A child execution resumed by its own id is still a child, and `runFlow`
+    // runs it as one: on the inputs its dispatch bound and its row recorded,
+    // **not parsed** against its flow's `inputs:` as an invocation's are (PRD
+    // resolved q65, Decision D150, `docs/durability.md` §6.2). Without it, the
+    // one surface left to recover a child whose parent has settled would refuse
+    // a bound input its dispatch — and `serve`'s recovery — runs on.
+    ...(job.lineage === undefined ? {} : { lineage: job.lineage }),
     // What this run owes at the moment its lifecycle row closes: the webhook a
     // `serve`-started execution finished here still owes ([`owed`]), and the
     // trace every settled execution ships under a target that declares a
@@ -561,7 +593,7 @@ async function executing(
         : divergence !== undefined
           ? describe(divergence)
           : describe(error);
-    const written = writeTrace(address, execution, status, trace, reason);
+    const written = writeTrace(address, execution, status, trace, job.lineage, reason);
     if (format === "json") {
       // The same record the completed run answers with, `error` where its
       // `outputs` would be — the trace file's path included, because a run that
@@ -596,7 +628,7 @@ async function executing(
   }
 
   await prompting;
-  const written = writeTrace(address, execution, "completed", produced.trace);
+  const written = writeTrace(address, execution, "completed", produced.trace, job.lineage);
   if (format === "json") {
     process.stdout.write(
       `${JSON.stringify(
@@ -642,7 +674,28 @@ async function settled(
   error: unknown,
 ): Promise<void> {
   if (job.callback !== undefined) await owed(job, produced, error);
-  if (!sinkConfigured()) return;
+  const record = await journalExport(job.execution, job.address, produced, error);
+  if (record !== undefined) exported.record = record;
+}
+
+/**
+ * Journal one settled execution's trace export, from the hook that closes its
+ * row, and answer the row — `undefined` where the target declares no sink, the
+ * execution is already exported, or the journal would not take the intent.
+ *
+ * One writer for the two kinds of execution a command closes rows for: the one
+ * it was asked to run, and each child execution a detached dispatch in it
+ * started (PRD resolved q65). The export is one export either way —
+ * `shipTrace` reads a child's lineage off its row, so its envelope is headed by
+ * it — and lands on the ledger of the execution it describes.
+ */
+async function journalExport(
+  execution: string,
+  flow: string,
+  produced: FlowRun | undefined,
+  error: unknown,
+): Promise<runtime.DeliveryRecord | undefined> {
+  if (!sinkConfigured()) return undefined;
   // A failure carries its trace on the chain and a completion carries it on the
   // answer; a failure raised before the graph ran carries none, and ships an
   // envelope with no entries in it — which `docs/trace.md` §2 makes a statement
@@ -651,6 +704,7 @@ async function settled(
     produced === undefined
       ? (error as { trace?: readonly runtime.TraceEntry[] } | null)?.trace
       : produced.trace;
+  let record: runtime.DeliveryRecord | undefined;
   // **Insisted on rather than tried once**, for the reason `src/serve.ts` insists
   // on the same write: the lifecycle row closes as this hook returns, so an
   // intent the journal would not take here is a trace nothing will ever ship —
@@ -660,9 +714,9 @@ async function settled(
   // that still holds the run.
   await insisting(async () => {
     try {
-      exported.record = await shipTrace({
-        execution: job.execution,
-        flow: job.address,
+      record = await shipTrace({
+        execution,
+        flow,
         // Two of the envelope's three: this hook is reached only where the
         // lifecycle row closes, and a run holding a pause leaves it open.
         status: produced === undefined ? "failed" : "completed",
@@ -672,11 +726,12 @@ async function settled(
       return true;
     } catch (failure) {
       process.stderr.write(
-        `\`${job.execution}\`'s trace could not be journaled: ${describe(failure)}\n`,
+        `\`${execution}\`'s trace could not be journaled: ${describe(failure)}\n`,
       );
       return false;
     }
   });
+  return record;
 }
 
 /**
@@ -1505,12 +1560,19 @@ function formatOf(given: string | undefined): Format {
  * run silently overwriting another's record while both print the same path. The
  * id is unique per execution by construction, and it is also the one thing that
  * ties the file to the run that wrote it.
+ *
+ * The document is `runtime.traceDocument`'s — the one writer of an envelope, so
+ * the file and the sink cannot come to head one differently — which is also
+ * what heads a **child execution**'s file with its lineage, on the one path
+ * that writes one: a `resume` of a child by its own id (PRD resolved q65,
+ * `docs/trace.md` §2).
  */
 function writeTrace(
   address: string,
   execution: string,
   status: "completed" | "failed" | "interrupted",
   trace: readonly runtime.TraceEntry[],
+  lineage: runtime.Lineage | undefined,
   error?: string,
 ): string | undefined {
   // A run that failed before it started made no routing decisions, and an empty
@@ -1523,14 +1585,14 @@ function writeTrace(
       directory,
       `${address.replace(/[^A-Za-z0-9_.-]/g, "_")}-${execution.replace(/[^A-Za-z0-9_.-]/g, "_")}.json`,
     );
-    const document: runtime.TraceDocument = {
-      trace_version: TRACE_VERSION,
+    const document = traceDocument({
+      execution,
       flow: address,
-      execution_id: execution,
       status,
       ...(error === undefined ? {} : { error }),
       entries: trace,
-    };
+      ...(lineage === undefined ? {} : { lineage }),
+    });
     fs.writeFileSync(file, `${JSON.stringify(document, null, 1)}\n`);
     return file;
   } catch {

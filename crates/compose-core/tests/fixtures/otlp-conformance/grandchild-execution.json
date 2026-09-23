@@ -1,20 +1,21 @@
 {
-  "name": "detached-delivery",
-  "about": "The envelope a settled detached `flow.*` delivery ships of its own (PRD resolved q64): headed `detached: true`, `parent_execution` and the grammar §9.4 `idempotency_key`, with the parent's id as `execution_id`. Its trace id is the parent's — derived from the same execution id — so the delivery lands in the trace its parent's export lands in; its root is keyed by the idempotency key, so its span id is not the parent's root's, and it hangs off the parent execution's root span, whose id is a function of the execution id alone (§12.2). The head rides the root as `agentcompose.detached`, `agentcompose.parent_execution` and `agentcompose.idempotency_key` (§12.5), and the entries' instance paths hang off the dispatch's own path, as a joined dispatch's `inner` does. The window is the delivery's own: issued to settled.",
+  "name": "grandchild-execution",
+  "about": "The envelope of a **grandchild** execution — a child execution started by a detached `flow.*` dispatch inside another child execution (PRD resolved q65). Its envelope names only its immediate parent, the relay child, in `parent_execution`; the export context names the execution at the **head** of its lineage — the one a trigger started — as `root`. A child lands in the trace its parent's export lands in, and the relay landed in the head's, so the grandchild's trace id is derived from the **head's** id and not from its parent's: one hop would file it in a trace nothing else is exported into, under a root span that lives in another trace (`docs/trace.md` §12.2). Its root still hangs off its **immediate** parent's root span — the relay's, which is in that same trace — and carries its own lineage head (§12.5).",
   "context": {
     "target": "local",
     "artifact": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
     "compiler": "0.0.0-dev",
-    "startedAt": "2026-09-01T10:00:01.000Z",
-    "endedAt": "2026-09-01T10:00:04.000Z"
+    "startedAt": "2026-09-01T10:00:02.000Z",
+    "endedAt": "2026-09-01T10:00:05.000Z",
+    "root": "exec_parent"
   },
   "document": {
-    "trace_version": 4,
+    "trace_version": 5,
     "detached": true,
-    "parent_execution": "exec_parent",
-    "idempotency_key": "exec_parent/review/0/0",
+    "parent_execution": "exec_c647f4e8-c3d7-8e35-9077-b43b9f7be22f",
+    "idempotency_key": "exec_c647f4e8-c3d7-8e35-9077-b43b9f7be22f/hand_on/0/0",
     "flow": "flow.review",
-    "execution_id": "exec_parent",
+    "execution_id": "exec_1575fe9d-faa5-8bc0-8ae6-e74eb97e24b5",
     "status": "completed",
     "entries": [
       {
@@ -108,17 +109,17 @@
             "spans": [
               {
                 "traceId": "39c13e2e5e0c6acee32c763e8e34308c",
-                "spanId": "5ceed65e6e9ec1c6",
-                "parentSpanId": "f9f5328d4c329dfb",
+                "spanId": "993528604ec244a1",
+                "parentSpanId": "77e1c5474e35c725",
                 "name": "flow.review",
                 "kind": 1,
-                "startTimeUnixNano": "1788256801000000000",
-                "endTimeUnixNano": "1788256804000000000",
+                "startTimeUnixNano": "1788256802000000000",
+                "endTimeUnixNano": "1788256805000000000",
                 "attributes": [
                   {
                     "key": "agentcompose.execution.id",
                     "value": {
-                      "stringValue": "exec_parent"
+                      "stringValue": "exec_1575fe9d-faa5-8bc0-8ae6-e74eb97e24b5"
                     }
                   },
                   {
@@ -136,7 +137,7 @@
                   {
                     "key": "agentcompose.trace_version",
                     "value": {
-                      "intValue": "4"
+                      "intValue": "5"
                     }
                   },
                   {
@@ -148,13 +149,13 @@
                   {
                     "key": "agentcompose.parent_execution",
                     "value": {
-                      "stringValue": "exec_parent"
+                      "stringValue": "exec_c647f4e8-c3d7-8e35-9077-b43b9f7be22f"
                     }
                   },
                   {
                     "key": "agentcompose.idempotency_key",
                     "value": {
-                      "stringValue": "exec_parent/review/0/0"
+                      "stringValue": "exec_c647f4e8-c3d7-8e35-9077-b43b9f7be22f/hand_on/0/0"
                     }
                   }
                 ],
@@ -166,17 +167,17 @@
               },
               {
                 "traceId": "39c13e2e5e0c6acee32c763e8e34308c",
-                "spanId": "3ebfe08faed5736c",
-                "parentSpanId": "5ceed65e6e9ec1c6",
+                "spanId": "8079a849e0f7a492",
+                "parentSpanId": "993528604ec244a1",
                 "name": "judge",
                 "kind": 1,
-                "startTimeUnixNano": "1788256801000000000",
-                "endTimeUnixNano": "1788256804000000000",
+                "startTimeUnixNano": "1788256802000000000",
+                "endTimeUnixNano": "1788256805000000000",
                 "attributes": [
                   {
                     "key": "agentcompose.instance_path",
                     "value": {
-                      "stringValue": "exec_parent/review/0/0/judge/0"
+                      "stringValue": "exec_1575fe9d-faa5-8bc0-8ae6-e74eb97e24b5/judge/0"
                     }
                   },
                   {
@@ -250,12 +251,12 @@
               },
               {
                 "traceId": "39c13e2e5e0c6acee32c763e8e34308c",
-                "spanId": "8fe5757faa659a36",
-                "parentSpanId": "3ebfe08faed5736c",
+                "spanId": "acdcbcd80da73665",
+                "parentSpanId": "8079a849e0f7a492",
                 "name": "model.local",
                 "kind": 3,
-                "startTimeUnixNano": "1788256801000000000",
-                "endTimeUnixNano": "1788256804000000000",
+                "startTimeUnixNano": "1788256802000000000",
+                "endTimeUnixNano": "1788256805000000000",
                 "attributes": [
                   {
                     "key": "agentcompose.model",

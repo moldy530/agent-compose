@@ -69,6 +69,50 @@ export const flowFixNodeImplementOutput = z.object({
 }).strict();
 export type FlowFixNodeImplementOutput = z.infer<typeof flowFixNodeImplementOutput>;
 
+/** `flow.review` — the module's parameters (grammar 7.5). */
+export const flowReviewInputs = z.object({
+  goal: z.string(),
+  worktree: z.string(),
+}).strict();
+export type FlowReviewInputs = z.infer<typeof flowReviewInputs>;
+
+/**
+ * `flow.review` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowReviewOutputs = z.object({}).strict();
+export type FlowReviewOutputs = z.infer<typeof flowReviewOutputs>;
+
+/**
+ * `flow.review` node `inspect` — what the harness run is handed (grammar 8.9).
+ */
+export const flowReviewNodeInspectInput = z.object({
+  goal: z.string(),
+}).strict();
+export type FlowReviewNodeInspectInput = z.infer<typeof flowReviewNodeInspectInput>;
+
+/**
+ * `flow.review` node `inspect` — what the harness answers with, parsed in full by the output gate (grammar 8.9).
+ */
+export const flowReviewNodeInspectOutput = z.object({
+  verdict: z.enum(["approve", "revise"]),
+}).strict();
+export type FlowReviewNodeInspectOutput = z.infer<typeof flowReviewNodeInspectOutput>;
+
+/** `flow.review_batch` — the module's parameters (grammar 7.5). */
+export const flowReviewBatchInputs = z.object({
+  tasks: z.array(z.object({
+    goal: z.string(),
+    worktree: z.string(),
+  }).strict()).max(4),
+}).strict();
+export type FlowReviewBatchInputs = z.infer<typeof flowReviewBatchInputs>;
+
+/**
+ * `flow.review_batch` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowReviewBatchOutputs = z.object({}).strict();
+export type FlowReviewBatchOutputs = z.infer<typeof flowReviewBatchOutputs>;
+
 /** State channel `summaries` — its declared type (grammar 10.1). */
 export const stateSummaries = z.array(z.string()).max(4).describe("One entry per dispatched run, in source-item order.").default([]);
 export type StateSummaries = z.infer<typeof stateSummaries>;

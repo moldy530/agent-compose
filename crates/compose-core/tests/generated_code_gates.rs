@@ -414,7 +414,7 @@ use compose_core::ir::schema::{
 };
 use goldens::{GOLDENS, Golden, artifact, emitted, files_under, golden, goldens_root, repository};
 use serde_json::{Value, json};
-use toolchain::{bun, installed, required, runner, runs};
+use toolchain::{bun, installed, output_within, required, runner, runs};
 
 /// The golden gate 13 runs under Node.
 ///
@@ -1393,14 +1393,25 @@ fn the_run_channel_folds_a_steps_contributions_in_canonical_order() {
 ///     detached counterpart is asserted beside it, because Decision D94 puts
 ///     that delivery off the node's clock and the same signal must not cross
 ///     there;
-///   * **a detached `flow.*` delivery is collected on a trace of its own and
-///     never on its parent's** (PRD resolved q64). The parent's entry keeps the
-///     stub record and nothing the delivery did; the delivery's collector hears
-///     its settlement after the join has returned, for a completed and a failed
-///     delivery alike, and not for one that met a divergence or for a `tool.*`
-///     sink — which is a claim about *who* holds a record, and only the runtime
-///     can be asked that. Beside it, the one reader that tells the two event
-///     classes' ledger rows apart, over the bytes both `format:`s write.
+///   * **a detached `flow.*` dispatch starts a child execution** (PRD resolved
+///     q65). The parent's entry keeps the stub record and nothing the child did;
+///     the child is handed to the process's runner under the id its lineage
+///     derives, with its parent's session and trigger, after the join has
+///     returned; a child whose row is closed runs nothing and one whose row is
+///     open resumes under the inputs it recorded; a second dispatch of a running
+///     child, and a recovery reaching it from its row, **join** it rather than
+///     start a second generation; and `childrenSettled` waits for all of it —
+///     which is a claim about *which generation runs*, and only the runtime can
+///     be asked that. A child still **queued** behind its node's
+///     `max_concurrency:` already has its lifecycle row and is already on the
+///     drain, and children a recovery resumes are admitted under the bound their
+///     lineage recorded (Decision D28). Beside it, the one writer of an
+///     envelope's lineage head, and the one reader that tells an export from a
+///     legacy detached row, over the bytes both `format:`s write. And on a
+///     **worker** it starts none: the hub is the journal's single writer (PRD
+///     resolved q42), so the dispatch cannot be issued and the map node fails by
+///     name under its own `on_error:` (grammar 8.6 rule 7) — no stub record, no
+///     runner handed a child, no journal given a row.
 ///
 /// `src/runtime.ts` is a compiler constant, byte-identical in every project this
 /// release builds, so driving it directly is driving what every project runs.
@@ -1410,10 +1421,14 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
         return;
     };
     let project = staged(goldens::golden("triage-fanout"), root, "map-dispatch");
-    let output = runner("map-dispatch.mjs")
-        .arg(&project)
-        .output()
-        .expect("bun runs");
+    // Bounded: a regression in what joins or drains a child execution shows up
+    // as a promise the runner waits on for ever, and a named failure beats a CI
+    // job that times out naming nothing (`toolchain::output_within`).
+    let output = output_within(
+        runner("map-dispatch.mjs").arg(&project),
+        std::time::Duration::from_secs(300),
+        "the fan-out runtime (`map-dispatch.mjs`)",
+    );
     assert!(
         output.status.success(),
         "the fan-out runtime did not run:\n{}",
@@ -1814,85 +1829,143 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
         })
     );
 
-    // PRD resolved q64, the first half: the parent's entry does not move. Its
-    // `models` is the joined instance's call and no other — the three deliveries
-    // that each pushed a call, a store op and a tool dispatch into whatever
-    // context they were handed pushed into nothing — and every detached dispatch
-    // is the stub record `docs/trace.md` §5.1 describes: `attempts: 0`, no
-    // `inner`, whatever the delivery went on to do.
-    let collected = &observed["detachedCollector"];
+    // PRD resolved q65, the first half: the parent's entry does not move. Its
+    // `models` is the joined instance's call and no other, and every detached
+    // dispatch is the stub record `docs/trace.md` §5.1 describes — `attempts: 0`,
+    // no `inner` — whether it started a child, found one already settled, resumed
+    // one, or delivered to a `tool.*`.
+    let children = &observed["childExecutions"];
+    let parent = "exec_children";
+    let key = |index: usize| format!("{parent}/hand_off/0/{index}");
     assert_eq!(
-        collected["parent"],
+        children["parent"],
         serde_json::json!({
             "models": ["model.joined"],
             "stores": null,
             "toolDispatches": null,
             "dispatches": [
                 { "index": 0, "target": "agent.worker", "outcome": "completed", "attempts": 1,
-                  "key": "exec_trace_q64/hand_off/0/0", "inner": null },
+                  "key": key(0), "inner": null },
                 { "index": 1, "target": "flow.review", "outcome": "detached", "attempts": 0,
-                  "key": "exec_trace_q64/hand_off/0/1", "inner": null },
+                  "key": key(1), "inner": null },
                 { "index": 2, "target": "flow.broken", "outcome": "detached", "attempts": 0,
-                  "key": "exec_trace_q64/hand_off/0/2", "inner": null },
-                { "index": 3, "target": "flow.diverged", "outcome": "detached", "attempts": 0,
-                  "key": "exec_trace_q64/hand_off/0/3", "inner": null },
-                { "index": 4, "target": "tool.sink", "outcome": "detached", "attempts": 0,
-                  "key": "exec_trace_q64/hand_off/0/4", "inner": null },
+                  "key": key(2), "inner": null },
+                { "index": 3, "target": "flow.settled", "outcome": "detached", "attempts": 0,
+                  "key": key(3), "inner": null },
+                { "index": 4, "target": "flow.reopened", "outcome": "detached", "attempts": 0,
+                  "key": key(4), "inner": null },
+                { "index": 5, "target": "tool.sink", "outcome": "detached", "attempts": 0,
+                  "key": key(5), "inner": null },
             ],
         }),
-        "a detached delivery's activity reached its parent's entry (`docs/trace.md` §5.1)"
+        "a child execution's activity reached its parent's entry (`docs/trace.md` §5.1)"
     );
-    // The second half: the delivery's own collector, settled where the
-    // quiescence mark comes off — after the join returned, so nothing was heard
-    // by the time the node answered — and heard for the two `flow.*` deliveries
-    // that ended, the failed one included. Not for the one that diverged, which
-    // did not end (q29's "a divergence fires nothing"), and not for the
-    // `tool.*` sink, which runs no nodes and has no trace of its own to ship. A
-    // listener that throws cost the one beside it nothing.
+    // The second half: what each child was handed, after the join returned —
+    // nothing had settled by the time the node answered (rule 7). Its id is the
+    // one `docs/durability.md` §3.2 derives, computed here independently of the
+    // runtime; its session and trigger are its parent's; a first dispatch
+    // begins, and the dispatch whose child's row is open resumes it under the
+    // inputs the row recorded rather than the ones the dispatch re-bound. The
+    // dispatch whose child's row is **closed** handed nothing (q28: nothing
+    // resumes a settled execution), and the `tool.*` sink started no child.
     assert_eq!(
-        collected["heardAtReturn"], 0,
-        "a settlement was announced before the join it is detached from returned"
+        children["finishedAtReturn"], 0,
+        "a child settled before the join it is detached from returned"
     );
-    assert_eq!(
-        collected["heard"],
-        serde_json::json!(["exec_trace_q64/hand_off/0/1", "exec_trace_q64/hand_off/0/2"])
-    );
-    assert_eq!(
-        collected["review"],
+    let lineage = |index: usize| serde_json::json!({ "parent": parent, "idempotencyKey": key(index), "itemIndex": index });
+    // A first dispatch's child carries the bound it was issued under — the
+    // node's `max_concurrency: 8`, and its own route's, by the route's position
+    // — which is what a recovery with no parent to re-issue it admits it under
+    // (Decision D28, `docs/durability.md` §3.5, §6.1). The re-opened child's
+    // lineage is the one its row recorded, and that row recorded none.
+    let issued = |index: usize| {
         serde_json::json!({
-            "parentExecution": "exec_trace_q64",
-            "flow": "flow.review",
-            "status": "completed",
-            "error": null,
-            "entries": [["judge", "completed", 1]],
-            "ordered": true,
-        }),
-        "the completed delivery's collector holds its instance's own trace"
-    );
-    assert_eq!(collected["broken"]["status"], "failed");
+            "parent": parent,
+            "idempotencyKey": key(index),
+            "itemIndex": index,
+            "admission": {
+                "node": format!("{parent}/hand_off"),
+                "nodeBound": 8,
+                "route": index.to_string(),
+                "routeBound": 8,
+            },
+        })
+    };
     assert_eq!(
-        collected["broken"]["entries"],
-        serde_json::json!([["judge", "completed"], ["file", "failed"]]),
-        "a delivery that failed still carries the trace it made, off its `SubflowFailure`"
+        children["handed"],
+        serde_json::json!([
+            {
+                "id": child_execution_id(parent, &key(1)),
+                "flow": "flow.review",
+                "inputs": { "kind": "review", "subject": "a" },
+                "sessionKey": "sess_children",
+                "trigger": "on_request",
+                "lineage": issued(1),
+                "resume": false,
+            },
+            {
+                "id": child_execution_id(parent, &key(2)),
+                "flow": "flow.broken",
+                "inputs": { "kind": "broken", "subject": "b" },
+                "sessionKey": "sess_children",
+                "trigger": "on_request",
+                "lineage": issued(2),
+                "resume": false,
+            },
+            {
+                "id": child_execution_id(parent, &key(4)),
+                "flow": "flow.reopened",
+                "inputs": { "subject": "as recorded" },
+                "sessionKey": "sess_children",
+                "trigger": "on_request",
+                "lineage": lineage(4),
+                "resume": true,
+            },
+        ]),
+        "the children a detached map started are not the ones `docs/durability.md` §3.2 says"
     );
+    // The reconciliation, in one process: the review's dispatch re-issued and
+    // its row recovered while it was still running handed the runner nothing
+    // more, and neither they nor `childrenSettled` answered until it settled.
+    assert_eq!(
+        children["whileRunning"],
+        serde_json::json!({ "handed": 3, "joinedSettled": false, "drained": false, "finished": 0 }),
+        "a second arrival at a running child started a second generation of it, or something \
+         that waits for it did not"
+    );
+    assert_eq!(
+        children["handedAtEnd"], 3,
+        "a joined dispatch ran its child again"
+    );
+    let failure = children["failure"].as_str().unwrap_or_default();
     assert!(
-        collected["broken"]["error"]
-            .as_str()
-            .is_some_and(|held| held.starts_with("SubflowFailure: ")),
-        "a failed delivery's error is in `<error name>: <message>` shape: {collected:#}"
+        failure.contains(&format!(
+            "the child execution `{}` (`flow.broken`, started by the detached dispatch `{}`) did \
+             not complete: ",
+            child_execution_id(parent, &key(2)),
+            key(2)
+        )) && failure.contains("cannot file"),
+        "a failed child is not reported on the process's stderr by id and cause: {failure:?}"
     );
-    // The envelope a settlement ships, head first: the version, `detached`,
-    // the parent it ran under and the key its stub record carries — and the
-    // parent's id as `execution_id`, because a delivery is not an execution.
     assert_eq!(
-        collected["document"],
+        children["distinct"],
+        serde_json::json!([true, true, true]),
+        "a child's id is not a function of exactly its parent and its key"
+    );
+    // The envelope a child ships, head first: the version, `detached`, the
+    // parent that dispatched it and the key its stub record carries — and its
+    // **own** id as `execution_id`, because a child is an execution. The item
+    // index its row holds is not a head field. An execution a trigger started
+    // carries none of the three.
+    assert_eq!(
+        children["document"],
         serde_json::json!({
-            "trace_version": 4,
+            "trace_version": 5,
             "detached": true,
-            "parent_execution": "exec_trace_q64",
-            "idempotency_key": "exec_trace_q64/hand_off/0/1",
+            "parent_execution": parent,
+            "idempotency_key": key(1),
             "flow": "flow.review",
-            "execution_id": "exec_trace_q64",
+            "execution_id": child_execution_id(parent, &key(1)),
             "status": "completed",
             "entries": [{
                 "step": 1, "flow": "flow.review", "node": "judge", "traversal": 0,
@@ -1902,30 +1975,173 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
             }],
         })
     );
-    assert_eq!(collected["failedDocument"]["status"], "failed");
+    assert_eq!(children["failedDocument"]["status"], "failed");
     assert_eq!(
-        collected["failedDocument"]["error"], collected["broken"]["error"],
-        "a failed delivery's envelope carries its outcome"
+        children["failedDocument"]["error"], "SubflowFailure: cannot file",
+        "a failed child's envelope carries its outcome"
     );
-    // …and the one reader of which class a sink row is, over the bytes both
-    // `format:`s write. The export guard counts only `"execution"` and the
-    // status route's report leaves out only `"detached"`, so a body neither can
-    // read — and a callback row, whatever it holds — is neither.
     assert_eq!(
-        collected["sinkClass"],
+        children["plainDocument"],
         serde_json::json!({
-            "envelopeExport": "execution",
-            "envelopeDetached": "detached",
-            "otlpExport": "execution",
-            "otlpDetached": "detached",
+            "trace_version": 5,
+            "flow": "flow.probe",
+            "execution_id": parent,
+            "status": "completed",
+            "entries": [],
+        }),
+        "an execution no dispatch started carries a lineage head"
+    );
+    // …and the one reader of whose export a sink row is, over the bytes both
+    // `format:`s write. A child's export on its own ledger is an export like any
+    // other; the envelope a build before q65 shipped onto its **parent's**
+    // ledger is `"legacy"` — which the export guard does not count and the
+    // status route's report leaves out — and a body nothing can read, or a
+    // callback row whatever it holds, is neither.
+    assert_eq!(
+        children["sinkClass"],
+        serde_json::json!({
+            "envelopeExport": "export",
+            "envelopeChild": "export",
+            "envelopeLegacy": "legacy",
+            "otlpExport": "export",
+            "otlpChild": "export",
+            "otlpLegacy": "legacy",
             "unreadable": null,
             "notAnObject": null,
             "noSpans": null,
             "callback": null,
         }),
-        "`runtime.traceSinkClass` misreads a sink row, so a delivery's envelope reaches the \
-         status route's report or silences its parent's export"
+        "`runtime.traceSinkClass` misreads a sink row, so a legacy detached envelope reaches \
+         the status route's report or silences its parent's export — or a child's own export \
+         is taken for one"
     );
+
+    // A **queued** child (PRD resolved q65, Decision D28): `max_concurrency: 1`
+    // over two detached children. Both dispatches are the stub record; both
+    // children's rows are down, open and with their lineage, from the moment the
+    // join returned — while only one had been handed to a runner — so a process
+    // that stopped then would leave both to recover. And the drain a process
+    // ends on did not answer while the second, admitted when the first settled,
+    // was still running.
+    let queued = &observed["queuedChildren"];
+    let queued_parent = "exec_queued";
+    let queued_lineage = |index: usize| {
+        json!({
+            "parent": queued_parent,
+            "idempotencyKey": format!("{queued_parent}/fan/0/{index}"),
+            "itemIndex": index,
+            "admission": {
+                "node": format!("{queued_parent}/fan"),
+                "nodeBound": 1,
+                "route": "0",
+                "routeBound": 1,
+            },
+        })
+    };
+    assert_eq!(
+        queued["dispatches"],
+        json!([[0, "detached"], [1, "detached"]]),
+        "{queued:#}"
+    );
+    assert_eq!(
+        queued["rowsAtIssue"],
+        json!([
+            { "status": "open", "lineage": queued_lineage(0) },
+            { "status": "open", "lineage": queued_lineage(1) },
+        ]),
+        "a child still queued for its node's permit has no lifecycle row, so a process that \
+         stops now loses it for good (`docs/durability.md` §3.2, §6.1)"
+    );
+    assert_eq!(
+        queued["handedWhileFirstRan"], 1,
+        "a queued child started beside the running one, past `max_concurrency: 1`: {queued:#}"
+    );
+    assert_eq!(queued["handedAtEnd"], json!([0, 1]), "{queued:#}");
+    assert_eq!(
+        queued["drainedWhileSecondRan"], false,
+        "`childrenSettled` answered while a child that had been queued was still running — the \
+         moment the first settled and handed its permit on, a process ends under the second \
+         (`src/cli.ts`, PRD resolved q65)"
+    );
+    // …and **recovered** children are admitted under the bound their lineage
+    // recorded (`docs/durability.md` §6.1): three resumed at once, one at a time.
+    assert_eq!(
+        observed["recoveredChildren"],
+        json!({ "peak": 1, "handed": [0, 1, 2] }),
+        "recovered children of one `max_concurrency: 1` node ran side by side, or not at all"
+    );
+
+    // …and on a **worker**, none of it (PRD resolved q42, q65). A child
+    // execution is begun, journaled and recovered by the journal's single
+    // writer, the hub; a worker reaches a detached `flow.*` dispatch only inside
+    // a flow a placed agent attaches (grammar 14.1 rule 4), and there the
+    // dispatch cannot be issued — which grammar 8.6 rule 7 makes the **map
+    // node's own failure**, under its `on_error:`. The node fails by name before
+    // it dispatches anything: no stub record, no child handed to any runner, no
+    // row on any journal this process can open. The journal a worker binds is
+    // what every open in its process answers with, so no path reaches a second
+    // journal beside the hub's.
+    let worker = &observed["onAWorker"];
+    let refused = "exec_on_a_worker/hand_off/0/0";
+    assert_eq!(
+        worker["outcome"], "skipped",
+        "the map node that could not issue its dispatch did not fail into its `on_error: \
+         skip`: {worker:#}"
+    );
+    let said = worker["error"].as_str().unwrap_or_default();
+    assert!(
+        said.contains(&format!(
+            "node `hand_off` failed: ChildOnAWorker: `flow.review` is dispatched with `detach: \
+             true` (key `{refused}`) inside a placed node, on the worker running it"
+        )) && said.contains("PRD resolved q42, q65")
+            && said.contains("the map node that would have issued it fails"),
+        "a detached `flow.*` dispatch on a worker is not the map node's own failure, by name: \
+         {said:?}"
+    );
+    assert!(
+        worker["dispatches"].is_null()
+            || worker["dispatches"]
+                .as_array()
+                .is_some_and(|records| records.is_empty()),
+        "the node records a dispatch it could not issue: {worker:#}"
+    );
+    assert_eq!(
+        worker["handed"],
+        json!([]),
+        "a worker handed a child execution to a runner"
+    );
+    assert_eq!(
+        worker["row"],
+        Value::Null,
+        "a worker began a child execution's lifecycle row on its own journal"
+    );
+    assert_eq!(
+        worker["hosted"], true,
+        "`journal.hostJournal` did not make the dispatch's journal the one every open answers"
+    );
+}
+
+/// A child execution's id, derived the way `docs/durability.md` §3.2 publishes
+/// it — `exec_` and a version-8 UUID over SHA-256 of `agent-compose/execution/v1`,
+/// the parent's id and the dispatch's grammar 9.4 key, newline-separated — and
+/// computed here independently of the emitted runtime (PRD resolved q65).
+fn child_execution_id(parent: &str, key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut bytes: [u8; 16] =
+        Sha256::digest(format!("agent-compose/execution/v1\n{parent}\n{key}"))[..16]
+            .try_into()
+            .expect("sixteen bytes");
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(
+        "exec_{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// Gate 19: the `human` wait board — addressing, abandonment, the timer a
@@ -6151,7 +6367,16 @@ fn a_compiled_graphs_coder_nodes_record_route_and_write() {
 ///    the second attempt finds the directory **empty**. That is ruling c's own
 ///    sentence — a retry gets an empty directory, because a half-clobbered
 ///    workspace is routinely why the attempt being retried failed — and it is
-///    unreachable from gate 24, where a directory is the caller's to make.
+///    unreachable from gate 24, where a directory is the caller's to make;
+///  * **a coder run inside a child execution is the child's** (PRD resolved
+///    q65). A detached review per checkout is a child execution per checkout,
+///    so each review's `harness` record is on **that child's** journal, at the
+///    child's own site and carrying the answer the run gave, and its trace entry
+///    is the child's — while the parent's journal holds nothing at the dispatch
+///    and its entry keeps the stub `"detached"` record. The served acceptance
+///    suite (`child_execution_acceptance.rs`) cannot reach a harness SDK, so this
+///    is where the ruling's "harness journal record for a coder node in the
+///    child" is read back.
 #[test]
 fn a_fanned_out_coder_works_per_item_and_a_fresh_one_starts_empty() {
     let Some(root) = installed() else {
@@ -6287,6 +6512,99 @@ fn a_fanned_out_coder_works_per_item_and_a_fresh_one_starts_empty() {
         "the dispatched answers reduced in source-item order and the summarising \
          run's answer landed in its channel (grammar 8.6 rule 5, 8.0)"
     );
+
+    // --- A coder run inside a child execution (PRD resolved q65) ----------
+    let review = &answer["review"];
+    let parent = "exec_reviews";
+    let key = |index: usize| format!("{parent}/hand_off/0/{index}");
+    assert_eq!(
+        review["parent"],
+        json!({
+            "status": "completed",
+            "lineage": null,
+            "outputs": {},
+            "dispatches": [
+                { "index": 0, "outcome": "detached", "attempts": 0, "key": key(0), "inner": null },
+                { "index": 1, "outcome": "detached", "attempts": 0, "key": key(1), "inner": null },
+            ],
+            "effects": 0,
+            "harness": 0,
+        }),
+        "the parent of a detached coder review holds its stub records and nothing the \
+         reviews did — on its trace or on its journal (Decision D94, PRD resolved q65)"
+    );
+    for (index, verdict) in [(0, "approve"), (1, "revise")] {
+        let child = &review["children"][index];
+        let id = child_execution_id(parent, &key(index));
+        assert_eq!(
+            child["id"], id,
+            "the runtime derives a child's id as `docs/durability.md` §3.2 publishes it"
+        );
+        assert_eq!(child["status"], "completed", "{child:#}");
+        assert_eq!(child["flow"], "flow.review", "{child:#}");
+        assert_eq!(
+            child["lineage"],
+            json!({
+                "parent": parent,
+                "idempotencyKey": key(index),
+                "itemIndex": index,
+                // …and the bound it was issued under — `hand_off`'s
+                // `max_concurrency: 4`, on its one route — so a recovery that
+                // resumes it with no parent to re-issue it admits it under that
+                // bound (Decision D28, `docs/durability.md` §3.5, §6.1).
+                "admission": {
+                    "node": format!("{parent}/hand_off"),
+                    "nodeBound": 4,
+                    "route": "0",
+                    "routeBound": 4,
+                },
+            }),
+            "the child's row names the dispatch that started it: {child:#}"
+        );
+        let effects = child["effects"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the child's effects are listed: {child:#}"));
+        assert_eq!(
+            effects.len(),
+            1,
+            "one coder run, one `harness` record on the child's journal: {child:#}"
+        );
+        assert_eq!(effects[0]["execution"], id, "{child:#}");
+        assert_eq!(
+            effects[0]["site"], "inspect/0",
+            "the record is at the child's **own** site — its flow's node, not the parent's \
+             dispatch path: {child:#}"
+        );
+        assert_eq!(effects[0]["kind"], "harness", "{child:#}");
+        assert_eq!(effects[0]["outcome"]["kind"], "value", "{child:#}");
+        assert!(
+            carries(&effects[0]["outcome"]["value"], "verdict", verdict),
+            "the child's `harness` record carries the answer its run gave — `{verdict}` for \
+             `{}` — not a placeholder (`docs/durability.md` §3.1): {child:#}",
+            worktrees[index]
+        );
+        assert_eq!(
+            child["harness"],
+            json!([{ "outcome": "completed", "workspace": worktrees[index] }]),
+            "the child's own trace entry carries the run's record, in the checkout its \
+             item named (`docs/trace.md` §7.6)"
+        );
+    }
+}
+
+/// Whether `value` holds `field: wanted` anywhere inside it, including inside a
+/// string that is itself a JSON document — the shape a recorded answer takes on
+/// one wire and not on another.
+fn carries(value: &Value, field: &str, wanted: &str) -> bool {
+    match value {
+        Value::Object(fields) => fields
+            .iter()
+            .any(|(key, held)| (key == field && held == wanted) || carries(held, field, wanted)),
+        Value::Array(items) => items.iter().any(|item| carries(item, field, wanted)),
+        Value::String(text) => serde_json::from_str::<Value>(text)
+            .is_ok_and(|parsed| !parsed.is_string() && carries(&parsed, field, wanted)),
+        _ => false,
+    }
 }
 
 /// What `coder-runs.mjs` has to come back with.

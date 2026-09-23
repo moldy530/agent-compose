@@ -222,6 +222,56 @@ its schema creation is not idempotent: ${error instanceof Error ? error.message 
   results.a_closed_row_keeps_its_outcome = (await handle.execution(execution))?.status ===
     "completed";
 
+  // …and a **child execution's lineage** (§3.2, §3.5, PRD resolved q65): the
+  //  cause a detached `flow.*` dispatch leaves beside the lifecycle row, in a
+  //  table of its own. Read back on both of the reads that return a row — the
+  //  one-row read a dispatch asks, and the recovery scan a `serve` start walks —
+  //  absent on a row nothing dispatched, and written once: `begin` is idempotent
+  //  on the id, lineage included, which is what a re-issued dispatch relies on.
+  //  `item_index` is the one integer column the journal holds, so it is the one
+  //  a driver could hand back as a string. The admission bound the dispatch was
+  //  issued under rides with it, whole, because a recovery with no parent to
+  //  re-issue the child admits it under exactly that (Decision D28, §6.1).
+  const child = `${execution}-child`;
+  const childKey = `${execution}/review/0/3`;
+  const admission = { node: `${execution}/review`, nodeBound: 2, route: "1", routeBound: 1 };
+  await handle.begin({
+    id: child,
+    flow: "flow.review",
+    trigger: "on_request",
+    inputs: { goal: UNICODE },
+    sessionKey: "",
+    lineage: { parent: execution, idempotencyKey: childKey, itemIndex: 3, admission },
+    status: "open",
+    journalVersion: journal.JOURNAL_VERSION,
+    startedAt: new Date().toISOString(),
+  });
+  await handle.begin({
+    id: child,
+    flow: "flow.review",
+    trigger: "on_request",
+    inputs: {},
+    sessionKey: "",
+    lineage: { parent: "exec_other", idempotencyKey: "exec_other/review/0/0" },
+    status: "open",
+    journalVersion: journal.JOURNAL_VERSION,
+    startedAt: new Date().toISOString(),
+  });
+  const childRow = await handle.execution(child);
+  const scannedChild = (await handle.openExecutions()).find((held) => held.id === child);
+  const sameLineage = (held) =>
+    held?.parent === execution &&
+    held?.idempotencyKey === childKey &&
+    held?.itemIndex === 3 &&
+    JSON.stringify(held?.admission) === JSON.stringify(admission);
+  results.a_child_executions_lineage_round_trips =
+    sameLineage(childRow?.lineage) && sameLineage(scannedChild?.lineage);
+  results.an_execution_nothing_dispatched_has_no_lineage =
+    lifecycle !== undefined &&
+    lifecycle.lineage === undefined &&
+    (await handle.execution(execution))?.lineage === undefined;
+  await handle.end(child, "completed");
+
   // …and the columns that are **not** payloads take what a real failure is.
   //  `executions.error` holds a provider's whole failure body or a harness run's
   //  quoted transcript; MySQL's `TEXT` is 64 KiB and the `STRICT_TRANS_TABLES`

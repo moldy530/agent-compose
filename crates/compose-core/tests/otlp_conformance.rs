@@ -89,10 +89,14 @@ fn fixtures() -> Vec<(String, Value)> {
 /// `the_exporter_is_the_same_module_in_every_project` is what says so — so one
 /// golden answers the corpus for all of them, exactly as one golden answers the
 /// CEL corpus.
-fn staged(root: &Path) -> PathBuf {
+///
+/// `purpose` names the directory, one per test: the tests of this file run on
+/// parallel threads, and two of them staging into one directory would each
+/// remove it from under the other's copy — or under the other's runner.
+fn staged(root: &Path, purpose: &str) -> PathBuf {
     let golden = goldens::golden("review-loop");
     let destination = root
-        .join("projects/otlp-conformance")
+        .join(format!("projects/otlp-conformance-{purpose}"))
         .join(golden.directory);
     let _ = fs::remove_dir_all(&destination);
     let source = goldens_root().join(golden.directory);
@@ -115,7 +119,7 @@ fn the_emitted_exporter_answers_the_conformance_corpus() {
     let Some(root) = installed() else {
         return;
     };
-    let project = staged(root);
+    let project = staged(root, "exporter");
     let mut command = runner("otlp-conformance.mjs");
     command.arg(&project).arg(corpus());
     if std::env::var_os("UPDATE_GOLDENS").is_some() {
@@ -150,7 +154,7 @@ fn the_emitted_parser_answers_the_traceparent_corpus() {
     let Some(root) = installed() else {
         return;
     };
-    let project = staged(root);
+    let project = staged(root, "traceparent");
     let mut command = runner("traceparent-conformance.mjs");
     command.arg(&project).arg(traceparent_corpus());
     let output = command.output().expect("bun runs");
@@ -427,11 +431,11 @@ fn every_expectation_is_a_well_formed_export() {
 
         // Every parent, and every link, resolves to a span of this export — with
         // the two exceptions §12.2 and §12.3 state: a root parented at the
-        // **caller's** span, which is not one of ours, and a detached delivery's
+        // **caller's** span, which is not one of ours, and a child execution's
         // root parented at its **parent execution's** root, which is in the
-        // parent's export rather than this one (PRD resolved q64).
+        // parent's export rather than this one (PRD resolved q64, q65).
         let caller = fixture["context"]["parent"]["spanId"].as_str();
-        let execution_root = detached_parent_root(&fixture["document"]);
+        let execution_root = parent_execution_root(&fixture["document"]);
         for span in spans {
             if let Some(parent) = span["parentSpanId"].as_str() {
                 assert!(
@@ -749,42 +753,66 @@ fn derived(input: &str, bytes: usize) -> String {
         .collect()
 }
 
-/// The span id of the **parent execution's** root, for a detached delivery's
-/// envelope; `None` for every other envelope (PRD resolved q64, `docs/trace.md`
-/// §12.2).
+/// The span id of the **parent execution's** root, for a child execution's
+/// envelope; `None` for every other envelope (PRD resolved q64, q65,
+/// `docs/trace.md` §12.2).
 ///
-/// A function of the execution id alone — the root of any execution is keyed by
-/// that id under the kind word `execution` — which is what lets a delivery's
-/// export name its parent's root without the parent's export in hand.
-fn detached_parent_root(document: &Value) -> Option<String> {
+/// A function of the parent's execution id alone — the root of any execution is
+/// keyed by that id under the kind word `execution` — which is what lets a
+/// child's export name its parent's root without the parent's export in hand.
+fn parent_execution_root(document: &Value) -> Option<String> {
     if document["detached"] != true {
         return None;
     }
-    let execution = document["execution_id"]
+    let parent = document["parent_execution"]
         .as_str()
-        .expect("an envelope names its execution");
+        .expect("a child's envelope names its parent");
     Some(derived(
-        &format!("agent-compose/span/v1\n{execution}\nexecution\n{execution}"),
+        &format!("agent-compose/span/v1\n{parent}\nexecution\n{parent}"),
         8,
     ))
 }
 
-/// **A detached delivery's export is rooted in its parent's trace, under its
-/// parent's root, and says so on its root span** (PRD resolved q64,
+/// A child execution's id, derived the way `docs/durability.md` §3.2 publishes
+/// it — `exec_` and a version-8 UUID over SHA-256 of
+/// `agent-compose/execution/v1`, the parent's id and the dispatch's key — and
+/// computed here independently of the emitted runtime, so a fixture whose
+/// `execution_id` is not the one its lineage derives is caught rather than
+/// regenerated around.
+fn child_execution_id(parent: &str, key: &str) -> String {
+    let hex = derived(&format!("agent-compose/execution/v1\n{parent}\n{key}"), 16);
+    let variant = (u8::from_str_radix(&hex[16..17], 16).expect("hex") & 0x3) | 0x8;
+    format!(
+        "exec_{}-{}-8{}-{variant:x}{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[13..16],
+        &hex[17..20],
+        &hex[20..32]
+    )
+}
+
+/// **A child execution's export is its own, rooted in its parent's trace under
+/// its parent's root, and says so on its root span** (PRD resolved q64, q65,
 /// `docs/trace.md` §12.2, §12.5).
 ///
-/// The sink's second event class, read off the corpus. A detached envelope's
-/// `execution_id` is its parent's, so without the §12.2 rule for it its root
-/// would derive the parent root's very span id — two roots of one id, one span
-/// to a collector — and it would float free of the run it was dispatched from.
-/// So, for every detached fixture: the trace is the parent's (the caller's,
-/// where a `traceparent` started the parent; otherwise the one the execution id
-/// derives); the root is parented at the parent execution's root and is not that
-/// span; the root carries the envelope's head as the three documented
-/// attributes; and every entry's instance path hangs off the dispatch's key.
-/// And the other way round: no other envelope's root carries any of the three.
+/// PRD resolved q65 collapsed the sink's second event class into the first: what
+/// a detached `flow.*` dispatch starts is a child execution with an id of its
+/// own, so its envelope is an ordinary settled execution's under that id, and the
+/// span ids it derives are its own — no rule is needed any more to keep its root
+/// off its parent's. What remains is *placement*: a collector files a child under
+/// the run that dispatched it. So, for every child fixture: its `execution_id` is
+/// the one its lineage derives; the trace is the one its parent's export lands in
+/// — the **head's**, the execution at the top of its lineage that a trigger
+/// started (the caller's, where a `traceparent` started the head; otherwise the
+/// one the head's id derives, which for a grandchild is not its parent's id);
+/// the root is keyed by the child's own id, parented at the parent
+/// execution's root and not that span; the root carries the envelope's lineage
+/// head as the three documented attributes, whose names q64 shipped and q65
+/// kept; and every entry's instance path is the child's own. And the other way
+/// round: no other envelope's root carries any of the three.
 #[test]
-fn a_detached_deliverys_export_is_rooted_under_its_parents_execution() {
+fn a_child_executions_export_is_rooted_under_its_parents_execution() {
     let heads = [
         "agentcompose.detached",
         "agentcompose.parent_execution",
@@ -792,6 +820,7 @@ fn a_detached_deliverys_export_is_rooted_under_its_parents_execution() {
     ];
     let mut statuses: BTreeSet<String> = BTreeSet::new();
     let mut traced_into = false;
+    let mut nested = false;
     for (file, fixture) in fixtures() {
         let document = &fixture["document"];
         let spans = fixture["expected"]["resourceSpans"][0]["scopeSpans"][0]["spans"]
@@ -806,48 +835,73 @@ fn a_detached_deliverys_export_is_rooted_under_its_parents_execution() {
                 .find(|held| held["key"] == key)
                 .map(|held| held["value"].clone())
         };
-        let Some(parent_root) = detached_parent_root(document) else {
+        let Some(parent_root) = parent_execution_root(document) else {
             for head in heads {
                 assert!(
                     attribute(head).is_none(),
-                    "{file}: `{head}` is on the root of an envelope that is not a detached \
-                     delivery's (`docs/trace.md` §12.5)"
+                    "{file}: `{head}` is on the root of an envelope that is not a child \
+                     execution's (`docs/trace.md` §12.5)"
                 );
             }
             continue;
         };
         statuses.insert(document["status"].as_str().unwrap_or_default().to_string());
         let execution = document["execution_id"].as_str().expect("an execution id");
+        let parent = document["parent_execution"]
+            .as_str()
+            .expect("a child names its parent");
         let key = document["idempotency_key"]
             .as_str()
-            .unwrap_or_else(|| panic!("{file}: a detached envelope carries its key"));
+            .unwrap_or_else(|| panic!("{file}: a child's envelope carries its key"));
+        assert_eq!(
+            execution,
+            child_execution_id(parent, key),
+            "{file}: a child's id is derived from its parent's and its dispatch's key \
+             (`docs/durability.md` §3.2)"
+        );
+        assert_ne!(execution, parent, "{file}: a child is not its parent");
 
         let caller = fixture["context"]["parent"]["traceId"].as_str();
         traced_into |= caller.is_some();
+        // The head of the lineage — the execution a trigger started, whose trace
+        // every descendant lands in. The context names it where the child's
+        // parent is itself a child; a child whose parent a trigger started has
+        // that parent as its head, and the context need not say so.
+        let head = fixture["context"]["root"].as_str().unwrap_or(parent);
+        nested |= head != parent;
         let trace = caller.map_or_else(
-            || derived(&format!("agent-compose/trace/v1\n{execution}"), 16),
+            || derived(&format!("agent-compose/trace/v1\n{head}"), 16),
             str::to_string,
         );
         assert_eq!(
             root["traceId"], trace,
-            "{file}: a detached delivery is exported into its parent's trace"
+            "{file}: a child execution is exported into the trace its parent's export lands in \
+             — the head's, `{head}` (`docs/trace.md` §12.2)"
         );
+        if head != parent {
+            assert_ne!(
+                root["traceId"],
+                derived(&format!("agent-compose/trace/v1\n{parent}"), 16),
+                "{file}: a grandchild's trace is its head's, never the one its own parent's id \
+                 derives — a trace nothing else is exported into"
+            );
+        }
         assert_eq!(
             root["parentSpanId"], parent_root,
-            "{file}: a detached delivery's root hangs off its parent execution's root — not \
-             off a caller's span, which started the parent and not the delivery"
+            "{file}: a child's root hangs off its parent execution's root — not off a \
+             caller's span, which started the parent and not the child"
         );
         assert_ne!(
             root["spanId"], parent_root,
-            "{file}: a detached delivery's root is not its parent's root"
+            "{file}: a child's root is not its parent's root"
         );
         assert_eq!(
             root["spanId"],
             derived(
-                &format!("agent-compose/span/v1\n{execution}\nexecution\n{key}"),
+                &format!("agent-compose/span/v1\n{execution}\nexecution\n{execution}"),
                 8
             ),
-            "{file}: a detached delivery's root is keyed by its idempotency key (§12.2)"
+            "{file}: a child's root is keyed by its own execution id, as every root is (§12.2)"
         );
         assert_eq!(
             attribute("agentcompose.detached"),
@@ -856,7 +910,7 @@ fn a_detached_deliverys_export_is_rooted_under_its_parents_execution() {
         );
         assert_eq!(
             attribute("agentcompose.parent_execution"),
-            Some(serde_json::json!({ "stringValue": document["parent_execution"] })),
+            Some(serde_json::json!({ "stringValue": parent })),
             "{file}"
         );
         assert_eq!(
@@ -869,9 +923,9 @@ fn a_detached_deliverys_export_is_rooted_under_its_parents_execution() {
                 if held["key"] == "agentcompose.instance_path" {
                     let path = held["value"]["stringValue"].as_str().unwrap_or_default();
                     assert!(
-                        path.starts_with(&format!("{key}/")),
-                        "{file}: `{path}` does not hang off the dispatch's own path `{key}`, as \
-                         an instance's entries do (`docs/trace.md` §8)"
+                        path.starts_with(&format!("{execution}/")),
+                        "{file}: `{path}` is not the child's own instance path — a child \
+                         execution's frames hang off its own id (`docs/trace.md` §8)"
                     );
                 }
             }
@@ -883,13 +937,19 @@ fn a_detached_deliverys_export_is_rooted_under_its_parents_execution() {
             .into_iter()
             .map(str::to_string)
             .collect::<BTreeSet<String>>(),
-        "the corpus holds a detached delivery that completed and one that failed — a failed \
-         delivery ships too, with its outcome (PRD resolved q64)"
+        "the corpus holds a child execution that completed and one that failed — a failed \
+         child ships too, with its outcome (PRD resolved q64, q65)"
     );
     assert!(
         traced_into,
-        "no detached fixture sits under a caller's `traceparent`, which is the one context in \
+        "no child fixture sits under a caller's `traceparent`, which is the one context in \
          which a caller's span and the parent execution's root are different parents to pick"
+    );
+    assert!(
+        nested,
+        "no child fixture is a grandchild — a child whose parent is itself a child — which is \
+         the one case in which the trace (the head's) and the parent the root hangs off (the \
+         immediate parent's root) belong to two different executions"
     );
 }
 
