@@ -1,31 +1,25 @@
 {
-  "name": "detached-delivery-failed-in-a-callers-trace",
-  "about": "A detached `flow.*` delivery that failed (PRD resolved q64), under a parent a caller traced into with a W3C `traceparent`. The envelope ships anyway, its outcome on it: the root is `code: 2` with the envelope's `error` as its message, and the aborting entry is last. The caller's trace id is adopted, as the parent's own export adopts it (§12.3) — but the root hangs off the **parent execution's** root span rather than off the caller's span, because the delivery ran under that execution: the caller started the parent, not the delivery.",
+  "name": "child-execution",
+  "about": "The envelope a **child execution** ships — the execution a detached `flow.*` dispatch starts (PRD resolved q65): an ordinary settled execution's envelope under the child's own id, headed `detached: true`, `parent_execution` and the grammar §9.4 `idempotency_key` of the dispatch that started it. Its `execution_id` is derived from that pair (`docs/durability.md` §3.2), so every span id is the child's own and none can be its parent's; its trace id is the **parent's** — derived from the parent's id — so the child lands in the trace its parent's export lands in, and its root hangs off the parent execution's root span, whose id is a function of the parent's id alone (§12.2). The head rides the root as `agentcompose.detached`, `agentcompose.parent_execution` and `agentcompose.idempotency_key` (§12.5), and the entries' instance paths are the child's own. The window is the child's own: opened to settled.",
   "context": {
     "target": "local",
     "artifact": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
     "compiler": "0.0.0-dev",
     "startedAt": "2026-09-01T10:00:01.000Z",
-    "endedAt": "2026-09-01T10:00:03.250Z",
-    "parent": {
-      "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
-      "spanId": "00f067aa0ba902b7",
-      "flags": "01"
-    }
+    "endedAt": "2026-09-01T10:00:04.000Z"
   },
   "document": {
-    "trace_version": 4,
+    "trace_version": 5,
     "detached": true,
     "parent_execution": "exec_parent",
-    "idempotency_key": "exec_parent/review/0/1",
-    "flow": "flow.review_and_file",
-    "execution_id": "exec_parent",
-    "status": "failed",
-    "error": "SubflowFailure: the instance of `flow.review_and_file` did not run to quiescence: NodeFailure: `file` failed: `${OPS_BIN}/false` exited with 1",
+    "idempotency_key": "exec_parent/review/0/0",
+    "flow": "flow.review",
+    "execution_id": "exec_fe38735f-65f7-8cec-84bf-7a95927dbf21",
+    "status": "completed",
     "entries": [
       {
         "step": 1,
-        "flow": "flow.review_and_file",
+        "flow": "flow.review",
         "node": "judge",
         "traversal": 0,
         "outcome": "completed",
@@ -34,13 +28,13 @@
         "routing": {
           "edges": [
             {
-              "to": "file",
+              "to": "__end__",
               "taken": true,
               "reason": "unconditional"
             }
           ],
           "targets": [
-            "file"
+            "__end__"
           ],
           "counters": {}
         },
@@ -53,15 +47,6 @@
             "outputMechanism": "native"
           }
         ]
-      },
-      {
-        "step": 2,
-        "flow": "flow.review_and_file",
-        "node": "file",
-        "traversal": 0,
-        "outcome": "failed",
-        "attempts": 1,
-        "error": "NodeFailure: `file` failed: `${OPS_BIN}/false` exited with 1"
       }
     ]
   },
@@ -73,7 +58,7 @@
             {
               "key": "service.name",
               "value": {
-                "stringValue": "flow.review_and_file"
+                "stringValue": "flow.review"
               }
             },
             {
@@ -122,42 +107,36 @@
             },
             "spans": [
               {
-                "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
-                "spanId": "be4406e344f0c6e1",
+                "traceId": "39c13e2e5e0c6acee32c763e8e34308c",
+                "spanId": "e6d995a14d820a5b",
                 "parentSpanId": "f9f5328d4c329dfb",
-                "name": "flow.review_and_file",
+                "name": "flow.review",
                 "kind": 1,
                 "startTimeUnixNano": "1788256801000000000",
-                "endTimeUnixNano": "1788256803250000000",
+                "endTimeUnixNano": "1788256804000000000",
                 "attributes": [
                   {
                     "key": "agentcompose.execution.id",
                     "value": {
-                      "stringValue": "exec_parent"
+                      "stringValue": "exec_fe38735f-65f7-8cec-84bf-7a95927dbf21"
                     }
                   },
                   {
                     "key": "agentcompose.flow",
                     "value": {
-                      "stringValue": "flow.review_and_file"
+                      "stringValue": "flow.review"
                     }
                   },
                   {
                     "key": "agentcompose.status",
                     "value": {
-                      "stringValue": "failed"
+                      "stringValue": "completed"
                     }
                   },
                   {
                     "key": "agentcompose.trace_version",
                     "value": {
-                      "intValue": "4"
-                    }
-                  },
-                  {
-                    "key": "agentcompose.error",
-                    "value": {
-                      "stringValue": "SubflowFailure: the instance of `flow.review_and_file` did not run to quiescence: NodeFailure: `file` failed: `${OPS_BIN}/false` exited with 1"
+                      "intValue": "5"
                     }
                   },
                   {
@@ -175,36 +154,35 @@
                   {
                     "key": "agentcompose.idempotency_key",
                     "value": {
-                      "stringValue": "exec_parent/review/0/1"
+                      "stringValue": "exec_parent/review/0/0"
                     }
                   }
                 ],
                 "events": [],
                 "links": [],
                 "status": {
-                  "code": 2,
-                  "message": "SubflowFailure: the instance of `flow.review_and_file` did not run to quiescence: NodeFailure: `file` failed: `${OPS_BIN}/false` exited with 1"
+                  "code": 1
                 }
               },
               {
-                "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
-                "spanId": "2d4ca775896aa75c",
-                "parentSpanId": "be4406e344f0c6e1",
+                "traceId": "39c13e2e5e0c6acee32c763e8e34308c",
+                "spanId": "0306710b5a3924f5",
+                "parentSpanId": "e6d995a14d820a5b",
                 "name": "judge",
                 "kind": 1,
                 "startTimeUnixNano": "1788256801000000000",
-                "endTimeUnixNano": "1788256803250000000",
+                "endTimeUnixNano": "1788256804000000000",
                 "attributes": [
                   {
                     "key": "agentcompose.instance_path",
                     "value": {
-                      "stringValue": "exec_parent/review/0/1/judge/0"
+                      "stringValue": "exec_fe38735f-65f7-8cec-84bf-7a95927dbf21/judge/0"
                     }
                   },
                   {
                     "key": "agentcompose.flow",
                     "value": {
-                      "stringValue": "flow.review_and_file"
+                      "stringValue": "flow.review"
                     }
                   },
                   {
@@ -248,7 +226,7 @@
                   {
                     "key": "agentcompose.routing",
                     "value": {
-                      "stringValue": "{\"edges\":[{\"to\":\"file\",\"taken\":true,\"reason\":\"unconditional\"}],\"targets\":[\"file\"],\"counters\":{}}"
+                      "stringValue": "{\"edges\":[{\"to\":\"__end__\",\"taken\":true,\"reason\":\"unconditional\"}],\"targets\":[\"__end__\"],\"counters\":{}}"
                     }
                   },
                   {
@@ -257,7 +235,7 @@
                       "arrayValue": {
                         "values": [
                           {
-                            "stringValue": "file"
+                            "stringValue": "__end__"
                           }
                         ]
                       }
@@ -271,13 +249,13 @@
                 }
               },
               {
-                "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
-                "spanId": "abe6a509da10c6ad",
-                "parentSpanId": "2d4ca775896aa75c",
+                "traceId": "39c13e2e5e0c6acee32c763e8e34308c",
+                "spanId": "1f680961407dd47c",
+                "parentSpanId": "0306710b5a3924f5",
                 "name": "model.local",
                 "kind": 3,
                 "startTimeUnixNano": "1788256801000000000",
-                "endTimeUnixNano": "1788256803250000000",
+                "endTimeUnixNano": "1788256804000000000",
                 "attributes": [
                   {
                     "key": "agentcompose.model",
@@ -314,71 +292,6 @@
                 "links": [],
                 "status": {
                   "code": 1
-                }
-              },
-              {
-                "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
-                "spanId": "feb479cb3d39f68f",
-                "parentSpanId": "be4406e344f0c6e1",
-                "name": "file",
-                "kind": 1,
-                "startTimeUnixNano": "1788256801000000000",
-                "endTimeUnixNano": "1788256803250000000",
-                "attributes": [
-                  {
-                    "key": "agentcompose.instance_path",
-                    "value": {
-                      "stringValue": "exec_parent/review/0/1/file/0"
-                    }
-                  },
-                  {
-                    "key": "agentcompose.flow",
-                    "value": {
-                      "stringValue": "flow.review_and_file"
-                    }
-                  },
-                  {
-                    "key": "agentcompose.node",
-                    "value": {
-                      "stringValue": "file"
-                    }
-                  },
-                  {
-                    "key": "agentcompose.step",
-                    "value": {
-                      "intValue": "2"
-                    }
-                  },
-                  {
-                    "key": "agentcompose.traversal",
-                    "value": {
-                      "intValue": "0"
-                    }
-                  },
-                  {
-                    "key": "agentcompose.outcome",
-                    "value": {
-                      "stringValue": "failed"
-                    }
-                  },
-                  {
-                    "key": "agentcompose.attempts",
-                    "value": {
-                      "intValue": "1"
-                    }
-                  },
-                  {
-                    "key": "agentcompose.error",
-                    "value": {
-                      "stringValue": "NodeFailure: `file` failed: `${OPS_BIN}/false` exited with 1"
-                    }
-                  }
-                ],
-                "events": [],
-                "links": [],
-                "status": {
-                  "code": 2,
-                  "message": "NodeFailure: `file` failed: `${OPS_BIN}/false` exited with 1"
                 }
               }
             ]

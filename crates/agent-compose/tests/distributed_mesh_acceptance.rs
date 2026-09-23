@@ -2212,7 +2212,7 @@ fn a_mesh_execution_exports_its_whole_trace_from_the_hub() {
     let body = &exported[0].body;
     assert_eq!(body["execution_id"], execution, "{body:#}");
     assert_eq!(body["status"], "completed", "{body:#}");
-    assert_eq!(body["trace_version"], 4, "{body:#}");
+    assert_eq!(body["trace_version"], 5, "{body:#}");
 
     // The placed node's entry is in the hub's export, which is the whole of
     // "the hub owns the trace": `sign` ran in the worker's process, and its

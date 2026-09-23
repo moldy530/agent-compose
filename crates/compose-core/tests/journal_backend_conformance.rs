@@ -676,6 +676,10 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "recovery_scan_finds_the_open_execution",
     "recovery_scan_drops_a_closed_execution",
     "a_closed_row_keeps_its_outcome",
+    // §3.5 — a child execution's lineage, on both reads that return a row, written
+    // once, and absent on a row nothing dispatched (PRD resolved q65).
+    "a_child_executions_lineage_round_trips",
+    "an_execution_nothing_dispatched_has_no_lineage",
     // §7 — the mark that tells resolved q29's second divergence from a mismatch
     // the composition already had.
     "a_refusal_is_recorded",

@@ -115,5 +115,5 @@ expression: held
   "execution_id": "<execution-id>",
   "flow": "flow.both",
   "status": "completed",
-  "trace_version": 4
+  "trace_version": 5
 }

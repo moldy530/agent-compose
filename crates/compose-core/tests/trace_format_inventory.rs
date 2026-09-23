@@ -739,16 +739,17 @@ fn every_delivery_surface_emits_the_version() {
     for (module, sites, what) in [
         (
             "cli.ts",
-            3,
-            "the completed and failed `--format json` records, and the trace file's envelope",
+            2,
+            "the completed and failed `--format json` records — the trace file's envelope is \
+             `runtime.traceDocument`'s, as the sink's is",
         ),
         (
             "runtime.ts",
             2,
             "`executionReport`, the one writer of the document the status route serves and \
-             every lifecycle webhook posts, and `detachedTraceDocument`, the one writer of \
-             the envelope a detached `flow.*` delivery ships — the sink's second event class \
-             (§1.4, PRD resolved q64)",
+             every lifecycle webhook posts, and `traceDocument`, the one writer of the \
+             envelope — the trace file's and the sink's, a child execution's lineage head \
+             included (§1.4, §2, PRD resolved q65)",
         ),
         (
             "serve.ts",
@@ -759,9 +760,10 @@ fn every_delivery_surface_emits_the_version() {
         ),
         (
             "delivery.ts",
-            1,
-            "`shipTrace`, the one writer of the envelope §1's fourth surface — the trace \
-             sink — POSTs, and the document `./otlp.ts` maps when the sink asks for OTLP",
+            0,
+            "nothing of its own: `shipTrace` heads the envelope §1's fourth surface POSTs \
+             through `runtime.traceDocument`, so a child execution's export and every other \
+             one are written by one writer",
         ),
     ] {
         let source = fs::read_to_string(
@@ -1091,29 +1093,32 @@ fn an_unset_reference_is_resolved_outside_the_region_that_restates_a_failure() {
     }
 }
 
-/// **The trace sink's second event class is specified where a receiver reads
-/// it, and the runtime writes the head it specifies** (PRD resolved q64).
+/// **A child execution is specified where a receiver reads it, and the runtime
+/// writes the head it specifies** (PRD resolved q64, q65).
 ///
-/// A detached `flow.*` delivery's envelope is a document a *receiver* has to be
-/// taught about: it rides the sink under the same `X-AgentCompose-Event` as an
-/// execution's export, it carries its parent's `execution_id`, and it is
-/// at-least-once across recovery under a **new** delivery id each time. A
-/// receiver that deduped it on the delivery id alone would file one delivery
-/// twice, and one that did not know it existed would read it as a second export
-/// of the parent. So the three places that make the promise are held to it:
+/// A child execution's envelope is a document a *receiver* has to be taught
+/// about: it rides the sink under the same `X-AgentCompose-Event` as every other
+/// export, under an `execution_id` of its own that no request ever returned, and
+/// the only thing tying it to the run that caused it is its head. A receiver
+/// that did not know the head existed would file a child as an unrelated
+/// execution, and one that did not know how the id is derived could not tell
+/// that a re-issued dispatch names the same child. So the three places that make
+/// the promise are held to it:
 ///
-///  * `docs/trace.md` §1.4, the sink contract, names both event classes and the
-///    pair a receiver dedupes on;
-///  * §8, where the key is specified, names the key's new reader and the same
-///    pair — the key gains a reader, not a carrier;
-///  * `docs/durability.md`, where recovery is specified, says the envelope
-///    re-ships on a recovered delivery's settlement and names the pair too.
+///  * `docs/trace.md` §1.4, the sink contract, names child executions and the
+///    pair a receiver joins and dedupes a child on;
+///  * §8, where the key is specified, names the key's readers — the child's
+///    identity among them — and the same pair: the key gains a reader, not a
+///    carrier;
+///  * `docs/durability.md`, where the journal is specified, publishes the child
+///    id's derivation — the domain string the runtime hashes — and that one
+///    dispatch names one child in every generation.
 ///
 /// And the runtime's one writer of the envelope heads it in the order §2 states
 /// — the version, then `detached`, `parent_execution`, `idempotency_key` — so
 /// what the document calls the head is what a reader of the bytes meets first.
 #[test]
-fn a_detached_deliverys_envelope_is_documented_with_the_pair_receivers_dedupe_on() {
+fn a_child_executions_envelope_is_documented_with_the_pair_receivers_join_on() {
     const PAIR: &str = "`(parent_execution, idempotency_key)`";
     let document = specification();
     let held = sections(&document);
@@ -1129,35 +1134,58 @@ fn a_detached_deliverys_envelope_is_documented_with_the_pair_receivers_dedupe_on
 
     let sink = under("### 1.4");
     assert!(
-        sink.contains("**Two event classes**") && sink.contains("detached `flow.*` delivery"),
-        "`docs/trace.md` §1.4 no longer names the sink's second event class (PRD resolved q64)"
+        sink.contains("**Child executions**") && sink.contains("**one event class**"),
+        "`docs/trace.md` §1.4 no longer says a detached `flow.*` dispatch's export is a child \
+         execution's, on the sink's one event class (PRD resolved q65)"
     );
     assert!(
         sink.contains(PAIR),
-        "`docs/trace.md` §1.4 no longer tells a receiver to dedupe a detached delivery's \
-         envelope on {PAIR}: a recovered delivery re-ships under a new delivery id, so the id \
-         alone folds nothing"
+        "`docs/trace.md` §1.4 no longer tells a receiver to key a child on {PAIR}"
     );
+    for gone in ["**Two event classes**", "second event class"] {
+        assert!(
+            !sink.contains(gone),
+            "`docs/trace.md` §1.4 still describes {gone:?}, which PRD resolved q65 collapsed \
+             into the first"
+        );
+    }
     let keys = under("## 8.");
     assert!(
         keys.contains(PAIR) && keys.contains("gains a reader, not a carrier"),
-        "`docs/trace.md` §8 no longer names the idempotency key's new reader — a detached \
-         delivery's envelope — and the pair it is read in"
+        "`docs/trace.md` §8 no longer names the idempotency key's readers at the head of an \
+         envelope — a child execution's identity and its join — and the pair it is read in"
     );
     let durability = fs::read_to_string(repository().join("docs/durability.md"))
         .expect("docs/durability.md is readable")
         .replace('\n', " ");
+    let domain = runtime()
+        .lines()
+        .find_map(|line| {
+            line.split_once(".update(`")
+                .and_then(|(_, rest)| rest.split_once("\\n"))
+                .map(|(domain, _)| domain.to_string())
+                .filter(|domain| domain.starts_with("agent-compose/execution/"))
+        })
+        .expect("`src/runtime.ts` derives a child's id over a domain string of its own");
     assert!(
-        durability.contains(PAIR) && durability.contains("re-ships on **that** settlement"),
-        "`docs/durability.md` no longer says a recovered detached delivery re-ships, or which \
-         pair a receiver dedupes the repeat on"
+        durability.contains(&format!("`{domain}`"))
+            && durability.contains("one child in every generation"),
+        "`docs/durability.md` no longer publishes the child id's derivation over `{domain}` — \
+         the one `runtime.childExecutionId` hashes — or that one dispatch names one child in \
+         every generation"
     );
 
-    let writer = function_body(&runtime(), "export function detachedTraceDocument(");
+    let writer = function_body(&runtime(), "export function traceDocument(");
+    // The object it returns, past the parameter's type — which names `flow` and
+    // `execution` too, and in an order of its own.
+    let written = writer
+        .split_once("return {")
+        .unwrap_or_else(|| panic!("`traceDocument` returns an object literal:\n{writer}"))
+        .1;
     let at = |field: &str| -> usize {
-        writer
-            .find(&format!("    {field}:"))
-            .unwrap_or_else(|| panic!("`detachedTraceDocument` writes no `{field}`:\n{writer}"))
+        written
+            .find(&format!("{field}:"))
+            .unwrap_or_else(|| panic!("`traceDocument` writes no `{field}`:\n{writer}"))
     };
     let head = [
         "trace_version",
@@ -1170,7 +1198,7 @@ fn a_detached_deliverys_envelope_is_documented_with_the_pair_receivers_dedupe_on
     let order: Vec<usize> = head.iter().map(|field| at(field)).collect();
     assert!(
         order.windows(2).all(|pair| pair[0] < pair[1]),
-        "`detachedTraceDocument` writes its head out of the order `docs/trace.md` §2 states \
+        "`traceDocument` writes its head out of the order `docs/trace.md` §2 states \
          ({head:?}):\n{writer}"
     );
 }

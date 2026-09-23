@@ -26,7 +26,13 @@
 //   * **`fresh` is clean per attempt.** The first attempt writes a file into
 //     its directory and then fails; the node's `retry:` runs a second attempt,
 //     and what that one finds is an empty directory. A retry meeting the wreck
-//     of the attempt it is retrying is the case ruling c is about.
+//     of the attempt it is retrying is the case ruling c is about;
+//   * **a coder run inside a child execution is the child's** (PRD resolved
+//     q65). `flow.review_batch` detaches a review per checkout, so each review's
+//     coder run happens inside a child execution: its harness record is on the
+//     child's journal under the child's own site and its trace entry is the
+//     child's, while the parent's record holds nothing at the dispatch and its
+//     entry keeps the stub `"detached"` record (Decision D94).
 //
 // The seam is `registerHarnessDriver`, as everywhere else a coder node is
 // driven: a harness SDK speaks its own wire, so the mock provider never sees it
@@ -95,6 +101,16 @@ const stub = harness.scriptedDriver("cc", (run) => {
   const attempt = (made.get(run.node) ?? 0) + 1;
   made.set(run.node, attempt);
   handed.push({ node: run.node, attempt, workspace: run.workspace });
+  if (run.node === "flow.review.inspect") {
+    // A review, in a child execution: its verdict names the checkout, so the
+    // record read back off each child's journal says which run it was.
+    const verdict = path.basename(run.workspace) === "alpha" ? "approve" : "revise";
+    return [
+      { source: { type: "assistant" }, tap: { kind: "turn" } },
+      { source: { type: "result", subtype: "success" }, tap: { kind: "settled", cost: {} } },
+      { source: { type: "structured_output" }, tap: { kind: "output", value: { verdict } } },
+    ];
+  }
   if (run.node === "flow.fix.implement") {
     // Written into the directory this dispatch was given, so the answer is
     // evidence about the path and not only about the string: a run that was
@@ -125,7 +141,9 @@ const stub = harness.scriptedDriver("cc", (run) => {
 });
 runtime.registerHarnessDriver("cc", stub.driver);
 
-const { runFlow } = await import(pathToFileURL(path.resolve(project, "src/index.ts")).href);
+const { runFlow, runChildFlow } = await import(
+  pathToFileURL(path.resolve(project, "src/index.ts")).href
+);
 
 // The execution id is fixed rather than generated, because half of what this
 // gate reads is a **path** derived from it: a `workspace: fresh` directory is
@@ -165,6 +183,74 @@ const dispatched = (run.trace.find((entry) => entry.node === "work")?.dispatches
 
 const summarise = run.trace.find((entry) => entry.node === "summarise");
 
+// --- A coder run inside a child execution (PRD resolved q65) ---------------
+//
+// The review batch detaches one `flow.review` per checkout. Each is a child
+// execution — `src/graph.ts` hosts `runChildFlow` as the runner a detached
+// dispatch starts one with — and this wraps that runner only to keep what each
+// child's own run produced, because the child's trace is nowhere a parent's
+// `FlowRun` could carry it. The parent's `runFlow` answers as soon as its own
+// node has dispatched (grammar 8.6 rule 7); `childrenSettled` is what a process
+// that is about to read the result, or to exit, waits on.
+const childRuns = [];
+const unhost = runtime.hostChildren(async (child) => {
+  const produced = await runChildFlow(child);
+  childRuns.push({ id: child.id, trace: produced.trace });
+  return produced;
+});
+const reviewTasks = [
+  { goal: "review the parser", worktree: worktrees[0] },
+  { goal: "review the lexer", worktree: worktrees[1] },
+];
+const reviewed = await runFlow("flow.review_batch", { tasks: reviewTasks }, { executionId: "exec_reviews" });
+await runtime.childrenSettled();
+unhost();
+const journal = await runtime.openJournal();
+const children = [];
+for (const index of [0, 1]) {
+  const key = `exec_reviews/hand_off/0/${index}`;
+  const id = runtime.childExecutionId("exec_reviews", key);
+  const row = await journal.execution(id);
+  const effects = await journal.effectsUnder(id, "inspect/0");
+  const trace = childRuns.find((held) => held.id === id)?.trace ?? [];
+  children.push({
+    id,
+    key,
+    status: row?.status ?? null,
+    flow: row?.flow ?? null,
+    lineage: row?.lineage ?? null,
+    effects: effects.map((record) => ({
+      execution: record.execution,
+      site: record.site,
+      kind: record.kind,
+      outcome: record.outcome,
+    })),
+    harness: recorded(trace.find((entry) => entry.node === "inspect") ?? {}),
+  });
+}
+const parentRow = await journal.execution("exec_reviews");
+const review = {
+  parent: {
+    status: parentRow?.status ?? null,
+    lineage: parentRow?.lineage ?? null,
+    outputs: reviewed.outputs,
+    // The parent's account of each dispatch: the stub record, and nothing on
+    // its journal at or under the dispatch's site.
+    dispatches: (reviewed.trace.find((entry) => entry.node === "hand_off")?.dispatches ?? []).map(
+      (dispatch) => ({
+        index: dispatch.index,
+        outcome: dispatch.outcome,
+        attempts: dispatch.attempts,
+        key: dispatch.idempotencyKey,
+        inner: dispatch.inner ?? null,
+      }),
+    ),
+    effects: (await journal.effectsUnder("exec_reviews", "hand_off/0")).length,
+    harness: reviewed.trace.flatMap((entry) => entry.harness ?? []).length,
+  },
+  children,
+};
+
 process.stdout.write(
   JSON.stringify(
     {
@@ -181,6 +267,7 @@ process.stdout.write(
       // The directory `fresh` derived: the execution id is the one this run
       // was started with and the frame is the node's, so the whole path is a
       // derivation rather than a choice (grammar 9.4).
+      review,
       fresh: {
         expected: path.join(data, "workspaces", "exec_fanout", "summarise", "0"),
         found,

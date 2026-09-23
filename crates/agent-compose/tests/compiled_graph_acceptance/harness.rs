@@ -129,13 +129,14 @@ pub const FIXTURES: &[&str] = &[
     "agent-openai",
     "bounded-cycle",
     "builtin-tools",
-    // The trace sink's second event class (PRD resolved q64): detached `flow.*`
-    // deliveries whose own envelopes ship beside their parents'. Under `local`
-    // with no deploy file — which is what `the_acceptance_fixtures_validate_clean`
-    // resolves it as — it declares no sink; `tests/trace_sink_acceptance.rs`
-    // writes the `deploy/local.yml` it needs into a copy, as it does for
-    // `trace-sink`, and `local` is the one target `detach: true` is legal under.
-    "detached-trace-sink",
+    // Child executions (PRD resolved q65): detached `flow.*` dispatches, each
+    // starting an execution with its own id, journal, recovery and export.
+    // Under `local` with no deploy file — which is what
+    // `the_acceptance_fixtures_validate_clean` resolves it as — it declares no
+    // sink; `tests/child_execution_acceptance.rs` writes the `deploy/local.yml`
+    // it needs into a copy, as `trace-sink`'s tests do, and `local` is the one
+    // target `detach: true` is legal under.
+    "child-executions",
     "durability",
     "fanout",
     "flow-as-tool",
@@ -1585,6 +1586,27 @@ pub fn resume_entrypoint(
     Run { output }
 }
 
+/// `agent-compose resume <entrypoint> <execution> --target <name>`, into a
+/// directory the caller owns.
+///
+/// [`run_target`]'s counterpart for the other verb: a composition staged with a
+/// deploy file of its own — a sink's `deploy/local.yml` — is resumed under the
+/// target that names it, exactly as it was run.
+pub fn resume_target(
+    out: &Path,
+    entrypoint: &Path,
+    target: &str,
+    execution: &str,
+    environment: &[(String, String)],
+) -> Run {
+    let mut command = agent_compose();
+    command.arg("resume").arg(entrypoint).arg(execution);
+    command.args(["--target", target]).arg("--out").arg(out);
+    seal(&mut command, environment);
+    let output = command.output().expect("the command runs");
+    Run { output }
+}
+
 /// `agent-compose resume …`, before its environment is sealed.
 fn resume_command(out: &Path, name: &str, execution: &str, format: Option<&str>) -> Command {
     let mut command = agent_compose();
@@ -2537,6 +2559,35 @@ pub fn hmac_sha256(key: &[u8], message: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// The id of the **child execution** a detached `flow.*` dispatch starts,
+/// derived independently of the emitted runtime (PRD resolved q65,
+/// `docs/durability.md` §3.5).
+///
+/// `exec_` and a version-8 UUID over SHA-256 of `agent-compose/execution/v1`, the
+/// parent's id and the dispatch's grammar 9.4 key, newline-separated — the
+/// derivation `runtime.childExecutionId` documents, written out here from that
+/// sentence rather than borrowed from the code under test, so an app that
+/// derived something else fails as itself rather than agreeing with its own
+/// arithmetic. The version nibble is `8` and the variant's two high bits `10`;
+/// the other 122 bits are the digest's.
+pub fn child_execution_id(parent: &str, idempotency_key: &str) -> String {
+    let digest =
+        sha256(format!("agent-compose/execution/v1\n{parent}\n{idempotency_key}").as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(
+        "exec_{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// `SHA-256(message)`, as its thirty-two bytes.

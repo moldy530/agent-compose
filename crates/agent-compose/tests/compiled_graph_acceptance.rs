@@ -14927,7 +14927,7 @@ fn a_terminal_asks_one_question_per_pause_and_a_refused_answer_asks_again() {
         "{record}"
     );
     assert_eq!(
-        record["trace_version"], 4,
+        record["trace_version"], 5,
         "the JSON document a run prints is unchanged in shape by having asked: {record}"
     );
     assert!(

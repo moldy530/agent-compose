@@ -9,7 +9,7 @@
     "endedAt": "2026-09-01T10:00:09.000Z"
   },
   "document": {
-    "trace_version": 4,
+    "trace_version": 5,
     "flow": "flow.review_loop",
     "execution_id": "exec_routing",
     "status": "completed",
@@ -219,7 +219,7 @@
                   {
                     "key": "agentcompose.trace_version",
                     "value": {
-                      "intValue": "4"
+                      "intValue": "5"
                     }
                   }
                 ],

@@ -1,0 +1,346 @@
+# Acceptance fixture: a detached `flow.*` dispatch starts a **child execution**
+# — its own id, its own journal, its own recovery and its own export (PRD
+# resolved q65, `docs/durability.md` §3.2, §3.5, §6.1, `docs/trace.md` §1.4, §2).
+#
+# `detach: true` is legal under `--target local` and under no other target
+# (grammar 8.6 rule 7, Decision D59), so the deploy file the suite writes beside a
+# copy of this directory is `deploy/local.yml` — which admits `trace_sink:`
+# (grammar 14) — and a child execution exists exactly where detach does.
+#
+# Every parent here detaches one child per subject and never makes a model call
+# of its own, so the one model call in each child is the child's — and "it is on
+# the child's record and envelope and not on the parent's" is an assertion with
+# nothing else in the way. The parent's account of the dispatch stays the stub
+# `"detached"` record (Decision D94, `docs/trace.md` §5.1). The shapes:
+#
+#   * `flow.dispatch` detaches a `flow.review` and settles at once — the child
+#     that completes, with its verdict on its own record;
+#   * `flow.dispatch_filing` detaches a `flow.review_and_file`, whose second node
+#     always fails — the child that fails, and ships its failed envelope;
+#   * `flow.dispatch_and_wait` detaches the same review and then **parks** at a
+#     `human` node, so the parent is open while its child has already settled —
+#     the shape a restarted `serve` re-issues the dispatch from, and the one
+#     `agent-compose run` exits `3` over;
+#   * `flow.dispatch_stalling` and `flow.dispatch_stalling_and_wait` detach a
+#     `flow.review_and_stall`, whose second node is a subprocess that stalls, so a
+#     test can kill the process with the child **mid-run** — after its model call
+#     is on its record and before it has settled — once with the parent settled
+#     and once with the parent parked. `${TALLY_BIN}/stall` is a shim the tests
+#     that reach it write (it appends one line to `$TALLY_LOG` per run and then
+#     sleeps), so "the stalled step ran twice across the crash and not three
+#     times" is a line count; every other test reaches no such node.
+#
+# The provider is the mock, reached through `${MOCK_BASE_URL}` exactly as every
+# other fixture reaches it (PRD 5.9), and the `exec:` nodes use `${OPS_BIN}` as
+# `trace-sink`'s do.
+version: "0.1"
+
+defaults:
+  timeout: 60s
+  on_error: fail
+
+state:
+  noted:
+    description: What a parent wrote after it had detached its children.
+    type: string
+    default: ""
+  decision:
+    description: What the person answered, on a parent that parks.
+    enum: [approve, reject]
+    default: reject
+
+triggers:
+  on_review_request:
+    type: http
+    flow: flow.dispatch
+    path: /reviews
+    method: POST
+    input:
+      subjects: "payload.body.subjects"
+    respond: async
+
+  on_filing_request:
+    type: http
+    flow: flow.dispatch_filing
+    path: /filings
+    method: POST
+    input:
+      subjects: "payload.body.subjects"
+    respond: async
+
+  on_awaited_request:
+    type: http
+    flow: flow.dispatch_and_wait
+    path: /awaited-reviews
+    method: POST
+    input:
+      subjects: "payload.body.subjects"
+    respond: async
+
+  on_stalling_request:
+    type: http
+    flow: flow.dispatch_stalling
+    path: /stalling-reviews
+    method: POST
+    input:
+      subjects: "payload.body.subjects"
+    respond: async
+
+  on_awaited_stalling_request:
+    type: http
+    flow: flow.dispatch_stalling_and_wait
+    path: /awaited-stalling-reviews
+    method: POST
+    input:
+      subjects: "payload.body.subjects"
+    respond: async
+
+provider.mock:
+  kind: openai_compatible
+  base_url: ${MOCK_BASE_URL}
+  api_key: ${MOCK_API_KEY}
+
+model.local:
+  provider: provider.mock
+  id: qwen3-coder-30b
+
+# The child's one model call. Its `output:` names no channel, so nothing the
+# child answers is written anywhere — a detached dispatch may write no state
+# (grammar 8.6 rule 7) — and the verdict is on the child's journal record and
+# nowhere else a test can read it back from.
+agent.reviewer:
+  description: Reviews one subject, in an execution of its own.
+  model: model.local
+  prompt: |
+    Review the subject you are given and say whether it passes.
+  input:
+    subject:
+      type: string
+  output:
+    verdict:
+      enum: [approve, revise]
+
+# The child that completes. `outputs: {}`, because what a detached `flow.*`
+# returns is written after everything that reads it and so is refused (Decision
+# D94).
+flow.review:
+  description: Review one subject — the work a child execution does.
+  inputs:
+    subject:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    judge:
+      agent: agent.reviewer
+      input:
+        subject: "input.subject"
+  edges:
+    - { from: start, to: judge }
+    - { from: judge, to: end }
+
+# The child that fails: the same review, then a filing step that cannot succeed.
+# The review's model call really happened, and the child's own record and
+# envelope are where it is — which is the debugging story strongest exactly here.
+flow.review_and_file:
+  description: Review one subject and file it — a child whose filing always fails.
+  inputs:
+    subject:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    judge:
+      agent: agent.reviewer
+      input:
+        subject: "input.subject"
+    file:
+      exec:
+        command: "${OPS_BIN}/false"
+  edges:
+    - { from: start, to: judge }
+    - { from: judge, to: file }
+    - { from: file, to: end }
+
+# The child a test kills mid-run: the review, then a subprocess that stalls long
+# enough to be killed in. Its model call is on its record before the stall
+# starts, so a recovered generation replays it rather than asking again.
+flow.review_and_stall:
+  description: Review one subject, then stall — a child a crash can catch mid-run.
+  inputs:
+    subject:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    judge:
+      agent: agent.reviewer
+      input:
+        subject: "input.subject"
+    stall:
+      exec:
+        command: "${TALLY_BIN}/stall"
+  edges:
+    - { from: start, to: judge }
+    - { from: judge, to: stall }
+    - { from: stall, to: end }
+
+flow.dispatch:
+  description: Detach a review per subject, then note that they were sent.
+  inputs:
+    subjects:
+      description: One child execution per element.
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs:
+    noted:
+      type: string
+  nodes:
+    review:
+      map:
+        over: input.subjects
+        as: one
+        node: flow.review
+        max_concurrency: 1
+        detach: true
+        input:
+          subject: "one"
+    note:
+      exec:
+        command: "${OPS_BIN}/echo"
+        args: ['{"noted":"dispatched"}']
+        output:
+          noted: { type: string }
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: note }
+    - { from: note, to: end }
+
+flow.dispatch_filing:
+  description: Detach a review that fails, and settle anyway.
+  inputs:
+    subjects:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs:
+    noted:
+      type: string
+  nodes:
+    review:
+      map:
+        over: input.subjects
+        as: one
+        node: flow.review_and_file
+        max_concurrency: 1
+        detach: true
+        input:
+          subject: "one"
+    note:
+      exec:
+        command: "${OPS_BIN}/echo"
+        args: ['{"noted":"dispatched"}']
+        output:
+          noted: { type: string }
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: note }
+    - { from: note, to: end }
+
+flow.dispatch_and_wait:
+  description: Detach a review, then park until a person signs it off.
+  inputs:
+    subjects:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs:
+    decision:
+      enum: [approve, reject]
+  nodes:
+    review:
+      map:
+        over: input.subjects
+        as: one
+        node: flow.review
+        max_concurrency: 1
+        detach: true
+        input:
+          subject: "one"
+    sign_off:
+      human:
+        input:
+          note: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input:
+        note: "'is the review in?'"
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: sign_off }
+    - { from: sign_off, to: end }
+
+flow.dispatch_stalling:
+  description: Detach a review that stalls, then settle while it is still running.
+  inputs:
+    subjects:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs:
+    noted:
+      type: string
+  nodes:
+    review:
+      map:
+        over: input.subjects
+        as: one
+        node: flow.review_and_stall
+        max_concurrency: 1
+        detach: true
+        input:
+          subject: "one"
+    note:
+      exec:
+        command: "${OPS_BIN}/echo"
+        args: ['{"noted":"dispatched"}']
+        output:
+          noted: { type: string }
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: note }
+    - { from: note, to: end }
+
+flow.dispatch_stalling_and_wait:
+  description: Detach a review that stalls, then park while it is still running.
+  inputs:
+    subjects:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs:
+    decision:
+      enum: [approve, reject]
+  nodes:
+    review:
+      map:
+        over: input.subjects
+        as: one
+        node: flow.review_and_stall
+        max_concurrency: 1
+        detach: true
+        input:
+          subject: "one"
+    sign_off:
+      human:
+        input:
+          note: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input:
+        note: "'is the review in?'"
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: sign_off }
+    - { from: sign_off, to: end }
