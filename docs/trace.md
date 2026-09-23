@@ -1,6 +1,6 @@
 # agent-compose — Trace Format
 
-**Trace version:** `4`
+**Trace version:** `5`
 **Status:** Normative for the trace a compiled project emits
 **Companion artifacts:** [`docs/grammar.md`](grammar.md) (the DSL this describes runs of), [`prd.md`](../prd.md) §5.3, §5.6, §5.8, §5.9
 
@@ -79,7 +79,7 @@ entries; they differ in what surrounds them, and one of them may re-encode them.
 | `run --format json` | one JSON object on **stdout**, whose `trace` is the array of entries | `trace_version`, beside `trace` |
 | the trace **file** | one JSON object — the whole [envelope](#2-the-envelope) — under the project's data directory | `trace_version`, at the head of the envelope |
 | `serve` status | `GET /executions/:id` and the `callback:` webhook body, whose `trace` is the array of entries | `trace_version`, beside `trace` |
-| the **trace sink** | two event classes, to the address `trace_sink:` names (grammar §14.5): one POST per settled execution, and one per settled **detached `flow.*` delivery**, carrying that delivery's own envelope (§1.4). Each is the whole envelope, or the OTLP/JSON §12 maps it to | `trace_version`, at the head of the envelope — and, under `format: otlp`, as the `agentcompose.trace_version` attribute of the root span |
+| the **trace sink** | one POST per settled execution — a **child execution** a detached `flow.*` dispatch started included, under its own id (§1.4) — to the address `trace_sink:` names (grammar §14.5). Each is the whole envelope, or the OTLP/JSON §12 maps it to | `trace_version`, at the head of the envelope — and, under `format: otlp`, as the `agentcompose.trace_version` attribute of the root span |
 
 The rule that spans them: **on the first three surfaces above, wherever a
 `trace` appears, the `trace_version` that describes it appears beside it — and
@@ -119,9 +119,10 @@ never an execution: nothing about the export can fail, delay or change a run.
 One export per settled execution and no more. An execution the journal already
 holds an export for is not exported again — which is what a `serve` that died
 between journaling the row and closing the lifecycle row leaves behind. "An
-export" is the execution's **own**: a detached delivery's envelope below rides
-the same ledger and is not one, so a parent whose delivery shipped first still
-ships its own export when it settles.
+export" is the execution's **own** row on its own ledger; the one other kind of
+sink row a journal can hold is the envelope a build before version `5` shipped
+onto a *parent's* ledger for a detached delivery (§10.3.4), which is not the
+parent's export and does not stand in for it.
 
 **Settled** means the journal's lifecycle row closed, which is the moment the
 export is journaled in. Two runs therefore export nothing, and both are runs with
@@ -130,74 +131,65 @@ purpose (`docs/durability.md` §3.6) and has not settled yet, and one that faile
 before it was journaled at all — a payload the flow's `inputs:` refused, a
 journal that could not be opened — never had a row or a trace.
 
-**Two event classes** (PRD resolved q64). The sink carries two kinds of POST,
-and a receiver tells them apart by the body's head:
+**Child executions** (PRD resolved q64, q65). A **detached** `flow.*` dispatch
+(grammar §8.6 rule 7) starts a **child execution**: an execution of its own,
+with an id derived from its parent's and the dispatch's grammar §9.4 key, its
+own lifecycle row, journal and recovery (`docs/durability.md` §3.2) — and so its
+own export, under that id, by exactly the contract above. There is **one event
+class**: every POST is a settled execution's export. What a child's carries
+beside the ordinary envelope is its **cause**, as three head fields:
 
-| event class | one POST per | what it carries | its head |
-|---|---|---|---|
-| an execution's export | settled execution | the execution's envelope (§2) | no `detached` key |
-| a detached delivery's envelope | settled detached `flow.*` delivery | that delivery's own envelope (§2) | `detached: true`, `parent_execution`, `idempotency_key` — and, under `format: otlp`, the same three as attributes of the root span (§12.5) |
+| export of | its head |
+|---|---|
+| an execution a trigger or a command started | no `detached` key |
+| a child execution | `detached: true`, `parent_execution`, `idempotency_key` — and, under `format: otlp`, the same three as attributes of the root span (§12.5) |
 
-A **detached** `flow.*` delivery (grammar §8.6 rule 7) runs real nodes under its
-parent's execution id, past the join and under its own signal — and its parent's
-entry carries only the stub `"detached"` record, for the reason §5.1 gives,
-which is about the *parent's entry* and nothing else. So the delivery ships an
-account of its own. At the moment it **settles** — the runtime stops counting it
-as work in flight, however it ended — its envelope is journaled onto the
-parent's ledger: its entries in full, with their model calls, store records,
-harness runs and the delivery's own joined dispatches on them. `idempotency_key`
-is byte for byte the parent's stub record's `idempotencyKey`, so the join
-between the two envelopes is string equality (§8).
+Every execution has a cause — a trigger, or a detached dispatch from another
+execution's node — and the head is where a child's is written down.
+`idempotency_key` is byte for byte the `idempotencyKey` of the parent's stub
+`"detached"` record (§5.1), so the join between the two envelopes is string
+equality (§8). The parent's account of the dispatch does not move: its map
+node's entry carries that stub record and nothing the child did, so the parent's
+export is byte for byte what it would have been had the child never run. The
+child's envelope is where its entries are, with their model calls, store
+records, harness runs and the child's own joined dispatches on them.
 
-* **A delivery that failed ships too**, `status: "failed"` and `error` on its
+* **A child that failed ships too**, `status: "failed"` and `error` on its
   envelope and the aborting entry last (§9) — the debugging story is strongest
-  exactly there. One that met a replay **divergence** ships nothing: it did not
-  end, and PRD resolved q29 is that a divergence fires nothing
-  (`docs/durability.md` §7).
-* **Nothing about it can delay or fail the enclosing flow instance** (grammar
-  §8.6 rule 7). The envelope is journaled after the delivery settled, from a
-  listener nothing awaits, and delivering it is this section's contract
-  unchanged: the same ledger, schedule, headers, signature and `format:`, and a
-  sink that is down costs it a retry.
-* **A detached delivery is not an execution.** It gets no lifecycle row and no
-  journal of its own — its effects stay journaled under the parent's id
-  (`docs/durability.md` §3.2) — which is why its envelope's `execution_id` is
-  the parent's and why its row is on the parent's ledger.
+  exactly there. One that met a replay **divergence** stays open and ships
+  nothing, as every execution does (`docs/durability.md` §7).
+* **Nothing about it can delay or fail its parent** (grammar §8.6 rule 7). The
+  parent never waits for its child: a parent may settle, and export, before its
+  child has run a node, and a child that fails fails on its own.
+* **A child never parks.** A detached dispatch that could reach a `human` node
+  is refused at build time (Decision D118), so a child's envelope takes
+  `status: "completed"` or `"failed"` and never `"interrupted"`.
 * **A detached `agent.*` or `tool.*` delivery ships nothing of its own.** It
-  runs no node and so has no entry; the stub record stays its whole account.
-* **The wire does not move.** Both classes are `settled` rows, and both POSTs
-  carry `X-AgentCompose-Event: settled` — grammar §13.3's vocabulary is
-  unchanged. A receiver that files envelopes by `execution_id` alone files a
-  delivery's under its parent, which is where it belongs; `detached` is what
-  tells it which it is holding. Nor does the parent's **report** move: a
-  delivery's envelope row rides the parent's ledger without being one of the
-  parent's lifecycle events, and it is journaled while the parent is still
-  running or parked, so the status route's `deliveries` — the report every
-  `parked` and `settled` webhook carries — leaves it out. It stays on the
-  ledger and is worked like any other row (`docs/durability.md` §3.7).
+  runs no node and starts no child; the stub record stays its whole account.
+* **The wire does not move.** A child's export is a `settled` row on the
+  child's own ledger, and its POST carries `X-AgentCompose-Event: settled` —
+  grammar §13.3's vocabulary is unchanged.
 
-**At-least-once, and deduped on the pair.** A `serve` restart that recovers a
-parent re-runs the detached deliveries its dead generation issued, each
-replaying what the journal holds, and each **re-ships on its own settlement**
-under a new delivery id — including one that had already shipped, where the
-parent was still open. So a receiver MUST dedupe detached envelopes on
-**`(parent_execution, idempotency_key)`**, never on `X-AgentCompose-Delivery`
-alone. That is grammar §9.4's receiver-side rule read one more time: a repeated
-attempt at one effect reuses its key — which is also what a map node's own
-`retry:` re-dispatching the same item is, and folds the same way. A delivery
-still in flight when its parent's row **closed** is not recovered: nothing
-resumes a settled execution, and the delivery has no recovery identity of its
-own beyond what §9.4 gives it.
+**Once per child, and deduped on the pair.** A child's export is an execution's
+export, so the once-per-execution rule above is its rule: a child recovered after
+it exported is not exported again, whichever process recovers it, and a retried
+POST is one delivery under one `X-AgentCompose-Delivery` as ever. A receiver
+joining children to parents keys a child on
+**`(parent_execution, idempotency_key)`**, and may dedupe on the pair: one
+dispatch names one child in every generation (`docs/durability.md` §3.2), so the
+pair and the child's `execution_id` are one-to-one — which is grammar §9.4's
+receiver-side rule read one more time, and also what folds the envelope a build
+before version `5` shipped for the same dispatch (§10.3.4).
 
-**Where the second class exists.** `detach: true` is legal under `--target
-local` and under no other target (grammar §8.6 rule 7, Decision D59), so the
-second event class exists exactly where detach does: a `deploy/local.yml` that
-declares `trace_sink:`. Under `agent-compose run` the command ships what settled
-while it was still running, after the run has reported — and it is still
-running while it sends: it keeps listening until every envelope it has
-collected is sent, so a delivery that settles during one of those POSTs ships
-too. A delivery still in flight when the command exits ends with it, which is
-`detach: true`'s own promise — nothing waits for a detached delivery.
+**Where children exist.** `detach: true` is legal under `--target local` and
+under no other target (grammar §8.6 rule 7, Decision D59), so a child execution
+exists exactly where detach does. Under `serve` a child is tracked on the status
+route by its own id (§1.3), recovered like any open execution — including one
+whose parent settled first — and exported when it settles
+(`docs/durability.md` §6.1). Under `agent-compose run` the command reports its
+own run first and then **waits for every child execution it started**, children
+of children included, shipping each one's export before it exits
+(`docs/durability.md` §6.2).
 
 ### 1.1 `run --format json`
 
@@ -211,7 +203,7 @@ documents and no grammar section defines — prints one document:
   "execution_id": "exec_0f1e…",
   "status": "completed",
   "outputs": { "draft": "…" },
-  "trace_version": 4,
+  "trace_version": 5,
   "trace": [ /* entries */ ],
   "trace_path": "/…/.agent-compose/traces/flow.review_loop-exec_0f1e….json"
 }
@@ -233,7 +225,9 @@ one surface that arrives without a record around it: a reader who opens the file
 later has nothing else to tell them which format it is in or which run it belongs
 to.
 
-A run that made **no** entries writes no file, and names none.
+A run that made **no** entries writes no file, and names none. The file an
+`agent-compose resume` of a **child execution** writes carries the child's
+lineage head (§2), as its export does.
 
 ### 1.3 `serve` status
 
@@ -247,7 +241,7 @@ POSTs on completion, report an execution as (grammar §13.3):
   "trigger": "on_request",
   "status": "completed",
   "outputs": { "draft": "…" },
-  "trace_version": 4,
+  "trace_version": 5,
   "trace": [ /* entries */ ]
 }
 ```
@@ -282,6 +276,15 @@ before an execution exists to report on.
 one, so a `running` report is `execution_id`, `flow`, `trigger` and `status`,
 and nothing else.
 
+A **child execution** (§1.4) is reported here by its **own** id, exactly as
+every execution is — running, settled, or recovered by a later `serve` — and
+its `trigger` is its parent's: the trigger's `auth:` is what guards the route,
+and whoever may read the execution that dispatched a child may read the child,
+while a child reachable with no credential beside a parent that demands one
+would be a route around the parent's `auth:`. The report carries no lineage
+field; the envelope's head (§2) and the journal's lineage row
+(`docs/durability.md` §3.5) are where a child's cause is written.
+
 An `interrupted` report carries one more key, and it is what makes a status poll
 enough to *ask* the question rather than only to notice there is one:
 `interrupts`, an array with one entry per pause the execution is holding,
@@ -311,29 +314,26 @@ in full, and what `run --format json` spreads into the record it prints.
 
 | field | type | presence | meaning |
 |---|---|---|---|
-| `trace_version` | integer | always | The format the `entries` are written in. `4` is this document, and a compiled project spells it `TRACE_VERSION` (exported from its `src/runtime.ts`). See [Stability](#10-stability). |
-| `detached` | `true` | a detached delivery's envelope | Marks the envelope a settled **detached `flow.*` delivery** ships of its own — the trace sink's second event class (§1.4, PRD resolved q64). Never `false`: every other envelope omits the key. Only the trace sink carries such an envelope; the trace file, `run --format json` and a `serve` report never do. |
-| `parent_execution` | string | a detached delivery's envelope | The execution the delivery ran under. Equal to `execution_id` on the same envelope, and deliberately so: a detached delivery is not an execution of its own, so the execution its entries belong to is its parent's. Written out because it is half of the pair a receiver dedupes a re-shipped delivery on (§1.4), and a reader joining two envelopes should not have to know that one field doubles as the other. |
-| `idempotency_key` | string | a detached delivery's envelope | The grammar §9.4 key of the dispatch that issued the delivery: byte for byte the `idempotencyKey` of the parent's stub `"detached"` dispatch record (§5.1), so the join between the parent's entry and this envelope is string equality (§8). The other half of the dedupe pair (§1.4). |
-| `flow` | string | always | The flow that was run, as its typed address (grammar §2.2). On a detached delivery's envelope, the `flow.*` the delivery instantiated. |
-| `execution_id` | string | always | The execution the entries belong to — grammar §4.1's `execution.id`, and the prefix of every idempotency key in the document (grammar §9.4). On a detached delivery's envelope it is the parent's, for `parent_execution`'s reason: the delivery's effects are keyed under the id it ran under. |
-| `status` | `"completed"` \| `"failed"` \| `"interrupted"` | always | How the run ended: with an answer, without one, or holding a `human` pause it had no way to answer (grammar §8.7, §9). The third is told apart from the second because the two ask different things of whoever is reading — one is a run to look into, the other a question to answer — and because a reader may not decide it from the message text (§10.1). A detached delivery's envelope takes the first two only: a detached dispatch that could reach a `human` node is refused at build time (Decision D118). |
+| `trace_version` | integer | always | The format the `entries` are written in. `5` is this document, and a compiled project spells it `TRACE_VERSION` (exported from its `src/runtime.ts`). See [Stability](#10-stability). |
+| `detached` | `true` | a child execution's envelope | Marks the envelope of a **child execution** — one a detached `flow.*` dispatch started (§1.4, PRD resolved q65). Never `false`: an execution a trigger or a command started omits the key. Carried by the envelopes a child's settlement writes — its trace-sink export, and the trace file an `agent-compose resume` of it writes; `run --format json` and a `serve` report carry no envelope head and so never do. |
+| `parent_execution` | string | a child execution's envelope | The execution whose detached dispatch started this one — its **parent**, and never this envelope's own `execution_id`: a child is an execution of its own. Half of the pair a reader joins the parent's stub record to this envelope on, and the pair a receiver may dedupe on (§1.4); also half of what the child's id is derived from (`docs/durability.md` §3.2). |
+| `idempotency_key` | string | a child execution's envelope | The grammar §9.4 key of the dispatch that started this child: byte for byte the `idempotencyKey` of the parent's stub `"detached"` dispatch record (§5.1), so the join between the parent's entry and this envelope is string equality (§8). The other half of the pair (§1.4). |
+| `flow` | string | always | The flow that was run, as its typed address (grammar §2.2). On a child execution's envelope, the `flow.*` the dispatch targeted. |
+| `execution_id` | string | always | The execution the entries belong to — grammar §4.1's `execution.id`, and the prefix of every idempotency key in the document (grammar §9.4). On a child execution's envelope it is the **child's** own id — derived from `parent_execution` and `idempotency_key` (`docs/durability.md` §3.2) — under which its effects are journaled and every key in its entries is derived. |
+| `status` | `"completed"` \| `"failed"` \| `"interrupted"` | always | How the run ended: with an answer, without one, or holding a `human` pause it had no way to answer (grammar §8.7, §9). The third is told apart from the second because the two ask different things of whoever is reading — one is a run to look into, the other a question to answer — and because a reader may not decide it from the message text (§10.1). A child execution's envelope takes the first two only: a detached dispatch that could reach a `human` node is refused at build time (Decision D118), so a child never parks. |
 | `error` | string | on `"failed"` and `"interrupted"` | What stopped the run. Present on every document that carries neither answer, because such a run's last entry does not always say: a run stopped by the superstep ceiling has no aborting node to carry one. On `"interrupted"` it names the node that is waiting and where an answer would come from. |
-| `entries` | array of [entries](#3-entries) | always, possibly empty | Every entry the run recorded, in the order §3.1 fixes. Empty only on a run that recorded none at all — one that failed before any node produced an entry, which takes a failure the node a run aborts at cannot account for, since that node contributes one (§9). The trace **file** is not written for such a run (§1.2), so an empty array reaches a reader only as `run --format json`'s `trace` or a `serve` report's. On a detached delivery's envelope, the delivery instance's own entries — the trace a joined dispatch record's `inner` would have held, numbered from `step: 1` and ordered by §3.1 — and possibly empty for the same reason: a delivery that failed before any of its nodes produced an entry. |
+| `entries` | array of [entries](#3-entries) | always, possibly empty | Every entry the run recorded, in the order §3.1 fixes. Empty only on a run that recorded none at all — one that failed before any node produced an entry, which takes a failure the node a run aborts at cannot account for, since that node contributes one (§9). The trace **file** is not written for such a run (§1.2), so an empty array reaches a reader only as `run --format json`'s `trace` or a `serve` report's — or as a child execution's export, which ships whatever its run recorded. |
 
-**A detached delivery's envelope** is this record with three more keys at its
+**A child execution's envelope** is this record with three more keys at its
 head, in this order after `trace_version`: `detached`, `parent_execution`,
-`idempotency_key`. It is what a detached `flow.*` delivery ships when it settles
-(§1.4), and it is the only account of what the delivery did — its parent's entry
-carries the stub record and nothing else (§5.1). **This is an addition rather
-than a change**, under §10.2's first bullet: three fields added to an existing
-record type, present on an envelope of a class the sink did not carry before
-and on no other. An execution's own envelope is byte for byte what it was, the
-three surfaces other than the sink never carry the new class, and
-`idempotency_key` names no instance path a reader could not already find — it
-repeats the key the parent's stub record carries (§8). What moved is the sink
-contract of §1.4, which PRD resolved q64 moved: one POST per settled execution
-became two event classes.
+`idempotency_key` — the child's **cause**, where an execution a trigger started
+has none to write. Everything else about it is an execution's envelope, under
+the child's own `execution_id` (§1.4). Version `4` carried the same three keys on
+a different document — the envelope a detached `flow.*` *delivery* shipped of
+its own, whose `execution_id` was its **parent's** — and PRD resolved q65 made
+the delivery an execution, which changed what `execution_id` and
+`parent_execution` mean on it. That is §10.3's "changing the meaning of a
+field's value", and it is what version `5` is (§10.3.4).
 
 **Key spelling.** The envelope's keys are `snake_case`; an entry's are
 `camelCase`. The seam is deliberate rather than an oversight: the envelope's keys
@@ -588,8 +588,9 @@ before the instance has run a node, and the join never comes back for it
 joined dispatches and gets nothing from the detached ones — which is the same
 thing `outcome: "detached"` says, stated where the presence column is what §10.1
 makes reliable. The instance's trace is not lost, only elsewhere: a detached
-`flow.*` delivery ships it on an envelope of its own when it settles (§1.4),
-headed with an `idempotency_key` equal to this record's `idempotencyKey`.
+`flow.*` dispatch starts a **child execution**, which exports its own trace
+under its own id when it settles (§1.4), headed with an `idempotency_key` equal
+to this record's `idempotencyKey`.
 
 ### 5.1 Dispatch outcomes
 
@@ -616,17 +617,16 @@ headed with an `idempotency_key` equal to this record's `idempotencyKey`.
   and §7.2's "every model call that node execution made" is bounded by the same
   join that bounds the outcomes.
 
-  **What the delivery did is written somewhere else, and this record points at
-  it.** The rationale above is about the parent's entry and nothing more: that
-  entry is written when the join finishes, so a fuller one would be
-  nondeterministic. The delivery itself knows the moment it settles, and a
-  detached `flow.*` delivery ships an envelope of its own at that moment — the
-  trace sink's second event class (§1.4, PRD resolved q64): its entries in full,
-  a failed delivery's included, headed `detached: true`, `parent_execution` and
-  an `idempotency_key` that is **this record's `idempotencyKey`**, so a reader
-  joins the stub to the delivery's account by string equality (§2, §8). Nothing
-  of that envelope reaches this entry, and nothing about this record changes
-  because the envelope exists.
+  **What a detached `flow.*` did is written somewhere else, and this record
+  points at it.** The rationale above is about the parent's entry and nothing
+  more: that entry is written when the join finishes, so a fuller one would be
+  nondeterministic. A detached `flow.*` dispatch starts a **child execution**
+  (§1.4, PRD resolved q65) — an execution with its own id, journal and export —
+  and the child's envelope holds its entries in full, a failed child's included,
+  headed `detached: true`, `parent_execution` and an `idempotency_key` that is
+  **this record's `idempotencyKey`**, so a reader joins the stub to the child's
+  account by string equality (§2, §8). Nothing of that envelope reaches this
+  entry, and nothing about this record changes because the child exists.
 
 A `toolDispatches` record takes `"completed"` or `"failed"` and neither of the
 other two, and the two read as they do everywhere else: the instance answered and
@@ -744,8 +744,8 @@ attempt's would describe a run the store did not see. That is the same bound
 delivery is what "a node performs" does not reach, for the reason §5.1 gives:
 the node never waited for it, so whether its ops had happened by the time the
 entry was written is a matter of scheduling rather than a fact about the run. A
-detached `flow.*` delivery's ops are on the entries of the envelope it ships of
-its own (§1.4).
+detached `flow.*` dispatch's ops are a **child execution's**, on the entries of
+the envelope it exports under its own id (§1.4).
 
 "On *that* node's entry" is decided by where the op ran, and a fan-out has both
 shapes. A joined instance dispatched to an `agent.*` or a `tool.*` has no entry
@@ -801,9 +801,10 @@ not only the calls of the attempt that answered. A node that succeeded on its
 second attempt reports the first attempt's spent ladder too. A **detached**
 delivery's calls are not here, for the reason §5.1 gives: the node never waited
 for it, so what it had managed by the time the entry was written is a matter of
-scheduling. A detached `flow.*` delivery's calls are on the entries of its own
-envelope, which it ships when it settles (§1.4) — a detached coder review's
-harness runs, taped per PRD resolved q57, land there the same way.
+scheduling. A detached `flow.*` dispatch's calls are a **child execution's**, on
+the entries of the envelope it exports under its own id when it settles (§1.4) —
+a detached coder review's harness runs, taped per PRD resolved q57, land there
+the same way, and their transcripts on the child's journal record.
 
 "That node execution made" divides a fan-out exactly as §6 divides its store
 ops, and for the same reason — where the call was made. A joined instance
@@ -1134,23 +1135,30 @@ effects get distinct keys, and a repeated attempt at one effect reuses its key �
 so `deduped: true` on a store write means an earlier attempt of *this* effect had
 already been applied, rather than some other write colliding.
 
-**The key has one more reader, at the head of an envelope rather than inside
-one** (PRD resolved q64). A detached `flow.*` delivery's envelope carries
-`idempotency_key` beside `parent_execution` (§2): the key of the stub
-`"detached"` record the parent's entry holds, **repeated rather than derived
-afresh**, so it names no instance path the parent's trace does not already
-carry and grammar §9.4's list of carriers is unchanged — the key gains a reader,
-not a carrier. Both of the properties above are what that reader relies on.
-The first is the **join**: the parent's stub record and the delivery's envelope
-are the same dispatch exactly when the two strings are equal. The second is the
-**dedupe**: a recovered parent re-runs the delivery and re-ships its envelope
-under a new delivery id (§1.4), and a map node's own `retry:` re-issues it at
-the same path — both are a repeated attempt at one effect, so both carry the key
-the first attempt carried, and a receiver folds them on
-`(parent_execution, idempotency_key)`. Every key *inside* that envelope —
-its entries' store writes and dispatch records — is derived from the delivery's
-path exactly as a joined instance's are, so each begins with the envelope's own
-`idempotency_key`.
+**The key has more readers, at the head of an envelope rather than inside one**
+(PRD resolved q64, q65). A detached `flow.*` dispatch starts a child execution,
+and three things read its key:
+
+* **the child's identity.** The child's execution id is derived from its
+  parent's id and this key (`docs/durability.md` §3.2), so the key's two
+  properties below are what make one dispatch name one child in every
+  generation — a recovered parent that re-issues the dispatch, or a map node's
+  own `retry:` that re-issues it at the same path, derives the child it already
+  started rather than a second one;
+* **the join.** The child's envelope carries `idempotency_key` beside
+  `parent_execution` (§2): the key of the stub `"detached"` record the parent's
+  entry holds, **repeated rather than derived afresh**, so it names no instance
+  path the parent's trace does not already carry and grammar §9.4's list of
+  carriers is unchanged — the key gains a reader, not a carrier. The parent's
+  stub record and the child's envelope are the same dispatch exactly when the
+  two strings are equal;
+* **the dedupe.** A receiver that keys a child on
+  `(parent_execution, idempotency_key)` folds every account of one dispatch
+  into one (§1.4).
+
+Every key *inside* a child's envelope — its entries' store writes and dispatch
+records — is derived from the child's own id, beginning with its
+`execution_id`, because a child is an execution of its own.
 
 The second property is **positional** across a flow-tool frame, and grammar §9.4
 says so openly: an agent-node `retry:` restarts the call ordinals, so the Nth
@@ -1434,6 +1442,53 @@ PRD §9.22). That is a change to the *runtime*, but it reaches a reader of versi
   node, so no version-`3` run ever had a call standing behind one.
 
 Nothing was removed or renamed, no field was added, and no order changed.
+
+### 10.3.4 What version `5` changed
+
+A detached `flow.*` dispatch now starts a **child execution** (PRD resolved
+q65): an execution with its own id, journal, recovery and export, where version
+`4` ran the same work as a *delivery* under its parent's id and shipped an
+envelope of its own for it — the trace sink's second event class, which PRD
+resolved q64 had added one release before. The ruling collapsed that class into
+the first, and it reaches a reader of version `4` through the same three head
+fields q64 defined, in the one way §10.3 does not forgive:
+
+* **`execution_id` changed meaning on the envelope that carries `detached`.**
+  Under `4` it was the **parent's** id — the delivery ran under it — and it is
+  now the **child's** own, derived from the parent's id and the dispatch's key
+  (`docs/durability.md` §3.2). A reader of `4` that filed a `detached` envelope
+  under its `execution_id` filed it under the parent; the same reader now files
+  it under the child, which is the correct place and a different one. That is
+  "changing the meaning of a field's value", and it is the bump;
+* **`parent_execution` changed with it.** Under `4` it was equal to
+  `execution_id` on the same envelope, by construction; under `5` it never is.
+  Its meaning — the execution whose dispatch this was — is unchanged, and it is
+  the half of the pair that says so;
+* **the envelope moved ledgers, and its entries' keys moved with it.** It rides
+  the child's own ledger rather than its parent's (`docs/durability.md` §3.7),
+  and every idempotency key inside it — derived from the execution id, as every
+  key is (§8) — now begins with the child's id rather than with the parent's
+  dispatch path. §10.3 bumps for "changing the derivation of an idempotency key,
+  or where instance paths appear", and this is both, on this one envelope;
+* **the OTLP root is keyed by the child's id.** Under `4` the root of a
+  detached export was keyed by the envelope's `idempotency_key`, to keep it off
+  the parent root's span id; a child's id is its own, so the ordinary rule
+  applies and the special one is gone (§12.2). The trace and the root's parent
+  are what they were: the parent's trace, under the parent's root span;
+* **a child that is still running when its parent settles is recovered, and
+  exported once.** Under `4` a delivery still in flight when its parent's row
+  closed was lost, and a recovered delivery re-shipped under a new delivery id;
+  under `5` a child is an open execution that `serve` resumes, and its export is
+  guarded once per execution like any other (§1.4).
+
+What did **not** move: the three head fields' names, types, order and presence
+rule (on the envelope of a child, and of nothing else); the parent's envelope,
+byte for byte, with its stub `"detached"` record (§5.1); the wire, one event
+under `X-AgentCompose-Event: settled`; and every envelope an execution a trigger
+or a command started ships, which changed only its `trace_version`. A journal a
+version-`4` build wrote may still hold a detached envelope on a parent's ledger;
+this build delivers such a row as it was written — its `trace_version` says `4`
+— and never counts it as the parent's export (`docs/durability.md` §11.2).
 
 ### 10.4 How the two are held together
 
@@ -1740,7 +1795,7 @@ array, in the walk order §12.1 fixes.
 
 | trace record | span |
 |---|---|
-| the **execution** | the root span. Named for the flow (`flow.review_loop`), and parented by the caller's span where §12.3 gives it one. A **detached delivery's** envelope (§1.4) is rooted at the delivery instead: named for its `flow.*`, and parented by its parent execution's root span (§12.2) |
+| the **execution** | the root span. Named for the flow (`flow.review_loop`), and parented by the caller's span where §12.3 gives it one. A **child execution's** root (§1.4) is parented by its **parent** execution's root span instead (§12.2) |
 | each **entry**, at every depth | a span under whatever ran it: the root for a top-level entry, the enclosing entry's span for one under `inner`, the dispatch's span for one under a dispatch record. Named for the node id |
 | each **dispatch record**, on `dispatches` and on `toolDispatches` alike | a span under its entry's, named for the record's `target` |
 | each **model call** | a span under its entry's, named for the `model.*` the agent asked for. `kind` is `3` (client) — the call leaves the process for another service |
@@ -1796,27 +1851,19 @@ retry and what lets the conformance corpus pin exact output.
   envelope wrote it.
 * Neither id is ever **all zero**, which the W3C trace context forbids.
 
-**A detached delivery's export is rooted where it ran** (§1.4, PRD resolved
-q64). Its envelope's `execution_id` is its parent's, so the rules above would
-give its root the parent root's very span id — two roots of one id, one span to
-a collector. Three things differ for it, and nothing else does:
+**A child execution's export is filed under its parent** (§1.4, PRD resolved
+q64, q65). A child is an execution with an id of its own, so every span id its
+export derives is its own by the rules above — nothing it exports can take an id
+of its parent's. Two things place it:
 
-* its **trace** is its parent's: the one the shared execution id derives, or the
-  caller's where a valid `traceparent` started the parent (§12.3) — the delivery
-  lands in the trace its parent's export lands in;
-* its **root is keyed by the envelope's `idempotency_key`** rather than by the
-  execution id, and every key beneath it is built on that one, exactly as a
-  dispatch record's `inner` is built on its record's key — so no span of the
-  delivery's export can take an id of its parent's, and the entries' instance
-  paths hang off the dispatch's own path;
+* its **trace** is its parent's: the one the **parent's** execution id derives,
+  or the caller's where a valid `traceparent` started the parent (§12.3) — the
+  child lands in the trace its parent's export lands in, since a collector files
+  a child under the run that dispatched it rather than beside it;
 * its root's **parent is the parent execution's root span**, whose id is a
-  function of the execution id alone (the root key above) and so is known
-  without the parent's export in hand. Not a caller's span: the caller started
-  the parent, not the delivery.
-
-Two exports of one delivery — a re-ship after recovery — derive the same ids,
-which is the same statement §1.4's dedupe on `(parent_execution,
-idempotency_key)` makes about the envelope.
+  function of the parent's execution id alone (the root key above) and so is
+  known without the parent's export in hand. Not a caller's span: the caller
+  started the parent, and the parent's dispatch started the child.
 
 A **link** is how a flow-as-tool call reaches the instance that answered it. Its
 `ToolCallRecord.instance` is a dispatch record's `idempotencyKey` (§7.3), so the
@@ -1869,9 +1916,8 @@ section, and §10.2's compatible-change list is untouched with it.
 trace entry carries a superstep number and a traversal ordinal, not a clock. So:
 
 * the **root span** covers the execution's window — its journaled `startedAt`
-  (`docs/durability.md` §3.5) to the instant the export was journaled. A
-  detached delivery's export covers the delivery's own: the instant it was
-  issued to the instant it settled (§1.4);
+  (`docs/durability.md` §3.5) to the instant the export was journaled. A child
+  execution's is its own window, from its own row, like any execution's;
 * **every other span** covers the same window, except an entry whose `human`
   pause gives it one of its own: that span runs from `pausedAt` to `settledAt`,
   or to the execution's end where nothing settled it (§3.4);
@@ -1921,7 +1967,7 @@ or a row promising one nothing sets.
 | `agentcompose.flow` | root, entry | the envelope's `flow`; an entry's own `flow` |
 | `agentcompose.status` | root | the envelope's `status` |
 | `agentcompose.trace_version` | root | `TRACE_VERSION` — how a reader on a collector pins the format (§1) |
-| `agentcompose.detached`, `agentcompose.parent_execution`, `agentcompose.idempotency_key` | root of a detached delivery's export | the envelope's head — `detached` as a boolean, `parent_execution` and `idempotency_key` as strings (§2). How a collector tells the sink's two event classes apart, and the pair it dedupes a re-shipped delivery on (§1.4); on the root of no other export |
+| `agentcompose.detached`, `agentcompose.parent_execution`, `agentcompose.idempotency_key` | root of a child execution's export | the envelope's lineage head — `detached` as a boolean, `parent_execution` and `idempotency_key` as strings (§2). How a collector tells a child execution from one a trigger started, and the pair it joins the child to its parent's stub record on (§1.4); on the root of no other export |
 | `agentcompose.error` | root, entry, dispatch, tool-call event | that record's `error` |
 | `agentcompose.instance_path` | entry, dispatch, store event, tool-call event, link | §8's path — an entry's derived, a dispatch's read off its `idempotencyKey` |
 | `agentcompose.node`, `agentcompose.step`, `agentcompose.traversal`, `agentcompose.outcome`, `agentcompose.attempts` | entry | the entry's own fields |

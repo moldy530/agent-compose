@@ -383,6 +383,10 @@ exec_01/outer/0/3/inner/0/0/save/0   `save` under item 0 of `inner`, itself item
 exec_01/dispatch/0/7                 the detached dispatch of item 7 by map node `dispatch`
 ```
 
+A detached dispatch to a `flow.*` reads its key once more: the **child
+execution** it starts takes an id derived from its parent's and this key, so one
+dispatch names one child however many times it is re-issued.
+
 Two properties follow: **distinct effects get distinct keys**, and **a repeated
 attempt at one effect reuses its key** — a node retry, an item retry, and a
 `flow:` node's re-execution all re-run the same attempt.

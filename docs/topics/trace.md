@@ -17,7 +17,7 @@ Four surfaces carry the same entries and differ in what surrounds them:
 | `agent-compose run --format json` | one JSON object on **stdout**, whose `trace` is the array of entries |
 | the trace **file** | one JSON object — the whole envelope — under the project's data directory |
 | `agent-compose serve` status | `GET /executions/:id`, and the `callback:` webhook body |
-| the **trace sink** | two event classes to the address a deploy file's `trace_sink:` names: one POST per settled execution, and one per settled detached `flow.*` delivery |
+| the **trace sink** | one POST per settled execution — a child execution a detached `flow.*` dispatch started included — to the address a deploy file's `trace_sink:` names |
 
 On the first three, wherever a `trace` appears the `trace_version` describing it
 appears beside it, and wherever one is absent so is the other.
@@ -30,17 +30,19 @@ one-shot `run` alike. It is a journaled delivery like a `callback:` webhook:
 bounded retry, ordered per execution, signed with the same headers when the sink
 declares `auth:`, and **never** able to block or fail the run it describes.
 
-The sink carries a second kind of POST. A `map` route with `detach: true` to a
-`flow.*` runs real nodes nobody waits for, and its parent's trace holds only a
-stub `"detached"` dispatch record for it — so when that delivery **settles**,
-completed or failed, it ships an envelope of its own: its entries in full, model
-calls and store ops included, headed `detached: true`, `parent_execution` and an
-`idempotency_key` equal to the stub record's `idempotencyKey`, which is how a
-receiver joins the two. A `serve` restart that recovers the parent re-runs the
-delivery and ships it again, so a receiver dedupes these on
-`(parent_execution, idempotency_key)`. Detach is legal only under `--target
-local`, so this second class exists only where a `deploy/local.yml` declares a
-sink. `docs/trace.md` §1.4 is normative.
+A `map` route with `detach: true` to a `flow.*` starts a **child execution**:
+an execution of its own, with an id derived from its parent's and the dispatch's
+idempotency key, its own journal, its own recovery — a child still running when
+its parent settled is resumed by the next `serve` — and its own export. Its
+parent's trace holds only a stub `"detached"` dispatch record for it; the
+child's envelope, shipped when it settles, completed or failed, holds its
+entries in full, model calls, store ops and harness runs included, headed
+`detached: true`, `parent_execution` and an `idempotency_key` equal to the stub
+record's `idempotencyKey`, which is how a receiver joins the two — and the pair
+a receiver may dedupe on, since one dispatch names one child. Its `execution_id`
+is the child's own. Detach is legal only under `--target local`, so a child
+exists only where a `deploy/local.yml` allows it. `docs/trace.md` §1.4 is
+normative.
 
 Its body is the envelope, or — under `format: otlp` — an OTLP/JSON
 `ExportTraceServiceRequest` mapped from that same envelope: the execution as the

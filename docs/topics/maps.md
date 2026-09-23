@@ -186,10 +186,13 @@ permit to *start*, the join just never waits on its outcome.
 
 In the trace, the map node's entry records a detached dispatch as a stub —
 `outcome: "detached"`, `attempts: 0`, no `inner` — and nothing the delivery goes
-on to do. A detached `flow.*` delivery's own account is elsewhere: under a
-target that declares a `trace_sink:`, it ships an envelope of its own when it
-settles, headed `detached: true` and an `idempotency_key` equal to the stub's
-(`agent-compose docs trace`).
+on to do. A detached **`flow.*`** dispatch starts a **child execution**: an
+execution of its own, with an id derived from the parent's and the dispatch's
+idempotency key, its own journal and recovery — a child still running when its
+parent settles is resumed by the next `serve` — and, under a target that
+declares a `trace_sink:`, its own export, headed `detached: true` and an
+`idempotency_key` equal to the stub's (`agent-compose docs trace`). The parent
+never waits for it; a `run` command does, before it exits.
 
 In v0, `detach: true` is a validation error under any target whose execution
 state is durably checkpointed — every target except `local`. The same

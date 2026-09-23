@@ -426,8 +426,8 @@ generation's trace would say the node called no model at all.
 It also holds `served`, the route member that answered, in its own right rather
 than as the last of those records. Where the node is collecting them the two are
 the same call and the field is redundant; where it is **not**, it is the only
-account of who answered — a detached `map` delivery runs with the node's
-collectors detached (Decision D94, §3.2), so its record's list of filed calls is
+account of who answered — a detached `map` delivery to an `agent.*` runs with the
+node's collectors detached (Decision D94, §3.2), so its record's list of filed calls is
 empty by construction and a replay that read the answerer off the tail of that
 list would fail a resume whose composition nobody had touched.
 
@@ -547,34 +547,61 @@ posture and not the trace's: `docs/trace.md` §11 keeps a tool's answer out of t
 trace, and this record is private recovery data that a `run --format json` never
 carries.
 
-A **detached** `map` delivery (`docs/grammar.md` §8.6 rule 7) is journaled like
-any other effect under the dispatch's own instance path. Its outcome is never
-observed by the join (Decision D94) and nothing about the parent's trace
-changes; what the record buys is that a replay does not deliver it twice.
+A **detached** `map` delivery to an `agent.*` or a `tool.*`
+(`docs/grammar.md` §8.6 rule 7) is journaled like any other effect under the
+dispatch's own instance path. Its outcome is never observed by the join
+(Decision D94) and nothing about the parent's trace changes; what the record buys
+is that a replay does not deliver it twice.
 
-A detached **`flow.*`** delivery is also where the trace sink's second event
-class comes from (`docs/trace.md` §1.4, PRD resolved q64): when it settles it
-ships an envelope of its own. That envelope is a delivery on the parent's
-ledger (§3.7) and nothing else — no lifecycle row, no journal of its own, no
-record this section does not already write — because the delivery is not an
-execution: its effects stay journaled under the parent's id, and replay is
-untouched. Its recovery is the parent's. A generation that resumes the parent
-re-runs the delivery, replaying what this section holds, and the delivery
-re-ships on **that** settlement under a new delivery id — so the envelope is
-at-least-once across recovery, and a receiver dedupes it on
-`(parent_execution, idempotency_key)` rather than on the delivery id. A
-delivery that meets a divergence ships nothing (§7: a divergence fires
-nothing), and one still in flight when a settled parent's process dies is not
-recovered, because nothing resumes a settled execution. A divergence raised
-inside one is the exception to rule 7's "nothing it does can delay the enclosing
-flow instance" — §7 makes a divergence un-absorbable by any policy, and
-`detach:` is a policy — so it is held against the execution and fails it: at the
-next effect any branch of the run reaches, or on the way out of `runFlow` for a
-run with none left.
+A detached **`flow.*`** dispatch is not a delivery at all: it starts a **child
+execution** (PRD resolved q65) — an execution of its own, with its own lifecycle
+row (§3.5), its own records, its own recovery (§6.1) and its own export
+(`docs/trace.md` §1.4). Every effect the child runs is journaled **under the
+child's id**, at the child's own sites — its flow's node paths, exactly as if a
+trigger had started it — with its payloads, a coder node's harness records
+(§3.9) among them. Nothing is journaled on the parent's record at the dispatch's
+site, and nothing needs to be: a parent that replays re-issues the dispatch, and
+the dispatch finds its child. Every execution has a cause — a trigger, or a
+detached dispatch from another execution's node — and a child's is on its
+lifecycle row.
+
+**The child's id is derived, never minted**: `exec_` and a version-8 UUID
+(RFC 9562) whose 122 free bits are the leading bits of SHA-256 over
+`agent-compose/execution/v1`, the parent's execution id and the dispatch's
+`docs/grammar.md` §9.4 idempotency key, newline-separated — the version nibble
+`8` and the variant bits `10` laid over the rest. It has the shape of every minted
+id, so every reader of one, and every bound on one (§10), reads the other. And one
+dispatch names **one child in every generation**: the key is positional, so a
+replayed dispatch or a map node's own `retry:` derives it again, and distinct per
+dispatch site, so two dispatches never name one child. A dispatch reads the
+child's row to decide what it is:
+
+| the child's row | what the dispatch does |
+|---|---|
+| none | begins the child — its lineage (§3.5), its parent's session and trigger, the inputs the dispatch bound — and runs it |
+| `open` | resumes it: replays it to its frontier (§5) under the inputs its row recorded, its model not asked again for anything its record holds |
+| `completed` or `failed` | nothing: the child already ran to its end, and nothing resumes a settled execution (resolved q28) |
+
+**The join does not move** (Decision D94). The parent counts the dispatch the
+moment it is issued, whichever of the three it is, `attempts` is `0`, and the
+parent never learns the child's outcome. A child that fails fails on its own —
+its row says so and its export ships its outcome — and so does a **divergence**
+inside one: it holds the *child* open, as it would any execution (§7), and
+reaches the parent not at all. A child never parks, because Decision D118 refuses
+a detached dispatch that could reach a `human` node; and Decision D28's
+admission bound covers it exactly as it covered the delivery it replaced — the
+map node's permits are held until the child settles.
+
+A divergence raised inside a detached `agent.*` or `tool.*` delivery is the
+exception to rule 7's "nothing it does can delay the enclosing flow instance" —
+§7 makes a divergence un-absorbable by any policy, and `detach:` is a policy — so
+it is held against the execution and fails it: at the next effect any branch of
+the run reaches, or on the way out of `runFlow` for a run with none left.
 
 What no *flow instance* waits for is the delivery itself, which is rule 7. The
-**execution** waits on the way out, on the two occasions where a delivery still
-in flight changes what the run has to decide.
+**execution** waits on the way out for its `agent.*` and `tool.*` deliveries, on
+the two occasions where a delivery still in flight changes what the run has to
+decide.
 
 The first is a run whose lifecycle row stays **open** (§3.6) — parked at a
 `human` pause, or stopped by a divergence. Such a run is one a resume replays,
@@ -595,6 +622,12 @@ removed under the resume it was being kept for.
 
 A **first** generation that ended waits for nothing, because nothing will replay
 it — and a divergence cannot arise in one.
+
+**No execution waits for a child.** A child has a row of its own to replay, so
+what it had not finished when its parent's process walked away is on its own
+record, not an effect of its parent's with no row, and a divergence inside it is
+its own. What waits for a child is the **process** that would otherwise end with
+it running — `agent-compose run` (§6.2).
 
 ### 3.3 A store op
 
@@ -687,10 +720,11 @@ One row per execution, written before the graph is streamed:
 |---|---|
 | `id` | the execution id — what `resume` takes and what the trace's envelope carries |
 | `flow` | the flow's typed address |
-| `trigger` | what started it: `manual` for `agent-compose run` and for a `manual` trigger, an `http` trigger's own name where one did. **Recorded and never dispatched on** — resolved q28: recovery replays executions that exist, it does not re-fire the trigger that created them. It is *read* for one thing besides diagnosis: this execution's resume and status routes enforce the `auth:` of the trigger that started it, and a `serve` restarted while somebody was thinking has no other way to know which that was (`docs/grammar.md` §13.3, PRD resolved q32) |
+| `trigger` | what started it: `manual` for `agent-compose run` and for a `manual` trigger, an `http` trigger's own name where one did — and on a **child execution**, its parent's, so the `auth:` that guards the parent guards what it dispatched. **Recorded and never dispatched on** — resolved q28: recovery replays executions that exist, it does not re-fire the trigger that created them. It is *read* for one thing besides diagnosis: this execution's resume and status routes enforce the `auth:` of the trigger that started it, and a `serve` restarted while somebody was thinking has no other way to know which that was (`docs/grammar.md` §13.3, PRD resolved q32) |
 | `inputs` | the invocation's inputs, as the flow's `inputs:` parsed them |
 | `sessionKey` | the session identity `scope: session` stores key off (`docs/grammar.md` §11.3) |
 | `callback` | where this execution's lifecycle webhooks go, for an `async` `http` trigger that asked for one (`docs/grammar.md` §13.3) — absent for every other invocation. Recorded because the process that *finishes* an execution need not be the one that started it (§6.1), and resolved when the request arrives rather than when the run ends, which is what makes that possible. The URL only: the request it came out of is not kept. §3.7 is what is delivered to it |
+| `lineage` | what started a **child execution** (§3.2, PRD resolved q65): the `parent` execution's id, the dispatch's `idempotency_key`, and its `item_index` where a `map` dispatched it — the value `execution.item_index` holds everywhere inside the child (Decision D115). Absent on every execution a trigger or a command started. Held in a table of its own, `lineage`, keyed by the execution id, rather than as columns here: a whole table is what `CREATE TABLE IF NOT EXISTS` adds to a journal an older build wrote, on every backend, with no column probe on any of them (§11.2). It is written **before** the lifecycle row, so a process that dies between the two leaves a lineage row nothing reads rather than a child that has forgotten its cause |
 | `status` | `open`, `completed` or `failed` — §3.6 |
 | `journalVersion` | the version at the head of this document |
 | `startedAt`, `endedAt`, `error` | when, and why it failed |
@@ -723,17 +757,15 @@ are worked:
 * a **trace sink** export, which the deploy layer's `trace_sink:` subscribed to
   for every execution the deployment settles (`docs/grammar.md` §14.5, PRD
   resolved q50). One per settled execution, carrying the trace envelope
-  `docs/trace.md` §2 specifies or the OTLP/JSON §12 maps it to — and, the
-  sink's second event class, one per settled **detached `flow.*` delivery**,
-  carrying that delivery's own envelope (`docs/trace.md` §1.4, PRD resolved
-  q64). A delivery's envelope is a row on the ledger of the execution it ran
-  under, because a detached delivery is not an execution: it has no lifecycle
-  row and no journal of its own. It is on that ledger and not in that
-  execution's **report**: the status route's `deliveries`, which every `parked`
-  and `settled` webhook carries (`docs/grammar.md` §13.3), lists the
-  execution's own deliveries and leaves a delivery's envelope out — it is not
-  one of the execution's lifecycle events, and it is journaled while the
-  execution may still be running or parked.
+  `docs/trace.md` §2 specifies or the OTLP/JSON §12 maps it to — a **child
+  execution's** included (§3.2, PRD resolved q65), on the child's own ledger and
+  headed by its lineage (`docs/trace.md` §1.4). A journal a build before q65
+  wrote may hold one more kind of sink row: the envelope that build shipped for
+  a detached `flow.*` *delivery*, on its **parent's** ledger (PRD resolved q64).
+  Such a row is delivered as it was written, and it is neither the parent's
+  export nor in the parent's **report**: the status route's `deliveries`, which
+  every `parked` and `settled` webhook carries (`docs/grammar.md` §13.3), leaves
+  it out, as it always did.
 
 Nothing in the composition dispatches either: the graph does not know the
 subscription exists, no instance path addresses it, and no replay ever consumes
@@ -748,7 +780,7 @@ What is recorded, and in this order (PRD resolved q35, q50):
 | `execution`, `ordinal` | who it is about, and which of that execution's lifecycle events it is. The ordinal is **monotonically increasing per execution across every kind and event** and is allocated in the journal, so a restart cannot reuse one |
 | `id` | `<execution_id>:<ordinal>` — the `X-AgentCompose-Delivery` header, and what a receiver dedupes on. The same on every attempt |
 | `kind` | `callback` or `trace_sink` — who asked. A row written before the ledger recorded this is a `callback`, which is the only kind that existed then |
-| `event` | `parked` or `settled`. A `trace_sink` row is always `settled`: it is the record of a run that has stopped — or, for a detached delivery's envelope, of a delivery that has. The two are told apart by the body's head (`docs/trace.md` §1.4) rather than by a column, and a settle's "is this execution already exported?" asks about the execution's own export only |
+| `event` | `parked` or `settled`. A `trace_sink` row is always `settled`: it is the record of a run that has stopped — a child execution's included — or, on a journal a build before PRD resolved q65 wrote, of a detached delivery that had. The two are told apart by the body's head (`docs/trace.md` §1.4) rather than by a column: the older row's `parent_execution` names the very execution whose ledger it is on, which no child's export ever does. A settle's "is this execution already exported?" asks about the execution's own export only |
 | `trigger` | the trigger whose `callback_auth:` signs this delivery and whose `callback_allow:` admits its URL (`docs/grammar.md` §13.3). On the delivery rather than read off the execution's lifecycle row when it is picked up, because one delivery has no lifecycle row to read: the `settled` journaled for a run that failed **before** it was journaled at all. A start that could not name that row's trigger could neither send it nor end it, and `pending` is neither of the two ends below. A `trace_sink` row carries none — the identity it signs with is the deploy layer's own, so there is nothing for a later start to look up |
 | `url` | the callback URL the request payload named, resolved when the request arrived (§3.5); or, on a `trace_sink` row, the address the deploy file wrote |
 | `body` | the exact bytes every attempt POSTs. Bytes rather than a value, because a signature is over what is sent: a body re-serialized on a later attempt, or in a later process, would be a second delivery wearing the first one's id |
@@ -884,13 +916,15 @@ of `src/journal.ts`; `deliver` and `opening` in `src/serve.ts` for the half that
 is a trigger's — resolving a callback URL and holding it to `callback_allow:` —
 and `shipping` there for the trace; `owed` and `settled` in `src/cli.ts` for the
 `resume` and `run` above; and `runtime.executionReport` writing the report body a
-callback and the status route both publish. A detached delivery's envelope is
-`shipDetachedTrace` and `journalDetachedTrace` in `src/delivery.ts`, reached from
-`runtime.watchDetachedSettlements` — which `src/serve.ts`'s `exportingDetached`
-and `src/cli.ts`'s `execute` subscribe to — and `runtime.traceSinkClass` is the
-one reader that tells an execution's own export from one of those: a settle's
-guard asks it through `executionExport` there, and `runtime.executionReport`
-asks it to leave a delivery's envelope out of the report. `attemptDelivery` is the one
+callback and the status route both publish. A child execution's export is
+`shipTrace` like any other, which reads the child's lineage off its row and heads
+the envelope through `runtime.traceDocument` — reached from `src/serve.ts`'s
+`trackChild` and `src/cli.ts`'s `execute`, each of which hosts the runner a
+detached dispatch starts a child with (`runtime.hostChildren`) — and
+`runtime.traceSinkClass` is the one reader that tells an execution's own export
+from the older build's envelope on a parent's ledger: a settle's guard asks it
+through `executionExport` there, and `runtime.executionReport` asks it to leave
+such a row out of the report. `attemptDelivery` is the one
 declaration in the emitted app that reaches the network for a delivery, which is
 why §3's primitive walk names it as an exemption and
 `crates/compose-core/src/codegen/journal.rs`'s
@@ -1258,6 +1292,21 @@ on:
   written by another compiler release (§11) — and every one of those leaves the
   row open while looking like an ordinary failure. A caller is told an execution
   failed only where the run really ended;
+* a **child execution** (§3.2) is recovered like every open execution, and
+  that includes the case PRD resolved q65 was ratified from: a child still
+  running when its **parent had already settled**, which used to be lost with the
+  process. It replays to its frontier — its model not asked again for anything
+  its record holds — settles, and exports under its own id. It is on the status
+  route by that id, guarded by its parent's trigger's `auth:` (§3.5);
+* **one open child is one generation**, however many ways recovery reaches it.
+  A restart can reach an open child from two directions at once — this walk
+  finds its row, and its parent, open too, replays to the detached dispatch and
+  re-issues it — and both derive the same id. The process keeps one generation
+  per child id and the second arrival **joins** the first rather than opening
+  the child's record again, so the child's effects are issued once and its
+  record has one writer (`runtime.dispatchChild`, `runtime.resumeChild`). Across
+  processes the rule is the journal's own: one process writes a project's
+  journal (§2.1, PRD resolved q42);
 * recovery **does not wait** for the replays to finish. The executions it
   recovers are by definition ones that were still running, and the commonest of
   them is parked on a question nobody has answered yet. Registering them is what
@@ -1290,6 +1339,14 @@ declares is reported on stderr and left open for the same reason.
 
 Because recovery takes every open execution, an execution worth resuming by hand
 is one no `serve` is running — see §2 on what is outside the promise.
+
+**A stop leaves every execution where it was**, child executions included. A
+`serve` that receives `SIGINT` or `SIGTERM` closes and exits without waiting for
+the executions in flight — a parent's or a child's — and that is the durability
+contract rather than a gap in it: each is an open row, so the next start
+recovers it, a child whose parent had already settled among them. What a stop
+costs is the one effect each was in the middle of, which is §2's window for any
+execution.
 
 ### 6.2 `run` journals; `resume` replays
 
@@ -1340,6 +1397,20 @@ execution it puts back.
 | unknown id | the id is not one this journal holds, and the executions it does hold open |
 | already ended | the execution has already `completed` or `failed`, when, and why re-running it is not what a reader wants |
 | flow no longer declared | which flow the execution was running and which flows this build has |
+
+**And `run` waits for the children it started.** A detached `flow.*` dispatch
+starts a child execution (§3.2) that the run itself never waits for — nothing a
+detached dispatch does can delay the flow instance that issued it — so a `run`
+reports as soon as its own execution has, and then the **command** waits: until
+every child it started has settled, and every child those started, before it
+exits. A process that ended under a running child would end in the middle of an
+effect with no record, which the generation that resumes the child issues a
+second time, and a command has no later start to resume it from. Each child
+settles and exports like any execution, and the command sends each export after
+its own — the same "every offset already due" posture as its own trace (§3.7).
+A `resume` of a parent does the same, and a `resume` of a **child** is a resume
+like any other: it replays the child under the inputs its row recorded, and the
+trace file it writes carries the child's lineage head (`docs/trace.md` §1.2).
 
 ### 6.3 Triggers fire once
 
@@ -1517,12 +1588,16 @@ express something no consumer of the trace has asked for: the trace answers
 it. A reader who needs the other question — "what did *this process* do" —
 reads the journal, which timestamps every record.
 
-**`TRACE_VERSION` is unchanged at `4`.** Nothing in `docs/trace.md` moved: no
-field was added, removed or renamed, no presence rule widened or narrowed, no
-closed enumeration gained a member, no fixed order changed, and neither the
-derivation of an idempotency key nor where instance paths appear moved (§10.3's
-list, item by item). The journal is a separate artifact with a version of its
-own, which is the whole reason it can carry what §11 forbids the trace.
+**The journal moved nothing in the trace.** Replaying an execution added no
+field, removed or renamed none, widened or narrowed no presence rule, gave no
+closed enumeration a member, changed no fixed order, and moved neither the
+derivation of an idempotency key nor where instance paths appear (§10.3's list,
+item by item) — so `TRACE_VERSION` did not move for it. (It is `5` since PRD
+resolved q65, for a reason of its own: a detached `flow.*` dispatch became a
+child execution, and the envelope that carries `detached` changed what its
+`execution_id` means — `docs/trace.md` §10.3.4.) The journal is a separate
+artifact with a version of its own, which is the whole reason it can carry what
+§11 forbids the trace.
 
 ## 10. Backends, and what binds what
 
@@ -1589,8 +1664,9 @@ value this project writes.
 
 * **A value the caller decides the size of is `LONGTEXT`** — every payload,
   every request, an execution's `inputs`, a delivery's `body` and `attempts`, a
-  dispatch's `inputs`, `history` and `policy`, a node address, a placement, and
-  an instance `site`. So is `executions.error`, which is a provider's whole
+  dispatch's `inputs`, `history` and `policy`, a node address, a placement, an
+  instance `site`, and a child's `lineage.idempotency_key`, which is an instance
+  path under its parent's id. So is `executions.error`, which is a provider's whole
   failure body or a harness run's quoted transcript: a `failed` outcome the
   server refused would leave the lifecycle row `open` for ever, so every later
   `serve` start would re-recover an execution that has already finished.
@@ -1598,9 +1674,11 @@ value this project writes.
   are four bounds. `VARCHAR(2048)` on `effects.key` and `dispatches.wait` — the
   halves of a compound primary key that are not fixed-shape ids, and the pair
   whose arithmetic has to stay inside InnoDB's 3072-byte index limit.
-  `VARCHAR(255)` on every id the runtime mints, which is a four-character prefix
-  and a UUID: `executions.id`, `effects.execution`, `deliveries.execution`,
-  `dispatches.execution`, `dispatches.id` and `dispatches.session`.
+  `VARCHAR(255)` on every id the runtime mints or derives, which is a
+  four-character prefix and a UUID: `executions.id`, `effects.execution`,
+  `deliveries.execution`, `dispatches.execution`, `dispatches.id`,
+  `dispatches.session`, and `lineage.execution` and `lineage.parent` — a child
+  execution's derived id has a minted one's shape (§3.2).
   `VARCHAR(16)` on the `status`, `kind`, `event` and `outcome` columns, each a
   closed set of words this compiler emits. `VARCHAR(32)` on every instant, which
   is an ISO-8601 string of 24.
@@ -1779,6 +1857,46 @@ worker of this release can hand a hub of `1` a result that hub will read as a
 node which answered nothing, and no refusal stands between them until the version
 says so. A journal has one reader per file and one arrow of time, so the same
 new shape is compatible here and breaking there.
+
+**Child executions arrived under the physical-schema clause too** (§3.2, PRD resolved q65),
+and they are the change to read this section for twice, because two things moved
+at once. The **schema** is the easy half: a child's lineage is a table of its own
+(§3.5), created on first open like the two ledgers, so a journal written before
+it opens unchanged and every execution in it reads as one a trigger started —
+which is what every one of them was.
+
+The **records** are the half §11.3's last bullet is about. A build before the
+ruling ran a detached `flow.*` delivery under its parent's id, so every effect
+that delivery made while its parent's session was open is on the **parent's**
+record, at the dispatch's own instance path — and this build journals the same
+work under the child's id. Read naively that is "which sites are journaled"
+moving, and a parent the older build left open (parked at a `human` pause, or
+killed) would re-issue its dispatch under this build and begin the child empty:
+its model asked again, a review posted twice. So the records **move with the
+delivery**. When a dispatch finds no child row, the parent's records at or under
+the dispatch's site — which this build never writes, so any there is one an older
+build wrote — are carried over to the child's id before it runs, each re-keyed by
+stripping the dispatch's path from its site (the ordinals were counted per site,
+and a bijection of sites keeps every one of them), its refusal mark with it; the
+child then begins as a resuming generation and replays them to its frontier. A
+request identity that named the parent — a `scope: execution` store's partition
+is the execution's — no longer matches what the child asks, and replays as the
+divergence it is (§7): the resume stops rather than re-issuing, which is §11.3's
+line between a compatible change and a bump. The carrying is idempotent, since an
+append is a no-op on a key the child already holds.
+
+What an older journal cannot give back is what it never held: a delivery whose
+parent's session had already closed recorded nothing, under either build, and a
+delivery in flight when its parent **settled** had no recovery then and has no
+row to be recovered from now. Its sink envelope, if it shipped one, stays on the
+parent's ledger and is delivered as written (§3.7).
+
+That too is **executed rather than asserted**:
+`a_delivery_an_earlier_build_journaled_under_its_parent_is_replayed_as_a_child`
+moves a real child's records onto its parent's under the dispatch's path, deletes
+the child's rows and drops the `lineage` table — the journal an older build would
+have left — and resumes the parent: the provider is asked nothing, the records
+are on the child, and it settles and ships.
 
 ### 11.3 What requires a version bump
 

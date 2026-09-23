@@ -334,9 +334,9 @@ Every other way of reading a trace is somebody asking for **one**: `run --format
 json`, the trace file, `GET /executions/:id`, a trigger's `callback:`.
 `trace_sink:` is the deployment saying, once, where all of them go — one address
 every settled execution's trace envelope is POSTed to. Under `local`, where
-`detach: true` is legal, the same address also receives a second kind of POST:
-the envelope a detached `flow.*` delivery ships of its own when it settles,
-headed `detached: true` (`agent-compose docs trace`).
+`detach: true` is legal, that includes every **child execution** a detached
+`flow.*` dispatch starts: its own export under its own id, headed `detached:
+true` (`agent-compose docs trace`).
 
 | Key | Shape |
 |---|---|
