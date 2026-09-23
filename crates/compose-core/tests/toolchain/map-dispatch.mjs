@@ -61,6 +61,22 @@ const runtime = await import(pathToFileURL(path.resolve(project, "src/runtime.ts
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Wait for `promise`, or fail naming `what` once `ms` have passed.
+ *
+ * What turns "this never settled" into a failure with a sentence rather than a
+ * runner that sits until CI's own timeout kills it: a regression in what joins
+ * or drains a child execution shows up as a promise that never resolves, and
+ * the section that waits on it has to be able to say which one.
+ */
+const within = (promise, what, ms = 10_000) => {
+  let timer;
+  const expired = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} did not settle within ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
+};
+
 /** A sleep that a node's deadline can cut short, the way a real activity's does. */
 const naps = (ms, signal) =>
   new Promise((resolve, reject) => {
@@ -1342,12 +1358,19 @@ const observed = {};
   await journal.end(runtime.childExecutionId(parent, keyOf(3)), "completed");
   await journal.begin(rowOf(4, "flow.reopened", { subject: "as recorded" }));
 
+  // Every child handed over waits at a gate until the section opens them all —
+  // **every** child, a second generation of one id included. A gate keyed by id
+  // would let a second generation (the regression the join exists to prevent)
+  // replace the first one's gate, leaving that first run waiting for ever: the
+  // section would hang instead of reporting `handed` with one child too many.
+  // A child handed over after the gates opened is not held at all.
   const handed = [];
   const finished = [];
-  const gates = new Map();
+  const gates = [];
+  let opened = false;
   const unhost = runtime.hostChildren(async (child) => {
     handed.push(child);
-    await new Promise((open) => gates.set(child.id, open));
+    if (!opened) await new Promise((open) => gates.push(open));
     finished.push(child.id);
     if (child.flow === "flow.broken") throw new Error("cannot file");
     return { output: {} };
@@ -1442,10 +1465,11 @@ const observed = {};
     return true;
   };
   try {
-    for (const open of gates.values()) open();
-    await draining;
-    await reissued;
-    await recovered;
+    opened = true;
+    for (const open of gates) open();
+    await within(draining, "`childrenSettled` after every gate opened");
+    await within(reissued, "the re-issued dispatch of a running child");
+    await within(recovered, "the recovery that reached a running child");
   } finally {
     process.stderr.write = write;
   }
@@ -1578,6 +1602,66 @@ const observed = {};
       { timeoutMs: 10_000, retry: { max: 1, backoffMs: 1, multiplier: 1, jitter: false }, onError: "skip" },
     ),
     plain: runtime.effectivePolicy({ onError: "fail", timeoutMs: 1 }, false, { timeoutMs: 10_000 }),
+  };
+}
+
+// --- A worker begins no child execution (PRD resolved q42, q65) --------------
+//
+// **Last**, because both switches it turns on are the process's and are never
+// turned off: a worker runs one dispatch and exits (`./worker-node.ts`), and it
+// turns them on before anything runs. A worker reaches a detached `flow.*`
+// dispatch only inside a flow a placed agent attaches as a tool (grammar 14.1
+// rule 4), and a child execution is begun, journaled and recovered by the hub —
+// the journal's single writer — which a worker is not. So the dispatch answers
+// as a detached one does, hands no child to any runner, writes no row to the
+// journal this process can see, and says why on stderr by name. And the journal
+// a worker binds is the one every open in its process answers with, so no path
+// reaches a second journal beside the hub's.
+{
+  const journals = await import(pathToFileURL(path.resolve(project, "src/journal.ts")).href);
+  const parent = "exec_on_a_worker";
+  const key = `${parent}/hand_off/0/0`;
+  const handed = [];
+  const unhost = runtime.hostChildren(async (child) => {
+    handed.push(child.id);
+    return { output: {} };
+  });
+  runtime.refuseChildExecutions();
+  const written = [];
+  const write = process.stderr.write;
+  process.stderr.write = (chunk) => {
+    written.push(String(chunk));
+    return true;
+  };
+  let answer;
+  try {
+    answer = await within(
+      runtime.dispatchChild(
+        "flow.review",
+        { subject: "a" },
+        {
+          execution: { id: parent, session_key: "", item_index: 0 },
+          path: ["hand_off/0/0"],
+          idempotencyKey: key,
+        },
+      ),
+      "a detached dispatch refused on a worker",
+    );
+  } finally {
+    process.stderr.write = write;
+  }
+  unhost();
+  // The scratch journal the child-execution section opened is still this
+  // process's, so a row begun for the child would be there.
+  const row = await (await runtime.openJournal()).execution(runtime.childExecutionId(parent, key));
+  const dispatchJournal = { close: () => Promise.resolve() };
+  journals.hostJournal(dispatchJournal);
+  observed.onAWorker = {
+    answer,
+    handed,
+    row: row ?? null,
+    refusal: written.join(""),
+    hosted: (await runtime.openJournal()) === dispatchJournal,
   };
 }
 

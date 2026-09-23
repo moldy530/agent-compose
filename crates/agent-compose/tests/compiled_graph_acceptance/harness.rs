@@ -1724,6 +1724,33 @@ impl Served {
         gone(group);
     }
 
+    /// End the app and the command, as [`Served::stop`] does, and answer what the
+    /// two wrote on stderr.
+    ///
+    /// For an assertion about a line the app writes **only** there — a child
+    /// execution a second arrival failed to join reports itself on stderr and on
+    /// no route. The pipe ends once every process holding it has gone, which is
+    /// what [`Served::stop`] waits for; the read is still bounded, so a process
+    /// outside the group that inherited the pipe costs a test its tail rather
+    /// than its run.
+    pub fn stop_and_read_stderr(&mut self) -> String {
+        let pipe = self.child.stderr.take();
+        self.stop();
+        let Some(mut pipe) = pipe else {
+            return String::new();
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut said = Vec::new();
+            let _ = pipe.read_to_end(&mut said);
+            let _ = sender.send(said);
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(10))
+            .map(|said| String::from_utf8_lossy(&said).into_owned())
+            .unwrap_or_default()
+    }
+
     /// Wait for the command to exit and answer with its status.
     pub fn wait(&mut self) -> std::process::ExitStatus {
         let status = self.child.wait().expect("the command is waited on");

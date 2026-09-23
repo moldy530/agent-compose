@@ -24,7 +24,13 @@
 //!   hosts and reads its `harness` record off the child's journal;
 //! * **its envelope under its own id with the lineage head, and the parent's
 //!   byte-unchanged with its stub** — the first test, over `format: envelope`,
-//!   and [`an_otlp_sink_roots_a_child_executions_export_under_its_parent`];
+//!   and [`an_otlp_sink_roots_a_child_executions_export_under_its_parent`] —
+//!   and, down a chain of children, one trace:
+//!   [`a_grandchild_is_exported_into_the_trace_its_parent_landed_in`];
+//! * **the child runs on what its dispatch bound, as its joined twin does** —
+//!   [`a_detached_dispatch_runs_on_the_input_its_joined_twin_runs_on`] — **and
+//!   has an execution's own lifetimes**, its `scope: execution` store among them:
+//!   [`a_child_executions_execution_scoped_store_is_its_own_partition`];
 //! * **a failed child ships its failed envelope** —
 //!   [`a_child_execution_that_failed_ships_its_failed_envelope`];
 //! * **recovery with the parent settled** —
@@ -662,6 +668,295 @@ fn an_otlp_sink_roots_a_child_executions_export_under_its_parent() {
     assert_ne!(child_root["spanId"], parent_root["spanId"]);
 }
 
+/// **A grandchild is exported into the trace its parent's export landed in —
+/// the head's — under its parent's root span** (PRD resolved q65,
+/// `docs/trace.md` §12.2).
+///
+/// `flow.dispatch_nested` detaches a `flow.relay`, which detaches the review:
+/// three executions, three exports. The envelope names only the immediate
+/// parent, and deriving a grandchild's trace from that parent's id would file it
+/// in a trace nothing else is exported into, under a root span that lives in
+/// another one — two traces and a dangling parent on any collector. So all three
+/// share the head's trace, and each root hangs off the root of the execution that
+/// dispatched it.
+#[test]
+fn a_grandchild_is_exported_into_the_trace_its_parent_landed_in() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        REVIEWER_MODEL,
+        Outcome::structured(json!({ "verdict": "approve" })),
+    ));
+    let collector = harness::Receiver::start().expect("a loopback collector");
+    let Some((_composition, _entrypoint, project, served)) = served(
+        "child-nested-otlp",
+        &collector,
+        Some("otlp"),
+        &environment(&provider),
+    ) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let head_id = started(&app, "/nested-reviews");
+
+    let exported = collector.wait_for_event("settled", 3, PATIENCE);
+    assert_eq!(
+        exported.len(),
+        3,
+        "three executions, three exports: {exported:#?}"
+    );
+    let execution_of = |delivered: &harness::Delivered| -> String {
+        attribute(root_span(&delivered.body), "agentcompose.execution.id")
+            .and_then(|held| held["stringValue"].as_str().map(str::to_string))
+            .expect("a root names its execution")
+    };
+    let parent_of = |delivered: &harness::Delivered| -> Option<String> {
+        attribute(root_span(&delivered.body), "agentcompose.parent_execution")
+            .and_then(|held| held["stringValue"].as_str().map(str::to_string))
+    };
+    let head = exported
+        .iter()
+        .find(|delivered| parent_of(delivered).is_none())
+        .unwrap_or_else(|| panic!("the head's export arrived: {exported:#?}"));
+    assert_eq!(execution_of(head), head_id);
+    let child = exported
+        .iter()
+        .find(|delivered| parent_of(delivered).as_deref() == Some(head_id.as_str()))
+        .unwrap_or_else(|| panic!("the relay's export arrived: {exported:#?}"));
+    let child_id = execution_of(child);
+    assert_eq!(
+        child_id,
+        harness::child_execution_id(&head_id, &format!("{head_id}/relay/0/0")),
+        "the relay is the child the head's `relay` dispatch derives"
+    );
+    let grandchild = exported
+        .iter()
+        .find(|delivered| parent_of(delivered).as_deref() == Some(child_id.as_str()))
+        .unwrap_or_else(|| panic!("the review's export arrived: {exported:#?}"));
+    let grandchild_id = execution_of(grandchild);
+    assert_eq!(
+        grandchild_id,
+        harness::child_execution_id(&child_id, &format!("{child_id}/hand_on/0/0")),
+        "the review is the child the relay's `hand_on` dispatch derives"
+    );
+    assert_eq!(
+        root_span(&grandchild.body)["name"],
+        "flow.review",
+        "{:#}",
+        grandchild.body
+    );
+
+    let (head_root, child_root, grandchild_root) = (
+        root_span(&head.body),
+        root_span(&child.body),
+        root_span(&grandchild.body),
+    );
+    assert_eq!(
+        child_root["traceId"], head_root["traceId"],
+        "a child is exported into its parent's trace"
+    );
+    assert_eq!(
+        grandchild_root["traceId"], head_root["traceId"],
+        "a grandchild is exported into the trace its parent's export landed in — the head's — \
+         not into one its parent's own id derives"
+    );
+    for spans in [&child.body, &grandchild.body] {
+        for span in spans["resourceSpans"][0]["scopeSpans"][0]["spans"]
+            .as_array()
+            .expect("spans")
+        {
+            assert_eq!(
+                span["traceId"], head_root["traceId"],
+                "every span of a descendant's export is in the head's trace: {span:#}"
+            );
+        }
+    }
+    assert_eq!(
+        child_root["parentSpanId"], head_root["spanId"],
+        "the relay hangs off the head's root"
+    );
+    assert_eq!(
+        grandchild_root["parentSpanId"], child_root["spanId"],
+        "the review hangs off the relay's root — the span of the execution that dispatched \
+         it, which is in the same trace"
+    );
+
+    // Two lineages: each child names the execution that dispatched it.
+    for (execution, parent) in [(&child_id, &head_id), (&grandchild_id, &child_id)] {
+        assert_eq!(
+            harness::journal_rows(
+                &project,
+                &format!("SELECT parent FROM lineage WHERE execution = '{execution}'")
+            ),
+            json!([{ "parent": parent }]),
+            "`{execution}`'s lineage names the execution that dispatched it"
+        );
+    }
+}
+
+/// **A child execution's `scope: execution` store is its own partition** (PRD
+/// resolved q65, `docs/grammar.md` §11.3, Decision D150).
+///
+/// `flow.dispatch_scratch` sets `handoff` in `store.scratch` and then detaches a
+/// `flow.read_scratch` that gets the same key. The partition of an
+/// execution-scoped store is keyed by `execution.id`, and inside a child that is
+/// the child's own — so the key its parent set is in another partition, and the
+/// child's read answers `found: false`. (Before the ruling the detached flow ran
+/// under its parent's id and read its parent's partition, for as long as the
+/// parent had not yet settled and released it — which a detached flow exists to
+/// outlive.) The parent's own read-your-write is untouched: its `set` is on its
+/// own entry, and a `scope: session` or `scope: global` store is what a parent
+/// that hands data on to a child declares.
+#[test]
+fn a_child_executions_execution_scoped_store_is_its_own_partition() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let collector = harness::Receiver::start().expect("a loopback collector");
+    let Some((_composition, _entrypoint, project, served)) =
+        served("child-scratch", &collector, None, &environment(&provider))
+    else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let parent_id = started(&app, "/scratch-reviews");
+
+    let exported = collector.wait_for_event("settled", 2, PATIENCE);
+    let (parents, children) = by_lineage(&exported);
+    assert_eq!((parents.len(), children.len()), (1, 1), "{exported:#?}");
+    let parent = &parents[0].body;
+    assert_eq!(parent["status"], "completed", "{parent:#}");
+    let left = parent["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["node"] == "leave")
+        .unwrap_or_else(|| panic!("the parent's `leave` ran: {parent:#}"));
+    assert_eq!(
+        left["stores"][0]["op"], "set",
+        "the parent set the key in its own partition: {left:#}"
+    );
+    assert_eq!(left["stores"][0]["scope"], "execution", "{left:#}");
+
+    let child = &children[0].body;
+    let key = stub_record(parent, "review")["idempotencyKey"]
+        .as_str()
+        .expect("a key")
+        .to_string();
+    assert_eq!(
+        child["execution_id"],
+        harness::child_execution_id(&parent_id, &key),
+        "{child:#}"
+    );
+    assert_eq!(child["status"], "completed", "{child:#}");
+    let looked = &child["entries"][0];
+    assert_eq!(looked["node"], "look", "{child:#}");
+    let read = &looked["stores"][0];
+    assert_eq!(read["op"], "get", "{looked:#}");
+    assert_eq!(read["scope"], "execution", "{looked:#}");
+    assert_eq!(
+        read["answer"]["found"], false,
+        "a child execution read its parent's `scope: execution` partition; its own is the one \
+         its id keys, and it begins empty (`docs/grammar.md` §11.3): {looked:#}"
+    );
+    assert_eq!(
+        effect_keys(&project, &harness::child_execution_id(&parent_id, &key)),
+        [("look/0#store/0".to_string(), "store".to_string())],
+        "the child's read is on the child's record"
+    );
+}
+
+/// **A detached dispatch runs on the input its joined twin runs on** (PRD
+/// resolved q65, Decision D150).
+///
+/// `flow.dispatch_both` maps `flow.review` over the same subjects twice, joined
+/// and then detached, and the subject is the empty string — which `flow.review`'s
+/// own `inputs:` (`min_length: 1`) would refuse at an **invocation**. A dispatch
+/// is not one: grammar §8.6 rule 12 checks what a `map` binds when the
+/// composition is built, and the instance runs on what it was bound. So both
+/// run. Before this was held, the joined instance completed while the detached
+/// one was refused before its row opened — no row, no lineage, no journal, no
+/// envelope, one line on stderr — so the same dispatch meant two things by
+/// `detach:`. Now the child is an execution like any other: its row with its
+/// lineage, its model call on its record, its envelope under its own id.
+#[test]
+fn a_detached_dispatch_runs_on_the_input_its_joined_twin_runs_on() {
+    let provider = MockProvider::start().expect("a loopback port");
+    for _ in 0..2 {
+        provider.enqueue(Script::new(
+            REVIEWER_MODEL,
+            Outcome::structured(json!({ "verdict": "revise" })),
+        ));
+    }
+    let collector = harness::Receiver::start().expect("a loopback collector");
+    let Some((_composition, _entrypoint, project, served)) =
+        served("child-unparsed", &collector, None, &environment(&provider))
+    else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let answered = app
+        .send(Request::post("/both-reviews").json(&json!({ "subjects": [""] })))
+        .expect("the trigger's route answers");
+    assert_eq!(answered.status, 202, "{}", answered.text());
+    let parent_id = answered.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    let exported = collector.wait_for_event("settled", 2, PATIENCE);
+    let (parents, children) = by_lineage(&exported);
+    assert_eq!(
+        (parents.len(), children.len()),
+        (1, 1),
+        "the parent and its child each shipped: {exported:#?}"
+    );
+    let parent = &parents[0].body;
+    assert_eq!(parent["status"], "completed", "{parent:#}");
+    let joined = parent["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["node"] == "joined")
+        .unwrap_or_else(|| panic!("the joined map ran: {parent:#}"));
+    assert_eq!(
+        joined["dispatches"][0]["outcome"], "completed",
+        "the joined instance ran on the empty subject: {joined:#}"
+    );
+
+    let key = stub_record(parent, "review")["idempotencyKey"]
+        .as_str()
+        .expect("a key")
+        .to_string();
+    let child_id = harness::child_execution_id(&parent_id, &key);
+    let child = &children[0].body;
+    assert_eq!(child["execution_id"], child_id, "{child:#}");
+    assert_eq!(
+        child["status"], "completed",
+        "the detached instance ran on the same subject its joined twin did: {child:#}"
+    );
+    assert_eq!(child["entries"][0]["node"], "judge", "{child:#}");
+
+    assert_eq!(
+        harness::journal_rows(
+            &project,
+            &format!("SELECT status, inputs FROM executions WHERE id = '{child_id}'")
+        ),
+        json!([{ "status": "completed", "inputs": "{\"subject\":\"\"}" }]),
+        "the child's row holds the input its dispatch bound"
+    );
+    assert_eq!(
+        harness::journal_rows(&project, "SELECT execution, parent FROM lineage"),
+        json!([{ "execution": child_id, "parent": parent_id }])
+    );
+    assert_eq!(
+        effect_keys(&project, &child_id),
+        [("judge/0#model/0".to_string(), "model".to_string())]
+    );
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "one review joined, one detached"
+    );
+}
+
 /// **A child caught mid-run after its parent had settled is recovered by the
 /// next `serve`, replays to its frontier without asking its model again, and
 /// ships its envelope** (PRD resolved q65, `docs/durability.md` §6.1).
@@ -821,7 +1116,7 @@ fn a_recovered_parent_that_re_issues_its_dispatch_joins_the_child_it_started() {
         "the crash left both the parked parent and its child open"
     );
 
-    let Some(second) = harness::serve_target_into(&project, &entrypoint, LOCAL, &environment)
+    let Some(mut second) = harness::serve_target_into(&project, &entrypoint, LOCAL, &environment)
     else {
         return;
     };
@@ -832,6 +1127,33 @@ fn a_recovered_parent_that_re_issues_its_dispatch_joins_the_child_it_started() {
         shipped[0].body
     );
     assert_eq!(shipped[0].body["status"], "completed");
+
+    // **The join, asked about directly.** Everything below it — one row, one
+    // lineage, one effect set — is also what a second generation that *failed
+    // at once* would leave, and without the join that is exactly what the second
+    // arrival is: it puts a fresh entry for the child on this app's board and
+    // its run trips the one-generation guard (`docs/durability.md` §2.1),
+    // replacing the child the status route answers with one that failed. So the
+    // route is asked, and it has to answer the one generation that ran: the
+    // child `completed`, with both of its steps.
+    let restarted = Client::new(&second.base_url).expect("a client for the restarted app");
+    let reported = harness::settled(&restarted, &child_id);
+    assert_eq!(
+        reported["status"], "completed",
+        "the status route answers the child with a generation that did not run it — a second \
+         arrival started a second generation rather than joining the first: {reported:#}"
+    );
+    let steps: Vec<&str> = reported["trace"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry["node"].as_str())
+        .collect();
+    assert_eq!(
+        steps,
+        ["judge", "stall"],
+        "the child's report is its run's: {reported:#}"
+    );
 
     // One child, whichever direction reached it first.
     assert_eq!(
@@ -883,6 +1205,24 @@ fn a_recovered_parent_that_re_issues_its_dispatch_joins_the_child_it_started() {
     assert_eq!(
         stub_record(&parents[0].body, "review")["idempotencyKey"],
         key.as_str()
+    );
+
+    // …and what the restarted app said about it, which is where a second
+    // generation that failed at once is the only place it is said: the line the
+    // child machinery writes for a child that did not complete. The recovery
+    // line is the control — it is what shows this is the app's stderr at all.
+    let said = second.stop_and_read_stderr();
+    assert!(
+        said.contains(&format!("recovered {child_id} (flow.review_and_stall)")),
+        "the restarted app's stderr is not the one that recovered the child: {said}"
+    );
+    assert!(
+        !said.contains(&format!("the child execution `{child_id}`")),
+        "a second generation of the child ran beside the first and did not complete: {said}"
+    );
+    assert!(
+        !said.contains("is already running in this process"),
+        "a second arrival reached the one-generation guard instead of joining: {said}"
     );
 }
 

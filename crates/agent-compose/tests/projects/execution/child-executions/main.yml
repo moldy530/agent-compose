@@ -7,10 +7,11 @@
 # copy of this directory is `deploy/local.yml` — which admits `trace_sink:`
 # (grammar 14) — and a child execution exists exactly where detach does.
 #
-# Every parent here detaches one child per subject and never makes a model call
-# of its own, so the one model call in each child is the child's — and "it is on
-# the child's record and envelope and not on the parent's" is an assertion with
-# nothing else in the way. The parent's account of the dispatch stays the stub
+# Every parent here but `flow.dispatch_both` (below) detaches one child per
+# subject and never makes a model call of its own, so the one model call in each
+# child is the child's — and "it is on the child's record and envelope and not
+# on the parent's" is an assertion with nothing else in the way. The parent's
+# account of the dispatch stays the stub
 # `"detached"` record (Decision D94, `docs/trace.md` §5.1). The shapes:
 #
 #   * `flow.dispatch` detaches a `flow.review` and settles at once — the child
@@ -28,7 +29,20 @@
 #     and once with the parent parked. `${TALLY_BIN}/stall` is a shim the tests
 #     that reach it write (it appends one line to `$TALLY_LOG` per run and then
 #     sleeps), so "the stalled step ran twice across the crash and not three
-#     times" is a line count; every other test reaches no such node.
+#     times" is a line count; every other test reaches no such node;
+#   * `flow.dispatch_nested` detaches a `flow.relay`, which detaches a
+#     `flow.review` of its own — a child with a child, so a **grandchild**
+#     execution's export can be asked which trace it lands in (`docs/trace.md`
+#     §12.2: the trace its parent's export lands in, which is the head's);
+#   * `flow.dispatch_both` maps the same `flow.review` over the same subjects
+#     twice, joined and then detached — the one parent here that makes a model
+#     call of its own, through its joined instance — so "a dispatch's input is
+#     valid or not whatever `detach:` says" is one run with one input: a subject
+#     `flow.review`'s `min_length:` would refuse at an invocation runs in both;
+#   * `flow.dispatch_scratch` sets a key in `store.scratch` — `scope: execution` —
+#     and then detaches a `flow.read_scratch` that reads the same key: the child
+#     is an execution, so its execution-scoped store is its **own** partition,
+#     which begins empty (`docs/grammar.md` §11.3, Decision D150).
 #
 # The provider is the mock, reached through `${MOCK_BASE_URL}` exactly as every
 # other fixture reaches it (PRD 5.9), and the `exec:` nodes use `${OPS_BIN}` as
@@ -95,6 +109,33 @@ triggers:
       subjects: "payload.body.subjects"
     respond: async
 
+  on_nested_request:
+    type: http
+    flow: flow.dispatch_nested
+    path: /nested-reviews
+    method: POST
+    input:
+      subjects: "payload.body.subjects"
+    respond: async
+
+  on_both_request:
+    type: http
+    flow: flow.dispatch_both
+    path: /both-reviews
+    method: POST
+    input:
+      subjects: "payload.body.subjects"
+    respond: async
+
+  on_scratch_request:
+    type: http
+    flow: flow.dispatch_scratch
+    path: /scratch-reviews
+    method: POST
+    input:
+      subjects: "payload.body.subjects"
+    respond: async
+
 provider.mock:
   kind: openai_compatible
   base_url: ${MOCK_BASE_URL}
@@ -103,6 +144,17 @@ provider.mock:
 model.local:
   provider: provider.mock
   id: qwen3-coder-30b
+
+# One execution's working notes. `scope: execution` makes the partition the
+# execution's own — a parent's and each child's are three different stores as far
+# as a key is concerned (`docs/grammar.md` §11.3).
+store.scratch:
+  kind: kv
+  scope: execution
+  description: One execution's working notes.
+  value_schema:
+    note:
+      type: string
 
 # The child's one model call. Its `output:` names no channel, so nothing the
 # child answers is written anywhere — a detached dispatch may write no state
@@ -344,3 +396,154 @@ flow.dispatch_stalling_and_wait:
     - { from: start, to: review }
     - { from: review, to: sign_off }
     - { from: sign_off, to: end }
+
+# The middle of a chain: a child execution that detaches a child of its own.
+# It makes no model call, so the one call in the chain is the grandchild's.
+flow.relay:
+  description: Pass one subject on to a review of its own — a child with a child.
+  inputs:
+    subjects:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs: {}
+  nodes:
+    hand_on:
+      map:
+        over: input.subjects
+        as: one
+        node: flow.review
+        max_concurrency: 1
+        detach: true
+        input:
+          subject: "one"
+  edges:
+    - { from: start, to: hand_on }
+    - { from: hand_on, to: end }
+
+flow.dispatch_nested:
+  description: Detach a relay per subject, which detaches the review itself.
+  inputs:
+    subjects:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs:
+    noted:
+      type: string
+  nodes:
+    relay:
+      map:
+        over: input.subjects
+        as: one
+        node: flow.relay
+        max_concurrency: 1
+        detach: true
+        input:
+          subjects: "[one]"
+    note:
+      exec:
+        command: "${OPS_BIN}/echo"
+        args: ['{"noted":"dispatched"}']
+        output:
+          noted: { type: string }
+  edges:
+    - { from: start, to: relay }
+    - { from: relay, to: note }
+    - { from: note, to: end }
+
+flow.dispatch_both:
+  description: Review each subject joined, then detach the same review of it.
+  inputs:
+    subjects:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs:
+    noted:
+      type: string
+  nodes:
+    joined:
+      map:
+        over: input.subjects
+        as: one
+        node: flow.review
+        max_concurrency: 1
+        input:
+          subject: "one"
+    review:
+      map:
+        over: input.subjects
+        as: one
+        node: flow.review
+        max_concurrency: 1
+        detach: true
+        input:
+          subject: "one"
+    note:
+      exec:
+        command: "${OPS_BIN}/echo"
+        args: ['{"noted":"dispatched"}']
+        output:
+          noted: { type: string }
+  edges:
+    - { from: start, to: joined }
+    - { from: joined, to: review }
+    - { from: review, to: note }
+    - { from: note, to: end }
+
+
+# The child that looks for what its parent left in `store.scratch`. It is an
+# execution of its own, so the key its parent set is in another partition.
+flow.read_scratch:
+  description: Look for the note a parent left in its execution-scoped store.
+  inputs:
+    subject:
+      type: string
+  outputs: {}
+  nodes:
+    look:
+      store: store.scratch
+      op: get
+      key: "'handoff'"
+  edges:
+    - { from: start, to: look }
+    - { from: look, to: end }
+
+flow.dispatch_scratch:
+  description: Leave a note in this execution's store, then detach a reader of it.
+  inputs:
+    subjects:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs:
+    noted:
+      type: string
+  nodes:
+    leave:
+      store: store.scratch
+      op: set
+      key: "'handoff'"
+      value:
+        note: "'left by the parent'"
+    review:
+      map:
+        over: input.subjects
+        as: one
+        node: flow.read_scratch
+        max_concurrency: 1
+        detach: true
+        input:
+          subject: "one"
+    note:
+      exec:
+        command: "${OPS_BIN}/echo"
+        args: ['{"noted":"dispatched"}']
+        output:
+          noted: { type: string }
+  edges:
+    - { from: start, to: leave }
+    - { from: leave, to: review }
+    - { from: review, to: note }
+    - { from: note, to: end }

@@ -414,7 +414,7 @@ use compose_core::ir::schema::{
 };
 use goldens::{GOLDENS, Golden, artifact, emitted, files_under, golden, goldens_root, repository};
 use serde_json::{Value, json};
-use toolchain::{bun, installed, required, runner, runs};
+use toolchain::{bun, installed, output_within, required, runner, runs};
 
 /// The golden gate 13 runs under Node.
 ///
@@ -1404,7 +1404,9 @@ fn the_run_channel_folds_a_steps_contributions_in_canonical_order() {
 ///     which is a claim about *which generation runs*, and only the runtime can
 ///     be asked that. Beside it, the one writer of an envelope's lineage head, and
 ///     the one reader that tells an export from a legacy detached row, over the
-///     bytes both `format:`s write.
+///     bytes both `format:`s write. And on a **worker** it starts none: the hub is
+///     the journal's single writer (PRD resolved q42), so the dispatch is refused
+///     by name, no runner is handed a child and no journal is given a row.
 ///
 /// `src/runtime.ts` is a compiler constant, byte-identical in every project this
 /// release builds, so driving it directly is driving what every project runs.
@@ -1414,10 +1416,14 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
         return;
     };
     let project = staged(goldens::golden("triage-fanout"), root, "map-dispatch");
-    let output = runner("map-dispatch.mjs")
-        .arg(&project)
-        .output()
-        .expect("bun runs");
+    // Bounded: a regression in what joins or drains a child execution shows up
+    // as a promise the runner waits on for ever, and a named failure beats a CI
+    // job that times out naming nothing (`toolchain::output_within`).
+    let output = output_within(
+        runner("map-dispatch.mjs").arg(&project),
+        std::time::Duration::from_secs(300),
+        "the fan-out runtime (`map-dispatch.mjs`)",
+    );
     assert!(
         output.status.success(),
         "the fan-out runtime did not run:\n{}",
@@ -1985,6 +1991,42 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
         "`runtime.traceSinkClass` misreads a sink row, so a legacy detached envelope reaches \
          the status route's report or silences its parent's export — or a child's own export \
          is taken for one"
+    );
+
+    // …and on a **worker**, none of it (PRD resolved q42, q65). A child
+    // execution is begun, journaled and recovered by the journal's single
+    // writer, the hub; a worker reaches a detached `flow.*` dispatch only inside
+    // a flow a placed agent attaches (grammar 14.1 rule 4), and there the
+    // dispatch answers as a detached one does, hands no child to any runner,
+    // begins no row on any journal this process can open, and names the refusal
+    // on stderr. The journal a worker binds is what every open in its process
+    // answers with, so no path reaches a second journal beside the hub's.
+    let worker = &observed["onAWorker"];
+    let refused = "exec_on_a_worker/hand_off/0/0";
+    assert_eq!(worker["answer"], json!({ "output": {} }));
+    assert_eq!(
+        worker["handed"],
+        json!([]),
+        "a worker handed a child execution to a runner"
+    );
+    assert_eq!(
+        worker["row"],
+        Value::Null,
+        "a worker began a child execution's lifecycle row on its own journal"
+    );
+    let said = worker["refusal"].as_str().unwrap_or_default();
+    assert!(
+        said.contains(&format!(
+            "the child execution `{}` did not complete: ChildOnAWorker: `flow.review` was \
+             dispatched with `detach: true` (key `{refused}`) inside a placed node, on the \
+             worker running it",
+            child_execution_id("exec_on_a_worker", refused)
+        )) && said.contains("PRD resolved q42, q65"),
+        "a detached `flow.*` dispatch on a worker is not refused by name: {said:?}"
+    );
+    assert_eq!(
+        worker["hosted"], true,
+        "`journal.hostJournal` did not make the dispatch's journal the one every open answers"
     );
 }
 

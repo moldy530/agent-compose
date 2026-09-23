@@ -65,9 +65,11 @@
     reason = "each binary uses the part of the toolchain surface it needs"
 )]
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 /// The committed toolchain fixture: the pinned manifest, its lockfiles, and the
 /// runners.
@@ -199,4 +201,74 @@ pub fn runner(script: &str) -> Command {
     let mut command = bun();
     command.arg(root().join(script));
     command
+}
+
+/// Run `command` to completion and answer what it wrote — or, once `limit` has
+/// passed, kill it and fail naming `what`.
+///
+/// `Command::output` waits for ever, so a runner whose own promise never settles
+/// — a regression in something it awaits, such as a child execution that was
+/// never joined — sits until CI's job timeout kills the whole binary, and the
+/// report names no test. A runner can bound its own awaits with a timer, and the
+/// ones here do; this is the bound on the case a timer cannot see, a process
+/// spinning on a microtask loop that never yields to one. Either way the failure
+/// is a named assertion carrying what the process had written.
+///
+/// # Panics
+///
+/// Panics when the command cannot be spawned, and when it outlives `limit`.
+pub fn output_within(command: &mut Command, limit: Duration, what: &str) -> Output {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the runner starts");
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut held);
+            }
+            held
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+    );
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("the runner is waited on") {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    let Some(status) = status else {
+        panic!(
+            "{what} did not finish within {limit:?} and was killed: something it waits on never \
+             settled. It wrote:\n{}\n{}",
+            String::from_utf8_lossy(&stderr),
+            String::from_utf8_lossy(&stdout),
+        );
+    };
+    Output {
+        status,
+        stdout,
+        stderr,
+    }
 }
