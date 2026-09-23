@@ -27,7 +27,10 @@
 #     at-least-once half, deduped by a receiver on `(parent_execution,
 #     idempotency_key)` — and the answer that finally settles the parent is what
 #     shows its own export was not mistaken for one of the envelopes already on
-#     its ledger.
+#     its ledger. It is also the flow `agent-compose run` drives: a run that
+#     parks waits for its execution's deliveries before it exits, so the envelope
+#     the command ships after reporting is there deterministically, and it is
+#     the only POST, because the parked parent never settles.
 #
 # The provider is the mock, reached through `${MOCK_BASE_URL}` exactly as every
 # other fixture reaches it (PRD 5.9), and the two `exec:` nodes use `${OPS_BIN}`

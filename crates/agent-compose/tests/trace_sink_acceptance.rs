@@ -34,10 +34,13 @@
 //! `detached: true`, `parent_execution` and the grammar §9.4 `idempotency_key`,
 //! while its parent's entry keeps exactly the stub `"detached"` record it always
 //! had. Detach is legal only under `--target local` (Decision D59), so those
-//! tests serve the `detached-trace-sink` fixture under a `deploy/local.yml` —
+//! tests stage the `detached-trace-sink` fixture under a `deploy/local.yml` —
 //! the only place the second class can exist — and the verification the ruling
 //! ratified is theirs: two envelopes, the linkage between them, the failed
 //! delivery shipping with its outcome, and the re-shipping a recovery does.
+//! Those four are served; the last test here is a `run`, because PRD resolved
+//! q50 puts the sink "wherever executions settle, `run` included" and a command
+//! ships what settled under it through a path of its own.
 
 #[path = "compiled_graph_acceptance/harness.rs"]
 mod harness;
@@ -1751,5 +1754,131 @@ fn a_recovered_execution_reships_its_detached_delivery_and_still_exports_itself(
         stub_record(parent, "review")["idempotencyKey"],
         deliveries[0].body["idempotency_key"],
         "{parent:#}"
+    );
+}
+
+/// **A `run` ships the envelope of a detached delivery that settled while the
+/// command was still here** (PRD resolved q50's "`run` included", q64,
+/// `docs/trace.md` §1.4).
+///
+/// The second event class under the command rather than under `serve`. A served
+/// app subscribes to detached settlements for its whole life and works each
+/// envelope on the delivery schedule; a command subscribes for the length of one
+/// run, journals what settles meanwhile on the parent's ledger, and sends it
+/// after the run has reported. Every other test of the second class goes
+/// through `serve`, so this is the one that exercises that path.
+///
+/// `flow.dispatch_and_wait` is what makes it deterministic. It detaches a review
+/// and parks at a `human` node, and a run that parks waits for the deliveries of
+/// the execution it leaves open before it exits (`docs/durability.md` §3.2) — so
+/// by the time the command reports `3` the delivery has settled and its envelope
+/// has been journaled. The parent never settles under this command and exports
+/// nothing, so the envelope is the only POST: a `run` that stopped shipping
+/// detached envelopes leaves the collector empty, and the head tells the
+/// envelope apart from anything else a command might send in its place.
+#[test]
+fn a_run_ships_the_envelope_of_a_detached_delivery_that_settled_before_it_exited() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        REVIEWER_MODEL,
+        Outcome::structured(json!({ "verdict": "approve" })),
+    ));
+    let collector = harness::Receiver::start().expect("a loopback collector");
+    let (_composition, entrypoint) = harness::staged_with_deploy(
+        "sink-detached-run",
+        DETACHED_FIXTURE,
+        LOCAL,
+        &sink_target(&format!("{}/v1/traces", collector.base_url), None, false),
+    );
+    let Some(project) = harness::scratch_project("sink-detached-run") else {
+        return;
+    };
+    let run = harness::run_target(
+        &project,
+        &entrypoint,
+        LOCAL,
+        "flow.dispatch_and_wait",
+        &[("subjects", r#"["the collector"]"#)],
+        &environment(&provider),
+    );
+    let said = run.failed();
+    assert_eq!(
+        run.output.status.code(),
+        Some(3),
+        "a run with nobody to answer its `human` node parks and reports `3`: {said}"
+    );
+    let execution = said
+        .lines()
+        .find_map(|line| line.strip_prefix("execution: "))
+        .unwrap_or_else(|| panic!("the run names its execution\nstderr: {said}"))
+        .trim()
+        .to_string();
+
+    // The parent's account of the dispatch: the stub record, in the trace file
+    // the command wrote — the one trace of the parent there is, since it never
+    // settled and so never exported.
+    let parent = run.trace_document();
+    assert_eq!(parent["status"], "interrupted", "{parent:#}");
+    let stub = stub_record(&parent, "review");
+    assert_eq!(stub["outcome"], "detached", "{stub:#}");
+    assert_eq!(stub["attempts"], 0, "{stub:#}");
+    let key = stub["idempotencyKey"]
+        .as_str()
+        .expect("a dispatch record carries its key");
+    assert_eq!(
+        key,
+        format!("{execution}/review/0/0"),
+        "grammar §9.4's key for item 0 of map node `review` on its first traversal"
+    );
+
+    // The delivery's envelope reached the sink, sent by the command itself.
+    let exported = collector.wait_for_event("settled", 1, PATIENCE);
+    assert_eq!(
+        exported.len(),
+        1,
+        "the parked parent exports nothing, so the delivery's envelope is the only POST: \
+         {exported:#?}"
+    );
+    let delivery = &exported[0].body;
+    assert_eq!(delivery["trace_version"], 4, "{delivery:#}");
+    assert_eq!(delivery["detached"], true, "{delivery:#}");
+    assert_eq!(delivery["parent_execution"], execution, "{delivery:#}");
+    assert_eq!(
+        delivery["idempotency_key"], key,
+        "the join between the parent's stub record and this envelope is string equality on \
+         the key, under `run` as under `serve`: {delivery:#}"
+    );
+    assert_eq!(delivery["execution_id"], execution, "{delivery:#}");
+    assert_eq!(delivery["flow"], "flow.review", "{delivery:#}");
+    assert_eq!(delivery["status"], "completed", "{delivery:#}");
+    let entries = delivery["entries"]
+        .as_array()
+        .expect("a detached envelope carries entries");
+    assert_eq!(entries.len(), 1, "{delivery:#}");
+    assert_eq!(entries[0]["node"], "judge", "{delivery:#}");
+    assert!(
+        entries[0]["models"]
+            .as_array()
+            .is_some_and(|models| models.len() == 1),
+        "the delivery's model call is on its own envelope: {delivery:#}"
+    );
+    let id = exported[0]
+        .header("x-agentcompose-delivery")
+        .expect("a delivery names its id");
+    assert!(
+        id.starts_with(&format!("{execution}:")),
+        "the envelope rides the ledger of the execution the delivery ran under: {id}"
+    );
+
+    // …and the command finished that delivery rather than leaving it for a
+    // `serve` start to find.
+    let rows = harness::journal_rows(
+        &project,
+        "SELECT kind, event, status FROM deliveries ORDER BY ordinal ASC",
+    );
+    assert_eq!(
+        rows,
+        json!([{ "kind": "trace_sink", "event": "settled", "status": "delivered" }]),
+        "one row on the parent's ledger — the delivery's envelope — and the command sent it"
     );
 }
