@@ -125,12 +125,18 @@ import {
   type JournalOutcome,
   type JournalRecord,
   closeSession,
+  hostJournal,
   openSession,
   recorderFor,
 } from "./journal.ts";
 import { type PlacedAnswer, executeLocally } from "./mesh.ts";
 import type * as runtime from "./runtime.ts";
-import { dispatchPausesHome, releaseWorkspaces, remotePauseOf } from "./runtime.ts";
+import {
+  dispatchPausesHome,
+  refuseChildExecutions,
+  releaseWorkspaces,
+  remotePauseOf,
+} from "./runtime.ts";
 
 /** The dispatch this process was handed, as §3.2 puts it on the wire. */
 interface Dispatch {
@@ -601,6 +607,19 @@ async function main(): Promise<void> {
   // A dispatch with an empty history is the degenerate case of it and costs a
   // lookup per effect.
   openSession(dispatch.execution_id, journal, true);
+  // …and it is the **only** journal this process reaches, by any path. A
+  // session is found by execution id; a path that opens the journal by name —
+  // a detached `flow.*` dispatch beginning a child execution is one (PRD
+  // resolved q65) — would otherwise open the project's journal as this
+  // process's own data directory binds it, a second writer beside the hub's
+  // (§3.3, PRD resolved q42). Bound here, every such path meets the dispatch
+  // journal, whose every hub-only operation refuses by name.
+  hostJournal(journal);
+  // A child execution in particular is refused before it reaches any journal,
+  // with a sentence that says what to change (`runtime.ChildOnAWorker`): it is
+  // the one construct a flow attached to a placed agent can reach that only the
+  // hub may begin.
+  refuseChildExecutions();
   executeLocally(runPlaced);
   // …and a pause reached under any of it settles this dispatch rather than
   // looking for a board (§3.4, PRD resolved q46). Said once, for the process,

@@ -172,10 +172,32 @@ export interface ExportContext {
   readonly endedAt: string;
   /**
    * The inbound `traceparent` this execution was started by, where there was
-   * one — for a **child execution**, the one its parent was started by, whose
-   * trace the child's export joins (`docs/trace.md` §12.2).
+   * one — for a **child execution**, the one the execution at the head of its
+   * lineage ([`root`][`ExportContext.root`]) was started by, whose trace the
+   * child's export joins (`docs/trace.md` §12.2).
    */
   readonly parent?: TraceParent;
+  /**
+   * For a **child execution**, the execution at the head of its lineage: the
+   * one a trigger or a command started, which every child descended from it —
+   * a child's child included — is exported into the trace of (`docs/trace.md`
+   * §12.2, PRD resolved q65).
+   *
+   * Carried here rather than read off the envelope because the envelope names
+   * only the **immediate** parent (`parent_execution`), and one hop is not
+   * enough: a child's export lands in the trace its parent's export lands in,
+   * and a parent that is itself a child landed in *its* parent's. So a
+   * grandchild's trace is the root's, not the one its parent's id would
+   * derive — which is a trace nothing else exports into, holding a span whose
+   * parent is in another trace. `src/delivery.ts` walks the lifecycle rows up
+   * to the head and passes it.
+   *
+   * Absent on an execution a trigger or a command started — it is its own head
+   * — and, on a child, read as its parent: a child whose parent a trigger
+   * started has that parent as its head, which is every child a conformance
+   * fixture written before this field describes.
+   */
+  readonly root?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -204,9 +226,10 @@ const SCOPE_NAME = "agent-compose";
  *
  * A **child execution's** envelope (PRD resolved q64, q65) is the same tree
  * under its own execution id, hung off its **parent** execution's root span in
- * the parent's trace, and it carries the envelope's lineage head — `detached`,
- * `parent_execution`, `idempotency_key` — as root attributes (`docs/trace.md`
- * §12.2, §12.5).
+ * the trace its parent's export lands in — the trace of the execution at the
+ * head of its lineage — and it carries the envelope's lineage head —
+ * `detached`, `parent_execution`, `idempotency_key` — as root attributes
+ * (`docs/trace.md` §12.2, §12.5).
  *
  * What is deliberately **not** carried is payload: `StoreRecord.answer` and
  * `ToolCallRecord.result` are in the envelope and are not mapped to attributes.
@@ -219,13 +242,17 @@ export function exportRequest(
   document: TraceDocument,
   context: ExportContext,
 ): ExportTraceServiceRequest {
-  // **A child execution's export lands in its parent's trace** (PRD resolved
-  // q64, q65, `docs/trace.md` §12.2): the caller's, where a valid `traceparent`
-  // started the parent — which is the one `context.parent` carries for a child
-  // — and otherwise the one the parent's id derives, since a collector files a
-  // child under the run that dispatched it rather than beside it.
+  // **A child execution's export lands in the trace its parent's export lands
+  // in** (PRD resolved q64, q65, `docs/trace.md` §12.2), since a collector files
+  // a child under the run that dispatched it rather than beside it. Down a chain
+  // of children that is one trace, the **head's**: the caller's, where a valid
+  // `traceparent` started the execution at the head of the lineage — which is
+  // the one `context.parent` carries for a child — and otherwise the one the
+  // head's id derives. The head is `context.root`; a child with none named is
+  // one whose parent is its head.
   const lineage = document.detached === true ? document.parent_execution : undefined;
-  const traceId = context.parent?.traceId ?? traceIdOf(lineage ?? document.execution_id);
+  const head = lineage === undefined ? document.execution_id : (context.root ?? lineage);
+  const traceId = context.parent?.traceId ?? traceIdOf(head);
   // The window's own start is the one instant with nothing earlier to fall back
   // to, so an unreadable one falls back to the epoch; every other instant in
   // this file falls back to a point inside the window instead.

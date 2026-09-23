@@ -144,9 +144,11 @@ export interface SettledTrace {
  * so the envelope is headed `detached`, `parent_execution` and
  * `idempotency_key` (`docs/trace.md` §2) in every process that closes it, the
  * one that started it or one that recovered it after its parent had settled.
- * Its caller's trace is its parent's: a child lands in the trace its parent's
- * export lands in (`docs/trace.md` §12.2), so the `traceparent` read is the
- * parent's row's.
+ * Its trace is the one its parent's export lands in (`docs/trace.md` §12.2) —
+ * which, for a parent that is itself a child, is *its* parent's, and so on up
+ * to the execution a trigger or a command started. So the lineage is walked to
+ * that head ([`headOf`]): its id is the trace a child's export derives, and its
+ * row's `traceparent` is the caller's trace the whole chain joins.
  */
 export async function shipTrace(
   settled: SettledTrace,
@@ -161,8 +163,8 @@ export async function shipTrace(
   // (`docs/durability.md` §6.1), and the row is where it survived.
   const row = await journaledExecution(settled.execution);
   const lineage = row?.lineage;
-  const caller =
-    lineage === undefined ? row : await journaledExecution(lineage.parent);
+  const head = lineage === undefined ? undefined : await headOf(lineage.parent);
+  const caller = head === undefined ? row : head.row;
   const startedAt = row?.startedAt ?? new Date().toISOString();
   return await intendExport(
     sink,
@@ -171,8 +173,44 @@ export async function shipTrace(
       startedAt,
       endedAt: new Date().toISOString(),
       traceparent: caller?.traceparent,
+      ...(head === undefined ? {} : { root: head.execution }),
     },
   );
+}
+
+/**
+ * The execution at the head of a child's lineage — the one a trigger or a
+ * command started — found by walking lifecycle rows up from its parent, and
+ * that execution's row where the journal still holds one (PRD resolved q65,
+ * `docs/trace.md` §12.2).
+ *
+ * **Why one hop is not enough.** A child's export lands in the trace its
+ * parent's export lands in, and a parent that is itself a child landed in its
+ * own parent's — so every execution descended from one head shares the head's
+ * trace. Stopping at the parent would derive a grandchild's trace from its
+ * parent's id: a trace nothing else is exported into, holding a root span whose
+ * parent — the child's root — is in the head's.
+ *
+ * Where an ancestor's row cannot be found the walk stops there and answers the
+ * furthest id it reached, because that is the best statement of the head the
+ * journal can make; with no row, it carries no `traceparent` either. A lineage
+ * that names an execution already walked — which no derived id can produce,
+ * each being a digest over its parent's — is stopped rather than followed.
+ */
+async function headOf(
+  parent: string,
+): Promise<{ readonly execution: string; readonly row?: runtime.ExecutionRow }> {
+  const walked = new Set<string>();
+  let execution = parent;
+  for (;;) {
+    walked.add(execution);
+    const row = await journaledExecution(execution);
+    const above = row?.lineage?.parent;
+    if (above === undefined || walked.has(above)) {
+      return { execution, ...(row === undefined ? {} : { row }) };
+    }
+    execution = above;
+  }
 }
 
 /**
@@ -185,7 +223,13 @@ export async function shipTrace(
 async function intendExport(
   sink: NonNullable<typeof traceSink>,
   document: runtime.TraceDocument,
-  window: { readonly startedAt: string; readonly endedAt: string; readonly traceparent?: string },
+  window: {
+    readonly startedAt: string;
+    readonly endedAt: string;
+    readonly traceparent?: string;
+    /** A child's lineage head ([`headOf`]); what `ExportContext.root` carries. */
+    readonly root?: string;
+  },
 ): Promise<runtime.DeliveryRecord> {
   const parent = parseTraceparent(window.traceparent);
   const body =
@@ -198,6 +242,7 @@ async function intendExport(
             startedAt: window.startedAt,
             endedAt: window.endedAt,
             ...(parent === undefined ? {} : { parent }),
+            ...(window.root === undefined ? {} : { root: window.root }),
           }),
         )
       : JSON.stringify(document);

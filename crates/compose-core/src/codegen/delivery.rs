@@ -159,8 +159,13 @@ model.m:\n  provider: provider.p\n  id: some-model\n",
     /// ledger through the one export writer — and what makes it a child's is
     /// read off its lifecycle row rather than handed in, so every process that
     /// closes a child's row, the one that started it or one that recovered it
-    /// after its parent settled, heads the envelope the same way. Its caller's
-    /// trace is its **parent's**, read off the parent's row.
+    /// after its parent settled, heads the envelope the same way. Its trace is
+    /// the one its parent's export lands in — the **head's**, the execution at
+    /// the top of its lineage — so the lineage is walked up the rows to that head,
+    /// whose row carries the caller's `traceparent` and whose id the exporter is
+    /// told (`docs/trace.md` §12.2). One hop would file a grandchild in a trace
+    /// nothing else is exported into; the behaviour is pinned end to end by
+    /// `a_grandchild_is_exported_into_the_trace_its_parent_landed_in`.
     #[test]
     fn a_child_executions_export_is_headed_by_the_lineage_its_row_carries() {
         let ship = SOURCE
@@ -176,9 +181,22 @@ model.m:\n  provider: provider.p\n  id: some-model\n",
              through the runtime's one writer of it (`docs/trace.md` §2)"
         );
         assert!(
-            ship.contains("journaledExecution(lineage.parent)"),
-            "a child's export no longer joins its **parent's** trace: the caller's \
-             `traceparent` is the parent's row's (`docs/trace.md` §12.2)"
+            ship.contains("headOf(lineage.parent)") && ship.contains("root: head.execution"),
+            "a child's export no longer joins the trace its parent's export lands in: the \
+             caller's `traceparent` is the lineage head's row's, and the head's id is what the \
+             exporter derives the trace from (`docs/trace.md` §12.2)"
+        );
+        let walk = SOURCE
+            .split_once("async function headOf(")
+            .expect("`src/delivery.ts` walks a child's lineage to its head")
+            .1
+            .split_once("\n}\n")
+            .expect("…in a function with a closing brace")
+            .0;
+        assert!(
+            walk.contains("row?.lineage?.parent") && walk.contains("for (;;)"),
+            "the lineage walk no longer climbs past the immediate parent, so a grandchild's \
+             export would derive its trace from its parent's id (`docs/trace.md` §12.2)"
         );
         for gone in [
             "shipDetachedTrace",

@@ -4092,7 +4092,10 @@ export function sessionRefusal(address: string, stores: readonly string[]): stri
  * app are built on (PRD 5.11's `start`), and what an ejected project calls
  * directly. The inputs are parsed against the flow's own `inputs:` schema before
  * anything runs, which is where an invocation that the flow cannot accept is
- * refused by field name (grammar 13.2).
+ * refused by field name (grammar 13.2) — every invocation's but a **child
+ * execution's**, which runs on what its dispatch bound, as any dispatched
+ * instance does, and opens its row before anything can refuse it (see the note
+ * at the top of the body).
  *
  * A run that produces no answer raises `runtime.FlowFailure`, which carries the
  * trace it did make and the original error as its `cause` — see
@@ -4221,14 +4224,31 @@ export async function runFlow(
     readonly closing?: (produced: FlowRun | undefined, error: unknown) => Promise<void>;
   } = {},
 ): Promise<FlowRun> {
-  const flow = flows[address];
-  if (flow === undefined) {
-    throw new Error(
-      `\`${address}\` is not a flow of this composition: ${Object.keys(flows).join(", ")}`,
-    );
-  }
-  const parsed = flow.parse(inputs);
-  const ceiling = options.recursionLimit ?? flow.recursionLimit;
+  // **A child execution is not an invocation**, and two things below follow
+  // from it (PRD resolved q65, Decision D150).
+  //
+  // Its inputs are the ones its dispatch bound, and they are **not parsed**
+  // against the flow's `inputs:` again. What a flow's `inputs:` guards is an
+  // invocation's boundary (grammar 13.2) — a trigger's payload, a command's
+  // `--input` — and a dispatch is not one: grammar 8.6 rule 12 checks what a
+  // `map` binds against its target's fields when the composition is built, and
+  // an instance a dispatch starts runs on what it was bound, which is what a
+  // joined dispatch of this same target does (`runtime.runSubflow`) and what a
+  // detached one did before it had an identity of its own. Parsing here would
+  // make one dispatch's validity depend on `detach:` — a `min_length:` a joined
+  // item runs under would refuse the detached one — and D150 is that nothing an
+  // author writes means anything else at the join.
+  //
+  // And **nothing it refuses goes unrecorded**. An invocation refused before its
+  // row opens is answered to whoever sent it — a `400`, a usage error — and was
+  // never an execution; a child has nobody to answer, so a refusal before its row
+  // would be work that left no row, no lineage, no journal and no envelope, and
+  // that every recovery of its parent would re-issue and lose again. So a
+  // child's row opens **first**, and whatever stops it closes that row `failed`
+  // and ships the envelope that says why, as every settled execution does.
+  const child = options.lineage !== undefined;
+  const flow: CompiledFlow | undefined = flows[address];
+  const executionId = options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`;
   const sessionKey = options.sessionKey ?? "";
   // Grammar 11.3, checked where the value first exists: a flow that reaches a
   // `scope: session` store keys off the identity its trigger supplies, and a run
@@ -4238,10 +4258,20 @@ export async function runFlow(
   // caller it cannot stand in for — a `serve` request, an ejected invocation —
   // where the key arrives per invocation and its absence really is a failure of
   // that run rather than of the command.
-  if (sessionKey === "" && flow.sessionStores.length > 0) {
-    throw new Error(sessionRefusal(address, flow.sessionStores));
-  }
-  const executionId = options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`;
+  const admitted = (): CompiledFlow => {
+    if (flow === undefined) {
+      throw new Error(
+        `\`${address}\` is not a flow of this composition: ${Object.keys(flows).join(", ")}`,
+      );
+    }
+    if (sessionKey === "" && flow.sessionStores.length > 0) {
+      throw new Error(sessionRefusal(address, flow.sessionStores));
+    }
+    return flow;
+  };
+  const invoked = child ? undefined : admitted();
+  const parsed =
+    invoked === undefined ? ((inputs ?? {}) as Record<string, unknown>) : invoked.parse(inputs);
   // Before the graph is streamed, so an execution the process dies in the middle
   // of already has a row saying it was open (PRD resolved q28).
   const lineage = await runtime.openExecution({
@@ -4256,9 +4286,13 @@ export async function runFlow(
     ...(options.lineage === undefined ? {} : { lineage: options.lineage }),
   });
   try {
+    // A child's refusals, now that it has a row to close `failed` over — see
+    // the note at the top of this function.
+    const compiled = invoked ?? admitted();
+    const ceiling = options.recursionLimit ?? compiled.recursionLimit;
     const produced = await quiesceFlow(
       address,
-      flow,
+      compiled,
       parsed,
       ceiling,
       { id: executionId, session_key: sessionKey, ...(lineage?.itemIndex === undefined ? {} : { item_index: lineage.itemIndex }) },

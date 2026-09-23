@@ -2142,6 +2142,28 @@ export function openJournal(): Promise<Journal> {
 }
 
 /**
+ * Answer every [`openJournal`] in this process with `journal`, rather than with
+ * the project's own.
+ *
+ * Called by `./worker-node.ts`, before anything runs, and by nothing else. A
+ * worker runs one dispatch of an execution the **hub** journals, and the hub is
+ * the single writer (`docs/distributed.md` §3.3, PRD resolved q42): the journal
+ * a worker's code may reach is the dispatch's own — the history the hub handed
+ * over and the stream of effects going home — and never the project's journal
+ * as this process's data directory or environment would bind it. Installing the
+ * dispatch's journal as the session is not enough on its own: a session is
+ * found by execution id, and a path that opens the journal *by name* — a
+ * detached `flow.*` dispatch beginning a child execution (PRD resolved q65) is
+ * one — would otherwise open a second journal beside the hub's, on a file the
+ * hub never reads or a server whose writer guard the hub is holding. Bound
+ * here, every such path meets the dispatch journal, which refuses by name each
+ * operation that is the hub's.
+ */
+export function hostJournal(journal: Journal): void {
+  opening = Promise.resolve(journal);
+}
+
+/**
  * Close this project's journal, and let go of the writer guard with it.
  *
  * Called by `./cli.ts` on the way out of a `run` or a `resume`, and by nothing

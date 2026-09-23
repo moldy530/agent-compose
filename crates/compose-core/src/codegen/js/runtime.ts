@@ -11510,9 +11510,16 @@ export interface ChildExecution {
   /** The `flow.*` the dispatch targeted, as its typed address. */
   readonly flow: string;
   /**
-   * What the dispatch bound for it, which that flow's own `inputs:` parses as
-   * it parses every invocation's (grammar 13.2) — or, for a child the journal
-   * already holds, the inputs its lifecycle row recorded.
+   * What the dispatch bound for it — or, for a child the journal already
+   * holds, the inputs its lifecycle row recorded.
+   *
+   * Run as bound, and **not** parsed again against the flow's `inputs:`: that
+   * schema guards an invocation's boundary (grammar 13.2), and a dispatch is
+   * not one — grammar 8.6 rule 12 checks what a `map` binds against its
+   * target's fields at build time, and a joined dispatch of the same target
+   * runs on exactly this ([`runSubflow`]). A detached one runs on it too, so
+   * `detach:` cannot decide whether one dispatch's input is valid (Decision
+   * D150; `src/graph.ts`'s `runFlow`).
    */
   readonly inputs: unknown;
   /**
@@ -11669,6 +11676,11 @@ function superviseChild(
  *
  * A dispatch whose child is already running in this process joins it instead
  * ([`runningChildren`]).
+ *
+ * **On a worker it begins nothing** ([`childrenBeginHere`]): the child's row,
+ * records and recovery are the hub's to write, and a worker is not the hub. The
+ * refusal is said on the worker's stderr by name ([`ChildOnAWorker`]) before
+ * any journal is reached.
  */
 export async function dispatchChild(
   flow: string,
@@ -11682,6 +11694,7 @@ export async function dispatchChild(
   };
   const id = childExecutionId(lineage.parent, lineage.idempotencyKey);
   await superviseChild(id, async () => {
+    if (!childrenBeginHere) throw new ChildOnAWorker(flow, lineage.idempotencyKey);
     const journal = await openJournal();
     const row = await journal.execution(id);
     if (row !== undefined) return row.status === "open" ? childOf(row) : undefined;
@@ -12557,6 +12570,39 @@ let pausesSettleHome = false;
 /** See [`pausesSettleHome`]. Called by `./worker-node.ts` before anything runs. */
 export function dispatchPausesHome(): void {
   pausesSettleHome = true;
+}
+
+/**
+ * Whether this process may **begin** a child execution (PRD resolved q65).
+ *
+ * Every process may but one: `./worker-node.ts`, which turns it off before
+ * anything runs. A worker runs one dispatch of an execution the hub journals,
+ * and a child execution is begun, journaled, recovered and exported through
+ * the journal's single writer — the hub (`docs/distributed.md` §3.3, PRD
+ * resolved q42) — which a worker is not and cannot stand in for. A worker
+ * reaches a detached `flow.*` dispatch only through a flow a placed agent
+ * attaches as a tool (grammar 14.1 rule 4 runs it in the agent's process), and
+ * there [`dispatchChild`] refuses it by name rather than beginning a child
+ * nobody can recover on a journal nobody reads.
+ */
+let childrenBeginHere = true;
+
+/** See [`childrenBeginHere`]. Called by `./worker-node.ts` before anything runs. */
+export function refuseChildExecutions(): void {
+  childrenBeginHere = false;
+}
+
+/**
+ * A detached `flow.*` dispatch reached on a worker, where no child execution
+ * can begin (PRD resolved q42, q65, [`childrenBeginHere`]).
+ */
+export class ChildOnAWorker extends Error {
+  constructor(flow: string, idempotencyKey: string) {
+    super(
+      `\`${flow}\` was dispatched with \`detach: true\` (key \`${idempotencyKey}\`) inside a placed node, on the worker running it, and a detached \`flow.*\` dispatch starts a child execution — which the hub alone begins, journals and recovers, as the single writer of this deployment's journal (docs/distributed.md §3.3, PRD resolved q42, q65). It was not started. Drop \`detach:\` so the dispatch is joined inside the placed node, or dispatch the flow from a flow the hub runs rather than from one a placed agent attaches as a tool (grammar 14.1 rule 4)`,
+    );
+    this.name = "ChildOnAWorker";
+  }
 }
 
 /**
