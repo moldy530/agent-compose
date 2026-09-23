@@ -509,8 +509,8 @@ const flowReviewBatchNodeHandOffMap: runtime.MapDescriptor = {
         "goal": runtime.toJson(runtime.evaluate("task.goal", roots)),
         "worktree": runtime.toJson(runtime.evaluate("task.worktree", roots)),
       }),
-      run: (input, _context, site) =>
-        runtime.dispatchChild("flow.review", input, site),
+      run: (input, context, site) =>
+        runtime.dispatchChild("flow.review", input, site, context.admission),
       writes: [],
     },
   ],

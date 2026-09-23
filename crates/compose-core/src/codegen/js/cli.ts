@@ -438,8 +438,10 @@ async function execute(job: Job): Promise<number> {
     // `process.exit`, and a child killed in the middle of an effect is an effect
     // with no record, which the generation that resumes it issues a second time
     // (`docs/durability.md` §6.2). So the command stays until every child it
-    // started has settled — and every child *they* started, which is what
-    // `childrenSettled` re-reads for — and then sends what each exported.
+    // started has settled — one still queued behind its node's
+    // `max_concurrency:` included, which is on the process's books from the
+    // moment its dispatch was issued, and every child *they* started, which is
+    // what `childrenSettled` re-reads for — and then sends what each exported.
     await childrenSettled();
     for (const record of children) await shipped(record);
     return code;

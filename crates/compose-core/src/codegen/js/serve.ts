@@ -384,8 +384,9 @@ export function createApp(): FastifyInstance {
   // execution or a recovered one — is tracked on the same map, answers on the
   // same status route by its own id, and ships its own trace from the hook that
   // closes its own row ([`trackChild`]). Hosted **before** the recovery hook
-  // below, because recovery is one of the two ways a child starts here: an open
-  // child is resumed natively, whether or not its parent is open too. And let
+  // below, because recovery is one of the ways a child starts here: an open
+  // child is resumed — natively where its parent has settled, and through its
+  // recovered parent's re-issued dispatch where the parent is open too. And let
   // go of when the app closes, so an ejected caller that builds a second app in
   // one process tracks a child on the map of the app that is still serving.
   const unhost = hostChildren((child) => trackChild(executions, child));
@@ -997,6 +998,7 @@ async function recoverExecutions(executions: Map<string, Execution>): Promise<vo
     process.stderr.write(`this project's journal could not be read: ${message(error)}\n`);
     return;
   }
+  const stillOpen = new Set(open.map((row) => row.id));
   for (const row of open) {
     // One generation of one execution per process. Nothing can be running yet —
     // this hook is what runs before the first connection — so the guard is a
@@ -1013,15 +1015,31 @@ async function recoverExecutions(executions: Map<string, Execution>): Promise<vo
       );
       continue;
     }
-    // A **child execution** (PRD resolved q65) is resumed natively — including
-    // after the parent that dispatched it has settled, which is the crash the
-    // ruling was ratified from — and through the child machinery rather than
-    // beside it, so that a parent recovered in this same walk that re-issues
-    // its dispatch **joins** this generation instead of starting a second
-    // (`runtime.resumeChild`, `docs/durability.md` §6.1). Its own runner puts it
-    // on this map ([`trackChild`]). It announced no pauses, because it holds
-    // none (Decision D118), and it has no callback of its own to owe.
+    // A **child execution** (PRD resolved q65) is recovered one of two ways,
+    // decided by its parent's row (`docs/durability.md` §6.1).
+    //
+    // Where the parent is **open** too, the parent's replay is what resumes it:
+    // the replay reaches the detached dispatch again and re-issues it, and the
+    // dispatch finds the child's open row and resumes it — admitted behind that
+    // node's join, under its bounds, exactly as the first generation ran it.
+    // Resuming it here as well would put it in front of the parent's own joined
+    // instances in that node's permit queue, delaying the parent on work grammar
+    // 8.6 rule 7 says it never waits for.
+    //
+    // Where the parent has **settled** — the crash the ruling was ratified from
+    // — nothing will re-issue it, so it is resumed natively, admitted under the
+    // bound its lineage recorded (`runtime.resumeChild`): a fan-out stopped with
+    // one child running and three still queued restarts one at a time, not four
+    // at once. Either way its own runner puts it on this map ([`trackChild`]); it
+    // announced no pauses, because it holds none (Decision D118), and it has no
+    // callback of its own to owe.
     if (row.lineage !== undefined) {
+      if (stillOpen.has(row.lineage.parent)) {
+        process.stderr.write(
+          `recovered ${row.id} (${row.flow}), for its open parent ${row.lineage.parent} to re-issue\n`,
+        );
+        continue;
+      }
       void resumeChild(row);
       process.stderr.write(`recovered ${row.id} (${row.flow})\n`);
       continue;

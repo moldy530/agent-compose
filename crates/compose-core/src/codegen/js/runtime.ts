@@ -111,6 +111,7 @@ import type {
   ExecutionRow,
   Journal,
   Lineage,
+  LineageAdmission,
 } from "./journal.ts";
 
 export {
@@ -140,6 +141,7 @@ export type {
   JournalProvider,
   JournalRecord,
   Lineage,
+  LineageAdmission,
 } from "./journal.ts";
 
 // ---------------------------------------------------------------------------
@@ -1001,6 +1003,39 @@ export interface RunContext {
    * of the *invocation* rather than a dependency of the graph.
    */
   readonly effects?: EffectRecorder;
+  /**
+   * The permits a **detached `flow.*`** dispatch's child execution starts under
+   * (Decision D28, PRD resolved q65) — on that dispatch's context and on no
+   * other.
+   *
+   * [`runMap`] takes every other dispatch's permits itself, before it runs the
+   * route. A child's it hands over instead, for two reasons that are one: the
+   * child's lifecycle row is begun the moment the dispatch is issued — before
+   * any permit — so that a process which stops with the child still queued
+   * leaves a row to recover rather than work nothing records; and the
+   * generation that *runs* the child is the one that has to hold the permits,
+   * which is not always the dispatch that asked (a second arrival at a child
+   * already running joins it, holding nothing). See [`dispatchChild`].
+   */
+  readonly admission?: ChildAdmission;
+}
+
+/**
+ * How one child execution is admitted under its map node's bounds (Decision
+ * D28): wait for the permits, and answer the call that gives them back.
+ *
+ * Two makers, one per way a child's generation starts. [`runMap`]'s draws on the
+ * node's own [`Admission`], behind every joined instance of the call that issued
+ * the dispatch (grammar 8.6 rule 7); a recovery's, for a child no parent will
+ * re-issue, rebuilds the same gates from what the child's lineage recorded
+ * ([`recoveredAdmission`]). Either way the permits are taken as a `"detached"`
+ * waiter and held until the child settles.
+ */
+export interface ChildAdmission {
+  /** What the child's lineage records of the bound (`docs/durability.md` §3.5). */
+  readonly bounds: LineageAdmission;
+  /** Wait for both permits; answer the release. */
+  acquire(): Promise<() => void>;
 }
 
 /**
@@ -10685,6 +10720,80 @@ function retire(key: string, admission: Admission): void {
   }
 }
 
+/**
+ * The permits a child execution [`runMap`] issued starts under: this call's
+ * node gates, taken behind every joined instance of the call and as a
+ * `"detached"` waiter — exactly what the call takes for any other detached
+ * dispatch ([`ChildAdmission`]).
+ *
+ * Counting the dispatch in and out of the node's [`Admission`] stays
+ * [`runMap`]'s: it counted every planned instance when it began, and retires
+ * each when its dispatch settles — this one included, whichever generation of
+ * the child ended up holding the permits.
+ */
+function nodeAdmission(
+  behind: Promise<void>,
+  route: Gate,
+  node: Gate,
+  bounds: LineageAdmission,
+): ChildAdmission {
+  return {
+    bounds,
+    async acquire() {
+      await behind;
+      await route.acquire("detached");
+      await node.acquire("detached");
+      return () => {
+        node.release();
+        route.release();
+      };
+    },
+  };
+}
+
+/**
+ * The permits a **recovered** child starts under, where no parent will re-issue
+ * its dispatch: the gates of the map node that issued it, rebuilt from what its
+ * lineage recorded (`docs/durability.md` §6.1, Decision D28).
+ *
+ * Found by the key [`runMap`] uses, so every child a recovery resumes from one
+ * node draws on one set of gates — a `max_concurrency: 1` fan-out whose process
+ * stopped with one child running and three queued restarts with one running and
+ * three queued, rather than four at once. The dispatch is counted into that
+ * [`Admission`] when it asks and out of it when it gives the permits back, as a
+ * dispatch of the node's own would be. Only a child whose parent has **settled**
+ * is admitted this way — so no joined instance of that node can ever be
+ * waiting, and the queue discipline [`runMap`] keeps is kept by there being
+ * nobody to get ahead of.
+ */
+function recoveredAdmission(bounds: LineageAdmission): ChildAdmission {
+  return {
+    bounds,
+    async acquire() {
+      let held = admissions.get(bounds.node);
+      if (held === undefined) {
+        held = { node: new Gate(bounds.nodeBound), routes: new Map(), outstanding: 0 };
+        admissions.set(bounds.node, held);
+      }
+      const entry = held;
+      entry.outstanding += 1;
+      let gate = entry.routes.get(bounds.route);
+      if (gate === undefined) {
+        gate = new Gate(Math.min(bounds.routeBound, bounds.nodeBound));
+        entry.routes.set(bounds.route, gate);
+      }
+      const route = gate;
+      await route.acquire("detached");
+      await entry.node.acquire("detached");
+      return () => {
+        entry.node.release();
+        route.release();
+        retire(bounds.node, entry);
+      };
+    },
+  };
+}
+
 /** `on_item_error:` — per item, and map-wide (grammar 8.6 rule 10, D73). */
 export type ItemPolicy = "fail" | "skip" | { readonly retry: RetryPolicy };
 
@@ -11025,6 +11134,23 @@ export async function runMap(
   plan: MapPlan,
   context: RunContext,
 ): Promise<NodeAnswer> {
+  // **A dispatch that cannot be issued fails the node that would issue it**
+  // (grammar 8.6 rule 7: the map's own `on_error:` "still covers the node's own
+  // failures, including a dispatch that could not be issued at all"). On a
+  // worker a detached `flow.*` dispatch is one: its child execution would be
+  // begun, journaled and recovered by the journal's single writer, and a worker
+  // is not it ([`childrenBeginHere`]). So the node fails here — before anything
+  // is dispatched, before a permit is counted, before any stub record says a
+  // dispatch was issued — and the failure is the node's, on its trace entry and
+  // under its `retry:` and `on_error:`, travelling home with the placed node
+  // like any other rather than dying on the worker's stderr.
+  if (!childrenBeginHere) {
+    const refused = plan.instances.find((instance) => startsChild(instance.route));
+    if (refused !== undefined) {
+      plan.records.length = 0;
+      throw new ChildOnAWorker(refused.route.target, refused.site.idempotencyKey);
+    }
+  }
   const admission = admit(map, plan);
   const node = admission.node;
   const gateOf = (route: MapRoute): Gate => {
@@ -11168,6 +11294,34 @@ export async function runMap(
       const undetach = detaching(scoped.execution.id, site.path.join("/"));
       const delivering = (async () => {
         try {
+          // **A child execution is issued now and admitted inside** (PRD
+          // resolved q65, D28). `route.run` is [`dispatchChild`] for a `flow.*`
+          // sink, and it is called in this tick — before any `await` — so the
+          // child is on the process's books ([`childrenSettled`]) from the moment
+          // its stub record above says it was issued, and its lifecycle row is
+          // begun before it waits for anything. A child still queued for a
+          // permit when its process stops is then an open row to recover, not
+          // work that existed only in memory. The permits it waits for are this
+          // node's, taken exactly as the branch below takes them — behind the
+          // join, as a `"detached"` waiter — by whichever generation of the
+          // child actually runs, and held until it settles; it answers then, or
+          // at once where the child already ran.
+          if (startsChild(route)) {
+            await route.run(
+              instance.input,
+              {
+                ...delivery,
+                admission: nodeAdmission(joinedAdmitted, gate, node, {
+                  node: plan.admission,
+                  nodeBound: map.maxConcurrency,
+                  route: routeKey(map, route),
+                  routeBound: Math.min(route.maxConcurrency, map.maxConcurrency),
+                }),
+              },
+              site,
+            );
+            return;
+          }
           // `max_concurrency` is an **admission** bound over every in-flight
           // dispatch, detached included (grammar 8.6's key table, D28): a
           // detached delivery waits for a node permit to *start*, exactly as a
@@ -11177,11 +11331,6 @@ export async function runMap(
           // Both gates are taken after the barrier and as a `"detached"` waiter,
           // so a joined instance of this call never queues behind this delivery
           // and a later execution of this node never queues behind it either.
-          //
-          // A **child execution** takes its permits the same way and holds them
-          // for as long as it runs (PRD resolved q65 moves nothing about D28):
-          // `route.run` is [`dispatchChild`] for a `flow.*` sink, and it answers
-          // when the child settles — or at once, where the child already ran.
           await joinedAdmitted;
           await gate.acquire("detached");
           await node.acquire("detached");
@@ -11190,9 +11339,9 @@ export async function runMap(
           } finally {
             node.release();
             gate.release();
-            retire(plan.admission, admission);
           }
         } finally {
+          retire(plan.admission, admission);
           undetach();
         }
       })().catch((error: unknown) => {
@@ -11540,8 +11689,12 @@ export interface ChildExecution {
   /** The dispatch that started it. */
   readonly lineage: Lineage;
   /**
-   * Whether the journal already holds it, so this is a generation to replay to
-   * its frontier rather than one to begin (PRD resolved q29).
+   * Whether the journal already held it before this dispatch reached it — an
+   * earlier generation's row, or the records an earlier build journaled under
+   * its parent — so this is a generation to replay to its frontier rather than
+   * one to begin (PRD resolved q29). A first dispatch's child is `false`, though
+   * its row is already down by the time it is handed over ([`dispatchChild`]):
+   * that row holds nothing to replay.
    */
   readonly resume: boolean;
 }
@@ -11580,31 +11733,61 @@ export function hostChildren(runner: ChildRunner): () => void {
 }
 
 /**
- * Every child execution this process is running, by id.
+ * One child execution this process has on its books: from the moment its
+ * dispatch was issued — or its recovery began — until it has settled.
+ */
+interface SupervisedChild {
+  /**
+   * Settles once the child's lifecycle row is down, or it is known there is
+   * nothing to begin — its row already closed, or the attempt refused — and
+   * never rejects. What an execution closing its own row waits on for the
+   * children it dispatched ([`childrenBegun`]).
+   */
+  readonly begun: Promise<void>;
+  /** Settles once the child has, and never rejects ([`superviseChild`]). */
+  readonly settled: Promise<void>;
+}
+
+/**
+ * Every child execution this process has on its books, by id — **issued** ones
+ * still waiting for a permit as well as running ones.
  *
  * **What makes one dispatch one child in one process**, and the reconciliation
- * `docs/durability.md` §6.1 describes. A `serve` restart can reach one open child
- * from two directions at once: its recovery walks every open execution — the
- * child among them — while the parent, open too, replays to its detached
- * dispatch and re-issues it, and both derive the same id. Two generations of one
- * execution beside each other would interleave two runs' live effects into one
- * record, so the second arrival **joins** the first rather than opening the
- * journal again ([`superviseChild`]). The entry goes in synchronously, before
- * anything is awaited, so there is no gap for a second arrival to fall through.
+ * `docs/durability.md` §6.1 describes. One child can be reached twice in one
+ * process — a map node's own `retry:` re-issues its dispatches at the same
+ * paths, and a `resume` of a parent re-issues a dispatch whose child is already
+ * open — and both arrivals derive the same id. Two generations of one execution
+ * beside each other would interleave two runs' live effects into one record, so
+ * the second arrival **joins** the first rather than opening the journal again
+ * ([`superviseChild`]). The entry goes in synchronously, before anything is
+ * awaited, so there is no gap for a second arrival to fall through.
+ *
+ * It is also the set a process about to end drains ([`childrenSettled`]), and
+ * that is why a child is on it **from issue** rather than from admission: a
+ * dispatch still queued behind its node's `max_concurrency:` is work this
+ * process started, and a process that ended because only the running ones were
+ * counted would end under it (PRD resolved q65: the process does not end under
+ * a child it started).
  *
  * Across processes the rule is the journal's own: one process at a time writes a
  * project's journal (`docs/durability.md` §2.1, PRD resolved q42).
  */
-const runningChildren = new Map<string, Promise<void>>();
+const runningChildren = new Map<string, SupervisedChild>();
 
 /**
- * Run one child execution in this process, or join the one already running
- * under its id, and answer when it has settled.
+ * Put one child execution on this process's books and see it through — or join
+ * the one already there under its id.
  *
- * `prepare` reads what the child is — from the dispatch and the journal — and
- * answers nothing where there is nothing to run: a child whose lifecycle row has
- * already closed ran to its end in an earlier generation, and a dispatch of it
- * is delivered (PRD resolved q28: nothing resumes a settled execution).
+ * Three steps, in an order that is the point. `prepare` reads what the child
+ * is — from the dispatch and the journal — **begins its lifecycle row** where
+ * there is none, and answers nothing where there is nothing to run: a child
+ * whose row has already closed ran to its end in an earlier generation, and a
+ * dispatch of it is delivered (PRD resolved q28: nothing resumes a settled
+ * execution). Only then is the child **admitted** — its node's permits, taken by
+ * this generation and held until it settles (Decision D28) — so a process that
+ * stops while it waits leaves an open row with the child's cause on it, which a
+ * restart recovers (`docs/durability.md` §6.1). And then it **runs**, on the
+ * runner this process hosts.
  *
  * **It never rejects.** A child that failed failed on its own — its row says so,
  * its trace ships its outcome, and the one line below says so on stderr for a
@@ -11616,37 +11799,55 @@ const runningChildren = new Map<string, Promise<void>>();
 function superviseChild(
   id: string,
   prepare: () => Promise<ChildExecution | undefined>,
-): Promise<void> {
+  admission: ChildAdmission | undefined,
+): SupervisedChild {
   const held = runningChildren.get(id);
   if (held !== undefined) return held;
-  const running = (async () => {
-    let child: ChildExecution | undefined;
+  let child: ChildExecution | undefined;
+  const preparing = (async () => {
+    child = await prepare();
+  })();
+  const settled = (async () => {
     try {
-      child = await prepare();
-      if (child === undefined) return;
-      const runner = childRunner;
-      if (runner === undefined) {
-        // Unreachable in an emitted project, whose `src/graph.ts` hosts the plain
-        // runner as it loads; said rather than assumed for an ejected module
-        // graph that reaches this without it.
-        throw new Error("no runner is hosted for child executions in this process");
+      await preparing;
+      const handed = child;
+      if (handed === undefined) return;
+      const release = admission === undefined ? undefined : await admission.acquire();
+      try {
+        const runner = childRunner;
+        if (runner === undefined) {
+          // Unreachable in an emitted project, whose `src/graph.ts` hosts the
+          // plain runner as it loads; said rather than assumed for an ejected
+          // module graph that reaches this without it.
+          throw new Error("no runner is hosted for child executions in this process");
+        }
+        await runner(handed);
+      } finally {
+        release?.();
       }
-      await runner(child);
     } catch (error) {
+      const known = child;
       process.stderr.write(
         `the child execution \`${id}\`${
-          child === undefined
+          known === undefined
             ? ""
-            : ` (\`${child.flow}\`, started by the detached dispatch \`${child.lineage.idempotencyKey}\`)`
+            : ` (\`${known.flow}\`, started by the detached dispatch \`${known.lineage.idempotencyKey}\`)`
         } did not complete: ${describe(error)}\n`,
       );
     }
   })();
-  runningChildren.set(id, running);
-  void running.finally(() => {
-    if (runningChildren.get(id) === running) runningChildren.delete(id);
+  const supervised: SupervisedChild = {
+    begun: preparing.then(
+      () => undefined,
+      () => undefined,
+    ),
+    settled,
+  };
+  runningChildren.set(id, supervised);
+  void settled.finally(() => {
+    if (runningChildren.get(id) === supervised) runningChildren.delete(id);
   });
-  return running;
+  return supervised;
 }
 
 /**
@@ -11654,19 +11855,23 @@ function superviseChild(
  * or find it already ran — and answer when it has settled (PRD resolved q65).
  *
  * The emitted `route.run` of every detached route to a `flow.*` (`src/graph.ts`,
- * [`startsChild`]), reached from [`runMap`] with the dispatch's permits held:
+ * [`startsChild`]), called by [`runMap`] in the tick the dispatch is issued and
+ * handed the node's permits to take rather than holding them: the child's row is
+ * begun **first**, and the permits are taken by the generation that runs it —
  * Decision D28's admission bound covers a child exactly as it covered the
  * delivery the child replaces, so this answers when the child settles and the
- * permits go back then. The **join** moves nothing (Decision D94): the map
- * node's stub `"detached"` record was written the moment this was issued, and
- * nothing here writes to the node's entry, its channels or its outcome — the
- * answer is empty, and what became of the child is the child's.
+ * permits go back then ([`superviseChild`]). The **join** moves nothing
+ * (Decision D94): the map node's stub `"detached"` record was written the
+ * moment this was issued, and nothing here writes to the node's entry, its
+ * channels or its outcome — the answer is empty, and what became of the child is
+ * the child's.
  *
  * Three ways a dispatch finds its child, told apart by the child's lifecycle
  * row:
  *
- *  * **none** — a first dispatch. The child begins, with its lineage on its row
- *    and its parent's session and trigger;
+ *  * **none** — a first dispatch. The child's row is begun at once — its lineage,
+ *    its admission bound, its parent's session and trigger, the inputs the
+ *    dispatch bound — and the child runs once it is admitted;
  *  * **open** — the child began in an earlier generation and did not settle: a
  *    recovered parent re-issuing the dispatch, or a `resume` of one. The child
  *    replays to its frontier under the inputs its row recorded, its model not
@@ -11674,59 +11879,139 @@ function superviseChild(
  *  * **closed** — the child already ran to its end. Nothing runs, and the
  *    dispatch is delivered: a settled execution is never resumed.
  *
- * A dispatch whose child is already running in this process joins it instead
- * ([`runningChildren`]).
+ * A dispatch whose child is already on this process's books joins it instead
+ * ([`runningChildren`]), holding no permit of its own.
+ *
+ * **The parent does not close under an unbegun child.** Its row closing is the
+ * one moment after which nothing re-issues this dispatch, so the begin is noted
+ * against the parent and [`settleExecution`] waits for it — for the row, a
+ * journal write, and never for the child's work or its permit
+ * ([`childrenBegun`]).
  *
  * **On a worker it begins nothing** ([`childrenBeginHere`]): the child's row,
- * records and recovery are the hub's to write, and a worker is not the hub. The
- * refusal is said on the worker's stderr by name ([`ChildOnAWorker`]) before
- * any journal is reached.
+ * records and recovery are the hub's to write, and a worker is not the hub.
+ * [`runMap`] refuses such a dispatch before it is issued; one reached here some
+ * other way is refused by name ([`ChildOnAWorker`]) before any journal is.
  */
 export async function dispatchChild(
   flow: string,
   input: unknown,
   site: DispatchSite,
+  admission?: ChildAdmission,
 ): Promise<NodeAnswer> {
   const lineage: Lineage = {
     parent: site.execution.id,
     idempotencyKey: site.idempotencyKey,
     ...(site.execution.item_index === undefined ? {} : { itemIndex: site.execution.item_index }),
+    ...(admission === undefined ? {} : { admission: admission.bounds }),
   };
   const id = childExecutionId(lineage.parent, lineage.idempotencyKey);
-  await superviseChild(id, async () => {
-    if (!childrenBeginHere) throw new ChildOnAWorker(flow, lineage.idempotencyKey);
-    const journal = await openJournal();
-    const row = await journal.execution(id);
-    if (row !== undefined) return row.status === "open" ? childOf(row) : undefined;
-    const adopted = await adoptDelivery(journal, lineage, id, site.path.join("/"));
-    const parent = await journal.execution(lineage.parent);
-    return {
-      id,
-      flow,
-      inputs: input,
-      sessionKey: site.execution.session_key,
-      trigger: parent?.trigger ?? "manual",
-      lineage,
-      resume: adopted,
-    };
-  });
+  const supervised = superviseChild(
+    id,
+    async () => {
+      if (!childrenBeginHere) throw new ChildOnAWorker(flow, lineage.idempotencyKey);
+      const journal = await openJournal();
+      const row = await journal.execution(id);
+      if (row !== undefined) return row.status === "open" ? childOf(row) : undefined;
+      const adopted = await adoptDelivery(journal, lineage, id, site.path.join("/"));
+      const parent = await journal.execution(lineage.parent);
+      const child: ChildExecution = {
+        id,
+        flow,
+        inputs: input,
+        sessionKey: site.execution.session_key,
+        trigger: parent?.trigger ?? "manual",
+        lineage,
+        resume: adopted,
+      };
+      // **Begun now, before it waits for anything** — the row `runFlow` would
+      // begin when the child runs, written in the dispatch's own tick of work
+      // instead. `begin` is a no-op on a row that is already there, so the
+      // generation that runs the child begins it again for nothing.
+      await journal.begin({
+        id,
+        flow,
+        trigger: child.trigger,
+        inputs: (input ?? {}) as Record<string, unknown>,
+        sessionKey: child.sessionKey,
+        lineage,
+        status: "open",
+        journalVersion: JOURNAL_VERSION,
+        startedAt: new Date().toISOString(),
+      });
+      return child;
+    },
+    admission,
+  );
+  noteChildBegin(lineage.parent, supervised.begun);
+  await supervised.settled;
   return { output: {} };
 }
 
 /**
  * Resume one open child execution the journal holds — or join it where this
- * process is already running it — and answer when it has settled.
+ * process already has it on its books — and answer when it has settled.
  *
- * What `src/serve.ts`'s recovery calls for an open row that carries a lineage,
- * in place of the path every other open execution takes: through
- * [`superviseChild`], so that a parent recovered beside it which re-issues its
- * dispatch joins this generation rather than starting a second one — and so
- * that a child whose parent has **already settled** is resumed at all, which is
- * the crash PRD resolved q65 was ratified from: "nothing resumes a settled
- * execution" used to mean nothing resumed the delivery that outlived it.
+ * What `src/serve.ts`'s recovery calls for an open row that carries a lineage
+ * **whose parent has settled** — the crash PRD resolved q65 was ratified from:
+ * "nothing resumes a settled execution" used to mean nothing resumed the
+ * delivery that outlived it, and now the child is resumed as the open execution
+ * it is. It is admitted under the bound its dispatch was issued under, rebuilt
+ * from its lineage ([`recoveredAdmission`]), so a fan-out the process stopped in
+ * the middle of resumes as bounded as it ran. A child whose parent is open too
+ * is not resumed here: the parent's replay re-issues its dispatch, which
+ * resumes it behind that node's join exactly as the first generation ran it
+ * (`docs/durability.md` §6.1).
  */
 export function resumeChild(row: ExecutionRow): Promise<void> {
-  return superviseChild(row.id, async () => childOf(row));
+  const bounds = row.lineage?.admission;
+  return superviseChild(
+    row.id,
+    async () => childOf(row),
+    bounds === undefined ? undefined : recoveredAdmission(bounds),
+  ).settled;
+}
+
+/**
+ * The lifecycle-row begins of the child executions each execution has
+ * dispatched and not yet seen begun, by the parent's id.
+ */
+const childBegins = new Map<string, Set<Promise<void>>>();
+
+/** Note one child's begin against the execution that dispatched it. */
+function noteChildBegin(parent: string, begun: Promise<void>): void {
+  let held = childBegins.get(parent);
+  if (held === undefined) {
+    held = new Set();
+    childBegins.set(parent, held);
+  }
+  held.add(begun);
+  void begun.finally(() => {
+    const still = childBegins.get(parent);
+    if (still === undefined) return;
+    still.delete(begun);
+    if (still.size === 0) childBegins.delete(parent);
+  });
+}
+
+/**
+ * Wait until every child execution `execution` dispatched has its lifecycle row
+ * begun — or is known to need none.
+ *
+ * What [`settleExecution`] waits on before it closes a row, because a closed row
+ * is one nothing replays: a child whose begin had not landed when its parent
+ * closed would have no row, and no parent left to re-issue it — the work
+ * existing only in the memory of a process that may be about to stop. It is a
+ * wait for a **journal write** and nothing more: not for the child's permit,
+ * not for its work (grammar 8.6 rule 7 — the child is an execution its parent
+ * does not wait for), and nothing in it rejects.
+ */
+async function childrenBegun(execution: string): Promise<void> {
+  for (;;) {
+    const held = childBegins.get(execution);
+    if (held === undefined || held.size === 0) return;
+    await Promise.all([...held]);
+  }
 }
 
 /** An open child's lifecycle row, as the generation that resumes it runs it. */
@@ -11750,20 +12035,25 @@ function childOf(row: ExecutionRow): ChildExecution | undefined {
 }
 
 /**
- * Wait until this process is running no child execution.
+ * Wait until this process has no child execution on its books — none running,
+ * and none issued and still waiting for a permit.
  *
  * What a process that is about to **end** waits on — `src/cli.ts`, after its run
  * has reported — because a child killed mid-effect is an effect with no record,
- * which the generation that resumes the child issues a second time. Not what any
+ * which the generation that resumes the child issues a second time, and a child
+ * still queued is work the command started and has not done. Not what any
  * *execution* waits on: grammar 8.6 rule 7 is that nothing a detached dispatch
  * does can delay the flow instance that issued it, and a child is exactly that.
  *
  * Re-reads the set until it is empty, because a child may start children of its
- * own; nothing in it rejects ([`superviseChild`]).
+ * own; nothing in it rejects ([`superviseChild`]). A queued child is on the set
+ * from the tick its dispatch was issued ([`runningChildren`]), so the moment one
+ * child settles and hands its permit to the next is not a moment the set is
+ * empty.
  */
 export async function childrenSettled(): Promise<void> {
   for (;;) {
-    const held = [...runningChildren.values()];
+    const held = [...runningChildren.values()].map((child) => child.settled);
     if (held.length === 0) return;
     await Promise.all(held);
   }
@@ -12582,8 +12872,10 @@ export function dispatchPausesHome(): void {
  * resolved q42) — which a worker is not and cannot stand in for. A worker
  * reaches a detached `flow.*` dispatch only through a flow a placed agent
  * attaches as a tool (grammar 14.1 rule 4 runs it in the agent's process), and
- * there [`dispatchChild`] refuses it by name rather than beginning a child
- * nobody can recover on a journal nobody reads.
+ * there the dispatch cannot be issued: [`runMap`] fails the map node that would
+ * have issued it, by name, before anything is dispatched — the failure grammar
+ * 8.6 rule 7 leaves to that node's own `on_error:` — rather than beginning a
+ * child nobody can recover on a journal nobody reads.
  */
 let childrenBeginHere = true;
 
@@ -12594,12 +12886,13 @@ export function refuseChildExecutions(): void {
 
 /**
  * A detached `flow.*` dispatch reached on a worker, where no child execution
- * can begin (PRD resolved q42, q65, [`childrenBeginHere`]).
+ * can begin (PRD resolved q42, q65, [`childrenBeginHere`]) — the map node's own
+ * failure, because the dispatch could not be issued (grammar 8.6 rule 7).
  */
 export class ChildOnAWorker extends Error {
   constructor(flow: string, idempotencyKey: string) {
     super(
-      `\`${flow}\` was dispatched with \`detach: true\` (key \`${idempotencyKey}\`) inside a placed node, on the worker running it, and a detached \`flow.*\` dispatch starts a child execution — which the hub alone begins, journals and recovers, as the single writer of this deployment's journal (docs/distributed.md §3.3, PRD resolved q42, q65). It was not started. Drop \`detach:\` so the dispatch is joined inside the placed node, or dispatch the flow from a flow the hub runs rather than from one a placed agent attaches as a tool (grammar 14.1 rule 4)`,
+      `\`${flow}\` is dispatched with \`detach: true\` (key \`${idempotencyKey}\`) inside a placed node, on the worker running it, and a detached \`flow.*\` dispatch starts a child execution — which the hub alone begins, journals and recovers, as the single writer of this deployment's journal (docs/distributed.md §3.3, PRD resolved q42, q65). It could not be issued, so the map node that would have issued it fails, and its \`on_error:\` decides what follows (grammar 8.6 rule 7). Drop \`detach:\` so the dispatch is joined inside the placed node, or dispatch the flow from a flow the hub runs rather than from one a placed agent attaches as a tool (grammar 14.1 rule 4)`,
     );
     this.name = "ChildOnAWorker";
   }
@@ -14102,11 +14395,18 @@ const openedExecutions = new Set<string>();
  *  * **anything else** — `failed`. A composition's own error policy has already
  *    decided this run; replaying it would re-derive the same failure from the
  *    same record.
+ *
+ * A row that closes waits first for the lifecycle rows of the child executions
+ * this execution dispatched ([`childrenBegun`], PRD resolved q65): once it is
+ * closed nothing replays it, so nothing would re-issue a dispatch whose child
+ * had not been begun yet. A row that stays open needs no such wait — the
+ * generation that resumes it re-issues every dispatch it made.
  */
 export async function settleExecution(execution: string, error?: unknown): Promise<void> {
   const journal = settledJournals.get(execution);
   if (journal === undefined) return;
   if (staysOpen(execution, error)) return;
+  await childrenBegun(execution);
   if (error === undefined) {
     await journal.end(execution, "completed");
     return;

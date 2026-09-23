@@ -615,10 +615,13 @@ async function main(): Promise<void> {
   // (§3.3, PRD resolved q42). Bound here, every such path meets the dispatch
   // journal, whose every hub-only operation refuses by name.
   hostJournal(journal);
-  // A child execution in particular is refused before it reaches any journal,
-  // with a sentence that says what to change (`runtime.ChildOnAWorker`): it is
-  // the one construct a flow attached to a placed agent can reach that only the
-  // hub may begin.
+  // A child execution in particular is refused before it reaches any journal:
+  // a detached `flow.*` dispatch cannot be issued here, so the `map` node that
+  // would issue it fails with a sentence that says what to change
+  // (`runtime.ChildOnAWorker`) — the node's own failure, which grammar 8.6 rule
+  // 7 leaves to its `on_error:` and which travels home with this dispatch like
+  // any other. It is the one construct a flow attached to a placed agent can
+  // reach that only the hub may begin.
   refuseChildExecutions();
   executeLocally(runPlaced);
   // …and a pause reached under any of it settles this dispatch rather than

@@ -592,6 +592,44 @@ export interface Lineage {
    * and a child execution *is* that instance.
    */
   readonly itemIndex?: number;
+  /**
+   * The admission bound the dispatch was issued under (Decision D28), so a
+   * generation that resumes the child **without** its parent's dispatch in
+   * front of it still starts it under that bound (`docs/durability.md` §6.1).
+   *
+   * A child's row is begun the moment its dispatch is issued — before it has a
+   * permit, which it may wait for behind its siblings — so that a process which
+   * stops with the child still queued leaves an open row to recover rather than
+   * work nothing records (PRD resolved q65). A recovery that then started every
+   * such child at once would run a `max_concurrency: 1` fan-out all together,
+   * which is the number the author wrote down to prevent. Absent on a row a
+   * dispatch with no bound to carry began — a driver calling the runtime
+   * directly — which a recovery starts as it finds it.
+   */
+  readonly admission?: LineageAdmission;
+}
+
+/**
+ * The permits one detached `flow.*` dispatch was counted against, as its child's
+ * lineage records them (Decision D28, [`Lineage.admission`]).
+ *
+ * The two gates `runtime.runMap` admits every dispatch through: the map
+ * **node**'s `max_concurrency:`, and the **route**'s own bound beneath it. Each
+ * is named by the key that runtime gives it, so every child recovered from one
+ * node draws on one set of gates — the same set a re-run of that node would.
+ */
+export interface LineageAdmission {
+  /**
+   * The map node the dispatch counted against: its execution's id, the
+   * enclosing instance's path and the node id (`runtime.MapPlan.admission`).
+   */
+  readonly node: string;
+  /** That node's `max_concurrency:`. */
+  readonly nodeBound: number;
+  /** The route, by its position in the node's descriptor (`runtime.routeKey`). */
+  readonly route: string;
+  /** That route's own bound: its `max_concurrency:`, never more than the node's. */
+  readonly routeBound: number;
 }
 
 /** One execution's lifecycle row (`docs/durability.md` §3.5). */
@@ -966,7 +1004,7 @@ const INSERTION_ORDER = "insertion_order ASC";
  *
  * A `LEFT JOIN`, because every execution a trigger or a command started has no
  * `lineage` row at all and is read exactly as it was before the table existed.
- * The three columns are aliased rather than selected with `lineage.*`, so no
+ * The four columns are aliased rather than selected with `lineage.*`, so no
  * name of that table can shadow one of `executions`' on a driver that keys a
  * row by column name. One spelling of the statement for both readers
  * ([`SqlJournal.execution`], [`SqlJournal.openExecutions`]), so the two cannot
@@ -975,7 +1013,8 @@ const INSERTION_ORDER = "insertion_order ASC";
 const WITH_LINEAGE = `SELECT executions.*,
          lineage.parent AS lineage_parent,
          lineage.idempotency_key AS lineage_key,
-         lineage.item_index AS lineage_item_index
+         lineage.item_index AS lineage_item_index,
+         lineage.admission AS lineage_admission
        FROM executions LEFT JOIN lineage ON lineage.execution = executions.id`;
 
 /** `ON CONFLICT … DO NOTHING`, which SQLite and Postgres both speak. */
@@ -1074,10 +1113,16 @@ class SqlJournal implements Journal {
       const lineage = row.lineage;
       if (lineage !== undefined) {
         await this.#run(
-          `INSERT INTO lineage (execution, parent, idempotency_key, item_index)
-           VALUES (?, ?, ?, ?)
+          `INSERT INTO lineage (execution, parent, idempotency_key, item_index, admission)
+           VALUES (?, ?, ?, ?, ?)
            ${this.#conflict("(execution)", "execution = execution")}`,
-          [row.id, lineage.parent, lineage.idempotencyKey, lineage.itemIndex ?? null],
+          [
+            row.id,
+            lineage.parent,
+            lineage.idempotencyKey,
+            lineage.itemIndex ?? null,
+            lineage.admission === undefined ? null : JSON.stringify(lineage.admission),
+          ],
         );
       }
       await this.#run(
@@ -1593,11 +1638,14 @@ CREATE TABLE IF NOT EXISTS dispatches (
 -- row per execution a detached \`flow.*\` dispatch started, none for any other.
 -- A table of its own rather than columns of \`executions\`, so a journal an older
 -- build wrote grows it by the \`IF NOT EXISTS\` above and no probe below.
+-- \`admission\` is the map node's bound the dispatch was issued under, as JSON
+-- (§6.1): what a recovery starts the child under when no parent re-issues it.
 CREATE TABLE IF NOT EXISTS lineage (
   execution       TEXT PRIMARY KEY,
   parent          TEXT NOT NULL,
   idempotency_key TEXT NOT NULL,
-  item_index      INTEGER
+  item_index      INTEGER,
+  admission       TEXT
 );
 CREATE INDEX IF NOT EXISTS effects_of_execution ON effects (execution);
 CREATE INDEX IF NOT EXISTS executions_by_status ON executions (status, started_at);
@@ -1916,6 +1964,7 @@ function executionOf(row: Row): ExecutionRow {
   const parent = held["lineage_parent"];
   const key = held["lineage_key"];
   const itemIndex = held["lineage_item_index"];
+  const admission = admissionOf(held["lineage_admission"]);
   return {
     id: String(held["id"]),
     flow: String(held["flow"]),
@@ -1937,6 +1986,7 @@ function executionOf(row: Row): ExecutionRow {
             ...(itemIndex === null || itemIndex === undefined
               ? {}
               : { itemIndex: Number(itemIndex) }),
+            ...(admission === undefined ? {} : { admission }),
           },
         }),
     status: String(held["status"]) as ExecutionStatus,
@@ -1945,6 +1995,36 @@ function executionOf(row: Row): ExecutionRow {
     ...(endedAt === null || endedAt === undefined ? {} : { endedAt: String(endedAt) }),
     ...(error === null || error === undefined ? {} : { error: String(error) }),
   };
+}
+
+/**
+ * A child's recorded admission bound, read back off its `lineage` row
+ * ([`Lineage.admission`]) — or `undefined` where the row carries none, or one
+ * this build cannot read as the four fields it writes.
+ *
+ * Read defensively rather than trusted, because what it decides is only *how
+ * many* recovered children start at once, and a value that cannot be read is
+ * better recovered unbounded — as a child with no recorded bound is — than not
+ * recovered at all: an open row nothing resumes is the loss the row exists to
+ * prevent.
+ */
+function admissionOf(held: unknown): LineageAdmission | undefined {
+  if (held === null || held === undefined) return undefined;
+  try {
+    const parsed = JSON.parse(String(held)) as Partial<Record<keyof LineageAdmission, unknown>>;
+    const { node, nodeBound, route, routeBound } = parsed;
+    if (
+      typeof node !== "string" ||
+      typeof route !== "string" ||
+      typeof nodeBound !== "number" ||
+      typeof routeBound !== "number"
+    ) {
+      return undefined;
+    }
+    return { node, nodeBound, route, routeBound };
+  } catch {
+    return undefined;
+  }
 }
 
 // ---------------------------------------------------------------------------

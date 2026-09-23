@@ -3203,10 +3203,12 @@ fn dispatch_run(
         // export. Nothing of the map node's context crosses — not its clock, not
         // its collectors, not its effect site — because none of them is the
         // child's; what crosses is the dispatch site, which is where the child's
-        // identity and its cause are read from (`runtime.dispatchChild`).
+        // identity and its cause are read from, and the node's admission, which
+        // the generation that runs the child takes after its row is begun
+        // (`runtime.dispatchChild`, `runtime.RunContext.admission`).
         DefinitionBody::Flow(_) if detach => format!(
-            "{indent}run: (input, _context, site) =>\n{indent}  \
-             runtime.dispatchChild({}, input, site),\n",
+            "{indent}run: (input, context, site) =>\n{indent}  \
+             runtime.dispatchChild({}, input, site, context.admission),\n",
             names::string(target)
         ),
         DefinitionBody::Flow(_) => {
@@ -6662,10 +6664,11 @@ flow.f:
     /// everything the emitted `run` passes. A joined dispatch is an instance of
     /// this node's — handed its signal, its site and its execution — while a
     /// detached one is handed to `runtime.dispatchChild`, which derives an
-    /// execution of its own from the site and nothing else: not the node's clock,
-    /// not its collectors. A detached route that still instantiated the flow in
-    /// place would journal the child's effects under the parent's id, which is
-    /// the mechanism PRD resolved q65 was ratified to remove.
+    /// execution of its own from the site and takes nothing else of the node's
+    /// but its admission bound: not the node's clock, not its collectors. A
+    /// detached route that still instantiated the flow in place would journal
+    /// the child's effects under the parent's id, which is the mechanism PRD
+    /// resolved q65 was ratified to remove.
     #[test]
     fn a_detached_flow_dispatch_starts_a_child_execution() {
         let source = format!(
@@ -6718,9 +6721,10 @@ flow.f:
         assert!(away.contains("detach: true,"), "{away}");
         assert!(
             away.contains(
-                "run: (input, _context, site) =>\n        runtime.dispatchChild(\"flow.inner\", input, site),"
+                "run: (input, context, site) =>\n        runtime.dispatchChild(\"flow.inner\", input, site, context.admission),"
             ),
-            "a detached `flow.*` route starts a child execution from the dispatch site:\n{away}"
+            "a detached `flow.*` route starts a child execution from the dispatch site, under \
+             the node's admission:\n{away}"
         );
         assert!(
             !away.contains("runtime.runSubflow("),

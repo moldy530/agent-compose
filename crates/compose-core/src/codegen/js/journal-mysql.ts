@@ -160,7 +160,8 @@ const MYSQL_SCHEMA = [
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
   // A child execution's cause (PRD resolved q65). The two ids are ids this
   // runtime mints; the key is an instance path, which is the caller's length —
-  // the rule above, read on one more table. A table of its own, so `IF NOT
+  // the rule above, read on one more table — and so is the node key inside the
+  // `admission` JSON, which is `LONGTEXT` for it. A table of its own, so `IF NOT
   // EXISTS` is the whole of its migration into a database an earlier build
   // created.
   `CREATE TABLE IF NOT EXISTS lineage (
@@ -168,6 +169,7 @@ const MYSQL_SCHEMA = [
   parent          VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   idempotency_key LONGTEXT CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   item_index      INT,
+  admission       LONGTEXT,
   PRIMARY KEY (execution)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
 ];

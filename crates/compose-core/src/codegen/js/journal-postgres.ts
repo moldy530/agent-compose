@@ -110,7 +110,8 @@ CREATE TABLE IF NOT EXISTS lineage (
   execution       TEXT COLLATE "C" PRIMARY KEY,
   parent          TEXT COLLATE "C" NOT NULL,
   idempotency_key TEXT COLLATE "C" NOT NULL,
-  item_index      INTEGER
+  item_index      INTEGER,
+  admission       TEXT
 );
 CREATE INDEX IF NOT EXISTS effects_of_execution ON effects (execution);
 CREATE INDEX IF NOT EXISTS executions_by_status ON executions (status, started_at);
