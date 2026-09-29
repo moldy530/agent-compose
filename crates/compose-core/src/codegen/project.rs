@@ -191,12 +191,17 @@ pub fn dependencies(ir: &Ir) -> Vec<(String, String)> {
     // rather than a composition's declaration, but a composition that binds no
     // harness declares none of them — which is what makes "emit only the drivers
     // a composition uses" true of the manifest as well as of the module.
+    //
+    // Each at the version **this target** installs: a `harnesses:` entry writes
+    // its accepted version in the pin's place, for that harness's SDK alone —
+    // the SDK's peers stay at the compiler's pins (grammar 14.8, PRD resolved
+    // q66 ruling d).
     let mut harness: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     for bound in super::harness::bound(ir) {
-        for (package, version) in super::harness::pins_of(bound) {
-            let held = harness.insert((*package).to_string(), (*version).to_string());
+        for (package, version) in super::harness::pins_for(ir, bound) {
+            let held = harness.insert(package.to_string(), version.to_string());
             assert!(
-                held.is_none_or(|held| held == *version),
+                held.is_none_or(|held| held == version),
                 "two harnesses pin `{package}` at two versions"
             );
         }
@@ -415,17 +420,57 @@ pub fn readme(ir: &Ir, partition: &super::env::Partition) -> super::GeneratedFil
     contents.push_str(&host_functions(ir));
     contents.push_str(README_PINS);
 
-    let mut pins = String::from("\n| package | version |\n|---|---|\n");
-    for (package, version) in PINS.iter().chain(DEV_PINS) {
-        pins.push_str(&format!("| `{package}` | `{version}` |\n"));
-    }
-    contents.push_str(&pins);
+    contents.push_str(&pins_table(ir));
     contents.push_str(README_TAIL);
 
     super::GeneratedFile {
         path: "README.md".to_string(),
         contents,
     }
+}
+
+/// The pins table at the foot of the README: the compiler's pins, in the order
+/// `package.json` declares them — the runtime's own set, then the SDK of each
+/// harness a `coder:` node binds, then the type gate's.
+///
+/// A harness SDK row is the one row whose number can differ from the manifest,
+/// and only one way: a target's `harnesses:` may move that SDK to another exact
+/// version inside the range this compiler release audited it for (grammar
+/// 14.8, PRD resolved q66 ruling d). The row keeps the compiler's pin in its
+/// version cell — the column is the release's pins, and a reader comparing two
+/// targets built by one release reads the same pin in both — and says beside
+/// it which version this target installs, which is the one `package.json`
+/// declares. The SDK's peers are not rows: they stay at the compiler's pins
+/// whatever the target says, and the manifest is where they are listed.
+fn pins_table(ir: &Ir) -> String {
+    let mut pins = String::from("\n| package | version |\n|---|---|\n");
+    for (package, version) in PINS {
+        let _ = writeln!(pins, "| `{package}` | `{version}` |");
+    }
+    for harness in super::harness::bound(ir)
+        .into_iter()
+        .filter(|harness| harness.ships_in_v1())
+    {
+        let package = super::harness::package_of(harness);
+        let pinned = super::harness::version_of(harness);
+        match super::harness::override_of(ir, harness) {
+            None => {
+                let _ = writeln!(pins, "| `{package}` | `{pinned}` |");
+            }
+            Some(installed) => {
+                let _ = writeln!(
+                    pins,
+                    "| `{package}` | `{pinned}` — this target installs `{installed}` \
+                     (`harnesses.{}`) |",
+                    harness.as_str()
+                );
+            }
+        }
+    }
+    for (package, version) in DEV_PINS {
+        let _ = writeln!(pins, "| `{package}` | `{version}` |");
+    }
+    pins
 }
 
 /// The Layout table's opening rows, up to where the **target**-dependent ones
@@ -1525,6 +1570,15 @@ const README_PINS: &str = r#"
 A compiler release targets one LangGraph release (PRD 5.12). Upgrading is a
 change to the compiler, not to this directory: bump the pins there, rebuild, and
 review the diff.
+
+The table is the compiler's pins: the runtime's own dependencies, the SDK of
+each harness a `coder:` node binds, and the type checker's. A harness SDK row is
+the one that can differ from `package.json`, and only one way: a target's deploy
+file may move that SDK to another exact version inside the range this compiler
+release audited it for, with `harnesses:` (grammar §14.8). Where this target
+did, the row says which version it installs — the one `package.json` declares,
+and the one a coder node's trace record names when it runs. The SDK's own peers
+stay at the compiler's pins either way.
 "#;
 
 /// The section a composition using grammar 6.1's `function:` binding gets.
@@ -2137,9 +2191,10 @@ store.prefs:
     /// carrying `pg` and `@types/pg`, a journal section saying the journal cost
     /// no dependency this project did not already have, and, before this, no
     /// other mention of either package anywhere in the document. The pin table
-    /// at the foot is [`PINS`] and [`DEV_PINS`] only, by construction: a
-    /// driver is carried by the *deployment* rather than by the compiler
-    /// release, so it cannot be a row there.
+    /// at the foot is the compiler's pins only, by construction — [`PINS`], the
+    /// SDK of each bound harness, and [`DEV_PINS`]: a driver is carried by the
+    /// *deployment* rather than by the compiler release, so it cannot be a row
+    /// there.
     ///
     /// The address is the variable's **name**. A README that printed the value
     /// would put a database password in a file every worker unpacks
@@ -2558,6 +2613,98 @@ package_registry:
                 "the README does not document `{package}`"
             );
         }
+    }
+
+    /// **The pins table names the SDK of every harness the project declares, and
+    /// a target's own version beside the pin** (grammar 14.8, PRD resolved q66
+    /// ruling d).
+    ///
+    /// The table never carried the harness SDKs, which left the one dependency a
+    /// target may now move invisible in the document that says what a project
+    /// pins. So each bound harness's SDK is a row — its version cell the
+    /// compiler's pin, the column every row shares — and a target whose
+    /// `harnesses:` moved it says which version it installs beside that, which is
+    /// the number `package.json` declares. A harness no node binds is not a row:
+    /// the manifest carries none of its packages.
+    #[test]
+    fn the_readme_names_every_harness_sdk_the_project_declares() {
+        use crate::ast::flow::Harness;
+        use crate::codegen::harness::{package_of, version_of};
+
+        let composition = r#"version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+flow.f:
+  outputs: {}
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.m
+        workspace: "'/srv/checkout'"
+        prompt: Do the work.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }
+"#;
+        let (cc, codex) = (package_of(Harness::Cc), package_of(Harness::Codex));
+        let pinned = version_of(Harness::Cc);
+
+        let plain = readme_of(&ir_of(composition)).contents;
+        assert!(
+            plain.contains(&format!("| `{cc}` | `{pinned}` |\n")),
+            "the SDK of the harness this project binds is not in its pins table: {plain}"
+        );
+        assert!(
+            !plain.contains(&format!("| `{codex}` |")),
+            "a harness no node binds has no package in `package.json` and no row: {plain}"
+        );
+        // The row sits between the runtime's own pins and the type gate's, the
+        // order `package.json` declares them in.
+        let row = plain.find(&format!("| `{cc}` |")).expect("the row");
+        assert!(
+            plain
+                .find("| `node-sqlite3-wasm` |")
+                .expect("a runtime pin")
+                < row
+        );
+        assert!(row < plain.find("| `@types/node` |").expect("a type-gate pin"));
+
+        let moved = readme_of(&ir_of_mesh(
+            composition,
+            "version: \"0.1\"\nharnesses:\n  cc:\n    sdk_version: \"0.3.285\"\n",
+        ))
+        .contents;
+        assert!(
+            moved.contains(&format!(
+                "| `{cc}` | `{pinned}` — this target installs `0.3.285` (`harnesses.cc`) |\n"
+            )),
+            "a target that moved its harness SDK is not told which version it installs, beside \
+             the pin it moved it from: {moved}"
+        );
+        let manifest: serde_json::Value = serde_json::from_str(
+            &package_json(&ir_of_mesh(
+                composition,
+                "version: \"0.1\"\nharnesses:\n  cc:\n    sdk_version: \"0.3.285\"\n",
+            ))
+            .contents,
+        )
+        .expect("strict JSON");
+        assert_eq!(
+            manifest["dependencies"][cc], "0.3.285",
+            "the README names a version `package.json` does not declare"
+        );
+        assert!(
+            moved.contains("with `harnesses:` (grammar §14.8)"),
+            "the pins paragraph does not say where an override comes from: {moved}"
+        );
     }
 
     /// **Every project is told where its journal lives, and which one it is**

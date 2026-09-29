@@ -1033,6 +1033,22 @@ const REDUCTIONS: &[Reduction] = &[
         }"#,
     },
     Reduction {
+        // The same composition under the target that moves the Agent SDK inside
+        // its audited range (grammar 14.8): which SDK release serves a harness is
+        // a fact about the artifact, not about the graph, so the state model's
+        // answer is `patch-pipeline`'s — which is the claim, not a duplicate.
+        golden: "patch-pipeline-canary",
+        writes: r#"[
+            { "summary": "first pass", "feedback": "tighten it" },
+            { "summary": "second pass" }
+        ]"#,
+        expected: r#"{
+            "summary": "second pass",
+            "feedback": "tighten it",
+            "messages": []
+        }"#,
+    },
+    Reduction {
         // The fan-out one: `summaries` is the `append` channel a map's
         // dispatched instances write into, `summary` is the `last_wins` one an
         // instance writes inside itself, and `survey` is the summarising run's.
@@ -7819,6 +7835,120 @@ fn a_harness_record_names_the_sdk_version_that_ran() {
          SDK's `exports` publishes `./package.json`) and every edited install would read as \
          its pin too; any other version means the shared install is not the one \
          `tests/toolchain/package.json` declares"
+    );
+}
+
+/// Gate 29, the other direction: **a target that moved a harness SDK with
+/// `harnesses:` runs that version, and its trace envelope says so** (grammar
+/// 14.8, `docs/trace.md` §7.6, PRD resolved q66 ruling e).
+///
+/// The ruling adds nothing to the trace, and this is the proof it needs
+/// nothing: `HarnessRecord.sdk` already names the version installed (trace
+/// version 6), so a target's override reaches the record by way of the install
+/// alone. `patch-pipeline-canary` is the golden whose `package.json` declares
+/// the Agent SDK at a version the compiler did not pin, and
+/// `harness-record-sdk.mjs` runs its `flow.patch` twice:
+///
+///  * **declared** — stand-ins for both SDKs at exactly the versions that
+///    `package.json` declares, which is what an install from it puts there,
+///    driven through the golden's own emitted drivers with nothing registered
+///    over them; the run's entries are then written out by the runtime's own
+///    `traceDocument`, the one writer of the envelope the trace file and the
+///    sink carry. The `cc` record must name the target's version, and the
+///    `codex` record — a harness the target did not move — the pin;
+///  * **unreadable** — the same stand-ins with no `version` in their
+///    manifests, so each driver falls back to the constant compiled into
+///    `src/harness.ts`. That constant is the version `package.json` declares,
+///    so the fallback names the target's version too rather than a release the
+///    target never installed.
+#[test]
+fn a_harness_record_names_the_sdk_version_a_target_declared() {
+    use compose_core::ast::flow::Harness;
+    use compose_core::codegen::harness::{package_of, sdk_version, version_of};
+
+    let Some(root) = installed() else {
+        return;
+    };
+    let golden = goldens::golden("patch-pipeline-canary");
+    let ir = artifact(golden);
+    let declared = sdk_version(&ir, Harness::Cc).to_string();
+    assert_ne!(
+        declared,
+        version_of(Harness::Cc),
+        "`{}`'s target no longer moves the Agent SDK off the pin, so nothing below tells a \
+         target's version from the compiler's",
+        golden.directory
+    );
+    assert_eq!(
+        sdk_version(&ir, Harness::Codex),
+        version_of(Harness::Codex),
+        "the target moved `codex` too, and the record below would no longer show that an \
+         override moves one harness alone"
+    );
+    let run = |mode: &str| -> Value {
+        let purpose = format!("harness-record-sdk-canary-{mode}");
+        let project = staged(golden, root, &purpose);
+        let scratch = root.join("projects").join(&purpose).join("scratch");
+        let _ = fs::remove_dir_all(&scratch);
+        fs::create_dir_all(&scratch).expect("the scratch area is writable");
+        let output = runner("harness-record-sdk.mjs")
+            .arg(&project)
+            .arg(&scratch)
+            .arg(mode)
+            .output()
+            .expect("bun runs");
+        assert!(
+            output.status.success(),
+            "the `{mode}` run of the record-sdk runner over `{}` failed:\n{}",
+            golden.directory,
+            String::from_utf8_lossy(&output.stderr),
+        );
+        serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object")
+    };
+    let cc = package_of(Harness::Cc);
+    let codex = package_of(Harness::Codex);
+    let expected = json!([
+        {
+            "node": "implement",
+            "harness": "cc",
+            "outcome": "completed",
+            "sdk": format!("{cc}@{declared}"),
+        },
+        {
+            "node": "review",
+            "harness": "codex",
+            "outcome": "completed",
+            "sdk": format!("{codex}@{}", version_of(Harness::Codex)),
+        },
+    ]);
+
+    let answer = run("declared");
+    assert_eq!(
+        answer["declared"],
+        json!({ "cc": declared, "codex": version_of(Harness::Codex) }),
+        "the golden's `package.json` does not declare the SDK versions its target resolved to"
+    );
+    assert_eq!(
+        answer["standInCalls"],
+        json!({ "cc": 1, "codex": 1 }),
+        "the emitted drivers did not call the SDKs installed under the project"
+    );
+    assert_eq!(
+        answer["outputs"],
+        json!({ "summary": "stood in" }),
+        "`flow.patch` did not complete through the stand-ins"
+    );
+    assert_eq!(
+        answer["envelope"]["records"], expected,
+        "the trace envelope of a run under a target whose `harnesses:` moved the Agent SDK does \
+         not name the version that target installed (docs/trace.md §7.6, grammar 14.8)"
+    );
+
+    let unreadable = run("unreadable");
+    assert_eq!(
+        unreadable["records"], expected,
+        "a driver that cannot read the installed manifest fell back to a version other than the \
+         one `package.json` declares: the constant `src/harness.ts` carries is not the target's"
     );
 }
 

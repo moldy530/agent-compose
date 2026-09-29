@@ -1,0 +1,24 @@
+# A target that runs the Agent SDK one patch ahead of this compiler release's
+# pin — the case `harnesses:` exists for (grammar 14.8, PRD resolved q66): a
+# vendor ships a patch whose bundled CLI serves a model the pinned one refuses,
+# and waiting for a compiler release to move the pin is the only other way
+# forward.
+#
+# What this may say is bounded by the compiler, not by the deployment. Each
+# release declares, per harness SDK, the range its reserved `settings:` list was
+# audited for — `[audited, next minor)` — and `validate` refuses a version
+# outside it by name, above it or below it. Inside it, `build` writes the
+# version into `package.json` in the pin's place, for this SDK alone: its peers
+# stay at the compiler's pins, and so does `codex`'s SDK, which this file does
+# not mention. The emitted README's pins table shows the pin and this version
+# beside it, and a coder node's trace record names the version that ran.
+#
+# `harnesses:` is live under `local` too — a project built on a laptop is one
+# whose harness runs there — so the same block in `deploy/local.yml` would move
+# the laptop's install. It is a target of its own here so the default build of
+# this example stays on the pins.
+version: "0.1"
+
+harnesses:
+  cc:
+    sdk_version: "0.3.285"

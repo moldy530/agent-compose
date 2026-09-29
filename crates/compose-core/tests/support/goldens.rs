@@ -55,6 +55,18 @@ pub struct Golden {
 /// keyword — and the pair is what makes "the emitted binding carries the key as
 /// written" a claim about a *set* rather than about one spelling.
 ///
+/// `patch-pipeline-canary` is `patch-pipeline` under the target whose
+/// `harnesses:` moves the Agent SDK one patch ahead of the pin, inside the range
+/// this release audited it for (grammar 14.8, PRD resolved q66). It is the one
+/// golden whose `package.json` declares a harness SDK at a version the compiler
+/// did not pin, so it is where the override's three surfaces are reviewed
+/// together: the manifest's `cc` SDK line and nothing else — `codex`'s SDK and
+/// both SDKs' peers stay on the pins — the driver's fallback constant in
+/// `src/harness.ts`, and the README's pins table with the target's version
+/// beside the compiler's. The generated-code gates type-check and construct it
+/// like every other golden, and `harness-record-sdk.mjs` runs it to show the
+/// trace naming what the target installed.
+///
 /// `placed-nodes` is the fourth composition and the mesh one. `triage-fanout`'s
 /// `staging` target already places a component, so a mesh reaches the corpus
 /// either way; what this adds is the **three shapes a placed component is
@@ -88,6 +100,11 @@ pub const GOLDENS: &[Golden] = &[
         directory: "patch-pipeline",
         project: "examples/patch-pipeline",
         target: "local",
+    },
+    Golden {
+        directory: "patch-pipeline-canary",
+        project: "examples/patch-pipeline",
+        target: "canary",
     },
     Golden {
         directory: "coder-fanout",
