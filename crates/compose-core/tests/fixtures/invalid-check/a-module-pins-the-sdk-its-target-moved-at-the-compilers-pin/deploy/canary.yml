@@ -1,0 +1,6 @@
+version: "0.1"
+
+# The Agent SDK one patch ahead of the pin, inside the audited range.
+harnesses:
+  cc:
+    sdk_version: "0.3.285"

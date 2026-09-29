@@ -1,0 +1,6 @@
+version: "0.1"
+
+# Back to the release before the one the reserved list was audited at.
+harnesses:
+  cc:
+    sdk_version: "0.3.272"

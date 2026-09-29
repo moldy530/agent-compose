@@ -46,6 +46,7 @@
 //! | [`placements`] | 14.1 | an attached tool's placement against the placement of every agent that attaches it, and a store on a process-local backend against the processes that can open it |
 //! | [`fanout`] | 8.6 | `map.over` dominance, and `detach:` under a durably checkpointed target |
 //! | [`modules`] | 6.1 | the `module:` bindings of a composition read against each other: one authored file per tool, and one version per package across every binding's dependencies |
+//! | [`harnesses`] | 14.8 | a target's `harnesses:` entries against this release's harness enum and audited SDK ranges, and against the `coder:` nodes that bind each harness |
 //!
 //! Where a rule splits across the two families — `map.over` resolves a path in
 //! [`maps`] and proves dominance in [`fanout`] — each half is stated where its
@@ -86,6 +87,7 @@ pub(crate) mod expr;
 pub(crate) mod fanout;
 pub(crate) mod graph;
 pub(crate) mod guards;
+pub(crate) mod harnesses;
 pub(crate) mod maps;
 pub(crate) mod model;
 pub mod modules;
@@ -125,6 +127,7 @@ pub fn check(ir: &Ir) -> Vec<Diagnostic> {
     placements::check_stores(&mut ctx);
     components::check(&mut ctx);
     modules::check(&mut ctx);
+    harnesses::check(&mut ctx);
 
     let ir = ctx.ir;
     for (address, definition) in &ir.definitions {

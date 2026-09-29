@@ -569,6 +569,24 @@ const GRAMMAR: &[Check] = &[
         evidence: Evidence::Fixture,
     },
     Check {
+        // PRD resolved q66: a target may move a harness's SDK, inside the range
+        // this release audited it for. Decided over the resolved artifact
+        // because the last clause needs the composition — which harnesses a
+        // `coder:` node binds — and the other five are judged beside it so one
+        // entry is judged in one pass.
+        rule: "a `harnesses:` entry names a harness this release lowers, pins its SDK to one exact literal version inside the range this release audited it for, and names a harness some `coder:` node binds (14.8, D136, D151)",
+        pass: "check/harnesses.rs",
+        codes: &[
+            "unknown-variant",
+            "unsupported-harness",
+            "unexpected-env-ref",
+            "invalid-value",
+            "harness-sdk-outside-audited-range",
+            "unbound-harness-sdk",
+        ],
+        evidence: Evidence::Fixture,
+    },
+    Check {
         rule: "every CEL surface: roots, paths, constructs, and result type (4.1)",
         pass: "cel/mod.rs, over check/expr.rs",
         codes: &[

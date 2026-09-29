@@ -759,7 +759,7 @@ fn is_package_segment(text: &str) -> bool {
 /// has an empty prerelease and `1.2.3-01` a numeric identifier with a leading
 /// zero — that `npm install` rejects on the emitted `package.json`, which is the
 /// failure the exactness rule exists to move to `validate`.
-fn is_exact_version(text: &str) -> bool {
+pub(crate) fn is_exact_version(text: &str) -> bool {
     // Build metadata is everything after the *first* `+`; a second one is not a
     // separator but an illegal character, and `identifiers` refuses it.
     let (rest, build) = match text.split_once('+') {

@@ -1,0 +1,36 @@
+# rule: a `harnesses:` entry for a harness no `coder:` node binds is a warning, and `harnesses:` is live under `local` (grammar 14, 14.8, PRD resolved q66)
+# code: unbound-harness-sdk
+# message: `harnesses.codex` pins an SDK for a harness no `coder:` node binds, so it emits nothing
+# at: deploy/local.yml:4:3
+# help: a project installs a harness's SDK only where a `coder:` node binds that harness, so this entry changes nothing `build` writes; it is a warning rather than an error because a deploy file outlives the compositions it serves — keep it for the composition that binds `codex`, or drop it (grammar 14.8, PRD resolved q66)
+#
+# Only `cc` is bound below, so the `codex` entry changes nothing `build` writes.
+# A warning rather than an error: a deploy file outlives the compositions it
+# serves. And under `local`, deliberately: `harnesses:` is live there, on
+# `package_registry:`'s reasoning rather than D87's — a project built on a
+# laptop is a project whose harness runs there.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: coding-model
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: "'${REPO_ROOT}'"
+        prompt: Do the work.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

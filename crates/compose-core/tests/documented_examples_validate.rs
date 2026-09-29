@@ -207,10 +207,12 @@ const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
 const EXPLANATIONS_WITH_A_DEPLOY_EXAMPLE: &[&str] = &[
     "conflicting-placement",
     "conflicting-registry-credential",
+    "harness-sdk-outside-audited-range",
     "missing-join-token",
     "missing-journal-url",
     "missing-registry-token",
     "process-local-store",
+    "unbound-harness-sdk",
     "unsupported-journal-key",
     "unsupported-placement",
 ];

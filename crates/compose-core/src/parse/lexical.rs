@@ -504,6 +504,21 @@ pub(crate) fn contains_env_token(text: &str) -> bool {
     !scan_env_tokens(text).is_empty()
 }
 
+/// Every well-formed `${NAME}` token `text` carries, as written.
+///
+/// [`reject_env_refs`]'s reading — a malformed token is text, not a request for
+/// a substitution, and `$${` escapes — for the one class-3 surface judged after
+/// resolution rather than in this pass: a `harnesses:` entry's `sdk_version:`,
+/// which `check::harnesses` refuses a reference in with a repair of its own
+/// (grammar 14.8, §4.3).
+pub(crate) fn env_references(text: &str) -> Vec<String> {
+    scan_env_tokens(text)
+        .into_iter()
+        .filter(|token| token.name.is_some())
+        .map(|token| token.text)
+        .collect()
+}
+
 /// Whether `text` matches the env-name grammar `[A-Z_][A-Z0-9_]*`.
 #[must_use]
 pub fn is_env_name(text: &str) -> bool {

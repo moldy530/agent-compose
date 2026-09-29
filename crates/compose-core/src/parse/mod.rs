@@ -276,6 +276,7 @@ const DEPLOY_ONLY: &[&str] = &[
     "storage_backends",
     "journal",
     "package_registry",
+    "harnesses",
     "trace_sink",
     "event_sources",
 ];
@@ -405,6 +406,7 @@ fn deploy_file(
         storage_backends: None,
         journal: None,
         package_registry: None,
+        harnesses: None,
         trace_sink: None,
         event_sources: None,
         span: root.span.clone(),
@@ -423,6 +425,7 @@ fn deploy_file(
             "package_registry" => {
                 file.package_registry = deploy::package_registry(&entry.value, cx);
             }
+            "harnesses" => file.harnesses = deploy::harnesses(&entry.value, cx),
             "trace_sink" => file.trace_sink = deploy::trace_sink(&entry.value, cx),
             "event_sources" => file.event_sources = deploy::event_sources(&entry.value, cx),
             _ if SPEC_ONLY.contains(&key) || is_definition_key(key) => {

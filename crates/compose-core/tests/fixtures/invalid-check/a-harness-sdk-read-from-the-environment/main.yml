@@ -1,0 +1,34 @@
+# rule: a `harnesses:` entry's `sdk_version:` is a literal, never an environment reference (grammar 14.8, 4.3, PRD resolved q66)
+# code: unexpected-env-ref
+# message: `harnesses.cc.sdk_version` never interpolates environment references, but it contains `${CC_SDK_VERSION}`
+# at: deploy/canary.yml:5:18
+# help: a version is a build fact, not a secret: `build` writes it into `package.json` and `validate` holds it to the audited range `[0.3.284, 0.4.0)`, so it is the literal version itself — write it out (grammar 14.8, §4.3)
+# target: canary
+#
+# A version is a build fact rather than a secret: `build` writes it into
+# `package.json`, and `validate` has to read it to hold it to the range.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: coding-model
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: "'${REPO_ROOT}'"
+        prompt: Do the work.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

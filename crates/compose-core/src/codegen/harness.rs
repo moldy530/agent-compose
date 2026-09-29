@@ -32,6 +32,13 @@
 //! the package it maps over and the version this release pinned it to — held
 //! together by `the_emitted_driver_reports_the_version_the_manifest_pins`.
 //!
+//! **One exception, bounded**: a target's `harnesses:` may move a harness's own
+//! SDK to another exact version inside the range this release audited it for
+//! ([`AUDITED`], grammar 14.8, PRD resolved q66). Both surfaces then carry the
+//! target's version instead — `package.json` in the pin's place, and the
+//! constant below — through the one reading [`sdk_version`], so the manifest
+//! and the fallback still cannot disagree. The SDK's peers do not move.
+//!
 //! What a driver reports into the trace's [`HarnessRecord`] is the version
 //! **installed**, read off that package's own manifest when the module loads,
 //! and the pin only where the manifest cannot be read. The two agree in every
@@ -118,6 +125,262 @@ pub fn version_of(harness: Harness) -> &'static str {
     pins_of(harness).first().map_or("", |(_, version)| *version)
 }
 
+/// The SDK version each harness's reserved-list audit was performed at — the
+/// **floor** of the range a target's `harnesses:` may pin that SDK inside
+/// (grammar 14.8, Decision D151, PRD resolved q66 ruling b).
+///
+/// Each compiler release declares, per harness SDK, the half-open range
+/// `[audited, next minor)`: the version the audit was performed at, forward
+/// through that minor, so `0.3.284` admits `0.3.284` up to and excluding
+/// `0.4.0` ([`audited_range`]). The default is narrow by design, and widening
+/// it is a release decision recorded beside the audit, never a deployment's.
+///
+/// **What the range promises is precise and small: no *known* reach-around.**
+///
+///  * every option the audited version accepts was classified at the floor —
+///    **both readings** of its option surface, its typed `Options` *and* the
+///    names its runtime option reader takes, which is PRD resolved q60's audit
+///    as re-performed on 2026-09-29 — the audit test,
+///    `a_reserved_list_is_audited_against_the_pinned_option_surface`, is where
+///    that inventory is written down;
+///  * the driver's **other contracts were verified there** too — the shadowed
+///    `canUseTool` warning a bare `allowedTools` entry raises, resolved q60's
+///    permission-mode admissibility table, resolved q58's connection table;
+///  * and within the SDK's own patch series the compiler **expects** those to
+///    hold while stating plainly that **it has not checked them beyond the
+///    floor**: a version above it is admitted on that expectation, not on an
+///    audit of its own.
+///
+/// A version **below** the floor is refused as well. An older SDK carries a
+/// subset of the audited options, but it is not the version the driver's
+/// contracts were verified against, and the reason to go backward — a CLI that
+/// works — is a reason to move the floor in a compiler release, not to let a
+/// deployment reach below it.
+///
+/// The floor is not a second number that happens to agree with the audit:
+/// `a_range_floor_is_the_version_its_reserved_list_was_audited_at` holds each
+/// row equal to the anchor that audit test reads, so a bump of one without the
+/// other fails a named test rather than widening the range silently. The pin in
+/// [`HARNESS_PINS`] is held to the same anchor by the audit test itself, so in
+/// every release the pin is the floor.
+pub const AUDITED: &[(Harness, &str)] = &[(Harness::Cc, "0.3.284"), (Harness::Codex, "0.154.0")];
+
+/// The version one harness's reserved-list audit was performed at, if this
+/// release audited one — the floor of [`audited_range`].
+#[must_use]
+pub fn audited_of(harness: Harness) -> Option<&'static str> {
+    AUDITED
+        .iter()
+        .find(|(held, _)| *held == harness)
+        .map(|(_, version)| *version)
+}
+
+/// The range a target's `harnesses:` may pin one harness's SDK inside:
+/// `[audited, next minor)` (grammar 14.8, PRD resolved q66 ruling b).
+///
+/// `None` for a harness this release does not lower, which has no SDK to pin.
+#[must_use]
+pub fn audited_range(harness: Harness) -> Option<AuditedRange> {
+    let floor = audited_of(harness)?;
+    let parsed = SdkVersion::parse(floor).expect("an audited version is an exact version");
+    let minor: u64 = parsed
+        .minor
+        .parse()
+        .expect("an audited version's minor fits in a u64");
+    Some(AuditedRange {
+        floor,
+        ceiling: format!("{}.{}.0", parsed.major, minor + 1),
+    })
+}
+
+/// One harness's audited range (see [`AUDITED`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuditedRange {
+    /// The version the reserved-list audit was performed at — included.
+    pub floor: &'static str,
+    /// The next minor after the floor's, patch `0` — excluded.
+    pub ceiling: String,
+}
+
+impl std::fmt::Display for AuditedRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}, {})", self.floor, self.ceiling)
+    }
+}
+
+/// Where one exact version sits against a harness's [`audited_range`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RangePlacement {
+    /// Below the floor: an older release than the audit was performed at, or a
+    /// prerelease of the floor itself.
+    Below,
+    /// Inside `[floor, next minor)`.
+    Inside,
+    /// At or past the next minor — a prerelease of the next minor included,
+    /// since it belongs to that minor and not to the audited one.
+    Above,
+}
+
+/// Where `version` sits against `harness`'s audited range, or `None` where it
+/// is not an exact version or the harness has no range.
+///
+/// Semver precedence (semver.org §11), with one reading made explicit: the range
+/// is "the audited version, forward through that minor", so a version is inside
+/// it only if it **is** that minor — `0.4.0-rc.1` precedes `0.4.0` and is still
+/// above `[0.3.284, 0.4.0)`, because it is a release of the minor nobody
+/// audited. Build metadata carries no precedence, so `0.3.284+local` is the
+/// floor.
+#[must_use]
+pub fn placement_of(harness: Harness, version: &str) -> Option<RangePlacement> {
+    let floor = SdkVersion::parse(audited_of(harness)?)?;
+    let asked = SdkVersion::parse(version)?;
+    let line = |held: &SdkVersion| {
+        (
+            numeric(&held.major, &floor.major),
+            numeric(&held.minor, &floor.minor),
+        )
+    };
+    Some(match line(&asked) {
+        (std::cmp::Ordering::Less, _) | (std::cmp::Ordering::Equal, std::cmp::Ordering::Less) => {
+            RangePlacement::Below
+        }
+        (std::cmp::Ordering::Greater, _)
+        | (std::cmp::Ordering::Equal, std::cmp::Ordering::Greater) => RangePlacement::Above,
+        (std::cmp::Ordering::Equal, std::cmp::Ordering::Equal) => {
+            if asked.precedence(&floor) == std::cmp::Ordering::Less {
+                RangePlacement::Below
+            } else {
+                RangePlacement::Inside
+            }
+        }
+    })
+}
+
+/// An exact semantic version, split for comparison (semver.org §2, §9, §10).
+///
+/// Only what [`placement_of`] needs: the three numbers kept as their digit runs
+/// — compared by length first, which is numeric order for runs with no leading
+/// zero and never overflows — and the prerelease identifiers. Build metadata is
+/// read past, because it carries no precedence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SdkVersion {
+    major: String,
+    minor: String,
+    patch: String,
+    prerelease: Vec<String>,
+}
+
+impl SdkVersion {
+    /// The version `text` spells, if it is an exact one.
+    fn parse(text: &str) -> Option<Self> {
+        if !crate::parse::binding::is_exact_version(text) {
+            return None;
+        }
+        let rest = text.split_once('+').map_or(text, |(rest, _)| rest);
+        let (core, prerelease) = match rest.split_once('-') {
+            Some((core, prerelease)) => (core, prerelease.split('.').map(str::to_string).collect()),
+            None => (rest, Vec::new()),
+        };
+        let mut parts = core.split('.').map(str::to_string);
+        Some(Self {
+            major: parts.next()?,
+            minor: parts.next()?,
+            patch: parts.next()?,
+            prerelease,
+        })
+    }
+
+    /// Semver precedence (semver.org §11).
+    fn precedence(&self, other: &Self) -> std::cmp::Ordering {
+        numeric(&self.major, &other.major)
+            .then_with(|| numeric(&self.minor, &other.minor))
+            .then_with(|| numeric(&self.patch, &other.patch))
+            .then_with(
+                || match (self.prerelease.is_empty(), other.prerelease.is_empty()) {
+                    (true, true) => std::cmp::Ordering::Equal,
+                    // A version with a prerelease precedes the same version
+                    // without one.
+                    (true, false) => std::cmp::Ordering::Greater,
+                    (false, true) => std::cmp::Ordering::Less,
+                    (false, false) => {
+                        for (left, right) in self.prerelease.iter().zip(&other.prerelease) {
+                            let ordering = identifier(left, right);
+                            if ordering != std::cmp::Ordering::Equal {
+                                return ordering;
+                            }
+                        }
+                        self.prerelease.len().cmp(&other.prerelease.len())
+                    }
+                },
+            )
+    }
+}
+
+/// Two numeric identifiers with no leading zero, in numeric order.
+fn numeric(left: &str, right: &str) -> std::cmp::Ordering {
+    left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+}
+
+/// Two prerelease identifiers (semver.org §11.4): numeric ones numerically, and
+/// below every alphanumeric one; alphanumeric ones in ASCII order.
+fn identifier(left: &str, right: &str) -> std::cmp::Ordering {
+    let digits = |held: &str| held.bytes().all(|byte| byte.is_ascii_digit());
+    match (digits(left), digits(right)) {
+        (true, true) => numeric(left, right),
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        (false, false) => left.cmp(right),
+    }
+}
+
+/// The version this target's `harnesses:` pins one harness's SDK to **in place
+/// of** the compiler's pin, where it declares one (grammar 14.8, PRD resolved
+/// q66 ruling d).
+///
+/// Only an entry `validate` would accept is read — an exact version inside the
+/// audited range, for a harness this release lowers — so a caller holding an
+/// artifact that was never checked still cannot write an unaudited version into
+/// a manifest. An entry that states the pin itself is no override and answers
+/// `None`: it changes nothing `build` writes.
+#[must_use]
+pub fn override_of(ir: &Ir, harness: Harness) -> Option<&str> {
+    let entry = ir.deploy.harnesses.as_ref()?.get(harness.as_str())?;
+    let version = entry.sdk_version.value.as_str();
+    (placement_of(harness, version) == Some(RangePlacement::Inside)
+        && version != version_of(harness))
+    .then_some(version)
+}
+
+/// The version of one harness's SDK this target's project installs: the
+/// target's override where it declares one, and the compiler's pin otherwise.
+///
+/// The one reading of `harnesses:` every emitted surface shares —
+/// `package.json`, the driver's fallback constant in `src/harness.ts`, the
+/// README's pins table, and the `module:` agreement rule — so none of them can
+/// name a version the others do not.
+#[must_use]
+pub fn sdk_version(ir: &Ir, harness: Harness) -> &str {
+    override_of(ir, harness).unwrap_or_else(|| version_of(harness))
+}
+
+/// The packages one harness's driver brings **for this target**: its own SDK at
+/// [`sdk_version`], and the SDK's pinned peers exactly as [`HARNESS_PINS`] pins
+/// them — an override moves the SDK alone (PRD resolved q66 ruling d).
+#[must_use]
+pub fn pins_for(ir: &Ir, harness: Harness) -> Vec<(&'static str, &str)> {
+    pins_of(harness)
+        .iter()
+        .enumerate()
+        .map(|(index, (package, version))| {
+            if index == 0 {
+                (*package, sdk_version(ir, harness))
+            } else {
+                (*package, *version)
+            }
+        })
+        .collect()
+}
+
 /// Every harness some `coder:` node of this composition binds, sorted.
 ///
 /// Sorted by the enum's own order rather than by first use, for
@@ -182,14 +445,29 @@ pub fn module(ir: &Ir) -> super::GeneratedFile {
             package_constant(*harness),
             names::string(package_of(*harness))
         ));
+        // The version this target installs, which is the pin unless the
+        // target's `harnesses:` moved it inside the audited range (grammar
+        // 14.8, PRD resolved q66): the fallback a record reads has to be the
+        // number `package.json` declares, or a project whose manifest cannot
+        // be read would name a release the target never installed.
+        let first = match override_of(ir, *harness) {
+            None => format!(
+                "The `{}` SDK version this compiler release pins — the number \
+                 `package.json` declares.",
+                harness.as_str()
+            ),
+            Some(_) => format!(
+                "The `{name}` SDK version this target's `harnesses.{name}` declares, \
+                 in place of this compiler release's pin `{}` — the number \
+                 `package.json` declares.",
+                version_of(*harness),
+                name = harness.as_str()
+            ),
+        };
         contents.push_str(&names::doc(
             "",
             &[
-                format!(
-                    "The `{}` SDK version this compiler release pins — the number \
-                     `package.json` declares.",
-                    harness.as_str()
-                ),
+                first,
                 String::new(),
                 "A `HarnessRecord` reports the version **installed** instead \
                  (`installedVersion`), and this one only where the installed \
@@ -201,7 +479,7 @@ pub fn module(ir: &Ir) -> super::GeneratedFile {
         contents.push_str(&format!(
             "const {}: string = {};\n\n",
             version_constant(*harness),
-            names::string(version_of(*harness))
+            names::string(sdk_version(ir, *harness))
         ));
         contents.push_str(match harness {
             Harness::Cc => CC,
@@ -1255,6 +1533,342 @@ mod tests {
             .find_map(|node| node.coder.as_ref())
             .expect("the composition has a coder node")
             .tools_enforced
+    }
+
+    /// **Each range floor is the version its reserved list was audited at**
+    /// (grammar 14.8, Decision D151, PRD resolved q66 ruling b).
+    ///
+    /// The drift test the ruling asks for. [`AUDITED`] is what `validate`
+    /// holds a target's `harnesses:` to, and
+    /// [`a_reserved_list_is_audited_against_the_pinned_option_surface`] is where
+    /// the audit that range rests on is written down, anchored on a version of
+    /// its own. Two numbers for one fact drift the day a bump moves one of them:
+    /// an audit re-performed at a newer release with the floor left behind would
+    /// keep refusing versions the audit now covers, and — the direction that
+    /// matters — a floor moved forward without the audit would admit a range
+    /// nobody read, with the reserved list still describing the old surface. So
+    /// neither moves alone: a bump of either one fails here, by name.
+    #[test]
+    fn a_range_floor_is_the_version_its_reserved_list_was_audited_at() {
+        for harness in Harness::ALL.iter().copied() {
+            let (audited, _) = audited_surface(harness);
+            let name = harness.as_str();
+            if !harness.ships_in_v1() {
+                assert_eq!(
+                    audited_of(harness),
+                    None,
+                    "`{name}` is reserved: it has no driver, no audit and so no range a target \
+                     could pin its SDK inside"
+                );
+                continue;
+            }
+            assert_eq!(
+                audited_of(harness),
+                Some(audited),
+                "`{name}`'s audited range starts at {:?} and its reserved list was audited at \
+                 {audited}: the floor is the audited version, so move both together — re-audit the \
+                 release's option surface under both readings, then move `AUDITED` and the audit \
+                 anchor in one change (grammar 14.8, PRD resolved q66 ruling b)",
+                audited_of(harness)
+            );
+        }
+        let mut rows: Vec<Harness> = AUDITED.iter().map(|(harness, _)| *harness).collect();
+        let listed = rows.len();
+        rows.sort();
+        rows.dedup();
+        assert_eq!(rows.len(), listed, "`AUDITED` names one harness twice");
+    }
+
+    /// **Every document that states the audited ranges states this release's**
+    /// (grammar 14.8, PRD resolved q66).
+    ///
+    /// Three documents print the table — the grammar, the `targets` topic an
+    /// author on a laptop reads, and the `explain` page a refusal points at —
+    /// because the range is the one thing an author asking "which version may I
+    /// pin?" needs, and it is release data. Prose does not compile, so the table
+    /// is read back here: a bump that moved the pin and the floor together would
+    /// otherwise leave three documents naming a range `validate` no longer
+    /// enforces, and the refusal's own explanation contradicting the refusal.
+    #[test]
+    fn every_document_stating_the_audited_ranges_states_this_releases() {
+        let documents = [
+            (
+                "docs/grammar.md §14.8",
+                include_str!("../../../../docs/grammar.md"),
+            ),
+            (
+                "`agent-compose docs targets`",
+                include_str!("../../../../docs/topics/targets.md"),
+            ),
+            (
+                "`agent-compose explain harness-sdk-outside-audited-range`",
+                include_str!("../docs/codes/harness-sdk-outside-audited-range.md"),
+            ),
+        ];
+        for (place, text) in documents {
+            for harness in Harness::ALL.iter().copied().filter(|h| h.ships_in_v1()) {
+                let range = audited_range(harness).expect("a shipping harness has a range");
+                let row = format!(
+                    "| `{}` | `{}` | `{}` | `{range}` |",
+                    harness.as_str(),
+                    package_of(harness),
+                    version_of(harness)
+                );
+                assert!(
+                    text.contains(&row),
+                    "{place} does not state `{}`'s pin and audited range as this release \
+                     declares them — expected the row {row}",
+                    harness.as_str()
+                );
+            }
+        }
+    }
+
+    /// The range is `[audited, next minor)`, stated here in the spelling a
+    /// refusal prints it in — and in every release the pin is its floor.
+    #[test]
+    fn an_audited_range_runs_from_the_audited_version_through_that_minor() {
+        assert_eq!(
+            audited_range(Harness::Cc).map(|range| range.to_string()),
+            Some("[0.3.284, 0.4.0)".to_string())
+        );
+        assert_eq!(
+            audited_range(Harness::Codex).map(|range| range.to_string()),
+            Some("[0.154.0, 0.155.0)".to_string())
+        );
+        for harness in Harness::ALL.iter().copied() {
+            let Some(range) = audited_range(harness) else {
+                assert!(!harness.ships_in_v1(), "a harness that ships has a range");
+                continue;
+            };
+            assert_eq!(
+                range.floor,
+                version_of(harness),
+                "`{}`'s pin is not the floor of its audited range, so a target that declares no \
+                 `harnesses:` entry would build a version the range does not start at",
+                harness.as_str()
+            );
+            assert_eq!(
+                placement_of(harness, range.floor),
+                Some(RangePlacement::Inside),
+                "the floor is inside its own range"
+            );
+            assert_eq!(
+                placement_of(harness, &range.ceiling),
+                Some(RangePlacement::Above),
+                "the next minor is outside the range it closes"
+            );
+        }
+    }
+
+    /// Where a version sits is **semver precedence**, not string order, and the
+    /// range is one minor's releases (grammar 14.8).
+    ///
+    /// Each row is a spelling a string comparison or a sloppier range gets wrong:
+    /// `0.3.99` sorts after `0.3.284` as text and is older; `0.30.0` shares the
+    /// floor's prefix and is a different minor; `0.4.0-rc.1` precedes `0.4.0` and
+    /// is still the next minor, which nobody audited; a prerelease of the floor
+    /// precedes the floor; build metadata carries no precedence at all.
+    #[test]
+    fn a_version_is_placed_by_semver_precedence_within_the_audited_minor() {
+        use RangePlacement::{Above, Below, Inside};
+        for (version, expected) in [
+            ("0.3.284", Some(Inside)),
+            ("0.3.285", Some(Inside)),
+            ("0.3.1000", Some(Inside)),
+            ("0.3.284+local.build", Some(Inside)),
+            ("0.3.290-beta.1", Some(Inside)),
+            ("0.3.284-rc.1", Some(Below)),
+            ("0.3.283", Some(Below)),
+            ("0.3.99", Some(Below)),
+            ("0.2.999", Some(Below)),
+            ("0.0.1", Some(Below)),
+            ("0.4.0", Some(Above)),
+            ("0.4.0-rc.1", Some(Above)),
+            ("0.30.0", Some(Above)),
+            ("1.0.0", Some(Above)),
+            ("^0.3.284", None),
+            ("~0.3.284", None),
+            ("0.3.x", None),
+            ("0.3", None),
+            ("latest", None),
+            ("0.3.284 ", None),
+            ("00.3.284", None),
+        ] {
+            assert_eq!(
+                placement_of(Harness::Cc, version),
+                expected,
+                "`{version}` against `cc`'s range {:?}",
+                audited_range(Harness::Cc).map(|range| range.to_string())
+            );
+        }
+        // …and the reserved harnesses have no range to be placed against.
+        assert_eq!(placement_of(Harness::DeepAgents, "0.1.0"), None);
+
+        // semver.org §11's own ordering example, which is the prerelease rule the
+        // floor's own prereleases are placed by.
+        let ordered = [
+            "1.0.0-alpha",
+            "1.0.0-alpha.1",
+            "1.0.0-alpha.beta",
+            "1.0.0-beta",
+            "1.0.0-beta.2",
+            "1.0.0-beta.11",
+            "1.0.0-rc.1",
+            "1.0.0",
+        ];
+        for pair in ordered.windows(2) {
+            let (left, right) = (
+                SdkVersion::parse(pair[0]).expect("an exact version"),
+                SdkVersion::parse(pair[1]).expect("an exact version"),
+            );
+            assert_eq!(
+                left.precedence(&right),
+                std::cmp::Ordering::Less,
+                "`{}` precedes `{}` (semver.org §11)",
+                pair[0],
+                pair[1]
+            );
+            assert_eq!(right.precedence(&left), std::cmp::Ordering::Greater);
+        }
+    }
+
+    /// **A target's `sdk_version:` moves its harness's SDK, and only that
+    /// package, in every surface that names it** (grammar 14.8, PRD resolved
+    /// q66 ruling d).
+    ///
+    /// `package.json` declares the target's version in the pin's place, the
+    /// driver's fallback constant is that same number — so a record from an
+    /// install whose manifest cannot be read names the release the target asked
+    /// for rather than one it never installed — and the SDK's pinned peers stay
+    /// where the compiler put them, because a patch series resolves against
+    /// them. An entry stating the pin itself is no override and changes nothing
+    /// `build` writes.
+    #[test]
+    fn a_targets_sdk_version_moves_the_sdk_alone_in_every_surface_that_names_it() {
+        let moved = crate::codegen::test_support::ir_of_mesh(
+            &coder_composition(Harness::Cc),
+            "version: \"0.1\"\nharnesses:\n  cc:\n    sdk_version: \"0.3.285\"\n",
+        );
+        assert_eq!(override_of(&moved, Harness::Cc), Some("0.3.285"));
+        assert_eq!(sdk_version(&moved, Harness::Cc), "0.3.285");
+        let pins: Vec<(&str, &str)> = pins_of(Harness::Cc)
+            .iter()
+            .enumerate()
+            .map(|(index, (package, version))| {
+                (*package, if index == 0 { "0.3.285" } else { *version })
+            })
+            .collect();
+        assert_eq!(
+            pins_for(&moved, Harness::Cc),
+            pins,
+            "the peers moved with the SDK"
+        );
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&crate::codegen::project::package_json(&moved).contents)
+                .expect("strict JSON");
+        for (package, version) in &pins {
+            assert_eq!(
+                manifest["dependencies"][*package],
+                serde_json::Value::from(*version),
+                "`package.json` declares `{package}` at a version other than the target's"
+            );
+        }
+        let emitted = module(&moved).contents;
+        assert!(
+            emitted.contains("const CC_SDK_VERSION: string = \"0.3.285\";"),
+            "the driver's fallback is not the version `package.json` declares: {emitted}"
+        );
+        assert!(
+            emitted.contains(
+                "this target's `harnesses.cc` declares, in place of this compiler \
+                 release's pin `0.3.284`"
+            ),
+            "the constant does not say whose number it is: {emitted}"
+        );
+
+        // …and an entry that states the pin itself is no override at all.
+        let stated = crate::codegen::test_support::ir_of_mesh(
+            &coder_composition(Harness::Cc),
+            &format!(
+                "version: \"0.1\"\nharnesses:\n  cc:\n    sdk_version: \"{}\"\n",
+                version_of(Harness::Cc)
+            ),
+        );
+        let plain = crate::codegen::test_support::ir_of_mesh(
+            &coder_composition(Harness::Cc),
+            "version: \"0.1\"\n",
+        );
+        assert_eq!(override_of(&stated, Harness::Cc), None);
+        assert_eq!(module(&stated).contents, module(&plain).contents);
+        assert_eq!(
+            crate::codegen::project::package_json(&stated).contents,
+            crate::codegen::project::package_json(&plain).contents
+        );
+    }
+
+    /// An entry `validate` would refuse never reaches a manifest, even from an
+    /// artifact nobody checked (grammar 14.8).
+    ///
+    /// `build` refuses a composition the validator does, so on the command line
+    /// this is unreachable; what it guards is the reading itself. [`override_of`]
+    /// is the one place a target's version enters the emitted project, and a
+    /// reading that took the text on trust would write an unaudited release into
+    /// `package.json` for any caller that emits without checking first.
+    #[test]
+    fn an_entry_outside_the_range_is_never_read_as_an_override() {
+        let mut ir = crate::codegen::test_support::ir_of_mesh(
+            &coder_composition(Harness::Cc),
+            "version: \"0.1\"\nharnesses:\n  cc:\n    sdk_version: \"0.3.285\"\n",
+        );
+        for refused in ["0.4.0", "0.3.283", "^0.3.285", "${CC_SDK}", "latest"] {
+            ir.deploy
+                .harnesses
+                .as_mut()
+                .and_then(|section| section.entries.get_mut("cc"))
+                .expect("the entry the deploy file declared")
+                .sdk_version
+                .value = refused.to_string();
+            assert_eq!(override_of(&ir, Harness::Cc), None, "`{refused}` was read");
+            assert_eq!(sdk_version(&ir, Harness::Cc), version_of(Harness::Cc));
+        }
+    }
+
+    /// A composition whose one flow runs one `coder:` node on `harness`, over a
+    /// provider whose wire that harness speaks — so, unlike [`one_coder_node`],
+    /// one the validator accepts under either harness.
+    fn coder_composition(harness: Harness) -> String {
+        let kind = match harness {
+            Harness::Codex => "openai",
+            _ => "anthropic",
+        };
+        format!(
+            "version: \"0.1\"
+provider.p:
+  kind: {kind}
+  api_key: ${{K}}
+model.m:
+  provider: provider.p
+  id: some-model
+flow.f:
+  outputs: {{}}
+  nodes:
+    build:
+      coder:
+        harness: {}
+        model: model.m
+        workspace: \"'/srv/checkout'\"
+        prompt: Do the work.
+        output:
+          summary: {{ type: string }}
+      input: \"'go'\"
+  edges:
+    - {{ from: start, to: build }}
+    - {{ from: build, to: end }}
+",
+            harness.as_str()
+        )
     }
 
     /// A composition whose one flow runs one `coder:` node on `harness`, under

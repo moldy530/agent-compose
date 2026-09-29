@@ -76,6 +76,15 @@
       "description": "DEPLOY FILE ONLY. Where a generated project's installer resolves packages from; build writes a bunfig.toml and an .npmrc from it. Grammar 14.6 / PRD resolved q59.",
       "$ref": "#/$defs/packageRegistry"
     },
+    "harnesses": {
+      "description": "DEPLOY FILE ONLY. Which release of a harness's SDK this target's project installs, keyed by the harness a coder node's harness: names. Each compiler release declares, per harness SDK, the range its reserved settings: list was audited for - [audited, next minor) - and validate refuses a version outside it, above or below, by name; the range is release data this schema does not carry. build writes an accepted version into package.json in the pin's place, for that SDK alone. Grammar 14.8 / PRD resolved q66.",
+      "type": "object",
+      "propertyNames": {
+        "description": "A harness this release lowers. deepagents and native are reserved harness names and are refused here as they are on a node: a reserved harness has no driver, so there is no SDK to pin.",
+        "enum": ["cc", "codex"]
+      },
+      "additionalProperties": { "$ref": "#/$defs/harnessSdk" }
+    },
     "trace_sink": {
       "description": "DEPLOY FILE ONLY. Where every settled execution's trace ships, on the same journal-backed at-least-once delivery a callback: uses. Grammar 14.5 / PRD resolved q50, q51.",
       "$ref": "#/$defs/traceSink"
@@ -103,6 +112,7 @@
     "storage_backends": ["version"],
     "journal": ["version"],
     "package_registry": ["version"],
+    "harnesses": ["version"],
     "trace_sink": ["version"],
     "event_sources": ["version"]
   },
@@ -129,6 +139,7 @@
     "storage_backends": { "$ref": "#/$defs/deployFileOnly" },
     "journal": { "$ref": "#/$defs/deployFileOnly" },
     "package_registry": { "$ref": "#/$defs/deployFileOnly" },
+    "harnesses": { "$ref": "#/$defs/deployFileOnly" },
     "trace_sink": { "$ref": "#/$defs/deployFileOnly" },
     "event_sources": { "$ref": "#/$defs/deployFileOnly" }
   },
@@ -143,13 +154,14 @@
           { "required": ["storage_backends"] },
           { "required": ["journal"] },
           { "required": ["package_registry"] },
+          { "required": ["harnesses"] },
           { "required": ["trace_sink"] },
           { "required": ["event_sources"] }
         ]
       }
     },
     "deployFileOnly": {
-      "description": "A deploy file carries only version + hub/placements/storage_backends/journal/package_registry/trace_sink/event_sources: no definitions, imports, state, triggers, or defaults (PRD 5.8 per-target invariant).",
+      "description": "A deploy file carries only version + hub/placements/storage_backends/journal/package_registry/harnesses/trace_sink/event_sources: no definitions, imports, state, triggers, or defaults (PRD 5.8 per-target invariant).",
       "not": {
         "anyOf": [
           { "required": ["imports"] },
@@ -2938,6 +2950,18 @@
         }
       },
       "required": ["url"],
+      "additionalProperties": false
+    },
+    "harnessSdk": {
+      "description": "One harness's SDK release for this target (grammar 14.8). The block's one key is sdk_version; validate additionally holds the version to the range this compiler release audited the SDK for, and warns about an entry for a harness no coder node binds, since it emits nothing.",
+      "type": "object",
+      "properties": {
+        "sdk_version": {
+          "description": "The exact version build writes into package.json in the compiler pin's place. A literal: a version is a build fact rather than a secret, so no ${ENV} reference; and exact, because the range is the compiler's to declare rather than the deployment's - no ^, ~, >, <, * or x, no dist-tag, and no git/file/npm/workspace specifier.",
+          "$ref": "#/$defs/exactVersion"
+        }
+      },
+      "required": ["sdk_version"],
       "additionalProperties": false
     },
     "packageRegistryScope": {

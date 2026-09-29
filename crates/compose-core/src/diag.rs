@@ -654,6 +654,23 @@ pub enum DiagnosticCode {
     /// not define it" would be false about the block in front of the reader —
     /// what is refused is the pair.
     UnsupportedJournalKey,
+
+    // --- harnesses (grammar 14.8) -----------------------------------------
+    /// A `harnesses:` entry pins a harness's SDK to an exact version outside the
+    /// range this compiler release audited it for — `[audited, next minor)`,
+    /// above it or below it (grammar 14.8, PRD resolved q66, Decision D151). Its
+    /// own class rather than a [`ValueOutOfRange`](Self::ValueOutOfRange): the
+    /// bound is not a number the grammar states but a **release fact** — the
+    /// version the reserved `settings:` list was audited against — and the
+    /// explanation a reader needs is why that audit, and not the SDK's own
+    /// compatibility, is the boundary.
+    HarnessSdkOutsideAuditedRange,
+    /// A `harnesses:` entry names a harness no `coder:` node of the composition
+    /// binds, so it emits nothing (grammar 14.8, PRD resolved q66 ruling c). A
+    /// **warning**: a deploy file outlives the compositions it serves, and an
+    /// entry waiting for the one that binds the harness is not a mistake — only
+    /// a key that, today, does nothing.
+    UnboundHarnessSdk,
 }
 
 impl DiagnosticCode {
@@ -748,6 +765,8 @@ impl DiagnosticCode {
         Self::MissingRegistryToken,
         Self::MissingJournalUrl,
         Self::UnsupportedJournalKey,
+        Self::HarnessSdkOutsideAuditedRange,
+        Self::UnboundHarnessSdk,
     ];
 
     /// The stable kebab-case spelling of this code.
@@ -836,6 +855,8 @@ impl DiagnosticCode {
             Self::MissingRegistryToken => "missing-registry-token",
             Self::MissingJournalUrl => "missing-journal-url",
             Self::UnsupportedJournalKey => "unsupported-journal-key",
+            Self::HarnessSdkOutsideAuditedRange => "harness-sdk-outside-audited-range",
+            Self::UnboundHarnessSdk => "unbound-harness-sdk",
         }
     }
 }
@@ -1068,7 +1089,7 @@ mod tests {
         }
         assert_eq!(
             DiagnosticCode::ALL.len(),
-            DiagnosticCode::UnsupportedJournalKey as usize + 1,
+            DiagnosticCode::UnboundHarnessSdk as usize + 1,
             "`DiagnosticCode::ALL` stops short of the last declared variant"
         );
     }

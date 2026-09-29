@@ -81,7 +81,8 @@
 //!
 //! **A section is a construct too**, and every one of them is written the same
 //! way: `defaults:`, `state:`, `triggers:`, and the deploy layer's `hub:`,
-//! `placements:`, `storage_backends:`, `trace_sink:`, and `event_sources:` each
+//! `placements:`, `storage_backends:`, `harnesses:`, `trace_sink:`, and
+//! `event_sources:` each
 //! carry the region the section itself was written in alongside what it declares
 //! ([`Section`]). A rule whose subject is a whole section — a channel set that
 //! declares nothing a flow writes, a target that binds no backend for a kind a

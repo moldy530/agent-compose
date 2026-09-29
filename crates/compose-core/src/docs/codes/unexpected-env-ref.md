@@ -9,6 +9,11 @@ schema, every CEL expression, a model `id`, everything inside `settings:`,
 `version:`, `imports:` entries, a trigger's `path:` and `cron:`, every
 identifier and reference position.
 
+A deploy file has class-3 surfaces too: the three written-out URLs, and a
+`harnesses:` entry's `sdk_version:` (§14.8), where a version is a build fact
+rather than a secret and `validate` has to read it to hold it to the compiler's
+audited range.
+
 An unescaped token there is an error rather than text that silently survives,
 because whoever wrote it expected a substitution. Discovering at run time that a
 prompt says six literal characters is a worse outcome than a diagnostic.
@@ -49,5 +54,5 @@ diagnostic names — `name: web_search`, `type: approximate`. A closed set of
 *several* values is an ordinary interpolable string, so
 `search_context_size: ${SEARCH_DEPTH}` is not this error and needs no change.
 
-Grammar: `docs/grammar.md` §4.3, §12.1, Decisions D41, D92, D122. Topic:
+Grammar: `docs/grammar.md` §4.3, §12.1, §14.8, Decisions D41, D92, D122, D151. Topic:
 `agent-compose docs cel`.

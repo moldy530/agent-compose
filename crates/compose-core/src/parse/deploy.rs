@@ -6,16 +6,19 @@ use crate::ast::common::Namespace;
 use crate::ast::definition::StoreKind;
 use crate::ast::deploy::{
     BackendAlias, BackendConfig, BackendDefault, BackendProvider, ConnectionField, EventSource,
-    EventSourceKind, EventSourcesSection, HubSection, JournalProvider, JournalSection,
-    PackageRegistryScope, PackageRegistrySection, Placement, PlacementsSection, PluginEntry,
-    PluginValue, SECRET_FIELDS, StorageBackendsSection, TraceSinkFormat, TraceSinkSection,
+    EventSourceKind, EventSourcesSection, HarnessEntry, HarnessesSection, HubSection,
+    JournalProvider, JournalSection, PackageRegistryScope, PackageRegistrySection, Placement,
+    PlacementsSection, PluginEntry, PluginValue, SECRET_FIELDS, StorageBackendsSection,
+    TraceSinkFormat, TraceSinkSection,
 };
 use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
 use crate::yaml::{Mapping, Node, Yaml};
 
 use super::definition::description;
 use super::lexical;
-use super::reader::{Cx, Fields, expect_finite, expect_mapping, expect_sequence, list};
+use super::reader::{
+    Cx, Fields, expect_finite, expect_mapping, expect_sequence, expect_string, list,
+};
 use super::section;
 
 /// Namespaces a `members:` entry may name (grammar 14.1, Decision D129).
@@ -1108,6 +1111,49 @@ fn one_credential_per_address(section: &PackageRegistrySection, cx: &mut Cx) {
             ),
         );
     }
+}
+
+/// Read the `harnesses:` section (grammar 14.8, PRD resolved q66).
+///
+/// A closed construct like `package_registry:` one level down — each entry's
+/// block takes `sdk_version:` and nothing else, and an unknown key there is a
+/// mistake rather than a plugin's business (Decision D50) — and an **open** map
+/// one level up, whose keys are kept exactly as written.
+///
+/// That split is the whole of what the parser decides here. Everything that
+/// judges the *content* — whether a key names a harness this release lowers,
+/// whether the version is a literal, whether it is exact, whether it sits
+/// inside the compiler's audited range, and whether any `coder:` node binds the
+/// harness at all — is `check::harnesses`'. The last of those needs the
+/// composition, and the others are kept beside it rather than split across two
+/// passes, so that one entry is judged in one place and a deploy file carrying
+/// a mistake still resolves into an artifact the validator can say everything
+/// about (the invalid-check corpus pins each refusal against a project that
+/// resolves).
+pub(crate) fn harnesses(node: &Node, cx: &mut Cx) -> Option<HarnessesSection> {
+    let mapping = expect_mapping(node, "`harnesses`", cx)?;
+    let mut entries = Vec::new();
+    for entry in mapping.entries() {
+        let name = Spanned::new(entry.key.value.clone(), entry.key.span.clone());
+        let subject = format!("`harnesses.{}`", name.value);
+        let Some(body) = expect_mapping(&entry.value, &subject, cx) else {
+            continue;
+        };
+        let mut fields = Fields::new(body, entry.value.span.clone(), &subject);
+        let sdk_version = fields.require("sdk_version", cx).and_then(|node| {
+            expect_string(node, &format!("`harnesses.{}.sdk_version`", name.value), cx)
+        });
+        fields.finish(cx);
+        entries.push(HarnessEntry {
+            name,
+            sdk_version,
+            span: entry.key.span.joined(&entry.value.span),
+        });
+    }
+    Some(HarnessesSection {
+        entries,
+        span: node.span.clone(),
+    })
 }
 
 /// The `provider:` keywords a `journal:` chooses between (grammar 14.7).

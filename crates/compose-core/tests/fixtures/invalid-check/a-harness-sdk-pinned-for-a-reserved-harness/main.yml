@@ -1,0 +1,34 @@
+# rule: a `harnesses:` key names a harness this release lowers, and `deepagents` and `native` are refused here as they are on a node (grammar 14.8, D136, PRD resolved q57, q66)
+# code: unsupported-harness
+# message: `harnesses.deepagents` is reserved: this release lowers `cc`, `codex` and no other
+# at: deploy/canary.yml:4:3
+# help: a reserved harness has no driver, so no project installs an SDK for it and there is nothing here to pin: key the entry by a harness this release lowers, or drop it; the set grows by a resolved question rather than by a release adding a name (grammar 14.8, PRD resolved q57, q66)
+# target: canary
+#
+# A reserved harness has no driver, so no project installs an SDK for it and
+# there is nothing to pin.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: coding-model
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: "'${REPO_ROOT}'"
+        prompt: Do the work.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

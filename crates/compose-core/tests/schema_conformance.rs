@@ -1002,6 +1002,193 @@ fn the_published_schema_accepts_the_whole_package_registry_surface() {
     }
 }
 
+/// **The published schema takes every `harnesses:` entry `validate` does, and
+/// refuses none of them** (grammar 14.8, PRD resolved q66).
+///
+/// The schema carries the shape — the two harnesses this release lowers as the
+/// only keys, one closed block each, an exact version in it — and leaves the
+/// audited range to `validate`, because the range is a fact about a compiler
+/// *release* and one published schema serves every release. That split only
+/// holds while both directions do: every legal entry below must be accepted by
+/// the schema **and** validate clean against a composition that binds both
+/// harnesses, and every shape the schema refuses must be refused by `validate`
+/// too (grammar Appendix B: a file that fails the schema always fails
+/// `validate`).
+///
+/// The key set is read off `Harness::ALL` rather than written out, for the
+/// reason the journal test reads its providers off the enum: a harness that
+/// starts shipping and is forgotten in the `enum` leaves the editor squiggling a
+/// key `validate` accepts.
+///
+/// **Why the refused shapes live here rather than in `invalid-schema/`.** That
+/// corpus is replayed through the parser alone
+/// (`parse_invalid.rs`'s `the_parser_rejects_everything_the_published_schema_rejects`),
+/// and every judgement of a `harnesses:` entry's *content* — a name that is not
+/// a harness, a reserved one, a range spelling, a `${…}` — is the validator's
+/// (`check::harnesses`, grammar 14.8), so the parser accepts those files by
+/// design. Appendix B's invariant is about `validate`, which is parse, resolve
+/// and check together, so this test states it at that strength: each shape the
+/// schema refuses is run through all three against a composition that binds
+/// both harnesses, and must come back refused. The one shape the parser does
+/// own — a second key in an entry's block — is in `invalid-schema/` as well.
+#[test]
+fn the_published_schema_takes_every_harness_sdk_the_grammar_spells() {
+    use compose_core::ast::flow::Harness;
+    use compose_core::codegen::harness::{audited_range, version_of};
+
+    let schema = read_schema();
+    let validator = compile_schema();
+
+    let published = variants(&schema["properties"]["harnesses"]["propertyNames"])
+        .expect("`harnesses` keys must stay a closed set in the published schema");
+    let shipping: BTreeSet<String> = Harness::ALL
+        .iter()
+        .filter(|harness| harness.ships_in_v1())
+        .map(|harness| harness.as_str().to_string())
+        .collect();
+    assert_eq!(
+        published, shipping,
+        "the published schema and the harnesses this release lowers disagree about which keys \
+         `harnesses:` takes"
+    );
+
+    // A composition binding both harnesses, so no entry below is unbound.
+    let composition = r#"version: "0.1"
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+provider.openai:
+  kind: openai
+  api_key: ${OPENAI_API_KEY}
+model.claude:
+  provider: provider.anthropic
+  id: coding-model
+model.gpt:
+  provider: provider.openai
+  id: coding-model
+flow.fix:
+  outputs: {}
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.claude
+        workspace: "'/srv/checkout'"
+        prompt: Do the work.
+        output:
+          summary: { type: string }
+      input: "'go'"
+    review:
+      coder:
+        harness: codex
+        model: model.gpt
+        workspace: "'/srv/checkout'"
+        prompt: Review the work.
+        output:
+          verdict: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: review }
+    - { from: review, to: end }
+"#;
+    let validated = |name: &str, entries: &Value| -> Vec<String> {
+        let directory = std::env::temp_dir().join(format!(
+            "agent-compose-schema-harnesses-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(directory.join("deploy")).expect("a scratch project");
+        fs::write(directory.join("main.yml"), composition).expect("the composition");
+        let deploy = serde_yaml_ng::to_string(&json!({ "version": "0.1", "harnesses": entries }))
+            .expect("a printable deploy file");
+        fs::write(directory.join("deploy/staging.yml"), deploy).expect("the deploy file");
+        let resolution = compose_core::resolve_with_target(directory.join("main.yml"), "staging");
+        let mut found: Vec<String> = resolution
+            .diagnostics
+            .iter()
+            .map(|diagnostic| format!("[{}] {}", diagnostic.code, diagnostic.message))
+            .collect();
+        if let Some(ir) = &resolution.ir {
+            found.extend(
+                compose_core::check(ir)
+                    .iter()
+                    .map(|diagnostic| format!("[{}] {}", diagnostic.code, diagnostic.message)),
+            );
+        }
+        let _ = fs::remove_dir_all(&directory);
+        found
+    };
+
+    let floor = |harness: Harness| {
+        audited_range(harness)
+            .expect("a shipping harness has a range")
+            .floor
+    };
+    let legal = [
+        // Each harness at its own pin, which is the floor of its range.
+        json!({ "cc": { "sdk_version": version_of(Harness::Cc) } }),
+        json!({ "codex": { "sdk_version": version_of(Harness::Codex) } }),
+        // Both at once, one moved a patch inside its range.
+        json!({
+            "cc": { "sdk_version": "0.3.285" },
+            "codex": { "sdk_version": floor(Harness::Codex) },
+        }),
+        // A prerelease inside the audited minor, and build metadata on the floor:
+        // both exact, both inside — a pattern written one character too tight
+        // takes them down.
+        json!({ "cc": { "sdk_version": "0.3.290-beta.1" } }),
+        json!({ "cc": { "sdk_version": "0.3.284+local.1" } }),
+    ];
+    for (index, entries) in legal.iter().enumerate() {
+        let instance = json!({ "version": "0.1", "harnesses": entries });
+        let errors = validation_errors(&validator, &instance);
+        assert!(
+            errors.is_empty(),
+            "the published schema must accept this legal `harnesses:` block:\n{}\n{}",
+            serde_json::to_string_pretty(&instance).expect("a printable instance"),
+            errors.join("\n")
+        );
+        let found = validated(&format!("legal-{index}"), entries);
+        assert!(
+            found.is_empty(),
+            "`validate` must accept what the published schema accepts here:\n{}\n{}",
+            serde_json::to_string_pretty(entries).expect("printable"),
+            found.join("\n")
+        );
+    }
+
+    // …and every shape the schema refuses, `validate` refuses too — the parser
+    // for the block's shape, the validator for everything it judges.
+    for (index, entries) in [
+        json!({ "claude": { "sdk_version": "0.3.285" } }),
+        json!({ "deepagents": { "sdk_version": "0.2.0" } }),
+        json!({ "native": { "sdk_version": "0.2.0" } }),
+        json!({ "cc": { "sdk_version": "^0.3.284" } }),
+        json!({ "cc": { "sdk_version": "0.3.x" } }),
+        json!({ "cc": { "sdk_version": "latest" } }),
+        json!({ "cc": { "sdk_version": "${CC_SDK_VERSION}" } }),
+        json!({ "cc": { "sdk_version": "0.3.285", "peers": "pinned" } }),
+        json!({ "cc": {} }),
+        json!({ "cc": "0.3.285" }),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let instance = json!({ "version": "0.1", "harnesses": entries });
+        assert!(
+            !validation_errors(&validator, &instance).is_empty(),
+            "the published schema must refuse this `harnesses:` block:\n{}",
+            serde_json::to_string_pretty(&instance).expect("a printable instance")
+        );
+        assert!(
+            !validated(&format!("refused-{index}"), entries).is_empty(),
+            "`validate` must refuse what the published schema refuses:\n{}",
+            serde_json::to_string_pretty(entries).expect("printable")
+        );
+    }
+}
+
 /// The whole `journal:` surface, in the editor and in the parser (grammar 14.7,
 /// PRD resolved q62).
 ///

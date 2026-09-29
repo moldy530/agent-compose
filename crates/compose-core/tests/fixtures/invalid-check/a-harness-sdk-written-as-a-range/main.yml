@@ -1,0 +1,35 @@
+# rule: a `harnesses:` entry states one exact version, because the range is the compiler's to declare (grammar 14.8, PRD 5.12, resolved q66)
+# code: invalid-value
+# message: `harnesses.cc.sdk_version` is `^0.3.284`, which is not an exact version
+# at: deploy/canary.yml:5:18
+# help: the range is this compiler's to declare and not a deployment's, so a version here is one exact `MAJOR.MINOR.PATCH` — no `^`, `~`, `>`, `<`, `*` or `x`, no dist-tag, and no `git`, `file`, `npm` or `workspace` specifier — inside the audited range `[0.3.284, 0.4.0)` (grammar 14.8, PRD 5.12, resolved q66)
+# target: canary
+#
+# `^0.3.284` would let the installer choose, and on the day `0.4.0` is published
+# a caret is a version this release never audited — which is exactly the choice
+# the range exists to keep out of a deployment's hands.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: coding-model
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: "'${REPO_ROOT}'"
+        prompt: Do the work.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

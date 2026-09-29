@@ -102,6 +102,9 @@ const CHECK_CODES: &[&str] = &[
     "unsupported-connection-fact",
     "unsupported-provider-kind",
     "conflicting-connection-variable",
+    "unexpected-env-ref",
+    "harness-sdk-outside-audited-range",
+    "unbound-harness-sdk",
 ];
 
 struct Anchor {

@@ -180,6 +180,42 @@ pub struct PackageRegistryScope {
     pub span: Span,
 }
 
+/// The `harnesses:` section (grammar 14.8, PRD resolved q66).
+///
+/// Which version of each harness's SDK this target's project installs, where it
+/// is not the compiler's pin. A deploy-layer key for `package_registry:`'s
+/// reason: which SDK serves a harness is a fact about the artifact a target
+/// builds, not about the graph, so the composition says nothing.
+///
+/// The parser reads the **shape** — a map of blocks, each with its one
+/// `sdk_version:` string — and keeps both the key and the version as written.
+/// Which names are harnesses this release lowers, whether a version is exact,
+/// and whether it sits inside the compiler's audited range are the validator's
+/// (`check::harnesses`), so each refusal is a check a resolvable project fails
+/// rather than a file that never resolves.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HarnessesSection {
+    /// The entries, in declaration order.
+    pub entries: Vec<HarnessEntry>,
+    /// The section's own span.
+    pub span: Span,
+}
+
+/// One entry of `harnesses:` (grammar 14.8).
+#[derive(Clone, Debug, PartialEq)]
+pub struct HarnessEntry {
+    /// The harness, from the section key, as written — the grammar's
+    /// `harness:` enum (Decision D136) is what the validator reads it against.
+    pub name: Spanned<String>,
+    /// `sdk_version:` — required; the exact version `build` writes into
+    /// `package.json` in the pin's place. Kept as written, `${…}` and all, for
+    /// the validator to judge.
+    pub sdk_version: Option<Spanned<String>>,
+    /// The whole entry's span, name and body together. [`Self::name`] carries
+    /// the name alone, for the diagnostics that are about it.
+    pub span: Span,
+}
+
 /// The `journal:` section (grammar 14.7, PRD resolved q62).
 ///
 /// **One journal per target**, which is what makes this a single backend config
