@@ -991,7 +991,7 @@ it.
 | field | type | presence | meaning |
 |---|---|---|---|
 | `harness` | `HarnessName` — `"cc"` \| `"codex"` | always | Which harness ran it: the `harness:` keyword the composition wrote (grammar §8.9). A closed vocabulary, and the two reserved names of grammar §15 are **not** members — `validate` refuses a composition that binds one, so no run under one exists to record. |
-| `sdk` | string | always | The SDK package this compiler release reached it through and the version it pinned, as `<package>@<version>`. It is what joins a trace to the `package.json` of the project that produced it. |
+| `sdk` | string | always | The SDK package the run was reached through and **the version of it that ran**, as `<package>@<version>` — the installed package's own version, read off its manifest when the driver loads, not the number compiled into the driver. It is what joins a trace to the `package.json` of the project that produced it. In a project installed from the manifest `build` wrote (`build --check` clean), it is the version this compiler release pinned; a different version means the manifest was edited after `build`, or the install resolved a package it does not name — the drift a reader opens this record to find, which is why the field reports what ran rather than what was meant to. Where the installed manifest cannot be read (missing, unparsable, or carrying no version string) the version is the pin, silently: nothing in this record marks the fallback. The note after this table says why reading it this way was not a version bump. |
 | `model` | string | always | The `model.*` the composition named (grammar §12.2). |
 | `modelId` | string | always | The provider-native model id that address resolved to, which is what the harness was actually handed (grammar §8.9, Decision D141). |
 | `workspace` | string | always | **The directory this run was contained by, resolved** (grammar §8.9, Decision D147, PRD resolved q61). A `coder:` node's `workspace:` is an expression evaluated at each dispatch, so the composition's own text no longer answers which directory a run held — and for a `map` over a coder node, where the whole point is that every dispatch holds a different one, that is the first question a reader of this record has. A `workspace: fresh` run reads the directory the runtime provisioned for it, under `.agent-compose/workspaces/<execution id>/<instance path>/`. This is the **one** field of this format derived from a resolved value rather than from what the composition wrote; [§11.1](#111-secrets) names it as the exception it is. |
@@ -1001,6 +1001,22 @@ it.
 | `cost` | [a rollup](#764-what-a-run-cost) | always | What the run cost, as far as this harness reports it. |
 | `extra` | object | when this harness reports something the other has no shape for | Harness-native extras, read **under `harness`**: its keys are that harness's own vocabulary and this format fixes none of them. It is the deliberate escape hatch PRD resolved q57 ruling a asks for — the alternative was a fixed row that would have to invent a value for whichever harness did not supply one. A reader that does not know a key ignores it, which is what §10.1 already requires. |
 | `error` | string | `"failed"` | What ended the run, in §3's `<error name>: <message>` shape: the harness reported a fatal error, it produced no structured output at all, or its answer failed the node's `output:` gate. Written for a person — §10.1 makes the text something a reader must not parse. |
+
+**Why `sdk` reports what ran without a version bump** (§10.2, §10.3). Earlier
+releases wrote the compiled-in pin here whatever was installed. The field's
+name, type and presence are unchanged, and so is its value in every artifact
+this compiler vouches for — one installed from the `package.json` its `build`
+wrote, where the installed version *is* the pin — so no reader of such an
+artifact reads anything different, which is §10.3's own test: a change "that
+would make a reader written against the previous version wrong". The two
+readings part company only in an artifact edited after `build`, which
+`build --check` refuses to call the compiler's, and there the old value broke
+this row's stated purpose: it joined the trace to a pin the edited
+`package.json` no longer declared. A value the runtime was not keeping as the
+row describes it is the implementation bug §10.2 admits without a bump, not a
+new meaning. What a reader gains is the case the old value hid: a record whose
+`sdk` differs from its release's pin is now evidence of an edited or foreign
+install, where before every record agreed with the pin whatever had run.
 
 #### 7.6.1 A turn
 
@@ -1991,7 +2007,7 @@ or a row promising one nothing sets.
 | `agentcompose.model.member`, `agentcompose.model.condition`, `agentcompose.model.detail` | failover and refusal events | the refusing member, the `route_on:` condition, and what it said |
 | `agentcompose.tool.name`, `agentcompose.tool.target`, `agentcompose.tool.outcome` | tool-call event | the call's own fields. A **harness** run's tool events are the same three attributes, less `target`: the tool is the harness's rather than a component of this composition (§7.6.3) |
 | `agentcompose.harness` | harness run | which harness ran it (§7.6) |
-| `agentcompose.harness.sdk`, `agentcompose.harness.model_id`, `agentcompose.harness.outcome` | harness run | the record's own fields — the SDK and version this release pinned, the provider-native id the harness was handed, and how the run ended |
+| `agentcompose.harness.sdk`, `agentcompose.harness.model_id`, `agentcompose.harness.outcome` | harness run | the record's own fields — the SDK and the version of it that ran, the provider-native id the harness was handed, and how the run ended |
 | `agentcompose.harness.turns`, `agentcompose.harness.input_tokens`, `agentcompose.harness.output_tokens`, `agentcompose.harness.cost_usd` | harness run | the run's cost rollup (§7.6.4). The token attributes are present only where that harness reports tokens and the money one only where it estimates a cost, which is the rollup's own presence rule read onto the span |
 | `agentcompose.harness.turn`, `agentcompose.harness.input_tokens`, `agentcompose.harness.cached_input_tokens`, `agentcompose.harness.output_tokens`, `agentcompose.harness.reasoning_tokens` | turn event | the turn's ordinal, and whatever usage that harness reported for it (§7.6.2) |
 | `agentcompose.store`, `agentcompose.store.op`, `agentcompose.store.effect`, `agentcompose.store.via`, `agentcompose.store.scope`, `agentcompose.store.key`, `agentcompose.store.deduped` | store event | the store record's own fields |

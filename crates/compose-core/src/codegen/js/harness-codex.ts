@@ -104,8 +104,8 @@ const CODEX_SANDBOX: Readonly<Record<runtime.WorkspaceAccess, SandboxMode>> = {
  * adapter parses it against the **full** declared schema (PRD resolved q55).
  */
 const CODEX_DRIVER: runtime.HarnessDriver = {
-  sdk: "@openai/codex-sdk",
-  version: CODEX_SDK_VERSION,
+  sdk: CODEX_SDK,
+  version: installedVersion(CODEX_SDK, CODEX_SDK_VERSION),
   enforcesTools: false,
   run(run: runtime.HarnessRun): AsyncIterable<runtime.HarnessEvent> {
     return (async function* driven(): AsyncGenerator<runtime.HarnessEvent> {

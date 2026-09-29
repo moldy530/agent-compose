@@ -127,6 +127,60 @@ function passthrough(
   return held;
 }
 
+/**
+ * The version of one SDK this process **loaded**, read off the installed
+ * package's own manifest — or `pinned` where that manifest cannot be read
+ * (`docs/trace.md` §7.6).
+ *
+ * It is what a driver reports as its `version`, and so what every
+ * `HarnessRecord.sdk` says ran. The pin is what `package.json` declares, and in a
+ * project installed from the manifest `build` wrote the two are one number — so
+ * the only project where this answer differs from the pin is one whose
+ * `package.json` was edited after `build` (which `build --check` reports) or
+ * whose install resolved something the manifest does not name. That is exactly
+ * the project a trace must not paper over: a record naming the pin there says a
+ * release ran that did not, and the reader who opens a trace to ask *which SDK
+ * produced this* is handed the one answer that is certainly wrong.
+ *
+ * **Resolved from this module, the way its own `import` was.** `import.meta.resolve`
+ * is the resolver the static import above used, so the file it names belongs to
+ * the package instance this process really loaded — the nearest `node_modules/`
+ * walking up, conditions and all — rather than to some other copy on the
+ * machine. The manifest is then found by walking up from that entry point to the
+ * first `package.json` that **names the package**, because neither SDK's
+ * `exports` map publishes `./package.json` and an entry point may sit below a
+ * nested manifest of its own (`dist/package.json` carrying only a `type`).
+ *
+ * **Never a failure.** A manifest that is missing, unreadable, unparsable or
+ * carries no version string falls back to the pin, silently: the record has no
+ * field for "this number is the pin, not a reading", and a coder node whose run
+ * cannot be traced to the byte is still a run worth recording rather than a
+ * reason to refuse it (`docs/trace.md` §7.6 names the fallback). Read once, at
+ * module load, because the package a process loaded does not change under it.
+ */
+function installedVersion(sdk: string, pinned: string): string {
+  try {
+    let directory = path.dirname(fileURLToPath(import.meta.resolve(sdk)));
+    for (;;) {
+      const manifest = path.join(directory, "package.json");
+      if (fs.existsSync(manifest)) {
+        const held = JSON.parse(fs.readFileSync(manifest, "utf8")) as {
+          name?: unknown;
+          version?: unknown;
+        };
+        if (held.name === sdk) {
+          return typeof held.version === "string" && held.version !== "" ? held.version : pinned;
+        }
+      }
+      const parent = path.dirname(directory);
+      if (parent === directory) return pinned;
+      directory = parent;
+    }
+  } catch {
+    return pinned;
+  }
+}
+
 /** One `AbortController` that follows a run's signal, for an SDK that takes one. */
 function controllerFor(signal: AbortSignal): AbortController {
   const controller = new AbortController();

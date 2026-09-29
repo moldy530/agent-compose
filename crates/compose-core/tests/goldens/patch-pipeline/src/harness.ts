@@ -5,6 +5,10 @@
 // is the single source of truth (PRD 5.12); to own this code instead, copy
 // the whole directory out and stop regenerating it.
 
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 import * as runtime from "./runtime.ts";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type {
@@ -148,6 +152,60 @@ function passthrough(
   return held;
 }
 
+/**
+ * The version of one SDK this process **loaded**, read off the installed
+ * package's own manifest — or `pinned` where that manifest cannot be read
+ * (`docs/trace.md` §7.6).
+ *
+ * It is what a driver reports as its `version`, and so what every
+ * `HarnessRecord.sdk` says ran. The pin is what `package.json` declares, and in a
+ * project installed from the manifest `build` wrote the two are one number — so
+ * the only project where this answer differs from the pin is one whose
+ * `package.json` was edited after `build` (which `build --check` reports) or
+ * whose install resolved something the manifest does not name. That is exactly
+ * the project a trace must not paper over: a record naming the pin there says a
+ * release ran that did not, and the reader who opens a trace to ask *which SDK
+ * produced this* is handed the one answer that is certainly wrong.
+ *
+ * **Resolved from this module, the way its own `import` was.** `import.meta.resolve`
+ * is the resolver the static import above used, so the file it names belongs to
+ * the package instance this process really loaded — the nearest `node_modules/`
+ * walking up, conditions and all — rather than to some other copy on the
+ * machine. The manifest is then found by walking up from that entry point to the
+ * first `package.json` that **names the package**, because neither SDK's
+ * `exports` map publishes `./package.json` and an entry point may sit below a
+ * nested manifest of its own (`dist/package.json` carrying only a `type`).
+ *
+ * **Never a failure.** A manifest that is missing, unreadable, unparsable or
+ * carries no version string falls back to the pin, silently: the record has no
+ * field for "this number is the pin, not a reading", and a coder node whose run
+ * cannot be traced to the byte is still a run worth recording rather than a
+ * reason to refuse it (`docs/trace.md` §7.6 names the fallback). Read once, at
+ * module load, because the package a process loaded does not change under it.
+ */
+function installedVersion(sdk: string, pinned: string): string {
+  try {
+    let directory = path.dirname(fileURLToPath(import.meta.resolve(sdk)));
+    for (;;) {
+      const manifest = path.join(directory, "package.json");
+      if (fs.existsSync(manifest)) {
+        const held = JSON.parse(fs.readFileSync(manifest, "utf8")) as {
+          name?: unknown;
+          version?: unknown;
+        };
+        if (held.name === sdk) {
+          return typeof held.version === "string" && held.version !== "" ? held.version : pinned;
+        }
+      }
+      const parent = path.dirname(directory);
+      if (parent === directory) return pinned;
+      directory = parent;
+    }
+  } catch {
+    return pinned;
+  }
+}
+
 /** One `AbortController` that follows a run's signal, for an SDK that takes one. */
 function controllerFor(signal: AbortSignal): AbortController {
   const controller = new AbortController();
@@ -179,7 +237,14 @@ function settingList(value: unknown): string[] | undefined {
 }
 
 /**
- * The `cc` SDK version this compiler release pins — the number `package.json` declares and the number a `HarnessRecord` reports.
+ * The `cc` SDK — the package `package.json` declares, and the one a `HarnessRecord` names.
+ */
+const CC_SDK: string = "@anthropic-ai/claude-agent-sdk";
+
+/**
+ * The `cc` SDK version this compiler release pins — the number `package.json` declares.
+ *
+ * A `HarnessRecord` reports the version **installed** instead (`installedVersion`), and this one only where the installed package's manifest cannot be read: in a project installed from the manifest `build` wrote the two are one number.
  */
 const CC_SDK_VERSION: string = "0.3.284";
 
@@ -738,8 +803,8 @@ function ccEnvironment(run: runtime.HarnessRun): Record<string, string> {
  * amendment to q16 lives.
  */
 const CC_DRIVER: runtime.HarnessDriver = {
-  sdk: "@anthropic-ai/claude-agent-sdk",
-  version: CC_SDK_VERSION,
+  sdk: CC_SDK,
+  version: installedVersion(CC_SDK, CC_SDK_VERSION),
   enforcesTools: true,
   run(run: runtime.HarnessRun): AsyncIterable<runtime.HarnessEvent> {
     return (async function* driven(): AsyncGenerator<runtime.HarnessEvent> {
@@ -1006,7 +1071,14 @@ export function* ccEvents(
 }
 
 /**
- * The `codex` SDK version this compiler release pins — the number `package.json` declares and the number a `HarnessRecord` reports.
+ * The `codex` SDK — the package `package.json` declares, and the one a `HarnessRecord` names.
+ */
+const CODEX_SDK: string = "@openai/codex-sdk";
+
+/**
+ * The `codex` SDK version this compiler release pins — the number `package.json` declares.
+ *
+ * A `HarnessRecord` reports the version **installed** instead (`installedVersion`), and this one only where the installed package's manifest cannot be read: in a project installed from the manifest `build` wrote the two are one number.
  */
 const CODEX_SDK_VERSION: string = "0.154.0";
 
@@ -1116,8 +1188,8 @@ const CODEX_SANDBOX: Readonly<Record<runtime.WorkspaceAccess, SandboxMode>> = {
  * adapter parses it against the **full** declared schema (PRD resolved q55).
  */
 const CODEX_DRIVER: runtime.HarnessDriver = {
-  sdk: "@openai/codex-sdk",
-  version: CODEX_SDK_VERSION,
+  sdk: CODEX_SDK,
+  version: installedVersion(CODEX_SDK, CODEX_SDK_VERSION),
   enforcesTools: false,
   run(run: runtime.HarnessRun): AsyncIterable<runtime.HarnessEvent> {
     return (async function* driven(): AsyncGenerator<runtime.HarnessEvent> {

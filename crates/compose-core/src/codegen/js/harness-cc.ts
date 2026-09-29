@@ -553,8 +553,8 @@ function ccEnvironment(run: runtime.HarnessRun): Record<string, string> {
  * amendment to q16 lives.
  */
 const CC_DRIVER: runtime.HarnessDriver = {
-  sdk: "@anthropic-ai/claude-agent-sdk",
-  version: CC_SDK_VERSION,
+  sdk: CC_SDK,
+  version: installedVersion(CC_SDK, CC_SDK_VERSION),
   enforcesTools: true,
   run(run: runtime.HarnessRun): AsyncIterable<runtime.HarnessEvent> {
     return (async function* driven(): AsyncGenerator<runtime.HarnessEvent> {

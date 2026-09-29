@@ -28,10 +28,17 @@
 //! # Where the versions come from
 //!
 //! [`HARNESS_PINS`], which is the same table [`super::project`] writes into the
-//! generated `package.json`. A driver reports its own `sdk@version` into the
-//! trace's [`HarnessRecord`], so the number a reader sees in a trace is the
-//! number the manifest pinned — held together by
-//! `the_emitted_driver_reports_the_version_the_manifest_pins`.
+//! generated `package.json`, and which this module emits beside each driver as
+//! the package it maps over and the version this release pinned it to — held
+//! together by `the_emitted_driver_reports_the_version_the_manifest_pins`.
+//!
+//! What a driver reports into the trace's [`HarnessRecord`] is the version
+//! **installed**, read off that package's own manifest when the module loads,
+//! and the pin only where the manifest cannot be read. The two agree in every
+//! project installed from the manifest this compiler wrote; where they do not,
+//! the `package.json` was edited after `build` — which `build --check` reports
+//! — and a trace naming the pin would have hidden the edit behind the number the
+//! compiler meant rather than the one that ran.
 //!
 //! [`HarnessRecord`]: https://docs.rs/ "docs/trace.md §7.6"
 
@@ -99,6 +106,12 @@ pub fn pins_of(harness: Harness) -> &'static [(&'static str, &'static str)] {
         .map_or(&[], |(_, pins)| *pins)
 }
 
+/// The package one harness's own SDK is — the first pin of its row.
+#[must_use]
+pub fn package_of(harness: Harness) -> &'static str {
+    pins_of(harness).first().map_or("", |(package, _)| *package)
+}
+
 /// The version this release pins one harness's own SDK to.
 #[must_use]
 pub fn version_of(harness: Harness) -> &'static str {
@@ -133,7 +146,10 @@ pub fn module(ir: &Ir) -> super::GeneratedFile {
     let harnesses = bound(ir);
     let mut contents = super::header(ir, "// ");
 
-    contents.push_str("\nimport * as runtime from \"./runtime.ts\";\n");
+    contents.push_str("\nimport fs from \"node:fs\";\n");
+    contents.push_str("import path from \"node:path\";\n");
+    contents.push_str("import { fileURLToPath } from \"node:url\";\n\n");
+    contents.push_str("import * as runtime from \"./runtime.ts\";\n");
     if harnesses.contains(&Harness::Cc) {
         contents.push_str("import { query } from \"@anthropic-ai/claude-agent-sdk\";\n");
         contents.push_str(
@@ -150,16 +166,37 @@ pub fn module(ir: &Ir) -> super::GeneratedFile {
 
     for harness in &harnesses {
         contents.push('\n');
-        // The version a driver reports into the trace is the one the manifest
-        // pins, emitted here rather than written into the TypeScript so the two
-        // cannot drift (see the module header).
+        // The package a driver maps over and the version this release pinned it
+        // to, emitted here rather than written into the TypeScript so neither
+        // can drift from the manifest (see the module header).
         contents.push_str(&names::doc(
             "",
             &[format!(
-                "The `{}` SDK version this compiler release pins — the number \
-                 `package.json` declares and the number a `HarnessRecord` reports.",
+                "The `{}` SDK — the package `package.json` declares, and the one a \
+                 `HarnessRecord` names.",
                 harness.as_str()
             )],
+        ));
+        contents.push_str(&format!(
+            "const {}: string = {};\n\n",
+            package_constant(*harness),
+            names::string(package_of(*harness))
+        ));
+        contents.push_str(&names::doc(
+            "",
+            &[
+                format!(
+                    "The `{}` SDK version this compiler release pins — the number \
+                     `package.json` declares.",
+                    harness.as_str()
+                ),
+                String::new(),
+                "A `HarnessRecord` reports the version **installed** instead \
+                 (`installedVersion`), and this one only where the installed \
+                 package's manifest cannot be read: in a project installed from \
+                 the manifest `build` wrote the two are one number."
+                    .to_string(),
+            ],
         ));
         contents.push_str(&format!(
             "const {}: string = {};\n\n",
@@ -209,7 +246,16 @@ pub fn module(ir: &Ir) -> super::GeneratedFile {
     }
 }
 
-/// The name of the emitted constant holding one harness's pinned SDK version.
+/// The name of the emitted constant holding one harness's SDK package.
+fn package_constant(harness: Harness) -> &'static str {
+    match harness {
+        Harness::Cc => "CC_SDK",
+        Harness::Codex => "CODEX_SDK",
+        Harness::DeepAgents | Harness::Native => "",
+    }
+}
+
+/// …and the one holding the version this release pinned it to.
 fn version_constant(harness: Harness) -> &'static str {
     match harness {
         Harness::Cc => "CC_SDK_VERSION",
@@ -872,20 +918,21 @@ mod tests {
         owned
     }
 
-    /// The version a driver reports is the version the manifest pins.
+    /// The package and pin a driver is emitted with are the ones the manifest
+    /// declares.
     ///
     /// Two surfaces read one table: `package.json` declares the pin, and the
-    /// emitted driver reports `sdk@version` into every `HarnessRecord`. A reader
-    /// joining a trace to a manifest compares those two strings, so they are
-    /// held to one source here rather than by two constants agreeing on the day
-    /// they were written.
+    /// emitted module carries the same package and version as the constants a
+    /// driver names itself by and falls back to. A reader joining a trace to a
+    /// manifest compares those strings, so they are held to one source here
+    /// rather than by two constants agreeing on the day they were written.
     #[test]
     fn the_emitted_driver_reports_the_version_the_manifest_pins() {
         for (harness, pins) in HARNESS_PINS {
             let (package, version) = pins[0];
             assert_eq!(
-                version_of(*harness),
-                version,
+                (package_of(*harness), version_of(*harness)),
+                (package, version),
                 "`{}`'s own SDK is the first pin of its row",
                 harness.as_str()
             );
@@ -893,7 +940,65 @@ mod tests {
                 !package.is_empty() && !version.is_empty(),
                 "every pin names a package at a version"
             );
+            let emitted = module(&one_coder_node(*harness)).contents;
+            for (constant, value) in [
+                (package_constant(*harness), package),
+                (version_constant(*harness), version),
+            ] {
+                assert!(
+                    emitted.contains(&format!(
+                        "const {constant}: string = {};",
+                        names::string(value)
+                    )),
+                    "`{}`'s module does not carry `{constant}` as the manifest's `{value}`",
+                    harness.as_str()
+                );
+            }
         }
+    }
+
+    /// **A driver reports the SDK version installed, not the one compiled in**
+    /// (`docs/trace.md` §7.6).
+    ///
+    /// The pin is what `package.json` declares; what ran is whatever the
+    /// project's install resolved, and the two part company exactly when the
+    /// manifest was edited after `build` — the edit `build --check` reports, and
+    /// the one a trace naming the pin would hide. So each driver names its
+    /// package by the emitted constant and takes its `version` from
+    /// `installedVersion`, which reads the installed package's own manifest and
+    /// answers the pin only where it cannot. Read off the source for the reason
+    /// the other driver guards here are: it names the shape that is wrong — a
+    /// `version:` that *is* the constant — rather than one value that is right.
+    /// `generated_code_gates`' `a_harness_record_names_the_sdk_version_that_ran`
+    /// is the run: stand-in SDKs installed at a version no release pins, and the
+    /// records that name it.
+    #[test]
+    fn a_driver_reports_the_installed_sdk_version_rather_than_the_pin() {
+        for harness in Harness::ALL.iter().copied().filter(|h| h.ships_in_v1()) {
+            let (source, _, _) = driver_source(harness);
+            let (package, version) = (package_constant(harness), version_constant(harness));
+            assert!(
+                source.contains(&format!("  sdk: {package},\n"))
+                    && source.contains(&format!(
+                        "  version: installedVersion({package}, {version}),\n"
+                    )),
+                "`{}`'s driver does not report the installed version of `{package}` with \
+                 `{version}` as the fallback, so a record from an edited install names a release \
+                 that did not run (docs/trace.md §7.6)",
+                harness.as_str()
+            );
+            assert!(
+                !source.contains(&format!("version: {version},")),
+                "`{}`'s driver reports the compiled-in pin as the version that ran",
+                harness.as_str()
+            );
+        }
+        assert!(
+            PRELUDE.contains("function installedVersion(sdk: string, pinned: string): string {")
+                && PRELUDE.contains("import.meta.resolve(sdk)"),
+            "the prelude does not resolve the installed package the way the driver's own \
+             `import` did, so the version it reads may belong to some other copy"
+        );
     }
 
     /// **A driver that says it enforces `allow_tools:` narrows what its loop can

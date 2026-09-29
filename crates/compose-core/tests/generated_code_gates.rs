@@ -359,6 +359,19 @@
 //!     unmarked one as the divergence no policy may. And a mark the journal
 //!     refuses outright fails the node that was about to write past it — once —
 //!     rather than being swallowed into a resume refused months later.
+//! 29. **The SDK a record says ran** — `HarnessRecord.sdk` read off the
+//!     installed package rather than the compiled-in pin (`docs/trace.md`
+//!     §7.6), out of `harness-record-sdk.mjs`. The two are one number in every
+//!     other gate, because every golden here is installed from the pins `build`
+//!     wrote — which is exactly why none of them can tell a driver that reads
+//!     the install from one that reports the pin. So stand-ins for both SDKs are
+//!     installed into a staged golden's own `node_modules/` at a version no
+//!     release pins, the golden's `flow.patch` runs through its **emitted**
+//!     drivers with nothing registered over them, and every record must name
+//!     the stand-in's version; stand-ins whose manifests carry no version must
+//!     fall back to the pin; and with nothing staged over the shared install
+//!     the drivers must read the real packages — whose `exports` maps publish
+//!     no `./package.json` — as exactly the pins.
 //!
 //! # The toolchain fixture
 //!
@@ -7599,6 +7612,150 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
         json!("C:\\repos\\thing/topic"),
         "the per-item spelling the ruling exists for — a reference inside one literal of a \
          larger expression — stopped composing once the reference was escaped"
+    );
+}
+
+/// Gate 29: **a `HarnessRecord` names the SDK version that ran**, read off the
+/// installed package, and the pin only where that cannot be read
+/// (`docs/trace.md` §7.6).
+///
+/// The field exists to join a trace to the project that produced it, and the
+/// case that join is for is the one where the two disagree: a `package.json`
+/// edited after `build` to move an SDK the compiler pinned — the field report
+/// this answers moved the Agent SDK forward by hand to reach a model its pin
+/// refused — runs one release while a record naming the compiled-in constant
+/// says another. `build --check` reports the edit; the trace has to report
+/// what it did.
+///
+/// No other gate can see the difference, because every golden here is
+/// installed from exactly the pins `build` wrote and a driver reporting the pin
+/// passes them all. So `harness-record-sdk.mjs` runs `patch-pipeline` three
+/// ways, each on a copy staged for it alone (a driver reads its version when its
+/// module loads, so one process is one answer):
+///
+///  * **installed** — stand-ins for both SDKs in the project's own
+///    `node_modules/`, at a version no release pins, and the golden's own
+///    `flow.patch` run through `src/graph.ts`'s emitted bindings with nothing
+///    registered over the drivers. Both stand-ins must be what ran, and both
+///    records must name them;
+///  * **unreadable** — the same stand-ins with no `version` in their manifests:
+///    the run still completes, and each record falls back to its pin rather than
+///    naming nothing;
+///  * **pinned** — nothing staged: the drivers read the real packages out of the
+///    shared install, whose `exports` maps publish no `./package.json`, and must
+///    land on exactly the pins. That is the conformant case, and the one that
+///    breaks if the lookup cannot find a real package's manifest — which a
+///    fallback would hide, since it answers the pin too. So this copy's
+///    compiled-in pins are rewritten to a sentinel first, and the pin a driver
+///    reports can only have come off the installed manifest.
+#[test]
+fn a_harness_record_names_the_sdk_version_that_ran() {
+    use compose_core::ast::flow::Harness;
+    use compose_core::codegen::harness::{package_of, version_of};
+
+    let Some(root) = installed() else {
+        return;
+    };
+    let run = |mode: &str| -> Value {
+        let purpose = format!("harness-record-sdk-{mode}");
+        let project = staged(goldens::golden("patch-pipeline"), root, &purpose);
+        let scratch = root.join("projects").join(&purpose).join("scratch");
+        let _ = fs::remove_dir_all(&scratch);
+        fs::create_dir_all(&scratch).expect("the scratch area is writable");
+        let output = runner("harness-record-sdk.mjs")
+            .arg(&project)
+            .arg(&scratch)
+            .arg(mode)
+            .output()
+            .expect("bun runs");
+        assert!(
+            output.status.success(),
+            "the `{mode}` run of the record-sdk runner failed:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object")
+    };
+    let cc = package_of(Harness::Cc);
+    let codex = package_of(Harness::Codex);
+    let pinned = |harness: Harness| format!("{}@{}", package_of(harness), version_of(harness));
+
+    // --- installed: the record follows the package that ran ---------------
+    let installed = run("installed");
+    assert_eq!(
+        installed["standInCalls"],
+        json!({ "cc": 1, "codex": 1 }),
+        "the emitted drivers did not call the SDKs installed under the project, so nothing \
+         below says which version a record reports for a run that happened"
+    );
+    assert_eq!(
+        installed["outputs"],
+        json!({ "summary": "stood in" }),
+        "`flow.patch` did not complete through the stand-ins"
+    );
+    assert_eq!(
+        installed["records"],
+        json!([
+            {
+                "node": "implement",
+                "harness": "cc",
+                "outcome": "completed",
+                "sdk": format!("{cc}@9.9.9-edited"),
+            },
+            {
+                "node": "review",
+                "harness": "codex",
+                "outcome": "completed",
+                "sdk": format!("{codex}@9.9.9-edited"),
+            },
+        ]),
+        "a `HarnessRecord` names a version other than the one installed and run: a project \
+         whose `package.json` moved an SDK after `build` would carry a trace naming the \
+         compiled-in pin ({}, {}) for a release that never ran (docs/trace.md §7.6)",
+        pinned(Harness::Cc),
+        pinned(Harness::Codex),
+    );
+
+    // --- unreadable: the pin, rather than nothing ---------------------------
+    let unreadable = run("unreadable");
+    assert_eq!(
+        unreadable["standInCalls"],
+        json!({ "cc": 1, "codex": 1 }),
+        "the emitted drivers did not call the SDKs installed under the project"
+    );
+    assert_eq!(
+        unreadable["records"],
+        json!([
+            {
+                "node": "implement",
+                "harness": "cc",
+                "outcome": "completed",
+                "sdk": pinned(Harness::Cc),
+            },
+            {
+                "node": "review",
+                "harness": "codex",
+                "outcome": "completed",
+                "sdk": pinned(Harness::Codex),
+            },
+        ]),
+        "an installed SDK whose manifest carries no version must be reported at the pin — the \
+         fallback docs/trace.md §7.6 names — rather than failing the run or naming no version"
+    );
+
+    // --- pinned: the conformant install reads as exactly the pins ------------
+    let conformant = run("pinned");
+    assert_eq!(
+        conformant["drivers"],
+        json!({
+            "cc": { "sdk": cc, "version": version_of(Harness::Cc) },
+            "codex": { "sdk": codex, "version": version_of(Harness::Codex) },
+        }),
+        "the drivers did not read the pins off an install made from the pins: a version of \
+         `0.0.0-fell-back-to-the-compiled-pin` is the sentinel this copy's compiled-in pins \
+         were rewritten to, so the lookup could not find a real package's manifest (neither \
+         SDK's `exports` publishes `./package.json`) and every edited install would read as \
+         its pin too; any other version means the shared install is not the one \
+         `tests/toolchain/package.json` declares"
     );
 }
 

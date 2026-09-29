@@ -8151,7 +8151,13 @@ export type PermissionMode =
 export interface HarnessRecord {
   /** Which harness ran it. */
   readonly harness: HarnessName;
-  /** The SDK package and the version this compiler release pinned. */
+  /**
+   * The SDK package and the version of it that **ran**, as
+   * `<package>@<version>` — the installed one, read off its own manifest
+   * ([`HarnessDriver.version`]). In a project installed from the manifest
+   * `build` wrote, that is the version this compiler release pinned; where it is
+   * not, the difference is the edit `build --check` reports.
+   */
   readonly sdk: string;
   /** The `model.*` the composition named (grammar 12.2). */
   readonly model: string;
@@ -8466,7 +8472,15 @@ export type HarnessTap =
 export interface HarnessDriver {
   /** The npm package this driver maps over. */
   readonly sdk: string;
-  /** The exact version this compiler release pinned it to (PRD 5.12). */
+  /**
+   * The version of [`sdk`] this process loaded (`docs/trace.md` §7.6).
+   *
+   * The **installed** one, not the one this compiler release pinned (PRD 5.12):
+   * the two are one number wherever the project was installed from the manifest
+   * `build` wrote, and a record that reported the pin where they differ would
+   * hide exactly the edit a reader of the trace most needs to see. A driver that
+   * cannot read its package's manifest reports the pin.
+   */
   readonly version: string;
   /**
    * Whether this harness enforces [`HarnessRun.allowTools`] **inside its own

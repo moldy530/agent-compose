@@ -32,7 +32,9 @@
 //     subagent transcripts go, and a record that carried them would be the one
 //     thing resolved q57 ruling a forbids;
 //   * **the record** — turns with their usage, tool events in the three-outcome
-//     vocabulary, the cost rollup and the `sdk@version` the manifest pinned;
+//     vocabulary, the cost rollup and the `sdk@version` its driver reports
+//     (which, for a real driver, is the installed version:
+//     `harness-record-sdk.mjs`);
 //   * **one effect per run** — journaled once, whatever the run did inside;
 //   * **replay** — a resumed generation consumes the recorded answer, the driver
 //     is **not** run again, and the record it files is the record the run left,
