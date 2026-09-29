@@ -991,7 +991,7 @@ it.
 | field | type | presence | meaning |
 |---|---|---|---|
 | `harness` | `HarnessName` — `"cc"` \| `"codex"` | always | Which harness ran it: the `harness:` keyword the composition wrote (grammar §8.9). A closed vocabulary, and the two reserved names of grammar §15 are **not** members — `validate` refuses a composition that binds one, so no run under one exists to record. |
-| `sdk` | string | always | The SDK package the run was reached through and **the version of it that ran**, as `<package>@<version>` — the installed package's own version, read off its manifest when the driver loads, not the number compiled into the driver. It is what joins a trace to the `package.json` of the project that produced it. In a project installed from the manifest `build` wrote, it is the version this compiler release pinned; a different version means the manifest was edited after `build` (which `build --check` reports), or the tree that ran is not the one that manifest installs — a stale install, or a package resolved from outside the project — the drift a reader opens this record to find, which is why the field reports what ran rather than what was meant to. Where the installed manifest cannot be read (missing, unparsable, or carrying no version string) the version is the pin, silently: nothing in this record marks the fallback. Version `5` defined this value as the pin, compiled in and written whatever was installed; reading it off the install is what version `6` is (§10.3.5). |
+| `sdk` | string | always | The SDK package the run was reached through and **the version of it that ran**, as `<package>@<version>` — the installed package's own version, read off its manifest when the driver loads, not the number compiled into the driver. It is what joins a trace to the `package.json` of the project that produced it. In a project installed from the manifest `build` wrote, it is the version this compiler release pinned; a different version means the manifest was edited after `build` (which `build --check` reports), or the tree that ran is not the one that manifest installs — a stale install, or a package resolved from outside the project — the drift a reader opens this record to find, which is why the field reports what ran rather than what was meant to. The manifest read is the installed package's root one: the first `package.json` carrying a `name`, walking up from the entry point the driver's own import resolved, and never past the `node_modules/` directory the package is installed in. That is the root **whatever name it carries**, because a package installed under an npm alias (`npm:<fork>@<version>`) sits where the SDK's name resolves while its manifest names the fork: the version is the fork's, which is what ran, and the package half stays the name the driver imports. Where the installed manifest cannot be read (missing — which includes a package root whose manifest carries no name — unparsable, or carrying no version string) the version is the pin, silently: nothing in this record marks the fallback. Version `5` defined this value as the pin, compiled in and written whatever was installed; reading it off the install is what version `6` is (§10.3.5). |
 | `model` | string | always | The `model.*` the composition named (grammar §12.2). |
 | `modelId` | string | always | The provider-native model id that address resolved to, which is what the harness was actually handed (grammar §8.9, Decision D141). |
 | `workspace` | string | always | **The directory this run was contained by, resolved** (grammar §8.9, Decision D147, PRD resolved q61). A `coder:` node's `workspace:` is an expression evaluated at each dispatch, so the composition's own text no longer answers which directory a run held — and for a `map` over a coder node, where the whole point is that every dispatch holds a different one, that is the first question a reader of this record has. A `workspace: fresh` run reads the directory the runtime provisioned for it, under `.agent-compose/workspaces/<execution id>/<instance path>/`. This is the **one** field of this format derived from a resolved value rather than from what the composition wrote; [§11.1](#111-secrets) names it as the exception it is. |
@@ -1519,19 +1519,21 @@ version `5` through one field, in the one way §10.3 does not forgive:
   §10.3's test is whether a reader written against `5` can be made wrong, and
   this one can;
 * **the fallback is part of the new meaning.** Where the installed manifest
-  cannot be read — missing, unparsable, or carrying no version string — the
-  value is the pin, and nothing in the record marks it. A reader of `6` that
-  finds the pin has found the pin installed, or an install whose manifest could
-  not be read; one that finds another number has found drift, which under `5`
-  no record could show;
+  cannot be read — missing (a package root whose manifest names nothing
+  included), unparsable, or carrying no version string — the value is the
+  pin, and nothing in the record marks it. A reader of `6` that finds the pin
+  has found the pin installed, or an install whose manifest could not be read;
+  one that finds another number has found drift, which under `5` no record
+  could show;
 * **`agentcompose.harness.sdk` moved with it** (§12.5). The span attribute is
   the record's own field, so a harness run's OTLP export reads the same number.
 
 What did **not** move: the field's name, its type, its presence (always), its
 `<package>@<version>` shape, and its package half, which is still the package
-the driver was compiled against. No other field of any record changed, and an
-envelope whose run held no coder node changed its `trace_version` and nothing
-else.
+the driver was compiled against — under an npm alias too, where the version
+half is the aliased package's own and the package half is still the name the
+driver imports. No other field of any record changed, and an envelope whose run
+held no coder node changed its `trace_version` and nothing else.
 
 ### 10.4 How the two are held together
 

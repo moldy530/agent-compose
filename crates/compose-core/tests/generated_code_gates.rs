@@ -369,9 +369,12 @@
 //!     release pins, the golden's `flow.patch` runs through its **emitted**
 //!     drivers with nothing registered over them, and every record must name
 //!     the stand-in's version; stand-ins whose manifests carry no version must
-//!     fall back to the pin; and with nothing staged over the shared install
-//!     the drivers must read the real packages — whose `exports` maps publish
-//!     no `./package.json` — as exactly the pins.
+//!     fall back to the pin; a stand-in whose manifest names a fork (an npm
+//!     alias) must be reported at the fork's version, and one whose manifest
+//!     names nothing at the pin rather than at the enclosing project's; and with
+//!     nothing staged over the shared install the drivers must read the real
+//!     packages — whose `exports` maps publish no `./package.json` — as exactly
+//!     the pins.
 //!
 //! # The toolchain fixture
 //!
@@ -7650,9 +7653,12 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
 ///
 /// No other gate can see the difference, because every golden here is
 /// installed from exactly the pins `build` wrote and a driver reporting the pin
-/// passes them all. So `harness-record-sdk.mjs` runs `patch-pipeline` three
+/// passes them all. So `harness-record-sdk.mjs` runs `patch-pipeline` four
 /// ways, each on a copy staged for it alone (a driver reads its version when its
-/// module loads, so one process is one answer):
+/// module loads, so one process is one answer). Every stand-in keeps its entry
+/// point below a nested `dist/package.json` carrying only a `type`, so the
+/// manifest a driver reads has to be the package root's rather than the first
+/// one it meets:
 ///
 ///  * **installed** — stand-ins for both SDKs in the project's own
 ///    `node_modules/`, at a version no release pins, and the golden's own
@@ -7662,6 +7668,15 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
 ///  * **unreadable** — the same stand-ins with no `version` in their manifests:
 ///    the run still completes, and each record falls back to its pin rather than
 ///    naming nothing;
+///  * **renamed** — root manifests that do not carry the name the project
+///    imports by. The `cc` stand-in's names a fork at a version no release
+///    pins, which is what an npm alias (`npm:<fork>@<version>`) installs: the
+///    fork ran, so the record must name its version — a lookup that insisted on
+///    the SDK's own name would walk past it and report the pin, hiding exactly
+///    the drift the field is for. The `codex` stand-in's names nothing and
+///    carries no version, so the only version above it is the staged project's
+///    own `0.0.0`: the walk must stop at `node_modules/` and fall back to the
+///    pin rather than borrow that;
 ///  * **pinned** — nothing staged: the drivers read the real packages out of the
 ///    shared install, whose `exports` maps publish no `./package.json`, and must
 ///    land on exactly the pins. That is the conformant case, and the one that
@@ -7761,6 +7776,33 @@ fn a_harness_record_names_the_sdk_version_that_ran() {
         ]),
         "an installed SDK whose manifest carries no version must be reported at the pin — the \
          fallback docs/trace.md §7.6 names — rather than failing the run or naming no version"
+    );
+
+    // --- renamed: the package root's manifest, whatever it is called ---------
+    let renamed = run("renamed");
+    assert_eq!(
+        renamed["standInCalls"],
+        json!({ "cc": 1, "codex": 1 }),
+        "the emitted drivers did not call the SDKs installed under the project"
+    );
+    assert_eq!(
+        renamed["records"],
+        json!([
+            {
+                "node": "implement",
+                "harness": "cc",
+                "outcome": "completed",
+                "sdk": format!("{cc}@9.9.9-forked"),
+            },
+            {
+                "node": "review",
+                "harness": "codex",
+                "outcome": "completed",
+                "sdk": pinned(Harness::Codex),
+            },
+        ]),
+        "a package root whose manifest does not carry the SDK's own name was misread          (docs/trace.md §7.6). The `cc` record must name the version of the fork an npm alias          installed, `9.9.9-forked` — reporting the pin ({}) there means the lookup walked past          the package root looking for the SDK's name, and hid the drift. The `codex` record must          be the pin — `@openai/codex-sdk@0.0.0` means the walk left the package's `node_modules/`          directory and read the enclosing project's own manifest",
+        pinned(Harness::Cc),
     );
 
     // --- pinned: the conformant install reads as exactly the pins ------------

@@ -26,9 +26,21 @@
 //     stand-in's version;
 //   * `unreadable` — the same stand-ins with no `version` in their manifests.
 //     The drivers cannot read what ran, and the records fall back to the pin
-//     rather than failing the run or naming nothing.
+//     rather than failing the run or naming nothing;
+//   * `renamed` — stand-ins whose root manifests do not carry the name the
+//     project imports them by. The `cc` one names a fork, at a version no
+//     release pins, which is the manifest `npm i <sdk>@npm:<fork>@<version>`
+//     installs: the fork ran, so its record names the fork's version under the
+//     SDK's own name. The `codex` one names nothing and carries no version, so
+//     the only version walking up from it is the project's own `package.json`:
+//     its record falls back to the pin rather than borrowing that.
 //
-// Usage: bun harness-record-sdk.mjs <generated project directory> <scratch dir> <pinned|installed|unreadable>
+// Every stand-in keeps its entry point in `dist/`, below a nested
+// `dist/package.json` carrying only a `type`, so a lookup that took the first
+// manifest it met rather than the package root's would read no version in any
+// mode.
+//
+// Usage: bun harness-record-sdk.mjs <generated project directory> <scratch dir> <pinned|installed|unreadable|renamed>
 // Output: one JSON object, read by `generated_code_gates.rs`.
 
 import fs from "node:fs";
@@ -37,32 +49,60 @@ import process from "node:process";
 import { pathToFileURL } from "node:url";
 
 const [, , project, scratch, mode] = process.argv;
-if (project === undefined || scratch === undefined || !["pinned", "installed", "unreadable"].includes(mode)) {
+const MODES = ["pinned", "installed", "unreadable", "renamed"];
+if (project === undefined || scratch === undefined || !MODES.includes(mode)) {
   throw new Error(
-    "usage: bun harness-record-sdk.mjs <generated project directory> <scratch dir> <pinned|installed|unreadable>",
+    `usage: bun harness-record-sdk.mjs <generated project directory> <scratch dir> <${MODES.join("|")}>`,
   );
 }
+
+/** The two packages the emitted drivers import. */
+const CC_SDK = "@anthropic-ai/claude-agent-sdk";
+const CODEX_SDK = "@openai/codex-sdk";
 
 /** The version the stand-ins are installed at — one no compiler release pins. */
 const INSTALLED = "9.9.9-edited";
 
+/** The version the `renamed` fork of the Agent SDK is installed at. */
+const FORKED = "9.9.9-forked";
+
+/** The name the `renamed` fork's own manifest carries. */
+const FORK = "@someone/claude-agent-sdk-fork";
+
 /**
  * Install one stand-in package into the project's own `node_modules/`, where
  * resolution from `src/` finds it ahead of the shared install above.
+ * `identity` is the `name` and `version` its root manifest carries, either of
+ * them absent where the mode says so. The entry point sits in `dist/`, below a
+ * nested manifest carrying only a `type`.
  */
-function standIn(name, source) {
+function standIn(name, source, identity) {
   const directory = path.join(project, "node_modules", ...name.split("/"));
-  fs.mkdirSync(directory, { recursive: true });
+  fs.mkdirSync(path.join(directory, "dist"), { recursive: true });
   const manifest = {
-    name,
-    ...(mode === "installed" ? { version: INSTALLED } : {}),
+    ...identity,
     type: "module",
-    main: "./index.mjs",
-    exports: { ".": "./index.mjs" },
+    main: "./dist/index.mjs",
+    exports: { ".": "./dist/index.mjs" },
   };
   fs.writeFileSync(path.join(directory, "package.json"), JSON.stringify(manifest, null, 2));
-  fs.writeFileSync(path.join(directory, "index.mjs"), source);
-  return pathToFileURL(path.join(directory, "index.mjs")).href;
+  fs.writeFileSync(path.join(directory, "dist", "package.json"), JSON.stringify({ type: "module" }, null, 2));
+  fs.writeFileSync(path.join(directory, "dist", "index.mjs"), source);
+  return pathToFileURL(path.join(directory, "dist", "index.mjs")).href;
+}
+
+/** What each stand-in's root manifest carries, per mode. */
+function identityOf(name) {
+  switch (mode) {
+    case "installed":
+      return { name, version: INSTALLED };
+    case "unreadable":
+      return { name };
+    case "renamed":
+      return name === CC_SDK ? { name: FORK, version: FORKED } : {};
+    default:
+      throw new Error(`no stand-ins under \`${mode}\``);
+  }
 }
 
 // The Agent SDK's `query`, answering with the two messages the `cc` driver
@@ -144,8 +184,8 @@ if (mode === "pinned") {
   }
   fs.writeFileSync(file, rewritten);
 } else {
-  ccModule = standIn("@anthropic-ai/claude-agent-sdk", CC_STAND_IN);
-  codexModule = standIn("@openai/codex-sdk", CODEX_STAND_IN);
+  ccModule = standIn(CC_SDK, CC_STAND_IN, identityOf(CC_SDK));
+  codexModule = standIn(CODEX_SDK, CODEX_STAND_IN, identityOf(CODEX_SDK));
 }
 
 fs.mkdirSync(scratch, { recursive: true });

@@ -147,9 +147,17 @@ function passthrough(
  * the package instance this process really loaded — the nearest `node_modules/`
  * walking up, conditions and all — rather than to some other copy on the
  * machine. The manifest is then found by walking up from that entry point to the
- * first `package.json` that **names the package**, because neither SDK's
- * `exports` map publishes `./package.json` and an entry point may sit below a
- * nested manifest of its own (`dist/package.json` carrying only a `type`).
+ * first `package.json` that **carries a name**, which is the package's root
+ * whatever the name is. Not the first manifest of any kind, because neither
+ * SDK's `exports` map publishes `./package.json` and an entry point may sit below
+ * a nested manifest of its own (`dist/package.json` carrying only a `type`). And
+ * not the first that carries *this* name, because a package installed under an
+ * npm alias (`npm:<fork>@<version>`) sits where `sdk` resolves while its own
+ * manifest names the fork — and the fork's version is the one that ran, which is
+ * the drift this function exists to report rather than to walk past. The walk
+ * stops at the `node_modules/` directory the package is installed in, so a
+ * package root whose manifest names nothing reads as a missing manifest rather
+ * than as the version of whichever project encloses the install.
  *
  * **Never a failure.** A manifest that is missing, unreadable, unparsable or
  * carries no version string falls back to the pin, silently: the record has no
@@ -161,14 +169,14 @@ function passthrough(
 function installedVersion(sdk: string, pinned: string): string {
   try {
     let directory = path.dirname(fileURLToPath(import.meta.resolve(sdk)));
-    for (;;) {
+    while (path.basename(directory) !== "node_modules") {
       const manifest = path.join(directory, "package.json");
       if (fs.existsSync(manifest)) {
         const held = JSON.parse(fs.readFileSync(manifest, "utf8")) as {
           name?: unknown;
           version?: unknown;
         };
-        if (held.name === sdk) {
+        if (typeof held.name === "string" && held.name !== "") {
           return typeof held.version === "string" && held.version !== "" ? held.version : pinned;
         }
       }
@@ -176,6 +184,7 @@ function installedVersion(sdk: string, pinned: string): string {
       if (parent === directory) return pinned;
       directory = parent;
     }
+    return pinned;
   } catch {
     return pinned;
   }
