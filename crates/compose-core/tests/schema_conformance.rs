@@ -1006,13 +1006,13 @@ fn the_published_schema_accepts_the_whole_package_registry_surface() {
 /// refuses none of them** (grammar 14.8, PRD resolved q66).
 ///
 /// The schema carries the shape — the two harnesses this release lowers as the
-/// only keys, one closed block each, an exact version in it — and leaves the
-/// audited range to `validate`, because the range is a fact about a compiler
-/// *release* and one published schema serves every release. That split only
-/// holds while both directions do: every legal entry below must be accepted by
-/// the schema **and** validate clean against a composition that binds both
-/// harnesses, and every shape the schema refuses must be refused by `validate`
-/// too (grammar Appendix B: a file that fails the schema always fails
+/// only keys, one closed block each, an exact version with no build metadata in
+/// it — and leaves the audited range to `validate`, because the range is a fact
+/// about a compiler *release* and one published schema serves every release.
+/// That split only holds while both directions do: every legal entry below must
+/// be accepted by the schema **and** validate clean against a composition that
+/// binds both harnesses, and every shape the schema refuses must be refused by
+/// `validate` too (grammar Appendix B: a file that fails the schema always fails
 /// `validate`).
 ///
 /// The key set is read off `Harness::ALL` rather than written out, for the
@@ -1024,13 +1024,14 @@ fn the_published_schema_accepts_the_whole_package_registry_surface() {
 /// corpus is replayed through the parser alone
 /// (`parse_invalid.rs`'s `the_parser_rejects_everything_the_published_schema_rejects`),
 /// and every judgement of a `harnesses:` entry's *content* — a name that is not
-/// a harness, a reserved one, a range spelling, a `${…}` — is the validator's
-/// (`check::harnesses`, grammar 14.8), so the parser accepts those files by
-/// design. Appendix B's invariant is about `validate`, which is parse, resolve
-/// and check together, so this test states it at that strength: each shape the
-/// schema refuses is run through all three against a composition that binds
-/// both harnesses, and must come back refused. The one shape the parser does
-/// own — a second key in an entry's block — is in `invalid-schema/` as well.
+/// a harness, a reserved one, a range spelling, build metadata, a `${…}` — is
+/// the validator's (`check::harnesses`, grammar 14.8), so the parser accepts
+/// those files by design. Appendix B's invariant is about `validate`, which is
+/// parse, resolve and check together, so this test states it at that strength:
+/// each shape the schema refuses is run through all three against a composition
+/// that binds both harnesses, and must come back refused. The one shape the
+/// parser does own — a second key in an entry's block — is in `invalid-schema/`
+/// as well.
 #[test]
 fn the_published_schema_takes_every_harness_sdk_the_grammar_spells() {
     use compose_core::ast::flow::Harness;
@@ -1134,11 +1135,9 @@ flow.fix:
             "cc": { "sdk_version": "0.3.285" },
             "codex": { "sdk_version": floor(Harness::Codex) },
         }),
-        // A prerelease inside the audited minor, and build metadata on the floor:
-        // both exact, both inside — a pattern written one character too tight
-        // takes them down.
+        // A prerelease inside the audited minor: exact and inside — a pattern
+        // written one character too tight takes it down.
         json!({ "cc": { "sdk_version": "0.3.290-beta.1" } }),
-        json!({ "cc": { "sdk_version": "0.3.284+local.1" } }),
     ];
     for (index, entries) in legal.iter().enumerate() {
         let instance = json!({ "version": "0.1", "harnesses": entries });
@@ -1168,6 +1167,11 @@ flow.fix:
         json!({ "cc": { "sdk_version": "0.3.x" } }),
         json!({ "cc": { "sdk_version": "latest" } }),
         json!({ "cc": { "sdk_version": "${CC_SDK_VERSION}" } }),
+        // Build metadata is exact semver and names no release an install can
+        // hold — npm installs `0.3.284` for it — so both refuse it, on the floor
+        // and on a prerelease alike.
+        json!({ "cc": { "sdk_version": "0.3.284+local.1" } }),
+        json!({ "cc": { "sdk_version": "0.3.290-beta.1+local" } }),
         json!({ "cc": { "sdk_version": "0.3.285", "peers": "pinned" } }),
         json!({ "cc": {} }),
         json!({ "cc": "0.3.285" }),

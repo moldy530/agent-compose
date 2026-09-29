@@ -5926,7 +5926,7 @@ not about the graph, so the composition says nothing (PRD resolved q66).
 | Key | Type | Required | Notes |
 |---|---|---|---|
 | `<harness>` | `cc` \| `codex` | — | the harness, spelled as a `coder:` node's `harness:` spells it (§8.9, [D136](#d136-kind-coder-is-a-node-kind-and-harness-is-a-binding)); `deepagents` and `native` are refused |
-| `<harness>.sdk_version` | exact version literal | yes | `MAJOR.MINOR.PATCH`, optionally `-prerelease` and `+build`, inside the harness's audited range; never `${ENV}` |
+| `<harness>.sdk_version` | exact version literal | yes | `MAJOR.MINOR.PATCH`, optionally `-prerelease`, inside the harness's audited range; never `+build` metadata, never `${ENV}` |
 
 ```yaml
 harnesses:
@@ -5965,16 +5965,21 @@ The rules (Decision
    compiler's to declare, not the deployment's. Exact is §6.1's rule for a
    `module:` dependency
    ([D133](#d133-a-module-binding-declares-its-environment-and-pins-its-dependencies-exactly)),
-   read the same way.
+   read the same way, with one refusal more: **build metadata** —
+   `0.3.284+local.1` — is exact semver and still `invalid-value` here, because
+   it names no release an install can hold. npm reads past it when it resolves
+   a version and a registry publishes no release under it, so `0.3.284+local.1`
+   installs `0.3.284`; accepted, it would put into `package.json`, the README's
+   pins table and the driver's fallback constant a version the `HarnessRecord`
+   of every run contradicts.
 3. **The version is inside the harness's audited range.** A version above it
    **or below it** is `harness-sdk-outside-audited-range`, naming the harness,
    the version asked for, the range, the audited version it is anchored on, and
    the fact that the reserved-list audit is the boundary. Placement is semver
    precedence, and the range is one minor's releases: `0.3.99` is below
    `0.3.284` whatever its text sorts as, a prerelease of the floor precedes the
-   floor, build metadata carries no precedence, and `0.4.0-rc.1` — which
-   precedes `0.4.0` — is still above `[0.3.284, 0.4.0)`, because it is a release
-   of the minor nobody audited.
+   floor, and `0.4.0-rc.1` — which precedes `0.4.0` — is still above
+   `[0.3.284, 0.4.0)`, because it is a release of the minor nobody audited.
 
    **What the range promises is precise and small: no *known* reach-around.**
    Every option the audited release accepts was classified at the floor, under
@@ -10568,8 +10573,8 @@ exact version literal. Each compiler release declares, per harness SDK, an
 **audited range** — `[audited, next minor)`, the version the reserved-list audit
 was performed at, forward through that minor — and `validate` accepts a version
 inside it and refuses one outside it, above or below, by name
-(`harness-sdk-outside-audited-range`). A `${ENV}` reference, a range spelling
-and a reserved or unknown harness name are refused too; an entry for a harness
+(`harness-sdk-outside-audited-range`). A `${ENV}` reference, a range spelling,
+build metadata and a reserved or unknown harness name are refused too; an entry for a harness
 no `coder:` node binds is a warning (`unbound-harness-sdk`). `build` writes the
 accepted version into `package.json` in the pin's place, for that harness's SDK
 alone, and the emitted README's pins table shows it beside the pin. The block is
@@ -10630,7 +10635,13 @@ published. A `${ENV}` reference is refused for the reason every class-3 surface
 refuses one (§4.3,
 [D92](#d92-the-env-ref-classification-is-total-over-string-surfaces)): a version
 is a build fact, not a secret, and `validate` has to read it to hold it to the
-range.
+range. Build metadata is refused although semver calls it exact, because the
+version written here is the one every emitted surface names — `package.json`,
+the README's pins table, the driver's fallback constant — and npm installs
+`0.3.284` for `0.3.284+local.1`, so accepting it would have those surfaces name
+a release no install holds while the trace (`HarnessRecord.sdk`) names the one
+that ran. Precedence alone would place it on the floor, which is why the refusal
+is written out rather than left to the range.
 
 *Why the refusals are the validator's rather than the parser's.* Five of the six
 are decidable from the deploy file alone; the sixth — whether any `coder:` node

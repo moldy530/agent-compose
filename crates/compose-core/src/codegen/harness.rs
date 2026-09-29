@@ -222,16 +222,20 @@ pub enum RangePlacement {
 }
 
 /// Where `version` sits against `harness`'s audited range, or `None` where it
-/// is not an exact version or the harness has no range.
+/// is not an exact version, carries build metadata, or the harness has no range.
 ///
 /// Semver precedence (semver.org §11), with one reading made explicit: the range
 /// is "the audited version, forward through that minor", so a version is inside
 /// it only if it **is** that minor — `0.4.0-rc.1` precedes `0.4.0` and is still
 /// above `[0.3.284, 0.4.0)`, because it is a release of the minor nobody
-/// audited. Build metadata carries no precedence, so `0.3.284+local` is the
-/// floor.
+/// audited. A version carrying build metadata is placed nowhere
+/// ([`build_metadata_of`]): it names no release an install can hold, so there is
+/// nothing of it to place.
 #[must_use]
 pub fn placement_of(harness: Harness, version: &str) -> Option<RangePlacement> {
+    if build_metadata_of(version).is_some() {
+        return None;
+    }
     let floor = SdkVersion::parse(audited_of(harness)?)?;
     let asked = SdkVersion::parse(version)?;
     let line = |held: &SdkVersion| {
@@ -256,12 +260,32 @@ pub fn placement_of(harness: Harness, version: &str) -> Option<RangePlacement> {
     })
 }
 
+/// The build metadata an otherwise exact `version` carries — `local.1` of
+/// `0.3.284+local.1` — or `None` where it carries none or is not exact.
+///
+/// Build metadata is a semver spelling, and one no installer honours: npm reads
+/// past it when it resolves a version and a registry publishes no release under
+/// it, so `0.3.284+local.1` installs `0.3.284`. A `harnesses:` entry carrying
+/// some would have `package.json`, the README's pins table and the driver's
+/// fallback constant name a version no install holds, while the `HarnessRecord`
+/// a run writes names the one installed — so `validate` refuses it by name
+/// (grammar 14.8) and [`placement_of`] places it nowhere, which keeps
+/// [`override_of`] from ever reading one.
+#[must_use]
+pub fn build_metadata_of(version: &str) -> Option<&str> {
+    if !crate::parse::binding::is_exact_version(version) {
+        return None;
+    }
+    version.split_once('+').map(|(_, build)| build)
+}
+
 /// An exact semantic version, split for comparison (semver.org §2, §9, §10).
 ///
 /// Only what [`placement_of`] needs: the three numbers kept as their digit runs
 /// — compared by length first, which is numeric order for runs with no leading
 /// zero and never overflows — and the prerelease identifiers. Build metadata is
-/// read past, because it carries no precedence.
+/// read past, because it carries no precedence; [`placement_of`] refuses a
+/// version carrying any before it is parsed here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SdkVersion {
     major: String,
@@ -1668,7 +1692,9 @@ mod tests {
     /// `0.3.99` sorts after `0.3.284` as text and is older; `0.30.0` shares the
     /// floor's prefix and is a different minor; `0.4.0-rc.1` precedes `0.4.0` and
     /// is still the next minor, which nobody audited; a prerelease of the floor
-    /// precedes the floor; build metadata carries no precedence at all.
+    /// precedes the floor. Build metadata is placed nowhere, even on the floor:
+    /// it names no release an install can hold (grammar 14.8), and a comparison
+    /// that read past it would call `0.3.284+local.build` the floor.
     #[test]
     fn a_version_is_placed_by_semver_precedence_within_the_audited_minor() {
         use RangePlacement::{Above, Below, Inside};
@@ -1676,7 +1702,6 @@ mod tests {
             ("0.3.284", Some(Inside)),
             ("0.3.285", Some(Inside)),
             ("0.3.1000", Some(Inside)),
-            ("0.3.284+local.build", Some(Inside)),
             ("0.3.290-beta.1", Some(Inside)),
             ("0.3.284-rc.1", Some(Below)),
             ("0.3.283", Some(Below)),
@@ -1694,6 +1719,10 @@ mod tests {
             ("latest", None),
             ("0.3.284 ", None),
             ("00.3.284", None),
+            ("0.3.284+local.build", None),
+            ("0.3.285+20260929", None),
+            ("0.3.290-beta.1+local", None),
+            ("0.4.0+local", None),
         ] {
             assert_eq!(
                 placement_of(Harness::Cc, version),
@@ -1822,7 +1851,17 @@ mod tests {
             &coder_composition(Harness::Cc),
             "version: \"0.1\"\nharnesses:\n  cc:\n    sdk_version: \"0.3.285\"\n",
         );
-        for refused in ["0.4.0", "0.3.283", "^0.3.285", "${CC_SDK}", "latest"] {
+        for refused in [
+            "0.4.0",
+            "0.3.283",
+            "^0.3.285",
+            "${CC_SDK}",
+            "latest",
+            // Build metadata names no release an install can hold: npm installs
+            // `0.3.285` for it, so reading it would put a version into
+            // `package.json` that the `HarnessRecord` of the run never names.
+            "0.3.285+local.1",
+        ] {
             ir.deploy
                 .harnesses
                 .as_mut()

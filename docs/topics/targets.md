@@ -408,7 +408,9 @@ Five things worth knowing:
   compiler release, never a deploy key.
 - **The version is exact and literal.** `^0.3.284` or `0.3.x` would hand the
   choice back to the installer, and `${CC_SDK_VERSION}` is a version `validate`
-  cannot read — both are refused. The range is the compiler's to declare.
+  cannot read — both are refused. The range is the compiler's to declare. Build
+  metadata is refused as well: npm installs `0.3.284` for `0.3.284+local.1`, so
+  the manifest would name a release no install holds — write the release itself.
 - **A key is a harness this release lowers.** `claude` is not a harness name and
   is answered with the two that are; `deepagents` and `native` are reserved and
   refused, exactly as on a node — they have no driver, so there is no SDK to pin.

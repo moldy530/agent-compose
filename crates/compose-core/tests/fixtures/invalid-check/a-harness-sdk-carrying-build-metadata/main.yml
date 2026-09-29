@@ -1,0 +1,35 @@
+# rule: a `harnesses:` entry states a release an install can hold, so build metadata is refused though it is exact semver (grammar 14.8, PRD resolved q66)
+# code: invalid-value
+# message: `harnesses.cc.sdk_version` is `0.3.284+local.1`, which carries build metadata `+local.1`
+# at: deploy/local.yml:5:18
+# help: npm reads past build metadata when it resolves a version, and a registry publishes no release under it, so `0.3.284+local.1` installs `0.3.284` — `package.json` and the README's pins table would name a version no install holds, and the `HarnessRecord` a run writes would name another: write the release itself, `0.3.284`, inside the audited range `[0.3.284, 0.4.0)` (grammar 14.8, PRD resolved q66)
+#
+# `0.3.284+local.1` is exact by semver's grammar and sits on the floor by its
+# precedence, so a check that read the range alone would accept it — and `build`
+# would then write it into `package.json`, the README's pins table and the
+# driver's fallback constant, while the install and the trace hold `0.3.284`.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: coding-model
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: "'${REPO_ROOT}'"
+        prompt: Do the work.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

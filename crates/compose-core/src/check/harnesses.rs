@@ -24,7 +24,10 @@
 //!    a version is a build fact, not a secret, and `validate` has to be able to
 //!    read it to hold it to the range;
 //! 4. **an exact one** — a range, a tag or a specifier is `invalid-value`: the
-//!    range is the compiler's to declare, not the deployment's (PRD 5.12);
+//!    range is the compiler's to declare, not the deployment's (PRD 5.12); and
+//!    so is build metadata, which is exact semver and names no release an
+//!    install can hold — `0.3.284+local.1` installs `0.3.284`, so the manifest
+//!    and the README would name a version the trace never does;
 //! 5. **inside the audited range** — `harness-sdk-outside-audited-range`, above
 //!    it or below it;
 //! 6. **and bound by some `coder:` node** — otherwise a *warning*,
@@ -39,7 +42,7 @@
 
 use crate::ast::flow::Harness;
 use crate::codegen::harness::{
-    RangePlacement, audited_range, bound, package_of, placement_of, version_of,
+    RangePlacement, audited_range, bound, build_metadata_of, package_of, placement_of, version_of,
 };
 use crate::diag::{Diagnostic, DiagnosticCode};
 use crate::ir::deploy::HarnessSdk;
@@ -172,6 +175,33 @@ fn version_is_audited(ctx: &mut Ctx, entry: &HarnessSdk, harness: Harness) -> bo
                 "a version is a build fact, not a secret: `build` writes it into `package.json` \
                  and `validate` holds it to the audited range `{range}`, so it is the literal \
                  version itself — write it out (grammar 14.8, §4.3)"
+            )),
+        );
+        return false;
+    }
+
+    if let Some(build) = build_metadata_of(&version.value) {
+        let release = version
+            .value
+            .strip_suffix(&format!("+{build}"))
+            .unwrap_or(&version.value);
+        ctx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidValue,
+                version.span.clone(),
+                format!(
+                    "`harnesses.{name}.sdk_version` is `{}`, which carries build metadata \
+                     `+{build}`",
+                    version.value
+                ),
+            )
+            .with_help(format!(
+                "npm reads past build metadata when it resolves a version, and a registry \
+                 publishes no release under it, so `{}` installs `{release}` — `package.json` and \
+                 the README's pins table would name a version no install holds, and the \
+                 `HarnessRecord` a run writes would name another: write the release itself, \
+                 `{release}`, inside the audited range `{range}` (grammar 14.8, PRD resolved q66)",
+                version.value
             )),
         );
         return false;

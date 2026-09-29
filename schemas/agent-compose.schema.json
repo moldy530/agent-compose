@@ -2957,8 +2957,9 @@
       "type": "object",
       "properties": {
         "sdk_version": {
-          "description": "The exact version build writes into package.json in the compiler pin's place. A literal: a version is a build fact rather than a secret, so no ${ENV} reference; and exact, because the range is the compiler's to declare rather than the deployment's - no ^, ~, >, <, * or x, no dist-tag, and no git/file/npm/workspace specifier.",
-          "$ref": "#/$defs/exactVersion"
+          "description": "The exact version build writes into package.json in the compiler pin's place: MAJOR.MINOR.PATCH with an optional -prerelease. A literal: a version is a build fact rather than a secret, so no ${ENV} reference; and exact, because the range is the compiler's to declare rather than the deployment's - no ^, ~, >, <, * or x, no dist-tag, and no git/file/npm/workspace specifier. No +build metadata either: npm reads past it and a registry publishes no release under it, so 0.3.284+local.1 installs 0.3.284 and the manifest would name a version no install holds.",
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$"
         }
       },
       "required": ["sdk_version"],
