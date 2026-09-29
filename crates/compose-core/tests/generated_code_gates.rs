@@ -7114,12 +7114,14 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
         "extraArgs",
         "settings",
         "mcpServers",
+        "projectConfigRoot",
     ] {
         assert_eq!(
             bound[key],
             json!(null),
             "`settings: {{ {key}: … }}` reached the SDK — a root, a CLI flag, a \
-             permission file or a tool server outside everything this node states"
+             permission file, a tool server or another checkout's configuration \
+             outside everything this node states"
         );
     }
     assert_eq!(

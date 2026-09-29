@@ -421,7 +421,19 @@ pub struct ConnectionRow {
 pub const CONNECTION: &[ConnectionRow] = &[
     ConnectionRow {
         harness: Harness::Cc,
-        audited: "0.3.272",
+        // Read again at 0.3.284, in the SDK's `sdk.mjs` and in the CLI binary
+        // its platform package ships: every name below is still read there, and
+        // none of the connection-shaped names the release adds decides one of
+        // the three facts. `CLAUDE_CODE_GATEWAY_HINT_HEADERS` is a switch for
+        // the CLI's *own* request-grouping headers — it names no header and
+        // carries no value; `CLAUDE_CODE_HOST_GATEWAY_LINEAGE` is a condition
+        // inside the host-managed gateway path, which nothing turns on but
+        // `CLAUDE_CODE_USE_GATEWAY`, claimed below; and
+        // `CLAUDE_GATEWAY_DRAIN_TIMEOUT_MS` and
+        // `CLAUDE_GATEWAY_PROXY_IS_EGRESS_BOUNDARY` configure the CLI's
+        // `gateway` *server*, which is a process a run talks to rather than
+        // the run.
+        audited: "0.3.284",
         kinds: &[ProviderKind::Anthropic],
         slots: &[
             (
@@ -754,7 +766,9 @@ pub struct PermissionRow {
 ///
 /// # Where the modes were read
 ///
-/// `@anthropic-ai/claude-agent-sdk@0.3.272`, `sdk.d.ts`:
+/// `@anthropic-ai/claude-agent-sdk@0.3.284`, `sdk.d.ts` — the declaration and
+/// the doc comment over it unchanged from 0.3.272, where the table was first
+/// read:
 ///
 /// ```text
 /// export declare type PermissionMode = 'default' | 'acceptEdits'
@@ -806,7 +820,7 @@ pub struct PermissionRow {
 /// already is it, and refused everywhere else.
 pub const PERMISSION: &[PermissionRow] = &[PermissionRow {
     harness: Harness::Cc,
-    audited: "0.3.272",
+    audited: "0.3.284",
     levels: &[
         PermissionLevel {
             access: WorkspaceAccess::ReadOnly,
@@ -1083,7 +1097,7 @@ pub struct ReservedRow {
 pub const RESERVED: &[ReservedRow] = &[
     ReservedRow {
         harness: Harness::Cc,
-        audited: "0.3.272",
+        audited: "0.3.284",
         options: CC_RESERVED,
     },
     ReservedRow {
@@ -1211,6 +1225,16 @@ const CC_RESERVED: &[ReservedOption] = &[
     },
     ReservedOption {
         option: "plugins",
+        answered: Answered::By("allow_tools"),
+    },
+    ReservedOption {
+        // New at 0.3.284: the directory the CLI reads the project tier's hooks
+        // and permission rules, `.mcp.json`'s servers and the `.claude` trees'
+        // agents and skills out of, *instead of* the working directory. It is
+        // `settingSources` pointed at a tree `workspace:` never named, so it
+        // answers where that family does — the tools and loops a run may reach
+        // are what `allow_tools:` states, not what another checkout configures.
+        option: "projectConfigRoot",
         answered: Answered::By("allow_tools"),
     },
     ReservedOption {

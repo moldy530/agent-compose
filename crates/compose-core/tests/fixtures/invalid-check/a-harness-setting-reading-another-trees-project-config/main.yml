@@ -1,0 +1,50 @@
+# rule: a `coder:` node's `settings:` key naming the tree a `cc` run reads its
+# rule: project configuration out of is refused (grammar 8.9, D146)
+# code: reserved-harness-setting
+# message: `projectConfigRoot` of `flow.main` node `implement` is a `harness: cc` option the generated adapter owns: it is what `allow_tools:` states
+# at: main.yml:46:11
+# label: main.yml:38:18 the harness is bound here
+# help: write `allow_tools:` on the node instead. A bound has to be readable off the construct that holds it, which is why `allow_tools:` is a key and not a setting, and two spellings of one option would leave a reader and `validate` disagreeing about which wins. `settings:` is open so that a harness option the vendor ships tomorrow is usable the day it ships — it is not a second way to state this construct's own bounds, and a key here that reached one would be the only one no check covers. Refused rather than dropped, because a key silently removed leaves a run doing something no line of the composition says (grammar 8.9, Decision D146, PRD resolved q60 ruling b)
+#
+# The option the Agent SDK's 0.3.284 release added that reaches around a bound,
+# and the reason the pin bump re-opened the audit rather than carrying the list
+# forward. `projectConfigRoot` is the CLI's `--project-config-root`: the project
+# tier's hooks and permission rules, `.mcp.json`'s servers and the `.claude`
+# trees' agents and skills are read out of the directory it names *instead of*
+# the working directory. That is the settings family — `settings`,
+# `settingSources` — pointed at a tree `workspace:` never named, so it answers
+# where that family does: the tools and loops a run may reach are what
+# `allow_tools:` states on the node, not what another checkout's configuration
+# turns on.
+#
+# Its sibling in the same release, `verbatimPrompts`, is *not* refused: it only
+# turns the CLI's `@path` expansion and slash-command dispatch off for the prompt
+# a run is handed, which narrows a run rather than widening one.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.implementer:
+  provider: provider.p
+  id: claude-sonnet-4-5
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: "'${REPO_ROOT}'"
+        access: workspace_write
+        prompt: Make the smallest change that passes the tests.
+        output:
+          summary: { type: string }
+        settings:
+          projectConfigRoot: /srv/trusted-checkout
+      input: "'go'"
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }

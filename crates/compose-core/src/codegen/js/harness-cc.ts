@@ -48,8 +48,12 @@ const CC_SETTINGS: readonly string[] = [
  *    assigns and a list keyed off the driver could therefore never hold.
  *    `extraArgs` is an arbitrary CLI flag — `dangerously-skip-permissions` and
  *    `add-dir` among them — so it is every bound at once. `settings`,
- *    `managedSettings` and `settingSources` carry permission rules;
- *    `additionalDirectories` carries roots beside `workspace:`; `sandbox`
+ *    `managedSettings` and `settingSources` carry permission rules, and
+ *    `projectConfigRoot` carries all of that family at once from a tree
+ *    `workspace:` never named: it is the `--project-config-root` the pinned CLI
+ *    reads the project tier's hooks and permission rules, `.mcp.json`'s servers
+ *    and the `.claude` trees' agents and skills out of *instead of* the working
+ *    directory; `additionalDirectories` carries roots beside `workspace:`; `sandbox`
  *    carries containment; `mcpServers`, `agents`, `agent`, `skills` and
  *    `toolAliases` each put a tool or a whole loop outside `allow_tools:`
  *    within reach — `agent` also carrying its own model and prompt, and
@@ -76,7 +80,11 @@ const CC_SETTINGS: readonly string[] = [
  * The list is audited against the option surface of the pinned SDK, which is
  * what `a_reserved_list_is_audited_against_the_pinned_option_surface`
  * (`codegen/harness.rs`) holds it to: a version bump is where a new
- * reach-around arrives, so the pin is what re-opens the audit.
+ * reach-around arrives, so the pin is what re-opens the audit. The last one
+ * (0.3.272 to 0.3.284) arrived with two options and took one of them:
+ * `projectConfigRoot`, above, and not `verbatimPrompts`, which only turns the
+ * CLI's `@path` expansion and slash-command dispatch *off* for the prompt a run
+ * is handed — a narrowing no bound needs to own, left to D140's open tier.
  */
 const CC_RESERVED: readonly string[] = [
   // Options that spell a bound another key states.
@@ -111,6 +119,7 @@ const CC_RESERVED: readonly string[] = [
   "permissionPromptToolName",
   "permissionPrompts",
   "plugins",
+  "projectConfigRoot",
   "resume",
   "resumeDropsTurn",
   "resumeSessionAt",

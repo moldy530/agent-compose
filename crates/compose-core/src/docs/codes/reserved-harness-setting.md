@@ -23,7 +23,10 @@ An option does not have to *spell* a bound to reach around it, and the reserved
 set is the wider one. `extraArgs` is any command-line flag there is —
 `dangerously-skip-permissions` and `add-dir` among them. `mcpServers`, `agents`,
 `skills` and `plugins` put a tool or a whole loop within reach of a run whose
-`allow_tools:` never mentioned it. `additionalDirectories` is sandbox roots
+`allow_tools:` never mentioned it. `settings`, `settingSources` and
+`projectConfigRoot` load permission rules, hooks, servers and agents out of
+configuration files — the last out of a directory other than `workspace:`
+altogether. `additionalDirectories` is sandbox roots
 beside `workspace:`. `pathToClaudeCodeExecutable`, `executable`,
 `executableArgs` and `spawnClaudeCodeProcess` choose which program the run *is*,
 so a key among them does not widen one bound — it replaces the program enforcing
@@ -106,7 +109,7 @@ bound, so it is written on the node.
 | a permission mode, or the flag one requires | `permission_mode:` |
 | a sandbox preset, or sandbox configuration | `access:` |
 | a working directory | `workspace:` |
-| a tool set, an allowlist, a permission callback, an MCP server, a subagent, a skill set | `allow_tools:` |
+| a tool set, an allowlist, a permission callback, an MCP server, a subagent, a skill set, or the configuration that loads any of them | `allow_tools:` |
 | the environment | `env:` |
 | the output format | `output:` |
 | the system prompt, or plan mode's body | `prompt:` |

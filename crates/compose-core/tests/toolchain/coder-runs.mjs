@@ -805,6 +805,10 @@ const results = {};
     extraArgs: { "dangerously-skip-permissions": null },
     settings: "/tmp/permissions.json",
     mcpServers: { smuggled: { command: "/tmp/server" } },
+    // The settings family read out of a tree `workspace:` never named: the
+    // pinned CLI's `--project-config-root`, which moves where the project
+    // tier's hooks, permission rules, MCP servers, agents and skills come from.
+    projectConfigRoot: "/tmp/another-checkout",
     // …and the family that chooses what program the run is at all.
     pathToClaudeCodeExecutable: "/tmp/not-the-harness",
     executable: "bun",
@@ -852,6 +856,7 @@ const results = {};
     extraArgs: options.extraArgs ?? null,
     settings: options.settings ?? null,
     mcpServers: options.mcpServers ?? null,
+    projectConfigRoot: options.projectConfigRoot ?? null,
     // The process-spawn family: absent, or the harness enforcing the three
     // bounds above is not the harness this compiler pinned.
     spawn: [

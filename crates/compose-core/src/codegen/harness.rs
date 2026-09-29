@@ -70,7 +70,7 @@ pub const HARNESS_PINS: &[(Harness, &[(&str, &str)])] = &[
     (
         Harness::Cc,
         &[
-            ("@anthropic-ai/claude-agent-sdk", "0.3.272"),
+            ("@anthropic-ai/claude-agent-sdk", "0.3.284"),
             // The Agent SDK's own peers: its `.d.ts` imports message types from
             // the first and MCP types from the second, so a project that
             // installed neither would fail `tsc` on an import it never wrote.
@@ -717,9 +717,15 @@ mod tests {
     /// list itself, sorted as [`quoted_list`] returns it.
     fn audited_surface(harness: Harness) -> (&'static str, &'static [&'static str]) {
         match harness {
-            // `@anthropic-ai/claude-agent-sdk`'s `Options`.
+            // `@anthropic-ai/claude-agent-sdk`'s `Options`. Read again at
+            // 0.3.284, whose `Options` adds two members to 0.3.272's and removes
+            // none — the same two the bundle's own option reader adds, so the
+            // typed surface and the one `query()` destructures moved together:
+            // `projectConfigRoot`, reserved (the settings family read from
+            // another tree), and `verbatimPrompts`, left open (it only turns the
+            // CLI's prompt expansion *off*).
             Harness::Cc => (
-                "0.3.272",
+                "0.3.284",
                 &[
                     "abortController",
                     "additionalDirectories",
@@ -748,6 +754,7 @@ mod tests {
                     "permissionPrompts",
                     "planModeInstructions",
                     "plugins",
+                    "projectConfigRoot",
                     "resume",
                     "resumeDropsTurn",
                     "resumeSessionAt",
@@ -994,8 +1001,11 @@ mod tests {
     ///    `canUseTool`, which also tapes a denial as `"refused"` — and **no**
     ///    `allowedTools` beside it: a bare entry there approves the whole tool
     ///    before the callback is consulted, so the pinned SDK
-    ///    (`@anthropic-ai/claude-agent-sdk` 0.3.272) reports the pairing from
-    ///    `query()` as a shadowed callback, `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED`;
+    ///    (`@anthropic-ai/claude-agent-sdk` 0.3.284, whose `sdk.mjs` carries
+    ///    0.3.272's check unchanged: the same two messages, raised from `query()`
+    ///    on `canUseTool` set beside `bypassPermissions` or beside a bare
+    ///    `allowedTools` entry) reports the pairing as a shadowed callback,
+    ///    `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED`;
     ///  * `dontAsk`, which the SDK documents as "deny if not pre-approved" and
     ///    whose CLI denies a would-ask call **without** consulting
     ///    `canUseTool`, gets the list as `allowedTools` and no callback. A
