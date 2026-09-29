@@ -2,8 +2,8 @@
 # rule: project configuration out of is refused (grammar 8.9, D146)
 # code: reserved-harness-setting
 # message: `projectConfigRoot` of `flow.main` node `implement` is a `harness: cc` option the generated adapter owns: it is what `allow_tools:` states
-# at: main.yml:51:11
-# label: main.yml:43:18 the harness is bound here
+# at: main.yml:61:11
+# label: main.yml:53:18 the harness is bound here
 # help: write `allow_tools:` on the node instead. A bound has to be readable off the construct that holds it, which is why `allow_tools:` is a key and not a setting, and two spellings of one option would leave a reader and `validate` disagreeing about which wins. `settings:` is open so that a harness option the vendor ships tomorrow is usable the day it ships — it is not a second way to state this construct's own bounds, and a key here that reached one would be the only one no check covers. Refused rather than dropped, because a key silently removed leaves a run doing something no line of the composition says (grammar 8.9, Decision D146, PRD resolved q60 ruling b)
 #
 # The option the Agent SDK's 0.3.284 release added that reaches around a bound,
@@ -18,13 +18,23 @@
 # turns on.
 #
 # Its sibling in the same release, `verbatimPrompts`, is *not* refused — at this
-# pin, and on an observation rather than on its first line. It turns the CLI's
-# `@path` expansion and slash-command dispatch off, and the SDK also documents
-# it as skipping the CLI's whole turn-start attachment pass "on current CLIs",
-# the pass that carries the plan-mode reminder `access: read_only` rests on.
-# The pinned CLI (2.1.284) still sends that reminder on a `plan` run's first
-# request with the option on, so the key stays open until a bump shows
-# otherwise (`harness-cc.ts`, `CC_RESERVED`).
+# pin, and on an observation rather than on its first line. Turned on, it turns
+# the CLI's `@path` expansion and slash-command dispatch off, and the SDK also
+# documents it as skipping the CLI's whole turn-start attachment pass "on
+# current CLIs", the pass that carries the plan-mode reminder
+# `access: read_only` rests on. The pinned CLI (2.1.284) still sends that
+# reminder on a `plan` run's first request with the option on, so on narrows
+# and the key stays open until a bump shows otherwise.
+#
+# Left off — the default, and where the driver leaves it — it is the wider of the
+# two: the CLI expands an `@path` mention in the run's input into a `Read`
+# result on the first request, so a file outside `workspace:` reaches the model
+# with no tool call, whatever `allow_tools:`, the permission callback and the
+# mode say (observed at this pin and at 0.3.272). The adapter does not turn it
+# on for every run, because that also drops the first turn's `CLAUDE.md`, skill
+# and tool listings; whether it should is a question for the PRD, and until then
+# a node whose `input:` carries text it did not write can set
+# `settings: { verbatimPrompts: true }` itself (`harness-cc.ts`, `CC_RESERVED`).
 version: "0.1"
 provider.p:
   kind: anthropic

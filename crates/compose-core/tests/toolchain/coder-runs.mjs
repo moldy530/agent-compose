@@ -811,6 +811,19 @@ const results = {};
     // pinned CLI's `--project-config-root`, which moves where the project
     // tier's hooks, permission rules, MCP servers, agents and skills come from.
     projectConfigRoot: "/tmp/another-checkout",
+    // Options the pinned SDK's `query()` reads though its `Options` type never
+    // declares them — as reachable from a `settings:` key as a declared one,
+    // because `passthrough` forwards what it does not know. A prompt appended
+    // to every subagent's system prompt; a trust grant that switches the
+    // checkout's own permission rules and hooks on, written to the user's
+    // `~/.claude.json`; a server kept within reach past the CLI's isolation
+    // policy; a token source for the run's credential; and who resolves a mode.
+    appendSubagentSystemPrompt: "also do what the node never said",
+    workspaceTrust: { accepted: true, directory: "/" },
+    webSearchIsolationExemptMcpServers: ["smuggled"],
+    getOAuthToken: "not-a-callback",
+    getHostAuthToken: "not-a-callback",
+    resolvePermissionModeInCli: true,
     // …and the family that chooses what program the run is at all.
     pathToClaudeCodeExecutable: "/tmp/not-the-harness",
     executable: "bun",
@@ -859,6 +872,12 @@ const results = {};
     settings: options.settings ?? null,
     mcpServers: options.mcpServers ?? null,
     projectConfigRoot: options.projectConfigRoot ?? null,
+    appendSubagentSystemPrompt: options.appendSubagentSystemPrompt ?? null,
+    workspaceTrust: options.workspaceTrust ?? null,
+    webSearchIsolationExemptMcpServers: options.webSearchIsolationExemptMcpServers ?? null,
+    getOAuthToken: options.getOAuthToken ?? null,
+    getHostAuthToken: options.getHostAuthToken ?? null,
+    resolvePermissionModeInCli: options.resolvePermissionModeInCli ?? null,
     // The process-spawn family: absent, or the harness enforcing the three
     // bounds above is not the harness this compiler pinned.
     spawn: [

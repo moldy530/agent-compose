@@ -359,6 +359,12 @@ mod tests {
     /// against the version it was read against: a vendor's new option arrives
     /// with a version bump, so the bump is what fails this test and re-opens
     /// the audit rather than quietly widening the surface.
+    ///
+    /// **The surface is what the SDK reads, not only what it types.** The
+    /// Agent SDK's bundle reads option names its `Options` declaration never
+    /// mentions, and `passthrough` forwards those as readily as any other, so
+    /// an audit of the `.d.ts` alone is a floor of its own (see
+    /// [`audited_surface`]'s `cc` arm for the eight that audit missed).
     #[test]
     fn a_reserved_list_is_audited_against_the_pinned_option_surface() {
         for harness in Harness::ALL.iter().filter(|held| held.ships_in_v1()) {
@@ -369,7 +375,8 @@ mod tests {
                 version_of(*harness),
                 audited,
                 "`{name}`'s SDK is pinned at {} and `{reserved}` was audited against {audited}: \
-                 read the release's own options, add every one that reaches around \
+                 read the release's own options — the typed surface and every name its bundle \
+                 reads off the options object beside it — add every one that reaches around \
                  `workspace:`, `access:`, `env:`, `output:`, `prompt:`, `allow_tools:`, \
                  `timeout:` or `model:`, and move this version up (grammar 8.9)",
                 version_of(*harness)
@@ -763,22 +770,48 @@ mod tests {
     /// list itself, sorted as [`quoted_list`] returns it.
     fn audited_surface(harness: Harness) -> (&'static str, &'static [&'static str]) {
         match harness {
-            // `@anthropic-ai/claude-agent-sdk`'s `Options`. Read again at
-            // 0.3.284, whose `Options` adds two members to 0.3.272's and removes
-            // none — the same two the bundle's own option reader adds, so the
-            // typed surface and the one `query()` destructures moved together:
-            // `projectConfigRoot`, reserved (the settings family read from
-            // another tree), and `verbatimPrompts`, left open on an observation
-            // rather than on its first line. Besides turning `@path` expansion
-            // and slash-command dispatch off, the SDK documents it as skipping
-            // the CLI's whole turn-start attachment pass "on current CLIs" —
-            // which, under `read_only`'s `plan`, is where the plan-mode reminder
-            // holding the node read-only arrives. The pinned CLI (2.1.284)
-            // still sends that reminder, `planModeInstructions` and all, on a
-            // `plan` run's first request with the option on (observed: only the
-            // token-budget reminder went missing). **Re-verify that at the next
-            // bump, before moving this version**: a CLI that stops sending it
-            // puts `verbatimPrompts` on `CC_RESERVED` (`harness-cc.ts` says why).
+            // `@anthropic-ai/claude-agent-sdk`'s option surface, which is **two
+            // readings**: `Options` in `sdk.d.ts`, and the names the bundle's
+            // option reader in `sdk.mjs` — the function `query()` hands its
+            // options to — actually takes. The second is the wider one. It
+            // reads eight names no `Options` member declares, and `passthrough`
+            // forwards an unknown `settings:` key unchanged, so each reaches the
+            // SDK as a declared option would: `appendSubagentSystemPrompt`,
+            // `getHostAuthToken`, `getOAuthToken`, `resolvePermissionModeInCli`,
+            // `webSearchIsolationExemptMcpServers` and `workspaceTrust`, reserved
+            // (`harness.rs`'s rows say which bound each reaches), and
+            // `rapidFollowupPreempt` and `workload`, left open — a follow-up
+            // rendering declaration for a run that is handed no follow-up, and
+            // a billing-attribution tag inside the CLI's own header. The same
+            // eight at 0.3.272 and at 0.3.284; an earlier audit read `Options`
+            // alone and let all eight through.
+            //
+            // 0.3.284's `Options` adds two members to 0.3.272's and removes
+            // none — the same two the reader adds, so the two readings moved
+            // together this time: `projectConfigRoot`, reserved (the settings
+            // family read from another tree), and `verbatimPrompts`, left open
+            // with both of its settings read against the pinned CLI (2.1.284)
+            // rather than against its documentation:
+            //
+            //  * **on**, it skips the CLI's turn-start attachment pass "on
+            //    current CLIs", per the SDK — which, under `read_only`'s `plan`,
+            //    is where the plan-mode reminder holding the node read-only
+            //    arrives. The pinned CLI still sends that reminder,
+            //    `planModeInstructions` and all, on a `plan` run's first request
+            //    (observed: only the token-budget reminder went missing), so on
+            //    narrows. **Re-verify that at the next bump, before moving this
+            //    version**: a CLI that stops sending it puts `verbatimPrompts`
+            //    on `CC_RESERVED`;
+            //  * **off** — the default, and where the driver leaves it — the CLI
+            //    expands an `@path` mention in `run.input` into a synthetic
+            //    `Read` result on the first request: a file outside `workspace:`
+            //    reaches the model with no tool call, past `tools`, `canUseTool`
+            //    and the mode (observed at this pin and at 0.3.272, under
+            //    `acceptEdits` and `plan`, with `Read` outside `tools`). That is
+            //    a hole the driver does not close: turning the option on for
+            //    every run also drops the first turn's `CLAUDE.md`, skill and
+            //    tool listings, so whether the adapter owns it is a PRD question
+            //    rather than this audit's. `harness-cc.ts` says both halves.
             Harness::Cc => (
                 "0.3.284",
                 &[
@@ -788,6 +821,7 @@ mod tests {
                     "agents",
                     "allowDangerouslySkipPermissions",
                     "allowedTools",
+                    "appendSubagentSystemPrompt",
                     "canUseTool",
                     "continue",
                     "cwd",
@@ -797,6 +831,8 @@ mod tests {
                     "extraArgs",
                     "fallbackModel",
                     "forkSession",
+                    "getHostAuthToken",
+                    "getOAuthToken",
                     "hooks",
                     "managedSettings",
                     "maxThinkingTokens",
@@ -810,6 +846,7 @@ mod tests {
                     "planModeInstructions",
                     "plugins",
                     "projectConfigRoot",
+                    "resolvePermissionModeInCli",
                     "resume",
                     "resumeDropsTurn",
                     "resumeSessionAt",
@@ -823,6 +860,8 @@ mod tests {
                     "thinking",
                     "toolAliases",
                     "tools",
+                    "webSearchIsolationExemptMcpServers",
+                    "workspaceTrust",
                 ],
             ),
             // `@openai/codex-sdk`'s `ThreadOptions`, which is closed and small:

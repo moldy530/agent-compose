@@ -275,14 +275,18 @@ const CC_SETTINGS: readonly string[] = [
  * a list rather than a reading of what the driver below assigns:
  *
  *  * an option that **spells** a bound another key states. `workspace:` is
- *    `cwd`; `permission_mode:` is `permissionMode`, the plan-mode body beside it
- *    and the flag `bypassPermissions` requires, with `access:` the key that
- *    derives that mode where the node states none (Decision D146); `env:` is
+ *    `cwd`; `permission_mode:` is `permissionMode`, the plan-mode body beside it,
+ *    the flag `bypassPermissions` requires and `resolvePermissionModeInCli`,
+ *    which says who resolves a mode a run does not name, with `access:` the key
+ *    that derives that mode where the node states none (Decision D146); `env:` is
  *    `env` — which is also where
  *    the model's **connection** lands, because this SDK's endpoint, credential
  *    and custom headers are variables of the process it spawns (Decision D143),
- *    so one reserved name holds both bounds — `output:` is
- *    `outputFormat`, `prompt:` is `systemPrompt`, `allow_tools:` is the
+ *    so one reserved name holds both bounds, and the credential has two
+ *    spellings more in `getOAuthToken` and `getHostAuthToken`, the callbacks the
+ *    CLI asks for a token — `output:` is `outputFormat`, `prompt:` is
+ *    `systemPrompt` and `appendSubagentSystemPrompt`, the text the CLI appends
+ *    to every subagent's system prompt, `allow_tools:` is the
  *    available tool set and the per-call gate over it (`canUseTool`, or
  *    `allowedTools` under the one mode that never consults a callback),
  *    `timeout:` is the abort controller, and `model:` is the model and the one
@@ -303,13 +307,18 @@ const CC_SETTINGS: readonly string[] = [
  *    `workspace:` never named: it is the `--project-config-root` the pinned CLI
  *    reads the project tier's hooks and permission rules, `.mcp.json`'s servers
  *    and the `.claude` trees' agents and skills out of *instead of* the working
- *    directory; `additionalDirectories` carries roots beside `workspace:`; `sandbox`
+ *    directory, and `workspaceTrust` is the attestation that switches that
+ *    family on for the working directory's own checkout, recorded in the user's
+ *    `~/.claude.json` where it outlives the run; `additionalDirectories` carries
+ *    roots beside `workspace:`; `sandbox`
  *    carries containment; `mcpServers`, `agents`, `agent`, `skills` and
  *    `toolAliases` each put a tool or a whole loop outside `allow_tools:`
  *    within reach — `agent` also carrying its own model and prompt, and
  *    `skills` being the SDK's own single switch for turning skills on, which
  *    its documentation says needs no `'Skill'` entry in `allowedTools` beside
- *    it — and `plugins` carries hooks, agents and skills together; `hooks`,
+ *    it — `webSearchIsolationExemptMcpServers` keeps a server's tools within
+ *    reach after the CLI's web search / connector isolation policy took them
+ *    out, and `plugins` carries hooks, agents and skills together; `hooks`,
  *    `permissionPrompts` and
  *    `permissionPromptToolName` each move or silence the decision `canUseTool`
  *    makes; and `fallbackModel` is the failover ladder D141 stops at the
@@ -330,42 +339,88 @@ const CC_SETTINGS: readonly string[] = [
  * The list is audited against the option surface of the pinned SDK, which is
  * what `a_reserved_list_is_audited_against_the_pinned_option_surface`
  * (`codegen/harness.rs`) holds it to: a version bump is where a new
- * reach-around arrives, so the pin is what re-opens the audit. The last one
- * (0.3.272 to 0.3.284) arrived with two options and took one of them:
+ * reach-around arrives, so the pin is what re-opens the audit.
+ *
+ * **That surface is two readings, not one.** The typed one is `Options` in
+ * `sdk.d.ts`. The other is what `query()` actually reads: the bundle's option
+ * reader in `sdk.mjs` takes eight names no `Options` member declares —
+ * `appendSubagentSystemPrompt`, `getHostAuthToken`, `getOAuthToken`,
+ * `rapidFollowupPreempt`, `resolvePermissionModeInCli`,
+ * `webSearchIsolationExemptMcpServers`, `workload` and `workspaceTrust`, the
+ * same eight at 0.3.272 and 0.3.284 — and [`passthrough`] forwards an unknown
+ * key unchanged, so an undeclared name reaches the SDK exactly as a declared
+ * one does. Six of the eight are above, for the reasons given there. Two are
+ * left to D140's open tier: `rapidFollowupPreempt` declares that a consumer
+ * renders the CLI's turn-preempted frame when a person's follow-up interrupts
+ * a turn, and a run here is handed one prompt and no follow-up; `workload` is
+ * the CLI's `--workload` tag, a value inside the CLI's own billing-attribution
+ * header — not a header the connection states, and no bound — which the SDK
+ * adds as that one flag and nothing else, so it is no door back to the
+ * arbitrary flags a dropped `extraArgs` key would have been.
+ *
+ * The last bump (0.3.272 to 0.3.284) moved both readings together: `Options`
+ * gained two members and the reader the same two, and it took one of them,
  * `projectConfigRoot`, above. `verbatimPrompts` is left to D140's open tier
- * **at this pin**, and on narrower ground than its first line suggests. The
- * SDK documents it as turning the CLI's `@path` expansion and slash-command
- * dispatch off for the prompt a run is handed, and also, "on current CLIs", as
- * skipping "the CLI's turn-start attachment pass as a whole": "nested
- * `CLAUDE.md` and rules files, skill and tool listings, and the CLI's other
- * per-turn reminders", which then arrive only after the turn's first tool
- * call. Under `read_only` that pass is where containment lives — the plan-mode
- * reminder [`CC_PERMISSION`] rests on, which carries `planModeInstructions` —
- * and `plan` asks `canUseTool`, which answers `allow` inside the list, so a
- * first turn without the reminder could run an in-list `Write` or `Bash`
- * before the read-only preamble ever reached the model. The pinned CLI
- * (2.1.284) does not skip it: a `plan` run's first request with
- * `verbatimPrompts: true` still carries the plan-mode reminder and the node's
- * `planModeInstructions`, and of the context that run carried without the
- * option, the only piece missing was the token-budget reminder (observed
- * against a local Messages endpoint, not only read). That
- * observation is what keeps the key open, and it is the first thing the next
- * bump re-verifies: a CLI whose first request under `plan` has lost the
- * plan-mode reminder puts `verbatimPrompts` on this list.
+ * **at this pin**, and both of its settings have been read against the pinned
+ * CLI (2.1.284) rather than against its documentation alone:
+ *
+ *  * **On**, it narrows. The SDK documents it as turning the CLI's `@path`
+ *    expansion and slash-command dispatch off for the prompt a run is handed,
+ *    and also, "on current CLIs", as skipping "the CLI's turn-start attachment
+ *    pass as a whole": "nested `CLAUDE.md` and rules files, skill and tool
+ *    listings, and the CLI's other per-turn reminders", which then arrive only
+ *    after the turn's first tool call. Under `read_only` that pass is where
+ *    containment lives — the plan-mode reminder [`CC_PERMISSION`] rests on,
+ *    which carries `planModeInstructions` — and `plan` asks `canUseTool`, which
+ *    answers `allow` inside the list, so a first turn without the reminder
+ *    could run an in-list `Write` or `Bash` before the read-only preamble ever
+ *    reached the model. The pinned CLI does not skip it: a `plan` run's first
+ *    request with the option on still carries the plan-mode reminder and the
+ *    node's `planModeInstructions`, and of the context that run carried without
+ *    the option, the only piece missing was the token-budget reminder
+ *    (observed against a local Messages endpoint, not only read). That
+ *    observation is what keeps the key open, and it is the first thing the
+ *    next bump re-verifies: a CLI whose first request under `plan` has lost
+ *    the plan-mode reminder puts `verbatimPrompts` on this list.
+ *  * **Off — the default, and where this driver leaves it — it is a hole this
+ *    driver does not close.** The CLI expands an `@path` mention in the prompt
+ *    a run is handed into a synthetic `Read` result on the run's first
+ *    request: the file's contents, from anywhere the host can read, with no
+ *    tool call — so `tools`, `canUseTool` and the permission mode never see
+ *    it, and neither does `workspace:`. Observed against the pinned CLI and
+ *    against 0.3.272's (2.1.272) alike: `tools: ["Write"]`, a callback that
+ *    denies every call (and was never asked), a `cwd` of its own, and a prompt
+ *    naming a file outside it — the first request carried the file, under
+ *    `acceptEdits` and `plan` both; with the option on (which 0.3.272 does not
+ *    have), the pinned CLI's did not. The prompt
+ *    here is `run.input`, which a node's `input:` builds from state and a
+ *    trigger's data, so text the composition did not write can name a host
+ *    file. The driver does not turn the option on itself, because on is also
+ *    the first turn without its `CLAUDE.md`, skill and tool listings — the
+ *    harness's own context, which is what PRD resolved q57 adopts a harness
+ *    for — so whether the adapter owns `verbatimPrompts: true` is a question
+ *    for the PRD rather than for this audit. Until it is answered, a node
+ *    whose `input:` carries text it did not write can set
+ *    `settings: { verbatimPrompts: true }` itself, which is the direction the
+ *    open key narrows in.
  */
 const CC_RESERVED: readonly string[] = [
   // Options that spell a bound another key states.
   "abortController",
   "allowDangerouslySkipPermissions",
   "allowedTools",
+  "appendSubagentSystemPrompt",
   "canUseTool",
   "cwd",
   "env",
+  "getHostAuthToken",
+  "getOAuthToken",
   "maxThinkingTokens",
   "model",
   "outputFormat",
   "permissionMode",
   "planModeInstructions",
+  "resolvePermissionModeInCli",
   "systemPrompt",
   "thinking",
   "tools",
@@ -397,6 +452,8 @@ const CC_RESERVED: readonly string[] = [
   "skills",
   "spawnClaudeCodeProcess",
   "toolAliases",
+  "webSearchIsolationExemptMcpServers",
+  "workspaceTrust",
 ];
 
 /**

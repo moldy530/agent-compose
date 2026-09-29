@@ -7137,6 +7137,27 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
              outside everything this node states"
         );
     }
+    // …and the options the pinned SDK's `query()` reads without its `Options`
+    // type declaring them, which `passthrough` would forward like any other
+    // unknown key: an audit of the `.d.ts` alone let every one of these through
+    // (grammar 8.9, Decision D146).
+    for key in [
+        "appendSubagentSystemPrompt",
+        "workspaceTrust",
+        "webSearchIsolationExemptMcpServers",
+        "getOAuthToken",
+        "getHostAuthToken",
+        "resolvePermissionModeInCli",
+    ] {
+        assert_eq!(
+            bound[key],
+            json!(null),
+            "`settings: {{ {key}: … }}` reached the SDK — an option `query()` reads though \
+             `Options` never declares it, and one that reaches a bound this node states: a \
+             subagent's system prompt, a trust grant, a tool kept within reach, the run's \
+             credential or where its approval mode comes from"
+        );
+    }
     assert_eq!(
         bound["spawn"],
         json!([]),

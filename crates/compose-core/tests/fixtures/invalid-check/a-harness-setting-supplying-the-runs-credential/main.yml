@@ -1,0 +1,44 @@
+# rule: a `coder:` node's `settings:` key supplying a token source for a `cc`
+# rule: run's credential is refused, naming where `model:` points (8.9, D143)
+# code: reserved-harness-setting
+# message: `getOAuthToken` of `flow.main` node `implement` is a `harness: cc` option the generated adapter owns: it is what `model:` resolves to
+# at: main.yml:40:11
+# label: main.yml:32:18 the harness is bound here
+# help: `model:` is already on the node and is an address, so the value is written where it points, not here: `model:` is a registry address, so the credential a run authenticates with is the `api_key:` of the `provider.*` its `model.*` definition names, which crosses into the run through this harness's connection table and nowhere else (Decision D143) — and a callback is not a value YAML can hold, so a key here could only ever tell the harness that a token source exists where none does. `settings:` is open so that a harness option the vendor ships tomorrow is usable the day it ships — it is not a second way to state this construct's own bounds, and a key here that reached one would be the only one no check covers. Refused rather than dropped, because a key silently removed leaves a run doing something no line of the composition says (grammar 8.9, Decision D146, PRD resolved q60 ruling b)
+#
+# An option the Agent SDK's `query()` reads though its `Options` type never
+# declares it: the callback the CLI asks for a refreshed OAuth token, which is
+# the run's credential from somewhere other than the connection D143 crosses.
+# The SDK arms it on truthiness — it tells the CLI a token source exists — so
+# the string below would have reached the harness as exactly that claim, with
+# nothing to call behind it. The answer is the other kind of "already on the
+# node": `model:` is an address, and the credential is the `api_key:` of the
+# provider it resolves through.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.implementer:
+  provider: provider.p
+  id: claude-sonnet-4-5
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: "'${REPO_ROOT}'"
+        access: workspace_write
+        prompt: Make the smallest change that passes the tests.
+        output:
+          summary: { type: string }
+        settings:
+          getOAuthToken: token-from-the-vault
+      input: "'go'"
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }

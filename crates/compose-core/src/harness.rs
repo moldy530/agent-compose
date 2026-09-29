@@ -1107,7 +1107,20 @@ pub const RESERVED: &[ReservedRow] = &[
     },
 ];
 
-/// `cc`'s reserved options: `@anthropic-ai/claude-agent-sdk`'s `Options`.
+/// `cc`'s reserved options: `@anthropic-ai/claude-agent-sdk`'s `Options`, and
+/// the options `query()` reads that `Options` never declares.
+///
+/// The second half is the one a reading of `sdk.d.ts` alone misses. The
+/// bundle's option reader (the function `query()` hands its options to, in
+/// `sdk.mjs`) takes eight names the typed surface has no member for —
+/// `appendSubagentSystemPrompt`, `getHostAuthToken`, `getOAuthToken`,
+/// `rapidFollowupPreempt`, `resolvePermissionModeInCli`,
+/// `webSearchIsolationExemptMcpServers`, `workload` and `workspaceTrust`, the
+/// same eight at 0.3.272 and 0.3.284 — and `passthrough` forwards an unknown
+/// `settings:` key unchanged, so each of them reaches the SDK exactly as a
+/// declared option would. Six of them reach around a bound and are rows here;
+/// `rapidFollowupPreempt` and `workload` do not, and are left to Decision
+/// D140's open tier (`codegen/js/harness-cc.ts` says why, beside the list).
 const CC_RESERVED: &[ReservedOption] = &[
     ReservedOption {
         option: "abortController",
@@ -1134,6 +1147,16 @@ const CC_RESERVED: &[ReservedOption] = &[
     ReservedOption {
         option: "allowedTools",
         answered: Answered::By("allow_tools"),
+    },
+    ReservedOption {
+        // Read by `query()` and declared by no `Options` member: text the CLI
+        // appends to the system prompt of every Task-tool subagent and of the
+        // subagents those spawn, sent in the initialize request. It is
+        // system-prompt text the node's `prompt:` never stated, reaching every
+        // loop the run starts — the reason `agents` and `agent` are rows —
+        // and the CLI's own gate on it is a variable a node's `env:` can set.
+        option: "appendSubagentSystemPrompt",
+        answered: Answered::Already("prompt"),
     },
     ReservedOption {
         option: "canUseTool",
@@ -1173,6 +1196,25 @@ const CC_RESERVED: &[ReservedOption] = &[
     ReservedOption {
         option: "forkSession",
         answered: Answered::Nothing(RESUME),
+    },
+    ReservedOption {
+        // Undeclared, like `getOAuthToken` below, and its twin on the
+        // host-managed gateway path: the callback that answers the CLI's
+        // `host_auth_token_refresh` request with the token the run's traffic
+        // is authenticated by.
+        option: "getHostAuthToken",
+        answered: Answered::Through("model", CREDENTIAL),
+    },
+    ReservedOption {
+        // Undeclared: the callback that answers the CLI's
+        // `oauth_token_refresh` request, which is the credential the run
+        // authenticates with supplied from somewhere other than the connection
+        // Decision D143 crosses. The SDK arms it on truthiness
+        // (`CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH` in the CLI's environment), so a
+        // YAML value — which is never the function it calls — still tells the
+        // CLI a token source exists.
+        option: "getOAuthToken",
+        answered: Answered::Through("model", CREDENTIAL),
     },
     ReservedOption {
         option: "hooks",
@@ -1238,6 +1280,16 @@ const CC_RESERVED: &[ReservedOption] = &[
         answered: Answered::By("allow_tools"),
     },
     ReservedOption {
+        // Undeclared: whether the CLI, rather than `query()`, resolves the
+        // permission mode of a run that names none. The driver names one on
+        // every run, so the option changes nothing a run does — and a key
+        // whose only meaning is where the approval mode comes from, accepted
+        // and then doing nothing, is the node reading as though it said
+        // something about that mode. `permission_mode:` is the key that does.
+        option: "resolvePermissionModeInCli",
+        answered: Answered::By("permission_mode"),
+    },
+    ReservedOption {
         option: "resume",
         answered: Answered::Nothing(RESUME),
     },
@@ -1296,6 +1348,27 @@ const CC_RESERVED: &[ReservedOption] = &[
     },
     ReservedOption {
         option: "tools",
+        answered: Answered::By("allow_tools"),
+    },
+    ReservedOption {
+        // Undeclared: MCP server names exempted from the CLI's web search /
+        // connector isolation latch — an organization's policy that takes a
+        // run's connectors out of reach once it has searched the web, and the
+        // reverse. An exemption keeps a server's tools within reach where that
+        // policy removed them, which is `mcpServers`' reach one step later.
+        option: "webSearchIsolationExemptMcpServers",
+        answered: Answered::By("allow_tools"),
+    },
+    ReservedOption {
+        // Undeclared: a host's attestation that the user accepted a trust
+        // dialog for the working directory. The CLI records the grant in the
+        // user's own `~/.claude.json` — a write outside `workspace:` that
+        // outlives the run — and it is what the persisted-trust gates read
+        // before they load the project tier's permission rules and hooks,
+        // `.mcp.json`'s servers, project plugins and agent-frontmatter hooks.
+        // That is the family `settingSources` and `projectConfigRoot` answer
+        // for, switched on by an attestation nobody made.
+        option: "workspaceTrust",
         answered: Answered::By("allow_tools"),
     },
 ];
@@ -1400,6 +1473,23 @@ const REASONING: &str = "`model:` is a registry address, so the one model settin
                          takes is written in the `model.*` definition it names — \
                          `reasoning_effort:` in that definition's own `settings:`, where the \
                          provider plugin's schema checks it (grammar 12.2, Decision D141)";
+
+/// …and where the credential a run authenticates with is written instead: the
+/// `cc` callbacks that hand the CLI a token, which are the connection's
+/// credential fact supplied beside the one Decision D143 crosses.
+///
+/// [`Answered::Through`] rather than [`Answered::Nothing`], because a key does
+/// state it: the credential is the `provider.*` definition's `api_key:`, and
+/// `model:` is the address that reaches it. And rather than
+/// [`Answered::By`]`("env")`, because D143's "one spelling per fact" already
+/// refuses a node `env:` entry naming a credential variable — sending an author
+/// there would be sending them to the next refusal.
+const CREDENTIAL: &str = "`model:` is a registry address, so the credential a run authenticates \
+                          with is the `api_key:` of the `provider.*` its `model.*` definition \
+                          names, which crosses into the run through this harness's connection \
+                          table and nowhere else (Decision D143) — and a callback is not a \
+                          value YAML can hold, so a key here could only ever tell the harness \
+                          that a token source exists where none does";
 
 /// Every option one harness's adapter owns, in the table's order.
 #[must_use]
@@ -2301,7 +2391,8 @@ flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n 
                 version_of(row.harness),
                 row.audited,
                 "`{}`'s SDK is pinned at {} and its reserved row was audited against {}: read the \
-                 release's own options, add every one that reaches around `workspace:`, \
+                 release's own options — the typed surface and every name its bundle reads off \
+                 the options object beside it — add every one that reaches around `workspace:`, \
                  `access:`, `permission_mode:`, `env:`, `output:`, `prompt:`, `allow_tools:`, \
                  `timeout:` or `model:`, answer each with the key that states it, and move this \
                  version up (grammar 8.9, Decision D146)",
@@ -2316,6 +2407,50 @@ flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n 
                 "a reserved harness has no SDK whose options an adapter could own"
             );
         }
+    }
+
+    /// **An option `query()` reads is audited whether or not `Options` declares
+    /// it** (grammar 8.9, Decision D146, PRD resolved q60 ruling b).
+    ///
+    /// The Agent SDK's bundle reads eight option names its `sdk.d.ts` never
+    /// mentions, and the driver's `passthrough` forwards an unknown `settings:`
+    /// key unchanged — so an undeclared name the SDK reads is as reachable
+    /// from YAML as a declared one, and an audit of the typed surface alone let
+    /// every one of them through with a warning. Six reach a bound, and each is
+    /// pinned here to the key that answers it; the answers are the part a
+    /// reader of the table could get wrong in the nearest-key way the sibling
+    /// tests guard against — a subagent's system prompt is `prompt:`'s, which
+    /// is already on the node; a token callback is the connection's credential,
+    /// which `model:` addresses rather than holds.
+    #[test]
+    fn the_options_query_reads_beside_its_declared_surface_are_audited() {
+        for (option, answered) in [
+            ("appendSubagentSystemPrompt", Answered::Already("prompt")),
+            ("getHostAuthToken", Answered::Through("model", CREDENTIAL)),
+            ("getOAuthToken", Answered::Through("model", CREDENTIAL)),
+            (
+                "resolvePermissionModeInCli",
+                Answered::By("permission_mode"),
+            ),
+            (
+                "webSearchIsolationExemptMcpServers",
+                Answered::By("allow_tools"),
+            ),
+            ("workspaceTrust", Answered::By("allow_tools")),
+        ] {
+            assert_eq!(
+                reserved_option(Harness::Cc, option).map(|held| held.answered),
+                Some(answered),
+                "`{option}` is read by the pinned Agent SDK's `query()` though its `Options` does \
+                 not declare it, and a `settings:` key spelling it is not refused with the answer \
+                 the audit gave it"
+            );
+        }
+        assert!(
+            CREDENTIAL.contains("`api_key:`") && CREDENTIAL.contains("D143"),
+            "the credential callbacks' answer does not name where the credential is written — \
+             the `provider.*` definition's `api_key:`, crossing through D143's table"
+        );
     }
 
     /// **Each reserved row and its driver's own list are one table** (grammar
