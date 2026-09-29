@@ -768,8 +768,17 @@ mod tests {
             // none — the same two the bundle's own option reader adds, so the
             // typed surface and the one `query()` destructures moved together:
             // `projectConfigRoot`, reserved (the settings family read from
-            // another tree), and `verbatimPrompts`, left open (it only turns the
-            // CLI's prompt expansion *off*).
+            // another tree), and `verbatimPrompts`, left open on an observation
+            // rather than on its first line. Besides turning `@path` expansion
+            // and slash-command dispatch off, the SDK documents it as skipping
+            // the CLI's whole turn-start attachment pass "on current CLIs" —
+            // which, under `read_only`'s `plan`, is where the plan-mode reminder
+            // holding the node read-only arrives. The pinned CLI (2.1.284)
+            // still sends that reminder, `planModeInstructions` and all, on a
+            // `plan` run's first request with the option on (observed: only the
+            // token-budget reminder went missing). **Re-verify that at the next
+            // bump, before moving this version**: a CLI that stops sending it
+            // puts `verbatimPrompts` on `CC_RESERVED` (`harness-cc.ts` says why).
             Harness::Cc => (
                 "0.3.284",
                 &[

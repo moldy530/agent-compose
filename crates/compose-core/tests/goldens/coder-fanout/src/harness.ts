@@ -325,9 +325,26 @@ const CC_SETTINGS: readonly string[] = [
  * (`codegen/harness.rs`) holds it to: a version bump is where a new
  * reach-around arrives, so the pin is what re-opens the audit. The last one
  * (0.3.272 to 0.3.284) arrived with two options and took one of them:
- * `projectConfigRoot`, above, and not `verbatimPrompts`, which only turns the
- * CLI's `@path` expansion and slash-command dispatch *off* for the prompt a run
- * is handed — a narrowing no bound needs to own, left to D140's open tier.
+ * `projectConfigRoot`, above. `verbatimPrompts` is left to D140's open tier
+ * **at this pin**, and on narrower ground than its first line suggests. The
+ * SDK documents it as turning the CLI's `@path` expansion and slash-command
+ * dispatch off for the prompt a run is handed, and also, "on current CLIs", as
+ * skipping "the CLI's turn-start attachment pass as a whole": "nested
+ * `CLAUDE.md` and rules files, skill and tool listings, and the CLI's other
+ * per-turn reminders", which then arrive only after the turn's first tool
+ * call. Under `read_only` that pass is where containment lives — the plan-mode
+ * reminder [`CC_PERMISSION`] rests on, which carries `planModeInstructions` —
+ * and `plan` asks `canUseTool`, which answers `allow` inside the list, so a
+ * first turn without the reminder could run an in-list `Write` or `Bash`
+ * before the read-only preamble ever reached the model. The pinned CLI
+ * (2.1.284) does not skip it: a `plan` run's first request with
+ * `verbatimPrompts: true` still carries the plan-mode reminder and the node's
+ * `planModeInstructions`, and of the context that run carried without the
+ * option, the only piece missing was the token-budget reminder (observed
+ * against a local Messages endpoint, not only read). That
+ * observation is what keeps the key open, and it is the first thing the next
+ * bump re-verifies: a CLI whose first request under `plan` has lost the
+ * plan-mode reminder puts `verbatimPrompts` on this list.
  */
 const CC_RESERVED: readonly string[] = [
   // Options that spell a bound another key states.
