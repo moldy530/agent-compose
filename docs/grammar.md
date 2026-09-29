@@ -81,7 +81,7 @@ other, never both (Decision [D3](#d3-spec-files-and-deploy-files-are-disjoint-do
 | **Deploy file** | `--target <name>` → `deploy/<name>.yml` | `version`, `hub`, `placements`, `storage_backends`, `journal`, `package_registry`, `harnesses`, `trace_sink`, `event_sources` |
 
 A spec file that declares `hub`, `placements`, `storage_backends`, `journal`,
-`package_registry`, `trace_sink`,
+`package_registry`, `harnesses`, `trace_sink`,
 or `event_sources` is a compile error, and a deploy file that declares
 definitions, `imports`, `state`, `triggers`, or `defaults` is a compile error. This is the
 mechanical enforcement of the PRD 5.8 per-target invariant: only the deploy layer
