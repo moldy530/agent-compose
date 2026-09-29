@@ -203,6 +203,7 @@ const SECTIONS: &[&[&str]] = &[
     &["state"],
     &["triggers"],
     &["deploy", "placements"],
+    &["deploy", "harnesses"],
     &["deploy", "event_sources"],
 ];
 
@@ -526,6 +527,15 @@ fn subjects(ir: &Ir) -> BTreeMap<Subject, Slice> {
             Slice::own(journal.clone()),
         );
     }
+    // `harnesses:` is a map of named entries like `placements:`, so one subject
+    // per harness at `harness.<name>`, and the name the entry repeats is not a
+    // field of it (grammar §14.8, `docs/plan.md` §4, §8).
+    for (name, harness) in section(&artifact, &["deploy", "harnesses"]) {
+        found.insert(
+            (COMPONENTS, format!("harness.{name}")),
+            Slice::own(without(harness, &["name"])),
+        );
+    }
     for (name, source) in section(&artifact, &["deploy", "event_sources"]) {
         found.insert(
             (COMPONENTS, format!("event_source.{name}")),
@@ -539,6 +549,7 @@ fn subjects(ir: &Ir) -> BTreeMap<Subject, Slice> {
             "placements",
             "journal",
             "package_registry",
+            "harnesses",
             "trace_sink",
             "event_sources",
         ],
@@ -1349,6 +1360,33 @@ package_registry:
       url: "https://npm.internal.example/repository/corp/"
       token: ${NPM_CORP_TOKEN}"#;
 
+/// A harness SDK version planted under the same anchor, and the edits a plan
+/// has to report about one (grammar §14.8, `docs/plan.md` §4).
+///
+/// Planted for [`PACKAGE_REGISTRY`]'s reason: `local` admits the section — a
+/// project built on a laptop is one whose harness runs there — and the example
+/// carries none. A section a plan stopped reporting would let a deployment move
+/// the release of the program every coder node's run *is* with nothing in the
+/// review. The base composition binds no harness, so each side also carries the
+/// warning that says the entry emits nothing — which is `validation`'s business
+/// and, per this file's header, saves no case.
+const HARNESSES: &str = r#"hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
+harnesses:
+  cc:
+    sdk_version: "0.3.284""#;
+const HARNESSES_MOVED: &str = r#"hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
+harnesses:
+  cc:
+    sdk_version: "0.3.285""#;
+const HARNESSES_EMPTY: &str = r#"hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
+harnesses: {}"#;
+
 /// A placement planted under the same anchor, and the two edits a plan has to
 /// report about one (grammar §14.1, `docs/plan.md` §4).
 ///
@@ -1747,6 +1785,24 @@ const CASES: &[Case] = &[
         before: &[],
         after: &[("deploy/local.yml", HUB, PACKAGE_REGISTRY)],
         differs: true,
+    },
+    Case {
+        what: "a harness SDK moved to another version inside its audited range",
+        before: &[("deploy/local.yml", HUB, HARNESSES)],
+        after: &[("deploy/local.yml", HUB, HARNESSES_MOVED)],
+        differs: true,
+    },
+    Case {
+        what: "a harness SDK version declared by a target that declared none",
+        before: &[],
+        after: &[("deploy/local.yml", HUB, HARNESSES)],
+        differs: true,
+    },
+    Case {
+        what: "a harnesses section declared with no entries where the other side declares none",
+        before: &[],
+        after: &[("deploy/local.yml", HUB, HARNESSES_EMPTY)],
+        differs: false,
     },
     // --- Every remaining key of one component, swept a component at a time. ---
     //

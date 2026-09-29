@@ -1,6 +1,6 @@
 # agent-compose — Plan Format
 
-**Plan version:** `4`
+**Plan version:** `5`
 
 This document is **normative** for `agent-compose plan --format json`. It is the
 whole of what a consumer of that document may rely on, and §12 is the contract:
@@ -39,7 +39,9 @@ which is a report rather than a contract.
   - [12.3 What requires a version bump](#123-what-requires-a-version-bump)
   - [12.4 What version `2` changed](#124-what-version-2-changed)
   - [12.5 What version `3` changed](#125-what-version-3-changed)
-  - [12.6 How the two are held together](#126-how-the-two-are-held-together)
+  - [12.6 What version `4` changed](#126-what-version-4-changed)
+  - [12.7 What version `5` changed](#127-what-version-5-changed)
+  - [12.8 How the two are held together](#128-how-the-two-are-held-together)
 - [13. The human report](#13-the-human-report)
 
 ## 1. What a plan is
@@ -92,7 +94,7 @@ know rather than guessing.
 
 | field | meaning |
 |---|---|
-| `plan_version` | the shape of this document — `2`, and the first key so a reader can dispatch on it |
+| `plan_version` | the shape of this document — `5`, and the first key so a reader can dispatch on it |
 | `before` | the composition compared **from**, as §2.2 describes it |
 | `after` | the composition compared **to** |
 | `components` | §4's array. Empty when nothing in it changed |
@@ -295,6 +297,7 @@ is accounted for.
 | `"hub"` | the active target's `hub:` block |
 | `"trace_sink"` | the active target's `trace_sink:` block |
 | `"package_registry"` | the active target's `package_registry:` block |
+| `"harness"` | an entry of the active target's `harnesses:` |
 | `"journal"` | the active target's `journal:` block |
 | `"event_source"` | an entry of the active target's `event_sources:` |
 
@@ -312,8 +315,8 @@ Concretely, two components have fields held elsewhere:
   and what it is for. Its whole delivery surface is §6's.
 
 Everything else — an agent, a tool, a store, a provider, a model, a placement, the
-`hub:` block, the `trace_sink:` block, the `package_registry:` block, the
-`journal:` block, an event
+`hub:` block, the `trace_sink:` block, the `package_registry:` block, an entry of
+`harnesses:`, the `journal:` block, an event
 source — reports every field of its resolved definition here.
 
 One field of every entry is never reported: the key the artifact repeats
@@ -326,6 +329,7 @@ Which field it is depends on what the entry is, and this is all of them:
 |---|---|
 | a definition | `address` |
 | a placement | `name` |
+| an entry of `harnesses:` | `name` |
 | an event source | `name` |
 | a trigger | `name` |
 | a `state:` channel (§5) | `name` |
@@ -524,6 +528,7 @@ Every record names its subject by an address, and the spelling is fixed:
 | the `hub:` block | `hub` |
 | the `trace_sink:` block | `trace_sink` |
 | the `package_registry:` block | `package_registry` |
+| an entry of `harnesses:` | `harness.` and the harness it is keyed by: `harness.cc` |
 | the `journal:` block | `journal` |
 | an event source | `event_source.` and its logical name: `event_source.bug_reports` |
 | a node | the flow's address, a `.`, and the flow-local node id: `flow.review_loop.draft` |
@@ -678,10 +683,10 @@ a reason:
   grammar 14 makes each of them a compile error under `local` (Decisions D87,
   D148), so no artifact this command can build carries either. Both have a
   `component` member all the same (§4, §12.6): the vocabulary is the *format's*
-  rather than this command's, and a reader is entitled to exhaust it. The five
+  rather than this command's, and a reader is entitled to exhaust it. The six
   sections `local` *does*
-  admit — `hub:`, `placements:`, `package_registry:`, `trace_sink:` and
-  `event_sources:` — are
+  admit — `hub:`, `placements:`, `package_registry:`, `harnesses:`, `trace_sink:`
+  and `event_sources:` — are
   compared, and appear in §4.
 * **a declared-but-empty section**, as against an absent one. The IR draws that
   distinction — `state:` written with no channels is not `state:` unwritten — and
@@ -893,7 +898,25 @@ vocabulary member is what a plan built for a *named* target reports. Nothing els
 moved: every key, every address spelling, the ordering and the location rule are
 version `1`'s.
 
-### 12.7 How the two are held together
+### 12.7 What version `5` changed
+
+One member again, added to the same closed vocabulary: `component` gained
+`"harness"`, and §8 gained the address `harness.<name>` that goes with it. The
+deploy layer grew a section — `harnesses:`, where a target pins a harness's SDK
+to an exact version inside the range the compiler audited it for
+(`docs/grammar.md` §14.8, PRD resolved q66) — and §12.3 makes a reader entitled
+to exhaust `component`, so a kind version `4` never listed is a bump rather than
+an addition a reader could have absorbed.
+
+It is the first deploy section since `placements:` whose subjects are its
+**entries** rather than the block: one record per harness, at `harness.cc` and
+`harness.codex`, because moving one harness's SDK and moving another's are two
+decisions and a reader should see which was made. The entry repeats its key as
+`name`, which §4's table now lists. The built-in `local` target admits the
+section, so a plan really can carry one. Nothing else moved: every key, every
+other address spelling, the ordering and the location rule are version `1`'s.
+
+### 12.8 How the two are held together
 
 `crates/compose-core/tests/plan_format_inventory.rs` reads the record types out
 of `crates/compose-core/src/plan/` and holds each of them to this file: every
