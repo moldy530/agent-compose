@@ -14,7 +14,7 @@
     }
   },
   "document": {
-    "trace_version": 5,
+    "trace_version": 6,
     "flow": "flow.greet",
     "execution_id": "exec_minimal",
     "status": "completed",
@@ -118,7 +118,7 @@
                   {
                     "key": "agentcompose.trace_version",
                     "value": {
-                      "intValue": "5"
+                      "intValue": "6"
                     }
                   }
                 ],

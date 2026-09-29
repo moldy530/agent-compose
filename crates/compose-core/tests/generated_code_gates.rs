@@ -1973,7 +1973,7 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
     assert_eq!(
         children["document"],
         serde_json::json!({
-            "trace_version": 5,
+            "trace_version": 6,
             "detached": true,
             "parent_execution": parent,
             "idempotency_key": key(1),
@@ -1996,7 +1996,7 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
     assert_eq!(
         children["plainDocument"],
         serde_json::json!({
-            "trace_version": 5,
+            "trace_version": 6,
             "flow": "flow.probe",
             "execution_id": parent,
             "status": "completed",

@@ -3602,8 +3602,9 @@ version is the installed package's own rather than the compiled-in pin, so it
 is the pin in a project installed from the manifest `build` wrote and a
 different number wherever that manifest was edited — the drift is in the trace
 rather than hidden by it (an amendment to PRD resolved q57 ruling a's "pinned
-version"). A harness that runs subagents of its own keeps their transcripts in
-the journal payload and out of the envelope.
+version", and what `trace_version` `6` changed — `docs/trace.md` §10.3.5). A
+harness that runs subagents of its own keeps their transcripts in the journal
+payload and out of the envelope.
 
 #### A missing harness
 

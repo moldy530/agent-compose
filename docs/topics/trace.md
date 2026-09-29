@@ -69,7 +69,7 @@ file:
   "execution_id": "exec_0f1e…",
   "status": "completed",
   "outputs": { "draft": "…" },
-  "trace_version": 4,
+  "trace_version": 6,
   "trace": [ /* entries */ ],
   "trace_path": "/…/.agent-compose/traces/flow.review_loop-exec_0f1e….json"
 }
@@ -205,6 +205,8 @@ events in the same three-outcome vocabulary a tool call uses, and a cost rollup
 — money where the harness estimates one, tokens where it counts them. The SDK
 version is the installed package's own, not the one the compiler pinned, so a
 project whose `package.json` moved the SDK after `build` says so in its trace.
+That is what `trace_version` 6 changed: under 5 the field carried the pin
+whatever ran.
 
 Depth is the rule worth knowing: a harness that runs subagents of its own keeps
 their transcripts in the run's journal record and out of the trace. The other

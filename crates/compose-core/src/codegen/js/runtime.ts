@@ -9502,12 +9502,13 @@ export function route(
  * `docs/trace.md`'s *Stability* section is the contract, and it is what a reader
  * is entitled to rely on.
  *
- * `5` is PRD resolved q65's: a detached `flow.*` dispatch now starts a **child
- * execution**, whose envelope carries the child's own id in `execution_id` where
- * the one-release-old detached envelope carried its parent's — a field whose
- * value changed meaning, which `docs/trace.md` §10.3.4 records.
+ * `6` is `HarnessRecord.sdk`'s: it names the version of the SDK that **ran**,
+ * read off the installed package's manifest, where version `5` wrote the
+ * version this compiler release pinned whatever was installed — a field whose
+ * value changed meaning, which `docs/trace.md` §10.3.5 records. (`5` was PRD
+ * resolved q65's child execution, §10.3.4.)
  */
-export const TRACE_VERSION = 5;
+export const TRACE_VERSION = 6;
 
 /**
  * One run's whole trace, as a surface delivers it (`docs/trace.md`).

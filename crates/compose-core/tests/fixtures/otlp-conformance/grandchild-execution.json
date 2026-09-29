@@ -10,7 +10,7 @@
     "root": "exec_parent"
   },
   "document": {
-    "trace_version": 5,
+    "trace_version": 6,
     "detached": true,
     "parent_execution": "exec_c647f4e8-c3d7-8e35-9077-b43b9f7be22f",
     "idempotency_key": "exec_c647f4e8-c3d7-8e35-9077-b43b9f7be22f/hand_on/0/0",
@@ -137,7 +137,7 @@
                   {
                     "key": "agentcompose.trace_version",
                     "value": {
-                      "intValue": "5"
+                      "intValue": "6"
                     }
                   },
                   {
