@@ -385,26 +385,46 @@ const CC_SETTINGS: readonly string[] = [
  *    next bump re-verifies: a CLI whose first request under `plan` has lost
  *    the plan-mode reminder puts `verbatimPrompts` on this list.
  *  * **Off — the default, and where this driver leaves it — it is a hole this
- *    driver does not close.** The CLI expands an `@path` mention in the prompt
- *    a run is handed into a synthetic `Read` result on the run's first
- *    request: the file's contents, from anywhere the host can read, with no
- *    tool call — so `tools`, `canUseTool` and the permission mode never see
- *    it, and neither does `workspace:`. Observed against the pinned CLI and
- *    against 0.3.272's (2.1.272) alike: `tools: ["Write"]`, a callback that
- *    denies every call (and was never asked), a `cwd` of its own, and a prompt
- *    naming a file outside it — the first request carried the file, under
- *    `acceptEdits` and `plan` both; with the option on (which 0.3.272 does not
- *    have), the pinned CLI's did not. The prompt
- *    here is `run.input`, which a node's `input:` builds from state and a
- *    trigger's data, so text the composition did not write can name a host
- *    file. The driver does not turn the option on itself, because on is also
- *    the first turn without its `CLAUDE.md`, skill and tool listings — the
- *    harness's own context, which is what PRD resolved q57 adopts a harness
- *    for — so whether the adapter owns `verbatimPrompts: true` is a question
- *    for the PRD rather than for this audit. Until it is answered, a node
- *    whose `input:` carries text it did not write can set
- *    `settings: { verbatimPrompts: true }` itself, which is the direction the
- *    open key narrows in.
+ *    driver does not close, and it has two halves.** The prompt a run is
+ *    handed is `run.input`, which a node's `input:` builds from state and a
+ *    trigger's data, so text the composition did not write reaches the CLI as
+ *    a prompt — and the CLI acts on two things in a prompt before any model
+ *    reads it:
+ *     - **`@path` mentions.** The CLI expands one into a synthetic `Read`
+ *       result on the run's first request: the file's contents, from anywhere
+ *       the host can read, with no tool call — so `tools`, `canUseTool` and the
+ *       permission mode never see it, and neither does `workspace:`. Observed
+ *       against the pinned CLI and against 0.3.272's (2.1.272) alike:
+ *       `tools: ["Write"]`, a callback that denies every call (and was never
+ *       asked), a `cwd` of its own, and a prompt naming a file outside it — the
+ *       first request carried the file, under `acceptEdits` and `plan` both.
+ *     - **Slash commands.** A prompt that opens with `/<command>` is dispatched
+ *       as one of the CLI's own commands rather than sent, and that reaches
+ *       around `model:`: a `run.input` of `/model <id>` switches the session's
+ *       model, and the run's request goes out on `<id>` rather than on the id
+ *       the adapter mapped the node's `model:` to. Observed against the pinned
+ *       CLI, and at 0.3.272 too: `model: "claude-opus-5-5"`,
+ *       `tools: ["Write"]`, a deny-all callback and a prompt of
+ *       `/model claude-sonnet-4-5` — the run's only Messages request named
+ *       `claude-sonnet-4-5`. The same run's init message lists the commands
+ *       the prompt can reach (`slash_commands`): `config`, `mcp`, `effort`,
+ *       `fast` and `agents` among them, each reachable from the same text.
+ *       Only `/model` has been driven here; what the others reach is
+ *       unaudited.
+ *
+ *    With the option on (which 0.3.272 does not have), the pinned CLI did
+ *    neither: the file stayed out of the first request, and a `/model …`
+ *    prompt went to the model as text, on the mapped id. The driver does not
+ *    turn the option on itself, because on is also the first turn without its
+ *    `CLAUDE.md`, skill and tool listings — the harness's own context, which
+ *    is what PRD resolved q57 adopts a harness for — so whether the adapter
+ *    owns `verbatimPrompts: true` is a question for the PRD rather than for
+ *    this audit, and it is one question with both halves in it: file
+ *    mentions reaching past `workspace:` and the tool bounds, and command
+ *    dispatch reaching past `model:` and whatever else a command sets. Until
+ *    it is answered, a node whose `input:` carries text it did not write can
+ *    set `settings: { verbatimPrompts: true }` itself, which is the direction
+ *    the open key narrows in.
  */
 const CC_RESERVED: readonly string[] = [
   // Options that spell a bound another key states.

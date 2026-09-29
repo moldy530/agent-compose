@@ -803,15 +803,24 @@ mod tests {
             //    version**: a CLI that stops sending it puts `verbatimPrompts`
             //    on `CC_RESERVED`;
             //  * **off** — the default, and where the driver leaves it — the CLI
-            //    expands an `@path` mention in `run.input` into a synthetic
-            //    `Read` result on the first request: a file outside `workspace:`
-            //    reaches the model with no tool call, past `tools`, `canUseTool`
-            //    and the mode (observed at this pin and at 0.3.272, under
-            //    `acceptEdits` and `plan`, with `Read` outside `tools`). That is
-            //    a hole the driver does not close: turning the option on for
-            //    every run also drops the first turn's `CLAUDE.md`, skill and
-            //    tool listings, so whether the adapter owns it is a PRD question
-            //    rather than this audit's. `harness-cc.ts` says both halves.
+            //    acts on two things in `run.input` before a model reads it, and
+            //    both reach around a bound. It expands an `@path` mention into a
+            //    synthetic `Read` result on the first request: a file outside
+            //    `workspace:` reaches the model with no tool call, past `tools`,
+            //    `canUseTool` and the mode (observed at this pin and at 0.3.272,
+            //    under `acceptEdits` and `plan`, with `Read` outside `tools`).
+            //    And it dispatches a prompt opening with `/<command>` as one of
+            //    its own commands: `/model <id>` switches the session's model,
+            //    so the run's request goes out on `<id>` rather than on what
+            //    `model:` mapped to (observed at this pin and at 0.3.272), and
+            //    the init message's `slash_commands` lists `config`, `mcp`,
+            //    `effort`, `fast` and `agents` among the others the same text
+            //    reaches, none of them audited. That is a hole the driver does
+            //    not close: turning the option on for every run also drops the
+            //    first turn's `CLAUDE.md`, skill and tool listings, so whether
+            //    the adapter owns it is a PRD question — one question, with both
+            //    halves in it — rather than this audit's. `harness-cc.ts` says
+            //    all of it.
             Harness::Cc => (
                 "0.3.284",
                 &[
