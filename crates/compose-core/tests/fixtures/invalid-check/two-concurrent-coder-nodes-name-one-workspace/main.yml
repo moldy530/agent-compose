@@ -1,9 +1,10 @@
 # rule: two coder nodes on statically-concurrent branches whose `workspace:`
 # rule: values are written identically draw a warning (grammar 8.9, 7.6.1, D147)
 # code: shared-workspace
+# severity: warning
 # message: nodes `implement` and `document` of `flow.main` can run concurrently and their `workspace:` is written the same way
-# at: main.yml:68:20
-# label: main.yml:58:20 the other run is contained here
+# at: main.yml:69:20
+# label: main.yml:59:20 the other run is contained here
 # help: two edges of one fork that are not provably exclusive can both fire, so the branches they start are concurrent — and two harness runs inside one directory edit each other's files. `'${REPO_ROOT}'` is one expression over one scope, so both runs resolve it to one path. Give one of them a directory of its own, or write `workspace: fresh` on each for a directory the runtime provisions per dispatch. A **warning** rather than a refusal because equality here is a launch fact: a value bearing an `${ENV}` reference resolves on the machine that runs it, so two values this compiler reads as different may still be one directory, and two it reads as the same is the half it can see (grammar 7.6.1, 8.9, Decision D147, PRD resolved q61 ruling b)
 #
 # The second site of PRD resolved q61 ruling b, and a **warning** rather than a

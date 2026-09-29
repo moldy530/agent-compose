@@ -1,5 +1,6 @@
 # rule: a `harnesses:` entry for a harness no `coder:` node binds is a warning, and `harnesses:` is live under `local` (grammar 14, 14.8, PRD resolved q66)
 # code: unbound-harness-sdk
+# severity: warning
 # message: `harnesses.codex` pins an SDK for a harness no `coder:` node binds, so it emits nothing
 # at: deploy/local.yml:4:3
 # help: a project installs a harness's SDK only where a `coder:` node binds that harness, so this entry changes nothing `build` writes; it is a warning rather than an error because a deploy file outlives the compositions it serves — keep it for the composition that binds `codex`, or drop it (grammar 14.8, PRD resolved q66)

@@ -1,11 +1,12 @@
 # rule: a `map` node is a concurrent step like any other, so the runs it
 # rule: dispatches collide with a sibling branch's (grammar 7.6.1, 8.6, D147)
 # code: shared-workspace
+# severity: warning
 # message: `flow.work` node `implement` dispatched by `left` and `flow.main` node `right` can run concurrently and their `workspace:` is written the same way
-# at: main.yml:100:20
-# label: main.yml:65:20 the other run is contained here
-# label: main.yml:88:7 one of the two runs is inside this step
-# label: main.yml:97:7 and the other is inside this one
+# at: main.yml:101:20
+# label: main.yml:66:20 the other run is contained here
+# label: main.yml:89:7 one of the two runs is inside this step
+# label: main.yml:98:7 and the other is inside this one
 # help: two edges of one fork that are not provably exclusive can both fire, so the branches they start are concurrent — and two harness runs inside one directory edit each other's files. `'${REPO_ROOT}'` reads nothing from either run's own scope, so it is one path however the instances are bound. Give one of them a directory of its own: carry it in on the `input:` of the step that starts the instance — a `flow:` node or a map dispatch — and read it here (`workspace: "input.worktree"`), or write `workspace: fresh` on each for a directory the runtime provisions per dispatch. A **warning** rather than a refusal because equality here is a launch fact: a value bearing an `${ENV}` reference resolves on the machine that runs it, so two values this compiler reads as different may still be one directory, and two it reads as the same is the half it can see (grammar 7.6.1, 8.9, Decision D147, PRD resolved q61 ruling b)
 #
 # The concurrent half of PRD resolved q61 ruling b read over a **`map`** step.

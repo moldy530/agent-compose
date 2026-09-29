@@ -1,7 +1,8 @@
 # rule: a field of a known `server_tools:` entry with no near miss in the table is warned about with what this release does check on that tool (grammar 12.1, Decision D122)
 # code: unknown-server-tool-field
+# severity: warning
 # message: server tool `web_search` of `provider.main` declares `sources`, which is not a field this compiler release knows it has: the value is unchecked and travels to the provider as written
-# at: main.yml:20:16
+# at: main.yml:21:16
 # help: the fields this release checks on `web_search` are `filters`, `search_context_size`, `user_location`; anything else is carried unchecked, so a parameter the vendor adds later works here the day it ships (grammar 12.1, Decision D122)
 #
 # The same rule as `server-tool-declares-a-field-this-release-cannot-check`, on
