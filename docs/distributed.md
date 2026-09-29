@@ -1031,6 +1031,13 @@ the *name* of an environment variable, expanded by the installer, so the tarball
 carries no secret and a rotated token is the same artifact under the same hash;
 the variable itself is on the worker's own manifest, which is §9.1's business.
 
+**A target's `harnesses:` needs nothing here either.** A harness SDK moved inside
+the compiler's audited range (`docs/grammar.md` §14.8, PRD resolved q66) is a
+line of the artifact's own `package.json`, so step 4 installs the target's
+version on every worker exactly as it installs every other pin — and the
+artifact hash moves with it, because a different SDK release is a different
+artifact.
+
 ### 4.1 The handshake triple
 
 A join agrees on three values, and all three are on the wire, in the join §3.1
