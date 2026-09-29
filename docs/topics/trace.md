@@ -199,10 +199,12 @@ changes made without a version bump.
 
 A `coder:` node runs somebody else's agent loop (`agent-compose docs agents`),
 and what the trace carries of one is a record of its own on the entry's
-`harness`: which harness and which pinned SDK, the run's **top-level** turns with
-whatever usage that harness reports, its top-level tool events in the same
-three-outcome vocabulary a tool call uses, and a cost rollup — money where the
-harness estimates one, tokens where it counts them.
+`harness`: which harness and which version of its SDK ran, the run's
+**top-level** turns with whatever usage that harness reports, its top-level tool
+events in the same three-outcome vocabulary a tool call uses, and a cost rollup
+— money where the harness estimates one, tokens where it counts them. The SDK
+version is the installed package's own, not the one the compiler pinned, so a
+project whose `package.json` moved the SDK after `build` says so in its trace.
 
 Depth is the rule worth knowing: a harness that runs subagents of its own keeps
 their transcripts in the run's journal record and out of the trace. The other

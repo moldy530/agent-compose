@@ -3595,11 +3595,15 @@ is the complete hub state (`docs/durability.md` §12). Those stores are debuggin
 backstops.
 
 The trace carries a `HarnessRecord` per run ([`docs/trace.md`](trace.md) §7.6):
-the harness and its pinned SDK version, the run's **top-level** turns with their
-usage, its top-level tool events, a cost rollup, and a harness-tagged extension
-field for what one harness reports and the other has no shape for. A harness that
-runs subagents of its own keeps their transcripts in the journal payload and out
-of the envelope.
+the harness and the version of its SDK that ran, the run's **top-level** turns
+with their usage, its top-level tool events, a cost rollup, and a harness-tagged
+extension field for what one harness reports and the other has no shape for. The
+version is the installed package's own rather than the compiled-in pin, so it
+is the pin in a project installed from the manifest `build` wrote and a
+different number wherever that manifest was edited — the drift is in the trace
+rather than hidden by it (an amendment to PRD resolved q57 ruling a's "pinned
+version"). A harness that runs subagents of its own keeps their transcripts in
+the journal payload and out of the envelope.
 
 #### A missing harness
 

@@ -8156,7 +8156,8 @@ export interface HarnessRecord {
    * `<package>@<version>` — the installed one, read off its own manifest
    * ([`HarnessDriver.version`]). In a project installed from the manifest
    * `build` wrote, that is the version this compiler release pinned; where it is
-   * not, the difference is the edit `build --check` reports.
+   * not, the manifest was edited after `build` (the edit `build --check`
+   * reports) or the tree that ran is not the one it installs.
    */
   readonly sdk: string;
   /** The `model.*` the composition named (grammar 12.2). */

@@ -1049,7 +1049,7 @@ section:
 | part | what it is | who reads it |
 |---|---|---|
 | the **answer** | the run's structured output, already through the node's `output:` gate | a replay, which consumes it and does not run the harness again |
-| the **record** | the trace's account of the run — its harness and pinned SDK, its top-level turns and tool events, its cost rollup (`docs/trace.md` §7.6) | a resumed generation, which writes a fresh trace document whole (§9) and would otherwise report a run that never happened |
+| the **record** | the trace's account of the run — its harness and the SDK version that ran, its top-level turns and tool events, its cost rollup (`docs/trace.md` §7.6) | a resumed generation, which writes a fresh trace document whole (§9) and would otherwise report a run that never happened |
 | the **payload** | the run's whole event stream: every turn, tool call, reasoning item and subagent transcript the SDK yielded | nothing, in a normal run. It is the private half §8 is about |
 
 **The payload is where a harness's transcript lives, and where it stays.** It is
