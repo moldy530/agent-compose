@@ -785,6 +785,69 @@ fn the_target_reaches_the_emitted_project() {
     assert_eq!(code(&crossed), 1);
 }
 
+/// **A target that moves a harness SDK with `harnesses:` builds, and checks
+/// clean against what it built** (grammar 14.8, PRD resolved q66 ruling d).
+///
+/// `build --check` is clean by construction — the manifest says what the target
+/// said — and this is where that is held rather than assumed: the build writes
+/// the target's version into `package.json` in the pin's place, a `--check`
+/// straight after answers that the directory is up to date, and the same
+/// directory checked against the target that declares **no** override is drift,
+/// because a different SDK version is a different artifact (PRD resolved q40).
+#[test]
+fn a_target_that_moves_a_harness_sdk_builds_and_checks_clean() {
+    let out = scratch("harness-sdk");
+    let path = out.to_str().expect("a UTF-8 scratch path");
+    let built = build(&[
+        "examples/patch-pipeline/main.yml",
+        "--target",
+        "canary",
+        "--out",
+        path,
+    ]);
+    assert_eq!(code(&built), 0, "{}", stderr(&built));
+
+    let manifest: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(out.join("package.json")).expect("the manifest is readable"),
+    )
+    .expect("the manifest is JSON");
+    let deploy = fs::read_to_string(repo_root().join("examples/patch-pipeline/deploy/canary.yml"))
+        .expect("the canary deploy file is readable");
+    let declared = deploy
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("sdk_version: "))
+        .map(|value| value.trim_matches('"'))
+        .expect("the canary target declares an SDK version");
+    assert_eq!(
+        manifest["dependencies"]["@anthropic-ai/claude-agent-sdk"], declared,
+        "`package.json` does not declare the version the target's `harnesses:` accepted"
+    );
+
+    let clean = build(&[
+        "examples/patch-pipeline/main.yml",
+        "--target",
+        "canary",
+        "--out",
+        path,
+        "--check",
+    ]);
+    assert_eq!(code(&clean), 0, "{}", stderr(&clean));
+    assert!(
+        stderr(&clean).contains("is up to date"),
+        "{}",
+        stderr(&clean)
+    );
+
+    // …and the pinned build of the same composition is a different artifact.
+    let pinned = build(&["examples/patch-pipeline/main.yml", "--out", path, "--check"]);
+    assert_eq!(code(&pinned), 1, "{}", stderr(&pinned));
+    assert!(
+        stderr(&pinned).contains("`package.json`"),
+        "the drift a moved SDK leaves is not reported against the manifest: {}",
+        stderr(&pinned)
+    );
+}
+
 /// An invalid composition emits nothing: generated code is a build artifact of a
 /// valid spec (PRD 5.12).
 #[test]

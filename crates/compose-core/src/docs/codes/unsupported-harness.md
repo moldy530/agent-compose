@@ -14,6 +14,10 @@ has and does not lower is a *scope* statement, and the two deserve different
 answers. Writing `harness: deepagents` and being told "did you mean `codex`?"
 would suggest the composition was misspelled, when what it was is early.
 
+A target's `harnesses:` is keyed by the same enum, and refuses the same two
+names the same way (grammar §14.8): an entry pinning `deepagents`'s SDK has no
+driver to install it for, so there is nothing for its `sdk_version:` to move.
+
 ## A spec that triggers it
 
 ```yaml triggers
@@ -69,5 +73,5 @@ If you are here because you want a harness this release does not have, the set
 grows by a resolved question in `prd.md` rather than by a release adding a name
 — which is the same rule the built-in tool set is under.
 
-Grammar: `docs/grammar.md` §8.9, Decision D136. Topic:
+Grammar: `docs/grammar.md` §8.9, §14.8, Decision D136. Topic:
 `agent-compose docs agents`.

@@ -1,0 +1,5 @@
+version: "0.1"
+
+harnesses:
+  deepagents:
+    sdk_version: "0.2.0"

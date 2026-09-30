@@ -1,0 +1,5 @@
+version: "0.1"
+
+harnesses:
+  cc:
+    sdk_version: "${CC_SDK_VERSION}"

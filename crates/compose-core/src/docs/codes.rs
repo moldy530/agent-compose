@@ -166,6 +166,10 @@ pub fn explanation(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::UnsupportedJournalKey => {
             include_str!("codes/unsupported-journal-key.md")
         }
+        DiagnosticCode::HarnessSdkOutsideAuditedRange => {
+            include_str!("codes/harness-sdk-outside-audited-range.md")
+        }
+        DiagnosticCode::UnboundHarnessSdk => include_str!("codes/unbound-harness-sdk.md"),
     }
 }
 

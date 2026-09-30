@@ -1,8 +1,9 @@
 # rule: a route's members declare one `server_tools:` suite (grammar 12.2, Decision D122)
 # code: mismatched-server-tools
+# severity: warning
 # message: `model.resilient` fails over from `provider.primary` to `provider.spare`, which declares a different `server_tools:` suite: it does not declare `web_search_20250305`
-# at: main.yml:33:26
-# label: main.yml:33:11 `provider.primary` is the first member's provider
+# at: main.yml:34:26
+# label: main.yml:34:11 `provider.primary` is the first member's provider
 # help: a server tool runs on the provider's side, so each member of a route offers its own suite and which tools the model had depends on which member served the call: declare the same suite, field for field, on both providers, or keep this one knowing the difference (grammar 12.2, Decision D122)
 #
 # Failover capability is per-chain-member by construction — each provider

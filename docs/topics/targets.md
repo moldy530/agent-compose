@@ -8,8 +8,8 @@ compositions.
 
 A deploy file is never imported. It is a document kind of its own, and the two
 kinds are disjoint — a spec file declaring `hub:`, `placements:`,
-`storage_backends:`, `journal:`, `package_registry:`, `trace_sink:` or
-`event_sources:` is an
+`storage_backends:`, `journal:`, `package_registry:`, `harnesses:`,
+`trace_sink:` or `event_sources:` is an
 error, and so is a
 deploy file declaring definitions, `imports:`, `state:`, `triggers:` or
 `defaults:`.
@@ -45,6 +45,10 @@ package_registry:
       url: "https://npm.internal.example/repository/corp/"
       token: ${NPM_CORP_TOKEN}
 
+harnesses:
+  cc:
+    sdk_version: "0.3.285"
+
 trace_sink:
   url: "https://collector.internal.example/v1/traces"
   format: otlp
@@ -60,8 +64,8 @@ event_sources:
     consumer_group: agent-compose
 ```
 
-The spec side of that project needs nothing unusual — a store names an alias and
-that is all:
+The spec side of that project needs nothing unusual — a store names an alias, a
+coder node names its harness, and that is all:
 
 ```yaml spec
 version: "0.1"
@@ -102,6 +106,32 @@ flow.ingest:
   edges:
     - { from: start, to: save }
     - { from: save, to: end }
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.coding:
+  provider: provider.anthropic
+  id: coding-model
+
+flow.fix:
+  inputs:
+    goal: { type: string }
+  outputs: {}
+  nodes:
+    implement:
+      coder:
+        harness: cc                 # which SDK release serves it is the target's
+        model: model.coding
+        workspace: "'${REPO_ROOT}'"
+        prompt: Make the failing test pass, then say what you changed.
+        output:
+          summary: { type: string }
+      input: "input.goal"
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }
 ```
 
 That file validates under `--target local` with no deploy file at all, and under
@@ -118,14 +148,16 @@ unconditionally. Four consequences:
 - `deploy/local.yml` is **optional**, and `--target local` with no file is the
   zero-config path, not an error.
 - When present it may declare `hub:`, `placements:`, `package_registry:`,
-  `trace_sink:` and `event_sources:`. The first two are live grammar checked
-  under every target — a `local` mesh is the hub and its workers on one machine,
-  which is how you develop one. `package_registry:` is live here as well, for the
-  plainest version of the same reason: a project built on the laptop is a project
-  somebody runs `bun install` in, and the network that mandates a mirror mandates
-  it there too. `trace_sink:` is live here because a laptop's `run` settles
-  executions like any other target, and `event_sources:` is reserved grammar
-  carried into the IR.
+  `harnesses:`, `trace_sink:` and `event_sources:`. The first two are live
+  grammar checked under every target — a `local` mesh is the hub and its workers
+  on one machine, which is how you develop one. `package_registry:` is live here
+  as well, for the plainest version of the same reason: a project built on the
+  laptop is a project somebody runs `bun install` in, and the network that
+  mandates a mirror mandates it there too. `harnesses:` is live here on that same
+  reasoning — there is nothing in it for `local` to override, and the project
+  built on the laptop is the project whose harness runs there. `trace_sink:` is
+  live here because a laptop's `run` settles executions like any other target,
+  and `event_sources:` is reserved grammar carried into the IR.
 - It **must not** declare `storage_backends:`, and it **must not** declare
   `journal:`. Both are *active* grammar which `local` overrides unconditionally —
   it substitutes local storage for every store, and it binds the SQLite journal
@@ -328,6 +360,68 @@ Four things worth knowing:
   `README.md` and in the artifact hash over all three — and npm would then send
   those Basic credentials and ignore your `token` entirely.
 
+## `harnesses` — which SDK release serves a harness
+
+A `coder:` node runs a vendor's harness SDK, and each compiler release pins
+every one of them exactly. When a vendor ships a patch you need — a bundled CLI
+that serves a model the pinned one refuses — a target can move that SDK without
+waiting for a compiler release:
+
+```yaml
+# deploy/canary.yml
+version: "0.1"
+
+harnesses:
+  cc:
+    sdk_version: "0.3.285"
+```
+
+| Key | Shape |
+|---|---|
+| `<harness>` | `cc` or `codex` — the harness as a `coder:` node's `harness:` names it |
+| `<harness>.sdk_version` | required; one exact version, a literal |
+
+The version has to sit inside the range **this compiler release audited** that
+SDK for: `[audited, next minor)`, from the release the reserved `settings:` list
+was checked against up to the next minor. `agent-compose explain
+harness-sdk-outside-audited-range` prints the ranges and why they stop where they
+do. For this release:
+
+| Harness | SDK | Pin | Audited range |
+|---|---|---|---|
+| `cc` | `@anthropic-ai/claude-agent-sdk` | `0.3.284` | `[0.3.284, 0.4.0)` |
+| `codex` | `@openai/codex-sdk` | `0.154.0` | `[0.154.0, 0.155.0)` |
+
+`agent-compose build main.yml --target canary` writes `0.3.285` into
+`package.json` in the pin's place — for that SDK alone; its peers, and every
+other harness's SDK, stay at the compiler's pins. The emitted README's pins table
+shows the pin and your version beside it, `build --check` compares against what
+the target said, and a coder node's trace record names the version that ran.
+
+Five things worth knowing:
+
+- **Outside the range is refused by name, above and below.** `0.4.0` is the next
+  minor, which nobody audited: a release past the range may carry an option that
+  reaches around a bound the node states, and the reserved-list audit is the
+  boundary. `0.3.272` is older than the audit and is refused too — it is not the
+  release the driver's contracts were verified against. Going further is a
+  compiler release, never a deploy key.
+- **The version is exact and literal.** `^0.3.284` or `0.3.x` would hand the
+  choice back to the installer, and `${CC_SDK_VERSION}` is a version `validate`
+  cannot read — both are refused. The range is the compiler's to declare. Build
+  metadata is refused as well: npm installs `0.3.284` for `0.3.284+local.1`, so
+  the manifest would name a release no install holds — write the release itself.
+- **A key is a harness this release lowers.** `claude` is not a harness name and
+  is answered with the two that are; `deepagents` and `native` are reserved and
+  refused, exactly as on a node — they have no driver, so there is no SDK to pin.
+- **An entry for a harness no `coder:` node binds is a warning**, because it
+  emits nothing — and a deploy file outlives the compositions it serves, so it
+  is not an error.
+- **Nothing else moves.** LangGraph and the rest of the project's pins have no
+  deploy key; no lockfile is emitted; and a harness's `settings:` are checked
+  exactly as before — this changes which release is installed, never what a
+  setting may say.
+
 ## `trace_sink` — where every trace goes
 
 Every other way of reading a trace is somebody asking for **one**: `run --format
@@ -506,4 +600,4 @@ outside the list — see `agent-compose docs triggers`. What that adds to a
 the manifest a built project checks at process start, so a deployment receiving
 only the secrets its own surfaces name receives these too.
 
-Normative source: `docs/durability.md`, `docs/distributed.md`, `docs/trace.md`, `docs/grammar.md` §14, §14.1–14.7, §15
+Normative source: `docs/durability.md`, `docs/distributed.md`, `docs/trace.md`, `docs/grammar.md` §14, §14.1–14.8, §15

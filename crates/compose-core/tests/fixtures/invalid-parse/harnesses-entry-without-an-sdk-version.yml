@@ -1,0 +1,8 @@
+# rule: a `harnesses:` entry states the SDK version it pins (grammar 14.8)
+# code: missing-key
+# message: missing required key `sdk_version` in `harnesses.cc`
+# at: 8:7
+version: "0.1"
+
+harnesses:
+  cc: {}

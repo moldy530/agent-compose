@@ -16,13 +16,22 @@
 //! # at: main.yml:31:5
 //! # label: main.yml:9:3 the channel is declared here
 //! # help: <optional, asserted when present>
+//! # severity: <optional, `error` or `warning`; defaults to `error`>
 //! # count: <optional, total diagnostics expected; defaults to 1>
 //! # target: <optional, the target to resolve for; defaults to `local`>
 //! ```
 //!
 //! Header reading stops at the first line that is not a `# `-prefixed comment,
-//! and a comment whose key is not one of the eight above is skipped — so a
+//! and a comment whose key is not one of the nine above is skipped — so a
 //! fixture may carry as much prose after its header as the case needs.
+//!
+//! `# severity:` is asserted on **every** fixture, defaulting to `error`: a
+//! warning is a ruling that the composition is accepted with a caveat (an
+//! `unbound-harness-sdk` entry waiting for the composition that binds it, PRD
+//! resolved q66 ruling c), and a regression that turns it into an error fails
+//! every `validate` and `build` of a deploy file that was legal the day before.
+//! So a rule that warns says so in its header, and a rule that refuses says
+//! nothing and is held to refusing.
 //!
 //! `# label:` is the one repeatable key: a rule that points at several sites
 //! declares one line per site, in the order the diagnostic carries them, and
@@ -37,7 +46,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use compose_core::{Diagnostic, resolve_with_target};
+use compose_core::{Diagnostic, Severity, resolve_with_target};
 
 /// Every code the validator raises. The corpus must exercise all of them.
 ///
@@ -102,6 +111,9 @@ const CHECK_CODES: &[&str] = &[
     "unsupported-connection-fact",
     "unsupported-provider-kind",
     "conflicting-connection-variable",
+    "unexpected-env-ref",
+    "harness-sdk-outside-audited-range",
+    "unbound-harness-sdk",
 ];
 
 struct Anchor {
@@ -117,6 +129,7 @@ struct Expectation {
     at: Anchor,
     labels: Vec<(Anchor, String)>,
     help: Option<String>,
+    severity: Severity,
     count: usize,
     target: String,
 }
@@ -182,7 +195,11 @@ fn header(case: &Path) -> Expectation {
             labels.push(value.trim().to_string());
             continue;
         }
-        if ["rule", "code", "message", "at", "help", "count", "target"].contains(&key) {
+        if [
+            "rule", "code", "message", "at", "help", "severity", "count", "target",
+        ]
+        .contains(&key)
+        {
             values
                 .entry(key)
                 .or_insert_with(|| value.trim().to_string());
@@ -213,6 +230,13 @@ fn header(case: &Path) -> Expectation {
             })
             .collect(),
         help: values.get("help").cloned(),
+        severity: match values.get("severity").map(String::as_str) {
+            None | Some("error") => Severity::Error,
+            Some("warning") => Severity::Warning,
+            Some(other) => {
+                panic!("{label}: `# severity:` is `error` or `warning`, got `{other}`")
+            }
+        },
         count: values
             .get("count")
             .map(|count| {
@@ -230,8 +254,9 @@ fn header(case: &Path) -> Expectation {
 
 fn as_header(diagnostic: &Diagnostic) -> String {
     let mut rendered = format!(
-        "    # code: {}\n    # message: {}\n    # at: {}:{}:{}",
+        "    # code: {}\n    # severity: {}\n    # message: {}\n    # at: {}:{}:{}",
         diagnostic.code,
+        diagnostic.severity,
         diagnostic.message,
         diagnostic.span.source,
         diagnostic.span.start.line,
@@ -328,6 +353,12 @@ fn every_fixture_produces_exactly_the_diagnostic_it_declares() {
                     problems.push(format!(
                         "message differs\n      expected: {}\n      actual:   {}",
                         expected.message, diagnostic.message
+                    ));
+                }
+                if diagnostic.severity != expected.severity {
+                    problems.push(format!(
+                        "severity differs: expected {}, actual {}",
+                        expected.severity, diagnostic.severity
                     ));
                 }
                 check_anchor(&mut problems, "position", &expected.at, &diagnostic.span);

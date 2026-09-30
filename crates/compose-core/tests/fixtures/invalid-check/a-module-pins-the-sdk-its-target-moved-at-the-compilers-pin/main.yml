@@ -1,0 +1,52 @@
+# rule: a `module:` dependency agrees with the version of a harness SDK the target installs, which is the target's `harnesses:` version where it moved one (grammar 6.1, 14.8, Decision D133, PRD resolved q66)
+# code: invalid-dependency
+# message: `tool.sign` pins `@anthropic-ai/claude-agent-sdk` to `0.3.284`, which this project already holds at `0.3.285`
+# at: main.yml:32:41
+# help: a `coder:` node binding `harness: cc` brings `@anthropic-ai/claude-agent-sdk`, and this target's `harnesses.cc` moves it to `0.3.285` in the compiler pin's place — the generated `package.json` holds one version of it, so pin `0.3.285` or drop the pin (grammar 8.9, 14.8, PRD resolved q57, q66)
+# target: canary
+#
+# The pin below is the compiler's own, and under any other target it would agree
+# with `package.json`. Under `canary` it does not: the target moved the Agent SDK
+# to `0.3.285`, which is what `build` writes in the pin's place, so one manifest
+# would hold two versions of one package. The rule reads the version the target
+# installs rather than the compiler's constant.
+version: "0.1"
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.implementer:
+  provider: provider.anthropic
+  id: coding-model
+
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module:
+    path: ./src/tools/sign.ts
+    dependencies:
+      "@anthropic-ai/claude-agent-sdk": "0.3.284"
+
+state:
+  summary: { type: string, default: "" }
+
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: "'${REPO_ROOT}'"
+        prompt: Make the change.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }

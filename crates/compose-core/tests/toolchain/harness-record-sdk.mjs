@@ -33,14 +33,22 @@
 //     installs: the fork ran, so its record names the fork's version under the
 //     SDK's own name. The `codex` one names nothing and carries no version, so
 //     the only version walking up from it is the project's own `package.json`:
-//     its record falls back to the pin rather than borrowing that.
+//     its record falls back to the pin rather than borrowing that;
+//   * `declared` — stand-ins at exactly the versions the project's own
+//     `package.json` declares for each SDK, which is what `bun install` puts
+//     there, and the run's trace written out as the **envelope** —
+//     `src/runtime.ts`'s `traceDocument`, the one writer of the document the
+//     trace file and the sink both carry. Run against a golden whose target
+//     moved an SDK with `harnesses:` (grammar 14.8, PRD resolved q66), the
+//     record names the target's version: the one mode that installs what a
+//     manifest `build` wrote declares rather than something edited in after.
 //
 // Every stand-in keeps its entry point in `dist/`, below a nested
 // `dist/package.json` carrying only a `type`, so a lookup that took the first
 // manifest it met rather than the package root's would read no version in any
 // mode.
 //
-// Usage: bun harness-record-sdk.mjs <generated project directory> <scratch dir> <pinned|installed|unreadable|renamed>
+// Usage: bun harness-record-sdk.mjs <generated project directory> <scratch dir> <pinned|installed|unreadable|renamed|declared>
 // Output: one JSON object, read by `generated_code_gates.rs`.
 
 import fs from "node:fs";
@@ -49,7 +57,7 @@ import process from "node:process";
 import { pathToFileURL } from "node:url";
 
 const [, , project, scratch, mode] = process.argv;
-const MODES = ["pinned", "installed", "unreadable", "renamed"];
+const MODES = ["pinned", "installed", "unreadable", "renamed", "declared"];
 if (project === undefined || scratch === undefined || !MODES.includes(mode)) {
   throw new Error(
     `usage: bun harness-record-sdk.mjs <generated project directory> <scratch dir> <${MODES.join("|")}>`,
@@ -91,11 +99,22 @@ function standIn(name, source, identity) {
   return pathToFileURL(path.join(directory, "dist", "index.mjs")).href;
 }
 
+/**
+ * The versions the project's own `package.json` declares, by package — what an
+ * install made from the manifest `build` wrote would put under `node_modules/`.
+ */
+const DECLARED = JSON.parse(fs.readFileSync(path.join(project, "package.json"), "utf8")).dependencies;
+
 /** What each stand-in's root manifest carries, per mode. */
 function identityOf(name) {
   switch (mode) {
     case "installed":
       return { name, version: INSTALLED };
+    case "declared":
+      if (typeof DECLARED[name] !== "string") {
+        throw new Error(`\`package.json\` declares no \`${name}\``);
+      }
+      return { name, version: DECLARED[name] };
     case "unreadable":
       return { name };
     case "renamed":
@@ -210,6 +229,30 @@ if (mode !== "pinned") {
   const { runFlow } = await import(pathToFileURL(path.resolve(project, "src/index.ts")).href);
   const run = await runFlow("flow.patch", { goal: "make the failing test pass" });
   results["outputs"] = run.outputs;
+  if (mode === "declared") {
+    // The envelope, exactly as the trace file and the sink carry it: the
+    // runtime's own writer over the run's entries, so the record read below
+    // is the one a reader of the document meets.
+    const runtime = await import(pathToFileURL(path.resolve(project, "src/runtime.ts")).href);
+    const envelope = runtime.traceDocument({
+      execution: "exec_declared",
+      flow: "flow.patch",
+      status: "completed",
+      entries: run.trace,
+    });
+    results["declared"] = { cc: DECLARED[CC_SDK], codex: DECLARED[CODEX_SDK] };
+    results["envelope"] = {
+      trace_version: envelope.trace_version,
+      records: envelope.entries.flatMap((entry) =>
+        (entry.harness ?? []).map((record) => ({
+          node: entry.node,
+          harness: record.harness,
+          outcome: record.outcome,
+          sdk: record.sdk,
+        })),
+      ),
+    };
+  }
   results["records"] = run.trace.flatMap((entry) =>
     (entry.harness ?? []).map((record) => ({
       node: entry.node,

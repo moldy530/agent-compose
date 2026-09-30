@@ -1,0 +1,10 @@
+# rule: a `harnesses:` entry is closed, and its one key is `sdk_version:` — the peers stay at the compiler's pins (grammar 14.8, D50)
+# code: unknown-key
+# message: unknown key `peers` in `harnesses.cc`
+# at: 10:5
+version: "0.1"
+
+harnesses:
+  cc:
+    sdk_version: "0.3.285"
+    peers: pinned

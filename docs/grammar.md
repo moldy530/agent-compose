@@ -78,10 +78,10 @@ other, never both (Decision [D3](#d3-spec-files-and-deploy-files-are-disjoint-do
 | Kind | Selected by | May contain |
 |---|---|---|
 | **Spec file** | reachable from the entrypoint's `imports:`, or being the entrypoint | `version`, `imports` (entrypoint only), `defaults`, `state`, `triggers`, typed-address definition keys |
-| **Deploy file** | `--target <name>` → `deploy/<name>.yml` | `version`, `hub`, `placements`, `storage_backends`, `journal`, `package_registry`, `trace_sink`, `event_sources` |
+| **Deploy file** | `--target <name>` → `deploy/<name>.yml` | `version`, `hub`, `placements`, `storage_backends`, `journal`, `package_registry`, `harnesses`, `trace_sink`, `event_sources` |
 
 A spec file that declares `hub`, `placements`, `storage_backends`, `journal`,
-`package_registry`, `trace_sink`,
+`package_registry`, `harnesses`, `trace_sink`,
 or `event_sources` is a compile error, and a deploy file that declares
 definitions, `imports`, `state`, `triggers`, or `defaults` is a compile error. This is the
 mechanical enforcement of the PRD 5.8 per-target invariant: only the deploy layer
@@ -159,6 +159,7 @@ imports:
 | `storage_backends` | illegal | illegal | allowed | ≤ 1 per target |
 | `journal` | illegal | illegal | allowed | ≤ 1 per target |
 | `package_registry` | illegal | illegal | allowed | ≤ 1 per target |
+| `harnesses` | illegal | illegal | allowed | ≤ 1 per target |
 | `trace_sink` | illegal | illegal | allowed | ≤ 1 per target |
 | `event_sources` | illegal | illegal | allowed | ≤ 1 per target |
 
@@ -793,8 +794,9 @@ channel names, typed addresses, a store's `backend:` alias, a tool's
 `function.name`, an event trigger's `source:`); `version:`; `imports:` entries;
 a trigger's `path:`, `cron:`, and `timezone:` (§13.3, §13.4); the `header:` and
 `prefix:` of an `auth:`/`callback_auth:` scheme and every `callback_allow:` entry
-(§13.3); `hub.public_url:` (§14.2), `trace_sink.url:` (§14.5) and
-`package_registry`'s `url:`s (§14.6), which are
+(§13.3); `hub.public_url:` (§14.2), `trace_sink.url:` (§14.5),
+`package_registry`'s `url:`s (§14.6) and each `harnesses:` entry's
+`sdk_version:` (§14.8), which are
 shape-checked here and are part of what a deployment *is*; a `blob put`'s `content_type:` (§11.4); and every
 enum-valued key.
 
@@ -3555,7 +3557,10 @@ about something else. So is every option that
 **resumes a previous session**, for a different reason: harness-native resume is
 a named exclusion (below), not a bound. The reserved set is per harness and
 audited against the SDK release this compiler pins, so a vendor's new option
-arrives with the pin rather than behind it.
+arrives with the pin rather than behind it. That audit is also the bound on how
+far a target may move the SDK: a deploy file's `harnesses:` may pin another
+exact release inside the range the audit covers, `[audited, next minor)`, and
+no further (§14.8).
 
 **An option in this wider half answers to no key, and the message says so** rather
 than naming the nearest one. Additional roots are the case worth spelling out:
@@ -3608,8 +3613,10 @@ payload and out of the envelope.
 
 #### A missing harness
 
-The SDK a `coder:` node needs is pinned in the generated `package.json` and
-installed with the rest of a project's dependencies. A host that cannot reach it
+The SDK a `coder:` node needs is pinned in the generated `package.json` — at
+this compiler release's pin, or at the version the target's `harnesses:`
+accepted in its place (§14.8) — and installed with the rest of a project's
+dependencies. A host that cannot reach it
 is an **execution failure naming the requirement**, never a compile error: which
 machine has which SDK installed is a property of the machine, and it is the same
 posture §5.5 takes for a host with no `bash` on `PATH`.
@@ -5200,7 +5207,8 @@ well-defined rather than a file the grammar half-recognizes (Decision
 [D87](#d87-local-is-a-reserved-target-and-deploylocalyml-carries-no-storage_backends)):
 
 - `deploy/local.yml` is OPTIONAL. When present it MAY declare `hub:`,
-  `placements:`, `package_registry:`, `trace_sink:` and `event_sources:`. The
+  `placements:`, `package_registry:`, `harnesses:`, `trace_sink:` and
+  `event_sources:`. The
   first two are **live**
   static grammar (§14.1, §14.2) and are checked under every target including
   `local`, which is what a mesh looks like on one machine: this process is the
@@ -5210,7 +5218,10 @@ well-defined rather than a file the grammar half-recognizes (Decision
   execution that settles. `package_registry:` is live under `local` as well, and
   for the plainest version of the same reason: a project built on the laptop is
   a project somebody runs `bun install` in, and the network that mandates a
-  mirror mandates it there too (§14.6). `event_sources:` is reserved grammar
+  mirror mandates it there too (§14.6). `harnesses:` is live under `local` on
+  the same reasoning rather than on D87's: there is nothing in it for `local` to
+  override, and the project built on the laptop is the project whose harness
+  runs there (§14.8). `event_sources:` is reserved grammar
   (§15), parsed,
   type-checked, and carried into the IR under every target, so it is not inert
   there either.
@@ -5270,6 +5281,10 @@ package_registry:
     "@corp":
       url: "https://npm.internal.example/repository/corp/"
       token: ${NPM_CORP_TOKEN}
+
+harnesses:
+  cc:
+    sdk_version: "0.3.285"
 
 trace_sink:
   url: "https://collector.internal.example/v1/traces"
@@ -5893,6 +5908,132 @@ exclusion for **SQLite** journals only (PRD resolved q28) — a file is a file.
 What it costs is the operator's: retention is a `DELETE` rather than removing
 one file, and the payloads a journal holds (`docs/durability.md` §8) are private
 recovery data that binding into a shared database is an explicit choice about.
+
+### 14.8 `harnesses`
+
+**Which release of a harness's SDK this target's project installs.** Each
+compiler release pins every harness SDK exactly, as it pins LangGraph (PRD 5.12,
+resolved q57), and for two reasons rather than one: a harness SDK *is* what a
+`coder:` node's behaviour is, and the reserved `settings:` list (§8.9, Decision
+[D146](#d146-a-coder-nodes-permission-mode-is-a-key-bounded-by-access-and-a-reserved-setting-is-refused))
+is an audit of **one** release's option surface — an unaudited release may carry
+an option that reaches around a bound the node states. This block lifts the
+first reason on the terms the second sets: a target may move a harness's SDK to
+another exact version, but only inside the range this compiler release audited
+it for. Which SDK serves a harness is a fact about the artifact a target builds,
+not about the graph, so the composition says nothing (PRD resolved q66).
+
+| Key | Type | Required | Notes |
+|---|---|---|---|
+| `<harness>` | `cc` \| `codex` | — | the harness, spelled as a `coder:` node's `harness:` spells it (§8.9, [D136](#d136-kind-coder-is-a-node-kind-and-harness-is-a-binding)); `deepagents` and `native` are refused |
+| `<harness>.sdk_version` | exact version literal | yes | `MAJOR.MINOR.PATCH`, optionally `-prerelease`, inside the harness's audited range; never `+build` metadata, never `${ENV}` |
+
+```yaml
+harnesses:
+  cc:
+    sdk_version: "0.3.285"
+```
+
+The audited ranges this release declares, each `[audited, next minor)` — the
+version the reserved-list audit was performed at, forward through that minor:
+
+| Harness | SDK package | Pin | Audited range |
+|---|---|---|---|
+| `cc` | `@anthropic-ai/claude-agent-sdk` | `0.3.284` | `[0.3.284, 0.4.0)` |
+| `codex` | `@openai/codex-sdk` | `0.154.0` | `[0.154.0, 0.155.0)` |
+
+The pin is the floor in every release, and the floor is the audit's own anchor:
+the two are one number held equal by a test, so neither moves alone.
+
+The rules (Decision
+[D151](#d151-a-target-may-pin-a-harness-sdk-inside-the-range-the-compiler-audited-it-for)):
+
+1. **A key names a harness this release lowers.** A name the `harness:` enum
+   does not have is a typo and is `unknown-variant`, with a suggestion where one
+   is near and the two names it takes otherwise; a name it
+   has and does not lower — `deepagents`, `native` — is `unsupported-harness`,
+   exactly as on a node: a reserved harness has no driver, so no project
+   installs an SDK for it and there is nothing to pin.
+2. **`sdk_version:` is required, a literal, and exact.** It is the block's one
+   key, and any other is an error
+   ([D50](#d50-unknown-keys-are-errors-everywhere-except-plugin-config-objects)).
+   A version is a build fact, not a secret: a `${ENV}` reference is
+   `unexpected-env-ref` (§4.3 class 3), because `validate` has to read the
+   version to hold it to the range. A range, a tag or a specifier — `^0.3.284`,
+   `~0.3.284`, `>=0.3.284`, `0.3.x`, `latest`, `npm:`/`git`/`file` — is
+   `invalid-value`: PRD 5.12's discipline is exactness, and the range is the
+   compiler's to declare, not the deployment's. Exact is §6.1's rule for a
+   `module:` dependency
+   ([D133](#d133-a-module-binding-declares-its-environment-and-pins-its-dependencies-exactly)),
+   read the same way, with one refusal more: **build metadata** —
+   `0.3.284+local.1` — is exact semver and still `invalid-value` here, because
+   it names no release an install can hold. npm reads past it when it resolves
+   a version and a registry publishes no release under it, so `0.3.284+local.1`
+   installs `0.3.284`; accepted, it would put into `package.json`, the README's
+   pins table and the driver's fallback constant a version the `HarnessRecord`
+   of every run contradicts.
+3. **The version is inside the harness's audited range.** A version above it
+   **or below it** is `harness-sdk-outside-audited-range`, naming the harness,
+   the version asked for, the range, the audited version it is anchored on, and
+   the fact that the reserved-list audit is the boundary. Placement is semver
+   precedence, and the range is one minor's releases: `0.3.99` is below
+   `0.3.284` whatever its text sorts as, a prerelease of the floor precedes the
+   floor, and `0.4.0-rc.1` — which precedes `0.4.0` — is still above
+   `[0.3.284, 0.4.0)`, because it is a release of the minor nobody audited.
+
+   **What the range promises is precise and small: no *known* reach-around.**
+   Every option the audited release accepts was classified at the floor, under
+   both readings of its option surface — its typed `Options` and the names its
+   runtime option reader takes (§8.9) — and the driver's other contracts were
+   verified there: the callback-shadowing warning a bare `allowedTools` entry
+   raises (Decision [D138](#d138-a-coder-nodes-containment-is-a-workspace-an-access-preset-and-a-tool-list-one-harness-enforces)),
+   the permission-mode admissibility table (D146), and the connection table
+   (Decision [D143](#d143-a-coder-nodes-provider-connection-crosses-through-a-per-harness-table)).
+   Within the SDK's own patch series the compiler **expects** those to hold, and
+   states plainly that it has **not checked** them beyond the floor. A version
+   below the floor is refused as well: an older SDK carries a subset of the
+   audited options, but it is not the release the driver's contracts were
+   verified against, and the reason to go backward — a CLI that works — is a
+   reason to move the floor in a compiler release. Widening a range is a release
+   decision recorded beside the audit, never a deployment's.
+4. **An entry for a harness no `coder:` node binds is a warning**,
+   `unbound-harness-sdk`, not an error: it emits nothing, and a deploy file
+   outlives the compositions it serves.
+5. **`build` writes the version into `package.json` in the pin's place**, for
+   that harness's SDK alone. The SDK's pinned peers (`@anthropic-ai/sdk`,
+   `@modelcontextprotocol/sdk`) stay at the compiler's pins, which a patch series
+   resolves against, and so does every other harness's SDK. The driver's
+   fallback constant in `src/harness.ts` — the version a `HarnessRecord` names
+   where the installed manifest cannot be read — is the same number, and the
+   emitted `README.md`'s pins table shows each bound harness's SDK at the
+   compiler's pin with this target's version beside it. `build --check` is clean
+   by construction, since the manifest says what the target said; the artifact
+   hash moves with the override (PRD resolved q40 — it is a different
+   artifact), and a mesh needs nothing new, because every placement
+   materialises from the artifact's own `package.json` (resolved q49). An entry
+   that states the pin itself changes nothing `build` writes. `plan` reports
+   each entry as a component of its own, `harness.<name>` (`docs/plan.md` §4).
+6. **`deploy/local.yml` MAY declare this block**, and it is live there — on
+   §14.6's reasoning, not on
+   [D87](#d87-local-is-a-reserved-target-and-deploylocalyml-carries-no-storage_backends)'s.
+   D87 refuses `local` the *active* grammar it overrides (`storage_backends:`,
+   `journal:`), and there is nothing here for `local` to override: the project
+   built on the laptop is the project whose harness runs there.
+
+**The trace needs nothing new.** A `HarnessRecord`'s `sdk` names the version of
+the SDK that **ran**, read off the installed package's manifest
+(`docs/trace.md` §7.6, `trace_version` 6), so an overridden target's traces
+carry the override by way of the install alone.
+
+**What does not move.** LangGraph, the project-wide pins, the type gate's pins
+and the harness SDKs' peers stay exactly pinned, with no deploy-layer key of
+their own: no audit makes a range of them meaningful. No lockfile and no
+`packageManager` field is emitted (PRD resolved q18). The two-tier `settings:`
+check (Decision
+[D140](#d140-harness-settings-is-a-second-open-object-checked-in-two-tiers)) is
+untouched — this block changes which version is *installed*, never what a
+`settings:` key may say — and so are the reserved refusals of §8.9, which are the
+warrant the range rests on.
 
 ---
 
@@ -10424,6 +10565,120 @@ whether one dispatch's input is accepted cannot depend on `detach:`. *PRD 5.6,
 [D104](#d104-the-idempotency-key-is-the-flattened-instance-path),
 [D118](#d118-a-detached-dispatch-reaches-no-human-node).*
 
+### D151. A target may pin a harness SDK inside the range the compiler audited it for
+
+`harnesses:` is a deploy-layer section (§14.8): a map from a harness this
+release lowers (`cc`, `codex`) to a block whose one key is `sdk_version:`, an
+exact version literal. Each compiler release declares, per harness SDK, an
+**audited range** — `[audited, next minor)`, the version the reserved-list audit
+was performed at, forward through that minor — and `validate` accepts a version
+inside it and refuses one outside it, above or below, by name
+(`harness-sdk-outside-audited-range`). A `${ENV}` reference, a range spelling,
+build metadata and a reserved or unknown harness name are refused too; an entry for a harness
+no `coder:` node binds is a warning (`unbound-harness-sdk`). `build` writes the
+accepted version into `package.json` in the pin's place, for that harness's SDK
+alone, and the emitted README's pins table shows it beside the pin. The block is
+live under `local`.
+
+**Rationale.**
+
+*Why a deploy key at all.* PRD 5.12 pins backend versions so a compiled graph's
+semantics never drift with upstream churn, and resolved q57 pinned the harness
+SDKs "exactly as LangGraph is" because a harness SDK is what a coder node's
+behaviour *is*. The field report that opened PRD resolved q66 is the cost of that
+sentence read whole: a user on a release whose bundled CLI refused the model
+they were paying for, with a compiler release as the only way forward. The
+reason 5.12 pins LangGraph — this compiler's codegen targets that API — is only
+half of why an SDK is pinned; the other half is resolved q60's: the reserved
+`settings:` list is an audit of one release's option surface, and an unaudited
+release may carry an option that reaches around a bound. So a floating SDK is
+refused for two reasons, and this decision lifts exactly one of them, on the
+terms the other sets. Which SDK serves a harness is a fact about the artifact a
+target builds, which is what only this layer forks for (PRD 5.8); the
+composition says nothing.
+
+*Why a range the compiler declares, rather than any exact version.* The audit
+is the warrant, and an audit is of a release. **What the range promises is
+precise and small: no *known* reach-around.** Every option the audited release's
+typed `Options` *and* its runtime option reader accept was classified at the
+floor — both readings, per the 2026-09-29 re-audit (§8.9) — and the driver's
+other contracts (the callback-shadowing warning of
+[D138](#d138-a-coder-nodes-containment-is-a-workspace-an-access-preset-and-a-tool-list-one-harness-enforces),
+[D146](#d146-a-coder-nodes-permission-mode-is-a-key-bounded-by-access-and-a-reserved-setting-is-refused)'s
+permission-mode table,
+[D143](#d143-a-coder-nodes-provider-connection-crosses-through-a-per-harness-table)'s
+connection table) were verified there. Within the SDK's own patch series the
+compiler *expects* those to hold, while stating that it has not checked; past the
+minor it has no basis to expect anything, which is why the default is narrow by
+design. Widening it is a release decision recorded beside the audit, never a
+deployment's.
+
+*Why below the floor is refused too.* An older SDK carries a subset of the
+audited options, so no option there reaches around a bound the audit missed —
+but it is not the release the driver's contracts were verified against, and the
+reason to go backward, a CLI that works, is the reason to move the floor in a
+compiler release rather than to let a deployment reach below it.
+
+*Why the floor is the audit's anchor, held by a test.* Two numbers for one fact
+drift the day a bump moves one of them. An audit re-performed at a newer release
+with the floor left behind keeps refusing versions the audit now covers; a floor
+moved forward without the audit admits a range nobody read while the reserved
+list still describes the old surface — the dangerous direction. So the range
+table (`codegen::harness::AUDITED`) and the audit test's anchor are held equal by
+a named test, and the audit test already holds the pin to the same anchor: in
+every release the pin is the floor.
+
+*Why exact and literal.* 5.12's discipline is exactness, and a range spelling
+would hand back to the installer exactly the choice the audited range keeps out
+of a deployment's hands — `^0.3.284` resolves to `0.4.0` the day it is
+published. A `${ENV}` reference is refused for the reason every class-3 surface
+refuses one (§4.3,
+[D92](#d92-the-env-ref-classification-is-total-over-string-surfaces)): a version
+is a build fact, not a secret, and `validate` has to read it to hold it to the
+range. Build metadata is refused although semver calls it exact, because the
+version written here is the one every emitted surface names — `package.json`,
+the README's pins table, the driver's fallback constant — and npm installs
+`0.3.284` for `0.3.284+local.1`, so accepting it would have those surfaces name
+a release no install holds while the trace (`HarnessRecord.sdk`) names the one
+that ran. Precedence alone would place it on the floor, which is why the refusal
+is written out rather than left to the range.
+
+*Why the refusals are the validator's rather than the parser's.* Five of the six
+are decidable from the deploy file alone; the sixth — whether any `coder:` node
+binds the harness — needs the composition. They are judged in one pass so one
+entry is judged in one place, and so a deploy file carrying a mistake still
+resolves into an artifact the validator can say everything about. The parser
+decides the shape: a map of blocks, `sdk_version:` required, nothing else in a
+block.
+
+*Why an unbound entry is a warning.* It emits nothing — no project installs an
+SDK for a harness no node binds — and a deploy file outlives the compositions it
+serves: an entry waiting for the composition that binds its harness is a key that
+does nothing today, not a mistake. The contrast is
+[D61](#d61-else-takes-the-literal-true)'s inert-key refusals, which are about a
+key whose author expected an effect *now*.
+
+*Why the SDK alone moves.* A patch series of an SDK resolves against the peers
+its release line declares, which are the compiler's pins; moving them would be a
+second, unaudited change riding the first. LangGraph, the project-wide pins and
+the type gate's pins take no deploy-layer key at all, because no audit makes a
+range of them meaningful. The artifact hash moves with the override (PRD resolved
+q40 — it is a different artifact), a mesh needs nothing new (resolved q49 — every
+placement materialises from the artifact's own `package.json`), and the trace
+needs nothing new (`HarnessRecord.sdk` already names the version that ran,
+`docs/trace.md` §7.6).
+
+*Why it is live under `local`, and why D87 does not reach it.*
+[D87](#d87-local-is-a-reserved-target-and-deploylocalyml-carries-no-storage_backends)
+refuses `local` the *active* grammar it overrides — `storage_backends:` and
+`journal:`, which `local` replaces unconditionally, so a block there could only
+be an inert key. Nothing here is overridden: the project built on the laptop is
+the project whose harness runs there, and the field report this answers came
+from one. This is §14.6's reasoning for `package_registry:` — the analogy PRD
+resolved q66 follows — and the list of sections `local` refuses stays two.
+**Status**: shipped. *PRD 5.8, 5.12, resolved q18, q40, q49, q57, q58, q59, q60,
+q66; §4.3, §8.9, §14, §14.8.*
+
 ## Appendix B — Editor integration
 
 [`schemas/agent-compose.schema.json`](../schemas/agent-compose.schema.json) is a
@@ -10495,6 +10750,11 @@ authority. The schema cannot see across files, so it does not check:
   content: no `storage_backends:` and no `journal:` in `deploy/local.yml` and the
   existence of `deploy/<name>.yml` (§14, §14.7, D87, D148), and `detach: true`
   under a checkpointed target (§8.6 rule 7, D59);
+- a `harnesses:` entry's version against the compiler's audited range, and
+  whether any `coder:` node binds the harness it names (§14.8, D151). The first
+  is a fact about a compiler *release* — the version its reserved-list audit was
+  performed at — which a schema published once for every release does not carry,
+  and the second needs the composition;
 - context-sensitive schema rules whose surface is not syntactically identifiable
   in one file. `max_items` is the example of the split: on **every** result
   surface (§3.5) — `agent.output`, `tool.output`, `flow.outputs`,
@@ -10528,7 +10788,9 @@ file (§14.2, D130) — and, beside it, a placement's non-empty `members:` list,
 entries' distinctness, and the `agent.*`/`tool.*` pattern they take (§14.1,
 D129) — and, beside both, a `trace_sink:`'s required `url:`, its closed
 `format:`, and the at-least-one-scheme count its `auth:` inherits from
-`callback_auth:` (§14.5, D134), the map form
+`callback_auth:` (§14.5, D134) — and a `harnesses:` entry keyed by one of the
+two harnesses this release lowers, with its one required `sdk_version:` an exact
+version (§14.8, D151) — the map form
 rules and the `on_item_error` shape (§8.6) — including the confinement of
 `input:`/`writes:`/`detach:` to the homogeneous form (rule 7, D85) and the
 absence of any `context:` key, which is a `flow:` node's alone because a
@@ -10727,6 +10989,10 @@ journal:          { provider: sqlite|postgres|mysql, url?: ${VAR} }
 package_registry: { url: "https://<host>/<path>", token?: ${VAR},
                     scopes?: { "@<scope>": { url, token?: ${VAR} } } }
                                    # 14.6: build writes bunfig.toml + .npmrc
+harnesses:        { cc|codex: { sdk_version: "<exact version>" } }
+                                   # 14.8: inside the compiler's audited range,
+                                   # [audited, next minor); build writes it into
+                                   # package.json in the pin's place
 trace_sink:       { url: "https://<host>/<path>", format?: envelope|otlp,
                     auth?: { bearer?: {...}, hmac?: {...} } }   # 13.3's outbound
                                    # block; no allowlist key, and none is wanted

@@ -1,0 +1,8 @@
+# rule: a harnesses entry is closed, and its one key is sdk_version (grammar 14.8, D50)
+# at: /harnesses/cc
+# via: /$defs/harnessSdk/additionalProperties
+version: "0.1"
+harnesses:
+  cc:
+    sdk_version: "0.3.285"
+    peers: pinned

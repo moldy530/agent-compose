@@ -229,8 +229,40 @@ pub(super) fn components(before: &Ir, after: &Ir) -> Vec<ComponentChange> {
         &[],
     );
 
+    // `harnesses:` is reported beside it, and is the one deploy section of this
+    // family that is a map of named entries rather than a block: one subject
+    // per harness, at `harness.<name>`, as a placement is one at
+    // `placement.<name>` (grammar 14.8, PRD resolved q66). Per entry rather
+    // than per section for the reason the placements are: moving `cc`'s SDK and
+    // moving `codex`'s are two decisions about two harnesses, and a reader
+    // should see the one that was made. `local` admits the section, so a plan
+    // really can carry one.
+    let harnesses: BTreeSet<&str> = names(before.deploy.harnesses.as_ref())
+        .chain(names(after.deploy.harnesses.as_ref()))
+        .collect();
+    for name in harnesses {
+        let old = before
+            .deploy
+            .harnesses
+            .as_ref()
+            .and_then(|held| held.get(name));
+        let new = after
+            .deploy
+            .harnesses
+            .as_ref()
+            .and_then(|held| held.get(name));
+        entry(
+            &mut found,
+            ComponentKind::Harness,
+            &format!("harness.{name}"),
+            old.map(|held| (semantic(held), held.span.clone())),
+            new.map(|held| (semantic(held), held.span.clone())),
+            REPEATED_NAME,
+        );
+    }
+
     // …and so is `journal:`, the fourth block of one address (grammar 14.7, PRD
-    // resolved q62) — but unlike the three above it, this is a section `local`
+    // resolved q62) — but unlike the three blocks above it, this is a section `local`
     // **refuses**: a declared block under that target is a `misplaced-section`
     // error, exactly as `storage_backends:` is (Decisions D87, D148). `plan`
     // resolves `local` on both sides (docs/plan.md §1), so no artifact *this

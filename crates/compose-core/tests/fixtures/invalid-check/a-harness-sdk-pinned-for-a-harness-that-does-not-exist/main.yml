@@ -1,0 +1,34 @@
+# rule: a `harnesses:` key names a harness of the grammar's `harness:` enum (grammar 14.8, D136, PRD resolved q66)
+# code: unknown-variant
+# message: `claude` is not a valid harness
+# at: deploy/canary.yml:4:3
+# help: `harnesses:` is keyed by a harness this release lowers — `cc` or `codex` — spelled as a `coder:` node's `harness:` spells it (grammar 14.8, Decision D136)
+# target: canary
+#
+# The vendor's product name rather than the grammar's keyword for it — a key the
+# enum does not have is a typo, and is answered with the names it does have.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: coding-model
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: "'${REPO_ROOT}'"
+        prompt: Do the work.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

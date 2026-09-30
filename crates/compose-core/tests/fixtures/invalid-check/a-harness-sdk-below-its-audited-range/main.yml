@@ -1,0 +1,34 @@
+# rule: a `harnesses:` entry may not reach below the audited floor, although an older SDK carries a subset of the audited options (grammar 14.8, D151, PRD resolved q66)
+# code: harness-sdk-outside-audited-range
+# message: `harnesses.cc` asks for `@anthropic-ai/claude-agent-sdk` `0.3.272`, outside this release's audited range `[0.3.284, 0.4.0)` for `cc`: its reserved-list audit was performed at `0.3.284`, and that audit is the boundary
+# at: deploy/canary.yml:6:18
+# help: an older SDK is not the release the driver's contracts were verified against — its permission modes, its connection surface, the warning a shadowed permission callback raises — and the reason to go backward, a CLI that works, is a reason to move the floor in a compiler release rather than a deployment's to take: pin a version inside `[0.3.284, 0.4.0)`, or drop the entry to install this release's pin, `0.3.284` (grammar 14.8, PRD resolved q66)
+# target: canary
+#
+# The reason to go backward — a CLI that works — is a reason to move the floor
+# in a compiler release, not a deployment's to take.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: coding-model
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: "'${REPO_ROOT}'"
+        prompt: Do the work.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

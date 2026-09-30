@@ -825,6 +825,7 @@ fn deploy(source: &Composition) -> Option<ir::Deploy> {
             storage_backends: None,
             journal: None,
             package_registry: None,
+            harnesses: None,
             trace_sink: None,
             event_sources: None,
         });
@@ -929,6 +930,28 @@ fn deploy(source: &Composition) -> Option<ir::Deploy> {
         })
     })?;
 
+    // Keyed by the harness **as written**, and the version kept as written too:
+    // both are what `check::harnesses` judges, and the one thing this pass may
+    // not do is decide an entry is a harness before the validator has (grammar
+    // 14.8, PRD resolved q66).
+    let harnesses = optional(file.file.harnesses.as_ref(), |section| {
+        let mut entries = BTreeMap::new();
+        for entry in &section.entries {
+            entries.insert(
+                entry.name.value.clone(),
+                ir::deploy::HarnessSdk {
+                    name: entry.name.clone(),
+                    sdk_version: entry.sdk_version.clone()?,
+                    span: entry.span.clone(),
+                },
+            );
+        }
+        Some(ir::Section {
+            entries,
+            span: section.span.clone(),
+        })
+    })?;
+
     // The grammar's defaults land here rather than in whoever reads the
     // artifact: `format:` decides what a delivery's body is, and a reader that
     // re-derived it differently would ship a collector something it cannot
@@ -973,6 +996,7 @@ fn deploy(source: &Composition) -> Option<ir::Deploy> {
         storage_backends,
         journal,
         package_registry,
+        harnesses,
         trace_sink,
         event_sources,
     })

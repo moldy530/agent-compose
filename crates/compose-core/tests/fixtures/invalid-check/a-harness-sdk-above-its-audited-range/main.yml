@@ -1,0 +1,34 @@
+# rule: a `harnesses:` entry pins its SDK inside the audited range, and a version at or past the next minor is outside it (grammar 14.8, D151, PRD resolved q66)
+# code: harness-sdk-outside-audited-range
+# message: `harnesses.cc` asks for `@anthropic-ai/claude-agent-sdk` `0.4.0`, outside this release's audited range `[0.3.284, 0.4.0)` for `cc`: its reserved-list audit was performed at `0.3.284`, and that audit is the boundary
+# at: deploy/canary.yml:6:18
+# help: past the range, an option the SDK has added since may reach around a bound the node states — the reserved `settings:` list is an inventory of the audited release's option surface, and nothing has read this one's: pin a version inside `[0.3.284, 0.4.0)`, or drop the entry to install this release's pin, `0.3.284`; reaching further is a compiler release that re-audits, never a deploy key (grammar 14.8, PRD resolved q60, q66)
+# target: canary
+#
+# `0.4.0` is the range's own ceiling: `[0.3.284, 0.4.0)` is half-open, so the
+# first release of the next minor is the first version nobody audited.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: coding-model
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: "'${REPO_ROOT}'"
+        prompt: Do the work.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

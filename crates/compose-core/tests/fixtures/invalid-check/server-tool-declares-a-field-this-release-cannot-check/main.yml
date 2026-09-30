@@ -1,7 +1,8 @@
 # rule: a field of a known `server_tools:` entry that the curated table does not name is warned about and carried, with the near miss named where there is one (grammar 12.1, Decision D122)
 # code: unknown-server-tool-field
+# severity: warning
 # message: server tool `web_search_20250305` of `provider.main` declares `max_usages`, which is not a field this compiler release knows it has: the value is unchecked and travels to the provider as written
-# at: main.yml:21:19
+# at: main.yml:22:19
 # help: did you mean `max_uses`?
 #
 # The second tier of resolved q30's two, reached one level in from a `type:`

@@ -1,0 +1,5 @@
+version: "0.1"
+
+harnesses:
+  codex:
+    sdk_version: "0.154.0"

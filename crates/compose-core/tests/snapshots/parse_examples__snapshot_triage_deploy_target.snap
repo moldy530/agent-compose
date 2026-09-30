@@ -121,6 +121,7 @@ Deploy(
                 span: 71:3..77:31,
             },
         ),
+        harnesses: None,
         trace_sink: Some(
             TraceSinkSection {
                 url: Some(

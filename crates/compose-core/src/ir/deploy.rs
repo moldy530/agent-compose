@@ -57,6 +57,13 @@ pub struct Deploy {
     /// from (grammar 14.6, PRD resolved q59).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub package_registry: Option<PackageRegistry>,
+    /// `harnesses:` — which version of each harness's SDK this target's project
+    /// installs, keyed by the harness as written (grammar 14.8, PRD resolved
+    /// q66). An entry `validate` accepted is an exact version inside the
+    /// compiler's audited range for a harness this release lowers;
+    /// `codegen::harness::sdk_version` is the one reading of it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub harnesses: Option<Section<HarnessSdk>>,
     /// `trace_sink:` — where every settled execution's trace ships
     /// (grammar 14.5, PRD resolved q50).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -147,6 +154,26 @@ pub struct PackageRegistry {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub scopes: BTreeMap<String, PackageRegistryScope>,
     /// The section's own span.
+    pub span: Span,
+}
+
+/// One entry of `harnesses:`, resolved (grammar 14.8, PRD resolved q66).
+///
+/// Both halves are carried **as written**: the key and the version string are
+/// what `check::harnesses` judges — a name the `harness:` enum does not have, a
+/// reserved one, a `${…}` reference, a range spelling, a version outside the
+/// audited range — and a judgement about text needs the text. An artifact that
+/// passed `validate` holds only entries that name a harness this release lowers
+/// at an exact version inside its range, which is what `build` reads.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct HarnessSdk {
+    /// The harness, repeated from the key with its own span — the span a
+    /// diagnostic about the entry's name points at.
+    pub name: Spanned<String>,
+    /// `sdk_version:` — the version `build` writes into `package.json` in the
+    /// compiler pin's place.
+    pub sdk_version: Spanned<String>,
+    /// The whole entry's span.
     pub span: Span,
 }
 

@@ -276,6 +276,7 @@ const DEPLOY_ONLY: &[&str] = &[
     "storage_backends",
     "journal",
     "package_registry",
+    "harnesses",
     "trace_sink",
     "event_sources",
 ];
@@ -405,6 +406,7 @@ fn deploy_file(
         storage_backends: None,
         journal: None,
         package_registry: None,
+        harnesses: None,
         trace_sink: None,
         event_sources: None,
         span: root.span.clone(),
@@ -423,6 +425,7 @@ fn deploy_file(
             "package_registry" => {
                 file.package_registry = deploy::package_registry(&entry.value, cx);
             }
+            "harnesses" => file.harnesses = deploy::harnesses(&entry.value, cx),
             "trace_sink" => file.trace_sink = deploy::trace_sink(&entry.value, cx),
             "event_sources" => file.event_sources = deploy::event_sources(&entry.value, cx),
             _ if SPEC_ONLY.contains(&key) || is_definition_key(key) => {
@@ -652,19 +655,21 @@ mod tests {
         assert!(missing_version(IMPORTS_NO_VERSION, FileRole::Deploy).is_empty());
     }
 
-    /// **The document-kind split is published in three places, and they must
+    /// **The document-kind split is published in four places, and they must
     /// agree with the mechanism.**
     ///
     /// [`DEPLOY_ONLY`] and [`SPEC_ONLY`] are what actually decides a file's kind
     /// — the *disjoint* half of [`DEPLOY_SECTIONS`] and [`SPEC_SECTIONS`], since
     /// `version:` belongs to both kinds and so is never what drifts.
-    /// A reader meets that decision three times: `docs/grammar.md` §1.5's table,
+    /// A reader meets that decision four times: `docs/grammar.md` §1.2's table,
+    /// the normative sentence under it that names what each kind may not declare,
     /// `agent-compose docs targets`, and — when they have just been refused —
     /// `agent-compose explain misplaced-section`, which is the document the
     /// diagnostic's own footer sends them to. A section added to the mechanism
-    /// and written into only two of them leaves that explanation claiming the key
-    /// the author just wrote belongs to neither document kind, which is error UX
-    /// (PRD G3) failing at the one moment it is being read.
+    /// and written into only some of them leaves one claiming the key the author
+    /// just wrote belongs to neither document kind — the table and the sentence
+    /// under it sit two lines apart and still drifted once, over `harnesses` —
+    /// which is error UX (PRD G3) failing at the one moment it is being read.
     #[test]
     fn every_section_of_a_document_kind_is_named_wherever_the_split_is_published() {
         // The two prose sentences are read with their newlines flattened,
@@ -672,13 +677,29 @@ mod tests {
         // grammar's is a table row, which ends *at* a newline, so it is read as
         // it stands.
         let grammar = include_str!("../../../../docs/grammar.md");
+        let prose = grammar.replace('\n', " ");
         let targets = include_str!("../../../../docs/topics/targets.md").replace('\n', " ");
         let explain = include_str!("../docs/codes/misplaced-section.md").replace('\n', " ");
-        let published: [(&str, &str, &str); 3] = [
+        let published: [(&str, &str, &str); 4] = [
             (
-                "docs/grammar.md §1.5",
+                "docs/grammar.md §1.2's table",
                 enumeration("docs/grammar.md", grammar, "| **Spec file** |", "|\n"),
                 enumeration("docs/grammar.md", grammar, "| **Deploy file** |", "|\n"),
+            ),
+            (
+                "docs/grammar.md §1.2's prose",
+                enumeration(
+                    "docs/grammar.md",
+                    &prose,
+                    "a deploy file that declares",
+                    " is a compile error",
+                ),
+                enumeration(
+                    "docs/grammar.md",
+                    &prose,
+                    "A spec file that declares",
+                    " is a compile error",
+                ),
             ),
             (
                 "docs/topics/targets.md",
@@ -721,11 +742,11 @@ mod tests {
                         sentence.contains(&format!("`{section}`"))
                             || sentence.contains(&format!("`{section}:`")),
                         "{place} does not name the {kind} section `{section}` where it lists \
-                         them: `{sentence}`. All three of `docs/grammar.md` §1.5, \
-                         `agent-compose docs targets` and `agent-compose explain \
-                         misplaced-section` publish this split, and the last one is what an \
-                         author reads *after* being refused for writing `{section}:` in the \
-                         wrong document."
+                         them: `{sentence}`. `docs/grammar.md` §1.2 (its table and the \
+                         sentence under it), `agent-compose docs targets` and `agent-compose \
+                         explain misplaced-section` all publish this split, and the last one is \
+                         what an author reads *after* being refused for writing `{section}:` in \
+                         the wrong document."
                     );
                 }
             }

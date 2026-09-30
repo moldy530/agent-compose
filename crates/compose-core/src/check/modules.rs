@@ -94,17 +94,30 @@ fn harness_pins_agree(ctx: &mut Ctx) {
             // bring it at — one version, because `codegen::project` refuses to
             // emit a manifest for two and a gate holds the table to it
             // (`runtime_and_harness_pins`).
+            //
+            // Read **for this target**: a `harnesses:` entry moves one SDK off
+            // the compiler's pin (grammar 14.8, PRD resolved q66), and the
+            // manifest this rule protects is the one `build` writes with it.
             let mut holders: Vec<&'static str> = Vec::new();
-            let mut pinned: Option<&'static str> = None;
+            let mut pinned: Option<&str> = None;
+            // The harness whose SDK this is, where the target moved it — which
+            // is what the help has to name, since the compiler's pin is then not
+            // the number the manifest holds.
+            let mut moved: Option<&'static str> = None;
             for harness in &bound {
-                let Some((_, held)) = crate::codegen::harness::pins_of(*harness)
-                    .iter()
+                let Some((_, held)) = crate::codegen::harness::pins_for(ctx.ir, *harness)
+                    .into_iter()
                     .find(|(held, _)| *held == package)
                 else {
                     continue;
                 };
                 holders.push(harness.as_str());
                 pinned = Some(held);
+                if crate::codegen::harness::package_of(*harness) == package
+                    && crate::codegen::harness::override_of(ctx.ir, *harness).is_some()
+                {
+                    moved = Some(harness.as_str());
+                }
             }
             let Some(pinned) = pinned else {
                 continue;
@@ -126,9 +139,14 @@ fn harness_pins_agree(ctx: &mut Ctx) {
                         dependency.version.value
                     ),
                 )
-                .with_help(format!(
-                    "a `coder:` node binding {binding} pins `{package}` at `{pinned}`, and the generated `package.json` holds one version of it (grammar 8.9, PRD resolved q57)"
-                )),
+                .with_help(match moved {
+                    None => format!(
+                        "a `coder:` node binding {binding} pins `{package}` at `{pinned}`, and the generated `package.json` holds one version of it (grammar 8.9, PRD resolved q57)"
+                    ),
+                    Some(harness) => format!(
+                        "a `coder:` node binding {binding} brings `{package}`, and this target's `harnesses.{harness}` moves it to `{pinned}` in the compiler pin's place — the generated `package.json` holds one version of it, so pin `{pinned}` or drop the pin (grammar 8.9, 14.8, PRD resolved q57, q66)"
+                    ),
+                }),
             );
         }
     }

@@ -454,6 +454,7 @@ fn deploy(
                     storage_backends: None,
                     journal: None,
                     package_registry: None,
+                    harnesses: None,
                     trace_sink: None,
                     event_sources: None,
                     span: file.span,
@@ -576,6 +577,7 @@ fn deploy_section_span(file: &DeployFile) -> Option<Span> {
                 .as_ref()
                 .map(|section| section.span.clone())
         })
+        .or_else(|| file.harnesses.as_ref().map(|section| section.span.clone()))
         .or_else(|| file.trace_sink.as_ref().map(|section| section.span.clone()))
         .or_else(|| {
             file.event_sources

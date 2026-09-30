@@ -1,0 +1,5 @@
+version: "0.1"
+
+harnesses:
+  cc:
+    sdk_version: "0.3.284+local.1"

@@ -305,6 +305,15 @@ A compiler release targets one LangGraph release (PRD 5.12). Upgrading is a
 change to the compiler, not to this directory: bump the pins there, rebuild, and
 review the diff.
 
+The table is the compiler's pins: the runtime's own dependencies, the SDK of
+each harness a `coder:` node binds, and the type checker's. A harness SDK row is
+the one that can differ from `package.json`, and only one way: a target's deploy
+file may move that SDK to another exact version inside the range this compiler
+release audited it for, with `harnesses:` (grammar §14.8). Where this target
+did, the row says which version it installs — the one `package.json` declares,
+and the one a coder node's trace record names when it runs. The SDK's own peers
+stay at the compiler's pins either way.
+
 | package | version |
 |---|---|
 | `@langchain/langgraph` | `1.4.10` |
@@ -312,6 +321,7 @@ review the diff.
 | `zod` | `4.4.3` |
 | `fastify` | `5.12.0` |
 | `node-sqlite3-wasm` | `0.8.60` |
+| `@anthropic-ai/claude-agent-sdk` | `0.3.284` |
 | `@types/node` | `22.20.1` |
 | `typescript` | `7.0.2` |
 
