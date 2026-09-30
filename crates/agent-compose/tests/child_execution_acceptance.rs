@@ -324,7 +324,7 @@ fn a_detached_dispatch_starts_a_child_execution_with_a_record_of_its_own() {
     let child = &children[0].body;
 
     // The parent's export, byte for byte the shape it always was.
-    assert_eq!(parent["trace_version"], 5, "{parent:#}");
+    assert_eq!(parent["trace_version"], 6, "{parent:#}");
     assert_eq!(parent["execution_id"], parent_id, "{parent:#}");
     assert_eq!(parent["flow"], "flow.dispatch", "{parent:#}");
     assert_eq!(parent["status"], "completed", "{parent:#}");
@@ -369,7 +369,7 @@ fn a_detached_dispatch_starts_a_child_execution_with_a_record_of_its_own() {
 
     // The child's envelope: an ordinary settled-execution export, under its own
     // id, headed by its lineage.
-    assert_eq!(child["trace_version"], 5, "{child:#}");
+    assert_eq!(child["trace_version"], 6, "{child:#}");
     assert_eq!(child["detached"], true, "{child:#}");
     assert_eq!(child["parent_execution"], parent_id, "{child:#}");
     assert_eq!(
@@ -387,7 +387,7 @@ fn a_detached_dispatch_starts_a_child_execution_with_a_record_of_its_own() {
     let head = String::from_utf8_lossy(&children[0].bytes);
     assert!(
         head.starts_with(&format!(
-            "{{\"trace_version\":5,\"detached\":true,\"parent_execution\":\"{parent_id}\",\
+            "{{\"trace_version\":6,\"detached\":true,\"parent_execution\":\"{parent_id}\",\
              \"idempotency_key\":\"{key}\",\"flow\":\"flow.review\",\"execution_id\":\"{child_id}\","
         )),
         "the envelope is **headed** by the version and the lineage, in that order: {head}"
@@ -481,7 +481,7 @@ fn a_detached_dispatch_starts_a_child_execution_with_a_record_of_its_own() {
     assert_eq!(reported["execution_id"], child_id, "{reported:#}");
     assert_eq!(reported["flow"], "flow.review", "{reported:#}");
     assert_eq!(reported["status"], "completed", "{reported:#}");
-    assert_eq!(reported["trace_version"], 5, "{reported:#}");
+    assert_eq!(reported["trace_version"], 6, "{reported:#}");
     assert_eq!(reported["trace"][0]["node"], "judge", "{reported:#}");
     let parent_report = harness::settled(&app, &parent_id);
     let listed: Vec<&str> = parent_report["deliveries"]
@@ -662,7 +662,7 @@ fn an_otlp_sink_roots_a_child_executions_export_under_its_parent() {
     );
     assert_eq!(
         attribute(child_root, "agentcompose.trace_version"),
-        Some(json!({ "intValue": "5" })),
+        Some(json!({ "intValue": "6" })),
         "{child_root:#}"
     );
     assert_eq!(child_root["name"], "flow.review", "{child_root:#}");
@@ -1514,7 +1514,7 @@ fn a_run_waits_for_its_child_executions_and_ships_their_envelopes() {
     let exported = collector.wait_for_event("settled", 1, PATIENCE);
     assert_eq!(exported.len(), 1, "{exported:#?}");
     let child = &exported[0].body;
-    assert_eq!(child["trace_version"], 5, "{child:#}");
+    assert_eq!(child["trace_version"], 6, "{child:#}");
     assert_eq!(child["detached"], true, "{child:#}");
     assert_eq!(child["execution_id"], child_id, "{child:#}");
     assert_eq!(child["parent_execution"], parent_id, "{child:#}");

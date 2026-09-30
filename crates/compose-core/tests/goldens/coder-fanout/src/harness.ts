@@ -5,6 +5,10 @@
 // is the single source of truth (PRD 5.12); to own this code instead, copy
 // the whole directory out and stop regenerating it.
 
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 import * as runtime from "./runtime.ts";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type {
@@ -141,6 +145,69 @@ function passthrough(
   return held;
 }
 
+/**
+ * The version of one SDK this process **loaded**, read off the installed
+ * package's own manifest — or `pinned` where that manifest cannot be read
+ * (`docs/trace.md` §7.6).
+ *
+ * It is what a driver reports as its `version`, and so what every
+ * `HarnessRecord.sdk` says ran. The pin is what `package.json` declares, and in a
+ * project installed from the manifest `build` wrote the two are one number — so
+ * the only project where this answer differs from the pin is one whose
+ * `package.json` was edited after `build` (which `build --check` reports) or
+ * whose install resolved something the manifest does not name. That is exactly
+ * the project a trace must not paper over: a record naming the pin there says a
+ * release ran that did not, and the reader who opens a trace to ask *which SDK
+ * produced this* is handed the one answer that is certainly wrong.
+ *
+ * **Resolved from this module, the way its own `import` was.** `import.meta.resolve`
+ * is the resolver the static import above used, so the file it names belongs to
+ * the package instance this process really loaded — the nearest `node_modules/`
+ * walking up, conditions and all — rather than to some other copy on the
+ * machine. The manifest is then found by walking up from that entry point to the
+ * first `package.json` that **carries a name**, which is the package's root
+ * whatever the name is. Not the first manifest of any kind, because neither
+ * SDK's `exports` map publishes `./package.json` and an entry point may sit below
+ * a nested manifest of its own (`dist/package.json` carrying only a `type`). And
+ * not the first that carries *this* name, because a package installed under an
+ * npm alias (`npm:<fork>@<version>`) sits where `sdk` resolves while its own
+ * manifest names the fork — and the fork's version is the one that ran, which is
+ * the drift this function exists to report rather than to walk past. The walk
+ * stops at the `node_modules/` directory the package is installed in, so a
+ * package root whose manifest names nothing reads as a missing manifest rather
+ * than as the version of whichever project encloses the install.
+ *
+ * **Never a failure.** A manifest that is missing, unreadable, unparsable or
+ * carries no version string falls back to the pin, silently: the record has no
+ * field for "this number is the pin, not a reading", and a coder node whose run
+ * cannot be traced to the byte is still a run worth recording rather than a
+ * reason to refuse it (`docs/trace.md` §7.6 names the fallback). Read once, at
+ * module load, because the package a process loaded does not change under it.
+ */
+function installedVersion(sdk: string, pinned: string): string {
+  try {
+    let directory = path.dirname(fileURLToPath(import.meta.resolve(sdk)));
+    while (path.basename(directory) !== "node_modules") {
+      const manifest = path.join(directory, "package.json");
+      if (fs.existsSync(manifest)) {
+        const held = JSON.parse(fs.readFileSync(manifest, "utf8")) as {
+          name?: unknown;
+          version?: unknown;
+        };
+        if (typeof held.name === "string" && held.name !== "") {
+          return typeof held.version === "string" && held.version !== "" ? held.version : pinned;
+        }
+      }
+      const parent = path.dirname(directory);
+      if (parent === directory) return pinned;
+      directory = parent;
+    }
+    return pinned;
+  } catch {
+    return pinned;
+  }
+}
+
 /** One `AbortController` that follows a run's signal, for an SDK that takes one. */
 function controllerFor(signal: AbortSignal): AbortController {
   const controller = new AbortController();
@@ -172,9 +239,16 @@ function settingList(value: unknown): string[] | undefined {
 }
 
 /**
- * The `cc` SDK version this compiler release pins — the number `package.json` declares and the number a `HarnessRecord` reports.
+ * The `cc` SDK — the package `package.json` declares, and the one a `HarnessRecord` names.
  */
-const CC_SDK_VERSION: string = "0.3.272";
+const CC_SDK: string = "@anthropic-ai/claude-agent-sdk";
+
+/**
+ * The `cc` SDK version this compiler release pins — the number `package.json` declares.
+ *
+ * A `HarnessRecord` reports the version **installed** instead (`installedVersion`), and this one only where the installed package's manifest cannot be read: in a project installed from the manifest `build` wrote the two are one number.
+ */
+const CC_SDK_VERSION: string = "0.3.284";
 
 /**
  * The keys of a `cc` node's `settings:` this compiler release maps by name
@@ -203,14 +277,18 @@ const CC_SETTINGS: readonly string[] = [
  * a list rather than a reading of what the driver below assigns:
  *
  *  * an option that **spells** a bound another key states. `workspace:` is
- *    `cwd`; `permission_mode:` is `permissionMode`, the plan-mode body beside it
- *    and the flag `bypassPermissions` requires, with `access:` the key that
- *    derives that mode where the node states none (Decision D146); `env:` is
+ *    `cwd`; `permission_mode:` is `permissionMode`, the plan-mode body beside it,
+ *    the flag `bypassPermissions` requires and `resolvePermissionModeInCli`,
+ *    which says who resolves a mode a run does not name, with `access:` the key
+ *    that derives that mode where the node states none (Decision D146); `env:` is
  *    `env` — which is also where
  *    the model's **connection** lands, because this SDK's endpoint, credential
  *    and custom headers are variables of the process it spawns (Decision D143),
- *    so one reserved name holds both bounds — `output:` is
- *    `outputFormat`, `prompt:` is `systemPrompt`, `allow_tools:` is the
+ *    so one reserved name holds both bounds, and the credential has two
+ *    spellings more in `getOAuthToken` and `getHostAuthToken`, the callbacks the
+ *    CLI asks for a token — `output:` is `outputFormat`, `prompt:` is
+ *    `systemPrompt` and `appendSubagentSystemPrompt`, the text the CLI appends
+ *    to every subagent's system prompt, `allow_tools:` is the
  *    available tool set and the per-call gate over it (`canUseTool`, or
  *    `allowedTools` under the one mode that never consults a callback),
  *    `timeout:` is the abort controller, and `model:` is the model and the one
@@ -226,14 +304,23 @@ const CC_SETTINGS: readonly string[] = [
  *    assigns and a list keyed off the driver could therefore never hold.
  *    `extraArgs` is an arbitrary CLI flag — `dangerously-skip-permissions` and
  *    `add-dir` among them — so it is every bound at once. `settings`,
- *    `managedSettings` and `settingSources` carry permission rules;
- *    `additionalDirectories` carries roots beside `workspace:`; `sandbox`
+ *    `managedSettings` and `settingSources` carry permission rules, and
+ *    `projectConfigRoot` carries all of that family at once from a tree
+ *    `workspace:` never named: it is the `--project-config-root` the pinned CLI
+ *    reads the project tier's hooks and permission rules, `.mcp.json`'s servers
+ *    and the `.claude` trees' agents and skills out of *instead of* the working
+ *    directory, and `workspaceTrust` is the attestation that switches that
+ *    family on for the working directory's own checkout, recorded in the user's
+ *    `~/.claude.json` where it outlives the run; `additionalDirectories` carries
+ *    roots beside `workspace:`; `sandbox`
  *    carries containment; `mcpServers`, `agents`, `agent`, `skills` and
  *    `toolAliases` each put a tool or a whole loop outside `allow_tools:`
  *    within reach — `agent` also carrying its own model and prompt, and
  *    `skills` being the SDK's own single switch for turning skills on, which
  *    its documentation says needs no `'Skill'` entry in `allowedTools` beside
- *    it — and `plugins` carries hooks, agents and skills together; `hooks`,
+ *    it — `webSearchIsolationExemptMcpServers` keeps a server's tools within
+ *    reach after the CLI's web search / connector isolation policy took them
+ *    out, and `plugins` carries hooks, agents and skills together; `hooks`,
  *    `permissionPrompts` and
  *    `permissionPromptToolName` each move or silence the decision `canUseTool`
  *    makes; and `fallbackModel` is the failover ladder D141 stops at the
@@ -255,20 +342,107 @@ const CC_SETTINGS: readonly string[] = [
  * what `a_reserved_list_is_audited_against_the_pinned_option_surface`
  * (`codegen/harness.rs`) holds it to: a version bump is where a new
  * reach-around arrives, so the pin is what re-opens the audit.
+ *
+ * **That surface is two readings, not one.** The typed one is `Options` in
+ * `sdk.d.ts`. The other is what `query()` actually reads: the bundle's option
+ * reader in `sdk.mjs` takes eight names no `Options` member declares —
+ * `appendSubagentSystemPrompt`, `getHostAuthToken`, `getOAuthToken`,
+ * `rapidFollowupPreempt`, `resolvePermissionModeInCli`,
+ * `webSearchIsolationExemptMcpServers`, `workload` and `workspaceTrust`, the
+ * same eight at 0.3.272 and 0.3.284 — and [`passthrough`] forwards an unknown
+ * key unchanged, so an undeclared name reaches the SDK exactly as a declared
+ * one does. Six of the eight are above, for the reasons given there. Two are
+ * left to D140's open tier: `rapidFollowupPreempt` declares that a consumer
+ * renders the CLI's turn-preempted frame when a person's follow-up interrupts
+ * a turn, and a run here is handed one prompt and no follow-up; `workload` is
+ * the CLI's `--workload` tag, a value inside the CLI's own billing-attribution
+ * header — not a header the connection states, and no bound — which the SDK
+ * adds as that one flag and nothing else, so it is no door back to the
+ * arbitrary flags a dropped `extraArgs` key would have been.
+ *
+ * The last bump (0.3.272 to 0.3.284) moved both readings together: `Options`
+ * gained two members and the reader the same two, and it took one of them,
+ * `projectConfigRoot`, above. `verbatimPrompts` is left to D140's open tier
+ * **at this pin**, and both of its settings have been read against the pinned
+ * CLI (2.1.284) rather than against its documentation alone:
+ *
+ *  * **On**, it narrows. The SDK documents it as turning the CLI's `@path`
+ *    expansion and slash-command dispatch off for the prompt a run is handed,
+ *    and also, "on current CLIs", as skipping "the CLI's turn-start attachment
+ *    pass as a whole": "nested `CLAUDE.md` and rules files, skill and tool
+ *    listings, and the CLI's other per-turn reminders", which then arrive only
+ *    after the turn's first tool call. Under `read_only` that pass is where
+ *    containment lives — the plan-mode reminder [`CC_PERMISSION`] rests on,
+ *    which carries `planModeInstructions` — and `plan` asks `canUseTool`, which
+ *    answers `allow` inside the list, so a first turn without the reminder
+ *    could run an in-list `Write` or `Bash` before the read-only preamble ever
+ *    reached the model. The pinned CLI does not skip it: a `plan` run's first
+ *    request with the option on still carries the plan-mode reminder and the
+ *    node's `planModeInstructions`, and of the context that run carried without
+ *    the option, the only piece missing was the token-budget reminder
+ *    (observed against a local Messages endpoint, not only read). That
+ *    observation is what keeps the key open, and it is the first thing the
+ *    next bump re-verifies: a CLI whose first request under `plan` has lost
+ *    the plan-mode reminder puts `verbatimPrompts` on this list.
+ *  * **Off — the default, and where this driver leaves it — it is a hole this
+ *    driver does not close, and it has two halves.** The prompt a run is
+ *    handed is `run.input`, which a node's `input:` builds from state and a
+ *    trigger's data, so text the composition did not write reaches the CLI as
+ *    a prompt — and the CLI acts on two things in a prompt before any model
+ *    reads it:
+ *     - **`@path` mentions.** The CLI expands one into a synthetic `Read`
+ *       result on the run's first request: the file's contents, from anywhere
+ *       the host can read, with no tool call — so `tools`, `canUseTool` and the
+ *       permission mode never see it, and neither does `workspace:`. Observed
+ *       against the pinned CLI and against 0.3.272's (2.1.272) alike:
+ *       `tools: ["Write"]`, a callback that denies every call (and was never
+ *       asked), a `cwd` of its own, and a prompt naming a file outside it — the
+ *       first request carried the file, under `acceptEdits` and `plan` both.
+ *     - **Slash commands.** A prompt that opens with `/<command>` is dispatched
+ *       as one of the CLI's own commands rather than sent, and that reaches
+ *       around `model:`: a `run.input` of `/model <id>` switches the session's
+ *       model, and the run's request goes out on `<id>` rather than on the id
+ *       the adapter mapped the node's `model:` to. Observed against the pinned
+ *       CLI, and at 0.3.272 too: `model: "claude-opus-5-5"`,
+ *       `tools: ["Write"]`, a deny-all callback and a prompt of
+ *       `/model claude-sonnet-4-5` — the run's only Messages request named
+ *       `claude-sonnet-4-5`. The same run's init message lists the commands
+ *       the prompt can reach (`slash_commands`): `config`, `mcp`, `effort`,
+ *       `fast` and `agents` among them, each reachable from the same text.
+ *       Only `/model` has been driven here; what the others reach is
+ *       unaudited.
+ *
+ *    With the option on (which 0.3.272 does not have), the pinned CLI did
+ *    neither: the file stayed out of the first request, and a `/model …`
+ *    prompt went to the model as text, on the mapped id. The driver does not
+ *    turn the option on itself, because on is also the first turn without its
+ *    `CLAUDE.md`, skill and tool listings — the harness's own context, which
+ *    is what PRD resolved q57 adopts a harness for — so whether the adapter
+ *    owns `verbatimPrompts: true` is a question for the PRD rather than for
+ *    this audit, and it is one question with both halves in it: file
+ *    mentions reaching past `workspace:` and the tool bounds, and command
+ *    dispatch reaching past `model:` and whatever else a command sets. Until
+ *    it is answered, a node whose `input:` carries text it did not write can
+ *    set `settings: { verbatimPrompts: true }` itself, which is the direction
+ *    the open key narrows in.
  */
 const CC_RESERVED: readonly string[] = [
   // Options that spell a bound another key states.
   "abortController",
   "allowDangerouslySkipPermissions",
   "allowedTools",
+  "appendSubagentSystemPrompt",
   "canUseTool",
   "cwd",
   "env",
+  "getHostAuthToken",
+  "getOAuthToken",
   "maxThinkingTokens",
   "model",
   "outputFormat",
   "permissionMode",
   "planModeInstructions",
+  "resolvePermissionModeInCli",
   "systemPrompt",
   "thinking",
   "tools",
@@ -289,6 +463,7 @@ const CC_RESERVED: readonly string[] = [
   "permissionPromptToolName",
   "permissionPrompts",
   "plugins",
+  "projectConfigRoot",
   "resume",
   "resumeDropsTurn",
   "resumeSessionAt",
@@ -299,6 +474,8 @@ const CC_RESERVED: readonly string[] = [
   "skills",
   "spawnClaudeCodeProcess",
   "toolAliases",
+  "webSearchIsolationExemptMcpServers",
+  "workspaceTrust",
 ];
 
 /**
@@ -722,8 +899,8 @@ function ccEnvironment(run: runtime.HarnessRun): Record<string, string> {
  * amendment to q16 lives.
  */
 const CC_DRIVER: runtime.HarnessDriver = {
-  sdk: "@anthropic-ai/claude-agent-sdk",
-  version: CC_SDK_VERSION,
+  sdk: CC_SDK,
+  version: installedVersion(CC_SDK, CC_SDK_VERSION),
   enforcesTools: true,
   run(run: runtime.HarnessRun): AsyncIterable<runtime.HarnessEvent> {
     return (async function* driven(): AsyncGenerator<runtime.HarnessEvent> {

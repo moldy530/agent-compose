@@ -243,7 +243,7 @@ fn a_settled_trace_reaches_the_sink_signed_with_the_identity_the_target_declared
 
     // The envelope, which is the document the trace file holds.
     let body = &delivery.body;
-    assert_eq!(body["trace_version"], 5, "{body:#}");
+    assert_eq!(body["trace_version"], 6, "{body:#}");
     assert_eq!(body["flow"], "flow.greet", "{body:#}");
     assert_eq!(body["execution_id"], execution, "{body:#}");
     assert_eq!(body["status"], "completed", "{body:#}");
@@ -535,7 +535,7 @@ fn a_run_under_a_target_that_declares_a_sink_exports_its_trace() {
     assert_eq!(body["flow"], "flow.greet", "{body:#}");
     assert_eq!(body["status"], "completed", "{body:#}");
     assert_eq!(
-        body["trace_version"], 5,
+        body["trace_version"], 6,
         "a command's export is the same envelope a served one ships: {body:#}"
     );
     let nodes: Vec<&str> = body["entries"]

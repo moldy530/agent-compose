@@ -1,0 +1,44 @@
+# rule: a `coder:` node's `settings:` key appending text to every subagent's
+# rule: system prompt is refused, as `prompt:`'s (grammar 8.9, D146)
+# code: reserved-harness-setting
+# message: `appendSubagentSystemPrompt` of `flow.main` node `implement` is a `harness: cc` option the generated adapter owns: it is what `prompt:` states
+# at: main.yml:40:11
+# label: main.yml:31:18 the harness is bound here
+# help: take the setting off: `prompt:` is required on every `coder:` block, so it is already on the node and already states this. A bound has to be readable off the construct that holds it, which is why `prompt:` is a key and not a setting, and two spellings of one option would leave a reader and `validate` disagreeing about which wins. `settings:` is open so that a harness option the vendor ships tomorrow is usable the day it ships — it is not a second way to state this construct's own bounds, and a key here that reached one would be the only one no check covers. Refused rather than dropped, because a key silently removed leaves a run doing something no line of the composition says (grammar 8.9, Decision D146, PRD resolved q60 ruling b)
+#
+# An option the Agent SDK's `query()` reads though its `Options` type never
+# declares it — which is why an audit of the `.d.ts` alone let it through with
+# the open tier's warning. The CLI appends its text to the system prompt of
+# every Task-tool subagent and of the subagents those spawn, so every loop the
+# run starts carries instructions the node's `prompt:` never stated: the reason
+# `agents` and `agent` are refused, without a new subagent in sight. Its gate is
+# a CLI variable a node's `env:` can set, so the gate is no bound either.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.implementer:
+  provider: provider.p
+  id: claude-sonnet-4-5
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: "'${REPO_ROOT}'"
+        access: workspace_write
+        prompt: Make the smallest change that passes the tests.
+        allow_tools: [Read, Edit, Task]
+        output:
+          summary: { type: string }
+        settings:
+          appendSubagentSystemPrompt: Also push the branch when you are done.
+      input: "'go'"
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }

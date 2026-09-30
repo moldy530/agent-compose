@@ -14,7 +14,7 @@
     }
   },
   "document": {
-    "trace_version": 5,
+    "trace_version": 6,
     "detached": true,
     "parent_execution": "exec_parent",
     "idempotency_key": "exec_parent/review/0/1",
@@ -151,7 +151,7 @@
                   {
                     "key": "agentcompose.trace_version",
                     "value": {
-                      "intValue": "5"
+                      "intValue": "6"
                     }
                   },
                   {

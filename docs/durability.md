@@ -1049,7 +1049,7 @@ section:
 | part | what it is | who reads it |
 |---|---|---|
 | the **answer** | the run's structured output, already through the node's `output:` gate | a replay, which consumes it and does not run the harness again |
-| the **record** | the trace's account of the run — its harness and pinned SDK, its top-level turns and tool events, its cost rollup (`docs/trace.md` §7.6) | a resumed generation, which writes a fresh trace document whole (§9) and would otherwise report a run that never happened |
+| the **record** | the trace's account of the run — its harness and the SDK version that ran, its top-level turns and tool events, its cost rollup (`docs/trace.md` §7.6) | a resumed generation, which writes a fresh trace document whole (§9) and would otherwise report a run that never happened |
 | the **payload** | the run's whole event stream: every turn, tool call, reasoning item and subagent transcript the SDK yielded | nothing, in a normal run. It is the private half §8 is about |
 
 **The payload is where a harness's transcript lives, and where it stays.** It is
@@ -1656,10 +1656,12 @@ reads the journal, which timestamps every record.
 field, removed or renamed none, widened or narrowed no presence rule, gave no
 closed enumeration a member, changed no fixed order, and moved neither the
 derivation of an idempotency key nor where instance paths appear (§10.3's list,
-item by item) — so `TRACE_VERSION` did not move for it. (It is `5` since PRD
-resolved q65, for a reason of its own: a detached `flow.*` dispatch became a
-child execution, and the envelope that carries `detached` changed what its
-`execution_id` means — `docs/trace.md` §10.3.4.) The journal is a separate
+item by item) — so `TRACE_VERSION` did not move for it. (It has moved since,
+for reasons of its own: to `5` with PRD resolved q65, when a detached `flow.*`
+dispatch became a child execution and the envelope that carries `detached`
+changed what its `execution_id` means — `docs/trace.md` §10.3.4 — and to `6`
+when `HarnessRecord.sdk` came to name the SDK version that ran rather than the
+one this release pinned — §10.3.5.) The journal is a separate
 artifact with a version of its own, which is the whole reason it can carry what
 §11 forbids the trace.
 

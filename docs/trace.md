@@ -1,6 +1,6 @@
 # agent-compose — Trace Format
 
-**Trace version:** `5`
+**Trace version:** `6`
 **Status:** Normative for the trace a compiled project emits
 **Companion artifacts:** [`docs/grammar.md`](grammar.md) (the DSL this describes runs of), [`prd.md`](../prd.md) §5.3, §5.6, §5.8, §5.9
 
@@ -203,7 +203,7 @@ documents and no grammar section defines — prints one document:
   "execution_id": "exec_0f1e…",
   "status": "completed",
   "outputs": { "draft": "…" },
-  "trace_version": 5,
+  "trace_version": 6,
   "trace": [ /* entries */ ],
   "trace_path": "/…/.agent-compose/traces/flow.review_loop-exec_0f1e….json"
 }
@@ -241,7 +241,7 @@ POSTs on completion, report an execution as (grammar §13.3):
   "trigger": "on_request",
   "status": "completed",
   "outputs": { "draft": "…" },
-  "trace_version": 5,
+  "trace_version": 6,
   "trace": [ /* entries */ ]
 }
 ```
@@ -314,7 +314,7 @@ in full, and what `run --format json` spreads into the record it prints.
 
 | field | type | presence | meaning |
 |---|---|---|---|
-| `trace_version` | integer | always | The format the `entries` are written in. `5` is this document, and a compiled project spells it `TRACE_VERSION` (exported from its `src/runtime.ts`). See [Stability](#10-stability). |
+| `trace_version` | integer | always | The format the `entries` are written in. `6` is this document, and a compiled project spells it `TRACE_VERSION` (exported from its `src/runtime.ts`). See [Stability](#10-stability). |
 | `detached` | `true` | a child execution's envelope | Marks the envelope of a **child execution** — one a detached `flow.*` dispatch started (§1.4, PRD resolved q65). Never `false`: an execution a trigger or a command started omits the key. Carried by the envelopes a child's settlement writes — its trace-sink export, and the trace file an `agent-compose resume` of it writes; `run --format json` and a `serve` report carry no envelope head and so never do. |
 | `parent_execution` | string | a child execution's envelope | The execution whose detached dispatch started this one — its **parent**, and never this envelope's own `execution_id`: a child is an execution of its own. Half of the pair a reader joins the parent's stub record to this envelope on, and the pair a receiver may dedupe on (§1.4); also half of what the child's id is derived from (`docs/durability.md` §3.2). |
 | `idempotency_key` | string | a child execution's envelope | The grammar §9.4 key of the dispatch that started this child: byte for byte the `idempotencyKey` of the parent's stub `"detached"` dispatch record (§5.1), so the join between the parent's entry and this envelope is string equality (§8). The other half of the pair (§1.4). |
@@ -991,7 +991,7 @@ it.
 | field | type | presence | meaning |
 |---|---|---|---|
 | `harness` | `HarnessName` — `"cc"` \| `"codex"` | always | Which harness ran it: the `harness:` keyword the composition wrote (grammar §8.9). A closed vocabulary, and the two reserved names of grammar §15 are **not** members — `validate` refuses a composition that binds one, so no run under one exists to record. |
-| `sdk` | string | always | The SDK package this compiler release reached it through and the version it pinned, as `<package>@<version>`. It is what joins a trace to the `package.json` of the project that produced it. |
+| `sdk` | string | always | The SDK package the run was reached through and **the version of it that ran**, as `<package>@<version>` — the installed package's own version, read off its manifest when the driver loads, not the number compiled into the driver. It is what joins a trace to the `package.json` of the project that produced it. In a project installed from the manifest `build` wrote, it is the version this compiler release pinned; a different version means the manifest was edited after `build` (which `build --check` reports), or the tree that ran is not the one that manifest installs — a stale install, or a package resolved from outside the project — the drift a reader opens this record to find, which is why the field reports what ran rather than what was meant to. The manifest read is the installed package's root one: the first `package.json` carrying a `name`, walking up from the entry point the driver's own import resolved, and never past the `node_modules/` directory the package is installed in. That is the root **whatever name it carries**, because a package installed under an npm alias (`npm:<fork>@<version>`) sits where the SDK's name resolves while its manifest names the fork: the version is the fork's, which is what ran, and the package half stays the name the driver imports. Where the installed manifest cannot be read (missing — which includes a package root whose manifest carries no name — unparsable, or carrying no version string) the version is the pin, silently: nothing in this record marks the fallback. Version `5` defined this value as the pin, compiled in and written whatever was installed; reading it off the install is what version `6` is (§10.3.5). |
 | `model` | string | always | The `model.*` the composition named (grammar §12.2). |
 | `modelId` | string | always | The provider-native model id that address resolved to, which is what the harness was actually handed (grammar §8.9, Decision D141). |
 | `workspace` | string | always | **The directory this run was contained by, resolved** (grammar §8.9, Decision D147, PRD resolved q61). A `coder:` node's `workspace:` is an expression evaluated at each dispatch, so the composition's own text no longer answers which directory a run held — and for a `map` over a coder node, where the whole point is that every dispatch holds a different one, that is the first question a reader of this record has. A `workspace: fresh` run reads the directory the runtime provisioned for it, under `.agent-compose/workspaces/<execution id>/<instance path>/`. This is the **one** field of this format derived from a resolved value rather than from what the composition wrote; [§11.1](#111-secrets) names it as the exception it is. |
@@ -1492,6 +1492,49 @@ version-`4` build wrote may still hold a detached envelope on a parent's ledger;
 this build delivers such a row as it was written — its `trace_version` says `4`
 — and never counts it as the parent's export (`docs/durability.md` §11.2).
 
+### 10.3.5 What version `6` changed
+
+`HarnessRecord.sdk` (§7.6) now names the version of the SDK that **ran**, where
+version `5` named the version this compiler release pinned. The gap was found in
+the field: a project that moved its SDK past the pin — to reach a model the
+pinned release refused — wrote the pin into every record while another version
+ran, so the one field a reader opens to ask *which SDK produced this* answered
+with a release that never did. The change amends PRD resolved q57 ruling a,
+which named the field "harness name + pinned version". It reaches a reader of
+version `5` through one field, in the one way §10.3 does not forgive:
+
+* **`HarnessRecord.sdk` changed meaning.** Under `5` its version was the number
+  compiled into the driver, written whatever was installed; under `6` it is the
+  installed package's own, read off its manifest when the driver loads. That is
+  "changing … the meaning of its value", and it is the bump. The two readings
+  give the same bytes in every project installed from the `package.json`
+  `build` wrote — the install the compiler vouches for — and part company only
+  where the tree that ran is not that install: a manifest edited after `build`
+  (which `build --check` reports), or a stale or foreign install beside a clean
+  manifest. There a reader of `5` that took `sdk` for its release's pin — one
+  that checks a record against the release's pin, say — reads a number that is
+  not the pin, and the number on the envelope is what tells it the field no
+  longer means what it was written against. Agreement in the common case is why
+  the change costs a reader little, not a reason to withhold the number:
+  §10.3's test is whether a reader written against `5` can be made wrong, and
+  this one can;
+* **the fallback is part of the new meaning.** Where the installed manifest
+  cannot be read — missing (a package root whose manifest names nothing
+  included), unparsable, or carrying no version string — the value is the
+  pin, and nothing in the record marks it. A reader of `6` that finds the pin
+  has found the pin installed, or an install whose manifest could not be read;
+  one that finds another number has found drift, which under `5` no record
+  could show;
+* **`agentcompose.harness.sdk` moved with it** (§12.5). The span attribute is
+  the record's own field, so a harness run's OTLP export reads the same number.
+
+What did **not** move: the field's name, its type, its presence (always), its
+`<package>@<version>` shape, and its package half, which is still the package
+the driver was compiled against — under an npm alias too, where the version
+half is the aliased package's own and the package half is still the name the
+driver imports. No other field of any record changed, and an envelope whose run
+held no coder node changed its `trace_version` and nothing else.
+
 ### 10.4 How the two are held together
 
 The version number alone is a promise; two tests make it a checkable one:
@@ -1991,7 +2034,7 @@ or a row promising one nothing sets.
 | `agentcompose.model.member`, `agentcompose.model.condition`, `agentcompose.model.detail` | failover and refusal events | the refusing member, the `route_on:` condition, and what it said |
 | `agentcompose.tool.name`, `agentcompose.tool.target`, `agentcompose.tool.outcome` | tool-call event | the call's own fields. A **harness** run's tool events are the same three attributes, less `target`: the tool is the harness's rather than a component of this composition (§7.6.3) |
 | `agentcompose.harness` | harness run | which harness ran it (§7.6) |
-| `agentcompose.harness.sdk`, `agentcompose.harness.model_id`, `agentcompose.harness.outcome` | harness run | the record's own fields — the SDK and version this release pinned, the provider-native id the harness was handed, and how the run ended |
+| `agentcompose.harness.sdk`, `agentcompose.harness.model_id`, `agentcompose.harness.outcome` | harness run | the record's own fields — the SDK and the version of it that ran, the provider-native id the harness was handed, and how the run ended |
 | `agentcompose.harness.turns`, `agentcompose.harness.input_tokens`, `agentcompose.harness.output_tokens`, `agentcompose.harness.cost_usd` | harness run | the run's cost rollup (§7.6.4). The token attributes are present only where that harness reports tokens and the money one only where it estimates a cost, which is the rollup's own presence rule read onto the span |
 | `agentcompose.harness.turn`, `agentcompose.harness.input_tokens`, `agentcompose.harness.cached_input_tokens`, `agentcompose.harness.output_tokens`, `agentcompose.harness.reasoning_tokens` | turn event | the turn's ordinal, and whatever usage that harness reported for it (§7.6.2) |
 | `agentcompose.store`, `agentcompose.store.op`, `agentcompose.store.effect`, `agentcompose.store.via`, `agentcompose.store.scope`, `agentcompose.store.key`, `agentcompose.store.deduped` | store event | the store record's own fields |

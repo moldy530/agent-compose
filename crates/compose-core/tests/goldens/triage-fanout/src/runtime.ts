@@ -8151,7 +8151,14 @@ export type PermissionMode =
 export interface HarnessRecord {
   /** Which harness ran it. */
   readonly harness: HarnessName;
-  /** The SDK package and the version this compiler release pinned. */
+  /**
+   * The SDK package and the version of it that **ran**, as
+   * `<package>@<version>` — the installed one, read off its own manifest
+   * ([`HarnessDriver.version`]). In a project installed from the manifest
+   * `build` wrote, that is the version this compiler release pinned; where it is
+   * not, the manifest was edited after `build` (the edit `build --check`
+   * reports) or the tree that ran is not the one it installs.
+   */
   readonly sdk: string;
   /** The `model.*` the composition named (grammar 12.2). */
   readonly model: string;
@@ -8466,7 +8473,15 @@ export type HarnessTap =
 export interface HarnessDriver {
   /** The npm package this driver maps over. */
   readonly sdk: string;
-  /** The exact version this compiler release pinned it to (PRD 5.12). */
+  /**
+   * The version of [`sdk`] this process loaded (`docs/trace.md` §7.6).
+   *
+   * The **installed** one, not the one this compiler release pinned (PRD 5.12):
+   * the two are one number wherever the project was installed from the manifest
+   * `build` wrote, and a record that reported the pin where they differ would
+   * hide exactly the edit a reader of the trace most needs to see. A driver that
+   * cannot read its package's manifest reports the pin.
+   */
   readonly version: string;
   /**
    * Whether this harness enforces [`HarnessRun.allowTools`] **inside its own
@@ -9493,12 +9508,13 @@ export function route(
  * `docs/trace.md`'s *Stability* section is the contract, and it is what a reader
  * is entitled to rely on.
  *
- * `5` is PRD resolved q65's: a detached `flow.*` dispatch now starts a **child
- * execution**, whose envelope carries the child's own id in `execution_id` where
- * the one-release-old detached envelope carried its parent's — a field whose
- * value changed meaning, which `docs/trace.md` §10.3.4 records.
+ * `6` is `HarnessRecord.sdk`'s: it names the version of the SDK that **ran**,
+ * read off the installed package's manifest, where version `5` wrote the
+ * version this compiler release pinned whatever was installed — a field whose
+ * value changed meaning, which `docs/trace.md` §10.3.5 records. (`5` was PRD
+ * resolved q65's child execution, §10.3.4.)
  */
-export const TRACE_VERSION = 5;
+export const TRACE_VERSION = 6;
 
 /**
  * One run's whole trace, as a surface delivers it (`docs/trace.md`).

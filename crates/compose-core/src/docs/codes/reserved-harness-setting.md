@@ -23,11 +23,25 @@ An option does not have to *spell* a bound to reach around it, and the reserved
 set is the wider one. `extraArgs` is any command-line flag there is —
 `dangerously-skip-permissions` and `add-dir` among them. `mcpServers`, `agents`,
 `skills` and `plugins` put a tool or a whole loop within reach of a run whose
-`allow_tools:` never mentioned it. `additionalDirectories` is sandbox roots
-beside `workspace:`. `pathToClaudeCodeExecutable`, `executable`,
+`allow_tools:` never mentioned it. `settings`, `settingSources` and
+`projectConfigRoot` load permission rules, hooks, servers and agents out of
+configuration files — the last out of a directory other than `workspace:`
+altogether — and `workspaceTrust` is the trust grant that switches that loading
+on, recorded in the user's own `~/.claude.json`. `additionalDirectories` is
+sandbox roots beside `workspace:`. `pathToClaudeCodeExecutable`, `executable`,
 `executableArgs` and `spawnClaudeCodeProcess` choose which program the run *is*,
 so a key among them does not widen one bound — it replaces the program enforcing
 all of them.
+
+**An option counts whether or not the SDK's type declares it.** The Agent SDK
+reads some option names its `Options` type never mentions —
+`appendSubagentSystemPrompt`, which is text appended to every subagent's system
+prompt; `getOAuthToken` and `getHostAuthToken`, which are token sources for the
+run's credential; `workspaceTrust`; `webSearchIsolationExemptMcpServers`, which
+keeps a server's tools within reach past the CLI's isolation policy; and
+`resolvePermissionModeInCli`. A key this release does not know travels to the
+SDK unchanged, so an undeclared name reaches it exactly as a declared one would,
+and the audit that builds this set reads both.
 
 **This is an error rather than a dropped value with a warning**, and that is a
 deliberate change from how the key behaved when coder nodes first shipped. A key
@@ -103,15 +117,15 @@ bound, so it is written on the node.
 
 | a reserved option spelling… | is stated by |
 |---|---|
-| a permission mode, or the flag one requires | `permission_mode:` |
+| a permission mode, the flag one requires, or who resolves one | `permission_mode:` |
 | a sandbox preset, or sandbox configuration | `access:` |
 | a working directory | `workspace:` |
-| a tool set, an allowlist, a permission callback, an MCP server, a subagent, a skill set | `allow_tools:` |
+| a tool set, an allowlist, a permission callback, an MCP server, a subagent, a skill set, the configuration that loads any of them, or a trust grant or policy exemption that lets them load | `allow_tools:` |
 | the environment | `env:` |
 | the output format | `output:` |
-| the system prompt, or plan mode's body | `prompt:` |
+| the system prompt, plan mode's body, or text appended to every subagent's | `prompt:` |
 | the abort signal | `timeout:` |
-| the model | `model:` |
+| the model, or a token source for the credential its connection carries | `model:` |
 
 **Where the key is required, the repair is to delete the setting.**
 `workspace:`, `model:`, `prompt:` and `output:` are required on every `coder:`
@@ -126,9 +140,13 @@ One answer is a key that **addresses** the value rather than holding it. The one
 model setting a harness takes — `thinking` and `maxThinkingTokens` under `cc`,
 `modelReasoningEffort` under `codex` — is written in the `model.*` definition
 `model:` names, in that definition's own `settings:`, where the provider plugin's
-schema checks it (`docs/grammar.md` §12.2, Decision D141). `model:` is required
-on every `coder:` block, so the message says *where it points* rather than
-telling an author to write a key they already have.
+schema checks it (`docs/grammar.md` §12.2, Decision D141). The credential is the
+same shape one step further along: `cc`'s token callbacks, `getOAuthToken` and
+`getHostAuthToken`, answer to the `api_key:` of the `provider.*` the `model.*`
+definition names, which is the one way a credential crosses into a harness run
+(Decision D143) — and a callback is nothing a YAML value can be. `model:` is
+required on every `coder:` block, so the message says *where it points* rather
+than telling an author to write a key they already have.
 
 Five families answer to no key at all, and the message says so rather than
 pointing at the nearest one:
