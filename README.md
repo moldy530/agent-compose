@@ -21,19 +21,11 @@ That picks the artifact for this machine, checks it against the release's
 that directory is not on yours. **A tarball whose checksum does not match is
 never installed.**
 
-> **Until the first release.** Those URLs resolve once this repository has a
-> published release *and* is publicly readable. Today it is neither — it is
-> private and has cut no release — so `curl` answers `404`. Until then there are
-> two routes: build from source (`cargo build --release -p agent-compose`, and
-> the [section below](#build-from-source)), or take a tarball from the Actions
-> tab, where the *Release dry run* uploads the two Linux archives on a pull
-> request; all four from a manual *Release dry run* (`workflow_dispatch`).
-
 Two things it takes:
 
 ```sh
 # a particular release rather than the latest
-sh install.sh 0.2.0
+sh install.sh 0.16.0
 
 # somewhere else to put it
 AGENT_COMPOSE_INSTALL="$HOME/bin" sh install.sh
@@ -65,7 +57,7 @@ The Linux binaries are statically linked against musl, so they run on an alpine
 container and on an old glibc alike.
 
 ```sh
-version=0.2.0
+version=0.16.0
 target=x86_64-unknown-linux-musl
 base="https://github.com/moldy530/agent-compose/releases/download/v$version"
 
@@ -89,7 +81,7 @@ agent-compose --version
 ```
 
 It prints the release, the commit it was built from, and the target it was built
-for — `agent-compose 0.2.0 (a1b2c3d, x86_64-unknown-linux-musl)` — which is what
+for — `agent-compose 0.16.0 (a1b2c3d, x86_64-unknown-linux-musl)` — which is what
 a bug report should carry. If the command is not found, the install directory is
 not on your `PATH`.
 
