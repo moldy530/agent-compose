@@ -228,7 +228,7 @@ pub fn module(ir: &Ir, names: &Names) -> super::GeneratedFile {
     body.push_str(&shapes(ir, names, &surfaces));
     body.push_str(&providers(ir, names));
     body.push_str(&models(ir, names));
-    body.push_str(&stores(ir, names));
+    body.push_str(&stores(ir, names, &mut imported));
     body.push_str(&tools(ir, names, &surfaces, &mut imported, &mut seams));
     body.push_str(&agents(ir, names, &surfaces, &mut imported));
 
@@ -631,7 +631,7 @@ const DEFAULT_ROUTE_ON: &[&str] = &["rate_limit", "overloaded", "timeout"];
 /// `store:` node and a synthesized tool address the same binding, so a
 /// `scope: execution` store an agent wrote through is the same store the next
 /// node reads.
-fn stores(ir: &Ir, names: &Names) -> String {
+fn stores(ir: &Ir, names: &Names, imported: &mut Vec<String>) -> String {
     let mut text = String::new();
     for (address, definition) in &ir.definitions {
         let DefinitionBody::Store(store) = &definition.body else {
@@ -681,6 +681,16 @@ fn stores(ir: &Ir, names: &Names) -> String {
             "  metadata: {},\n",
             store.metadata_schema.is_some()
         ));
+        // The emitted Zod for `V`, which a `merge`, `append` or `incr` holds the
+        // whole value it is about to commit to — the first ops that validate a
+        // *stored* value rather than only what they were handed (PRD resolved
+        // q68). One schema for both surfaces, so a value a node's partial update
+        // and a tool's would each commit is the same value.
+        if store.kind == crate::ast::definition::StoreKind::Kv && store.value_schema.is_some() {
+            let schema = names.value(&format!("{address}.value_schema")).to_string();
+            text.push_str(&format!("  value: {schema},\n"));
+            imported.push(schema);
+        }
         if let Some(embed) = &store.embed {
             text.push_str("  embed: {\n");
             text.push_str(&format!("    store: {},\n", names::string(address)));
@@ -1300,7 +1310,9 @@ fn store_tools(
         let access = store
             .agent_access
             .unwrap_or(crate::ast::definition::AgentAccess::ReadWrite);
-        for op in crate::check::model::store_tools(store.kind, access) {
+        for op in crate::check::model::store_tools(store.kind, access, store.value_schema.as_ref())
+        {
+            let op = &op;
             let name = crate::check::model::store_tool_name(local, *op);
             let path = format!("{address}.tool.{}.input", op.as_str());
             let schema_name = names.value(&path).to_string();
@@ -1350,6 +1362,11 @@ fn store_tool_description(
         crate::ast::flow::StoreOp::Search => "Search by meaning in",
         crate::ast::flow::StoreOp::Upsert => "Add or replace a document in",
         crate::ast::flow::StoreOp::Put => "Store an object under a key in",
+        crate::ast::flow::StoreOp::Merge => "Change some fields of the value at a key in",
+        crate::ast::flow::StoreOp::Append => {
+            "Add one item to an array field of the value at a key in"
+        }
+        crate::ast::flow::StoreOp::Incr => "Add to a numeric field of the value at a key in",
     };
     match &store.description {
         Some(description) => format!("{what} `{address}`. {}", description.value.trim()),
@@ -1406,8 +1423,9 @@ fn output_tool_name(ir: &Ir, agent: &Agent, local: &str) -> String {
         let access = store
             .agent_access
             .unwrap_or(crate::ast::definition::AgentAccess::ReadWrite);
-        for op in crate::check::model::store_tools(store.kind, access) {
-            attached.push(crate::check::model::store_tool_name(store_local, *op));
+        for op in crate::check::model::store_tools(store.kind, access, store.value_schema.as_ref())
+        {
+            attached.push(crate::check::model::store_tool_name(store_local, op));
         }
     }
     let mut ordinal = 2;
@@ -1937,7 +1955,7 @@ fn input_builder(
         // every node's input is built here: an expression that cannot be
         // evaluated fails the execution rather than the activity, and neither
         // `skip` nor a `fallback:` may absorb that (Decisions D78, D110).
-        NodeKind::Store { params, .. } => store_params(params),
+        NodeKind::Store { op, params, .. } => store_params(*op, params),
         // What the human is **shown** (grammar 8.7): a declared input surface
         // like an agent's or a tool's, bound through grammar 8.0's own chain, so
         // `input: { answer: "state.answer" }` and a field that resolves by name
@@ -1952,11 +1970,13 @@ fn input_builder(
 
 /// One store op's parameters, as the object `stores.runStoreOp` takes.
 ///
-/// The three literals of grammar 8.8 — `top_k`, `limit`, `content_type` — are
-/// written out as literals rather than evaluated: a store op's bound is a
-/// written-down number, readable without running the graph, exactly as a
-/// fan-out's is a schema bound.
-fn store_params(params: &crate::ir::flow::StoreParams) -> String {
+/// The literals of grammar 8.8 and 11.4 — `top_k`, `limit`, `content_type`,
+/// and PRD resolved q68's `field`, `unique` and `if` — are written out as
+/// literals rather than evaluated: a store op's bound is a written-down number,
+/// and which field a partial update touches and what it is conditioned on are
+/// readable without running the graph, exactly as a fan-out's bound is a schema
+/// bound.
+fn store_params(op: crate::ast::flow::StoreOp, params: &crate::ir::flow::StoreParams) -> String {
     let mut text = String::from("  input: (roots) => ({\n");
     for (key, expression) in [
         ("key", params.key.as_ref()),
@@ -1972,6 +1992,16 @@ fn store_params(params: &crate::ir::flow::StoreParams) -> String {
         ));
     }
     match &params.value {
+        // A `kv append`'s value is one item of whatever its array holds, so it
+        // is the expression's JSON as it is.
+        Some(crate::ir::flow::StoreValue::Expression { value })
+            if op == crate::ast::flow::StoreOp::Append =>
+        {
+            text.push_str(&format!(
+                "    value: runtime.toJson(runtime.evaluate({}, roots)),\n",
+                names::string(value.value.as_str())
+            ));
+        }
         // A `vector upsert`'s and a `blob put`'s value is one expression: the
         // text, or the content.
         Some(crate::ir::flow::StoreValue::Expression { value }) => {
@@ -1997,6 +2027,7 @@ fn store_params(params: &crate::ir::flow::StoreParams) -> String {
     for (key, map) in [
         ("filter", params.filter.as_ref()),
         ("metadata", params.metadata.as_ref()),
+        ("fields", params.fields.as_ref()),
     ] {
         let Some(map) = map else { continue };
         text.push_str(&format!("    {key}: {{\n"));
@@ -2019,6 +2050,36 @@ fn store_params(params: &crate::ir::flow::StoreParams) -> String {
         text.push_str(&format!(
             "    contentType: {},\n",
             names::string(&content_type.value)
+        ));
+    }
+    if let Some(field) = &params.field {
+        text.push_str(&format!(
+            "    field: {},\n",
+            names::string(field.value.as_str())
+        ));
+    }
+    if let Some(unique) = params.unique {
+        text.push_str(&format!("    unique: {unique},\n"));
+    }
+    // A number either way: the field an `incr` adds to is an `integer` or a
+    // `number` (grammar 11.4), and a CEL `int` is a JavaScript number once it
+    // is JSON.
+    if let Some(by) = &params.by {
+        text.push_str(&format!(
+            "    by: Number(runtime.toJson(runtime.evaluate({}, roots))),\n",
+            names::string(by.value.as_str())
+        ));
+    }
+    if let Some(condition) = &params.condition {
+        text.push_str(&format!(
+            "    condition: {},\n",
+            names::string(condition.value.as_str())
+        ));
+    }
+    if let Some(version) = &params.if_version {
+        text.push_str(&format!(
+            "    ifVersion: Number(runtime.toJson(runtime.evaluate({}, roots))),\n",
+            names::string(version.value.as_str())
         ));
     }
     text.push_str("  }),\n");

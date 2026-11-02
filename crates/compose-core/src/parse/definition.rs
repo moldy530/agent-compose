@@ -596,6 +596,7 @@ const STORE_SCOPES: &[(&str, StoreScope)] = &[
 const AGENT_ACCESS: &[(&str, AgentAccess)] = &[
     ("read", AgentAccess::Read),
     ("read_write", AgentAccess::ReadWrite),
+    ("full", AgentAccess::Full),
 ];
 
 fn store(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> StoreDef {

@@ -52,7 +52,7 @@ pub use document::{
 };
 pub use flow::{
     Edge, FlowContext, FlowDef, FlowNode, HumanBlock, ItemError, MapBlock, MapDispatch, MapRoute,
-    NODE_KIND_KEYS, Node, NodeKind, StoreNode, StoreOp, StoreOpParams, StoreValue,
+    NODE_KIND_KEYS, Node, NodeKind, StoreCondition, StoreNode, StoreOp, StoreOpParams, StoreValue,
 };
 pub use policy::{OnError, PolicyBlock, Retry};
 pub use schema::{
@@ -83,6 +83,7 @@ mod keyword_tests {
 
         assert_eq!(AgentAccess::Read.as_str(), "read");
         assert_eq!(AgentAccess::ReadWrite.as_str(), "read_write");
+        assert_eq!(AgentAccess::Full.as_str(), "full");
 
         assert_eq!(FlowContext::Isolated.as_str(), "isolated");
         assert_eq!(FlowContext::Inherit.as_str(), "inherit");

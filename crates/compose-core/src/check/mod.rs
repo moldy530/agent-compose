@@ -191,8 +191,8 @@ fn flow_definition<'a>(ctx: &mut Ctx<'a>, address: &'a str, flow: &'a Flow) {
         channels::node_writes(ctx, &cx, node);
         match &node.kind {
             NodeKind::Map { map } => maps::map_node(ctx, &cx, node, map),
-            NodeKind::Store { store, params, .. } => {
-                stores::store_node(ctx, &cx, node, store, params);
+            NodeKind::Store { store, op, params } => {
+                stores::store_node(ctx, &cx, node, store, *op, params);
             }
             NodeKind::Coder { coder } => coder::coder_node(ctx, &cx, node, coder),
             NodeKind::Http { http } => bindings::inline_http(ctx, &cx, node, http),

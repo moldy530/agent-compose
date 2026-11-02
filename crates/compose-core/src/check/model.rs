@@ -573,7 +573,7 @@ pub(crate) fn default_of(node: &TypeNode) -> Option<&Spanned<Literal>> {
 }
 
 /// How a form is named where the two sides are not even the same shape.
-fn describe_form(form: &TypeForm) -> String {
+pub(crate) fn describe_form(form: &TypeForm) -> String {
     match form {
         TypeForm::Scalar(scalar) => scalar_name(scalar.kind),
         TypeForm::Enum(enumeration) => format!("one of [{}]", variants(&enumeration.variants)),
@@ -774,10 +774,18 @@ pub(crate) fn http_default_output(span: &Span) -> FieldMap {
 /// `limit` the node declares, which is the only bound either result has and is
 /// what lets one be written to a bounded channel at all (grammar 3.5).
 ///
-/// The catalog marks one field optional — `value` on a `kv`/`blob` `get`,
-/// absent on a miss — and that is a runtime fact with no static consequence
-/// (Decision D110: the read fails, the write does not happen), so the
-/// synthesized map carries every field alike.
+/// The catalog marks three fields optional — `value` on a `kv`/`blob` `get`,
+/// absent on a miss; `version` on every `kv` row that carries one, absent where
+/// the key holds nothing; and `value` on a partial update, absent where its
+/// condition did not hold — and that is a runtime fact with no static
+/// consequence (Decision D110: the read fails, the write does not happen), so
+/// the synthesized map carries every field alike.
+///
+/// A `kv` **write**'s row is PRD resolved q68's: `applied` says whether the
+/// write's condition held and it landed, `version` is the key's version after
+/// it (or the one it still holds, where it declined), and `deduped` says the
+/// answer is a first attempt's, handed back by the idempotency ledger rather
+/// than performed again.
 pub(crate) fn store_output(
     kind: StoreKind,
     op: StoreOp,
@@ -787,41 +795,53 @@ pub(crate) fn store_output(
     span: &Span,
 ) -> FieldMap {
     let string = || scalar_node(ScalarKind::String, span);
+    let boolean = || scalar_node(ScalarKind::Boolean, span);
+    let version = || scalar_node(ScalarKind::Integer, span);
+    let stored = || {
+        value_schema.map_or_else(
+            || object_node(Vec::new(), span),
+            |schema| object_node_of(schema.clone(), span),
+        )
+    };
     match (kind, op) {
-        (StoreKind::Kv, StoreOp::Get) => {
-            let value = value_schema.map_or_else(
-                || object_node(Vec::new(), span),
-                |schema| {
-                    node(
-                        TypeForm::Object(ObjectType {
-                            properties: schema.clone(),
-                            optional: Vec::new(),
-                            default: None,
-                        }),
-                        span,
-                    )
-                },
-            );
-            field_map(
-                vec![
-                    ("value", value),
-                    ("found", scalar_node(ScalarKind::Boolean, span)),
-                ],
-                span,
-            )
-        }
-        (StoreKind::Blob, StoreOp::Get) => field_map(
+        (StoreKind::Kv, StoreOp::Get) => field_map(
             vec![
-                ("value", string()),
-                ("found", scalar_node(ScalarKind::Boolean, span)),
+                ("value", stored()),
+                ("found", boolean()),
+                ("version", version()),
             ],
             span,
         ),
-        (StoreKind::Kv, StoreOp::Set) | (StoreKind::Blob, StoreOp::Put) => {
-            field_map(vec![("key", string())], span)
+        (StoreKind::Blob, StoreOp::Get) => {
+            field_map(vec![("value", string()), ("found", boolean())], span)
         }
-        (_, StoreOp::Delete) => field_map(
-            vec![("deleted", scalar_node(ScalarKind::Boolean, span))],
+        (StoreKind::Kv, StoreOp::Set) => field_map(
+            vec![
+                ("key", string()),
+                ("applied", boolean()),
+                ("version", version()),
+                ("deduped", boolean()),
+            ],
+            span,
+        ),
+        (StoreKind::Blob, StoreOp::Put) => field_map(vec![("key", string())], span),
+        (StoreKind::Kv, StoreOp::Delete) => field_map(
+            vec![
+                ("deleted", boolean()),
+                ("applied", boolean()),
+                ("deduped", boolean()),
+            ],
+            span,
+        ),
+        (_, StoreOp::Delete) => field_map(vec![("deleted", boolean())], span),
+        (StoreKind::Kv, StoreOp::Merge | StoreOp::Append | StoreOp::Incr) => field_map(
+            vec![
+                ("key", string()),
+                ("applied", boolean()),
+                ("version", version()),
+                ("value", stored()),
+                ("deduped", boolean()),
+            ],
             span,
         ),
         (_, StoreOp::List) => field_map(vec![("keys", array_node(string(), bound, span))], span),
@@ -835,17 +855,8 @@ pub(crate) fn store_output(
             // all, so a match carries no `metadata` field to read — as against
             // `metadata_schema: {}`, which declares one that is always empty
             // (Decision D114).
-            let metadata;
             if let Some(schema) = metadata_schema {
-                metadata = node(
-                    TypeForm::Object(ObjectType {
-                        properties: schema.clone(),
-                        optional: Vec::new(),
-                        default: None,
-                    }),
-                    span,
-                );
-                properties.push(("metadata", metadata));
+                properties.push(("metadata", object_node_of(schema.clone(), span)));
             }
             field_map(
                 vec![(
@@ -856,24 +867,97 @@ pub(crate) fn store_output(
             )
         }
         (StoreKind::Vector, StoreOp::Upsert) => field_map(vec![("id", string())], span),
-        // Every remaining pair is refused by the parser, which reads the op
-        // against its kind's row before the IR exists (grammar 11.4).
+        // Every remaining pair is an op its store's kind does not take, which
+        // the validator refuses against the store (`check::stores`, grammar
+        // 11.4): there is no row to derive, and the node is already an error.
         _ => field_map(Vec::new(), span),
     }
 }
 
+/// Whether a store of this kind takes this op — grammar 11.4's table, read
+/// by row through [`StoreKind::operations`], which is the one place it is
+/// written.
+pub(crate) fn kind_takes(kind: StoreKind, op: StoreOp) -> bool {
+    kind.operations().contains(&op.as_str())
+}
+
+/// The fields of `V` an `append` may name: its array fields, in declaration
+/// order, each with the item type it holds.
+pub(crate) fn array_fields(value_schema: Option<&FieldMap>) -> Vec<(&Field, &TypeNode)> {
+    value_schema
+        .map(|schema| {
+            schema
+                .fields
+                .iter()
+                .filter_map(|field| match &field.ty.form {
+                    TypeForm::Array(array) => Some((field, array.items.as_ref())),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The fields of `V` an `incr` may name: its `integer` and `number` fields, in
+/// declaration order.
+pub(crate) fn numeric_fields(value_schema: Option<&FieldMap>) -> Vec<&Field> {
+    value_schema
+        .map(|schema| {
+            schema
+                .fields
+                .iter()
+                .filter(|field| {
+                    matches!(
+                        &field.ty.form,
+                        TypeForm::Scalar(Scalar {
+                            kind: ScalarKind::Integer | ScalarKind::Number,
+                            ..
+                        })
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The tools an agent-attached store synthesizes, in grammar 11.5's own order.
 ///
-/// The table is 11.5's, read through `agent_access:` (Decision D37): `read`
-/// grants the reading ops and `read_write` — the default — adds the writing one.
-pub(crate) fn store_tools(kind: StoreKind, access: AgentAccess) -> &'static [StoreOp] {
+/// The table is 11.5's, read through `agent_access:` (Decisions D37, D152):
+/// `read` grants the reading ops, `read_write` — the default — adds the
+/// whole-value write, and `full` adds the rest of a `kv` store's writes:
+/// `merge`, `append`, `incr` and `delete` (PRD resolved q68). Two of those are
+/// offered where `V` gives them something to address and nowhere else — an
+/// `append` needs an array field and an `incr` a numeric one, and a tool whose
+/// every call the schema would refuse is a tool the model can only waste a
+/// turn on. A `vector` or `blob` store's writes are the ones `read_write`
+/// already grants, so `full` there grants exactly that.
+pub(crate) fn store_tools(
+    kind: StoreKind,
+    access: AgentAccess,
+    value_schema: Option<&FieldMap>,
+) -> Vec<StoreOp> {
     match (kind, access) {
-        (StoreKind::Kv, AgentAccess::Read) => &[StoreOp::Get],
-        (StoreKind::Kv, AgentAccess::ReadWrite) => &[StoreOp::Get, StoreOp::Set],
-        (StoreKind::Vector, AgentAccess::Read) => &[StoreOp::Search],
-        (StoreKind::Vector, AgentAccess::ReadWrite) => &[StoreOp::Search, StoreOp::Upsert],
-        (StoreKind::Blob, AgentAccess::Read) => &[StoreOp::Get, StoreOp::List],
-        (StoreKind::Blob, AgentAccess::ReadWrite) => &[StoreOp::Get, StoreOp::List, StoreOp::Put],
+        (StoreKind::Kv, AgentAccess::Read) => vec![StoreOp::Get],
+        (StoreKind::Kv, AgentAccess::ReadWrite) => vec![StoreOp::Get, StoreOp::Set],
+        (StoreKind::Kv, AgentAccess::Full) => {
+            let mut ops = vec![StoreOp::Get, StoreOp::Set, StoreOp::Merge];
+            if !array_fields(value_schema).is_empty() {
+                ops.push(StoreOp::Append);
+            }
+            if !numeric_fields(value_schema).is_empty() {
+                ops.push(StoreOp::Incr);
+            }
+            ops.push(StoreOp::Delete);
+            ops
+        }
+        (StoreKind::Vector, AgentAccess::Read) => vec![StoreOp::Search],
+        (StoreKind::Vector, AgentAccess::ReadWrite | AgentAccess::Full) => {
+            vec![StoreOp::Search, StoreOp::Upsert]
+        }
+        (StoreKind::Blob, AgentAccess::Read) => vec![StoreOp::Get, StoreOp::List],
+        (StoreKind::Blob, AgentAccess::ReadWrite | AgentAccess::Full) => {
+            vec![StoreOp::Get, StoreOp::List, StoreOp::Put]
+        }
     }
 }
 
@@ -881,6 +965,20 @@ pub(crate) fn store_tools(kind: StoreKind, access: AgentAccess) -> &'static [Sto
 pub(crate) fn store_tool_name(local: &str, op: StoreOp) -> String {
     format!("{local}_{}", op.as_str())
 }
+
+/// The `if` argument a synthesized `kv` write offers: `absent`, `present`, or
+/// the empty string — the default, meaning no condition (PRD resolved q68).
+///
+/// A string with a pattern rather than an enum because a tool's optional
+/// argument is spelled with a `default:` (grammar 3.6, and see
+/// [`store_tool_input`]) and an enum's default has to be one of its variants,
+/// which "no condition" is not. The empty string is the same "nothing asked"
+/// sentinel `builtin.bash`'s `command` defaults to.
+pub(crate) const STORE_TOOL_CONDITION_PATTERN: &str = "^(absent|present)?$";
+
+/// The `if_version` a synthesized `kv` write is called without: no version
+/// condition. Every version a key can hold is `0` or more (PRD resolved q68).
+pub(crate) const STORE_TOOL_NO_VERSION: i64 = -1;
 
 /// The **arguments** one synthesized store tool takes (grammar 11.5, 11.4).
 ///
@@ -893,7 +991,13 @@ pub(crate) fn store_tool_name(local: &str, op: StoreOp) -> String {
 /// * The parameters §11.4 marks optional carry a `default:` here rather than
 ///   being required, because that is how this schema language spells optional at
 ///   a declaration surface (grammar 3.6) — so a model may leave a `filter:` out
-///   and mean "no filter" rather than having to invent an empty object.
+///   and mean "no filter" rather than having to invent an empty object. The
+///   conditions of PRD resolved q68 are the two whose "left out" has no value of
+///   the parameter's own type to default to, so each defaults to a sentinel that
+///   means "no condition": `if` to the empty string
+///   ([`STORE_TOOL_CONDITION_PATTERN`]) and `if_version` to
+///   [`STORE_TOOL_NO_VERSION`]. A call carrying **both** is refused by the tool
+///   with a sentence saying so, and goes back to the model (Decision D119).
 /// * Two parameters of the node surface are **not** offered to the model.
 ///   `top_k`/`limit` are, because §11.4 requires them and how many results to
 ///   ask for is the caller's question — but `content_type:` is not: grammar 8.8
@@ -901,6 +1005,17 @@ pub(crate) fn store_tool_name(local: &str, op: StoreOp) -> String {
 ///   type the author writes down, and a model choosing what media type a stored
 ///   object claims to be is exactly the authority `agent_access:` exists to
 ///   withhold. A store whose blobs need one writes a `store:` node.
+///
+/// One row is folded rather than copied, and the reason is a type. An
+/// `append`'s `field:` and `value:` are a pair whose second half is typed by the
+/// first — the item type of the array the field names — and a field map has no
+/// way to say that across two of its properties. So the tool takes the pair as
+/// **one** argument, `item`: an object whose properties are `V`'s array fields,
+/// each typed as its item, of which the call names exactly one —
+/// `{"item": {"tags": "urgent"}}`. Every property is optional and a call naming
+/// none, or two, is refused by the tool (Decision D119). `merge`'s `fields` is
+/// the same object over all of `V`, every property optional, for the reason a
+/// `filter:` is: a merge names the fields it changes.
 ///
 /// A `vector` store that declares no `metadata_schema:` has no metadata at all
 /// (Decision D114), so its `filter:` and `metadata:` have no legal key and the
@@ -913,24 +1028,124 @@ pub(crate) fn store_tool_input(
     span: &Span,
 ) -> FieldMap {
     let string = || scalar_node(ScalarKind::String, span);
+    let described = |mut ty: TypeNode, text: &str| {
+        ty.description = Some(Spanned::new(text.to_string(), span.clone()));
+        ty
+    };
+    let schema = || {
+        value_schema
+            .cloned()
+            .unwrap_or_else(|| field_map(Vec::new(), span))
+    };
+    let condition = || {
+        let mut ty = string();
+        if let TypeForm::Scalar(scalar) = &mut ty.form {
+            scalar.pattern = Some(STORE_TOOL_CONDITION_PATTERN.to_string());
+            scalar.default = Some(Spanned::new(Literal::String(String::new()), span.clone()));
+        }
+        described(
+            ty,
+            "Apply this write only if the key holds no value (`absent`) or only if it holds \
+             one (`present`). Leave it empty for a write that applies either way. A write \
+             whose condition does not hold changes nothing and answers `applied: false`.",
+        )
+    };
+    let if_version = || {
+        let mut ty = bounded_integer(STORE_TOOL_NO_VERSION, i64::MAX, span);
+        if let TypeForm::Scalar(scalar) = &mut ty.form {
+            scalar.maximum = None;
+            scalar.default = Some(Spanned::new(
+                Literal::Int(STORE_TOOL_NO_VERSION),
+                span.clone(),
+            ));
+        }
+        described(
+            ty,
+            "Apply this write only if the key's current `version` is this one, as a `get` or \
+             an earlier write answered it. `-1`, the default, asks for no version. A write \
+             whose version does not match changes nothing and answers `applied: false` with \
+             the version the key holds.",
+        )
+    };
     let mut fields: Vec<(&str, TypeNode)> = Vec::new();
     match (kind, op) {
-        // Grammar 11.5 synthesizes no `delete` tool for any kind, so the only
-        // one-parameter row here is a `get`.
         (StoreKind::Kv, StoreOp::Get) | (StoreKind::Blob, StoreOp::Get) => {
             fields.push(("key", string()));
         }
         (StoreKind::Kv, StoreOp::Set) => {
             fields.push(("key", string()));
+            fields.push(("value", object_node_of(schema(), span)));
+            fields.push(("if", condition()));
+            fields.push(("if_version", if_version()));
+        }
+        (StoreKind::Kv, StoreOp::Merge) => {
+            fields.push(("key", string()));
             fields.push((
-                "value",
-                object_node_of(
-                    value_schema
-                        .cloned()
-                        .unwrap_or_else(|| field_map(Vec::new(), span)),
-                    span,
+                "fields",
+                described(
+                    optional_object(schema(), span),
+                    "The fields to change. Every other field of the stored value is kept, and \
+                     the value that results has to be one the store's schema admits.",
                 ),
             ));
+            fields.push(("if", condition()));
+            fields.push(("if_version", if_version()));
+        }
+        (StoreKind::Kv, StoreOp::Append) => {
+            let items: Vec<(&str, TypeNode)> = array_fields(value_schema)
+                .into_iter()
+                .map(|(field, item)| (field.name.value.as_str(), item.clone()))
+                .collect();
+            fields.push(("key", string()));
+            fields.push((
+                "item",
+                described(
+                    optional_object(field_map(items, span), span),
+                    "Name exactly one array field of the stored value, with the item to add to \
+                     its end: `{\"tags\": \"urgent\"}`. A key holding nothing starts from an \
+                     empty array.",
+                ),
+            ));
+            fields.push(("unique", {
+                let mut ty = scalar_node(ScalarKind::Boolean, span);
+                if let TypeForm::Scalar(scalar) = &mut ty.form {
+                    scalar.default = Some(Spanned::new(Literal::Bool(false), span.clone()));
+                }
+                described(
+                    ty,
+                    "Set to `true` to add the item only if the array does not already hold an \
+                     equal one.",
+                )
+            }));
+            fields.push(("if", condition()));
+            fields.push(("if_version", if_version()));
+        }
+        (StoreKind::Kv, StoreOp::Incr) => {
+            let names: Vec<&str> = numeric_fields(value_schema)
+                .into_iter()
+                .map(|field| field.name.value.as_str())
+                .collect();
+            fields.push(("key", string()));
+            fields.push((
+                "field",
+                described(
+                    enum_node(&names, span),
+                    "The numeric field to add to. A key holding nothing starts from `0`.",
+                ),
+            ));
+            fields.push(("by", {
+                let mut ty = scalar_node(ScalarKind::Number, span);
+                if let TypeForm::Scalar(scalar) = &mut ty.form {
+                    scalar.default = Some(Spanned::new(Literal::Int(1), span.clone()));
+                }
+                described(ty, "What to add; `1` by default, and negative to subtract.")
+            }));
+            fields.push(("if", condition()));
+            fields.push(("if_version", if_version()));
+        }
+        (StoreKind::Kv, StoreOp::Delete) => {
+            fields.push(("key", string()));
+            fields.push(("if_version", if_version()));
         }
         (StoreKind::Blob, StoreOp::Put) => {
             fields.push(("key", string()));
@@ -994,6 +1209,24 @@ fn partial_object(properties: FieldMap, span: &Span) -> TypeNode {
             properties,
             optional,
             default: Some(Spanned::new(Literal::Mapping(Vec::new()), span.clone())),
+        }),
+        span,
+    )
+}
+
+/// The same object with every property optional and **no** default — an
+/// argument the call has to supply, naming the properties it means.
+fn optional_object(properties: FieldMap, span: &Span) -> TypeNode {
+    let optional = properties
+        .fields
+        .iter()
+        .map(|field| Spanned::new(field.name.value.clone(), span.clone()))
+        .collect();
+    node(
+        TypeForm::Object(ObjectType {
+            properties,
+            optional,
+            default: None,
         }),
         span,
     )
@@ -1412,6 +1645,75 @@ mod tests {
             &with("x", &here),
             &scalar_node(ScalarKind::String, &here)
         ));
+    }
+
+    /// Grammar 11.5's table read through `agent_access:`: `full` adds a `kv`
+    /// store's partial updates and `delete`, `read_write` keeps exactly the two
+    /// tools it always had, and an `append`/`incr` is offered only where `V`
+    /// gives it a field to address (PRD resolved q68).
+    #[test]
+    fn full_access_adds_the_partial_updates_and_delete_and_read_write_does_not() {
+        let at = span();
+        let schema = field_map(
+            vec![
+                ("title", scalar_node(ScalarKind::String, &at)),
+                (
+                    "tags",
+                    array_node(scalar_node(ScalarKind::String, &at), Some(5), &at),
+                ),
+                ("count", scalar_node(ScalarKind::Integer, &at)),
+            ],
+            &at,
+        );
+        assert_eq!(
+            store_tools(StoreKind::Kv, AgentAccess::Full, Some(&schema)),
+            [
+                StoreOp::Get,
+                StoreOp::Set,
+                StoreOp::Merge,
+                StoreOp::Append,
+                StoreOp::Incr,
+                StoreOp::Delete
+            ]
+        );
+        assert_eq!(
+            store_tools(StoreKind::Kv, AgentAccess::ReadWrite, Some(&schema)),
+            [StoreOp::Get, StoreOp::Set],
+            "an existing composition keeps exactly the tools it had"
+        );
+        assert_eq!(
+            store_tools(StoreKind::Kv, AgentAccess::Read, Some(&schema)),
+            [StoreOp::Get]
+        );
+        let flat = field_map(vec![("title", scalar_node(ScalarKind::String, &at))], &at);
+        assert_eq!(
+            store_tools(StoreKind::Kv, AgentAccess::Full, Some(&flat)),
+            [StoreOp::Get, StoreOp::Set, StoreOp::Merge, StoreOp::Delete],
+            "no array field and no numeric one: nothing to append to or add to"
+        );
+        assert_eq!(
+            store_tools(StoreKind::Vector, AgentAccess::Full, None),
+            store_tools(StoreKind::Vector, AgentAccess::ReadWrite, None),
+            "a `vector` store's writes are the ones `read_write` already grants"
+        );
+        assert_eq!(
+            store_tools(StoreKind::Blob, AgentAccess::Full, None),
+            store_tools(StoreKind::Blob, AgentAccess::ReadWrite, None)
+        );
+    }
+
+    /// Which kind takes which op is grammar 11.4's table, row by row — the
+    /// partial updates are `kv`'s alone.
+    #[test]
+    fn the_partial_updates_are_ops_of_a_kv_store_alone() {
+        for op in [StoreOp::Merge, StoreOp::Append, StoreOp::Incr] {
+            assert!(kind_takes(StoreKind::Kv, op), "{}", op.as_str());
+            assert!(!kind_takes(StoreKind::Vector, op), "{}", op.as_str());
+            assert!(!kind_takes(StoreKind::Blob, op), "{}", op.as_str());
+            assert!(op.writes(), "{} is a write", op.as_str());
+        }
+        assert!(!kind_takes(StoreKind::Kv, StoreOp::Search));
+        assert!(kind_takes(StoreKind::Vector, StoreOp::Delete));
     }
 
     #[test]

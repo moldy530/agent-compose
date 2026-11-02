@@ -1,0 +1,21 @@
+# rule: which ops a store takes is its kind's, decided against the definition the node names (grammar 11.4, Decision D152)
+# code: invalid-value
+# message: node `tweak` asks `store.artifacts` for a `merge`, which a `blob` store does not take
+# at: main.yml:14:14
+# help: a `blob` store takes `put`, `get`, `delete`, `list` (grammar 11.4)
+version: "0.1"
+store.artifacts:
+  kind: blob
+  scope: global
+flow.f:
+  outputs: {}
+  nodes:
+    tweak:
+      store: store.artifacts
+      op: merge
+      key: "'report.txt'"
+      fields:
+        title: "'t'"
+  edges:
+    - { from: start, to: tweak }
+    - { from: tweak, to: end }

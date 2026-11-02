@@ -1,0 +1,28 @@
+# rule: a `kv append` adds one item to an array field of `value_schema` (grammar 11.4, PRD resolved q68)
+# code: type-mismatch
+# message: `append` adds one item to an array field, and `title` of `store.notes` is a string
+# at: main.yml:24:14
+# label: main.yml:12:5 the field is declared here
+# help: name an array field — `store.notes` declares `tags` — or write the field with `merge` (grammar 11.4)
+version: "0.1"
+store.notes:
+  kind: kv
+  scope: global
+  value_schema:
+    title: { type: string }
+    tags:
+      type: array
+      max_items: 20
+      items: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    tag:
+      store: store.notes
+      op: append
+      key: "'k'"
+      field: title
+      value: "'urgent'"
+  edges:
+    - { from: start, to: tag }
+    - { from: tag, to: end }

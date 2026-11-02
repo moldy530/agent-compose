@@ -603,7 +603,11 @@ fn store_params(params: &StoreParams) -> Vec<BindingView> {
     if let Some(limit) = params.limit {
         push("limit", limit.to_string());
     }
-    for (name, bindings) in [("filter", &params.filter), ("metadata", &params.metadata)] {
+    for (name, bindings) in [
+        ("filter", &params.filter),
+        ("metadata", &params.metadata),
+        ("fields", &params.fields),
+    ] {
         let Some(bindings) = bindings else { continue };
         for entry in &bindings.entries {
             push(
@@ -614,6 +618,21 @@ fn store_params(params: &StoreParams) -> Vec<BindingView> {
     }
     if let Some(content_type) = &params.content_type {
         push("content_type", content_type.value.clone());
+    }
+    if let Some(field) = &params.field {
+        push("field", field.value.as_str().to_string());
+    }
+    if let Some(unique) = params.unique {
+        push("unique", unique.to_string());
+    }
+    if let Some(by) = &params.by {
+        push("by", by.value.as_str().to_string());
+    }
+    if let Some(condition) = &params.condition {
+        push("if", condition.value.as_str().to_string());
+    }
+    if let Some(version) = &params.if_version {
+        push("if_version", version.value.as_str().to_string());
     }
     held
 }
@@ -941,7 +960,7 @@ fn agent_tools(ir: &Ir, agent: &Agent) -> Vec<ToolView> {
         };
         let access = store.agent_access.unwrap_or(AgentAccess::ReadWrite);
         let local = attached.value.name.as_str();
-        for op in model::store_tools(store.kind, access) {
+        for op in &model::store_tools(store.kind, access, store.value_schema.as_ref()) {
             held.push(ToolView {
                 name: model::store_tool_name(local, *op),
                 source: ToolSource::Store,

@@ -1,0 +1,18 @@
+# rule: a `kv` write takes one condition, so `if:` and `if_version:` together are refused (grammar 11.4, PRD resolved q68)
+# at: /flow.demo/nodes/claim
+# via: /$defs/storeNode/allOf/12/not
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    claim:
+      store: store.jobs
+      op: set
+      key: "'job'"
+      value:
+        owner: "'me'"
+      if: absent
+      if_version: "3"
+  edges:
+    - { from: start, to: claim }
+    - { from: claim, to: end }

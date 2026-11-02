@@ -507,7 +507,7 @@ pub fn surfaces(ir: &Ir) -> Vec<Surface<'_>> {
                         .split_once('.')
                         .map_or(address.as_str(), |(_, rest)| rest);
                     let access = store.agent_access.unwrap_or(AgentAccess::ReadWrite);
-                    for op in model::store_tools(store.kind, access) {
+                    for op in &model::store_tools(store.kind, access, store.value_schema.as_ref()) {
                         surfaces.push(Surface {
                             path: format!("{address}.tool.{}.input", op.as_str()),
                             about: format!(
@@ -2258,5 +2258,143 @@ flow.f:\n  outputs: {}\n  nodes:\n    probe:\n      exec:\n        command: \"tr
         let ir = ir_of(source);
         let module = crate::codegen::schema::module(&ir, &Names::of(&ir)).contents;
         assert!(!module.contains("kind default"), "{module}");
+    }
+
+    /// A composition with one `kv` store reached by every `kv` op, and attached
+    /// to an agent at `agent_access: full` — the surfaces PRD resolved q68 adds.
+    const KV_WRITES: &str = concat!(
+        "version: \"0.1\"\n",
+        "provider.p:\n  kind: anthropic\n  api_key: ${K}\n",
+        "model.m:\n  provider: provider.p\n  id: some-model\n",
+        "store.notes:\n  kind: kv\n  scope: global\n  agent_access: full\n  value_schema:\n",
+        "    title: { type: string }\n",
+        "    tags: { type: array, max_items: 10, items: { type: string } }\n",
+        "    count: { type: integer }\n",
+        "agent.a:\n  model: model.m\n  prompt: p\n  stores: [store.notes]\n",
+        "  output:\n    done: { type: boolean }\n",
+        "flow.f:\n  outputs: {}\n  nodes:\n",
+        "    read: { store: store.notes, op: get, key: \"'k'\" }\n",
+        "    claim: { store: store.notes, op: set, key: \"'k'\", if: absent, ",
+        "value: { title: \"'t'\", tags: \"[]\", count: \"0\" } }\n",
+        "    drop: { store: store.notes, op: delete, key: \"'k'\", if_version: \"1\" }\n",
+        "    tweak: { store: store.notes, op: merge, key: \"'k'\", fields: { title: \"'u'\" } }\n",
+        "    tag: { store: store.notes, op: append, key: \"'k'\", field: tags, value: \"'x'\", ",
+        "unique: true }\n",
+        "    bump: { store: store.notes, op: incr, key: \"'k'\", field: count, by: \"2\" }\n",
+        "  edges:\n",
+        "    - { from: start, to: read }\n    - { from: read, to: claim }\n",
+        "    - { from: claim, to: drop }\n    - { from: drop, to: tweak }\n",
+        "    - { from: tweak, to: tag }\n    - { from: tag, to: bump }\n",
+        "    - { from: bump, to: end }\n",
+    );
+
+    /// The derived output of every `kv` row is the one grammar 11.4 tabulates
+    /// (Decision D34), and its Zod follows — `applied`, `version` and `deduped`
+    /// on every write, the whole `V` on a partial update (PRD resolved q68).
+    #[test]
+    fn a_kv_writes_derived_output_answers_applied_version_and_deduped() {
+        let value = "z.object({\n    title: z.string(),\n    tags: z.array(z.string()).max(10),\n    count: z.number().int(),\n  }).strict()";
+        assert_eq!(
+            schema_of(KV_WRITES, "flow.f.node.read.output"),
+            format!(
+                "z.object({{\n  value: {value},\n  found: z.boolean(),\n  version: z.number().int(),\n}}).strict()"
+            )
+        );
+        assert_eq!(
+            schema_of(KV_WRITES, "flow.f.node.claim.output"),
+            "z.object({\n  key: z.string(),\n  applied: z.boolean(),\n  version: z.number().int(),\n  deduped: z.boolean(),\n}).strict()"
+        );
+        assert_eq!(
+            schema_of(KV_WRITES, "flow.f.node.drop.output"),
+            "z.object({\n  deleted: z.boolean(),\n  applied: z.boolean(),\n  deduped: z.boolean(),\n}).strict()"
+        );
+        let partial = format!(
+            "z.object({{\n  key: z.string(),\n  applied: z.boolean(),\n  version: z.number().int(),\n  value: {value},\n  deduped: z.boolean(),\n}}).strict()"
+        );
+        for node in ["tweak", "tag", "bump"] {
+            assert_eq!(
+                schema_of(KV_WRITES, &format!("flow.f.node.{node}.output")),
+                partial,
+                "`{node}` is a partial update and answers as `merge` does"
+            );
+        }
+    }
+
+    /// The tool surface `agent_access: full` synthesizes: `set`'s conditions as
+    /// defaulted sentinels, a `merge`'s fields as a partial `V`, an `append`'s
+    /// field-and-item pair folded into one `item`, an `incr`'s field as an enum
+    /// of `V`'s numeric fields, and a `delete`'s version (grammar 11.5).
+    #[test]
+    fn the_full_tool_surface_is_derived_from_the_value_schema() {
+        /// The one property line of `schema` that starts `  <name>: `, split at
+        /// its description so what is asserted is the schema, not the prose.
+        fn property<'a>(schema: &'a str, name: &str) -> (&'a str, &'a str) {
+            let line = schema
+                .lines()
+                .find(|line| line.starts_with(&format!("  {name}: ")))
+                .unwrap_or_else(|| panic!("no `{name}` property in {schema}"));
+            line.split_once(".describe(")
+                .map_or((line, ""), |(head, tail)| {
+                    (
+                        head,
+                        tail.split_once("\")").map_or(tail, |(_, after)| after),
+                    )
+                })
+        }
+        let set = schema_of(KV_WRITES, "store.notes.tool.set.input");
+        assert_eq!(
+            property(&set, "if"),
+            (
+                "  if: z.string().regex(/^(absent|present)?$/)",
+                ".default(\"\"),"
+            ),
+            "{set}"
+        );
+        assert_eq!(
+            property(&set, "if_version"),
+            ("  if_version: z.number().int().min(-1)", ".default(-1),"),
+            "{set}"
+        );
+        let merge = schema_of(KV_WRITES, "store.notes.tool.merge.input");
+        assert!(
+            merge.contains("  fields: z.object({\n    title: z.string().optional(),\n    tags: z.array(z.string()).max(10).optional(),\n    count: z.number().int().optional(),\n  }).strict().describe("),
+            "{merge}"
+        );
+        assert!(
+            merge.contains("\n  if: ") && merge.contains("\n  if_version: "),
+            "{merge}"
+        );
+        let append = schema_of(KV_WRITES, "store.notes.tool.append.input");
+        assert!(
+            append.contains(
+                "  item: z.object({\n    tags: z.string().optional(),\n  }).strict().describe("
+            ),
+            "only the array field is offered, typed as its item: {append}"
+        );
+        assert_eq!(
+            property(&append, "unique"),
+            ("  unique: z.boolean()", ".default(false),"),
+            "{append}"
+        );
+        let incr = schema_of(KV_WRITES, "store.notes.tool.incr.input");
+        assert_eq!(
+            property(&incr, "field"),
+            ("  field: z.enum([\"count\"])", ","),
+            "only the numeric field is offered: {incr}"
+        );
+        assert_eq!(
+            property(&incr, "by"),
+            ("  by: z.number()", ".default(1),"),
+            "{incr}"
+        );
+        let delete = schema_of(KV_WRITES, "store.notes.tool.delete.input");
+        assert!(
+            delete.starts_with("z.object({\n  key: z.string(),\n  if_version: "),
+            "{delete}"
+        );
+        assert!(
+            !delete.contains("\n  if: "),
+            "a delete takes `if_version` alone: {delete}"
+        );
     }
 }

@@ -1,0 +1,20 @@
+# rule: a `kv` write takes one condition, `if:` or `if_version:` (grammar 11.4, PRD resolved q68)
+# code: conflicting-keys
+# message: node `claim` declares both `if:` and `if_version:`, and a write takes one condition
+# at: 17:19
+# help: `if:` asks whether the key holds a value and `if_version:` which version it holds, and only a key holding a value holds a version — so `if_version:` alone already asks `if: present` as well, and beside `if: absent` it could never apply: keep one (grammar 11.4)
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    claim:
+      store: store.jobs
+      op: set
+      key: "'job'"
+      value:
+        owner: "'me'"
+      if: absent
+      if_version: "3"
+  edges:
+    - { from: start, to: claim }
+    - { from: claim, to: end }

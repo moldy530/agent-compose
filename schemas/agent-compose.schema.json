@@ -1488,14 +1488,14 @@
       "properties": {
         "store": { "description": "The store definition to operate on.", "$ref": "#/$defs/storeRef" },
         "op": {
-          "description": "The operation. Legal values depend on the store's kind: kv = get|set|delete|list, vector = search|upsert|delete, blob = get|put|delete|list. Each op's output schema is derived and fixed (grammar 11.4). `get` is the one op whose result may omit a field: a miss returns `found: false` and no `value`, so a `writes:` of `value` performs no write that pass and reading `<node>.output.value` fails the execution - route on `found` instead (Decision D110).",
-          "enum": ["get", "set", "delete", "list", "search", "upsert", "put"]
+          "description": "The operation. Legal values depend on the store's kind: kv = get|set|delete|list|merge|append|incr, vector = search|upsert|delete, blob = get|put|delete|list. Each op's output schema is derived and fixed (grammar 11.4). A `get` that misses returns `found: false` and no `value` or `version`, so a `writes:` of `value` performs no write that pass and reading `<node>.output.value` fails the execution - route on `found` instead (Decision D110). A kv write answers `applied`: a write whose `if:`/`if_version:` condition did not hold changes nothing and answers `applied: false` - a result to route on, never a node error (PRD resolved q68).",
+          "enum": ["get", "set", "delete", "list", "search", "upsert", "put", "merge", "append", "incr"]
         },
         "key": { "description": "CEL key expression. Inside a map-dispatched instance a write's key must derive from the item.", "$ref": "#/$defs/cel" },
         "value": {
-          "description": "Value to write. `kv set` takes a field map of CEL expressions, checked against the store's value_schema; `vector upsert` and `blob put` take a single CEL string (the text / the content). Grammar 11.4.",
+          "description": "Value to write. `kv set` takes a field map of CEL expressions, checked against the store's value_schema; `vector upsert` and `blob put` take a single CEL string (the text / the content), and `kv append` one CEL expression, the item it adds. Grammar 11.4.",
           "oneOf": [
-            { "description": "The text (vector upsert) or content (blob put).", "$ref": "#/$defs/cel" },
+            { "description": "The text (vector upsert), content (blob put) or item (kv append).", "$ref": "#/$defs/cel" },
             {
               "description": "Field -> CEL, matching the store's value_schema (kv set).",
               "type": "object",
@@ -1521,6 +1521,17 @@
           "additionalProperties": { "$ref": "#/$defs/cel" }
         },
         "content_type": { "description": "Content type for a blob put: a literal media type, not CEL. Env references are illegal (grammar 4.3 class 3, Decision D92).", "$ref": "#/$defs/noEnvRefString" },
+        "fields": {
+          "description": "The fields a kv merge changes: field -> CEL, each a field of the store's value_schema. The rest of the stored value is kept, and the value that results is validated whole against value_schema before it commits (grammar 11.4, PRD resolved q68).",
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/identifier" },
+          "additionalProperties": { "$ref": "#/$defs/cel" }
+        },
+        "field": { "description": "The one field of the store's value_schema a kv append (an array field) or incr (an integer or number field) addresses. A literal name, not CEL.", "$ref": "#/$defs/identifier" },
+        "unique": { "description": "kv append only: add the item only if the array does not already hold an equal one (default false). A literal, not CEL.", "type": "boolean" },
+        "by": { "description": "kv incr only: CEL number added to the field (default 1).", "$ref": "#/$defs/cel" },
+        "if": { "description": "Apply a kv write only if the key holds no value (`absent`) or only if it holds one (`present`). A literal, not CEL. Mutually exclusive with `if_version:`; a condition that does not hold answers `applied: false` (PRD resolved q68).", "enum": ["absent", "present"] },
+        "if_version": { "description": "CEL integer: apply a kv write only if the key's current version - as a `get` or an earlier write answered it - is this one. Mutually exclusive with `if:` (PRD resolved q68).", "$ref": "#/$defs/cel" },
         "writes": { "description": "Write remap over the op's derived output fields.", "$ref": "#/$defs/writes" },
         "retry": { "$ref": "#/$defs/retry" },
         "timeout": { "description": "Wall-clock bound on this node.", "$ref": "#/$defs/duration" },
@@ -1532,7 +1543,7 @@
         {
           "if": { "properties": { "op": { "enum": ["get", "delete"] } }, "required": ["op"] },
           "then": {
-            "description": "`get`/`delete` address one key and take no other parameter. Grammar 11.4.",
+            "description": "`get`/`delete` address one key; a `delete` may also take `if_version:` (a kv one - a version is a kv key's). Grammar 11.4.",
             "required": ["key"],
             "properties": {
               "value": false,
@@ -1542,7 +1553,12 @@
               "limit": false,
               "filter": false,
               "metadata": false,
-              "content_type": false
+              "content_type": false,
+              "fields": false,
+              "field": false,
+              "unique": false,
+              "by": false,
+              "if": false
             }
           }
         },
@@ -1553,7 +1569,7 @@
         {
           "if": { "properties": { "op": { "const": "set" } }, "required": ["op"] },
           "then": {
-            "description": "`kv set` takes `key` and `value` only. Grammar 11.4.",
+            "description": "`kv set` takes `key`, `value`, and one optional condition. Grammar 11.4.",
             "properties": {
               "query": false,
               "top_k": false,
@@ -1561,7 +1577,11 @@
               "limit": false,
               "filter": false,
               "metadata": false,
-              "content_type": false
+              "content_type": false,
+              "fields": false,
+              "field": false,
+              "unique": false,
+              "by": false
             }
           }
         },
@@ -1575,7 +1595,13 @@
               "prefix": false,
               "limit": false,
               "filter": false,
-              "content_type": false
+              "content_type": false,
+              "fields": false,
+              "field": false,
+              "unique": false,
+              "by": false,
+              "if": false,
+              "if_version": false
             }
           }
         },
@@ -1589,7 +1615,13 @@
               "prefix": false,
               "limit": false,
               "filter": false,
-              "metadata": false
+              "metadata": false,
+              "fields": false,
+              "field": false,
+              "unique": false,
+              "by": false,
+              "if": false,
+              "if_version": false
             }
           }
         },
@@ -1605,7 +1637,13 @@
               "top_k": false,
               "filter": false,
               "metadata": false,
-              "content_type": false
+              "content_type": false,
+              "fields": false,
+              "field": false,
+              "unique": false,
+              "by": false,
+              "if": false,
+              "if_version": false
             }
           }
         },
@@ -1620,7 +1658,13 @@
               "prefix": false,
               "limit": false,
               "metadata": false,
-              "content_type": false
+              "content_type": false,
+              "fields": false,
+              "field": false,
+              "unique": false,
+              "by": false,
+              "if": false,
+              "if_version": false
             }
           }
         },
@@ -1642,6 +1686,75 @@
           "then": {
             "description": "`vector upsert` and `blob put` write one string: `value` is a CEL expression, never a field map.",
             "properties": { "value": { "$ref": "#/$defs/cel" } }
+          }
+        },
+        {
+          "if": { "properties": { "op": { "const": "merge" } }, "required": ["op"] },
+          "then": {
+            "description": "`kv merge` takes `key`, `fields`, and one optional condition. Grammar 11.4, PRD resolved q68.",
+            "required": ["key", "fields"],
+            "properties": {
+              "value": false,
+              "query": false,
+              "top_k": false,
+              "prefix": false,
+              "limit": false,
+              "filter": false,
+              "metadata": false,
+              "content_type": false,
+              "field": false,
+              "unique": false,
+              "by": false
+            }
+          }
+        },
+        {
+          "if": { "properties": { "op": { "const": "append" } }, "required": ["op"] },
+          "then": {
+            "description": "`kv append` takes `key`, `field` (an array field), `value` (one CEL item), an optional `unique`, and one optional condition. Grammar 11.4, PRD resolved q68.",
+            "required": ["key", "field", "value"],
+            "properties": {
+              "value": { "$ref": "#/$defs/cel" },
+              "query": false,
+              "top_k": false,
+              "prefix": false,
+              "limit": false,
+              "filter": false,
+              "metadata": false,
+              "content_type": false,
+              "fields": false,
+              "by": false
+            }
+          }
+        },
+        {
+          "if": { "properties": { "op": { "const": "incr" } }, "required": ["op"] },
+          "then": {
+            "description": "`kv incr` takes `key`, `field` (an integer or number field), an optional `by`, and one optional condition. Grammar 11.4, PRD resolved q68.",
+            "required": ["key", "field"],
+            "properties": {
+              "value": false,
+              "query": false,
+              "top_k": false,
+              "prefix": false,
+              "limit": false,
+              "filter": false,
+              "metadata": false,
+              "content_type": false,
+              "fields": false,
+              "unique": false
+            }
+          }
+        },
+        {
+          "description": "A kv write takes one condition: `if:` asks whether the key holds a value and `if_version:` which version it holds, so the two together are two answers to one question (grammar 11.4, PRD resolved q68).",
+          "not": { "required": ["if", "if_version"] }
+        },
+        {
+          "if": { "properties": { "op": { "const": "get" } }, "required": ["op"] },
+          "then": {
+            "description": "`get` reads and is conditioned on nothing.",
+            "properties": { "if_version": false }
           }
         }
       ]
@@ -1789,8 +1902,8 @@
         },
         "description": { "description": "Documentation; LLM-facing for agent-attached stores.", "type": "string" },
         "agent_access": {
-          "description": "Narrows the tools synthesized for agents that attach this store (default read_write).",
-          "enum": ["read", "read_write"]
+          "description": "How much of this store's synthesized tool surface an attaching agent gets (default read_write): `read` withholds the writes, `read_write` adds the whole-value write, and `full` adds a kv store's partial updates and delete - merge, append, incr, delete (grammar 11.5, PRD resolved q68).",
+          "enum": ["read", "read_write", "full"]
         }
       },
       "additionalProperties": false,

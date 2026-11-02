@@ -259,7 +259,7 @@ impl StoreKind {
     #[must_use]
     pub const fn operations(self) -> &'static [&'static str] {
         match self {
-            Self::Kv => &["get", "set", "delete", "list"],
+            Self::Kv => &["get", "set", "delete", "list", "merge", "append", "incr"],
             Self::Vector => &["search", "upsert", "delete"],
             Self::Blob => &["put", "get", "delete", "list"],
         }
@@ -289,14 +289,17 @@ impl StoreScope {
     }
 }
 
-/// How much of a store's surface an attached agent gets (grammar 11.1,
-/// Decision D37).
+/// How much of a store's surface an attached agent gets (grammar 11.1, 11.5,
+/// Decisions D37, D152).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentAccess {
     /// Read-only tools.
     Read,
     /// Read and write tools (the default).
     ReadWrite,
+    /// Every tool a store's kind synthesizes: on a `kv` store, the partial
+    /// updates and `delete` beside `get` and `set` (PRD resolved q68).
+    Full,
 }
 
 impl AgentAccess {
@@ -306,6 +309,7 @@ impl AgentAccess {
         match self {
             Self::Read => "read",
             Self::ReadWrite => "read_write",
+            Self::Full => "full",
         }
     }
 }

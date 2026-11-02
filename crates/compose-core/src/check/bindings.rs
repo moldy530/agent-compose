@@ -26,7 +26,7 @@
 //! than an agent's: the node has no `agent.*` to be sent to.
 
 use crate::ast::common::{Address, Namespace};
-use crate::ast::definition::{AgentAccess, ProviderKind, StoreKind};
+use crate::ast::definition::{AgentAccess, ProviderKind};
 use crate::cel::Scope;
 use crate::cel::ty::Type;
 use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
@@ -685,17 +685,18 @@ fn server_tool_collisions(ctx: &mut Ctx, address: &str, agent: &Agent) {
 }
 
 /// The tool-name suffixes an attached store synthesizes, in the order grammar
-/// 11.5's table lists them.
-fn synthesized_tools(store: &Store) -> &'static [&'static str] {
-    let read_only = store.agent_access == Some(AgentAccess::Read);
-    match (store.kind, read_only) {
-        (StoreKind::Kv, true) => &["get"],
-        (StoreKind::Kv, false) => &["get", "set"],
-        (StoreKind::Vector, true) => &["search"],
-        (StoreKind::Vector, false) => &["search", "upsert"],
-        (StoreKind::Blob, true) => &["get", "list"],
-        (StoreKind::Blob, false) => &["get", "list", "put"],
-    }
+/// 11.5's table lists them — read off the one table codegen emits from
+/// (`model::store_tools`), so the names this check compares are the names that
+/// reach the wire.
+fn synthesized_tools(store: &Store) -> Vec<&'static str> {
+    super::model::store_tools(
+        store.kind,
+        store.agent_access.unwrap_or(AgentAccess::ReadWrite),
+        store.value_schema.as_ref(),
+    )
+    .into_iter()
+    .map(crate::ast::flow::StoreOp::as_str)
+    .collect()
 }
 
 /// A `tool.*` implementation binding's CEL, which sees exactly one root — the

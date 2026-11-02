@@ -12,7 +12,7 @@ use crate::ast::common::{
     Address, Cel, ControlTarget, Duration, EdgeSource, EdgeTarget, Ident, Literal, PathExpr,
 };
 use crate::ast::flow::{
-    CoderWorkspace, FlowContext, Harness, PermissionMode, StoreOp, WorkspaceAccess,
+    CoderWorkspace, FlowContext, Harness, PermissionMode, StoreCondition, StoreOp, WorkspaceAccess,
 };
 use crate::diag::{Span, Spanned};
 
@@ -223,8 +223,10 @@ pub struct Human {
 
 /// The parameters of a store op (grammar 11.4).
 ///
-/// Six of the nine are CEL; `top_k`, `limit`, and `content_type` are literals
-/// (grammar 8.8), so a bound written here is readable without running the graph.
+/// Nine of the fifteen are CEL; `top_k`, `limit`, `content_type`, `field`,
+/// `unique` and `if` are literals (grammar 8.8, 11.4), so a bound — and which
+/// field a partial update touches, and what it is conditioned on — is readable
+/// without running the graph.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct StoreParams {
     /// `key:`
@@ -254,6 +256,25 @@ pub struct StoreParams {
     /// `content_type:` — a literal media type.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<Spanned<String>>,
+    /// `fields:` — a `merge`'s field of `V` to CEL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Bindings>,
+    /// `field:` — the field of `V` an `append` or an `incr` addresses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<Spanned<Ident>>,
+    /// `unique:` — an `append` that adds only an item its array lacks; absent
+    /// means `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unique: Option<bool>,
+    /// `by:` — what an `incr` adds; absent means `1`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub by: Option<Spanned<Cel>>,
+    /// `if:` — the literal condition a `kv` write is applied under.
+    #[serde(rename = "if", skip_serializing_if = "Option::is_none")]
+    pub condition: Option<Spanned<StoreCondition>>,
+    /// `if_version:` — the version the key must hold for the write to apply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub if_version: Option<Spanned<Cel>>,
 }
 
 /// A store op's `value:`: one expression on a `vector upsert` and a `blob put`,
