@@ -202,23 +202,33 @@ jobs:
           echo "$RUNNER_TEMP/zig-x86_64-linux-$ZIG_VERSION" >> "$GITHUB_PATH"
           cargo install --locked "cargo-zigbuild@$ZIGBUILD_VERSION"
 
-      # `qemu-aarch64-static` runs a *static* aarch64 binary directly — no
+      # A user-mode `qemu-aarch64` runs a *static* aarch64 binary directly — no
       # container, no `binfmt` registration, no privileged step — which is
       # exactly what makes the smoke test below affordable on the one leg an
-      # x86_64 runner cannot execute natively. Only the archive matters, so the
-      # install is retried rather than allowed to fail a release on a mirror
-      # hiccup.
+      # x86_64 runner cannot execute natively. Ubuntu ships it as
+      # `qemu-user-static` (binaries named `qemu-<arch>-static`) through 24.04
+      # and as plain `qemu-user` (binaries named `qemu-<arch>`, now static
+      # themselves) from 26.04, where the old name is only a virtual package
+      # with no installation candidate; the step takes whichever the runner's
+      # release has. Only the archive matters, so the install is retried rather
+      # than allowed to fail a release on a mirror hiccup.
       - name: Install qemu, so the aarch64 binary can be run here
         if: matrix.target.triple == 'aarch64-unknown-linux-musl'
         run: |
           for attempt in 1 2 3; do
-            if sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends qemu-user-static; then
-              exit 0
+            if sudo apt-get update -qq \
+               && { sudo apt-get install -y --no-install-recommends qemu-user-static \
+                    || sudo apt-get install -y --no-install-recommends qemu-user; }; then
+              if command -v qemu-aarch64-static >/dev/null || command -v qemu-aarch64 >/dev/null; then
+                exit 0
+              fi
+              echo "::error::qemu installed but neither qemu-aarch64-static nor qemu-aarch64 is on PATH"
+              exit 1
             fi
             echo "apt failed (attempt $attempt)"
             sleep $((attempt * 5))
           done
-          echo "::error::could not install qemu-user-static"
+          echo "::error::could not install a user-mode qemu (qemu-user-static or qemu-user)"
           exit 1
 
       # The musl legs build through `cargo zigbuild`, which hands `ring`'s C the
@@ -298,7 +308,8 @@ jobs:
           launcher=()
           case "$TRIPLE" in
             aarch64-unknown-linux-musl)
-              launcher=(qemu-aarch64-static)
+              # Whichever name the install step above found (see its comment).
+              launcher=("$(command -v qemu-aarch64-static || command -v qemu-aarch64)")
               ;;
             x86_64-apple-darwin)
               # An arm64 runner needs Rosetta to run this one. When it has none
