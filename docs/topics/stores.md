@@ -178,7 +178,7 @@ supplying `--session` is then a run-time requirement.
 |---|---|---|---|
 | `kv` | `get` | `key` | `{ value: V (optional), found: boolean, version: integer (optional) }` |
 | `kv` | `set` | `key`, `value` (field map of CEL matching `V`), one optional condition | `{ key, applied: boolean, version: integer (optional), deduped: boolean }` |
-| `kv` | `delete` | `key`, `if_version` (optional) | `{ deleted: boolean, applied: boolean, deduped: boolean }` |
+| `kv` | `delete` | `key`, `if_version` (optional) | `{ deleted: boolean, applied: boolean, version: integer (optional), deduped: boolean }` |
 | `kv` | `list` | `prefix` (optional), `limit` (1..1000, required) | `{ keys: array<string> }` |
 | `kv` | `merge` | `key`, `fields` (field map of CEL, each a field of `V`), one optional condition | `{ key, applied, version (optional), value: V (optional), deduped }` |
 | `kv` | `append` | `key`, `field` (an array field of `V`), `value` (one item), `unique` (optional literal, default `false`), one optional condition | as `merge` |
@@ -282,9 +282,10 @@ version it showed before.
 `if: absent`, `if: present`, or `if_version: <CEL int>`; `delete` takes
 `if_version:`. Both at once is `conflicting-keys`. A condition that does not hold
 **writes nothing** and answers `applied: false` — with the key's current
-`version` where it holds one — which is a result an edge routes on, as `claim`
-above does, never a node error. `if_version:` on a `vector` or `blob` `delete` is
-`invalid-value`: a version is a `kv` key's.
+`version` where it holds one, a declined `delete` included — which is a result
+an edge routes on, as `claim` above does, never a node error. A `delete` that
+applied answers no `version`: the key holds nothing. `if_version:` on a `vector`
+or `blob` `delete` is `invalid-value`: a version is a `kv` key's.
 
 **`merge`, `append` and `incr` write part of a value.** Each reads what the key
 holds, applies itself, validates the **whole** result against `value_schema`, and
@@ -356,9 +357,11 @@ execution id and the store node's flattened instance path.
 | `blob` | `<name>_get`, `<name>_list` | `<name>_get`, `<name>_list`, `<name>_put` | as `read_write` |
 
 `full` is opt-in because the writes past a whole-value `set` are a different
-authority: a model that can delete a key can remove what a run depends on.
-`<name>_append` is offered where `value_schema` declares an array field and
-`<name>_incr` where it declares a numeric one. `<name>_set` takes the conditions
+authority: a model that can delete a key can remove what a run depends on. It
+grants all four on every `kv` store, whatever `value_schema` declares: where it
+declares no array field, `<name>_append` has no field to name and refuses every
+call, and so does `<name>_incr` where it declares no `integer` or `number` one —
+each says so in its own description. `<name>_set` takes the conditions
 at `read_write` — a condition narrows a write — as `if` (`absent`, `present`, or
 empty for none) and `if_version` (`-1` for none); an append's field and item
 arrive together as `item`, naming one array field: `{"item": {"tags": "x"}}`.

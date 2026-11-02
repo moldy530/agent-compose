@@ -692,7 +692,6 @@ fn synthesized_tools(store: &Store) -> Vec<&'static str> {
     super::model::store_tools(
         store.kind,
         store.agent_access.unwrap_or(AgentAccess::ReadWrite),
-        store.value_schema.as_ref(),
     )
     .into_iter()
     .map(crate::ast::flow::StoreOp::as_str)

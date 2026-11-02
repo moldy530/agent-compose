@@ -371,6 +371,7 @@ export type FlowShapeNodeTidyOutput = z.infer<typeof flowShapeNodeTidyOutput>;
 export const flowShapeNodeDropOutput = z.object({
   deleted: z.boolean(),
   applied: z.boolean(),
+  version: z.number().int(),
   deduped: z.boolean(),
 }).strict();
 export type FlowShapeNodeDropOutput = z.infer<typeof flowShapeNodeDropOutput>;

@@ -822,7 +822,25 @@ export function releaseExecution(id: string, parked = false): void {
   }
 }
 
-/** Run `work` inside a transaction, rolling back whatever it did if it throws. */
+/**
+ * Run `work` inside a transaction, rolling back whatever it did if it throws.
+ *
+ * `BEGIN IMMEDIATE` takes the write lock **before** the first read, so a `kv`
+ * write's read of its key, its decision and its commit are one step no other
+ * writer lands inside (PRD resolved q68). On this driver that is also what a
+ * deferred `BEGIN` would do, and the difference is worth stating rather than
+ * leaving to be rediscovered: the virtual file system has one lock, the
+ * `<file>.lock` directory (see the module header), and it takes it for every
+ * level SQLite asks for — a read's `SHARED` included — and keeps it to the end
+ * of the transaction. So a read in one process already waits for another
+ * process's open transaction, and no reader holds a lock a writer has to wait
+ * on while it upgrades. `IMMEDIATE` is what keeps the claim true of a VFS with
+ * real shared locks, where a deferred transaction's read would see what the
+ * next commit is about to replace and then fail its upgrade with
+ * `SQLITE_BUSY`. What the store contract checks is the property itself: a
+ * write arriving while another write's window is held open waits for that
+ * commit and builds on it (`store-window.mjs`).
+ */
 function transact<T>(database: Database, work: () => T): T {
   database.exec("BEGIN IMMEDIATE");
   try {
@@ -1078,17 +1096,21 @@ function decideKvWrite(
   via: StoreSite["via"],
 ): KvDecision {
   const key = required(params.key, "key", store);
+  // A condition that does not hold answers what the key still holds, on a
+  // `delete` exactly as on every other write: the version is what the next
+  // compare-and-set needs, and an `if_version:` delete that lost is the case
+  // most likely to make one (PRD resolved q68 (b)).
+  const declined = absent(held) ? {} : { version: held.version };
   if (op === "delete") {
     if (!conditionHolds(params, held)) {
-      return { effect: "none", answer: { deleted: false, applied: false } };
+      return { effect: "none", answer: { deleted: false, applied: false, ...declined } };
     }
+    // A delete that applied leaves the key holding nothing, so it answers no
+    // version — the same "absent where the key holds nothing" a `get` reads.
     return { effect: "remove", answer: { deleted: !absent(held), applied: true } };
   }
   if (!conditionHolds(params, held)) {
-    return {
-      effect: "none",
-      answer: { key, applied: false, ...(absent(held) ? {} : { version: held.version }) },
-    };
+    return { effect: "none", answer: { key, applied: false, ...declined } };
   }
   if (op === "set") {
     return {
@@ -2637,6 +2659,33 @@ COMMIT;
 `;
 
 /**
+ * What makes a write's reads see what the previous writer committed:
+ * `READ COMMITTED`, asserted on the session rather than assumed of the server.
+ *
+ * It is Postgres's *default*, and a default is what a database or a role can
+ * change — `ALTER DATABASE … SET default_transaction_isolation`, or a role's
+ * own setting — while `RemoteKv`'s `#write` opens every write with a bare
+ * `BEGIN`. Under `REPEATABLE READ` or `SERIALIZABLE` a transaction's snapshot
+ * is taken at its first statement, which is the sequence row's
+ * `SELECT … FOR UPDATE` — the one that waits. A write queued there behind
+ * another one's commit then finds the row it waited for "concurrently updated"
+ * and is refused with `40001` instead of serializing behind it: a claim, an
+ * append or an increment that fails the node where PRD resolved q68 promises it
+ * queues. Under `READ COMMITTED` the lock that waited reads the row its holder
+ * committed, which is what `#write` is built on, and the MySQL arm asserts the
+ * same level on its own session for its own reasons (`MYSQL_STORE_ISOLATION`)
+ * — so the two servers answer one write the same way (PRD resolved q63).
+ *
+ * The session's characteristics rather than each `BEGIN`'s, so that every
+ * statement this connection sends runs at it: the autocommit insert that
+ * creates a partition's sequence row too, which two first writes to one
+ * partition race, and the schema's own transaction. Sent on every open, before
+ * the schema, so a redialled connection carries it as the first one did.
+ */
+const POSTGRES_STORE_ISOLATION =
+  "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED";
+
+/**
  * Create it, and treat a creator that got there first as having created it.
  *
  * The second attempt runs against the tables the other opener has now committed,
@@ -2821,6 +2870,7 @@ async function openPostgresStore(
   });
   await client.connect();
   try {
+    await client.query(POSTGRES_STORE_ISOLATION);
     await createPostgresStoreSchema(client);
   } catch (error) {
     await client.end().catch(() => undefined);

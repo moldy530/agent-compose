@@ -298,9 +298,10 @@ const MYSQL_STORE_SORT_LENGTH = "SET SESSION max_sort_length = 8192";
  * index between two existing rows, so two writers in two different partitions
  * whose keys happen to sit in one gap each hold one and then wait on the
  * other's to insert: a deadlock the server breaks by failing one of them.
- * `READ COMMITTED` is what Postgres already gives every session: each
- * statement reads the latest committed rows, and a search locks the records it
- * finds and no gaps. The partition's sequence row is what serializes a write
+ * `READ COMMITTED` is the level the Postgres arm asserts on its session too
+ * (`POSTGRES_STORE_ISOLATION`), and Postgres's default besides: each statement
+ * reads the latest committed rows, and a search locks the records it finds and
+ * no gaps. The partition's sequence row is what serializes a write
  * against every other write to its partition (`RemoteKv`'s `#write`), so
  * nothing here needs the stronger level — and asserting this one is what lets
  * the two servers answer one write the same way.

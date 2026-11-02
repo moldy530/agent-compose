@@ -113,6 +113,11 @@ state:
     type: boolean
     default: false
 
+  # …and whether `flow.shelve`'s does. Its trace is what is asserted about too.
+  shelved:
+    type: boolean
+    default: false
+
 provider.mock:
   kind: anthropic
   api_key: ${MOCK_API_KEY}
@@ -545,6 +550,67 @@ flow.claim:
       store: store.jobs
       op: get
       key: "input.job"
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: reread }
+    - { from: reread, to: end }
+
+# PRD resolved q68's `full` level read against Decision D119's split. `full`
+# grants all six `kv` tools whatever the store's `value_schema` declares, and a
+# call the store's contract refuses — a partial update whose result `V` does not
+# admit, an `item` naming other than one field, an `incr` of a value with no
+# numeric field, an `append` to one with no array field — goes back to the
+# model rather than ending the agent node. `store.shelf` has two array fields
+# and no numeric one, which is what makes an `item` naming two fields a call a
+# model can make; `store.flat` has neither, so its `flat_append` and
+# `flat_incr` are tools every call to which is refused.
+store.shelf:
+  kind: kv
+  scope: execution
+  description: Two short lists under a label.
+  agent_access: full
+  value_schema:
+    label: { type: string }
+    left:
+      type: array
+      max_items: 2
+      items: { type: string }
+    right:
+      type: array
+      max_items: 2
+      items: { type: string }
+
+store.flat:
+  kind: kv
+  scope: execution
+  description: One title per key.
+  agent_access: full
+  value_schema:
+    title: { type: string }
+
+agent.shelver:
+  description: Arranges the shelf.
+  model: model.smart
+  prompt: Arrange the shelf, and note any job you touch.
+  stores: [store.shelf, store.flat, store.jobs]
+  output:
+    done: { type: boolean }
+
+flow.shelve:
+  description: Let the agent arrange the shelf, then read back what it holds.
+  outputs:
+    shelved:
+      type: boolean
+  nodes:
+    work:
+      agent: agent.shelver
+      input: "'Arrange the shelf.'"
+      writes:
+        done: shelved
+    reread:
+      store: store.shelf
+      op: get
+      key: "'s'"
   edges:
     - { from: start, to: work }
     - { from: work, to: reread }

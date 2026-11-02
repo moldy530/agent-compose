@@ -507,7 +507,7 @@ pub fn surfaces(ir: &Ir) -> Vec<Surface<'_>> {
                         .split_once('.')
                         .map_or(address.as_str(), |(_, rest)| rest);
                     let access = store.agent_access.unwrap_or(AgentAccess::ReadWrite);
-                    for op in &model::store_tools(store.kind, access, store.value_schema.as_ref()) {
+                    for op in &model::store_tools(store.kind, access) {
                         surfaces.push(Surface {
                             path: format!("{address}.tool.{}.input", op.as_str()),
                             about: format!(
@@ -2306,7 +2306,7 @@ flow.f:\n  outputs: {}\n  nodes:\n    probe:\n      exec:\n        command: \"tr
         );
         assert_eq!(
             schema_of(KV_WRITES, "flow.f.node.drop.output"),
-            "z.object({\n  deleted: z.boolean(),\n  applied: z.boolean(),\n  deduped: z.boolean(),\n}).strict()"
+            "z.object({\n  deleted: z.boolean(),\n  applied: z.boolean(),\n  version: z.number().int(),\n  deduped: z.boolean(),\n}).strict()"
         );
         let partial = format!(
             "z.object({{\n  key: z.string(),\n  applied: z.boolean(),\n  version: z.number().int(),\n  value: {value},\n  deduped: z.boolean(),\n}}).strict()"
@@ -2395,6 +2395,44 @@ flow.f:\n  outputs: {}\n  nodes:\n    probe:\n      exec:\n        command: \"tr
         assert!(
             !delete.contains("\n  if: "),
             "a delete takes `if_version` alone: {delete}"
+        );
+    }
+
+    /// `full` grants all six `kv` tools whatever `V` declares (PRD resolved
+    /// q68, grammar 11.5), so a `V` with neither an array nor a numeric field
+    /// still has `<name>_append` and `<name>_incr` — and their arguments are
+    /// still schemas: an `item` with no property to name, and a `field` that is
+    /// a plain string rather than `z.enum([])`, which `tsc` refuses and a
+    /// provider would too. Each description says every call is refused.
+    #[test]
+    fn the_full_tool_surface_over_a_flat_value_schema_is_still_six_schemas() {
+        let source = concat!(
+            "version: \"0.1\"\n",
+            "provider.p:\n  kind: anthropic\n  api_key: ${K}\n",
+            "model.m:\n  provider: provider.p\n  id: some-model\n",
+            "store.flat:\n  kind: kv\n  scope: global\n  agent_access: full\n  value_schema:\n",
+            "    title: { type: string }\n",
+            "agent.a:\n  model: model.m\n  prompt: p\n  stores: [store.flat]\n",
+            "  output:\n    done: { type: boolean }\n",
+            "flow.f:\n  outputs: {}\n  nodes:\n",
+            "    work: { agent: agent.a }\n",
+            "  edges:\n    - { from: start, to: work }\n    - { from: work, to: end }\n",
+        );
+        for op in ["get", "set", "merge", "append", "incr", "delete"] {
+            schema_of(source, &format!("store.flat.tool.{op}.input"));
+        }
+        let append = schema_of(source, "store.flat.tool.append.input");
+        assert!(
+            append.contains("  item: z.object({}).strict().describe(")
+                && append.contains("declares no array field"),
+            "{append}"
+        );
+        let incr = schema_of(source, "store.flat.tool.incr.input");
+        assert!(
+            incr.contains("  field: z.string().describe(")
+                && incr.contains("declares no `integer` or `number` field")
+                && !incr.contains("z.enum("),
+            "{incr}"
         );
     }
 }

@@ -822,7 +822,25 @@ export function releaseExecution(id: string, parked = false): void {
   }
 }
 
-/** Run `work` inside a transaction, rolling back whatever it did if it throws. */
+/**
+ * Run `work` inside a transaction, rolling back whatever it did if it throws.
+ *
+ * `BEGIN IMMEDIATE` takes the write lock **before** the first read, so a `kv`
+ * write's read of its key, its decision and its commit are one step no other
+ * writer lands inside (PRD resolved q68). On this driver that is also what a
+ * deferred `BEGIN` would do, and the difference is worth stating rather than
+ * leaving to be rediscovered: the virtual file system has one lock, the
+ * `<file>.lock` directory (see the module header), and it takes it for every
+ * level SQLite asks for — a read's `SHARED` included — and keeps it to the end
+ * of the transaction. So a read in one process already waits for another
+ * process's open transaction, and no reader holds a lock a writer has to wait
+ * on while it upgrades. `IMMEDIATE` is what keeps the claim true of a VFS with
+ * real shared locks, where a deferred transaction's read would see what the
+ * next commit is about to replace and then fail its upgrade with
+ * `SQLITE_BUSY`. What the store contract checks is the property itself: a
+ * write arriving while another write's window is held open waits for that
+ * commit and builds on it (`store-window.mjs`).
+ */
 function transact<T>(database: Database, work: () => T): T {
   database.exec("BEGIN IMMEDIATE");
   try {
@@ -1078,17 +1096,21 @@ function decideKvWrite(
   via: StoreSite["via"],
 ): KvDecision {
   const key = required(params.key, "key", store);
+  // A condition that does not hold answers what the key still holds, on a
+  // `delete` exactly as on every other write: the version is what the next
+  // compare-and-set needs, and an `if_version:` delete that lost is the case
+  // most likely to make one (PRD resolved q68 (b)).
+  const declined = absent(held) ? {} : { version: held.version };
   if (op === "delete") {
     if (!conditionHolds(params, held)) {
-      return { effect: "none", answer: { deleted: false, applied: false } };
+      return { effect: "none", answer: { deleted: false, applied: false, ...declined } };
     }
+    // A delete that applied leaves the key holding nothing, so it answers no
+    // version — the same "absent where the key holds nothing" a `get` reads.
     return { effect: "remove", answer: { deleted: !absent(held), applied: true } };
   }
   if (!conditionHolds(params, held)) {
-    return {
-      effect: "none",
-      answer: { key, applied: false, ...(absent(held) ? {} : { version: held.version }) },
-    };
+    return { effect: "none", answer: { key, applied: false, ...declined } };
   }
   if (op === "set") {
     return {

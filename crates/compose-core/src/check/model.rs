@@ -783,9 +783,10 @@ pub(crate) fn http_default_output(span: &Span) -> FieldMap {
 ///
 /// A `kv` **write**'s row is PRD resolved q68's: `applied` says whether the
 /// write's condition held and it landed, `version` is the key's version after
-/// it (or the one it still holds, where it declined), and `deduped` says the
-/// answer is a first attempt's, handed back by the idempotency ledger rather
-/// than performed again.
+/// it (or the one it still holds, where it declined — a `delete` included, and
+/// absent after a `delete` that applied, since the key then holds nothing), and
+/// `deduped` says the answer is a first attempt's, handed back by the
+/// idempotency ledger rather than performed again.
 pub(crate) fn store_output(
     kind: StoreKind,
     op: StoreOp,
@@ -829,6 +830,7 @@ pub(crate) fn store_output(
             vec![
                 ("deleted", boolean()),
                 ("applied", boolean()),
+                ("version", version()),
                 ("deduped", boolean()),
             ],
             span,
@@ -925,31 +927,26 @@ pub(crate) fn numeric_fields(value_schema: Option<&FieldMap>) -> Vec<&Field> {
 /// The table is 11.5's, read through `agent_access:` (Decisions D37, D152):
 /// `read` grants the reading ops, `read_write` — the default — adds the
 /// whole-value write, and `full` adds the rest of a `kv` store's writes:
-/// `merge`, `append`, `incr` and `delete` (PRD resolved q68). Two of those are
-/// offered where `V` gives them something to address and nowhere else — an
-/// `append` needs an array field and an `incr` a numeric one, and a tool whose
-/// every call the schema would refuse is a tool the model can only waste a
-/// turn on. A `vector` or `blob` store's writes are the ones `read_write`
-/// already grants, so `full` there grants exactly that.
-pub(crate) fn store_tools(
-    kind: StoreKind,
-    access: AgentAccess,
-    value_schema: Option<&FieldMap>,
-) -> Vec<StoreOp> {
+/// `merge`, `append`, `incr` and `delete` (PRD resolved q68). All four, on
+/// every `kv` store, because that is the set the ruling names: the tool set is
+/// the access level's and not the schema's, so a `V` with no array field still
+/// offers `<name>_append` — whose `item` then has no field to name, so every
+/// call is refused back to the model ([`store_tool_input`]) — and one with no
+/// numeric field still offers `<name>_incr`. A `vector` or `blob` store's
+/// writes are the ones `read_write` already grants, so `full` there grants
+/// exactly that.
+pub(crate) fn store_tools(kind: StoreKind, access: AgentAccess) -> Vec<StoreOp> {
     match (kind, access) {
         (StoreKind::Kv, AgentAccess::Read) => vec![StoreOp::Get],
         (StoreKind::Kv, AgentAccess::ReadWrite) => vec![StoreOp::Get, StoreOp::Set],
-        (StoreKind::Kv, AgentAccess::Full) => {
-            let mut ops = vec![StoreOp::Get, StoreOp::Set, StoreOp::Merge];
-            if !array_fields(value_schema).is_empty() {
-                ops.push(StoreOp::Append);
-            }
-            if !numeric_fields(value_schema).is_empty() {
-                ops.push(StoreOp::Incr);
-            }
-            ops.push(StoreOp::Delete);
-            ops
-        }
+        (StoreKind::Kv, AgentAccess::Full) => vec![
+            StoreOp::Get,
+            StoreOp::Set,
+            StoreOp::Merge,
+            StoreOp::Append,
+            StoreOp::Incr,
+            StoreOp::Delete,
+        ],
         (StoreKind::Vector, AgentAccess::Read) => vec![StoreOp::Search],
         (StoreKind::Vector, AgentAccess::ReadWrite | AgentAccess::Full) => {
             vec![StoreOp::Search, StoreOp::Upsert]
@@ -1096,15 +1093,23 @@ pub(crate) fn store_tool_input(
                 .into_iter()
                 .map(|(field, item)| (field.name.value.as_str(), item.clone()))
                 .collect();
+            // A `V` with no array field still has the tool (`full` grants it
+            // on every `kv` store, [`store_tools`]), and its `item` an object
+            // with nothing to name — so the description says so, rather than
+            // inviting a call the tool can only refuse.
+            let about = if items.is_empty() {
+                "The stored value declares no array field, so there is nothing to append to: \
+                 every call is refused. Write the whole value with the `set` tool, or change \
+                 fields with the `merge` one."
+            } else {
+                "Name exactly one array field of the stored value, with the item to add to its \
+                 end: `{\"tags\": \"urgent\"}`. A key holding nothing starts from an empty \
+                 array."
+            };
             fields.push(("key", string()));
             fields.push((
                 "item",
-                described(
-                    optional_object(field_map(items, span), span),
-                    "Name exactly one array field of the stored value, with the item to add to \
-                     its end: `{\"tags\": \"urgent\"}`. A key holding nothing starts from an \
-                     empty array.",
-                ),
+                described(optional_object(field_map(items, span), span), about),
             ));
             fields.push(("unique", {
                 let mut ty = scalar_node(ScalarKind::Boolean, span);
@@ -1126,13 +1131,26 @@ pub(crate) fn store_tool_input(
                 .map(|field| field.name.value.as_str())
                 .collect();
             fields.push(("key", string()));
-            fields.push((
-                "field",
+            // An enum of `V`'s numeric fields where it declares any. One that
+            // declares none still has the tool ([`store_tools`]), and an enum
+            // of no variants is not a schema — `z.enum([])` is a `tsc` error
+            // and a provider refuses `"enum": []` — so the field is then a
+            // string the tool refuses: whatever it names, the result is one `V`
+            // does not admit, and that goes back to the model (Decision D119).
+            let field = if names.is_empty() {
+                described(
+                    string(),
+                    "The stored value declares no `integer` or `number` field, so there is \
+                     nothing to add to: every call is refused. Change fields with the `merge` \
+                     tool instead.",
+                )
+            } else {
                 described(
                     enum_node(&names, span),
                     "The numeric field to add to. A key holding nothing starts from `0`.",
-                ),
-            ));
+                )
+            };
+            fields.push(("field", field));
             fields.push(("by", {
                 let mut ty = scalar_node(ScalarKind::Number, span);
                 if let TypeForm::Scalar(scalar) = &mut ty.form {
@@ -1648,25 +1666,13 @@ mod tests {
     }
 
     /// Grammar 11.5's table read through `agent_access:`: `full` adds a `kv`
-    /// store's partial updates and `delete`, `read_write` keeps exactly the two
-    /// tools it always had, and an `append`/`incr` is offered only where `V`
-    /// gives it a field to address (PRD resolved q68).
+    /// store's partial updates and `delete` — all four, whatever `V` declares,
+    /// which is the set PRD resolved q68 names — and `read_write` keeps exactly
+    /// the two tools it always had.
     #[test]
     fn full_access_adds_the_partial_updates_and_delete_and_read_write_does_not() {
-        let at = span();
-        let schema = field_map(
-            vec![
-                ("title", scalar_node(ScalarKind::String, &at)),
-                (
-                    "tags",
-                    array_node(scalar_node(ScalarKind::String, &at), Some(5), &at),
-                ),
-                ("count", scalar_node(ScalarKind::Integer, &at)),
-            ],
-            &at,
-        );
         assert_eq!(
-            store_tools(StoreKind::Kv, AgentAccess::Full, Some(&schema)),
+            store_tools(StoreKind::Kv, AgentAccess::Full),
             [
                 StoreOp::Get,
                 StoreOp::Set,
@@ -1677,28 +1683,22 @@ mod tests {
             ]
         );
         assert_eq!(
-            store_tools(StoreKind::Kv, AgentAccess::ReadWrite, Some(&schema)),
+            store_tools(StoreKind::Kv, AgentAccess::ReadWrite),
             [StoreOp::Get, StoreOp::Set],
             "an existing composition keeps exactly the tools it had"
         );
         assert_eq!(
-            store_tools(StoreKind::Kv, AgentAccess::Read, Some(&schema)),
+            store_tools(StoreKind::Kv, AgentAccess::Read),
             [StoreOp::Get]
         );
-        let flat = field_map(vec![("title", scalar_node(ScalarKind::String, &at))], &at);
         assert_eq!(
-            store_tools(StoreKind::Kv, AgentAccess::Full, Some(&flat)),
-            [StoreOp::Get, StoreOp::Set, StoreOp::Merge, StoreOp::Delete],
-            "no array field and no numeric one: nothing to append to or add to"
-        );
-        assert_eq!(
-            store_tools(StoreKind::Vector, AgentAccess::Full, None),
-            store_tools(StoreKind::Vector, AgentAccess::ReadWrite, None),
+            store_tools(StoreKind::Vector, AgentAccess::Full),
+            store_tools(StoreKind::Vector, AgentAccess::ReadWrite),
             "a `vector` store's writes are the ones `read_write` already grants"
         );
         assert_eq!(
-            store_tools(StoreKind::Blob, AgentAccess::Full, None),
-            store_tools(StoreKind::Blob, AgentAccess::ReadWrite, None)
+            store_tools(StoreKind::Blob, AgentAccess::Full),
+            store_tools(StoreKind::Blob, AgentAccess::ReadWrite)
         );
     }
 

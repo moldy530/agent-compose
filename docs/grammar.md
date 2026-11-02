@@ -4246,7 +4246,7 @@ see the `M`-is-absent rule below. `C` is one optional **condition**, `if:` or
 |---|---|---|---|
 | `kv` | `get` | `key` (CEL string) | `{ value: V (optional), found: boolean, version: integer (optional) }` |
 | `kv` | `set` | `key`, `value` (map field→CEL matching `V`), `C` | `{ key: string, applied: boolean, version: integer (optional), deduped: boolean }` |
-| `kv` | `delete` | `key`, `if_version` (CEL int, optional) | `{ deleted: boolean, applied: boolean, deduped: boolean }` |
+| `kv` | `delete` | `key`, `if_version` (CEL int, optional) | `{ deleted: boolean, applied: boolean, version: integer (optional), deduped: boolean }` |
 | `kv` | `list` | `prefix` (CEL string, optional), `limit` (integer 1..1000, required) | `{ keys: array<string> }` |
 | `kv` | `merge` | `key`, `fields` (map field→CEL, each a field of `V`), `C` | `{ key: string, applied: boolean, version: integer (optional), value: V (optional), deduped: boolean }` |
 | `kv` | `append` | `key`, `field` (an array field of `V`, literal), `value` (CEL, one item of it), `unique` (literal boolean, default `false`), `C` | as `merge` |
@@ -4287,13 +4287,15 @@ Rules (PRD 5.8):
   so a key deleted and set again never shows a version it showed before: the
   ABA race a compare-and-set exists to close stays closed across a delete. A
   `get` returns it, `version` present exactly when `found`; every `kv` write
-  but a `delete` returns the version the key holds after it.
+  returns the version the key holds after it — so none after a `delete` that
+  applied, which leaves the key holding nothing.
 - **Conditions.** `set`, `merge`, `append` and `incr` take one of `if: absent`,
   `if: present` (literals) or `if_version: <CEL int>`; `delete` takes
   `if_version:` alone. Both conditions at once is a compile error, decidable in
   one file and refused by the published schema too. A condition that does not
   hold **applies nothing** and answers `applied: false`, with the key's current
-  `version` where it holds one — a normal result an edge routes on
+  `version` where it holds one — a declined `delete` too — a normal result an
+  edge routes on
   (`when: "claim.output.applied"`), never a node error. A write with no
   condition answers `applied: true` whenever it ran. A condition is a `kv`
   key's: `if_version:` on a `vector` or `blob` `delete` is a compile error
@@ -4497,10 +4499,13 @@ is a compile error.
 the writes beyond a whole-value `set` are a different authority — a model that
 can delete a key can remove what a run depends on — so an author opts into them
 by name, and every composition written before it keeps exactly the tools it had.
-Two of its tools are offered where `V` gives them something to address and
-nowhere else: `<name>_append` where `V` declares an array field, and
-`<name>_incr` where it declares an `integer` or `number` one, since a tool whose
-every call the schema refuses is a tool the model can only waste a turn on. A
+The set is the access level's, not the schema's: `full` grants all six tools on
+every `kv` store, which is the set the ruling names. Where `V` declares no array
+field, `<name>_append`'s `item` has no property to name and every call is
+refused; where it declares no `integer` or `number` field, `<name>_incr`'s
+`field` is a plain string rather than an enum of none, and every call is refused
+too, since whatever it names leaves a value `V` does not admit. Each tool's
+description says so, and each refusal goes back to the model (below). A
 `vector` or `blob` store's writes are the ones `read_write` already grants, so
 `full` there grants exactly that.
 
@@ -10874,8 +10879,10 @@ alone.
 composition keeps the tools it had. A `merge`, `append`, `incr` or `delete` is a
 different authority — a model that can delete a key can remove what a run
 depends on — so it is a third level an author opts into
-([D37](#d37-agent_access-narrows-the-synthesized-store-tool-surface)). Two of
-those tools are offered only where `V` gives them something to address (§11.5).
+([D37](#d37-agent_access-narrows-the-synthesized-store-tool-surface)). It grants
+all four on every `kv` store — the set the ruling names — so a `V` with no array
+or no numeric field still offers `<name>_append` or `<name>_incr`, and each
+refuses every call back to the model (§11.5).
 
 **What this amends, and what it does not.** D149's "per key, last write wins" is
 now the posture of a plain unconditional `set` alone; D67 is untouched and every

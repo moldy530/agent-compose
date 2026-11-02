@@ -300,7 +300,8 @@ const flowShapeNodeDropShape: runtime.Shape = {
   "properties": {
     "applied": "bool",
     "deduped": "bool",
-    "deleted": "bool"
+    "deleted": "bool",
+    "version": "int"
   }
 };
 

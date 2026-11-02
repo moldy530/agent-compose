@@ -147,6 +147,33 @@ COMMIT;
 `;
 
 /**
+ * What makes a write's reads see what the previous writer committed:
+ * `READ COMMITTED`, asserted on the session rather than assumed of the server.
+ *
+ * It is Postgres's *default*, and a default is what a database or a role can
+ * change — `ALTER DATABASE … SET default_transaction_isolation`, or a role's
+ * own setting — while `RemoteKv`'s `#write` opens every write with a bare
+ * `BEGIN`. Under `REPEATABLE READ` or `SERIALIZABLE` a transaction's snapshot
+ * is taken at its first statement, which is the sequence row's
+ * `SELECT … FOR UPDATE` — the one that waits. A write queued there behind
+ * another one's commit then finds the row it waited for "concurrently updated"
+ * and is refused with `40001` instead of serializing behind it: a claim, an
+ * append or an increment that fails the node where PRD resolved q68 promises it
+ * queues. Under `READ COMMITTED` the lock that waited reads the row its holder
+ * committed, which is what `#write` is built on, and the MySQL arm asserts the
+ * same level on its own session for its own reasons (`MYSQL_STORE_ISOLATION`)
+ * — so the two servers answer one write the same way (PRD resolved q63).
+ *
+ * The session's characteristics rather than each `BEGIN`'s, so that every
+ * statement this connection sends runs at it: the autocommit insert that
+ * creates a partition's sequence row too, which two first writes to one
+ * partition race, and the schema's own transaction. Sent on every open, before
+ * the schema, so a redialled connection carries it as the first one did.
+ */
+const POSTGRES_STORE_ISOLATION =
+  "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED";
+
+/**
  * Create it, and treat a creator that got there first as having created it.
  *
  * The second attempt runs against the tables the other opener has now committed,
@@ -331,6 +358,7 @@ async function openPostgresStore(
   });
   await client.connect();
   try {
+    await client.query(POSTGRES_STORE_ISOLATION);
     await createPostgresStoreSchema(client);
   } catch (error) {
     await client.end().catch(() => undefined);

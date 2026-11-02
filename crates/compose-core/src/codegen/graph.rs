@@ -1310,8 +1310,7 @@ fn store_tools(
         let access = store
             .agent_access
             .unwrap_or(crate::ast::definition::AgentAccess::ReadWrite);
-        for op in crate::check::model::store_tools(store.kind, access, store.value_schema.as_ref())
-        {
+        for op in crate::check::model::store_tools(store.kind, access) {
             let op = &op;
             let name = crate::check::model::store_tool_name(local, *op);
             let path = format!("{address}.tool.{}.input", op.as_str());
@@ -1423,8 +1422,7 @@ fn output_tool_name(ir: &Ir, agent: &Agent, local: &str) -> String {
         let access = store
             .agent_access
             .unwrap_or(crate::ast::definition::AgentAccess::ReadWrite);
-        for op in crate::check::model::store_tools(store.kind, access, store.value_schema.as_ref())
-        {
+        for op in crate::check::model::store_tools(store.kind, access) {
             attached.push(crate::check::model::store_tool_name(store_local, op));
         }
     }

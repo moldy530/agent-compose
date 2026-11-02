@@ -863,6 +863,13 @@ const CODEGEN: &[Criterion] = &[
                 "a_map_of_partial_updates_at_one_key_keeps_every_item",
                 Status::Live,
             ),
+            // …and Decision D119's split read on that surface: a partial update
+            // the store's contract refuses is the model's call to make again,
+            // on every `kv` store `full` attaches, whatever its `V` declares.
+            (
+                "a_partial_update_the_store_refuses_goes_back_to_the_model",
+                Status::Live,
+            ),
         ],
     },
     Criterion {

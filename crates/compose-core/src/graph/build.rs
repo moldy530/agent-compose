@@ -960,7 +960,7 @@ fn agent_tools(ir: &Ir, agent: &Agent) -> Vec<ToolView> {
         };
         let access = store.agent_access.unwrap_or(AgentAccess::ReadWrite);
         let local = attached.value.name.as_str();
-        for op in &model::store_tools(store.kind, access, store.value_schema.as_ref()) {
+        for op in &model::store_tools(store.kind, access) {
             held.push(ToolView {
                 name: model::store_tool_name(local, *op),
                 source: ToolSource::Store,

@@ -528,10 +528,15 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "if_version_declines_a_stale_version_and_answers_the_current_one",
     "if_version_declines_an_absent_key",
     "a_conditional_delete_declines_a_stale_version_and_applies_a_current_one",
+    "a_declined_delete_answers_the_version_the_key_holds",
     // (d) the ledger answers a retried write with its first attempt's whole
     // answer, on one connection and on two at once.
     "a_retried_claim_answers_applied_and_deduped",
     "a_concurrently_retried_claim_is_applied_once_and_answered_twice",
+    // …and a retried write whose first attempt declined answers that decline,
+    // even once the key is free and the same request made fresh would apply.
+    "a_retried_declined_write_answers_its_first_decline",
+    "a_retried_declined_partial_update_writes_nothing",
     // (c) the partial updates: from an absent key, on a held one, and against
     // the schema — a result it refuses fails naming the field and changes
     // nothing, a stored value under a changed schema included.
@@ -546,9 +551,17 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "a_merge_the_schema_refuses_leaves_the_row_unchanged",
     "a_merge_on_an_absent_key_must_satisfy_the_schema_whole",
     "a_refused_merge_leaves_no_ledger_row",
+    // Decision D119's split at the op: the same refusal fails a node and goes
+    // back to a model, by class.
+    "a_refused_partial_update_fails_a_node_and_goes_back_to_a_model",
     "a_partial_update_under_a_changed_schema_fails_naming_the_field",
     "a_get_under_a_changed_schema_answers_the_stored_value",
     "two_connections_appending_at_once_keep_every_item",
+    // …and on a server whose default isolation is stricter than the
+    // `READ COMMITTED` every dialled arm asserts on its own session: the
+    // writes queue behind each other rather than failing (PRD resolved q63,
+    // q68).
+    "writes_serialize_whatever_isolation_the_server_defaults_to",
     // The trace: a write record carries `applied` and `version`, and a tool's
     // carries neither an idempotency key nor `deduped`.
     "a_node_write_record_carries_applied_version_and_its_key",
@@ -562,6 +575,11 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "two_processes_incrementing_at_once_lose_no_increment",
     "two_processes_merging_different_fields_keep_both",
     "two_processes_never_take_one_version",
+    // …and the window those races almost never land in, held open by a
+    // second process on purpose (`store-window.mjs`): a write arriving inside
+    // another write's read-modify-write waits for its commit and builds on it.
+    "the_window_was_open_when_the_second_write_arrived",
+    "a_write_inside_another_writes_window_waits_and_builds_on_it",
 ];
 
 /// The cases a backend with a **socket** must answer `true`, on top of those.

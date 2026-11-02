@@ -11672,6 +11672,180 @@ fn an_agents_conditional_store_write_applies_or_declines_and_the_trace_says_whic
     );
 }
 
+/// Decision D119's split on the `full` surface: a call the store's **contract**
+/// refuses goes back to the model, and the agent node carries on (grammar 11.5,
+/// PRD resolved q68).
+///
+/// Every refusal here is one the arguments' own schema admits, so what says no
+/// is the store: a `merge` whose result `V` does not admit (an absent key, so
+/// the merge has to supply the whole value), an `append` past `V`'s
+/// `max_items`, an `item` naming no field or two, an `incr` of a store whose `V`
+/// declares no numeric field, and an `append` to one that declares no array
+/// field — which `full` offers all the same, because the tool set is the access
+/// level's (`store.flat`). Each was the model's call, so each is an error tool
+/// result the model is handed back and a `refused` tool-call record, and none
+/// reached a backend far enough to leave a store record; the two calls that
+/// fit land, and what the store holds afterwards is exactly what they made.
+#[test]
+fn a_partial_update_the_store_refuses_goes_back_to_the_model() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![
+                ToolCall::new(
+                    "jobs_merge",
+                    json!({ "key": "job-9", "fields": { "owner": "me" } }),
+                ),
+                ToolCall::new("shelf_append", json!({ "key": "s", "item": {} })),
+                ToolCall::new(
+                    "shelf_append",
+                    json!({ "key": "s", "item": { "left": "a", "right": "b" } }),
+                ),
+                ToolCall::new("shelf_incr", json!({ "key": "s", "field": "label" })),
+                ToolCall::new("flat_append", json!({ "key": "f", "item": {} })),
+                ToolCall::new("flat_incr", json!({ "key": "f", "field": "title" })),
+                ToolCall::new(
+                    "shelf_set",
+                    json!({ "key": "s", "value": { "label": "kept", "left": ["a", "b"], "right": [] } }),
+                ),
+            ]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![
+                ToolCall::new("shelf_append", json!({ "key": "s", "item": { "left": "c" } })),
+                ToolCall::new("shelf_append", json!({ "key": "s", "item": { "right": "c" } })),
+            ]),
+        ),
+        Script::new(SONNET, Outcome::text("Arranged.")),
+        Script::new(SONNET, Outcome::structured(json!({ "done": true }))),
+    ]);
+    let Some(run) = harness::invoke("stores", "flow.shelve", &[], &provider) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["shelved"], json!(true));
+
+    // `full` is the access level's tool set, not the schema's: a store whose
+    // `V` has no array and no numeric field still offers all six.
+    let call = &provider.requests()[0];
+    assert!(call.is_valid(), "{:?}", call.failures());
+    for local in ["shelf", "flat"] {
+        let offered: Vec<&String> = call
+            .tools
+            .iter()
+            .filter(|tool| tool.starts_with(&format!("{local}_")))
+            .collect();
+        assert_eq!(
+            offered,
+            ["get", "set", "merge", "append", "incr", "delete"]
+                .map(|op| format!("{local}_{op}"))
+                .iter()
+                .collect::<Vec<_>>(),
+            "`full` grants every `kv` tool on `store.{local}`: {:?}",
+            call.tools
+        );
+    }
+
+    let first = tool_results(&provider.requests()[1]);
+    assert_eq!(first.len(), 7, "{first:?}");
+    let refusals = [
+        (
+            "an absent key's merge has to supply the whole value",
+            "does not admit",
+        ),
+        ("an `item` naming no field", "naming no field"),
+        ("an `item` naming two fields", "naming 2 fields"),
+        (
+            "`shelf_incr`, whose `V` has no numeric field",
+            "does not admit",
+        ),
+        (
+            "`flat_append`, whose `V` has no array field",
+            "naming no field",
+        ),
+        (
+            "`flat_incr`, whose `V` has no numeric field either",
+            "does not admit",
+        ),
+    ];
+    for (index, (what, says)) in refusals.iter().enumerate() {
+        let (text, is_error) = &first[index];
+        assert!(
+            *is_error && text.contains(says),
+            "{what} goes back to the model as an error result saying `{says}`: {first:?}"
+        );
+    }
+    assert!(!first[6].1, "the `set` that fits lands: {first:?}");
+    let second = tool_results(&provider.requests()[2]);
+    assert_eq!(second.len(), 2, "{second:?}");
+    assert!(
+        second[0].1 && second[0].0.contains("does not admit"),
+        "an `append` past `max_items` is a result `V` refuses, and goes back: {second:?}"
+    );
+    assert!(!second[1].1, "…and the one that fits lands: {second:?}");
+
+    let entries = run.entries("work");
+    let [entry] = entries.as_slice() else {
+        panic!("`work` ran once: {entries:?}");
+    };
+    assert_ne!(
+        entry["outcome"], "failed",
+        "no refusal ended the node: {entry}"
+    );
+    let outcomes: Vec<(String, String)> = entry["models"]
+        .as_array()
+        .expect("model calls")
+        .iter()
+        .flat_map(|model| model["toolCalls"].as_array().cloned().unwrap_or_default())
+        .map(|call| {
+            (
+                call["name"].as_str().unwrap_or_default().to_string(),
+                call["outcome"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    let expected: Vec<(String, String)> = [
+        ("jobs_merge", "refused"),
+        ("shelf_append", "refused"),
+        ("shelf_append", "refused"),
+        ("shelf_incr", "refused"),
+        ("flat_append", "refused"),
+        ("flat_incr", "refused"),
+        ("shelf_set", "completed"),
+        ("shelf_append", "refused"),
+        ("shelf_append", "completed"),
+    ]
+    .iter()
+    .map(|(name, outcome)| ((*name).to_string(), (*outcome).to_string()))
+    .collect();
+    assert_eq!(outcomes, expected, "{entry}");
+    let records: Vec<String> = entry["stores"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the two calls that landed left store records: {entry}"))
+        .iter()
+        .map(|record| record["op"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        records,
+        ["set", "append"],
+        "a refused partial update wrote nothing, so it left no store record: {entry}"
+    );
+
+    let reread = run.entries("reread");
+    let answer = &reread[0]["stores"][0]["answer"];
+    assert_eq!(
+        answer,
+        &json!({
+            "value": { "label": "kept", "left": ["a", "b"], "right": ["c"] },
+            "found": true,
+            "version": 2,
+        }),
+        "only the two calls that fit changed the store: {answer}"
+    );
+}
+
 /// Every `tool_result` block of one Messages request, in order: its text and
 /// whether it was an error result.
 fn tool_results(request: &RecordedRequest) -> Vec<(String, bool)> {

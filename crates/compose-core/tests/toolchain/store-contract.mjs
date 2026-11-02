@@ -27,6 +27,7 @@
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 import process from "node:process";
@@ -46,6 +47,9 @@ process.env["AGENT_COMPOSE_DATA_DIR"] = data;
 const at = (relative) => pathToFileURL(path.resolve(project, relative)).href;
 const stores = await import(at("src/stores.ts"));
 const journal = await import(at("src/journal.ts"));
+// The module `src/stores.ts` imports, so `ToolCallRefused` here is the class it
+// throws rather than a second copy of it.
+const runtime = await import(at("src/runtime.ts"));
 
 /** The variable each of the five connections reads its address from. */
 const URL_ENV = "AGENT_COMPOSE_STORE_URL";
@@ -672,6 +676,18 @@ const refusal = async (promise) => {
     gone.applied === true &&
     gone.deleted === true &&
     (await get(store, "k", run)).found === false;
+  // A declined delete answers the version the key still holds, exactly as a
+  // declined `set` does — it is what the next compare-and-set needs — and one
+  // that applied answers none, because the key then holds nothing (PRD
+  // resolved q68 (b), (d)).
+  const nothing = await write(store, "delete", { key: "k", ifVersion: won.version }, run, "cas/7");
+  answer.a_declined_delete_answers_the_version_the_key_holds =
+    kept.version === won.version &&
+    stillThere.version === won.version &&
+    !("version" in gone) &&
+    nothing.applied === false &&
+    !("version" in nothing);
+  answer.declined_delete = kept;
 }
 
 {
@@ -703,6 +719,51 @@ const refusal = async (promise) => {
     both.every((row) => row.applied === true) &&
     both[0].version === both[1].version &&
     same(both.map((row) => row.deduped).sort(), [false, true]);
+}
+
+{
+  // …and the other half of "the answer its first attempt gave": a retried
+  // write whose first attempt **declined** is answered with that decline —
+  // `applied: false`, the version the key held then, `deduped: true` — even
+  // where the key has since been freed and the same request made fresh would
+  // apply. The ledger answers the attempt, not the key, so a losing claim
+  // retried after the winner let go does not quietly become a second winner
+  // (PRD resolved q68 (d)). A declined partial update is the same: its retry
+  // answers the decline, and writes nothing, whatever the key holds by then.
+  const store = kv("retried_decline", "global");
+  const run = ctx(execution("retried_decline"));
+  const losing = `${execution("retried_decline")}/claim/b`;
+  const winner = await write(store, "set", { key: "job", value: { owner: "a" }, condition: "absent" }, run, "rdc/a");
+  const lost = await write(store, "set", { key: "job", value: { owner: "b" }, condition: "absent" }, run, losing);
+  const freed = await write(store, "delete", { key: "job" }, run, "rdc/free");
+  const retried = await write(store, "set", { key: "job", value: { owner: "b" }, condition: "absent" }, run, losing);
+  answer.a_retried_declined_write_answers_its_first_decline =
+    winner.applied === true &&
+    lost.applied === false &&
+    lost.version === winner.version &&
+    lost.deduped === false &&
+    freed.applied === true &&
+    retried.applied === false &&
+    retried.version === winner.version &&
+    retried.deduped === true &&
+    (await get(store, "job", run)).found === false;
+  answer.retried_decline = retried;
+
+  const records = kv("retried_decline_merge", "global", URL_ENV, RECORD);
+  const merging = `${execution("retried_decline")}/merge/0`;
+  const whole = { title: "t", tags: [], count: 0 };
+  const missed = await write(records, "merge", { key: "r", fields: whole, condition: "present" }, run, merging);
+  const seeded = await set(records, "r", { title: "seeded", tags: [], count: 1 }, run, "rdc/seed");
+  const remissed = await write(records, "merge", { key: "r", fields: whole, condition: "present" }, run, merging);
+  const held = await get(records, "r", run);
+  answer.a_retried_declined_partial_update_writes_nothing =
+    missed.applied === false &&
+    !("version" in missed) &&
+    remissed.applied === false &&
+    remissed.deduped === true &&
+    !("version" in remissed) &&
+    held.version === seeded.version &&
+    held.value?.title === "seeded";
 }
 
 {
@@ -766,6 +827,51 @@ const refusal = async (promise) => {
 }
 
 {
+  // Decision D119's split, read at the op: a partial update whose result `V`
+  // refuses is the **author's** failure on a store-op node — a plain error,
+  // which the node's `retry:`/`on_error:` decide — and the **model's** on a
+  // synthesized tool, a `ToolCallRefused` the agent loop hands back to it. One
+  // op, one backend, one refusal; only who asked differs. So does an `item`
+  // naming other than one field, which the tool refuses before the store sees
+  // it. Every refusal here leaves the row as it was.
+  const store = kv("tool_refusals", "global", URL_ENV, z.object({ items: z.array(z.string()).max(1) }).strict());
+  const run = ctx(execution("tool_refusals"));
+  const start = await set(store, "r", { items: ["only"] }, run, "tr/0");
+  const caught = async (promise) => {
+    try {
+      await promise;
+      return undefined;
+    } catch (error) {
+      return error;
+    }
+  };
+  const fromNode = await caught(write(store, "append", { key: "r", field: "items", value: "one too many" }, run, "tr/1"));
+  const fromTool = await caught(stores.runStoreTool(store, "append", { key: "r", item: { items: "one too many" } }, run));
+  const merged = await caught(stores.runStoreTool(store, "merge", { key: "fresh", fields: {} }, run));
+  const none = await caught(stores.runStoreTool(store, "append", { key: "r", item: {} }, run));
+  const two = await caught(stores.runStoreTool(store, "append", { key: "r", item: { items: "a", other: "b" } }, run));
+  const held = await get(store, "r", run);
+  const toModel = (error) => error instanceof runtime.ToolCallRefused;
+  answer.a_refused_partial_update_fails_a_node_and_goes_back_to_a_model =
+    fromNode instanceof Error &&
+    !toModel(fromNode) &&
+    String(fromNode.message).includes("value_schema") &&
+    toModel(fromTool) &&
+    String(fromTool.message).includes("value_schema") &&
+    toModel(merged) &&
+    toModel(none) &&
+    String(none.message).includes("naming no field") &&
+    toModel(two) &&
+    String(two.message).includes("naming 2 fields") &&
+    same(held.value, { items: ["only"] }) &&
+    held.version === start.version &&
+    (await get(store, "fresh", run)).found === false;
+  answer.tool_refusal_classes = [fromNode, fromTool, merged, none, two].map((error) =>
+    error === undefined ? "none" : `${error.name}: ${String(error.message).slice(0, 60)}`,
+  );
+}
+
+{
   // Schema evolution, written down: a value stored under one schema and read
   // by a partial update under another is validated whole, so the op fails
   // naming the field the stored value lacks — `get` would have answered it as
@@ -795,6 +901,49 @@ const refusal = async (promise) => {
   const held = await get(mine, "shared", run);
   answer.two_connections_appending_at_once_keep_every_item =
     same([...(held.value?.items ?? [])].sort(), [...items].sort());
+}
+
+{
+  // …and on a server whose **default** isolation is stricter than the
+  // `READ COMMITTED` the arms' writes are built for. A default is what a
+  // database or a role can change (`ALTER DATABASE … SET
+  // default_transaction_isolation`), and under a snapshot a write queued
+  // behind another one's commit finds the row it waited for "concurrently
+  // updated": on Postgres it fails with `40001` instead of serializing behind
+  // it. So each dialled arm asserts the level on its own session (PRD resolved
+  // q63: one contract on every arm; q68: the writes serialize rather than
+  // fail). The Postgres connections here are opened with
+  // `default_transaction_isolation=serializable` in their startup options; a
+  // stock MySQL server already defaults to `REPEATABLE READ`, so its arm is
+  // asked the same question by the server it is given. On SQLite the case is
+  // the two-connection race above, which it has to answer the same way.
+  const STRICT_URL_ENV = "AGENT_COMPOSE_STORE_URL_STRICT";
+  const OTHER_STRICT_URL_ENV = "AGENT_COMPOSE_STORE_URL_STRICT_B";
+  if (provider !== "sqlite") {
+    const strict = new URL(process.env[URL_ENV]);
+    if (provider === "postgres") {
+      strict.searchParams.set("options", "-c default_transaction_isolation=serializable");
+    }
+    process.env[STRICT_URL_ENV] = strict.href;
+    process.env[OTHER_STRICT_URL_ENV] = strict.href;
+  }
+  const schema = z.object({ items: z.array(z.string()) }).strict();
+  const mine = kv("strict_race", "global", STRICT_URL_ENV, schema);
+  const theirs = kv("strict_race", "global", OTHER_STRICT_URL_ENV, schema);
+  const run = ctx(execution("strict_race"));
+  const items = Array.from({ length: 20 }, (_, index) => `item-${index}`);
+  const settled = await Promise.allSettled(
+    items.map((item, index) =>
+      write(index % 2 === 0 ? mine : theirs, "append", { key: "shared", field: "items", value: item }, run, `sr/${index}`),
+    ),
+  );
+  const failures = settled
+    .filter((outcome) => outcome.status === "rejected")
+    .map((outcome) => String(outcome.reason?.message ?? outcome.reason));
+  const held = await get(mine, "shared", run);
+  answer.writes_serialize_whatever_isolation_the_server_defaults_to =
+    failures.length === 0 && same([...(held.value?.items ?? [])].sort(), [...items].sort());
+  answer.strict_isolation_failures = failures.slice(0, 3);
 }
 
 {
@@ -856,15 +1005,50 @@ const refusal = async (promise) => {
     }
     answer.two_processes_claiming_one_key_get_exactly_one_applied = exactlyOne;
     answer.race_winners = winners.join("");
+    // Every partial update answers the whole value it left at the version it
+    // took, so the two processes' answers, put in version order, are the key's
+    // history replayed — and each one has to be the one before it with its
+    // own change applied. That is a stronger reading than the final value:
+    // a lost update (a write that read before the other's commit and wrote
+    // after it) is invisible there whenever the loser writes again later, and
+    // every process here writes again every round. Distinct versions are part
+    // of it, since two writes taking one version leave no order to replay.
+    const history = (pick) =>
+      ["a", "b"]
+        .flatMap((role) => pick(role === "a" ? a : b).map((row, round) => ({ role, round, row })))
+        .sort((left, right) => left.row.version - right.row.version);
+    const ordered = (rows) =>
+      rows.every((entry) => entry.row.applied === true && Number.isInteger(entry.row.version)) &&
+      new Set(rows.map((entry) => entry.row.version)).size === rows.length;
+    const appended = history((side) => side.appends);
     const lists = await get(kv("race_lists", "global"), "shared", ctx(execution("race_read")));
     const expected = ["a", "b"].flatMap((role) => Array.from({ length: rounds }, (_, i) => `${role}-${i}`));
     answer.two_processes_appending_at_once_keep_every_item =
-      same([...(lists.value?.items ?? [])].sort(), [...expected].sort());
+      same([...(lists.value?.items ?? [])].sort(), [...expected].sort()) &&
+      ordered(appended) &&
+      appended.every((entry, index) =>
+        same(
+          entry.row.value?.items,
+          appended.slice(0, index + 1).map((earlier) => `${earlier.role}-${earlier.round}`),
+        ),
+      );
+    const incremented = history((side) => side.incrs);
     const counters = await get(kv("race_counters", "global"), "shared", ctx(execution("race_read")));
-    answer.two_processes_incrementing_at_once_lose_no_increment = counters.value?.count === rounds * 2;
+    answer.two_processes_incrementing_at_once_lose_no_increment =
+      counters.value?.count === rounds * 2 &&
+      ordered(incremented) &&
+      incremented.every((entry, index) => entry.row.value?.count === index + 1);
+    const merged = history((side) => side.merges);
     const records = await get(kv("race_records", "global"), "shared", ctx(execution("race_read")));
+    const latest = {};
     answer.two_processes_merging_different_fields_keep_both =
-      records.value?.a === rounds - 1 && records.value?.b === rounds - 1;
+      records.value?.a === rounds - 1 &&
+      records.value?.b === rounds - 1 &&
+      ordered(merged) &&
+      merged.every((entry) => {
+        latest[entry.role] = entry.round;
+        return entry.row.value?.a === latest.a && entry.row.value?.b === latest.b;
+      });
     // Every write that landed in one partition took a distinct version, and
     // each process saw its own versions rise.
     const versions = [...a.appends, ...b.appends].map((row) => row.version);
@@ -876,6 +1060,82 @@ const refusal = async (promise) => {
       lists.version === Math.max(...versions);
   } catch (error) {
     answer.race_error = String(error?.message ?? error);
+  }
+}
+
+{
+  // **A write that arrives inside another write's read-modify-write window
+  // waits for that write's commit, and builds on it.** The race above starts
+  // its writes together, and on SQLite a write's transaction is a few
+  // synchronous microseconds, so two racers almost never overlap inside one:
+  // it would pass a store that read its key outside the lock it writes under.
+  // Here the window is held open on purpose — `store-window.mjs` is a second
+  // process whose merge validates against a schema that spins for a second and
+  // a half, and a partial update validates between reading its key and writing
+  // it, inside its transaction — and this process writes the same key only
+  // once the other's marker says the window is open. Correctly serialized,
+  // this write waits on the other's lock (`BEGIN IMMEDIATE`'s on SQLite, the
+  // partition's sequence row on a server), reads what it committed, and keeps
+  // both fields; a store that let it land inside the window would have the
+  // other's write overwrite it a moment later.
+  const script = path.join(path.dirname(fileURLToPath(import.meta.url)), "store-window.mjs");
+  const marker = path.join(data, `${RUN}-window.marker`);
+  const schema = z.object({ a: z.number().int().optional(), b: z.number().int().optional() }).strict();
+  const mine = kv("window", "global", OTHER_URL_ENV, schema);
+  const run = ctx(execution("window"));
+  try {
+    // Opened first, so this side's file or connection is not what it waits on.
+    await get(mine, "warm", run);
+    // A dialled arm writes nothing under the data directory, so it may not be
+    // there yet; the marker is written into it.
+    fs.mkdirSync(data, { recursive: true });
+    const holder = new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [script, project, provider, data, RUN, marker], {
+        env: process.env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let out = "";
+      let err = "";
+      child.stdout.on("data", (chunk) => (out += chunk));
+      child.stderr.on("data", (chunk) => (err += chunk));
+      child.on("error", reject);
+      child.on("close", (code) =>
+        code === 0 ? resolve(JSON.parse(out)) : reject(new Error(`the window holder exited ${code}: ${err}`)),
+      );
+    });
+    // A rejection nothing is listening to yet would end this process, and the
+    // holder can fail before the marker ever appears.
+    const settled = holder.then(
+      (row) => ({ row }),
+      (error) => ({ error }),
+    );
+    const deadline = Date.now() + 30_000;
+    let open = false;
+    while (Date.now() < deadline) {
+      if (fs.existsSync(marker)) {
+        open = true;
+        break;
+      }
+      const early = await Promise.race([settled, new Promise((resolve) => setTimeout(resolve, 5))]);
+      if (early !== undefined) break;
+    }
+    answer.the_window_was_open_when_the_second_write_arrived = open;
+    const late = open
+      ? await write(mine, "merge", { key: "shared", fields: { b: 1 } }, run, `${RUN}/window/b`)
+      : undefined;
+    const outcome = await settled;
+    if (outcome.error !== undefined) throw outcome.error;
+    const early = outcome.row;
+    const held = await get(mine, "shared", run);
+    answer.a_write_inside_another_writes_window_waits_and_builds_on_it =
+      open &&
+      same(early.value, { a: 1 }) &&
+      same(late?.value, { a: 1, b: 1 }) &&
+      late.version > early.version &&
+      same(held.value, { a: 1, b: 1 });
+    answer.window = { early, late: late ?? null, held: held.value ?? null };
+  } catch (error) {
+    answer.window_error = String(error?.message ?? error);
   }
 }
 
