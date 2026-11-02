@@ -511,6 +511,57 @@ const TRUE_EVERYWHERE: &[&str] = &[
     // PRD 5.8's replay discipline, unchanged by the arms underneath it.
     "a_replayed_read_answers_out_of_the_record",
     "a_replayed_write_is_not_applied_again",
+    // PRD resolved q68 (a): every landed write takes the partition's next
+    // version, `get` answers it, and a sequence rather than a per-key counter
+    // means a key deleted and set again never repeats one.
+    "a_set_answers_applied_and_the_version_it_took",
+    "a_get_answers_the_version_its_key_holds",
+    "a_miss_answers_no_version",
+    "versions_rise_with_every_write_to_a_partition",
+    "a_version_is_never_reused_across_a_delete",
+    // (b) conditions: a condition that does not hold is `applied: false` with
+    // the key's current version, and writes nothing.
+    "if_absent_applies_once_and_then_declines",
+    "if_present_declines_an_absent_key_with_no_version",
+    "if_present_applies_to_a_key_that_holds_a_value",
+    "if_version_applies_when_the_version_matches",
+    "if_version_declines_a_stale_version_and_answers_the_current_one",
+    "if_version_declines_an_absent_key",
+    "a_conditional_delete_declines_a_stale_version_and_applies_a_current_one",
+    // (d) the ledger answers a retried write with its first attempt's whole
+    // answer, on one connection and on two at once.
+    "a_retried_claim_answers_applied_and_deduped",
+    "a_concurrently_retried_claim_is_applied_once_and_answered_twice",
+    // (c) the partial updates: from an absent key, on a held one, and against
+    // the schema — a result it refuses fails naming the field and changes
+    // nothing, a stored value under a changed schema included.
+    "a_merge_creates_a_value_that_satisfies_the_schema",
+    "an_append_adds_one_item_to_the_end",
+    "a_unique_append_of_a_held_item_changes_nothing",
+    "an_incr_adds_by_to_the_field",
+    "a_merge_keeps_every_field_it_does_not_name",
+    "an_incr_from_absent_starts_at_zero",
+    "an_append_from_absent_starts_from_an_empty_array",
+    "a_merge_the_schema_refuses_fails_naming_the_field",
+    "a_merge_the_schema_refuses_leaves_the_row_unchanged",
+    "a_merge_on_an_absent_key_must_satisfy_the_schema_whole",
+    "a_refused_merge_leaves_no_ledger_row",
+    "a_partial_update_under_a_changed_schema_fails_naming_the_field",
+    "a_get_under_a_changed_schema_answers_the_stored_value",
+    "two_connections_appending_at_once_keep_every_item",
+    // The trace: a write record carries `applied` and `version`, and a tool's
+    // carries neither an idempotency key nor `deduped`.
+    "a_node_write_record_carries_applied_version_and_its_key",
+    "a_tool_write_record_carries_applied_and_version_but_no_key",
+    // …and the clause the ruling was asked for, read where it means anything:
+    // two **processes**, each with its own SQLite handle or its own server
+    // connection, writing one store from one agreed instant
+    // (`store-race.mjs`).
+    "two_processes_claiming_one_key_get_exactly_one_applied",
+    "two_processes_appending_at_once_keep_every_item",
+    "two_processes_incrementing_at_once_lose_no_increment",
+    "two_processes_merging_different_fields_keep_both",
+    "two_processes_never_take_one_version",
 ];
 
 /// The cases a backend with a **socket** must answer `true`, on top of those.

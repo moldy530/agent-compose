@@ -30,6 +30,14 @@ import {
   flowShapeNodeAskOutput,
   flowShapeNodeNotifyOutput,
   flowShapeNodeProbeOutput,
+  storeLedgerToolAppendInput,
+  storeLedgerToolDeleteInput,
+  storeLedgerToolGetInput,
+  storeLedgerToolIncrInput,
+  storeLedgerToolMergeInput,
+  storeLedgerToolSetInput,
+  storeLedgerValueSchema,
+  storeNotesValueSchema,
   toolDispatchInput,
   toolDispatchOutput,
   toolFileTicketInput,
@@ -220,6 +228,82 @@ const flowShapeNodeRecallShape: runtime.Shape = {
   }
 };
 
+/** `flow.shape` node `claim` — the `claim.output` root its guards read. */
+const flowShapeNodeClaimShape: runtime.Shape = {
+  "properties": {
+    "applied": "bool",
+    "deduped": "bool",
+    "key": "string",
+    "version": "int"
+  }
+};
+
+/** `flow.shape` node `stamp` — the `stamp.output` root its guards read. */
+const flowShapeNodeStampShape: runtime.Shape = {
+  "properties": {
+    "applied": "bool",
+    "deduped": "bool",
+    "key": "string",
+    "value": {
+      "properties": {
+        "hits": "int",
+        "marks": {
+          "items": "string"
+        },
+        "owner": "string"
+      }
+    },
+    "version": "int"
+  }
+};
+
+/** `flow.shape` node `tick` — the `tick.output` root its guards read. */
+const flowShapeNodeTickShape: runtime.Shape = {
+  "properties": {
+    "applied": "bool",
+    "deduped": "bool",
+    "key": "string",
+    "value": {
+      "properties": {
+        "hits": "int",
+        "marks": {
+          "items": "string"
+        },
+        "owner": "string"
+      }
+    },
+    "version": "int"
+  }
+};
+
+/** `flow.shape` node `tidy` — the `tidy.output` root its guards read. */
+const flowShapeNodeTidyShape: runtime.Shape = {
+  "properties": {
+    "applied": "bool",
+    "deduped": "bool",
+    "key": "string",
+    "value": {
+      "properties": {
+        "hits": "int",
+        "marks": {
+          "items": "string"
+        },
+        "owner": "string"
+      }
+    },
+    "version": "int"
+  }
+};
+
+/** `flow.shape` node `drop` — the `drop.output` root its guards read. */
+const flowShapeNodeDropShape: runtime.Shape = {
+  "properties": {
+    "applied": "bool",
+    "deduped": "bool",
+    "deleted": "bool"
+  }
+};
+
 /**
  * `provider.aws` — a `bedrock` connection (grammar 12.1). Every value is read when a node calls it, never at import: a build carries no credential and `./index.ts` is where their presence is checked (PRD 5.9).
  */
@@ -281,6 +365,23 @@ const storeDocs: stores.StoreBinding = {
 };
 
 /**
+ * `store.ledger` — a `kv` store with `scope: execution`, on the `sqlite` backend (the `local` target substitutes local storage for every store unconditionally) (grammar 11.1, 11.3).
+ */
+const storeLedger: stores.StoreBinding = {
+  address: "store.ledger",
+  name: "ledger",
+  kind: "kv",
+  scope: "execution",
+  description: "Who holds what, and how often it was touched.",
+  metadata: false,
+  value: storeLedgerValueSchema,
+  backend: {
+    provider: "sqlite",
+    from: "the `local` target substitutes local storage for every store unconditionally",
+  },
+};
+
+/**
  * `store.notes` — a `kv` store with `scope: execution`, on the `sqlite` backend (the `local` target substitutes local storage for every store unconditionally) (grammar 11.1, 11.3).
  */
 const storeNotes: stores.StoreBinding = {
@@ -290,6 +391,7 @@ const storeNotes: stores.StoreBinding = {
   scope: "execution",
   description: "What has been noted.",
   metadata: false,
+  value: storeNotesValueSchema,
   backend: {
     provider: "sqlite",
     from: "the `local` target substitutes local storage for every store unconditionally",
@@ -623,6 +725,281 @@ const agentShaper: runtime.AgentBinding = {
           runtime.parseToolArguments(builtinFilesInput, args, "the arguments `str_replace_based_edit_tool` was called with"),
           context,
           call,
+        ),
+    },
+    {
+      name: "ledger_get",
+      address: "store.ledger",
+      description: "Read one stored value by key from `store.ledger`. Who holds what, and how often it was touched.",
+      schema: {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "type": "object"
+      },
+      invoke: async (args, context) =>
+        stores.runStoreTool(
+          storeLedger,
+          "get",
+          runtime.parseToolArguments(storeLedgerToolGetInput, args, "the arguments `ledger_get` was called with") as Record<string, unknown>,
+          context,
+        ),
+    },
+    {
+      name: "ledger_set",
+      address: "store.ledger",
+      description: "Store a value under a key in `store.ledger`. Who holds what, and how often it was touched.",
+      schema: {
+        "additionalProperties": false,
+        "properties": {
+          "if": {
+            "default": "",
+            "description": "Apply this write only if the key holds no value (`absent`) or only if it holds one (`present`). Leave it empty for a write that applies either way. A write whose condition does not hold changes nothing and answers `applied: false`.",
+            "pattern": "^(absent|present)?$",
+            "type": "string"
+          },
+          "if_version": {
+            "default": -1,
+            "description": "Apply this write only if the key's current `version` is this one, as a `get` or an earlier write answered it. `-1`, the default, asks for no version. A write whose version does not match changes nothing and answers `applied: false` with the version the key holds.",
+            "minimum": -1,
+            "type": "integer"
+          },
+          "key": {
+            "type": "string"
+          },
+          "value": {
+            "additionalProperties": false,
+            "properties": {
+              "hits": {
+                "type": "integer"
+              },
+              "marks": {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 8,
+                "type": "array"
+              },
+              "owner": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "owner",
+              "marks",
+              "hits"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "key",
+          "value"
+        ],
+        "type": "object"
+      },
+      invoke: async (args, context) =>
+        stores.runStoreTool(
+          storeLedger,
+          "set",
+          runtime.parseToolArguments(storeLedgerToolSetInput, args, "the arguments `ledger_set` was called with") as Record<string, unknown>,
+          context,
+        ),
+    },
+    {
+      name: "ledger_merge",
+      address: "store.ledger",
+      description: "Change some fields of the value at a key in `store.ledger`. Who holds what, and how often it was touched.",
+      schema: {
+        "additionalProperties": false,
+        "properties": {
+          "fields": {
+            "additionalProperties": false,
+            "description": "The fields to change. Every other field of the stored value is kept, and the value that results has to be one the store's schema admits.",
+            "properties": {
+              "hits": {
+                "type": "integer"
+              },
+              "marks": {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 8,
+                "type": "array"
+              },
+              "owner": {
+                "type": "string"
+              }
+            },
+            "required": [],
+            "type": "object"
+          },
+          "if": {
+            "default": "",
+            "description": "Apply this write only if the key holds no value (`absent`) or only if it holds one (`present`). Leave it empty for a write that applies either way. A write whose condition does not hold changes nothing and answers `applied: false`.",
+            "pattern": "^(absent|present)?$",
+            "type": "string"
+          },
+          "if_version": {
+            "default": -1,
+            "description": "Apply this write only if the key's current `version` is this one, as a `get` or an earlier write answered it. `-1`, the default, asks for no version. A write whose version does not match changes nothing and answers `applied: false` with the version the key holds.",
+            "minimum": -1,
+            "type": "integer"
+          },
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "fields"
+        ],
+        "type": "object"
+      },
+      invoke: async (args, context) =>
+        stores.runStoreTool(
+          storeLedger,
+          "merge",
+          runtime.parseToolArguments(storeLedgerToolMergeInput, args, "the arguments `ledger_merge` was called with") as Record<string, unknown>,
+          context,
+        ),
+    },
+    {
+      name: "ledger_append",
+      address: "store.ledger",
+      description: "Add one item to an array field of the value at a key in `store.ledger`. Who holds what, and how often it was touched.",
+      schema: {
+        "additionalProperties": false,
+        "properties": {
+          "if": {
+            "default": "",
+            "description": "Apply this write only if the key holds no value (`absent`) or only if it holds one (`present`). Leave it empty for a write that applies either way. A write whose condition does not hold changes nothing and answers `applied: false`.",
+            "pattern": "^(absent|present)?$",
+            "type": "string"
+          },
+          "if_version": {
+            "default": -1,
+            "description": "Apply this write only if the key's current `version` is this one, as a `get` or an earlier write answered it. `-1`, the default, asks for no version. A write whose version does not match changes nothing and answers `applied: false` with the version the key holds.",
+            "minimum": -1,
+            "type": "integer"
+          },
+          "item": {
+            "additionalProperties": false,
+            "description": "Name exactly one array field of the stored value, with the item to add to its end: `{\"tags\": \"urgent\"}`. A key holding nothing starts from an empty array.",
+            "properties": {
+              "marks": {
+                "type": "string"
+              }
+            },
+            "required": [],
+            "type": "object"
+          },
+          "key": {
+            "type": "string"
+          },
+          "unique": {
+            "default": false,
+            "description": "Set to `true` to add the item only if the array does not already hold an equal one.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "key",
+          "item"
+        ],
+        "type": "object"
+      },
+      invoke: async (args, context) =>
+        stores.runStoreTool(
+          storeLedger,
+          "append",
+          runtime.parseToolArguments(storeLedgerToolAppendInput, args, "the arguments `ledger_append` was called with") as Record<string, unknown>,
+          context,
+        ),
+    },
+    {
+      name: "ledger_incr",
+      address: "store.ledger",
+      description: "Add to a numeric field of the value at a key in `store.ledger`. Who holds what, and how often it was touched.",
+      schema: {
+        "additionalProperties": false,
+        "properties": {
+          "by": {
+            "default": 1,
+            "description": "What to add; `1` by default, and negative to subtract.",
+            "type": "number"
+          },
+          "field": {
+            "description": "The numeric field to add to. A key holding nothing starts from `0`.",
+            "enum": [
+              "hits"
+            ],
+            "type": "string"
+          },
+          "if": {
+            "default": "",
+            "description": "Apply this write only if the key holds no value (`absent`) or only if it holds one (`present`). Leave it empty for a write that applies either way. A write whose condition does not hold changes nothing and answers `applied: false`.",
+            "pattern": "^(absent|present)?$",
+            "type": "string"
+          },
+          "if_version": {
+            "default": -1,
+            "description": "Apply this write only if the key's current `version` is this one, as a `get` or an earlier write answered it. `-1`, the default, asks for no version. A write whose version does not match changes nothing and answers `applied: false` with the version the key holds.",
+            "minimum": -1,
+            "type": "integer"
+          },
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "field"
+        ],
+        "type": "object"
+      },
+      invoke: async (args, context) =>
+        stores.runStoreTool(
+          storeLedger,
+          "incr",
+          runtime.parseToolArguments(storeLedgerToolIncrInput, args, "the arguments `ledger_incr` was called with") as Record<string, unknown>,
+          context,
+        ),
+    },
+    {
+      name: "ledger_delete",
+      address: "store.ledger",
+      description: "Delete the value at a key in `store.ledger`. Who holds what, and how often it was touched.",
+      schema: {
+        "additionalProperties": false,
+        "properties": {
+          "if_version": {
+            "default": -1,
+            "description": "Apply this write only if the key's current `version` is this one, as a `get` or an earlier write answered it. `-1`, the default, asks for no version. A write whose version does not match changes nothing and answers `applied: false` with the version the key holds.",
+            "minimum": -1,
+            "type": "integer"
+          },
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "type": "object"
+      },
+      invoke: async (args, context) =>
+        stores.runStoreTool(
+          storeLedger,
+          "delete",
+          runtime.parseToolArguments(storeLedgerToolDeleteInput, args, "the arguments `ledger_delete` was called with") as Record<string, unknown>,
+          context,
         ),
     },
   ],
@@ -1014,6 +1391,157 @@ const flowShapeNodeSpread: runtime.NodeDescriptor = {
     runtime.runMap(flowShapeNodeSpreadMap, input as runtime.MapPlan, context),
   writes: [],
   edges: [
+    { to: "claim" },
+  ],
+};
+
+/** `flow.shape` node `claim` — a `set` on `store.ledger` (grammar 8.8). */
+const flowShapeNodeClaim: runtime.NodeDescriptor = {
+  flow: "flow.shape",
+  node: "claim",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from the built-in, `on_error` from the built-in.
+  policy: {
+    onError: "fail",
+  },
+  shapes: { input: flowShapeShape, state: stateShape, output: flowShapeNodeClaimShape },
+  input: (roots) => ({
+    key: String(runtime.toJson(runtime.evaluate("input.goal", roots))),
+    value: {
+      "owner": runtime.toJson(runtime.evaluate("'shaper'", roots)),
+      "marks": runtime.toJson(runtime.evaluate("[]", roots)),
+      "hits": runtime.toJson(runtime.evaluate("0", roots)),
+    },
+    condition: "absent",
+  }),
+  run: async (input, context, view) => ({
+    output: await stores.runStoreOp(
+      storeLedger,
+      "set",
+      input as stores.StoreParams,
+      context,
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "claim")].join("/") },
+    ),
+  }),
+  writes: [],
+  edges: [
+    { to: "stamp" },
+  ],
+};
+
+/** `flow.shape` node `stamp` — a `append` on `store.ledger` (grammar 8.8). */
+const flowShapeNodeStamp: runtime.NodeDescriptor = {
+  flow: "flow.shape",
+  node: "stamp",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from the built-in, `on_error` from the built-in.
+  policy: {
+    onError: "fail",
+  },
+  shapes: { input: flowShapeShape, state: stateShape, output: flowShapeNodeStampShape },
+  input: (roots) => ({
+    key: String(runtime.toJson(runtime.evaluate("input.goal", roots))),
+    value: runtime.toJson(runtime.evaluate("state.latest", roots)),
+    field: "marks",
+    unique: true,
+  }),
+  run: async (input, context, view) => ({
+    output: await stores.runStoreOp(
+      storeLedger,
+      "append",
+      input as stores.StoreParams,
+      context,
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "stamp")].join("/") },
+    ),
+  }),
+  writes: [],
+  edges: [
+    { to: "tick" },
+  ],
+};
+
+/** `flow.shape` node `tick` — a `incr` on `store.ledger` (grammar 8.8). */
+const flowShapeNodeTick: runtime.NodeDescriptor = {
+  flow: "flow.shape",
+  node: "tick",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from the built-in, `on_error` from the built-in.
+  policy: {
+    onError: "fail",
+  },
+  shapes: { input: flowShapeShape, state: stateShape, output: flowShapeNodeTickShape },
+  input: (roots) => ({
+    key: String(runtime.toJson(runtime.evaluate("input.goal", roots))),
+    field: "hits",
+    by: Number(runtime.toJson(runtime.evaluate("2", roots))),
+  }),
+  run: async (input, context, view) => ({
+    output: await stores.runStoreOp(
+      storeLedger,
+      "incr",
+      input as stores.StoreParams,
+      context,
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "tick")].join("/") },
+    ),
+  }),
+  writes: [],
+  edges: [
+    { to: "tidy" },
+  ],
+};
+
+/** `flow.shape` node `tidy` — a `merge` on `store.ledger` (grammar 8.8). */
+const flowShapeNodeTidy: runtime.NodeDescriptor = {
+  flow: "flow.shape",
+  node: "tidy",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from the built-in, `on_error` from the built-in.
+  policy: {
+    onError: "fail",
+  },
+  shapes: { input: flowShapeShape, state: stateShape, output: flowShapeNodeTidyShape },
+  input: (roots) => ({
+    key: String(runtime.toJson(runtime.evaluate("input.goal", roots))),
+    fields: {
+      "owner": runtime.toJson(runtime.evaluate("'tidier'", roots)),
+    },
+    ifVersion: Number(runtime.toJson(runtime.evaluate("3", roots))),
+  }),
+  run: async (input, context, view) => ({
+    output: await stores.runStoreOp(
+      storeLedger,
+      "merge",
+      input as stores.StoreParams,
+      context,
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "tidy")].join("/") },
+    ),
+  }),
+  writes: [],
+  edges: [
+    { to: "drop" },
+  ],
+};
+
+/** `flow.shape` node `drop` — a `delete` on `store.ledger` (grammar 8.8). */
+const flowShapeNodeDrop: runtime.NodeDescriptor = {
+  flow: "flow.shape",
+  node: "drop",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from the built-in, `on_error` from the built-in.
+  policy: {
+    onError: "fail",
+  },
+  shapes: { input: flowShapeShape, state: stateShape, output: flowShapeNodeDropShape },
+  input: (roots) => ({
+    key: String(runtime.toJson(runtime.evaluate("input.goal", roots))),
+    ifVersion: Number(runtime.toJson(runtime.evaluate("4", roots))),
+  }),
+  run: async (input, context, view) => ({
+    output: await stores.runStoreOp(
+      storeLedger,
+      "delete",
+      input as stores.StoreParams,
+      context,
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "drop")].join("/") },
+    ),
+  }),
+  writes: [],
+  edges: [
     { to: END },
   ],
 };
@@ -1037,6 +1565,21 @@ function flowShape() {
       ends: ["spread"],
     })
     .addNode("spread", (state: GraphState) => runtime.runNode(flowShapeNodeSpread, state), {
+      ends: ["claim"],
+    })
+    .addNode("claim", (state: GraphState) => runtime.runNode(flowShapeNodeClaim, state), {
+      ends: ["stamp"],
+    })
+    .addNode("stamp", (state: GraphState) => runtime.runNode(flowShapeNodeStamp, state), {
+      ends: ["tick"],
+    })
+    .addNode("tick", (state: GraphState) => runtime.runNode(flowShapeNodeTick, state), {
+      ends: ["tidy"],
+    })
+    .addNode("tidy", (state: GraphState) => runtime.runNode(flowShapeNodeTidy, state), {
+      ends: ["drop"],
+    })
+    .addNode("drop", (state: GraphState) => runtime.runNode(flowShapeNodeDrop, state), {
       ends: [END],
     })
     .addEdge(START, "shape")
@@ -1054,7 +1597,7 @@ const flowShapeGraph = flowShape();
 const flowShapeBinding: runtime.SubflowBinding = {
   address: "flow.shape",
   outputs: ["draft", "notes"],
-  recursionLimit: 31,
+  recursionLimit: 36,
   stream: (initial, options) =>
     flowShapeGraph.stream(initial, {
       ...options,
@@ -1146,7 +1689,7 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
     inputKinds: { "goal": "string", "goals": "json", },
     outputs: ["draft", "notes"],
     sessionStores: [],
-    recursionLimit: 31,
+    recursionLimit: 36,
     parse: (inputs: unknown) =>
       runtime.parseResult(flowShapeInputs, inputs, "the `inputs:` of `flow.shape`") as Record<string, unknown>,
     stream: (initial, options) =>

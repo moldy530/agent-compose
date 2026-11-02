@@ -849,6 +849,10 @@ function storeAttributes(record: StoreRecord): readonly OtlpAttribute[] {
     text("agentcompose.store.via", record.via),
     text("agentcompose.store.scope", record.scope),
     ...(record.key === undefined ? [] : [text("agentcompose.store.key", record.key)]),
+    ...(record.applied === undefined
+      ? []
+      : [{ key: "agentcompose.store.applied", value: { boolValue: record.applied } }]),
+    ...(record.version === undefined ? [] : [integer("agentcompose.store.version", record.version)]),
     ...(record.idempotencyKey === undefined
       ? []
       : [text("agentcompose.instance_path", record.idempotencyKey)]),

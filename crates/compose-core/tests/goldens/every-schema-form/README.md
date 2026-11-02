@@ -502,8 +502,9 @@ boundary the target draws everywhere else. A deployment that really has two is a
 named target binding a **dialled** backend: a `kv` store on `postgres` or
 `mysql` is a connection rather than a file, every process reaching it reaches the
 same rows, and nothing else about the store changes — same ops, same scopes, same
-recorded reads and deduplicated writes. It takes no lock and no writer guard, and
-per key the last write wins.
+recorded reads and deduplicated writes. It takes no writer guard and holds no lock
+past one write: a plain `set` is last-write-wins per key, and a conditional write
+or a `merge`/`append`/`incr` is serialized against every other write to its key.
 
 **Opening** is the concession to that, and both artifacts make it: the journal
 and the stores wait for a lock rather than failing on one, so an

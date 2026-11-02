@@ -1,6 +1,6 @@
 {
   "name": "pauses-stores-and-subflows",
-  "about": "The three record kinds that are events or nesting rather than spans of their own: a `human` node's pause — the one timing this format records, and so the one span with a window of its own (§12.4) — store ops as events, and a `flow:` node's instance as entry spans under the node that ran it. The retried `flow:` node is what the positional discriminator of §12.2 exists for: two attempts of one instance derive the same instance path.",
+  "about": "The three record kinds that are events or nesting rather than spans of their own: a `human` node's pause — the one timing this format records, and so the one span with a window of its own (§12.4) — store ops as events, and a `flow:` node's instance as entry spans under the node that ran it. The retried `flow:` node is what the positional discriminator of §12.2 exists for: two attempts of one instance derive the same instance path. A `kv` write a tool ran carries `applied` and `version` and no key: the condition it was conditioned on did not hold, which is an answer rather than a failure (PRD resolved q68).",
   "context": {
     "target": "staging",
     "artifact": "sha256:00000000000000000000000000000000000000000000000000000000000000e6",
@@ -45,6 +45,16 @@
             "key": "case-17",
             "idempotencyKey": "exec_pause/load/0",
             "deduped": false
+          },
+          {
+            "store": "store.cases",
+            "op": "set",
+            "effect": "write",
+            "via": "tool",
+            "scope": "global",
+            "key": "case-17",
+            "applied": false,
+            "version": 3
           },
           {
             "store": "store.notes",
@@ -359,6 +369,60 @@
                         "key": "agentcompose.store.deduped",
                         "value": {
                           "boolValue": false
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "timeUnixNano": "1788271200000000000",
+                    "name": "store",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.store",
+                        "value": {
+                          "stringValue": "store.cases"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.op",
+                        "value": {
+                          "stringValue": "set"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.effect",
+                        "value": {
+                          "stringValue": "write"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.via",
+                        "value": {
+                          "stringValue": "tool"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.scope",
+                        "value": {
+                          "stringValue": "global"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.key",
+                        "value": {
+                          "stringValue": "case-17"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.applied",
+                        "value": {
+                          "boolValue": false
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.version",
+                        "value": {
+                          "intValue": "3"
                         }
                       }
                     ]

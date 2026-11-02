@@ -845,6 +845,24 @@ const CODEGEN: &[Criterion] = &[
                 "a_store_tool_refuses_arguments_to_the_model_and_still_fails_the_node_on_a_backend_error",
                 Status::Live,
             ),
+            // PRD resolved q68 on both surfaces. The third `agent_access:` level
+            // is a tool *list*, decided against the default on the same
+            // attachment list; a conditional `set` and the partial updates are
+            // the *surface*, decided by what the model was handed back and what
+            // the trace records; and a `map` of partial updates at one constant
+            // key is D67's exemption meaning what authors reach for it to mean.
+            (
+                "agent_access_full_offers_the_partial_updates_and_read_write_does_not",
+                Status::Live,
+            ),
+            (
+                "an_agents_conditional_store_write_applies_or_declines_and_the_trace_says_which",
+                Status::Live,
+            ),
+            (
+                "a_map_of_partial_updates_at_one_key_keeps_every_item",
+                Status::Live,
+            ),
         ],
     },
     Criterion {

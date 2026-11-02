@@ -238,6 +238,25 @@ store.notes:
     body:   { type: string }
     weight: { type: number, minimum: 0 }
 
+# PRD resolved q68's `kv` shapes, which no example reaches: a store an agent
+# attaches at `agent_access: full` — so `src/graph.ts` carries the six tools and
+# the condition arguments of `<name>_set`, the folded `item` of
+# `<name>_append` and the field enum of `<name>_incr` — and the nodes in
+# `flow.shape` below that reach every conditional and partial-update row. The
+# binding's `value:` is the emitted Zod the partial updates validate against.
+store.ledger:
+  kind: kv
+  scope: execution
+  description: Who holds what, and how often it was touched.
+  agent_access: full
+  value_schema:
+    owner: { type: string }
+    marks:
+      type: array
+      max_items: 8
+      items: { type: string }
+    hits:  { type: integer }
+
 store.docs:
   kind: vector
   scope: global
@@ -302,6 +321,7 @@ agent.shaper:
     - flow.condense
     - builtin.files
     - tool.sandbox
+  stores: [store.ledger]
   input:
     goal: { type: string, description: What to shape. }
   output:
@@ -417,6 +437,44 @@ flow.shape:
           goal: "one.goal"
         writes:
           note: notes
+    # Every conditional and partial-update row of grammar 11.4 (PRD resolved
+    # q68): the literal `if:`, the CEL `if_version:`, `fields:`, the literal
+    # `field:` and `unique:`, an `append`'s item as a value rather than a string,
+    # and an `incr`'s `by:`.
+    claim:
+      store: store.ledger
+      op: set
+      key: "input.goal"
+      if: absent
+      value:
+        owner: "'shaper'"
+        marks: "[]"
+        hits: "0"
+    stamp:
+      store: store.ledger
+      op: append
+      key: "input.goal"
+      field: marks
+      value: "state.latest"
+      unique: true
+    tick:
+      store: store.ledger
+      op: incr
+      key: "input.goal"
+      field: hits
+      by: "2"
+    tidy:
+      store: store.ledger
+      op: merge
+      key: "input.goal"
+      fields:
+        owner: "'tidier'"
+      if_version: "3"
+    drop:
+      store: store.ledger
+      op: delete
+      key: "input.goal"
+      if_version: "4"
   edges:
     - { from: start, to: shape }
     - { from: shape, to: ask }
@@ -424,7 +482,12 @@ flow.shape:
     - { from: probe, to: notify }
     - { from: notify, to: recall }
     - { from: recall, to: spread }
-    - { from: spread, to: end }
+    - { from: spread, to: claim }
+    - { from: claim, to: stamp }
+    - { from: stamp, to: tick }
+    - { from: tick, to: tidy }
+    - { from: tidy, to: drop }
+    - { from: drop, to: end }
 
 # The trigger surface of grammar 13.3, in the two spellings that make its
 # emitted table more than a type declaration.

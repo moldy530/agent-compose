@@ -94,6 +94,25 @@ state:
     type: string
     default: ""
 
+  # What `flow.tally` reads back after a `map` of partial updates at one key —
+  # with a default no run produces, so a read that found nothing cannot pass.
+  tally:
+    type: object
+    properties:
+      items:
+        type: array
+        max_items: 8
+        items: { type: string }
+      count: { type: integer }
+      last: { type: string }
+    default: { items: [], count: -1, last: nothing was read }
+
+  # Whether `flow.claim`'s agent says it finished. What is asserted about is the
+  # trace — the tool calls and the store records they left.
+  claimed:
+    type: boolean
+    default: false
+
 provider.mock:
   kind: anthropic
   api_key: ${MOCK_API_KEY}
@@ -469,3 +488,158 @@ flow.reingest:
   edges:
     - { from: start, to: sub }
     - { from: sub, to: end }
+
+# PRD resolved q68 on the agent surface: `agent_access: full` adds a `kv`
+# store's partial updates and `delete` beside `get` and `set`, and the default
+# `read_write` keeps exactly the two tools it always had — `store.jobs` and
+# `store.ledger` are the same kind on one attachment list, so the narrowing is a
+# comparison rather than an absence. `jobs_set` carries the conditions at either
+# level, because a condition narrows a write rather than widening it.
+store.jobs:
+  kind: kv
+  scope: execution
+  description: Who has claimed which job, and what they noted.
+  agent_access: full
+  value_schema:
+    owner: { type: string }
+    tags:
+      type: array
+      max_items: 20
+      items: { type: string }
+    count: { type: integer }
+
+store.ledger:
+  kind: kv
+  scope: execution
+  description: Notes about the run, one per key.
+  value_schema:
+    note: { type: string }
+
+agent.claimer:
+  description: Claims a job, then records what it did.
+  model: model.smart
+  prompt: Claim the job before working on it, and record what you did.
+  stores: [store.jobs, store.ledger]
+  input:
+    job: { type: string }
+  output:
+    done: { type: boolean }
+
+flow.claim:
+  description: Let the agent claim a job, then read back what the store holds for it.
+  inputs:
+    job:
+      type: string
+      min_length: 1
+  outputs:
+    claimed:
+      type: boolean
+  nodes:
+    work:
+      agent: agent.claimer
+      input:
+        job: "input.job"
+      writes:
+        done: claimed
+    reread:
+      store: store.jobs
+      op: get
+      key: "input.job"
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: reread }
+    - { from: reread, to: end }
+
+# D67, read where it finally means what authors reach for: a `map` whose every
+# instance writes **one** constant `kv` key. A `set` there would be a declared
+# overwrite; an `append`, an `incr` and a `merge` are each serialized against
+# every other write to the key, so every instance's change lands. The value is
+# seeded whole first, because a partial update has to leave a value the schema
+# admits and `V` here has three required fields.
+store.tally:
+  kind: kv
+  scope: execution
+  description: One record every instance of a fan-out adds to.
+  value_schema:
+    items:
+      type: array
+      max_items: 8
+      items: { type: string }
+    count: { type: integer }
+    last: { type: string }
+
+flow.tally_one:
+  description: Add one item to the shared record.
+  inputs:
+    item:
+      type: string
+  outputs: {}
+  nodes:
+    add:
+      store: store.tally
+      op: append
+      key: "'all'"
+      field: items
+      value: "input.item"
+    bump:
+      store: store.tally
+      op: incr
+      key: "'all'"
+      field: count
+    touch:
+      store: store.tally
+      op: merge
+      key: "'all'"
+      fields:
+        last: "input.item"
+  edges:
+    - { from: start, to: add }
+    - { from: add, to: bump }
+    - { from: bump, to: touch }
+    - { from: touch, to: end }
+
+flow.tally:
+  description: Fan out over the items, every instance adding to one key, and read it back.
+  inputs:
+    items:
+      type: array
+      max_items: 8
+      items: { type: string }
+  outputs:
+    tally:
+      type: object
+      properties:
+        items:
+          type: array
+          max_items: 8
+          items: { type: string }
+        count: { type: integer }
+        last: { type: string }
+  nodes:
+    seed:
+      store: store.tally
+      op: set
+      key: "'all'"
+      value:
+        items: "[]"
+        count: "0"
+        last: "''"
+    each:
+      map:
+        over: input.items
+        as: one
+        node: flow.tally_one
+        max_concurrency: 4
+        input:
+          item: "one"
+    read:
+      store: store.tally
+      op: get
+      key: "'all'"
+      writes:
+        value: tally
+  edges:
+    - { from: start, to: seed }
+    - { from: seed, to: each }
+    - { from: each, to: read }
+    - { from: read, to: end }

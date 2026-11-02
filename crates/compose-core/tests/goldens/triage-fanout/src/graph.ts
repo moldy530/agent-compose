@@ -33,6 +33,7 @@ import {
   flowTriageNodeEscalateOutput,
   flowTriageNodeVerifyOutput,
   storeDocsToolSearchInput,
+  storeTriageMemoryValueSchema,
   toolCheckoutInput,
   toolDeadLetterInput,
   toolDeadLetterOutput,
@@ -158,7 +159,10 @@ const flowTriageNodeSummarizeShape: runtime.Shape = {
  */
 const flowTriageNodeRememberShape: runtime.Shape = {
   "properties": {
-    "key": "string"
+    "applied": "bool",
+    "deduped": "bool",
+    "key": "string",
+    "version": "int"
   }
 };
 
@@ -274,6 +278,7 @@ const storeTriageMemory: stores.StoreBinding = {
   scope: "session",
   description: "What this session has already triaged.",
   metadata: false,
+  value: storeTriageMemoryValueSchema,
   backend: {
     provider: "sqlite",
     from: "the `local` target substitutes local storage for every store unconditionally",

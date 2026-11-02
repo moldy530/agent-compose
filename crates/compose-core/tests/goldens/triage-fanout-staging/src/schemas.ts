@@ -194,6 +194,9 @@ export type FlowTriageNodeVerifyOutput = z.infer<typeof flowTriageNodeVerifyOutp
  */
 export const flowTriageNodeRememberOutput = z.object({
   key: z.string(),
+  applied: z.boolean(),
+  version: z.number().int(),
+  deduped: z.boolean(),
 }).strict();
 export type FlowTriageNodeRememberOutput = z.infer<typeof flowTriageNodeRememberOutput>;
 

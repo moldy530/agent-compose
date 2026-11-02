@@ -11454,6 +11454,295 @@ fn agent_access_read_withholds_the_write_tool() {
     );
 }
 
+/// `agent_access: full` adds a `kv` store's partial updates and `delete` to the
+/// synthesized surface, and the `read_write` default does not (grammar 11.5,
+/// PRD resolved q68).
+///
+/// `store.jobs` and `store.ledger` are both `kind: kv` on one attachment list,
+/// so what the request offers is a comparison: the six tools `full` grants
+/// beside the two the default always granted — which every composition written
+/// before the third level keeps.
+#[test]
+fn agent_access_full_offers_the_partial_updates_and_read_write_does_not() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(SONNET, Outcome::text("Nothing to claim.")),
+        Script::new(SONNET, Outcome::structured(json!({ "done": true }))),
+    ]);
+    let Some(run) = harness::invoke("stores", "flow.claim", &[("job", "job-1")], &provider) else {
+        return;
+    };
+    run.succeeded();
+
+    let call = &provider.requests()[0];
+    assert!(call.is_valid(), "{:?}", call.failures());
+    let offered = |prefix: &str| -> Vec<String> {
+        call.tools
+            .iter()
+            .filter(|tool| tool.starts_with(prefix))
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        offered("jobs_"),
+        [
+            "jobs_get",
+            "jobs_set",
+            "jobs_merge",
+            "jobs_append",
+            "jobs_incr",
+            "jobs_delete"
+        ],
+        "`full` grants every `kv` tool, in grammar 11.5's order: {:?}",
+        call.tools
+    );
+    assert_eq!(
+        offered("ledger_"),
+        ["ledger_get", "ledger_set"],
+        "the `read_write` default grants the two it always did, and nothing more: {:?}",
+        call.tools
+    );
+    // `<name>_set` takes the conditions at either level, schema-held.
+    let declared: Vec<Value> = call.body()["tools"]
+        .as_array()
+        .expect("a tool list")
+        .clone();
+    for name in ["jobs_set", "ledger_set"] {
+        let tool = declared
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("`{name}` is declared: {declared:?}"));
+        let properties = &tool["input_schema"]["properties"];
+        assert_eq!(
+            properties["if"]["pattern"], "^(absent|present)?$",
+            "`{name}` offers `if`: {tool}"
+        );
+        assert_eq!(properties["if_version"]["default"], -1, "`{name}`: {tool}");
+    }
+}
+
+/// The agent's `<name>_set` with a condition applies, then declines; the partial
+/// updates land, a stale `if_version` declines, a call naming both conditions
+/// goes back to the model — and every tool write's record carries `applied` and
+/// `version` and neither an idempotency key nor `deduped` (grammar 11.4, 11.5,
+/// `docs/trace.md` §6, PRD resolved q68).
+#[test]
+fn an_agents_conditional_store_write_applies_or_declines_and_the_trace_says_which() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let fresh = json!({ "owner": "me", "tags": [], "count": 0 });
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![
+                ToolCall::new(
+                    "jobs_set",
+                    json!({ "key": "job-1", "value": fresh, "if": "absent" }),
+                ),
+                ToolCall::new(
+                    "jobs_set",
+                    json!({
+                        "key": "job-1",
+                        "value": { "owner": "someone else", "tags": [], "count": 0 },
+                        "if": "absent",
+                    }),
+                ),
+            ]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![
+                ToolCall::new(
+                    "jobs_append",
+                    json!({ "key": "job-1", "item": { "tags": "urgent" } }),
+                ),
+                ToolCall::new(
+                    "jobs_incr",
+                    json!({ "key": "job-1", "field": "count", "by": 3 }),
+                ),
+                ToolCall::new(
+                    "jobs_merge",
+                    json!({ "key": "job-1", "fields": { "owner": "me again" }, "if_version": 1 }),
+                ),
+                ToolCall::new(
+                    "jobs_set",
+                    json!({ "key": "job-1", "value": fresh, "if": "present", "if_version": 3 }),
+                ),
+            ]),
+        ),
+        Script::new(SONNET, Outcome::text("Claimed and noted.")),
+        Script::new(SONNET, Outcome::structured(json!({ "done": true }))),
+    ]);
+    let Some(run) = harness::invoke("stores", "flow.claim", &[("job", "job-1")], &provider) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["claimed"], json!(true));
+
+    // What the model was handed back: the losing claim is an answer, not an
+    // error, and carries the version the key holds.
+    let answers = tool_results(&provider.requests()[1]);
+    assert_eq!(answers.len(), 2, "{answers:?}");
+    let won: Value = serde_json::from_str(&answers[0].0).expect("a JSON answer");
+    let lost: Value = serde_json::from_str(&answers[1].0).expect("a JSON answer");
+    assert_eq!(
+        won,
+        json!({ "key": "job-1", "applied": true, "version": 1, "deduped": false })
+    );
+    assert_eq!(
+        lost,
+        json!({ "key": "job-1", "applied": false, "version": 1, "deduped": false }),
+        "a condition that does not hold answers `applied: false` with the current version"
+    );
+    assert!(!answers[1].1, "…and it is not an error result: {answers:?}");
+    let second = tool_results(&provider.requests()[2]);
+    assert_eq!(second.len(), 4, "{second:?}");
+    let refused = &second[3];
+    assert!(
+        refused.1 && refused.0.contains("both `if` and `if_version`"),
+        "a call naming both conditions goes back to the model as a refusal: {second:?}"
+    );
+
+    let entries = run.entries("work");
+    let [entry] = entries.as_slice() else {
+        panic!("`work` ran once: {entries:?}");
+    };
+    let records = entry["stores"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the tool writes left store records: {entry}"));
+    let summary: Vec<(String, bool, Option<i64>)> = records
+        .iter()
+        .map(|record| {
+            (
+                record["op"].as_str().unwrap_or_default().to_string(),
+                record["applied"]
+                    .as_bool()
+                    .unwrap_or_else(|| panic!("`applied` on {record}")),
+                record["version"].as_i64(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("set".to_string(), true, Some(1)),
+            ("set".to_string(), false, Some(1)),
+            ("append".to_string(), true, Some(2)),
+            ("incr".to_string(), true, Some(3)),
+            ("merge".to_string(), false, Some(3)),
+        ],
+        "five writes reached the store — the refused call left no record: {records:#?}"
+    );
+    for record in records {
+        assert_eq!(record["via"], "tool", "{record}");
+        assert_eq!(record["effect"], "write", "{record}");
+        assert!(
+            record.get("idempotencyKey").is_none() && record.get("deduped").is_none(),
+            "a tool write carries no idempotency key and so no `deduped`: {record}"
+        );
+    }
+    let called: Vec<(String, String)> = entry["models"]
+        .as_array()
+        .expect("model calls")
+        .iter()
+        .flat_map(|model| model["toolCalls"].as_array().cloned().unwrap_or_default())
+        .map(|call| {
+            (
+                call["name"].as_str().unwrap_or_default().to_string(),
+                call["outcome"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        called.last(),
+        Some(&("jobs_set".to_string(), "refused".to_string())),
+        "the both-conditions call is recorded as refused: {called:?}"
+    );
+
+    // …and what the store holds afterwards is what the applied writes made.
+    let reread = run.entries("reread");
+    let answer = &reread[0]["stores"][0]["answer"];
+    assert_eq!(
+        answer,
+        &json!({
+            "value": { "owner": "me", "tags": ["urgent"], "count": 3 },
+            "found": true,
+            "version": 3,
+        }),
+        "the losing claim and the stale merge changed nothing: {answer}"
+    );
+}
+
+/// Every `tool_result` block of one Messages request, in order: its text and
+/// whether it was an error result.
+fn tool_results(request: &RecordedRequest) -> Vec<(String, bool)> {
+    let messages = request.body()["messages"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let Some(last) = messages.last() else {
+        return Vec::new();
+    };
+    last["content"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|block| block["type"] == "tool_result")
+        .map(|block| {
+            let text = match &block["content"] {
+                Value::String(text) => text.clone(),
+                Value::Array(parts) => parts
+                    .iter()
+                    .filter_map(|part| part["text"].as_str())
+                    .collect::<String>(),
+                other => other.to_string(),
+            };
+            (text, block["is_error"] == json!(true))
+        })
+        .collect()
+}
+
+/// D67 read where it finally means what authors reach for: a `map` whose every
+/// instance appends, increments and merges at **one** constant `kv` key keeps
+/// every instance's change (grammar 11.4, PRD resolved q68).
+///
+/// `max_concurrency: 4` puts instances in flight together, and each partial
+/// update is a read-modify-write of the one key — so a store that read, then
+/// wrote, outside one transaction would lose items here, and a count of eight
+/// would come back lower.
+#[test]
+fn a_map_of_partial_updates_at_one_key_keeps_every_item() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let items = ["a", "b", "c", "d", "e", "f", "g", "h"];
+    let Some(run) = harness::invoke_with(
+        "stores",
+        "flow.tally",
+        &json!({ "items": items }),
+        &harness::environment(&provider),
+    ) else {
+        return;
+    };
+    run.succeeded();
+    let tally = &run.outputs()["tally"];
+    let mut kept: Vec<String> = tally["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the record was read back: {tally}"))
+        .iter()
+        .map(|item| item.as_str().unwrap_or_default().to_string())
+        .collect();
+    kept.sort();
+    assert_eq!(kept, items, "every instance's append landed: {tally}");
+    assert_eq!(
+        tally["count"],
+        json!(items.len()),
+        "every instance's incr landed: {tally}"
+    );
+    assert!(
+        items.contains(&tally["last"].as_str().unwrap_or_default()),
+        "a merge from one of the instances is the last one standing: {tally}"
+    );
+}
+
 /// A model that **calls** a synthesized store tool reaches the same backend the
 /// store-op nodes do, with the arguments it supplied (grammar 11.5, PRD 5.8).
 ///

@@ -99,6 +99,7 @@ expression: document(&run)
               "step": 1,
               "stores": [
                 {
+                  "applied": true,
                   "deduped": false,
                   "effect": "write",
                   "idempotencyKey": "<execution-id>/ask/0/condense/0/note/0",
@@ -106,6 +107,7 @@ expression: document(&run)
                   "op": "set",
                   "scope": "execution",
                   "store": "store.seen",
+                  "version": 1,
                   "via": "node"
                 }
               ],
@@ -175,6 +177,7 @@ expression: document(&run)
               "step": 1,
               "stores": [
                 {
+                  "applied": true,
                   "deduped": false,
                   "effect": "write",
                   "idempotencyKey": "<execution-id>/ask/0/condense/1/note/0",
@@ -182,6 +185,7 @@ expression: document(&run)
                   "op": "set",
                   "scope": "execution",
                   "store": "store.seen",
+                  "version": 2,
                   "via": "node"
                 }
               ],

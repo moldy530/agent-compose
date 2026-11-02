@@ -306,12 +306,162 @@ export const flowShapeNodeRecallOutput = z.object({
 }).strict();
 export type FlowShapeNodeRecallOutput = z.infer<typeof flowShapeNodeRecallOutput>;
 
+/**
+ * `flow.shape` node `claim` — what the `set` of `store.ledger` answers, derived from the op and the store (grammar 11.4, Decision D34).
+ */
+export const flowShapeNodeClaimOutput = z.object({
+  key: z.string(),
+  applied: z.boolean(),
+  version: z.number().int(),
+  deduped: z.boolean(),
+}).strict();
+export type FlowShapeNodeClaimOutput = z.infer<typeof flowShapeNodeClaimOutput>;
+
+/**
+ * `flow.shape` node `stamp` — what the `append` of `store.ledger` answers, derived from the op and the store (grammar 11.4, Decision D34).
+ */
+export const flowShapeNodeStampOutput = z.object({
+  key: z.string(),
+  applied: z.boolean(),
+  version: z.number().int(),
+  value: z.object({
+    owner: z.string(),
+    marks: z.array(z.string()).max(8),
+    hits: z.number().int(),
+  }).strict(),
+  deduped: z.boolean(),
+}).strict();
+export type FlowShapeNodeStampOutput = z.infer<typeof flowShapeNodeStampOutput>;
+
+/**
+ * `flow.shape` node `tick` — what the `incr` of `store.ledger` answers, derived from the op and the store (grammar 11.4, Decision D34).
+ */
+export const flowShapeNodeTickOutput = z.object({
+  key: z.string(),
+  applied: z.boolean(),
+  version: z.number().int(),
+  value: z.object({
+    owner: z.string(),
+    marks: z.array(z.string()).max(8),
+    hits: z.number().int(),
+  }).strict(),
+  deduped: z.boolean(),
+}).strict();
+export type FlowShapeNodeTickOutput = z.infer<typeof flowShapeNodeTickOutput>;
+
+/**
+ * `flow.shape` node `tidy` — what the `merge` of `store.ledger` answers, derived from the op and the store (grammar 11.4, Decision D34).
+ */
+export const flowShapeNodeTidyOutput = z.object({
+  key: z.string(),
+  applied: z.boolean(),
+  version: z.number().int(),
+  value: z.object({
+    owner: z.string(),
+    marks: z.array(z.string()).max(8),
+    hits: z.number().int(),
+  }).strict(),
+  deduped: z.boolean(),
+}).strict();
+export type FlowShapeNodeTidyOutput = z.infer<typeof flowShapeNodeTidyOutput>;
+
+/**
+ * `flow.shape` node `drop` — what the `delete` of `store.ledger` answers, derived from the op and the store (grammar 11.4, Decision D34).
+ */
+export const flowShapeNodeDropOutput = z.object({
+  deleted: z.boolean(),
+  applied: z.boolean(),
+  deduped: z.boolean(),
+}).strict();
+export type FlowShapeNodeDropOutput = z.infer<typeof flowShapeNodeDropOutput>;
+
 /** `store.docs` — the metadata a match carries (grammar 11.1). */
 export const storeDocsMetadataSchema = z.object({
   source: z.string(),
   updated_at: z.string().refine(rfc3339DateTime, { message: "expected an RFC 3339 date-time" }),
 }).strict();
 export type StoreDocsMetadataSchema = z.infer<typeof storeDocsMetadataSchema>;
+
+/** `store.ledger` — the value it stores (grammar 11.1). */
+export const storeLedgerValueSchema = z.object({
+  owner: z.string(),
+  marks: z.array(z.string()).max(8),
+  hits: z.number().int(),
+}).strict();
+export type StoreLedgerValueSchema = z.infer<typeof storeLedgerValueSchema>;
+
+/**
+ * `store.ledger` — the arguments of its synthesized `ledger_get` tool, which is its `get` row of grammar 11.4 with the expressions replaced by what the model supplies (grammar 11.5).
+ */
+export const storeLedgerToolGetInput = z.object({
+  key: z.string(),
+}).strict();
+export type StoreLedgerToolGetInput = z.infer<typeof storeLedgerToolGetInput>;
+
+/**
+ * `store.ledger` — the arguments of its synthesized `ledger_set` tool, which is its `set` row of grammar 11.4 with the expressions replaced by what the model supplies (grammar 11.5).
+ */
+export const storeLedgerToolSetInput = z.object({
+  key: z.string(),
+  value: z.object({
+    owner: z.string(),
+    marks: z.array(z.string()).max(8),
+    hits: z.number().int(),
+  }).strict(),
+  if: z.string().regex(/^(absent|present)?$/).describe("Apply this write only if the key holds no value (`absent`) or only if it holds one (`present`). Leave it empty for a write that applies either way. A write whose condition does not hold changes nothing and answers `applied: false`.").default(""),
+  if_version: z.number().int().min(-1).describe("Apply this write only if the key's current `version` is this one, as a `get` or an earlier write answered it. `-1`, the default, asks for no version. A write whose version does not match changes nothing and answers `applied: false` with the version the key holds.").default(-1),
+}).strict();
+export type StoreLedgerToolSetInput = z.infer<typeof storeLedgerToolSetInput>;
+
+/**
+ * `store.ledger` — the arguments of its synthesized `ledger_merge` tool, which is its `merge` row of grammar 11.4 with the expressions replaced by what the model supplies (grammar 11.5).
+ */
+export const storeLedgerToolMergeInput = z.object({
+  key: z.string(),
+  fields: z.object({
+    owner: z.string().optional(),
+    marks: z.array(z.string()).max(8).optional(),
+    hits: z.number().int().optional(),
+  }).strict().describe("The fields to change. Every other field of the stored value is kept, and the value that results has to be one the store's schema admits."),
+  if: z.string().regex(/^(absent|present)?$/).describe("Apply this write only if the key holds no value (`absent`) or only if it holds one (`present`). Leave it empty for a write that applies either way. A write whose condition does not hold changes nothing and answers `applied: false`.").default(""),
+  if_version: z.number().int().min(-1).describe("Apply this write only if the key's current `version` is this one, as a `get` or an earlier write answered it. `-1`, the default, asks for no version. A write whose version does not match changes nothing and answers `applied: false` with the version the key holds.").default(-1),
+}).strict();
+export type StoreLedgerToolMergeInput = z.infer<typeof storeLedgerToolMergeInput>;
+
+/**
+ * `store.ledger` — the arguments of its synthesized `ledger_append` tool, which is its `append` row of grammar 11.4 with the expressions replaced by what the model supplies (grammar 11.5).
+ */
+export const storeLedgerToolAppendInput = z.object({
+  key: z.string(),
+  item: z.object({
+    marks: z.string().optional(),
+  }).strict().describe("Name exactly one array field of the stored value, with the item to add to its end: `{\"tags\": \"urgent\"}`. A key holding nothing starts from an empty array."),
+  unique: z.boolean().describe("Set to `true` to add the item only if the array does not already hold an equal one.").default(false),
+  if: z.string().regex(/^(absent|present)?$/).describe("Apply this write only if the key holds no value (`absent`) or only if it holds one (`present`). Leave it empty for a write that applies either way. A write whose condition does not hold changes nothing and answers `applied: false`.").default(""),
+  if_version: z.number().int().min(-1).describe("Apply this write only if the key's current `version` is this one, as a `get` or an earlier write answered it. `-1`, the default, asks for no version. A write whose version does not match changes nothing and answers `applied: false` with the version the key holds.").default(-1),
+}).strict();
+export type StoreLedgerToolAppendInput = z.infer<typeof storeLedgerToolAppendInput>;
+
+/**
+ * `store.ledger` — the arguments of its synthesized `ledger_incr` tool, which is its `incr` row of grammar 11.4 with the expressions replaced by what the model supplies (grammar 11.5).
+ */
+export const storeLedgerToolIncrInput = z.object({
+  key: z.string(),
+  field: z.enum(["hits"]).describe("The numeric field to add to. A key holding nothing starts from `0`."),
+  by: z.number().describe("What to add; `1` by default, and negative to subtract.").default(1),
+  if: z.string().regex(/^(absent|present)?$/).describe("Apply this write only if the key holds no value (`absent`) or only if it holds one (`present`). Leave it empty for a write that applies either way. A write whose condition does not hold changes nothing and answers `applied: false`.").default(""),
+  if_version: z.number().int().min(-1).describe("Apply this write only if the key's current `version` is this one, as a `get` or an earlier write answered it. `-1`, the default, asks for no version. A write whose version does not match changes nothing and answers `applied: false` with the version the key holds.").default(-1),
+}).strict();
+export type StoreLedgerToolIncrInput = z.infer<typeof storeLedgerToolIncrInput>;
+
+/**
+ * `store.ledger` — the arguments of its synthesized `ledger_delete` tool, which is its `delete` row of grammar 11.4 with the expressions replaced by what the model supplies (grammar 11.5).
+ */
+export const storeLedgerToolDeleteInput = z.object({
+  key: z.string(),
+  if_version: z.number().int().min(-1).describe("Apply this write only if the key's current `version` is this one, as a `get` or an earlier write answered it. `-1`, the default, asks for no version. A write whose version does not match changes nothing and answers `applied: false` with the version the key holds.").default(-1),
+}).strict();
+export type StoreLedgerToolDeleteInput = z.infer<typeof storeLedgerToolDeleteInput>;
 
 /** `store.notes` — the value it stores (grammar 11.1). */
 export const storeNotesValueSchema = z.object({

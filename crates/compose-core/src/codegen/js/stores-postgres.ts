@@ -71,15 +71,19 @@ const POSTGRES_STORE_SCHEMA_LOCK: readonly [number, number] = [0x6167_656e, 0x74
 const POSTGRES_CONCURRENT_CREATOR: readonly string[] = ["23505", "42P07", "42710"];
 
 /**
- * The schema, created on first open and never migrated.
+ * The schema, created on first open and brought forward where an earlier
+ * release created it.
  *
  * `IF NOT EXISTS` throughout, so a second open of a store this build already
- * created does nothing — which is all a physical schema can be asked for here: a
- * dialled store is created by this release or a later one, so there is no older
- * database whose columns have to be probed for. The whole of it is **one
- * transaction holding [`POSTGRES_STORE_SCHEMA_LOCK`]**, because `IF NOT EXISTS`
- * is not atomic against a concurrent creator and a store is opened concurrently
- * by design.
+ * created does nothing. One migration exists, and it is the `ADD COLUMN IF NOT
+ * EXISTS` below: PRD resolved q68 gave every `kv` key a `version`, and a
+ * database the previous release created has `store_entries` without it. Its
+ * rows take `0`, which no write of this release hands out — a partition's
+ * sequence starts past what it holds — so a key answering `version: 0` is one
+ * nothing has written since the upgrade. The whole of it is **one transaction
+ * holding [`POSTGRES_STORE_SCHEMA_LOCK`]**, because `IF NOT EXISTS` is not
+ * atomic against a concurrent creator and a store is opened concurrently by
+ * design.
  *
  * **`COLLATE "C"` on every column a statement compares or orders by**, and it is
  * a correctness choice rather than a preference. A `kv` key is the
@@ -106,6 +110,11 @@ const POSTGRES_CONCURRENT_CREATOR: readonly string[] = ["23505", "42P07", "42710
  * first attempt gave instead of applying the effect again. `scope_key` is on the
  * row rather than in the key so that an execution-scoped partition can be
  * deleted whole when its run ends.
+ *
+ * `store_sequences` holds each partition's version sequence — the last version
+ * it handed out — and its row is also the lock every write to the partition
+ * takes first (`RemoteKv`'s `#write`). `BIGINT` on both sides of it, because a
+ * sequence that only counts up should not be the thing that runs out.
  */
 const POSTGRES_STORE_SCHEMA = `
 BEGIN;
@@ -115,8 +124,10 @@ CREATE TABLE IF NOT EXISTS store_entries (
   scope_key TEXT COLLATE "C" NOT NULL,
   "key"     TEXT COLLATE "C" NOT NULL,
   value     TEXT NOT NULL,
+  version   BIGINT NOT NULL DEFAULT 0,
   PRIMARY KEY (store, scope_key, "key")
 );
+ALTER TABLE store_entries ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0;
 CREATE TABLE IF NOT EXISTS store_applied (
   store           TEXT COLLATE "C" NOT NULL,
   scope_key       TEXT COLLATE "C" NOT NULL,
@@ -126,6 +137,12 @@ CREATE TABLE IF NOT EXISTS store_applied (
   PRIMARY KEY (store, idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS store_applied_partition ON store_applied (store, scope_key);
+CREATE TABLE IF NOT EXISTS store_sequences (
+  store     TEXT COLLATE "C" NOT NULL,
+  scope_key TEXT COLLATE "C" NOT NULL,
+  last      BIGINT NOT NULL,
+  PRIMARY KEY (store, scope_key)
+);
 COMMIT;
 `;
 

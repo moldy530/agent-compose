@@ -114,11 +114,13 @@ expression: document(&run)
           "via": "tool"
         },
         {
+          "applied": true,
           "effect": "write",
           "key": "preferences",
           "op": "set",
           "scope": "execution",
           "store": "store.prefs",
+          "version": 1,
           "via": "tool"
         }
       ],
@@ -148,6 +150,7 @@ expression: document(&run)
       "step": 3,
       "stores": [
         {
+          "applied": true,
           "deduped": false,
           "effect": "write",
           "idempotencyKey": "<execution-id>/remember/0",
@@ -155,6 +158,7 @@ expression: document(&run)
           "op": "set",
           "scope": "execution",
           "store": "store.prefs",
+          "version": 2,
           "via": "node"
         }
       ],
@@ -187,7 +191,8 @@ expression: document(&run)
             "value": {
               "theme": "default",
               "verbosity": "low"
-            }
+            },
+            "version": 2
           },
           "effect": "read",
           "key": "preferences",

@@ -39,7 +39,38 @@
 //
 // A store is deliberately multi-writer, and nothing here takes a writer guard —
 // see the dialled section for the whole of that, including the per-key
-// last-write-wins it means.
+// last-write-wins a plain `set` still means.
+//
+// # Versions, conditions and partial updates (PRD resolved q68)
+//
+// Every `kv` key carries a **version**, drawn from one monotonic sequence per
+// partition (a store and one scope key): every write that lands takes the next
+// value of it. A sequence rather than a per-key counter, so a key deleted and
+// set again never shows a version it showed before — the ABA race a
+// compare-and-set exists to close stays closed across a delete. `get` answers
+// it beside the value.
+//
+// A `kv` write may be **conditional** — `if: absent`, `if: present`, or
+// `if_version: <n>` — and a condition that does not hold applies nothing and
+// answers `applied: false`, with the version the key holds where it holds one:
+// a normal answer an edge routes on, never a failure. Three ops write **part**
+// of a value — `merge`, `append`, `incr` — and each reads what the key holds,
+// applies itself, validates the whole result against the store's
+// `value_schema`, and commits, all in one transaction. Every write is therefore
+// a read-modify-write of its key, serialized against every other write to that
+// key on every backend: SQLite's own serialized writer (`BEGIN IMMEDIATE`)
+// locally, and a row lock on the partition's sequence row and on the key's
+// entry on a dialled server. Two concurrent appends keep both items; a result
+// the schema refuses fails the op and changes nothing. What each write decides,
+// given what its key held, is [`decideKvWrite`] — one function every arm calls,
+// so the arms differ in how they lock and store a row and in nothing a write
+// means.
+//
+// Every `kv` write answers `{ applied, version, deduped }` beside its own
+// fields, and the idempotency ledger below stores that **whole** answer: a
+// retried write is answered with its first attempt's `applied` and `version`
+// and `deduped: true`, so a retried successful claim never fails against its
+// own first write.
 //
 // Grammar 14.3's other providers — `redis`, `chroma`, `pgvector`, `qdrant`,
 // `s3`, `gcs` — are still M3's ("production `storage_backends` behind the store
@@ -294,6 +325,14 @@ export interface StoreBinding {
   readonly metadata: boolean;
   /** `embed:` — `vector` only (grammar 11.2). */
   readonly embed?: EmbedBinding;
+  /**
+   * `value_schema:`, as the emitted Zod — on a `kv` store.
+   *
+   * What a `merge`, `append` or `incr` holds the whole value it is about to
+   * commit to (PRD resolved q68). A binding without one validates nothing,
+   * which no binding `./graph.ts` emits is.
+   */
+  readonly value?: runtime.ResultSchema<unknown>;
   /** The backend the active target resolved (grammar 11.3, 14.2). */
   readonly backend: BackendBinding;
 }
@@ -302,8 +341,11 @@ export interface StoreBinding {
 // What an op takes (grammar 11.4)
 // ---------------------------------------------------------------------------
 
-/** The seven ops of grammar 11.4's catalog. */
-export type StoreOp = "get" | "set" | "delete" | "list" | "search" | "upsert" | "put";
+/** The ops of grammar 11.4's catalog — its seven, and PRD resolved q68's three. */
+export type StoreOp = "get" | "set" | "delete" | "list" | "search" | "upsert" | "put" | "merge" | "append" | "incr";
+
+/** The literal conditions a `kv` write's `if:` takes (grammar 11.4). */
+export type StoreCondition = "absent" | "present";
 
 /**
  * One op's parameters, already evaluated.
@@ -333,6 +375,18 @@ export interface StoreParams {
   readonly metadata?: Readonly<Record<string, unknown>>;
   /** `content_type:` */
   readonly contentType?: string;
+  /** `fields:` — what a `merge` changes. */
+  readonly fields?: Readonly<Record<string, unknown>>;
+  /** `field:` — the field an `append` or an `incr` addresses. */
+  readonly field?: string;
+  /** `unique:` — an `append` that adds only an item its array lacks. */
+  readonly unique?: boolean;
+  /** `by:` — what an `incr` adds; `1` when absent. */
+  readonly by?: number;
+  /** `if:` — the literal condition a `kv` write is applied under. */
+  readonly condition?: StoreCondition;
+  /** `if_version:` — the version the key must hold for the write to apply. */
+  readonly ifVersion?: number;
 }
 
 /** Where an op was issued from, and what key it carries (grammar 9.4). */
@@ -350,7 +404,20 @@ export interface StoreSite {
 
 /** The ops that write, which are the ones a key and a dedupe apply to. */
 function writes(op: StoreOp): boolean {
-  return op === "set" || op === "delete" || op === "upsert" || op === "put";
+  return (
+    op === "set" ||
+    op === "delete" ||
+    op === "upsert" ||
+    op === "put" ||
+    op === "merge" ||
+    op === "append" ||
+    op === "incr"
+  );
+}
+
+/** Whether one op is a `kv` write — the ops PRD resolved q68 versions. */
+function kvWrite(store: StoreBinding, op: StoreOp): boolean {
+  return store.kind === "kv" && writes(op);
 }
 
 // ---------------------------------------------------------------------------
@@ -486,6 +553,18 @@ function handleKey(store: StoreBinding, execution: runtime.ExecutionIdentity): s
   return store.scope === "execution" ? `${store.name}\u0000${execution.id}` : store.name;
 }
 
+/**
+ * A store file's schema.
+ *
+ * `version` is a `kv` key's (PRD resolved q68) and `sequences` is where each
+ * partition's version sequence is kept: one row per scope key, holding the
+ * last version handed out — so a key deleted and set again takes a version
+ * past every one the partition has shown, which `MAX(version)` over what is
+ * stored would not. A `vector` store's file has both and uses neither.
+ *
+ * A file an earlier release created has `entries` without the column, and
+ * [`migrateStoreFile`] adds it.
+ */
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS entries (
   scope_key TEXT NOT NULL,
@@ -493,6 +572,7 @@ CREATE TABLE IF NOT EXISTS entries (
   value     TEXT NOT NULL,
   metadata  TEXT,
   embedding TEXT,
+  version   INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (scope_key, key)
 );
 CREATE TABLE IF NOT EXISTS applied (
@@ -500,7 +580,34 @@ CREATE TABLE IF NOT EXISTS applied (
   op              TEXT NOT NULL,
   result          TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS sequences (
+  scope_key TEXT PRIMARY KEY,
+  last      INTEGER NOT NULL
+);
 `;
+
+/**
+ * Give a store file an earlier release created the column a version needs.
+ *
+ * `CREATE TABLE IF NOT EXISTS` leaves a table that is already there as it is,
+ * so a file from before PRD resolved q68 keeps an `entries` with no `version`.
+ * Its rows take `0`, which no write of this release hands out — the sequence
+ * starts past what the partition holds — so a key a `get` answers `version: 0`
+ * is one nothing has written since the upgrade, and an `if_version: 0` names
+ * exactly it. Two processes opening one old file at once race to add the
+ * column, and the loser's "duplicate column" is the column being there.
+ */
+function migrateStoreFile(database: Database): void {
+  const columns = database.all("PRAGMA table_info(entries)") as Row[];
+  if (columns.some((column) => column["name"] === "version")) return;
+  try {
+    database.exec("ALTER TABLE entries ADD COLUMN version INTEGER NOT NULL DEFAULT 0");
+  } catch (error) {
+    if (!String((error as Error | undefined)?.message ?? error).includes("duplicate column")) {
+      throw error;
+    }
+  }
+}
 
 /**
  * How long an op waits on a locked store file, and how long the retry inside
@@ -554,6 +661,7 @@ async function migrated(
       // contended statement is a setting nobody read.
       database.exec(`PRAGMA busy_timeout = ${LOCK_WAIT_MS};`);
       database.exec(SCHEMA);
+      migrateStoreFile(database);
       return database;
     } catch (error) {
       database.close();
@@ -779,9 +887,14 @@ export async function runStoreOp(
     context.effects,
     "store",
     { store: store.address, op, scope: store.scope, partition: scopeKey, via: site.via, params },
-    () => perform(store, op, params, scopeKey, execution, idempotencyKey, context.signal),
+    () => perform(store, op, params, scopeKey, execution, idempotencyKey, site.via, context.signal),
     (slot) => inProcessState(store, op, execution, slot),
   );
+  // A `kv` write's record carries what it decided — whether it landed, and
+  // the version the key holds after it — read off its own answer, so the
+  // record and the node's output cannot disagree (`docs/trace.md` §6, PRD
+  // resolved q68).
+  const version = answer.row["version"];
   record(context, {
     store: store.address,
     op,
@@ -790,6 +903,12 @@ export async function runStoreOp(
     scope: store.scope,
     ...(key === undefined ? {} : { key }),
     ...(writes(op) ? {} : { answer: answer.row }),
+    ...(kvWrite(store, op)
+      ? {
+          applied: answer.row["applied"] === true,
+          ...(typeof version === "number" ? { version } : {}),
+        }
+      : {}),
     ...(idempotencyKey === undefined ? {} : { idempotencyKey, deduped: answer.deduped }),
   });
   return answer.row;
@@ -889,6 +1008,233 @@ interface Applied {
   readonly deduped: boolean;
 }
 
+// ---------------------------------------------------------------------------
+// What a `kv` write decides (PRD resolved q68)
+// ---------------------------------------------------------------------------
+//
+// One function every arm calls, inside whatever serializes that arm's writes to
+// a key: SQLite's `BEGIN IMMEDIATE` locally, a row lock on a dialled server. It
+// is handed what the key held when that lock was taken and answers what to do —
+// nothing, remove the key, or write this value — and what to answer. So the
+// conditions, the three partial updates and the answer rows are written once,
+// and "the runtime cannot tell which arm answered" stays true by construction
+// of one more thing.
+
+/** What one `kv` key holds, read under the lock its write holds. */
+interface Held {
+  /** The stored value, parsed — the JSON this module wrote. */
+  readonly value: unknown;
+  /** The version the write that stored it took. */
+  readonly version: number;
+}
+
+/**
+ * Whether a key holds nothing, which is what `if: absent` asks.
+ *
+ * One predicate, so that every reading of "absent" — the condition, the
+ * declined answer's missing `version`, and a partial update starting from
+ * nothing — is this one. A key whose time is up will count as absent here and
+ * nowhere else (PRD resolved q69).
+ */
+function absent(held: Held | undefined): held is undefined {
+  return held === undefined;
+}
+
+/** What one `kv` write decided, given what its key held. */
+type KvDecision =
+  | { readonly effect: "none"; readonly answer: Record<string, unknown> }
+  | { readonly effect: "remove"; readonly answer: Record<string, unknown> }
+  | {
+      readonly effect: "write";
+      readonly value: unknown;
+      readonly answer: (version: number) => Record<string, unknown>;
+    };
+
+/** Whether a write's condition holds of what its key held (grammar 11.4). */
+function conditionHolds(params: StoreParams, held: Held | undefined): boolean {
+  if (params.condition === "absent") return absent(held);
+  if (params.condition === "present") return !absent(held);
+  if (params.ifVersion !== undefined) return !absent(held) && held.version === params.ifVersion;
+  return true;
+}
+
+/**
+ * What one `kv` write does, and answers, given what its key held.
+ *
+ * A condition that does not hold applies nothing and answers `applied: false`
+ * with the version the key holds where it holds one — never a failure. A
+ * `merge`, `append` or `incr` computes the whole value it would leave and holds
+ * it to the store's `value_schema` before anything is written; one the schema
+ * refuses throws, and the caller's transaction takes nothing with it. An
+ * `append` with `unique: true` whose item is already there changes nothing and
+ * takes no version: it is answered as applied — the item is in the array —
+ * with the version and the value the key already holds.
+ */
+function decideKvWrite(
+  store: StoreBinding,
+  op: StoreOp,
+  params: StoreParams,
+  held: Held | undefined,
+  via: StoreSite["via"],
+): KvDecision {
+  const key = required(params.key, "key", store);
+  if (op === "delete") {
+    if (!conditionHolds(params, held)) {
+      return { effect: "none", answer: { deleted: false, applied: false } };
+    }
+    return { effect: "remove", answer: { deleted: !absent(held), applied: true } };
+  }
+  if (!conditionHolds(params, held)) {
+    return {
+      effect: "none",
+      answer: { key, applied: false, ...(absent(held) ? {} : { version: held.version }) },
+    };
+  }
+  if (op === "set") {
+    return {
+      effect: "write",
+      value: params.value ?? {},
+      answer: (version) => ({ key, applied: true, version }),
+    };
+  }
+  const result = partialUpdate(store, op, key, params, held, via);
+  admitted(store, op, key, result.value, via);
+  if (!result.changed && !absent(held)) {
+    return {
+      effect: "none",
+      answer: { key, applied: true, version: held.version, value: result.value },
+    };
+  }
+  return {
+    effect: "write",
+    value: result.value,
+    answer: (version) => ({ key, applied: true, version, value: result.value }),
+  };
+}
+
+/**
+ * The whole value a `merge`, `append` or `incr` would leave at its key.
+ *
+ * An absent key starts from `{}`: a `merge` then has to supply every field the
+ * schema requires, an `append` starts its array from `[]` and an `incr` its
+ * number from `0`. A stored value whose field is the wrong shape for the op —
+ * a schema that changed under it — is refused naming the field, because the
+ * stored value is what this op is about to build on.
+ */
+function partialUpdate(
+  store: StoreBinding,
+  op: StoreOp,
+  key: string,
+  params: StoreParams,
+  held: Held | undefined,
+  via: StoreSite["via"],
+): { readonly value: Record<string, unknown>; readonly changed: boolean } {
+  const stored = absent(held) ? {} : held.value;
+  if (stored === null || typeof stored !== "object" || Array.isArray(stored)) {
+    throw refused(store, op, key, `the stored value is ${excerpt(stored)}, which is not an object`, via);
+  }
+  const base = stored as Record<string, unknown>;
+  switch (op) {
+    case "merge":
+      return { value: { ...base, ...(params.fields ?? {}) }, changed: true };
+    case "append": {
+      const field = required(params.field, "field", store);
+      const items = base[field] ?? [];
+      if (!Array.isArray(items)) {
+        throw refused(store, op, key, `${field}: the stored value holds ${excerpt(items)}, which is not an array`, via);
+      }
+      if (params.unique === true && items.some((item) => sameJson(item, params.value))) {
+        return { value: base, changed: false };
+      }
+      return { value: { ...base, [field]: [...items, params.value] }, changed: true };
+    }
+    case "incr": {
+      const field = required(params.field, "field", store);
+      const current = base[field] ?? 0;
+      if (typeof current !== "number") {
+        throw refused(store, op, key, `${field}: the stored value holds ${excerpt(current)}, which is not a number`, via);
+      }
+      return { value: { ...base, [field]: current + (params.by ?? 1) }, changed: true };
+    }
+    default:
+      throw new Error(`\`${store.address}\` is \`kind: kv\` and takes no \`${op}\``);
+  }
+}
+
+/** Hold a value a partial update would commit to the store's `value_schema`. */
+function admitted(
+  store: StoreBinding,
+  op: StoreOp,
+  key: string,
+  value: unknown,
+  via: StoreSite["via"],
+): void {
+  const schema = store.value;
+  if (schema === undefined) return;
+  const parsed = schema.safeParse(value);
+  if (parsed.success) return;
+  throw refused(store, op, key, runtime.describeIssues(value, parsed.error?.issues ?? []), via);
+}
+
+/**
+ * A partial update its result refuses: nothing was written.
+ *
+ * Which class it is depends on who asked, and that is Decision D119's split
+ * rather than a choice made here. A store-op **node**'s parameters are the
+ * author's, so the op fails the node and its `retry:`/`on_error:` decide. A
+ * synthesized **tool**'s are the model's, and a call the store's contract
+ * refuses goes back to the model to make again — the same as a call its
+ * argument schema refuses — so it is a [`runtime.ToolCallRefused`].
+ */
+function refused(
+  store: StoreBinding,
+  op: StoreOp,
+  key: string,
+  detail: string,
+  via: StoreSite["via"],
+): Error {
+  const message = `\`${store.address}\` refused the \`${op}\` at key ${JSON.stringify(key)}: the value it would leave is one the store's \`value_schema\` does not admit — ${detail}. Nothing was written: a \`merge\`, \`append\` or \`incr\` holds the whole value it commits to the schema, what was already stored included (grammar 11.4, PRD resolved q68)`;
+  return via === "tool" ? new runtime.ToolCallRefused(message) : new Error(message);
+}
+
+/** Two JSON values as one, whatever order an object's keys were written in. */
+function sameJson(left: unknown, right: unknown): boolean {
+  return canonicalJson(left) === canonicalJson(right);
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, held]) => held !== undefined)
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+    return `{${entries.map(([name, held]) => `${JSON.stringify(name)}:${canonicalJson(held)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+/** A value as a message quotes it: JSON, and short enough to read. */
+function excerpt(value: unknown): string {
+  const rendered = JSON.stringify(value) ?? String(value);
+  return rendered.length <= 120 ? rendered : `${rendered.slice(0, 117)}...`;
+}
+
+/**
+ * What a write the ledger already holds is answered with: its first attempt's
+ * answer, whole, marked `deduped`.
+ *
+ * A `kv` write's answer carries `deduped` itself (PRD resolved q68), so the
+ * stored one — written `false` by the attempt that applied — is answered
+ * `true` here. A ledger row an earlier release wrote holds no `applied`, and
+ * every write that release made was unconditional and landed, so it is
+ * answered as one that did.
+ */
+function redelivered(store: StoreBinding, op: StoreOp, result: string): Record<string, unknown> {
+  const row = JSON.parse(result) as Record<string, unknown>;
+  if (!kvWrite(store, op)) return row;
+  return "applied" in row ? { ...row, deduped: true } : { ...row, applied: true, deduped: true };
+}
+
 /**
  * Refuse a backend this compiler release does not implement (PRD §7 M3).
  *
@@ -914,6 +1260,7 @@ async function perform(
   scopeKey: string,
   execution: runtime.ExecutionIdentity,
   idempotencyKey: string | undefined,
+  via: StoreSite["via"],
   signal: AbortSignal,
 ): Promise<Applied> {
   if (store.kind === "blob") {
@@ -924,7 +1271,7 @@ async function perform(
     // 14.3's capability check refuses a `postgres`/`mysql` binding on either
     // kind at compile time, and [`supported`] above has already refused every
     // other networked provider.
-    return await dialled(store, op, params, scopeKey, idempotencyKey);
+    return await dialled(store, op, params, scopeKey, idempotencyKey, via);
   }
   const database = await open(store, execution);
   // A `vector` write and a `vector` search both need a vector, and computing one
@@ -941,16 +1288,23 @@ async function perform(
         )
       : undefined;
 
+  // `BEGIN IMMEDIATE` is SQLite's serialized writer, and it is what makes a
+  // `kv` write's read of its key, its decision and its commit one step that no
+  // other writer — another instance of a `map` in this process, or another
+  // process on the same file — can land inside (PRD resolved q68).
   return transact(database, () => {
     if (idempotencyKey !== undefined) {
       const seen = database.get("SELECT result FROM applied WHERE idempotency_key = ?", [
         idempotencyKey,
       ]) as Row | null;
       if (seen !== null) {
-        return { row: JSON.parse(String(seen["result"])) as Record<string, unknown>, deduped: true };
+        return { row: redelivered(store, op, String(seen["result"])), deduped: true };
       }
     }
-    const row = tabular(store, op, params, scopeKey, database, vector);
+    const row =
+      store.kind === "kv"
+        ? localKv(store, op, params, scopeKey, database, via)
+        : tabular(store, op, params, scopeKey, database, vector);
     if (idempotencyKey !== undefined) {
       database.run("INSERT INTO applied (idempotency_key, op, result) VALUES (?, ?, ?)", [
         idempotencyKey,
@@ -962,7 +1316,98 @@ async function perform(
   });
 }
 
-/** The `kv` and `vector` rows of grammar 11.4's catalog. */
+/**
+ * The `kv` rows of grammar 11.4's catalog on the local backend, inside the
+ * transaction [`perform`] opened.
+ *
+ * A write reads what its key holds, asks [`decideKvWrite`] what that means,
+ * and does it — taking the partition's next version where something lands
+ * ([`nextLocalVersion`]). The transaction is SQLite's serialized writer, so
+ * nothing lands between the read and the write.
+ */
+function localKv(
+  store: StoreBinding,
+  op: StoreOp,
+  params: StoreParams,
+  scopeKey: string,
+  database: Database,
+  via: StoreSite["via"],
+): Record<string, unknown> {
+  switch (op) {
+    case "get": {
+      const key = required(params.key, "key", store);
+      const held = localHeld(database, scopeKey, key);
+      // A miss answers `found: false` and **no** `value` or `version` at all
+      // (Decision D110, PRD resolved q68).
+      return held === undefined
+        ? { found: false }
+        : { value: held.value, found: true, version: held.version };
+    }
+    case "list":
+      return tabular(store, op, params, scopeKey, database, undefined);
+    case "set":
+    case "delete":
+    case "merge":
+    case "append":
+    case "incr": {
+      const key = required(params.key, "key", store);
+      const decision = decideKvWrite(store, op, params, localHeld(database, scopeKey, key), via);
+      switch (decision.effect) {
+        case "none":
+          return { ...decision.answer, deduped: false };
+        case "remove":
+          database.run("DELETE FROM entries WHERE scope_key = ? AND key = ?", [scopeKey, key]);
+          return { ...decision.answer, deduped: false };
+        case "write": {
+          const version = nextLocalVersion(database, scopeKey);
+          database.run(
+            "INSERT INTO entries (scope_key, key, value, version) VALUES (?, ?, ?, ?) " +
+              "ON CONFLICT (scope_key, key) DO UPDATE SET value = excluded.value, version = excluded.version",
+            [scopeKey, key, JSON.stringify(decision.value), version],
+          );
+          return { ...decision.answer(version), deduped: false };
+        }
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  throw new Error(`\`${store.address}\` is \`kind: kv\` and takes no \`${op}\``);
+}
+
+/** What one key of a local store holds, or `undefined` where it holds nothing. */
+function localHeld(database: Database, scopeKey: string, key: string): Held | undefined {
+  const found = database.get(
+    "SELECT value, version FROM entries WHERE scope_key = ? AND key = ?",
+    [scopeKey, key],
+  ) as Row | null;
+  if (found === null) return undefined;
+  return { value: JSON.parse(String(found["value"])) as unknown, version: Number(found["version"]) };
+}
+
+/**
+ * The next version of one local partition's sequence, taken.
+ *
+ * The row is created on the partition's first write, starting past whatever
+ * the partition already holds — `0` for a file an earlier release wrote, whose
+ * rows all carry `0` ([`migrateStoreFile`]) — and every later write moves it
+ * on by one. Inside [`perform`]'s transaction, so a write that is rolled back
+ * gives its number back with everything else.
+ */
+function nextLocalVersion(database: Database, scopeKey: string): number {
+  database.run(
+    "INSERT INTO sequences (scope_key, last) VALUES (?, " +
+      "(SELECT COALESCE(MAX(version), 0) FROM entries WHERE scope_key = ?)) " +
+      "ON CONFLICT (scope_key) DO NOTHING",
+    [scopeKey, scopeKey],
+  );
+  database.run("UPDATE sequences SET last = last + 1 WHERE scope_key = ?", [scopeKey]);
+  const held = database.get("SELECT last FROM sequences WHERE scope_key = ?", [scopeKey]) as Row;
+  return Number(held["last"]);
+}
+
+/** The `vector` rows of grammar 11.4's catalog, and the `kv` `list`. */
 function tabular(
   store: StoreBinding,
   op: StoreOp,
@@ -972,26 +1417,6 @@ function tabular(
   vector: number[] | undefined,
 ): Record<string, unknown> {
   switch (op) {
-    case "get": {
-      const key = required(params.key, "key", store);
-      const found = database.get("SELECT value FROM entries WHERE scope_key = ? AND key = ?", [
-        scopeKey,
-        key,
-      ]) as Row | null;
-      // A miss answers `found: false` and **no** `value` at all (Decision D110).
-      return found === null
-        ? { found: false }
-        : { value: JSON.parse(String(found["value"])) as unknown, found: true };
-    }
-    case "set": {
-      const key = required(params.key, "key", store);
-      database.run(
-        "INSERT INTO entries (scope_key, key, value) VALUES (?, ?, ?) " +
-          "ON CONFLICT (scope_key, key) DO UPDATE SET value = excluded.value",
-        [scopeKey, key, JSON.stringify(params.value ?? {})],
-      );
-      return { key };
-    }
     case "delete": {
       const key = required(params.key, "key", store);
       const result = database.run("DELETE FROM entries WHERE scope_key = ? AND key = ?", [
@@ -1097,11 +1522,26 @@ function tabular(
 // so. A store is the opposite by design: grammar 14.1 rule 5 already governs who
 // may reach one, and two processes reaching a dialled store are **two readers of
 // one store** rather than a forked state — which is the whole reason that rule
-// admits them. So nothing here locks, and the concurrency posture is stated
-// rather than prevented: **per key, last write wins**. Two writers setting one
-// key leave the value of whichever statement the server ran second; two writers
-// at different keys never meet. A composition that needs more than that is
-// asking for a transaction across nodes, which is not what a `kv` store is.
+// admits them. So nothing here holds a lock past one op, and two writers at
+// different partitions never meet.
+//
+// # What one write does lock (PRD resolved q68)
+//
+// A write is a read-modify-write of its key — a condition reads what the key
+// holds, a partial update builds on it, and every write takes the partition's
+// next version — so each one is a transaction that takes two row locks before
+// it reads anything: the partition's **sequence row**
+// (`SELECT … FOR UPDATE` on `store_sequences`), and then the key's entry. The
+// first is what serializes every write to one partition, across connections
+// and across processes; the second is the row lock the ruling names, and the
+// order — sequence, then entry, always — is what keeps two writers from ever
+// waiting on each other in a circle. A lock is held for one op's few
+// statements and given back at its `COMMIT`. What is left of last-write-wins is
+// exactly what D149 now says it is: a plain unconditional `set` replaces
+// whatever the write before it left, and two of them leave the value of
+// whichever committed second. A composition that needs more than one key to
+// move together is asking for a transaction across nodes, which is not what a
+// `kv` store is.
 //
 // **The keepalive and reap-window machinery.** Those exist on the journal to
 // bound how long a dead host's *guard* locks a live one out. With no guard there
@@ -1183,14 +1623,15 @@ interface StoreDialect {
    */
   readonly bind: (sql: string) => string;
   /**
-   * The clause that makes an insert overwrite the row already there.
+   * The clause that makes an insert overwrite the row already there, column by
+   * column.
    *
    * Everything after the statement's `VALUES (…)` list, which is more than the
    * conflict clause on one arm: MySQL's row alias (`AS excluded`) sits there
    * too, and a hook that could only return the conflict half would have made
    * the shared statement carry a dialect.
    */
-  readonly overwrite: (target: string, column: string) => string;
+  readonly overwrite: (target: string, columns: readonly string[]) => string;
   /**
    * …and the clause that makes it do **nothing** — the ledger's half, and the
    * one the whole dedupe rests on.
@@ -1210,8 +1651,10 @@ interface StoreDriver {
 }
 
 /** `ON CONFLICT … DO UPDATE`, which Postgres speaks. */
-function standardOverwrite(target: string, column: string): string {
-  return `ON CONFLICT ${target} DO UPDATE SET ${column} = excluded.${column}`;
+function standardOverwrite(target: string, columns: readonly string[]): string {
+  return `ON CONFLICT ${target} DO UPDATE SET ${columns
+    .map((column) => `${column} = excluded.${column}`)
+    .join(", ")}`;
 }
 
 /** …and `ON CONFLICT … DO NOTHING`. */
@@ -1383,9 +1826,10 @@ async function dialled(
   params: StoreParams,
   scopeKey: string,
   idempotencyKey: string | undefined,
+  via: StoreSite["via"],
 ): Promise<Applied> {
   const connection = await connectionFor(store);
-  return await connection.apply(store, op, params, scopeKey, idempotencyKey);
+  return await connection.apply(store, op, params, scopeKey, idempotencyKey, via);
 }
 
 /**
@@ -1397,7 +1841,8 @@ async function dialled(
  * that transaction on the same connection would join a transaction it knows
  * nothing about. A `map` dispatches its instances concurrently, so that is the
  * ordinary case rather than an edge one. Two *processes* are still concurrent —
- * that is the multi-writer posture, and last-write-wins is what it means.
+ * that is the multi-writer posture — and what serializes their writes to one
+ * key is the server's row locks (see [`#write`]).
  */
 class RemoteKv {
   readonly #driver: StoreDriver;
@@ -1416,21 +1861,24 @@ class RemoteKv {
     params: StoreParams,
     scopeKey: string,
     idempotencyKey: string | undefined,
+    via: StoreSite["via"],
   ): Promise<Applied> {
-    return this.#serial(() => this.#apply(store, op, params, scopeKey, idempotencyKey));
+    return this.#serial(() => this.#apply(store, op, params, scopeKey, idempotencyKey, via));
   }
 
-  /** Delete one execution-scoped partition, when its run has ended. */
+  /**
+   * Delete one execution-scoped partition, when its run has ended — its
+   * entries, its ledger, and its version sequence, which nothing will address
+   * again.
+   */
   forget(store: string, scopeKey: string): Promise<unknown> {
     return this.#serial(async () => {
-      await this.#run("DELETE FROM store_entries WHERE store = ? AND scope_key = ?", [
-        store,
-        scopeKey,
-      ]);
-      await this.#run("DELETE FROM store_applied WHERE store = ? AND scope_key = ?", [
-        store,
-        scopeKey,
-      ]);
+      for (const table of ["store_entries", "store_applied", "store_sequences"]) {
+        await this.#run(`DELETE FROM ${table} WHERE store = ? AND scope_key = ?`, [
+          store,
+          scopeKey,
+        ]);
+      }
     });
   }
 
@@ -1461,24 +1909,14 @@ class RemoteKv {
   }
 
   /**
-   * The op, and the ledger of grammar 9.4 around it.
-   *
-   * **The dedupe is the server's, not this module's** (PRD resolved q63): the
-   * ledger's primary key is a unique index and the claim is an insert whose
-   * conflict clause does nothing, so a repeated write carrying the key its first
-   * attempt carried applies **once** even when the two attempts are two
-   * processes. A read-then-write would not: both would read nothing and both
-   * would apply.
-   *
-   * The effect and its ledger row are one transaction, so an attempt that failed
-   * half way leaves neither — and a duplicate is exactly the case where that
-   * transaction is *rolled back*, taking the second application of the effect
-   * with it. The answer the first attempt gave is then read outside the
-   * transaction, because it is another transaction's committed row and one
-   * server here reads at a snapshot.
+   * The op, and — on a write — the locks and the ledger of grammar 9.4 around
+   * it.
    *
    * A **read** opens no transaction at all: one statement is atomic on both
    * servers, and a `BEGIN` around it would buy a round trip and nothing else.
+   * Every **write** is [`#write`]'s, keyed or not: a tool's write carries no
+   * idempotency key, and is still a read-modify-write of its key that the
+   * other writers of its partition must not land inside.
    */
   async #apply(
     store: StoreBinding,
@@ -1486,37 +1924,162 @@ class RemoteKv {
     params: StoreParams,
     scopeKey: string,
     idempotencyKey: string | undefined,
+    via: StoreSite["via"],
   ): Promise<Applied> {
-    if (idempotencyKey === undefined) {
-      return { row: await this.#row(store, op, params, scopeKey), deduped: false };
+    if (!writes(op)) {
+      return { row: await this.#read(store, op, params, scopeKey), deduped: false };
     }
+    for (let attempt = 0; ; attempt += 1) {
+      const answered = await this.#write(store, op, params, scopeKey, idempotencyKey, via);
+      if (answered !== undefined) return answered;
+      // The partition's sequence row was not there to lock. It is created on
+      // the partition's first write and deleted only when an execution-scoped
+      // partition's run ends, so a second miss in a row is a server that
+      // answers an insert it then does not show — not a race worth waiting on.
+      if (attempt > 0) {
+        throw new Error(
+          `\`${store.address}\` could not lock its version sequence for partition ${JSON.stringify(scopeKey)}: the row was created and then not found, so this server is not keeping what this store writes (PRD resolved q68)`,
+        );
+      }
+      await this.#run(
+        "INSERT INTO store_sequences (store, scope_key, last) VALUES (?, ?, " +
+          '(SELECT COALESCE(MAX(version), 0) FROM store_entries WHERE store = ? AND scope_key = ?)) ' +
+          this.#driver.dialect.ignore("(store, scope_key)", "last = last"),
+        [store.name, scopeKey, store.name, scopeKey],
+      );
+    }
+  }
+
+  /**
+   * One write, in one transaction: lock, dedupe, read, decide, write, claim,
+   * commit — or `undefined` where the partition has no sequence row yet.
+   *
+   * **The locks come first, and always in one order.** The partition's sequence
+   * row (`store_sequences`) is locked before anything is read, so every write
+   * to one partition — from this connection's queue, another connection, or
+   * another process — runs one at a time from here to its `COMMIT`; and the
+   * key's own entry is locked next, which is the row lock PRD resolved q68
+   * names. Sequence first, entry second, on every write, is what makes the two
+   * locks unable to deadlock: nobody holding an entry lock waits for a
+   * sequence row. A row a lock finds is read at its latest committed version
+   * on both servers — that is what `FOR UPDATE` reads — so the decision is made
+   * against what the previous writer committed rather than against a snapshot
+   * taken before it. The new row is created **outside** this transaction
+   * ([`#apply`]), so a write rolled back never takes a sequence row other
+   * writers are queued behind with it.
+   *
+   * **The dedupe is the server's, not this module's** (PRD resolved q63): a
+   * repeated write carrying the key its first attempt carried applies **once**
+   * even when the two attempts are two processes. Under the sequence lock the
+   * second finds the first's committed ledger row and is answered with it,
+   * whole — `applied` and `version` included (PRD resolved q68) — and the claim
+   * is still an insert on the ledger's primary key whose conflict clause does
+   * nothing, so a writer that reached this partition without the lock (an
+   * earlier release, mid-upgrade) cannot make a second application land either:
+   * a claim that conflicts rolls this attempt's effect back and answers with
+   * the row that won. The effect and its ledger row are one transaction, so an
+   * attempt that failed half way leaves neither.
+   *
+   * A partial update whose result the schema refuses throws out of
+   * [`decideKvWrite`], and the `ROLLBACK` takes nothing with it but the locks.
+   */
+  async #write(
+    store: StoreBinding,
+    op: StoreOp,
+    params: StoreParams,
+    scopeKey: string,
+    idempotencyKey: string | undefined,
+    via: StoreSite["via"],
+  ): Promise<Applied | undefined> {
+    const key = required(params.key, "key", store);
     await this.#run("BEGIN", []);
     let row: Record<string, unknown>;
-    let claimed: number;
     try {
-      row = await this.#row(store, op, params, scopeKey);
-      claimed = await this.#run(
-        "INSERT INTO store_applied (store, scope_key, idempotency_key, op, result) " +
-          `VALUES (?, ?, ?, ?, ?) ${this.#driver.dialect.ignore(
-            "(store, idempotency_key)",
-            "idempotency_key = idempotency_key",
-          )}`,
-        [store.name, scopeKey, idempotencyKey, op, JSON.stringify(row)],
+      const sequence = await this.#all(
+        "SELECT last FROM store_sequences WHERE store = ? AND scope_key = ? FOR UPDATE",
+        [store.name, scopeKey],
       );
+      if (sequence.length === 0) {
+        await this.#run("ROLLBACK", []);
+        return undefined;
+      }
+      const last = Number(sequence[0]?.["last"]);
+      if (idempotencyKey !== undefined) {
+        const seen = await this.#all(
+          "SELECT result FROM store_applied WHERE store = ? AND idempotency_key = ?",
+          [store.name, idempotencyKey],
+        );
+        const result = seen[0]?.["result"];
+        if (result !== undefined && result !== null) {
+          await this.#run("ROLLBACK", []);
+          return { row: redelivered(store, op, String(result)), deduped: true };
+        }
+      }
+      const found = await this.#all(
+        'SELECT value, version FROM store_entries WHERE store = ? AND scope_key = ? AND "key" = ? FOR UPDATE',
+        [store.name, scopeKey, key],
+      );
+      const stored = found[0];
+      const held: Held | undefined =
+        stored === undefined
+          ? undefined
+          : { value: JSON.parse(String(stored["value"])) as unknown, version: Number(stored["version"]) };
+      const decision = decideKvWrite(store, op, params, held, via);
+      switch (decision.effect) {
+        case "none":
+          row = { ...decision.answer, deduped: false };
+          break;
+        case "remove":
+          await this.#run(
+            'DELETE FROM store_entries WHERE store = ? AND scope_key = ? AND "key" = ?',
+            [store.name, scopeKey, key],
+          );
+          row = { ...decision.answer, deduped: false };
+          break;
+        case "write": {
+          const version = last + 1;
+          await this.#run(
+            "UPDATE store_sequences SET last = ? WHERE store = ? AND scope_key = ?",
+            [version, store.name, scopeKey],
+          );
+          await this.#run(
+            'INSERT INTO store_entries (store, scope_key, "key", value, version) VALUES (?, ?, ?, ?, ?) ' +
+              this.#driver.dialect.overwrite('(store, scope_key, "key")', ["value", "version"]),
+            [store.name, scopeKey, key, JSON.stringify(decision.value), version],
+          );
+          row = { ...decision.answer(version), deduped: false };
+          break;
+        }
+      }
+      if (idempotencyKey !== undefined) {
+        const claimed = await this.#run(
+          "INSERT INTO store_applied (store, scope_key, idempotency_key, op, result) " +
+            `VALUES (?, ?, ?, ?, ?) ${this.#driver.dialect.ignore(
+              "(store, idempotency_key)",
+              "idempotency_key = idempotency_key",
+            )}`,
+          [store.name, scopeKey, idempotencyKey, op, JSON.stringify(row)],
+        );
+        if (claimed === 0) {
+          await this.#run("ROLLBACK", []);
+          return await this.#claimedElsewhere(store, op, idempotencyKey);
+        }
+      }
     } catch (error) {
       await this.#run("ROLLBACK", []).catch(() => undefined);
       throw error;
     }
-    if (claimed !== 0) {
-      await this.#run("COMMIT", []);
-      return { row, deduped: false };
-    }
-    // Somebody has this key already, so this attempt's effect is undone and the
-    // answer is theirs. The read is after the rollback rather than inside the
-    // transaction because the row it is looking for is another transaction's,
-    // and MySQL's default isolation would answer a snapshot taken before that
-    // row existed.
-    await this.#run("ROLLBACK", []);
+    await this.#run("COMMIT", []);
+    return { row, deduped: false };
+  }
+
+  /**
+   * The answer a claim that conflicted is owed: the row that won it.
+   *
+   * Read after the rollback rather than inside the transaction, because the row
+   * it is looking for is another transaction's committed one.
+   */
+  async #claimedElsewhere(store: StoreBinding, op: StoreOp, idempotencyKey: string): Promise<Applied> {
     const held = await this.#all(
       "SELECT result FROM store_applied WHERE store = ? AND idempotency_key = ?",
       [store.name, idempotencyKey],
@@ -1527,11 +2090,11 @@ class RemoteKv {
         `\`${store.address}\` refused a write under an idempotency key its ledger holds and then could not read what that key answered; the ledger row and the effect it dedupes are written in one transaction, so this server is not the one that took the write (grammar 9.4, PRD 5.8)`,
       );
     }
-    return { row: JSON.parse(String(result)) as Record<string, unknown>, deduped: true };
+    return { row: redelivered(store, op, String(result)), deduped: true };
   }
 
-  /** The `kv` rows of grammar 11.4's catalogue, as this server answers them. */
-  async #row(
+  /** The `kv` reads of grammar 11.4's catalogue, as this server answers them. */
+  async #read(
     store: StoreBinding,
     op: StoreOp,
     params: StoreParams,
@@ -1541,32 +2104,20 @@ class RemoteKv {
       case "get": {
         const key = required(params.key, "key", store);
         const found = await this.#all(
-          'SELECT value FROM store_entries WHERE store = ? AND scope_key = ? AND "key" = ?',
+          'SELECT value, version FROM store_entries WHERE store = ? AND scope_key = ? AND "key" = ?',
           [store.name, scopeKey, key],
         );
         const value = found[0]?.["value"];
-        // A miss answers `found: false` and **no** `value` at all, which is the
-        // same row the local backend answers (Decision D110).
+        // A miss answers `found: false` and **no** `value` or `version` at
+        // all, which is the same row the local backend answers (Decision D110,
+        // PRD resolved q68).
         return value === undefined || value === null
           ? { found: false }
-          : { value: JSON.parse(String(value)) as unknown, found: true };
-      }
-      case "set": {
-        const key = required(params.key, "key", store);
-        await this.#run(
-          'INSERT INTO store_entries (store, scope_key, "key", value) VALUES (?, ?, ?, ?) ' +
-            this.#driver.dialect.overwrite('(store, scope_key, "key")', "value"),
-          [store.name, scopeKey, key, JSON.stringify(params.value ?? {})],
-        );
-        return { key };
-      }
-      case "delete": {
-        const key = required(params.key, "key", store);
-        const changed = await this.#run(
-          'DELETE FROM store_entries WHERE store = ? AND scope_key = ? AND "key" = ?',
-          [store.name, scopeKey, key],
-        );
-        return { deleted: changed > 0 };
+          : {
+              value: JSON.parse(String(value)) as unknown,
+              found: true,
+              version: Number(found[0]?.["version"]),
+            };
       }
       case "list": {
         const limit = required(params.limit, "limit", store);
@@ -1850,6 +2401,15 @@ function record(context: RunContext, entry: StoreRecord): void {
  * synthesized `put` offers `key` and `value` alone and the schema this parses
  * against is `.strict()`. A model has no way to send one, and a line reading for
  * it would be a mapping no call can reach.
+ *
+ * Three arguments are the tool surface's own spelling of a node parameter
+ * (`check::model::store_tool_input` says why): the conditions arrive as `if`
+ * and `if_version` with "no condition" spelled as their defaults, the empty
+ * string and `-1`; and an `append`'s field and item arrive together as `item`,
+ * an object naming one array field. A call that names both conditions, or an
+ * `item` naming other than one field, is refused here and goes back to the
+ * model (Decision D119) — before the store sees it, so it leaves no store
+ * record.
  */
 export async function runStoreTool(
   store: StoreBinding,
@@ -1857,9 +2417,34 @@ export async function runStoreTool(
   args: Record<string, unknown>,
   context: RunContext,
 ): Promise<Record<string, unknown>> {
+  const condition = args["if"] === undefined || args["if"] === "" ? undefined : String(args["if"]);
+  const version =
+    args["if_version"] === undefined || Number(args["if_version"]) === NO_TOOL_VERSION
+      ? undefined
+      : Number(args["if_version"]);
+  if (condition !== undefined && version !== undefined) {
+    throw new runtime.ToolCallRefused(
+      `\`${store.name}_${op}\` was called with both \`if\` and \`if_version\`, and a write takes one condition: \`if\` asks whether the key holds a value and \`if_version\` which version it holds — send \`if_version\` alone to ask both`,
+    );
+  }
+  let item: { readonly field: string; readonly value: unknown } | undefined;
+  if (op === "append") {
+    const named = Object.entries((args["item"] ?? {}) as Record<string, unknown>);
+    const [only] = named;
+    if (named.length !== 1 || only === undefined) {
+      throw new runtime.ToolCallRefused(
+        `\`${store.name}_append\` was called with an \`item\` naming ${named.length === 0 ? "no field" : `${named.length} fields`}: name exactly one array field, with the one item to add to it — \`{"item": {"<field>": <item>}}\``,
+      );
+    }
+    item = { field: only[0], value: only[1] };
+  }
   const params: StoreParams = {
     ...(args["key"] === undefined ? {} : { key: String(args["key"]) }),
-    ...(args["value"] === undefined ? {} : { value: args["value"] }),
+    ...(item !== undefined
+      ? { field: item.field, value: item.value }
+      : args["value"] === undefined
+        ? {}
+        : { value: args["value"] }),
     ...(args["query"] === undefined ? {} : { query: String(args["query"]) }),
     ...(args["prefix"] === undefined ? {} : { prefix: String(args["prefix"]) }),
     ...(args["top_k"] === undefined ? {} : { topK: Number(args["top_k"]) }),
@@ -1870,9 +2455,38 @@ export async function runStoreTool(
     ...(args["metadata"] === undefined
       ? {}
       : { metadata: args["metadata"] as Record<string, unknown> }),
+    ...(args["fields"] === undefined
+      ? {}
+      : { fields: args["fields"] as Record<string, unknown> }),
+    ...(args["field"] === undefined ? {} : { field: String(args["field"]) }),
+    ...(args["unique"] === undefined ? {} : { unique: args["unique"] === true }),
+    ...(args["by"] === undefined ? {} : { by: Number(args["by"]) }),
+    ...(condition === undefined ? {} : { condition: condition as StoreCondition }),
+    ...(version === undefined ? {} : { ifVersion: version }),
   };
-  return await runStoreOp(store, op, params, context, { via: "tool" });
+  try {
+    return await runStoreOp(store, op, params, context, { via: "tool" });
+  } catch (error) {
+    // A refusal the journal replayed comes back as a plain `Error` carrying the
+    // class's name (`./journal.ts`'s `replayedFailure`), and the agent loop
+    // reads the class to decide whether a call goes back to the model — so a
+    // resume would otherwise end the node the run it resumes carried on from.
+    if (
+      error instanceof Error &&
+      !(error instanceof runtime.ToolCallRefused) &&
+      error.name === "ToolCallRefused"
+    ) {
+      throw new runtime.ToolCallRefused(error.message);
+    }
+    throw error;
+  }
 }
+
+/**
+ * The `if_version` a synthesized write is called with to ask for no version
+ * condition — `check::model::STORE_TOOL_NO_VERSION`, the argument's default.
+ */
+const NO_TOOL_VERSION = -1;
 
 // ---------------------------------------------------------------------------
 // The Postgres `kv` arm (grammar §14.3, PRD resolved q63)
@@ -1947,15 +2561,19 @@ const POSTGRES_STORE_SCHEMA_LOCK: readonly [number, number] = [0x6167_656e, 0x74
 const POSTGRES_CONCURRENT_CREATOR: readonly string[] = ["23505", "42P07", "42710"];
 
 /**
- * The schema, created on first open and never migrated.
+ * The schema, created on first open and brought forward where an earlier
+ * release created it.
  *
  * `IF NOT EXISTS` throughout, so a second open of a store this build already
- * created does nothing — which is all a physical schema can be asked for here: a
- * dialled store is created by this release or a later one, so there is no older
- * database whose columns have to be probed for. The whole of it is **one
- * transaction holding [`POSTGRES_STORE_SCHEMA_LOCK`]**, because `IF NOT EXISTS`
- * is not atomic against a concurrent creator and a store is opened concurrently
- * by design.
+ * created does nothing. One migration exists, and it is the `ADD COLUMN IF NOT
+ * EXISTS` below: PRD resolved q68 gave every `kv` key a `version`, and a
+ * database the previous release created has `store_entries` without it. Its
+ * rows take `0`, which no write of this release hands out — a partition's
+ * sequence starts past what it holds — so a key answering `version: 0` is one
+ * nothing has written since the upgrade. The whole of it is **one transaction
+ * holding [`POSTGRES_STORE_SCHEMA_LOCK`]**, because `IF NOT EXISTS` is not
+ * atomic against a concurrent creator and a store is opened concurrently by
+ * design.
  *
  * **`COLLATE "C"` on every column a statement compares or orders by**, and it is
  * a correctness choice rather than a preference. A `kv` key is the
@@ -1982,6 +2600,11 @@ const POSTGRES_CONCURRENT_CREATOR: readonly string[] = ["23505", "42P07", "42710
  * first attempt gave instead of applying the effect again. `scope_key` is on the
  * row rather than in the key so that an execution-scoped partition can be
  * deleted whole when its run ends.
+ *
+ * `store_sequences` holds each partition's version sequence — the last version
+ * it handed out — and its row is also the lock every write to the partition
+ * takes first (`RemoteKv`'s `#write`). `BIGINT` on both sides of it, because a
+ * sequence that only counts up should not be the thing that runs out.
  */
 const POSTGRES_STORE_SCHEMA = `
 BEGIN;
@@ -1991,8 +2614,10 @@ CREATE TABLE IF NOT EXISTS store_entries (
   scope_key TEXT COLLATE "C" NOT NULL,
   "key"     TEXT COLLATE "C" NOT NULL,
   value     TEXT NOT NULL,
+  version   BIGINT NOT NULL DEFAULT 0,
   PRIMARY KEY (store, scope_key, "key")
 );
+ALTER TABLE store_entries ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0;
 CREATE TABLE IF NOT EXISTS store_applied (
   store           TEXT COLLATE "C" NOT NULL,
   scope_key       TEXT COLLATE "C" NOT NULL,
@@ -2002,6 +2627,12 @@ CREATE TABLE IF NOT EXISTS store_applied (
   PRIMARY KEY (store, idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS store_applied_partition ON store_applied (store, scope_key);
+CREATE TABLE IF NOT EXISTS store_sequences (
+  store     TEXT COLLATE "C" NOT NULL,
+  scope_key TEXT COLLATE "C" NOT NULL,
+  last      BIGINT NOT NULL,
+  PRIMARY KEY (store, scope_key)
+);
 COMMIT;
 `;
 

@@ -415,7 +415,7 @@ function excerpt(value: unknown): string {
  * person reading it cannot tell a refusal from a truncation. The callers pass
  * `issues` defensively (`?? []`) for the same reason this clause exists.
  */
-function describeIssues(value: unknown, issues: readonly ResultIssue[]): string {
+export function describeIssues(value: unknown, issues: readonly ResultIssue[]): string {
   if (issues.length === 0) return "the schema refused it and reported no issue";
   return issues
     .map((issue) => {
@@ -9761,6 +9761,17 @@ export interface StoreRecord {
   readonly key?: string;
   /** What a read answered — the history a replay consumes. */
   readonly answer?: unknown;
+  /**
+   * Whether a `kv` write's condition held and it landed (PRD resolved q68) —
+   * on every `kv` write, whichever surface ran it.
+   */
+  readonly applied?: boolean;
+  /**
+   * The version the written key holds after the write — the one it took, or
+   * the one it still holds where the write declined — on a `kv` write whose
+   * answer carries one.
+   */
+  readonly version?: number;
   /** A store-op node write's idempotency key (grammar 9.4). */
   readonly idempotencyKey?: string;
   /** Whether the backend had already applied that key (at-least-once). */
