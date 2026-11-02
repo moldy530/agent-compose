@@ -93,8 +93,9 @@ partition already carries to every placement that reaches it.
 For a **`kv`** store that repair runs today: `postgres` and `mysql` are
 implemented behind the store interface (PRD resolved q63, grammar §14.3,
 Decision D149), so the hub and every worker that reaches the store reach the same
-rows — the store is deliberately multi-writer, takes no writer guard, and per key
-the last write wins. For a `vector` or a `blob` store nothing networked is open
+rows — the store is deliberately multi-writer and takes no writer guard; a plain
+`set` is last-write-wins per key, and a conditional or partial write is
+serialized against every other write to its key (Decision D152). For a `vector` or a `blob` store nothing networked is open
 yet (the rest of production `storage_backends` land behind the store plugin
 interface in M3, PRD §7), so a mesh whose composition needs one keeps the
 component that binds it on the hub.
