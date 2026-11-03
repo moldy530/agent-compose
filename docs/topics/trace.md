@@ -82,7 +82,9 @@ The **file**'s document, and the one to write a consumer against:
 `error` on a run that carried no answer. `status` is `"completed"`, `"failed"`,
 or `"interrupted"`; the third is told apart from the second because they ask
 different things of whoever is reading. One is a run to look into, the other a
-question to answer.
+question to answer. `finally_error` is there when a flow's `finally:` node
+failed after its retries — beside a `status` it did not change, so a
+`"completed"` run carrying one is a run that answered and whose cleanup did not.
 
 Envelope keys are `snake_case`; an entry's are `camelCase`. The seam is
 deliberate: the envelope's are document keys, an entry's are runtime record
@@ -108,9 +110,12 @@ one more than the step of the topology it belongs to, throughout.
 
 Entries are ordered by `(step, node)` — ascending superstep, then ascending node
 id. Node id rather than completion order, so two runs of one composition produce
-the entries in the same order. One entry is outside that ordering and is always
-last: the entry of the node a **failed** run aborted at. Nested entries have
-step numbers of their own instance, starting again at 1.
+the entries in the same order. One entry is outside that ordering: the entry of
+the node a **failed** run aborted at, which is last — but for a flow's
+`finally:` node's, which runs once the instance has ended and so comes after
+every entry of its instance, on every outcome. That entry is ordinary but for
+one thing: it carries no `routing`, because the node has no edges. Nested
+entries have step numbers of their own instance, starting again at 1.
 
 **An entry's `outcome`** is `"completed"`, `"skipped"` (the activity failed and
 `on_error: skip` absorbed it — it carries an `error` too) or `"failed"`. A

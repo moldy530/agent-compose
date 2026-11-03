@@ -304,7 +304,16 @@ Node ids are identifiers scoped to their flow; two flows may both have a node
   positions accept exactly the same targets; nothing else accepts a pseudo-node.
 
 A node MUST NOT be named `start` or `end`; every node MUST have at least one
-outgoing edge (§7.6.3) and MUST be reachable from `start` (§7.8).
+outgoing edge (§7.6.3) and MUST be reachable from `start` (§7.8) — the one
+exception to both being a flow's `finally:` node (§7.9).
+
+A flow's `finally:` names a node and is **not a control-transfer position**:
+nothing routes to the finally node and it accepts no pseudo-node. The two
+positions above are places a branch is *sent*, mid-instance, and `end` is legal
+there because retiring a branch is something a branch can do; the finally node is
+what an instance runs once it has no branches left, so it is never a branch's
+destination, and an edge, a fallback or an `on_timeout:` naming it is a compile
+error (§7.9).
 
 ### 2.5 Reserved names
 
@@ -653,6 +662,22 @@ Root identifier meanings:
   `execution.id` is the child's own id, and `execution.session_key` and
   `execution.item_index` are the dispatch's, as they are inside any dispatched
   instance (Decision [D150](#d150-a-detached-flow-dispatch-starts-a-child-execution)).
+  **Inside a flow's `finally:` node, and only there** (§7.9), two more:
+  `execution.outcome` — how the instance that declared it ended, one of
+  `completed`, `failed`, `cancelled`, typed as that enum so a comparison against
+  anything else is a compile error — and `execution.error` (string; the error
+  that ended the body, in `docs/trace.md` §3's `<name>: <message>` shape, and
+  **absent** on an instance that did not fail, which is the third case of the
+  absent-value rule below: `has(execution.error)` asks first). Read on any other
+  surface — an edge guard, another node's `input:`, a store key, a `map`'s
+  per-item binding — either is a compile error naming the field and the rule
+  (`outcome-outside-finally`, Decision
+  [D159](#d159-finally-names-the-node-an-instance-runs-once-when-it-ends)). It is
+  a **scope** rule rather than a presence one, which is the difference from
+  `execution.item_index`: the index's presence depends on where a flow is
+  instantiated, so no static rule can promise it, while an outcome exists exactly
+  inside the one node that runs after the instance has one, whatever instantiated
+  it.
 - **`payload`** — the trigger payload; shape per trigger type (§13).
 - **`<node>.output`** — a node's node-scoped output object (PRD 5.7 tier 1).
 - **`<as-name>`** — the per-item binding of a `map` (`item` unless renamed with
@@ -689,9 +714,10 @@ composition declares, and one this section does:
 - a property of a `merge` channel that no write has supplied (§10.1,
   [D101](#d101-a-merge-channels-properties-are-unset-until-supplied));
 - a property a *value* may legally omit: one listed in an object's `optional:`
-  (§3.4), and the `value` field a `kv` or `blob` `get` omits on a miss — the one
+  (§3.4), the `value` field a `kv` or `blob` `get` omits on a miss — the one
   top-level field of any result schema in this grammar that its own node may not
-  return (§11.4);
+  return (§11.4) — and `execution.error` inside a `finally:` node whose instance
+  did not fail (§7.9);
 - **`execution.item_index` where no `map` dispatch encloses the expression**
   (above, §8.6). This one is a property of the *site*, not of the flow: the same
   `flow.*` may be a dispatch target at one instantiation and a directly
@@ -1571,6 +1597,7 @@ flow.review_loop:
 | `outputs` | field map (result surface, §3.5) | **yes** | the module's result surface (PRD 5.1) |
 | `inputs` | field map (input surface) | no | default: no inputs |
 | `description` | string | no | REQUIRED when the flow is used as an agent tool |
+| `finally` | node id (§2.4) | no | the node an instance of this flow runs once when it ends — completed, failed or cancelled — outside routing (§7.9, Decision [D159](#d159-finally-names-the-node-an-instance-runs-once-when-it-ends)) |
 
 ### 7.1 Nodes
 
@@ -2117,7 +2144,10 @@ reachable only when every branch got there. Three static rules keep that true
 
 1. **Every node MUST have at least one outgoing edge.** A node with none would
    swallow its branch without reaching `end`. Writing `- { from: n, to: end }` is
-   the one-line way to say "this branch is done here".
+   the one-line way to say "this branch is done here". The flow's `finally:`
+   node is **exempt** — and MUST have no edges at all, in or out: it runs when
+   the instance ends rather than on a branch, so there is no branch for it to
+   retire (§7.9).
 2. **At least one edge leaving `start` MUST be unconditional or carry
    `else: true`.** §2.4 requires an edge; this requires one that is guaranteed to
    fire, so an execution always has a first step instead of dying on §7.3 rule 7
@@ -2250,9 +2280,18 @@ relation**: node `n` transfers to node `m` when
 1. an edge (§7.2) declares `from: n, to: m` — `start` is the root, so an edge
    `from: start` makes its target reachable; or
 2. `n` declares `on_error: { fallback: m }` (§9.2); or
-3. `n` is a `human` node declaring `on_timeout: m` (§8.7).
+3. `n` is a `human` node declaring `on_timeout: m` (§8.7);
 
-A node is reachable when some chain of those transfers leads to it from `start`.
+and, a fourth clause that is not a transfer at all:
+
+4. the flow's `finally:` node (§7.9) is reachable **because it is `finally:`** —
+   every instance that ends runs it, so it is live code with no transfer
+   leading to it, as a node addressed only by a fallback is live code with no
+   edge (Decision
+   [D159](#d159-finally-names-the-node-an-instance-runs-once-when-it-ends)).
+
+A node is reachable when some chain of those transfers leads to it from `start`,
+or it is the finally node.
 Guards are ignored: an edge with a `when:` transfers control for this purpose,
 because whether it fires is a runtime question and this check is about whether a
 node is *ever* addressable (§7.3.1 is where guard coverage is decided).
@@ -2268,7 +2307,106 @@ and is never asked about; `start` needs no inbound transfer.
 Reachability constrains *entry*, and §7.6.3's rules constrain *exit*: every node
 must be reachable from `start` and must have an outgoing edge. A node targeted
 only by a fallback still needs one — `- { from: cleanup, to: end }` is the usual
-line — because retiring a branch is what `end` is for (§7.6.3 rule 1).
+line — because retiring a branch is what `end` is for (§7.6.3 rule 1). The
+finally node is the one exception on both sides: clause 4 is its entry, and it
+has no exit, because it is on no branch (§7.9).
+
+### 7.9 `finally:` — the node an instance runs when it ends
+
+A flow definition MAY name one of its nodes as `finally:`. That node runs
+**once**, when an instance of the flow **ends** — whether it completed, failed,
+or (once `cancel` exists, PRD resolved q75) was cancelled — with how it ended
+readable inside it, and nowhere else (Decision
+[D159](#d159-finally-names-the-node-an-instance-runs-once-when-it-ends), PRD
+resolved q76).
+
+```yaml
+flow.job:
+  outputs: {}
+  nodes:
+    work:    { agent: agent.worker, input: "'go'" }
+    report:
+      exec: { command: "${OPS_BIN}/report" }
+      input:
+        outcome: "execution.outcome"
+        error:   "has(execution.error) ? execution.error : ''"
+      retry:   { max: 2, backoff: 5s }
+      timeout: 30s
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: report
+```
+
+**What it may be.** `finally:` names a node of the same flow by its id (§2.4) —
+a missing one is `undefined-reference`, in the words an edge naming one gets. The
+node is any kind but `human`, and nothing it reaches over §7.7's relation may be
+a `human` node — through a `flow:` node it is, a `map` it is, or the `flow.*`
+tools of an agent it calls — because a step that must always finish cannot park
+(`finally-interrupt`, §8.7).
+
+**It is outside routing.** No edge names it, at either end; no
+`on_error: { fallback: … }` and no `human.on_timeout:` names it either. What
+runs it is the instance ending, not a branch arriving, so a transfer into it would
+run it a second time mid-instance with no outcome to read, and an edge out of it
+would continue a branch the instance has finished with. Each such position is a
+compile error naming the flow, the node and the position (`routed-finally`). In
+exchange it is exempt from §7.6.3 rule 1 — it needs no outgoing edge — and it is
+reachable because it is `finally:` (§7.8 clause 4). It is not a control-transfer
+position (§2.4), and it accepts no pseudo-node.
+
+**When it runs.** Once per instance of the flow that declared it — the root
+instance of an execution, and every `flow:` node's, joined `map` dispatch's and
+flow-as-tool call's instance alike — at the instance's end:
+
+- **completed** — the body reached quiescence and materialized its outputs
+  (§7.6.3). A body that ended through `on_error: skip` or a `fallback:` to `end`
+  is a completed one: a skipped body still ends (Decision
+  [D97](#d97-a-skip-changes-guard-values-not-the-routing-algorithm));
+- **failed** — the body's own error policy did not absorb a failure, or the body
+  reached quiescence and could not materialize an output;
+- **cancelled** — PRD resolved q75's cancel, which this release does not yet
+  have; the outcome is in the language now so a finally node written against it
+  checks and runs today.
+
+**Innermost first.** A subflow instance's finally node runs when that instance
+ends — inside the `flow:` node's own execution, so the node that instantiated it
+settles after it has — and the parent's when the parent ends. A failure that
+propagates out of a subflow therefore runs the subflow's finally node, then the
+parent's. A **child execution** — what a detached `flow.*` dispatch starts (§8.6
+rule 7) — is an execution of its own, and its root instance runs its own finally
+node when it ends.
+
+**What is not an end.** A `human` pause that parks the run (exit `3`,
+`status: "interrupted"`) is not one: the finally node does not run, and the
+resumed run answers the pause, runs the body on, and runs it when the instance
+does end. Neither is a replay divergence — the run's record stopped describing it
+— nor an instance whose pause was abandoned because the node holding it ended.
+
+**What it reads.** Inside the finally node, and only there, the `execution` root
+carries `execution.outcome` (`completed | failed | cancelled`) and
+`execution.error` (optional string, absent where the instance did not fail) —
+§4.1, `outcome-outside-finally` anywhere else. Its other roots are any node's:
+the instance's `input` and `state`. It reads no node output: no node dominates
+it, so a finally `map` fans out over a channel rather than over `<node>.output`
+(§8.6 rule 11).
+
+**What it changes.** Nothing the instance produced. The instance's outputs are
+read from its state **before** the finally node runs, so a finally node's
+`writes:` land in a state nothing reads afterwards, and the outcome is the body's:
+a completed run stays completed, with its outputs and its exit code. Its own
+policy is grammar 9.3's — its `retry:` and `timeout:` at every level, and no
+`on_error:` at any (§9.3). An error it raises after its retries is
+`finally_error` on the execution's record — the journal's lifecycle row
+(`docs/durability.md` §3.5) and the trace envelope (`docs/trace.md` §2) — and
+its own trace entry, the instance's last, carries no `routing`
+(`docs/trace.md` §3.5).
+
+**Durability.** The start of the finally node is a journaled boundary
+(`docs/durability.md` §3.10): a restart that finds the body settled and the
+boundary recorded replays the body, reads the recorded outcome, and runs the
+finally node once — its own effects journaled like any node's, so what landed
+before the crash is replayed rather than applied again.
 
 ---
 
@@ -2896,6 +3034,15 @@ A `run` with **neither** — standard input is not a terminal, or
 `AGENT_COMPOSE_INTERACTIVE=0` forces it — has no way to answer, so a run that
 reaches a pause reports it and exits on a code of its own rather than waiting or
 carrying on. So does one whose terminal goes away.
+
+**A flow's `finally:` node is never a `human` node, and reaches none** — through
+a `flow:` node it is, a `map` it is, or the `flow.*` tools of an agent it calls,
+over §7.7's relation (`finally-interrupt`, §7.9, Decision
+[D159](#d159-finally-names-the-node-an-instance-runs-once-when-it-ends)). A step
+that must always finish cannot park on a question. And a pause that parks a run
+is not an end of its instance, so the finally node does not run there: the
+resumed run answers the pause, runs the body on, and runs the finally node when
+the instance does end.
 
 Four details of the terminal surface are its own, because a stream of typed lines
 is not a request, and PRD §9.21 fixes the same four. The framing is **one JSON
@@ -3818,6 +3965,18 @@ means sixty seconds of running.
 target is a node id of the flow the declaring node sits in and those two levels
 name no flow (§9.2, Decision
 [D103](#d103-fallback-is-a-node-level-on_error-form-only)).
+
+**A flow's `finally:` node resolves `retry` and `timeout` like any node, and
+`on_error` from no level** (§7.9, Decision
+[D159](#d159-finally-names-the-node-an-instance-runs-once-when-it-ends)). Its own
+`retry:` and `timeout:` are level 2, `defaults:` level 3, an instantiating
+`flow:` node's `policy:` level 1 — so a finally node is as bounded and as patient
+as the composition says. Its `on_error:` is refused at level 2
+(`routed-finally`), and a strategy `defaults:` or a `policy:` would deliver is not
+applied to it: those levels are written for every node, and a finally node's
+failure has exactly one meaning — once its retries are spent, the error is
+recorded as `finally_error` on the execution's record, and the instance ends with
+the outcome it already had.
 
 ```yaml
 # main.yml
@@ -12218,6 +12377,125 @@ the rows a `delete` of a key holding nothing and an unchanged `unique: true`
 `append` record. Nothing in the PRD records that ruling yet. *PRD 5.8, resolved
 q29, q68, q69, q70, q71, q72, q73, q74; §8.8, §11.1, §11.4, §11.5.*
 
+### D159. `finally:` names the node an instance runs once when it ends
+
+A flow definition may name one `finally:` node: a node of the same flow, any
+kind but `human`, reaching no `human` node over §7.7's relation, with no edge in
+or out and no `on_error:` of its own. It runs once when an instance of the flow
+ends — completed, failed, or cancelled — for the root instance and every
+subflow instance alike, innermost first; inside it and only there, CEL reads
+`execution.outcome` (`completed | failed | cancelled`) and `execution.error`
+(optional string). Its start is a journaled boundary, so a restart that finds
+the body settled and the boundary recorded runs it alone, once; grammar 9.3
+applies to it for `retry` and `timeout`; an error it raises after retries is
+`finally_error` on the execution's record — journal and trace — and the outcome
+is unchanged (§7.9, PRD resolved q76).
+
+**Rationale**: a lease that must be released, a record that must be written, a
+notification that must go out whatever happened — an author had two spellings
+for that and neither said it. An ordinary last node runs only where the body
+completed, so a failure leaves the lease to expire on its own (the q69 example,
+`docs/topics/stores.md`); a `fallback:` to a cleanup node runs only where the
+one node declaring it failed, so every node needs one and a cleanup node reached
+from three of them is reached three times. The ruling's answer is a construct
+for the *end of the instance*, and each clause below is what keeps it exactly
+that.
+
+**A flow key, not an `on_error:` strategy.** D21 and D103 fix what `on_error:`
+is: a node's answer to its own failure, `fail`, `skip` or a `fallback:` naming
+where its branch goes next. `finally:` answers a different question — not "what
+does this node's failure do" but "what does the instance do when it is over" —
+and it does so once per instance rather than once per node, on success as on
+failure. Folding it into `on_error:` would make it a node's key with an
+instance's meaning, and would need it on every node of a body for the instance
+to be covered. So it is a key of the **flow definition**, beside `nodes:` and
+`edges:`, and the strategies D21 lists are unchanged — including the fallback
+target, which stays a control transfer inside the body.
+
+**Outside routing, reachable anyway.** A transfer into the finally node would run
+it mid-instance with no outcome to read, and one out of it would continue a
+branch that has ended, so every edge, fallback and `on_timeout:` naming it is
+refused one position at a time (`routed-finally`), and it is exempt from "every
+node exits" (§7.6.3 rule 1). D95 counts a node reachable when a transfer leads to
+it; the finally node is reachable because it is `finally:` — D21's reading of a
+fallback target, that a node addressed only by its position is live code, applied
+to the one position that is not a transfer. That is §7.8's fourth clause rather
+than a new relation: §7.7's component reachability walks every node of a flow and
+so includes the finally node already, which is what makes a `respond: sync`
+trigger's flow and a detached dispatch's target answer for what their finally
+nodes reach too.
+
+**Its failure has one meaning.** An `on_error:` on the finally node is refused
+(`routed-finally`) rather than ignored, and this is a reading of the ruling the
+owner may wish to confirm: the ruling says "the §9.3 chain applies to it (its
+own `timeout:`, `retry:`)" and that an error after retries is `finally_error`
+with the outcome unchanged. `skip` and `fallback` would route out of a node that
+routes nowhere, and `fail` — "abort the execution" — would contradict the outcome
+being unchanged, so a strategy has nothing it could do. A strategy `defaults:` or
+an instantiating `policy:` delivers is not an error, because those levels are
+written for every node, and is not applied to it. `retry` and `timeout` resolve
+through all four levels as on any node — unlike D102's `human` exemption, which
+withholds them, because a finally node is work the instance does and should be
+bounded like work.
+
+**A scope, not a presence.** `execution.outcome` and `execution.error` are
+members of `execution` inside the finally node and refused by name everywhere
+else (`outcome-outside-finally`), where D115 makes `execution.item_index` a
+member everywhere and absent at run time. The difference is what decides each:
+whether an index exists depends on where a flow is instantiated, which no static
+rule can know, while an outcome exists exactly inside the one node that runs
+after there is one, whatever instantiated it. `outcome` is the enum of its three
+values, so `execution.outcome == 'complete'` is a type error rather than a
+silent false; `error` is optional, absent on an instance that did not fail, and
+`has(execution.error)` asks first (D110). Nothing dominates the finally node —
+the instance may have ended before any node ran — so it reads no node output,
+and a finally `map`'s `over:` reading one is `non-dominating-source`.
+
+**Nothing it does changes what the instance produced.** The outputs are read
+before the finally node runs, so its writes change no output and a completed
+run's answer and exit code are what its body made them. Its failure is recorded
+where a reader of the run will find it: `finally_error` on the lifecycle row and
+the envelope — the first such failure in the execution, since a subflow's
+finally node and the root's can both fail — and its own entry, failed, with its
+`error`. `trace_version` stays `6`: the envelope field is optional, and the one
+presence rule that moved — a completed entry with no `routing` — moved only for
+the entries of a node position that did not exist (`docs/trace.md` §10.2).
+
+**Journaled at its boundary.** q28's recovery re-runs a resumed execution from
+its entry, consulting the journal per effect, so the body of an instance that
+ended replays to the same end. What the finally node reads, though, is the
+*outcome*, and a resumed generation could reach a different one — a `timeout:`
+that ended a `retry:` ladder runs against the new generation's clock
+(`docs/durability.md` §5). So the end is recorded before the node runs — a
+`finally` record at the node's own site, keyed and claimed through the effect
+seam — and a replay that reaches the end again is handed the recorded outcome,
+and diverges (q29) if its own disagrees, rather than running the finally node a
+second time under another story. The node's own effects are ordinary journaled
+effects, which is what makes "runs once" hold across a restart in either window:
+killed before its effect landed, a resume issues it live, once; killed after, a
+resume replays it. The lifecycle row's `finallyError` is a nullable column, added
+by a probe on all three journal backends (`docs/durability.md` §11.2).
+
+**What this release does not produce: `cancelled`.** The enum value, the record
+and the end-of-instance seam all carry it, and nothing reaches them with it: PRD
+resolved q75's cancel route is not built. The seam is driven with it directly by
+a test that says so, so q75 adds a caller rather than a code path.
+
+**Collision review.** D21 and D103 are unchanged, and the finally node is not one
+of D21's targets (above). D95 and §7.8 gain clause 4, which no existing
+composition can meet because none has a `finally:` key. D97 is read, not
+amended: a skipped body completed. D102 stands; the finally node is never a
+`human` node. D115 is unchanged; `outcome` and `error` are scoped where
+`item_index` is presence-checked. D118's interrupt-freedom relation gains a third
+reader. D150's child executions run their own finally nodes. q28's recovery and
+q29's divergence are what the boundary record is read under. D153's lease
+example moves its release into a `finally:` node, guarded so that a run which
+never held the lease releases nothing (`docs/topics/stores.md`).
+
+**Status**: shipped. *PRD resolved q28, q29, q65, q69, q75, q76; §2.4, §4.1,
+§7, §7.6.3, §7.8, §7.9, §8.7, §9.2, §9.3; builds on D21, D95, D97, D103, D118,
+D150, D153.*
+
 ## Appendix B — Editor integration
 
 [`schemas/agent-compose.schema.json`](../schemas/agent-compose.schema.json) is a
@@ -12460,6 +12738,9 @@ flow.<name>:
   edges: [ { from, to, when?, else?, max_iterations? } ]
           # else: true needs a when:-guarded sibling (D107);
           # max_iterations needs a when: on its own edge (D90)
+  finally: <node id>                # runs once when an instance ends; no edges,
+                                    # no on_error, never human; reads
+                                    # execution.outcome / execution.error (D159)
 
 store.<name>:
   kind: kv|vector|blob              # required
