@@ -175,7 +175,7 @@
 //! | code | meaning |
 //! |---|---|
 //! | `0` | clean: nothing was reported, or a `plan` was produced, or a `store` op found or applied |
-//! | `1` | diagnostics were reported, `build --check` found drift, a `run` produced no answer, a `store` op found nothing, declined its condition, had its value refused, met a failing backend or could not write its answer to a standard output that had closed, a `plan`'s spec did not resolve, or a discovery verb found something already there and would not replace it |
+//! | `1` | diagnostics were reported, `build --check` found drift, a `run` produced no answer, a `store` op found nothing, declined its condition, had its value refused or met a failing backend, a `store export` could not write its lines (a full disk, never a reader that left), a `plan`'s spec did not resolve, or a discovery verb found something already there and would not replace it |
 //! | `2` | the command could not run: bad usage, an unreadable entrypoint, an output directory that could not be written, a `visualize --flow` naming no flow, a `store` address, sub-verb or partition flag the composition does not take, a missing environment variable or one carrying a value the command does not take (`AGENT_COMPOSE_INTERACTIVE`, grammar 8.7), an uninstalled dependency set, or no JavaScript runtime to launch |
 //! | `3` | a `run` with nobody to ask stopped at a `human` pause (grammar 8.7, PRD 5.11) |
 //!
@@ -691,7 +691,7 @@ fn main() -> ExitCode {
                 }
                 .to_string(),
             );
-            launch(&path, "run", &target, &out, format, &arguments)
+            launch(&path, "run", &target, &out, format.into(), &arguments)
         }
         Command::Resume {
             path,
@@ -716,7 +716,7 @@ fn main() -> ExitCode {
                 }
                 .to_string(),
             ];
-            launch(&path, "resume", &target, &out, format, &arguments)
+            launch(&path, "resume", &target, &out, format.into(), &arguments)
         }
         Command::Worker {
             hub,
@@ -745,7 +745,7 @@ fn main() -> ExitCode {
                 "--port".to_string(),
                 port.to_string(),
             ];
-            launch(&path, "serve", &target, &out, format, &arguments)
+            launch(&path, "serve", &target, &out, format.into(), &arguments)
         }
         Command::Store { operation } => store(operation),
         Command::Docs { topic } => docs(topic.as_deref()),
@@ -893,7 +893,37 @@ fn store(operation: StoreOperation) -> ExitCode {
     arguments.push("--".to_string());
     arguments.push(store);
     arguments.extend(operands);
-    launch(&path, "store", &target, &out, format, &arguments)
+    // An export's stdout is only ever its lines, which an operator redirects
+    // into a file for an import to read back — so a composition refused before
+    // anything was read is reported beside the export's summary and failure,
+    // on stderr, rather than into that file (Decision D155).
+    let refused = match (format, sub_verb) {
+        (Format::Json, "export") => Refused::JsonOnStderr,
+        (format, _) => format.into(),
+    };
+    launch(&path, "store", &target, &out, refused, &arguments)
+}
+
+/// How [`launch`] reports a composition it refuses before launching anything —
+/// the one report it writes on its own account rather than the child's.
+#[derive(Clone, Copy)]
+enum Refused {
+    /// `validate`'s human block, on stderr.
+    Human,
+    /// One JSON object on stdout: the composition is the answer, as `validate`'s is.
+    Json,
+    /// One JSON object on **stderr**: `store export --format json`, whose stdout
+    /// is only ever its lines.
+    JsonOnStderr,
+}
+
+impl From<Format> for Refused {
+    fn from(format: Format) -> Self {
+        match format {
+            Format::Human => Self::Human,
+            Format::Json => Self::Json,
+        }
+    }
 }
 
 /// `agent-compose run`, `agent-compose resume`, `agent-compose serve` and
@@ -910,13 +940,15 @@ fn store(operation: StoreOperation) -> ExitCode {
 /// command's answer — the flow's outputs for `run`, the readiness line for
 /// `serve` — so a report that shared the stream would corrupt it; the build
 /// report goes to stderr, or to stdout as JSON only when it is what the command
-/// answers, which is when the composition was refused and nothing was launched.
+/// answers, which is when the composition was refused and nothing was launched
+/// — and never for `store export`, whose stdout is only ever its lines
+/// ([`Refused::JsonOnStderr`]).
 fn launch(
     entrypoint: &Path,
     command: &str,
     target: &str,
     out: &Path,
-    format: Format,
+    refused: Refused,
     arguments: &[String],
 ) -> ExitCode {
     // The verb is the caller's, not this function's: all three commands come
@@ -937,13 +969,17 @@ fn launch(
     let diagnostics = report.into_vec();
     let Some(ir) = ir.filter(|_| !report::refuses(&diagnostics)) else {
         // The composition is the answer, so the report is what this command
-        // writes — on the stream the format names, exactly as `validate` does.
-        let written = match format {
-            Format::Json => match report::json(&diagnostics) {
-                Ok(text) => write(&mut io::stdout().lock(), &text),
+        // writes — on the stream the format names, exactly as `validate` does,
+        // unless that stream is one the command keeps for something else.
+        let written = match refused {
+            Refused::Json | Refused::JsonOnStderr => match report::json(&diagnostics) {
+                Ok(text) if matches!(refused, Refused::Json) => {
+                    write(&mut io::stdout().lock(), &text)
+                }
+                Ok(text) => write(&mut io::stderr().lock(), &text),
                 Err(error) => return fail(&format!("cannot write the report as JSON: {error}")),
             },
-            Format::Human => {
+            Refused::Human => {
                 let color = report::color_enabled();
                 let root = entrypoint.parent().unwrap_or_else(|| Path::new(""));
                 let mut stream = io::stderr().lock();

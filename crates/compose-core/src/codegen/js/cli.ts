@@ -210,15 +210,48 @@ class UsageError extends Error {
 }
 
 /**
- * Standard output went away before what the `store` verb wrote reached it: the
- * reader of a pipe closed its end — a `head -1`, a `grep -q`, a `jq` that
- * failed — or the stream failed some other way.
+ * Standard output stopped taking what the `store` verb wrote to it: its reader
+ * **departed** — the reader of a pipe closed its end, as a `head -1` that has
+ * its line, a `grep -q` that matched or a `jq` that failed does — or the
+ * stream failed under a reader still there, as a full disk under
+ * `> entries.jsonl` fails it.
+ *
+ * The two are told apart because they owe the caller different things. A
+ * reader that left took as much of the answer as it wanted, which is never the
+ * command's failure (the cli topic's rule for every verb); a stream that failed
+ * left whoever is holding the file believing it holds an answer.
  */
-class OutputClosed extends Error {
+class OutputLost extends Error {
+  /** Whether the reader left, rather than the stream failing under one still reading. */
+  readonly departed: boolean;
   constructor(cause: Error) {
-    super(`standard output closed before the answer reached it (${cause.message})`);
-    this.name = "OutputClosed";
+    const gone = departed(cause);
+    super(`standard output ${gone ? "closed" : "failed"} (${cause.message})`);
+    this.name = "OutputLost";
+    this.departed = gone;
   }
+}
+
+/**
+ * Standard output closing, or found closed, with no error of its own to say
+ * why: its reader is gone.
+ */
+class ReaderGone extends Error {
+  constructor() {
+    super("standard output closed");
+    this.name = "ReaderGone";
+  }
+}
+
+/**
+ * Whether a failure standard output reported is its reader having left — the
+ * `EPIPE` both runtimes answer a write into a pipe nobody reads with, a stream
+ * destroyed by one, or a stream that closed — rather than the stream failing.
+ */
+function departed(failure: Error): boolean {
+  if (failure instanceof ReaderGone) return true;
+  const code = (failure as NodeJS.ErrnoException).code;
+  return code === "EPIPE" || code === "ERR_STREAM_DESTROYED";
 }
 
 /**
@@ -1483,20 +1516,21 @@ const LAST_INSTANT = 8.64e15;
  *
  * The exit codes are the project's, read for a store: `0` found or applied;
  * `1` the answer is no — a `get` that found nothing, a condition that did not
- * hold, a value the store's `value_schema` refused, or a backend that failed —
- * or an answer that never reached its reader, because standard output closed
- * first; `2` the command could not run — a flag, a store address, a sub-verb
- * or a partition the command does not take.
+ * hold, a value the store's `value_schema` refused, or a backend that failed;
+ * `2` the command could not run — a flag, a store address, a sub-verb or a
+ * partition the command does not take (PRD resolved q72).
  *
  * **Standard output is watched from the first line**, because a pipe's reader
  * may leave before the answer is written (`| head -1`), and a stream that fails
  * with nobody listening is an uncaught error: Bun prints it and carries on,
  * with nothing left to drain the write an `export` waits on, and Node dies of
  * it. So every write here is one [`put`] — answered once it has left the
- * process, or with the failure that stopped it — and the command ends `1`
- * saying so on stderr, which is where a reader that is still there looks. An
- * `export` stops reading pages at the first refused one; an op that wrote has
- * still written.
+ * process, or with the failure that stopped it — and the command still ends,
+ * with **the op's own exit code**: a reader that left is never a failure, so a
+ * `get` that found its key and a `set` that applied end `0` whether or not
+ * anybody read the table, and a supervisor branching on the code never
+ * re-issues a write that landed ([`undelivered`]). An `export` stops reading
+ * pages at the first one standard output refused ([`storeExport`]).
  */
 async function storeVerb(argv: readonly string[]): Promise<number> {
   watchOutput();
@@ -1525,18 +1559,16 @@ async function storeVerb(argv: readonly string[]): Promise<number> {
   const format = formatOf(options.single["format"]);
   const target = operatorTarget(address, options.single["session"], options.single["execution"]);
   let code: number;
-  let failure: string | undefined;
   try {
     code = await storeSubverb(name, target, operands, options, format);
   } catch (error) {
     if (error instanceof UsageError) throw error;
     // The answer is no, and the backend said why: a value the schema refused,
     // a server that is not there, a provider this release does not open.
-    failure = error instanceof Error ? error.message : String(error);
-    code = failed(format, failure);
+    code = failed(format, error instanceof Error ? error.message : String(error));
   }
   const lost = await delivered();
-  return lost === undefined ? code : closed(format, new OutputClosed(lost), failure);
+  return lost === undefined ? code : undelivered(new OutputLost(lost), code);
 }
 
 /** One `store` sub-verb, run against the target it names, and its exit code. */
@@ -1787,8 +1819,14 @@ function wrote(
  * redirecting them into a file would otherwise carry into its import.
  *
  * Each page waits for standard output to take the one before it, so a slow
- * reader is never more than a page behind; one that has closed its end stops
- * the export there, with nothing more read from the store.
+ * reader is never more than a page behind. One that has closed its end stops
+ * the export there, with nothing more read from the store — and that is not a
+ * failure: the reader took as much as it wanted (`| head -1` has its line), so
+ * the export ends `0`, its summary saying where it stopped — `{ written,
+ * stopped }` under `--format json`. A standard output that failed under a
+ * reader still there — a full disk under a redirect — is the export's own
+ * failure, since what that file holds is not the partition: exit `1`, said as
+ * any other failure is.
  */
 async function storeExport(
   target: OperatorTarget,
@@ -1822,8 +1860,17 @@ async function storeExport(
     }
   } catch (error) {
     if (error instanceof UsageError) throw error;
+    const lines = `${written} ${written === 1 ? "line" : "lines"}`;
+    if (error instanceof OutputLost && error.departed) {
+      process.stderr.write(
+        format === "json"
+          ? `${JSON.stringify({ written, stopped: error.message })}\n`
+          : `${error.message} after ${lines}, so the export stopped there and read nothing more of ${where(target)}\n`,
+      );
+      return 0;
+    }
     const reason = error instanceof Error ? error.message : String(error);
-    const message = `${reason}: the export stopped after ${written} ${written === 1 ? "line" : "lines"}, so what was written is not the whole of ${where(target)}`;
+    const message = `${reason}: the export stopped after ${lines}, so what was written is not the whole of ${where(target)}`;
     process.stderr.write(format === "json" ? `${JSON.stringify({ error: message, written })}\n` : `error: ${message}\n`);
     return 1;
   }
@@ -1883,7 +1930,7 @@ async function storeImport(
   if (refused.length > 0) {
     const message = `${refused.length === 1 ? "a line" : `${refused.length} lines`} of the import could not be written to \`${target.store.address}\`, so none was`;
     if (format === "json") {
-      out(`${JSON.stringify({ error: message, lines: refused }, null, 2)}\n`);
+      answered({ error: message, lines: refused }, 1);
     } else {
       process.stderr.write(`error: ${message}:\n`);
       for (const { line, error } of refused) process.stderr.write(`  line ${line}: ${error}\n`);
@@ -2094,13 +2141,13 @@ function readImportFile(file: string): string {
 
 /**
  * Write `text` to stdout and wait for it to leave the process before the next
- * page is read — refused with [`OutputClosed`] where standard output failed
- * instead.
+ * page is read — refused with [`OutputLost`] where standard output did not
+ * take it.
  */
 async function emit(text: string): Promise<void> {
   if (text === "") return;
   const failure = await put(text);
-  if (failure !== undefined) throw new OutputClosed(failure);
+  if (failure !== undefined) throw new OutputLost(failure);
 }
 
 /**
@@ -2150,7 +2197,8 @@ function put(text: string): Promise<Error | undefined> {
   const stdout = process.stdout;
   if (outputFailure !== undefined) return Promise.resolve(outputFailure);
   if (stdout.destroyed || stdout.writableEnded) {
-    return Promise.resolve(new Error("standard output is closed"));
+    outputFailure ??= new ReaderGone();
+    return Promise.resolve(outputFailure);
   }
   return new Promise((resolve) => {
     let settled = false;
@@ -2163,7 +2211,7 @@ function put(text: string): Promise<Error | undefined> {
       resolve(failure);
     };
     const onError = (error: Error): void => settle(error);
-    const onClose = (): void => settle(new Error("standard output closed"));
+    const onClose = (): void => settle(new ReaderGone());
     stdout.once("error", onError);
     stdout.once("close", onClose);
     stdout.write(text, (error) => settle(error ?? undefined));
@@ -2175,32 +2223,54 @@ function out(text: string): void {
   pendingOutput.push(put(text));
 }
 
-/** Wait for everything [`out`] wrote to settle, and answer the first failure, if any. */
+/**
+ * Wait for everything [`out`] wrote to settle, and answer what stopped
+ * standard output taking any of it, if anything did.
+ *
+ * The stream's first failure rather than the first write's: once a stream has
+ * failed, the writes queued behind it are refused for that reason or for none
+ * a reader could act on (Node's `ERR_STREAM_DESTROYED`), and what tells a
+ * reader that left from a disk that filled is the failure that came first.
+ */
 async function delivered(): Promise<Error | undefined> {
   const settled = await Promise.all(pendingOutput.splice(0));
-  return settled.find((failure) => failure !== undefined);
+  return settled.some((failure) => failure !== undefined) ? outputFailure : undefined;
 }
 
 /**
- * Report an answer that never reached its reader, and answer `1`.
+ * An answer standard output did not take, and the exit code the command ends
+ * with all the same — **the op's own**, however the answer was lost.
  *
- * On stderr under both formats, since stdout is the stream that failed — the
- * sentence, or `{ error }` under `--format json`. The op itself ran, so a write
- * it applied stays applied: what was lost is the report of it — unless the
- * report was itself a `failure` (an `{ error }` under `--format json`), which
- * is then said here instead, since this is the only place left to say it.
+ * What a caller branches on is the verdict, and the exit code carries it: a
+ * `get` that found its key ends `0` and so does a `set` that applied, whether
+ * or not anybody read the table, so a supervisor that retries `1` never
+ * re-issues a write that landed (PRD resolved q72's exit table). A reader that
+ * left took as much of the answer as it wanted, as every verb treats one (the
+ * cli topic), so nothing more is said — unless the answer lost was itself a
+ * failure, the `{ error }` of `--format json`, which is said on stderr instead:
+ * a reader still there looks for it there, and it is the one place left to say
+ * it. A stream that failed under a reader still there — a full disk under a
+ * redirect — is said on stderr too, since whoever holds that file is owed the
+ * news that it does not hold the answer.
  */
-function closed(format: Format, error: OutputClosed, failure?: string): number {
-  const message =
-    failure === undefined
-      ? `${error.message}; the op itself ran, so a write it applied stays applied`
-      : `${failure} — said here because ${error.message}`;
-  process.stderr.write(format === "json" ? `${JSON.stringify({ error: message })}\n` : `error: ${message}\n`);
-  return 1;
+function undelivered(lost: OutputLost, code: number): number {
+  if (typeof lastAnswer === "object" && lastAnswer !== null && "error" in lastAnswer) {
+    process.stderr.write(`${JSON.stringify(lastAnswer)}\n`);
+  }
+  if (!lost.departed) {
+    process.stderr.write(
+      `${lost.message} before the answer reached it; the op ran all the same, and the exit code is its own\n`,
+    );
+  }
+  return code;
 }
+
+/** The last document [`answered`] wrote, for [`undelivered`] to say again where it did not arrive. */
+let lastAnswer: unknown;
 
 /** Answer one JSON document on stdout, and the exit code it goes with. */
 function answered(document: unknown, code: number): number {
+  lastAnswer = document;
   out(`${JSON.stringify(document, null, 2)}\n`);
   return code;
 }

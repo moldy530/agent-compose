@@ -33,11 +33,17 @@
 //!    line named by number, `--if-absent` seeding without overwriting, the wrong
 //!    scope flags and an unknown address exiting `2`, and the `--format json`
 //!    shapes — [`drive`], once per arm;
-//!  * a command whose standard output's reader has gone — an `export` into
-//!    `| head -1` — exiting `1` and saying so rather than waiting for ever —
-//!    [`cut_off`], once per arm — and a server that is not there exiting `1`
-//!    from every sub-verb, with `{ error }` under `--format json` —
-//!    [`no_server`], once per dialled arm;
+//!  * a store's `default_ttl:` taken by a `set` with no `--ttl` and not by an
+//!    import line with no `expires_at` — [`drive`] too;
+//!  * a command whose standard output will not take its answer — a pipe whose
+//!    reader has gone, as `| head -1` leaves it, or a full disk — ending all
+//!    the same rather than waiting for ever, with **the op's own exit code**:
+//!    `0` for a `get` that found its key or a `set` that applied, an export
+//!    stopped by a departed reader included, and `1` only where the op's
+//!    answer is no or an export's lines did not land — [`undelivered`], once
+//!    per arm — and a server that is not there exiting `1` from every
+//!    sub-verb, with `{ error }` under `--format json` — [`no_server`], once
+//!    per dialled arm;
 //!  * **no effect**: no journal is opened by any of it, no ledger row is left,
 //!    and a flow run afterwards reads what the operator wrote — the end of
 //!    [`drive`];
@@ -46,6 +52,9 @@
 //!    `--session`, and on a dialled arm the command, handed a parked run's
 //!    execution id, reads what that execution wrote — the very end of
 //!    [`drive`];
+//!  * a composition the compiler refuses, reported on stderr for an `export`
+//!    and never among its lines —
+//!    [`a_refused_composition_is_reported_beside_an_exports_summary_not_among_its_lines`];
 //!  * clap's own surface for the verb and each sub-verb, pinned byte for byte —
 //!    [`the_store_help_pages_are_pinned`].
 
@@ -112,8 +121,8 @@ const MYSQL: Arm = Arm {
 
 /// The composition every arm is driven against, with its stores named `suffix`.
 ///
-/// One store per scope a `kv` store may declare, a `blob` store the command
-/// must refuse, one flow that reads what an operator left — in the global
+/// One store per scope a `kv` store may declare, one more declaring a
+/// `default_ttl:`, a `blob` store the command must refuse, one flow that reads what an operator left — in the global
 /// store and in one session's — which is how "a flow sees the operator's values"
 /// is asked of the runtime rather than of this command, and one that writes its
 /// own execution's partition and parks there, which is how "the command reads
@@ -138,6 +147,15 @@ store.notes_{suffix}:
   backend: cli_db
   value_schema:
     text: {{ type: string, min_length: 1 }}
+
+store.leases_{suffix}:
+  kind: kv
+  scope: global
+  description: Keys that expire an hour after their write unless told otherwise.
+  backend: cli_db
+  default_ttl: 1h
+  value_schema:
+    text: {{ type: string }}
 
 store.visits_{suffix}:
   kind: kv
@@ -242,8 +260,9 @@ struct Project {
     target: &'static str,
     provider: &'static str,
     environment: Vec<(String, String)>,
-    /// The run-unique names of the four stores, without `store.`.
+    /// The run-unique names of the five stores, without `store.`.
     notes: String,
+    leases: String,
     visits: String,
     scratch: String,
     files: String,
@@ -302,6 +321,7 @@ impl Project {
             provider: arm.provider,
             environment,
             notes: format!("notes_{suffix}"),
+            leases: format!("leases_{suffix}"),
             visits: format!("visits_{suffix}"),
             scratch: format!("scratch_{suffix}"),
             files: format!("files_{suffix}"),
@@ -432,6 +452,30 @@ impl Project {
         }
     }
 
+    /// `agent-compose store <sub-verb> …` with standard output `/dev/full`, a
+    /// stream that refuses every write with `ENOSPC` while nobody has left —
+    /// or `None`, said loudly, where this machine has no such device.
+    fn store_into_full_disk(&self, sub_verb: &str, arguments: &[&str]) -> Option<Answer> {
+        let Ok(full) = std::fs::OpenOptions::new().write(true).open("/dev/full") else {
+            notice(
+                "warning: skipping the full-disk half of the store command's undelivered-answer \
+                 case — this machine has no `/dev/full`",
+            );
+            return None;
+        };
+        let mut command = self.command(sub_verb, arguments, &Given::default());
+        let output = command
+            .stdin(Stdio::null())
+            .stdout(full)
+            .stderr(Stdio::piped())
+            .output()
+            .expect("the command runs");
+        Some(Answer {
+            what: format!("store {sub_verb} {} > /dev/full", arguments.join(" ")),
+            output,
+        })
+    }
+
     /// `agent-compose run main.yml flow.park --input key=<key>`, which writes
     /// its own `scope: execution` partition and then stops at a `human` pause
     /// with nobody to ask.
@@ -516,13 +560,13 @@ impl Project {
     /// The idempotency ledger rows this project's stores hold, on any arm.
     fn ledger_rows(&self) -> u64 {
         if let Some(rows) = self.server(
-            "SELECT COUNT(*) AS n FROM store_applied WHERE store IN (?, ?, ?)",
-            &json!([self.notes, self.visits, self.scratch]),
+            "SELECT COUNT(*) AS n FROM store_applied WHERE store IN (?, ?, ?, ?)",
+            &json!([self.notes, self.leases, self.visits, self.scratch]),
         ) {
             return count(&rows);
         }
         let mut held = 0;
-        for store in [&self.notes, &self.visits] {
+        for store in [&self.notes, &self.leases, &self.visits] {
             let file = self
                 .out
                 .join(".agent-compose/stores")
@@ -546,12 +590,12 @@ impl Drop for Project {
         if self.provider != "sqlite" {
             let script = self.script();
             for table in ["store_entries", "store_applied", "store_sequences"] {
-                let sql = format!("DELETE FROM {table} WHERE store IN (?, ?, ?)");
+                let sql = format!("DELETE FROM {table} WHERE store IN (?, ?, ?, ?)");
                 let mut command = bun();
                 command
                     .arg(&script)
                     .args([self.provider, STORE_URL, &sql])
-                    .arg(json!([self.notes, self.visits, self.scratch]).to_string());
+                    .arg(json!([self.notes, self.leases, self.visits, self.scratch]).to_string());
                 seal(&mut command, &self.environment);
                 let _ = command.output();
             }
@@ -650,6 +694,27 @@ fn notice(message: &str) {
     let mut stderr = std::io::stderr().lock();
     let _ = writeln!(stderr, "{message}");
     let _ = stderr.flush();
+}
+
+/// An hour, in milliseconds: the `default_ttl:` the composition's `leases`
+/// store declares.
+const HOUR: i64 = 3_600_000;
+
+/// How far the store's clock may sit from this process's when an expiry is
+/// read against the instants a write was made between: a dialled server keeps
+/// its own clock (PRD resolved q69), on this machine or a service container
+/// beside it.
+const CLOCK_SLACK: i64 = 2_000;
+
+/// Now, in epoch milliseconds.
+fn now_millis() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the clock is past the epoch")
+            .as_millis(),
+    )
+    .expect("an instant in range")
 }
 
 /// Every key one export answered, by key, with what it carried.
@@ -1132,6 +1197,80 @@ fn drive(arm: &Arm) {
         json!({ "text": "new" })
     );
 
+    // A store's `default_ttl:` — an hour, on `leases`: a `set` with no `--ttl`
+    // takes it, `--ttl never` overrides it, and an import line with no
+    // `expires_at` writes a key that never expires, whatever the default, so an
+    // export and its import leave the same keys alive (D155).
+    let leases = format!("store.{}", project.leases);
+    let before_write = now_millis();
+    project
+        .store("set", &[&leases, "defaulted", r#"{"text":"lapses"}"#])
+        .exits(0);
+    let after_write = now_millis();
+    project
+        .store(
+            "set",
+            &[&leases, "forever", r#"{"text":"stays"}"#, "--ttl", "never"],
+        )
+        .exits(0);
+    let imported = project.store_with(
+        "import",
+        &[&leases, "--format", "json"],
+        Given {
+            input: Some(&format!(
+                "{}\n",
+                json!({ "key": "imported", "value": { "text": "stays" } })
+            )),
+            ..Given::default()
+        },
+    );
+    assert_eq!(
+        imported.exits(0).json(),
+        json!({ "read": 1, "written": 1, "skipped": 0, "expired": 0, "present": 0 })
+    );
+    let held = by_key(&project.store("export", &[&leases]).exits(0).lines());
+    assert_eq!(
+        held.keys().collect::<Vec<_>>(),
+        ["defaulted", "forever", "imported"]
+    );
+    assert!(
+        held["defaulted"]["expires_at"].is_string(),
+        "a `set` with no `--ttl` takes the store's `default_ttl: 1h`, so the key expires: {}",
+        held["defaulted"]
+    );
+    let lapses = instant(&held["defaulted"]);
+    assert!(
+        (before_write + HOUR - CLOCK_SLACK..=after_write + HOUR + CLOCK_SLACK).contains(&lapses),
+        "a `set` with no `--ttl` takes the store's `default_ttl: 1h`, so it expires an hour after \
+         the write, made between {before_write} and {after_write}: {}",
+        held["defaulted"]
+    );
+    assert!(
+        held["forever"].get("expires_at").is_none(),
+        "`--ttl never` overrides the store's default: {}",
+        held["forever"]
+    );
+    assert!(
+        held["imported"].get("expires_at").is_none(),
+        "an import line with no `expires_at` writes a key that never expires, whatever the \
+         store's `default_ttl:` says: {}",
+        held["imported"]
+    );
+    // …and every read agrees, once the store's clock is past the default's hour.
+    let later = project.store_with(
+        "list",
+        &[&leases, "--format", "json"],
+        Given {
+            environment: &[(CLOCK_OFFSET, "7200000")],
+            ..Given::default()
+        },
+    );
+    assert_eq!(
+        later.exits(0).json(),
+        json!({ "keys": ["forever", "imported"] }),
+        "past an hour, the defaulted key is gone and the two that never expire are not"
+    );
+
     // A session's partition, by the session identity.
     project
         .store(
@@ -1351,11 +1490,19 @@ fn drive(arm: &Arm) {
     }
 }
 
-/// A command whose standard output's reader has gone, on one arm: an `export`
-/// into a pipe nobody reads any more stops and exits `1`, saying so — in both
-/// formats — and so does an op whose answer cannot be written, whose write is
-/// made all the same.
-fn cut_off(arm: &Arm) {
+/// A command whose standard output will not take its answer, on one arm — and
+/// the exit code it ends with all the same, which is **the op's own** (PRD
+/// resolved q72's exit table, the `cli` topic's rule for a reader that stops
+/// reading).
+///
+/// A reader that has gone is never a failure: a `get` that found its key and a
+/// `set` that applied end `0`, a `get` that found nothing and a `set` whose
+/// condition declined end `1`, an answer that was itself a failure is said on
+/// stderr instead, and an `export` stops at the page the pipe refused and ends
+/// `0`, its summary saying where. A standard output that fails under a reader
+/// still there — a full disk — is said on stderr, and for an `export` is the
+/// export failing.
+fn undelivered(arm: &Arm) {
     let Some(project) = Project::new(arm) else {
         return;
     };
@@ -1366,57 +1513,87 @@ fn cut_off(arm: &Arm) {
             .exits(0);
     }
 
-    // An export whose reader has gone stops there and exits `1`, saying so on
-    // stderr — the stream left to say it on — rather than waiting for ever on a
-    // pipe nobody will drain; under `--format json` as one object counting the
-    // lines that went out first, which here is none.
+    // An export whose reader has gone stops there — rather than waiting for
+    // ever on a pipe nobody will drain — and ends `0`, its summary on stderr
+    // saying where it stopped: here before its first line.
     let cut = project.store_into_closed_pipe("export", &[&notes]);
     assert!(
-        cut.exits(1)
-            .stderr()
-            .contains("standard output closed before the answer reached it")
-            && cut.stderr().contains("the export stopped after 0 lines"),
+        cut.exits(0).stderr().contains("standard output closed")
+            && cut
+                .stderr()
+                .contains("after 0 lines, so the export stopped there and read nothing more"),
         "an export into a closed pipe says it stopped, and where:\n{}",
         cut.stderr()
     );
+    assert!(!cut.stderr().contains("error"), "{}", cut.stderr());
     let cut = project.store_into_closed_pipe("export", &[&notes, "--format", "json"]);
-    let said: Value = serde_json::from_str(cut.exits(1).stderr().trim())
+    let said: Value = serde_json::from_str(cut.exits(0).stderr().trim())
         .unwrap_or_else(|error| panic!("one JSON object on stderr ({error}):\n{}", cut.stderr()));
+    assert_eq!(
+        said.as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["stopped", "written"],
+        "{said}"
+    );
     assert_eq!(said["written"], json!(0), "{said}");
     assert!(
-        said["error"]
+        said["stopped"]
             .as_str()
-            .is_some_and(|error| error.contains("standard output closed")),
+            .is_some_and(|stopped| stopped.contains("standard output closed")),
         "{said}"
     );
-    // …and so does any other sub-verb whose answer cannot reach its reader,
-    // whose op ran all the same.
-    let cut = project.store_into_closed_pipe("get", &[&notes, "cut/a"]);
-    assert!(
-        cut.exits(1)
-            .stderr()
-            .contains("standard output closed before the answer reached it"),
-        "{}",
-        cut.stderr()
-    );
-    let cut = project.store_into_closed_pipe(
-        "set",
-        &[
-            &notes,
-            "cut/set",
-            r#"{"text":"written"}"#,
-            "--format",
-            "json",
-        ],
-    );
-    let said: Value = serde_json::from_str(cut.exits(1).stderr().trim())
-        .unwrap_or_else(|error| panic!("one JSON object on stderr ({error}):\n{}", cut.stderr()));
-    assert!(
-        said["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("a write it applied stays applied")),
-        "{said}"
-    );
+
+    // Every other sub-verb ends with its op's own code, in both formats, and
+    // says nothing more about a reader that chose to leave.
+    for (sub_verb, arguments, code) in [
+        ("get", vec![notes.as_str(), "cut/a"], 0),
+        ("get", vec![notes.as_str(), "cut/a", "--format", "json"], 0),
+        (
+            "get",
+            vec![notes.as_str(), "cut/nothing", "--format", "json"],
+            1,
+        ),
+        ("list", vec![notes.as_str(), "--prefix", "cut/"], 0),
+        ("count", vec![notes.as_str(), "--format", "json"], 0),
+        (
+            "set",
+            vec![
+                notes.as_str(),
+                "cut/a",
+                r#"{"text":"again"}"#,
+                "--if",
+                "absent",
+            ],
+            1,
+        ),
+    ] {
+        let cut = project.store_into_closed_pipe(sub_verb, &arguments);
+        cut.exits(code);
+        assert!(
+            !cut.stderr().contains("standard output"),
+            "a reader that left is not this command's to report:\n{}",
+            cut.stderr()
+        );
+    }
+    // A write whose report nobody read applied, and says so with `0` — so a
+    // supervisor retrying on `1` does not write it twice.
+    project
+        .store_into_closed_pipe(
+            "set",
+            &[
+                &notes,
+                "cut/set",
+                r#"{"text":"written"}"#,
+                "--if",
+                "absent",
+                "--format",
+                "json",
+            ],
+        )
+        .exits(0);
     assert_eq!(
         project
             .store("get", &[&notes, "cut/set", "--format", "json"])
@@ -1425,7 +1602,54 @@ fn cut_off(arm: &Arm) {
         json!({ "text": "written" }),
         "the write whose report was lost was made"
     );
-    project.store("delete", &[&notes, "cut/set"]).exits(0);
+    project
+        .store_into_closed_pipe("delete", &[&notes, "cut/set"])
+        .exits(0);
+    project.store("get", &[&notes, "cut/set"]).exits(1);
+    // An answer that was itself a failure is said on stderr instead.
+    let refused = project.store_into_closed_pipe(
+        "set",
+        &[&notes, "cut/refused", r#"{"text":3}"#, "--format", "json"],
+    );
+    let said: Value =
+        serde_json::from_str(refused.exits(1).stderr().trim()).unwrap_or_else(|error| {
+            panic!(
+                "the lost failure is one JSON object on stderr ({error}):\n{}",
+                refused.stderr()
+            )
+        });
+    assert!(
+        said["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("refused the value")),
+        "{said}"
+    );
+
+    // A standard output that fails under a reader still there is another
+    // matter: a full disk under an export's redirect is the export failing,
+    // since the file does not hold the partition — exit `1`, said on stderr —
+    // while an op's answer lost to it still ends with the op's code, said.
+    let Some(full) = project.store_into_full_disk("export", &[&notes, "--format", "json"]) else {
+        return;
+    };
+    let said: Value = serde_json::from_str(full.exits(1).stderr().trim())
+        .unwrap_or_else(|error| panic!("one JSON object on stderr ({error}):\n{}", full.stderr()));
+    assert!(
+        said["error"].as_str().is_some_and(|error| {
+            error.contains("standard output failed") && error.contains("ENOSPC")
+        }) && said["written"] == json!(0),
+        "{said}"
+    );
+    let full = project
+        .store_into_full_disk("set", &[&notes, "cut/full", r#"{"text":"written"}"#])
+        .expect("`/dev/full` is still there");
+    assert!(
+        full.exits(0).stderr().contains("standard output failed")
+            && full.stderr().contains("the exit code is its own"),
+        "{}",
+        full.stderr()
+    );
+    project.store("get", &[&notes, "cut/full"]).exits(0);
 }
 
 /// A target whose server is not there, on one dialled arm: the ruling's
@@ -1550,18 +1774,18 @@ fn the_store_command_reads_and_writes_a_mysql_store_through_its_target() {
 }
 
 #[test]
-fn a_store_command_whose_reader_has_gone_exits_1_on_sqlite() {
-    cut_off(&SQLITE);
+fn a_store_answer_stdout_does_not_take_still_ends_with_the_ops_exit_code_on_sqlite() {
+    undelivered(&SQLITE);
 }
 
 #[test]
-fn a_store_command_whose_reader_has_gone_exits_1_on_postgres() {
-    cut_off(&POSTGRES);
+fn a_store_answer_stdout_does_not_take_still_ends_with_the_ops_exit_code_on_postgres() {
+    undelivered(&POSTGRES);
 }
 
 #[test]
-fn a_store_command_whose_reader_has_gone_exits_1_on_mysql() {
-    cut_off(&MYSQL);
+fn a_store_answer_stdout_does_not_take_still_ends_with_the_ops_exit_code_on_mysql() {
+    undelivered(&MYSQL);
 }
 
 #[test]
@@ -1671,4 +1895,83 @@ fn the_store_command_line_refuses_what_it_cannot_parse() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+/// A composition the compiler refuses is reported where the sub-verb keeps its
+/// failures: as one JSON object on stdout for an op, whose answer the report
+/// stands in for — as `validate`'s does — and on **stderr** for an `export`,
+/// whose stdout is only ever the lines an import reads back, so a redirect
+/// collecting them never collects a report instead (D155). Refused before
+/// anything is built or launched, so it needs no backend and no runtime.
+#[test]
+fn a_refused_composition_is_reported_beside_an_exports_summary_not_among_its_lines() {
+    let source = Scratch::new("store-cli-refused");
+    let entrypoint = source.path().join("main.yml");
+    let suffix = run_unique();
+    let refusing = composition(&suffix).replacen(
+        &format!("store: store.notes_{suffix}"),
+        "store: store.nonexistent",
+        1,
+    );
+    assert_ne!(
+        refusing,
+        composition(&suffix),
+        "one node names a store nobody declares"
+    );
+    std::fs::write(&entrypoint, refusing).expect("the scratch area is writable");
+    let store = format!("store.notes_{suffix}");
+    let out = source.path().join("build");
+    let refused = |sub_verb: &str, operands: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_agent-compose"))
+            .args(["store", sub_verb, "--out"])
+            .arg(&out)
+            .arg(&entrypoint)
+            .arg(&store)
+            .args(operands)
+            .args(["--format", "json"])
+            .env("NO_COLOR", "1")
+            .stdin(Stdio::null())
+            .output()
+            .expect("the command runs");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "`store {sub_verb}` on a refused composition exits 1\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    let names_the_store = |report: &[u8], stream: &str| {
+        let report: Value = serde_json::from_slice(report).unwrap_or_else(|error| {
+            panic!(
+                "the report is one JSON object on {stream} ({error}): {}",
+                String::from_utf8_lossy(report)
+            )
+        });
+        assert!(
+            report["diagnostics"]
+                .as_array()
+                .expect("the report lists its diagnostics")
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == "undefined-reference"),
+            "{report}"
+        );
+    };
+
+    let export = refused("export", &[]);
+    assert_eq!(
+        String::from_utf8_lossy(&export.stdout),
+        "",
+        "an export's stdout is only ever its lines, and a refused composition has none"
+    );
+    names_the_store(&export.stderr, "stderr");
+    assert!(
+        !out.exists(),
+        "nothing was built for a composition the compiler refused"
+    );
+
+    let get = refused("get", &["k"]);
+    names_the_store(&get.stdout, "stdout");
+    assert_eq!(String::from_utf8_lossy(&get.stderr), "", "{get:?}");
 }

@@ -11348,10 +11348,11 @@ same, checks every line before writing any, writes each at the partition's next
 version, turns a remaining `expires_at` into the `ttl` that keeps it, skips a
 line already expired, and under `--if-absent` keeps a key already held. The
 answer is a table, or one JSON document under `--format json` — the op's own
-answer row, or the import's summary, with an export's summary and failure on
-stderr so its stdout is only ever its lines; exit `0` is found or applied, `1`
-not found, declined, refused, a failing backend or an answer standard output
-closed before it could take, `2` usage (PRD resolved q72).
+answer row, or the import's summary, with an export's summary and failure — a
+refused composition's report among them — on stderr so its stdout is only ever
+its lines; exit `0` is found or applied, `1` not found, declined, refused or a
+failing backend, `2` usage (PRD resolved q72), whether or not the reader of
+standard output stayed to read the answer.
 
 **Rationale**: a store's contents were reachable only from a flow, so seeing what
 a run left or seeding a store before one meant writing a composition for it, or
@@ -11410,15 +11411,27 @@ variables, as `run` does. A wrong partition flag, an address naming no store,
 and an unknown sub-verb are usage errors too, exit `2`, because nothing was read
 or written and a different command line is the fix.
 
-**An answer nobody is left to read is a failure, and ends the command.** An
-operator pipes these commands — `export … | head -1`, `get … | jq` — and a pipe's
-reader may leave before the answer is written. The command watches standard
-output from its first line, so a write the closed pipe refuses ends it `1`,
-said on stderr, rather than as an uncaught error or a wait for a drain that
-cannot come: an `export` stops at the page it could not write and reads nothing
-more, and an op that wrote has still written, since what was lost is the report
-of it. For the same reason an export's failure goes to stderr beside its
-summary, never among the lines a redirect is collecting for an import.
+**A reader that leaves is not a failure, and the exit code is still the op's.**
+An operator pipes these commands — `export … | head -1`, `get … | jq` — and a
+pipe's reader may leave before the answer is written. The command watches
+standard output from its first line, so a write the closed pipe refuses ends it
+rather than surfacing as an uncaught error or a wait for a drain that cannot
+come; and it ends with the op's own code, the rule every verb of this command
+line keeps for a reader that stops reading (the `cli` topic): what is left of
+the answer is dropped, and the code is the verdict. The ruling's exit table is
+about the op — `0` found or applied — and a code that turned `1` when the
+report of a write was lost would send a supervisor retrying on `1` to make a
+write that had already landed. So a `get` that found its key and a `set` that
+applied end `0` with nobody reading; an answer that was itself a failure, a
+`--format json` `{ error }`, is said on stderr instead, the one stream left to
+say it on; and an `export` stops at the page it could not write, reads nothing
+more, and ends `0` with a summary saying where it stopped. A stream that fails
+under a reader still there — a full disk under a redirect — is a different
+case, said on stderr, and for an `export` it is the export failing (`1`): the
+file its operator will import does not hold the partition. For the same reason
+an export's failure goes to stderr beside its summary, and so does the report of
+a composition the compiler refuses before anything is read, never among the
+lines a redirect is collecting for an import.
 
 **What this does not change.** No grammar: the command reads a composition and
 adds nothing to what one may say, so no section of this document gains a key and
