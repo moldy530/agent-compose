@@ -617,6 +617,7 @@ Spec(
                                             include_values: None,
                                             keys: None,
                                             ops: None,
+                                            idempotency_key: None,
                                         },
                                     },
                                 ),
