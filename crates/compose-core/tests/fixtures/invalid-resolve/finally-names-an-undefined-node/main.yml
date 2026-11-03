@@ -1,0 +1,15 @@
+# rule: a flow's `finally:` names a node of its own flow, refused in the words an edge naming a missing one is (grammar 7.9, 2.4, Decision D159)
+# code: undefined-reference
+# message: `clean_up` is not a node of `flow.f`
+# at: main.yml:15:12
+# help: did you mean `cleanup`?
+version: "0.1"
+flow.f:
+  outputs: {}
+  nodes:
+    run: { exec: { command: "true" } }
+    cleanup: { exec: { command: "true" } }
+  edges:
+    - { from: start, to: run }
+    - { from: run, to: end }
+  finally: clean_up

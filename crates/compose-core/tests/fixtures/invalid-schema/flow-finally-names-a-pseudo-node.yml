@@ -1,0 +1,11 @@
+# rule: a flow's `finally:` names a node of the flow, and `end` is a pseudo-node rather than a node (grammar 2.4, 7.9 / D159)
+# at: /flow.demo/finally
+# via: /$defs/nodeId/allOf/1/not
+flow.demo:
+  outputs: {}
+  nodes:
+    work: { exec: { command: "true" } }
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: end

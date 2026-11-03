@@ -321,6 +321,7 @@ fn flow(source: &ast_flow::FlowDef) -> Option<ir::flow::Flow> {
         outputs: field_map(source.outputs.as_ref()?)?,
         nodes: source.nodes.iter().map(node).collect::<Option<Vec<_>>>()?,
         edges: source.edges.iter().map(edge).collect::<Option<Vec<_>>>()?,
+        finally: source.finally.clone(),
     })
 }
 

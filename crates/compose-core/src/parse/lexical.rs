@@ -259,6 +259,36 @@ pub(crate) fn edge_target(node: &Node, cx: &mut Cx) -> Option<Spanned<EdgeTarget
     }
 }
 
+/// Read a flow's `finally:` value: the id of one node of the same flow
+/// (grammar 7.9, Decision D159).
+///
+/// A **reference** to a node, not a declaration of one, so it is read the way
+/// an edge's `to:` is — the identifier grammar, and the two pseudo-nodes refused
+/// by name — and whether a node of that id exists is the resolver's question,
+/// asked with the message an edge naming a missing node gets. `start` and `end`
+/// are refused here because neither is a node: `start` runs nothing and `end`
+/// retires a branch, so neither is something an instance could run as it ends.
+pub(crate) fn finally_target(node: &Node, cx: &mut Cx) -> Option<Spanned<Ident>> {
+    let text = expect_string(node, "`finally`", cx)?;
+    if PSEUDO_NODES.contains(&text.value.as_str()) {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::ReservedName,
+                text.span.clone(),
+                format!(
+                    "`finally` names a node of this flow, and `{}` is a pseudo-node",
+                    text.value
+                ),
+            )
+            .with_help(
+                "`start` is a flow's entry and `end` retires a branch; `finally:` names the node an instance runs once when it ends, whatever its outcome (grammar 7.9, Decision D159)",
+            ),
+        );
+        return None;
+    }
+    identifier(&text, "`finally`", cx)
+}
+
 /// How a set of accepted namespaces is described in a diagnostic:
 /// "a `model.*` reference", "an `agent.*`, `tool.*`, or `flow.*` reference".
 pub(crate) fn reference_expectation(allowed: &[Namespace]) -> String {
