@@ -903,7 +903,7 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "two_different_authored_keys_both_apply",
     "the_same_authored_key_on_two_stores_applies_on_both",
     "a_derived_and_an_authored_write_are_independent_ledger_rows",
-    "an_authored_key_another_op_took_fails_naming_both",
+    "a_delete_under_an_authored_key_a_set_took_fails_naming_both",
     "an_authored_key_past_ascii_applies_and_dedupes",
     "two_session_partitions_sharing_an_authored_key_dedupe_against_each_other",
     "two_partitions_racing_one_authored_key_apply_it_once",
@@ -915,6 +915,16 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "an_expired_authored_row_leaves_storage_at_the_next_authored_write",
     "an_expired_authored_row_leaves_storage_when_a_process_next_starts",
     "an_authored_row_on_a_store_without_default_ttl_answers_after_any_wait",
+    // …while a derived row on a store with `default_ttl:` never expires: a
+    // retry of an open execution's write, long past the default, is still
+    // answered by its row, which carries no expiry (PRD resolved q69(d)).
+    "a_derived_row_on_a_store_with_default_ttl_never_expires",
+    // Two nodes naming one authored key with different ops: the later is
+    // answered with the first's row wherever that row holds every field its
+    // own output declares, and fails naming both where it does not.
+    "partial_updates_under_one_authored_key_answer_one_another",
+    "a_set_after_a_partial_update_under_one_authored_key_is_answered_without_its_value",
+    "a_partial_update_after_a_set_under_one_authored_key_fails_naming_both",
     "a_batch_under_an_authored_key_dedupes_whole",
     "an_authored_key_on_an_execution_scoped_store_is_refused",
     "an_execution_id_in_the_authored_namespace_is_refused_by_the_store_and_the_journal",

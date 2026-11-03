@@ -223,11 +223,13 @@
 // compiler refuses an authored key there and [`runStoreOp`] refuses one a
 // caller hands it.
 //
-// **One key, one op.** The row an authored key is answered with is the answer
-// of the write that first took the key, and that answer's shape is its op's;
-// a second node naming the same key with **another** op would be handed an
-// answer its own output does not describe, so it fails naming both instead
-// ([`answeredFrom`]).
+// **One key, one answer.** The row an authored key is answered with is the
+// answer of the write that first took the key, in its op's shape. A second
+// node naming the key is handed that row whenever it holds every field the
+// second node's own output declares — the same op, any two of the partial
+// updates, or a `set` after a partial update, without the `value` — and fails
+// naming both ops where it does not, rather than being handed an answer its
+// own output does not describe ([`answeredFrom`]).
 //
 // **Retention follows the store.** A derived row lives until its execution
 // settles (see "Retention"). An authored row has no execution to settle, so
@@ -666,15 +668,32 @@ function ledgerExpiry(store: StoreBinding, idempotencyKey: string, now: number):
 }
 
 /**
+ * The ops whose answers are one shape: grammar 11.4's catalog gives `merge`,
+ * `append` and `incr` one output row (Decision D34), `{ key, applied,
+ * version, value, deduped }`.
+ */
+const PARTIAL_UPDATES: readonly StoreOp[] = ["merge", "append", "incr"];
+
+/**
  * The answer a write whose key the ledger holds is owed: the row it holds,
  * marked `deduped` ([`redelivered`]).
  *
  * An authored key may be named by more than one node, and the row it holds is
- * the answer of the write that took it first — an answer whose shape is that
- * write's op's. So a write under an authored key whose row another op wrote
- * fails naming both, rather than handing the node an answer its own output
- * does not describe (PRD resolved q73). A derived key is one effect site, whose
- * op is the op that wrote its row, so it is answered as it always was.
+ * the answer of the write that took it first — an answer in that write's op's
+ * shape. A later write under the key is answered with it, `deduped: true`,
+ * whenever the row holds every field the later write's own output declares
+ * (PRD resolved q73): the same op; any two of `merge`, `append` and `incr`,
+ * whose answers are one shape; and a `set` answered by a partial update's
+ * row, which holds every field a `set` answers — `key`, `applied`, `version`
+ * — and one more, the `value`, which a `set`'s output does not declare and so
+ * is not handed. Every other pair has no answer in the later write's shape: a
+ * partial update answered by a `set`'s row has no `value` to answer with, a
+ * `delete`'s answer has `deleted` and no `key` where every other single-key
+ * write's has the reverse, and a `batch`'s is `results` where a single-key
+ * write's is one key's. So that write fails naming both ops, rather than
+ * handing the node an answer its own output does not describe. A derived key
+ * is one effect site, whose op is the op that wrote its row, so it is answered
+ * as it always was.
  */
 function answeredFrom(
   store: StoreBinding,
@@ -683,12 +702,18 @@ function answeredFrom(
   held: Readonly<Record<string, unknown>>,
 ): Applied {
   const wrote = held["op"];
-  if (authored(idempotencyKey) && wrote !== op) {
-    throw new Error(
-      `\`${store.address}\` holds the authored idempotency key ${JSON.stringify(idempotencyKey)} for a \`${String(wrote)}\`, and this write is a \`${op}\`: an authored key names one write, answered by the row of the write that first took it, and a \`${String(wrote)}\`'s answer is not a \`${op}\`'s — give the two nodes distinct keys (PRD resolved q73)`,
-    );
+  const row = redelivered(store, op, String(held["result"]));
+  if (!authored(idempotencyKey) || wrote === op) return { row, deduped: true };
+  const partial = (candidate: unknown): boolean => PARTIAL_UPDATES.some((one) => one === candidate);
+  if (partial(wrote) && partial(op)) return { row, deduped: true };
+  if (partial(wrote) && op === "set") {
+    const answer = { ...row };
+    delete answer["value"];
+    return { row: answer, deduped: true };
   }
-  return { row: redelivered(store, op, String(held["result"])), deduped: true };
+  throw new Error(
+    `\`${store.address}\` holds the authored idempotency key ${JSON.stringify(idempotencyKey)} for a \`${String(wrote)}\`, and this write is a \`${op}\`: an authored key is answered by the row of the write that first took it, and a \`${String(wrote)}\`'s row holds no answer in a \`${op}\`'s shape — give the two nodes distinct keys, or make them ops one row answers alike: \`merge\`, \`append\` and \`incr\` answer one another, and a \`set\` takes a partial update's row without its \`value\` (PRD resolved q73)`,
+  );
 }
 
 /**

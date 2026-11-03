@@ -4356,14 +4356,15 @@ const authored = (store, key) => stores.authoredKey(store.name, key);
       (await ledgerRows(store, derivedKey)) === 1 &&
       (await ledgerRows(store, authored(store, derivedKey))) === 1 &&
       (await get(store, "event/4", ctx(execution("authored_read")))).value?.by === "authored";
-    // An authored key names one write, answered by the row of the write that
-    // took it first — whose shape is that op's. A second node naming it with
-    // another op fails naming both rather than taking an answer its own
-    // output does not describe.
+    // An authored key is answered by the row of the write that took it first,
+    // in that op's shape. A `delete` has no answer in a `set`'s row — its
+    // output declares `deleted`, which the row does not hold — so a second
+    // node naming the key with it fails naming both rather than taking an
+    // answer its own output does not describe.
     const crossed = await refusal(
       write(store, "delete", { key: "event/1" }, second, authored(store, "evt-1")),
     );
-    answer.an_authored_key_another_op_took_fails_naming_both =
+    answer.a_delete_under_an_authored_key_a_set_took_fails_naming_both =
       (crossed ?? "").includes("for a `set`, and this write is a `delete`") &&
       (await get(store, "event/1", ctx(execution("authored_read")))).value?.by === "first";
     // A business key is the composition's string, whatever it holds — and a
@@ -4625,6 +4626,122 @@ const authored = (store, key) => stores.authoredKey(store.name, key);
       (await get(store, "event", ctx(execution("authored_kept_read")))).value?.by === "first";
   } catch (error) {
     answer.authored_kept_error = String(error?.stack ?? error);
+  }
+}
+
+{
+  // …**while a derived row never expires, whatever the store's default.** It
+  // is its execution's, kept for as long as an attempt can repeat and pruned
+  // when the execution settles (PRD resolved q69(d)) — so on a store with
+  // `default_ttl:`, a retry of a write an execution still open made, long
+  // past the default, is answered by its row rather than applied a second
+  // time, and the row carries no expiry at all. The key itself expires with
+  // the default as ever; what the default does not reach is the ledger's
+  // memory of the write.
+  const store = { ...kv("derived_defaulted", "global"), defaultTtl: HOUR };
+  const id = execution("derived_defaulted");
+  const site = `${id}/save/0`;
+  try {
+    const first = await later(0, () =>
+      write(store, "set", { key: "event", value: { by: "first" } }, ctx(id), site),
+    );
+    const retried = await later(10 * HOUR, () =>
+      write(store, "set", { key: "event", value: { by: "retried" } }, ctx(id), site),
+    );
+    const held = await later(10 * HOUR, () => get(store, "event", ctx(execution("derived_defaulted_read"))));
+    const expiry = await storage(
+      "SELECT expires_at FROM store_applied WHERE store = ? AND idempotency_key = ?",
+      [store.name, site],
+      [store.name, "SELECT expires_at FROM applied WHERE idempotency_key = ?", [site]],
+    );
+    answer.a_derived_row_on_a_store_with_default_ttl_never_expires =
+      first.applied === true &&
+      first.deduped === false &&
+      same({ ...first, deduped: true }, retried) &&
+      held.found === false &&
+      expiry.length === 1 &&
+      expiry[0].expires_at === null;
+    answer.derived_defaulted_trace = { first, retried, held, expiry };
+  } catch (error) {
+    answer.derived_defaulted_error = String(error?.stack ?? error);
+  }
+}
+
+{
+  // **One key, one answer, in the shape the later write declares.** Two nodes
+  // may name one authored key with different ops, and the later is answered
+  // with the first's row whenever that row holds every field its own output
+  // declares: `merge`, `append` and `incr` answer one shape, so each answers
+  // the others whole; a `set` is answered by a partial update's row without
+  // its `value`, which a `set`'s output does not declare. A partial update
+  // after a `set` has no `value` in the row to answer with, so it fails naming
+  // both, and writes nothing.
+  const store = kv("authored_ops", "global", URL_ENV, RECORD);
+  try {
+    const merged = await write(
+      store,
+      "merge",
+      { key: "record", fields: { title: "first", tags: [], count: 1 } },
+      ctx(execution("authored_ops_1")),
+      authored(store, "evt"),
+    );
+    const incremented = await write(
+      store,
+      "incr",
+      { key: "record", field: "count", by: 5 },
+      ctx(execution("authored_ops_2")),
+      authored(store, "evt"),
+    );
+    const appended = await write(
+      store,
+      "append",
+      { key: "record", field: "tags", value: "late" },
+      ctx(execution("authored_ops_3")),
+      authored(store, "evt"),
+    );
+    const replaced = await write(
+      store,
+      "set",
+      { key: "record", value: { title: "set", tags: [], count: 9 } },
+      ctx(execution("authored_ops_4")),
+      authored(store, "evt"),
+    );
+    const held = await get(store, "record", ctx(execution("authored_ops_read")));
+    const withoutValue = { ...merged, deduped: true };
+    delete withoutValue.value;
+    answer.partial_updates_under_one_authored_key_answer_one_another =
+      merged.applied === true &&
+      merged.deduped === false &&
+      merged.value?.count === 1 &&
+      same({ ...merged, deduped: true }, incremented) &&
+      same({ ...merged, deduped: true }, appended);
+    answer.a_set_after_a_partial_update_under_one_authored_key_is_answered_without_its_value =
+      same(withoutValue, replaced) &&
+      !("value" in replaced) &&
+      held.version === merged.version &&
+      held.value?.title === "first" &&
+      held.value?.count === 1 &&
+      same(held.value?.tags, []);
+    const seeded = await write(
+      store,
+      "set",
+      { key: "other", value: { title: "set", tags: [], count: 0 } },
+      ctx(execution("authored_ops_5")),
+      authored(store, "evt-set"),
+    );
+    const crossed = await refusal(
+      write(store, "incr", { key: "other", field: "count" }, ctx(execution("authored_ops_6")), authored(store, "evt-set")),
+    );
+    const other = await get(store, "other", ctx(execution("authored_ops_read")));
+    answer.a_partial_update_after_a_set_under_one_authored_key_fails_naming_both =
+      seeded.applied === true &&
+      (crossed ?? "").includes("for a `set`, and this write is a `incr`") &&
+      (crossed ?? "").includes("holds no answer in a `incr`'s shape") &&
+      other.version === seeded.version &&
+      other.value?.count === 0;
+    answer.authored_ops_trace = { merged, incremented, appended, replaced, held, seeded, crossed, other };
+  } catch (error) {
+    answer.authored_ops_error = String(error?.stack ?? error);
   }
 }
 

@@ -823,10 +823,14 @@ second session's partition is not written. A `scope: execution` store's
 partition is one run's and dies with it — no second execution ever reaches it —
 so `idempotency_key:` there is refused.
 
-**One key, one write.** Two nodes may name one key, and the answer the second
-is handed is the first write's. If the two are different ops — a `set` and a
-`delete` under one key — the second fails naming both, rather than taking an
-answer its own output does not describe: give them distinct keys.
+**One key, one answer.** Two nodes may name one key, and the answer the second
+is handed is the first write's, `deduped: true`. Different ops share it where
+the first's answer fits the second's output: `merge`, `append` and `incr`
+answer one another whole, and a `set` after any of them is answered without
+the `value`, which a `set` does not output. Where it does not fit — a partial
+update after a `set`, whose answer has no `value`, or a `delete` or a `batch`
+beside another op — the second fails naming both, rather than taking an answer
+its own output does not describe: give them distinct keys.
 
 **Retention follows the store, and this is the trade.** A derived ledger row
 goes when its execution settles. An authored row belongs to no execution, so it
