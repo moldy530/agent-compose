@@ -1998,11 +1998,13 @@ function refused(
 // condition that does not hold rolls every earlier entry back to the savepoint
 // taken before the first, and the batch answers `applied: false` naming that
 // entry's index as `failed` — an answer like a declined `set`'s, so it is the
-// ledger row too, and a retry answers it again. A value `value_schema` refuses
-// throws, and the transaction takes everything with it but the error: the
-// node fails, as a partial update whose result the schema refuses does, with
-// no version consumed. A crash anywhere between the first entry and the
-// `COMMIT` is a transaction that never committed, on every arm.
+// ledger row too, and a retry answers it again. An entry's value is checked
+// against `value_schema` exactly as its single op's is — by CEL typing at
+// `validate`, the check PRD resolved q68 gives a store-op node — and written
+// as it evaluated, so no entry is refused here that its `set` would not be. A
+// statement that fails throws, and the transaction takes everything with it
+// but the error, with no version consumed. A crash anywhere between the first
+// entry and the `COMMIT` is a transaction that never committed, on every arm.
 
 /** The most entries one `batch` applies (grammar 11.4, PRD resolved q71). */
 const BATCH_MAX_ENTRIES = 100;
@@ -2053,33 +2055,20 @@ type BatchStep =
   | { readonly effect: "write"; readonly value: unknown };
 
 /**
- * One `batch` entry, decided: a `set` entry's value held to `value_schema`,
- * then [`decideKvWrite`] over what its key held — the very decision a single
- * `set` or `delete` makes, with the same conditions, so an entry cannot mean
- * anything its single op would not.
+ * One `batch` entry, decided: [`decideKvWrite`] over what its key held — the
+ * very decision a single `set` or `delete` makes, with the same conditions,
+ * so an entry cannot mean anything its single op would not.
  *
- * The value is held to the store's `value_schema` by the emitted Zod, as a
- * partial update's result is. A single `set` node's value is typed by CEL at
- * `validate` and written as it evaluated; a batch's entries are typed the same
- * way and checked again here, because a batch is all of them or none: one
- * value the schema refuses — a pattern, a bound, an enum member no type
- * decides — fails the node with nothing written rather than landing beside
- * the entries that fit.
+ * A `set` entry's value is not parsed against the store's `value_schema`
+ * here, because a single `set` node's is not: the schema check PRD resolved
+ * q71 gives every entry is q68's — CEL typing at `validate` for a store-op
+ * node, the emitted Zod at run time for a tool's arguments — and a batch is a
+ * node's alone. So an entry is written as its CEL evaluated, exactly as the
+ * `set` it spells would be, and a constraint CEL typing does not decide — a
+ * bound, a pattern — holds of an entry no more and no less than of that `set`
+ * (grammar 11.4's schema evolution).
  */
-function batchStep(
-  store: StoreBinding,
-  index: number,
-  entry: BatchEntryParams,
-  held: Held | undefined,
-): BatchStep {
-  if (entry.op === "set" && store.value !== undefined) {
-    const parsed = store.value.safeParse(entry.value);
-    if (!parsed.success) {
-      throw new Error(
-        `\`${store.address}\` refused the \`batch\` at its entry ${index}, a \`set\` at key ${JSON.stringify(entry.key)}: the value is one the store's \`value_schema\` does not admit — ${runtime.describeIssues(entry.value, parsed.error?.issues ?? [])}. Nothing was written: a batch lands every one of its entries or none of them (grammar 11.4, PRD resolved q71)`,
-      );
-    }
-  }
+function batchStep(store: StoreBinding, entry: BatchEntryParams, held: Held | undefined): BatchStep {
   const decision = decideKvWrite(store, entry.op, entry, held, "node");
   switch (decision.effect) {
     case "none":
@@ -2339,7 +2328,7 @@ function localBatch(
   database.exec("SAVEPOINT batch_entries");
   const results: Record<string, unknown>[] = [];
   for (const [index, entry] of entries.entries()) {
-    const step = batchStep(store, index, entry, localHeld(database, scopeKey, entry.key, now));
+    const step = batchStep(store, entry, localHeld(database, scopeKey, entry.key, now));
     if (step.effect === "none") {
       database.exec("ROLLBACK TO SAVEPOINT batch_entries");
       database.exec("RELEASE SAVEPOINT batch_entries");
@@ -3518,12 +3507,11 @@ class RemoteKv {
    *
    * An entry whose condition does not hold rolls the entries back to the
    * savepoint and the batch answers its decline, which the ledger row then
-   * holds; a value the schema refuses, a lost connection or a server that
-   * fails a statement throws, and the `ROLLBACK` takes every entry, the
-   * versions they would have taken and the sweep with it. A connection that
-   * dies between two entries — the process killed, the session ended by the
-   * server — is a transaction that never reached its `COMMIT`, which the
-   * server rolls back the same way.
+   * holds; a lost connection or a server that fails a statement throws, and
+   * the `ROLLBACK` takes every entry, the versions they would have taken and
+   * the sweep with it. A connection that dies between two entries — the
+   * process killed, the session ended by the server — is a transaction that
+   * never reached its `COMMIT`, which the server rolls back the same way.
    */
   async #batch(
     store: StoreBinding,
@@ -3570,7 +3558,7 @@ class RemoteKv {
           'SELECT value, version, expires_at FROM store_entries WHERE store = ? AND scope_key = ? AND "key" = ? FOR UPDATE',
           [store.name, scopeKey, entry.key],
         );
-        const step = batchStep(store, index, entry, heldRow(found[0], now));
+        const step = batchStep(store, entry, heldRow(found[0], now));
         if (step.effect === "none") {
           failed = index;
           break;

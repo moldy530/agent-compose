@@ -2839,8 +2839,11 @@ async function sequenceLast(store, scopeKey = "global") {
   return held[0] === undefined ? undefined : Number(held[0].last);
 }
 
-/** The schema the batch cases hold their `set` entries' values to. */
-const BATCHED = z.object({ n: z.number().int().min(0), hold: z.boolean().optional() }).strict();
+/**
+ * The batch cases' `value_schema`, as the emitted Zod — which a `set` entry's
+ * value is not parsed against at run time, as a single `set`'s is not.
+ */
+const BATCHED = z.object({ n: z.number().int().min(0) }).strict();
 
 {
   // **A set, a set and a delete land together**, the two sets taking the
@@ -2957,31 +2960,46 @@ const BATCHED = z.object({ n: z.number().int().min(0), hold: z.boolean().optiona
 }
 
 {
-  // **A value the schema refuses fails the batch and changes nothing**: the
-  // entry before it, written inside the transaction, is rolled back, the
-  // entry after it never runs, no version is consumed, and no ledger row is
-  // left, so a retry is refused again rather than answered.
-  const store = kv("batch_refused", "global", URL_ENV, BATCHED);
-  const run = ctx(execution("batch_refused"));
-  const kept = await set(store, "kept", { n: 7 }, run, `${RUN}/batch_refused/seed`);
-  const key = `${execution("batch_refused")}/move/0`;
-  const ops = [
-    { op: "set", key: "e", value: { n: 1 } },
-    { op: "set", key: "f", value: { n: -1 } },
-    { op: "delete", key: "kept" },
-  ];
-  const refused = await refusal(batch(store, ops, run, key));
-  answer.batch_refusal = refused ?? null;
-  answer.a_value_the_schema_refuses_at_index_1_fails_the_node_and_leaves_the_partition_unchanged =
-    refused !== undefined &&
-    refused.includes(`refused the \`batch\` at its entry 1, a \`set\` at key "f"`) &&
-    refused.includes("Nothing was written") &&
-    (await get(store, "e", run)).found === false &&
-    (await get(store, "f", run)).found === false &&
-    (await get(store, "kept", run)).version === kept.version &&
-    (await sequenceLast(store)) === kept.version &&
-    (await ledgerRows(store, key)) === 0 &&
-    (await refusal(batch(store, ops, run, key))) !== undefined;
+  // **A `set` entry's schema check is its single op's** (PRD resolved q71,
+  // which names q68's): CEL typing at `validate` for a store-op node, and no
+  // Zod at run time. So a value the store's emitted Zod would refuse — `n: -1`
+  // under a `min(0)` no CEL type decides — is written by a single `set` and by
+  // that same `set` as a batch entry alike, rather than landing one way and
+  // failing the node the other; the entry before it and the `delete` after it
+  // land beside it, each `set` at the partition's next version.
+  const store = kv("batch_typed_once", "global", URL_ENV, BATCHED);
+  const run = ctx(execution("batch_typed_once"));
+  const single = await set(store, "single", { n: -1 }, run, `${RUN}/batch_typed_once/single`);
+  const kept = await set(store, "kept", { n: 7 }, run, `${RUN}/batch_typed_once/seed`);
+  const moved = await batch(
+    store,
+    [
+      { op: "set", key: "e", value: { n: 1 } },
+      { op: "set", key: "f", value: { n: -1 } },
+      { op: "delete", key: "kept" },
+    ],
+    run,
+    `${execution("batch_typed_once")}/move/0`,
+  );
+  const [alone, e, f, gone] = await Promise.all(
+    ["single", "e", "f", "kept"].map((name) => get(store, name, run)),
+  );
+  answer.batch_typed_once = moved;
+  answer.a_batch_set_entry_writes_the_value_a_single_set_writes =
+    BATCHED.safeParse({ n: -1 }).success === false &&
+    single.applied === true &&
+    alone.value?.n === -1 &&
+    moved.applied === true &&
+    same(moved.results, [
+      { key: "e", version: kept.version + 1 },
+      { key: "f", version: kept.version + 2 },
+      { key: "kept" },
+    ]) &&
+    e.value?.n === 1 &&
+    f.value?.n === -1 &&
+    f.version === kept.version + 2 &&
+    gone.found === false &&
+    (await sequenceLast(store)) === kept.version + 2;
 }
 
 {
@@ -3270,8 +3288,8 @@ async function heldUncommitted(store, key) {
 {
   // **A batch killed between two entry writes leaves none of it** — on every
   // arm, by killing the writing process outright. `store-batch-crash.mjs` seeds
-  // a key, then runs a batch whose second entry's value holds the schema's
-  // refinement open for ever, after its first entry was written inside the
+  // a key, then runs a batch whose second entry's value holds its own
+  // serialization open for ever, after its first entry was written inside the
   // transaction; this process waits for the marker that says so, proves the
   // first entry was really written (SQLite's rollback journal is on disk; a
   // server holds an uncommitted insert of the key), and sends `SIGKILL`. What

@@ -189,6 +189,20 @@ state:
     properties:
       name: { type: string }
     default: { name: "nothing was batched" }
+  # …and what `flow.typed`'s `set` and one-entry `batch` left of one value
+  # its store's emitted Zod would refuse: the keys, and the batched record.
+  typed_keys:
+    description: The keys `flow.typed`'s `set` and `batch` left, in byte order.
+    type: array
+    max_items: 10
+    items: { type: string }
+    default: []
+  typed_batched:
+    description: The record `flow.typed`'s `batch` entry wrote.
+    type: object
+    properties:
+      name: { type: string }
+    default: { name: "nothing was batched" }
 
 provider.mock:
   kind: anthropic
@@ -914,6 +928,63 @@ flow.batch_each:
     - { from: each, to: counted }
     - { from: counted, to: last }
     - { from: last, to: end }
+
+# PRD resolved q71's "every entry's schema check is q68's", end to end: a `set`
+# node and a `batch` whose one entry is that same `set` write one value — an
+# empty `name` under a `min_length: 1` that CEL typing does not decide — and
+# both land. A store-op node's value is typed against `value_schema` at
+# `validate` and not parsed against the emitted Zod at run time (q68's schema
+# evolution), and a `batch` entry is held to exactly what its single op is.
+store.typed:
+  kind: kv
+  scope: execution
+  description: One record a `set` wrote and one a `batch` entry wrote.
+  value_schema:
+    name: { type: string, min_length: 1 }
+
+flow.typed:
+  description: Write one value with a `set` and again with a `batch` entry, and read both back.
+  inputs:
+    name:
+      type: string
+  outputs:
+    typed_keys:
+      type: array
+      max_items: 10
+      items: { type: string }
+    typed_batched:
+      type: object
+      properties:
+        name: { type: string }
+  nodes:
+    one_set:
+      store: store.typed
+      op: set
+      key: "'single'"
+      value: { name: "input.name" }
+    one_batch:
+      store: store.typed
+      op: batch
+      ops:
+        - { op: set, key: "'batched'", value: { name: "input.name" } }
+    typed_page:
+      store: store.typed
+      op: list
+      limit: 10
+      writes:
+        keys: typed_keys
+    typed_read:
+      store: store.typed
+      op: get
+      key: "'batched'"
+      writes:
+        value: typed_batched
+  edges:
+    - { from: start, to: one_set }
+    - { from: one_set, to: one_batch }
+    - { from: one_batch, to: typed_page }
+    - { from: typed_page, to: typed_read }
+    - { from: typed_read, to: end }
 
 # PRD resolved q70, end to end: a `kv` store written by a fan-out and then read
 # back the way a flow reads one too large for one answer — a page at a time,

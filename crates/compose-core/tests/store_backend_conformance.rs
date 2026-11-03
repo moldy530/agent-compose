@@ -819,12 +819,14 @@ const TRUE_EVERYWHERE: &[&str] = &[
     // PRD resolved q71: a `batch` is one transaction on every arm — a set, a
     // set and a delete land together at consecutive versions; a condition
     // failing at index 2 takes indexes 0 and 1 back and answers `failed: 2`; a
-    // value the schema refuses fails the batch with nothing written and no
-    // version consumed; later entries read what earlier ones left; each
-    // entry's `ttl` and the store's default apply as on one write.
+    // `set` entry's value is checked as a single `set`'s is (q68: CEL typing
+    // at `validate`, no run-time Zod for a node), so a value the emitted Zod
+    // would refuse is written by both alike; later entries read what earlier
+    // ones left; each entry's `ttl` and the store's default apply as on one
+    // write.
     "a_batch_of_set_set_delete_lands_all_three_with_consecutive_versions",
     "a_failed_condition_at_index_2_leaves_indexes_0_and_1_unapplied",
-    "a_value_the_schema_refuses_at_index_1_fails_the_node_and_leaves_the_partition_unchanged",
+    "a_batch_set_entry_writes_the_value_a_single_set_writes",
     "a_duplicate_key_within_a_batch_applies_in_order",
     "an_entry_condition_reads_what_the_entries_before_it_left",
     "each_batch_entrys_ttl_and_the_store_default_apply",

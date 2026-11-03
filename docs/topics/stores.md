@@ -518,9 +518,14 @@ its `ttl`, else the store's `default_ttl:` — exactly as one `set` would.
 **The first entry that cannot land decides the whole batch.** An entry whose
 condition does not hold applies **nothing** — the entries before it included —
 and the batch answers `applied: false`, `results: []` and `failed:` with that
-entry's index, counted from 0: a result to route on, as `move` above does. A
-`set` entry whose value `value_schema` refuses **fails the node**, names the
-entry, and writes nothing.
+entry's index, counted from 0: a result to route on, as `move` above does.
+
+**An entry is typed as its single op is.** A `set` entry's value is checked
+against `value_schema` by CEL typing at `validate` — exactly the check a `set`
+node's value gets (schema evolution, above) — and written as it evaluated, so a
+value one `set` would write, its batch entry writes too. A batch that fails — a
+statement the store refuses, a lost connection — fails the node and writes
+nothing.
 
 **One effect, one answer.** A batch is one write carrying the node's one
 idempotency key, and its whole answer — a decline included — is what a retry

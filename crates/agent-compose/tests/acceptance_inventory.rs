@@ -931,6 +931,13 @@ const CODEGEN: &[Criterion] = &[
                 "a_map_of_batches_lands_every_instances_entries",
                 Status::Live,
             ),
+            // …and a batch's `set` entry is held to exactly what a single `set`
+            // is: q68's schema check, CEL typing at `validate` and no run-time
+            // Zod for a node, so one value lands by either.
+            (
+                "a_batch_set_entry_is_held_to_what_a_single_set_is",
+                Status::Live,
+            ),
         ],
     },
     Criterion {

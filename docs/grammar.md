@@ -4433,10 +4433,14 @@ Rules (PRD 5.8):
     whose condition does not hold applies **nothing** of the batch, the
     entries before it included, and the batch answers `applied: false`,
     `results: []` and `failed:` that entry's index (from 0) — a normal result
-    an edge routes on, as a declined `set`'s is. A `set` entry whose value `V`
-    refuses — held to the emitted Zod as the batch reaches it, beside the CEL
-    typing every entry gets at `validate` — **fails the node**, naming the
-    entry, with nothing written and no version consumed.
+    an edge routes on, as a declined `set`'s is.
+  - **Typed as its single op is.** A `set` entry's value is checked against
+    `V` by CEL typing at `validate` — the check a `set` node gets (schema
+    evolution, below) — and written as it evaluated; the runtime does not
+    parse it against the emitted Zod, so a batch holds an entry to no more and
+    no less of `V` than the `set` it spells. A batch that fails — a statement
+    the store refuses, a connection lost — fails the node with nothing
+    written and no version consumed.
   - **Expiry per entry.** Each `set` entry's key takes its own expiry from
     the one clock the batch reads — its `ttl`, else the store's
     `default_ttl:`, else none — exactly as a single write's; a `delete` entry
@@ -11533,10 +11537,10 @@ exactly the single op of its name — and applies them to one partition in
 order, each reading its key as the ones before it left it, each `set` entry
 taking the partition's next version and its own expiry; the first entry whose
 condition does not hold applies nothing of the batch and answers
-`applied: false` with its index as `failed`, and a `set` entry whose value `V`
-refuses fails the node with nothing written. The batch carries the node's one
-§9.4 key and its whole answer is one ledger row, so a retry answers what the
-first attempt did. It answers
+`applied: false` with its index as `failed`, and every entry's value is
+checked against `V` as its single op's is — CEL typing at `validate`, no
+run-time parse. The batch carries the node's one §9.4 key and its whole answer
+is one ledger row, so a retry answers what the first attempt did. It answers
 `{ applied, deduped, results: array<{ key, version (optional) }>, failed (optional) }`,
 is admitted inside a `map` as a keyed `kv` write, and is offered to no agent
 (§8.8, §11.4, §11.5, PRD resolved q71).
@@ -11584,14 +11588,18 @@ the decline, never re-run against a state that changed since, which is the
 same "the ledger answers whole" D152 gives every write. `failed` names the
 entry because one `applied` cannot say which of a hundred conditions lost.
 
-**A value is held to `V` twice.** Every `set` entry's value is CEL-typed against
-`V` at `validate`, as a `set`'s is, and the batch holds it to the emitted Zod
-again as it reaches it — the check the partial updates already make of the
-value they commit. A single `set` writes what its CEL evaluated; a batch cannot,
-because one value `V` refuses on a bound, a pattern or an enum no type decides
-would otherwise land beside the entries that fit. So it fails the node, naming
-the entry, and the transaction takes the earlier entries and the versions they
-took with it.
+**A value is typed once, as its single op's is.** The ruling gives every entry
+q68's schema check, and q68's is CEL typing at `validate` for a store-op node
+and the emitted Zod at run time for a tool's arguments — a batch is a node's
+alone, so its `set` entries are CEL-typed against `V` at `validate` exactly as a
+`set`'s value is, and written as they evaluated. Parsing them against the Zod
+as well would make an entry stricter than the op it spells: one value — an
+empty string under a `min_length:`, a number past a bound CEL typing does not
+decide — would land from a `set` node and fail the node from a batch, and the
+schema-evolution rule (§11.4) would stop being true of every node write. What
+CEL typing cannot decide, a batch holds no more than a `set` does; the partial
+updates parse what they commit because they build on a *stored* value, and no
+entry does.
 
 **Taken once, applied N times.** On every arm the batch is one write's shape
 with N entries inside it: the partition's sequence lock and the ledger check

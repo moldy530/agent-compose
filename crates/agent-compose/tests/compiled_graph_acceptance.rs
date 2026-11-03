@@ -12183,6 +12183,42 @@ fn a_map_of_batches_lands_every_instances_entries() {
     );
 }
 
+/// A `batch` entry's value is held to exactly what a single `set`'s is (grammar
+/// 11.4, PRD resolved q71's "every entry's schema check is q68's").
+///
+/// `flow.typed` writes one value with a `set` node and again as a one-entry
+/// `batch` — an empty `name` under the store's `min_length: 1`, which CEL
+/// typing at `validate` does not decide and the emitted Zod would refuse.
+/// q68 types a store-op node's value at `validate` and parses it at run time
+/// for a tool's arguments only, so both land: the run succeeds, both keys are
+/// there, and the batched record is the empty name, as written. A batch that
+/// held its entries to the Zod a `set` is never held to would fail the second
+/// node on the value the first had just written.
+#[test]
+fn a_batch_set_entry_is_held_to_what_a_single_set_is() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(run) = harness::invoke_with(
+        "stores",
+        "flow.typed",
+        &json!({ "name": "" }),
+        &harness::environment(&provider),
+    ) else {
+        return;
+    };
+    run.succeeded();
+    let outputs = run.outputs();
+    assert_eq!(
+        outputs["typed_keys"],
+        json!(["batched", "single"]),
+        "the `set` and the `batch` entry both wrote the value: {outputs}"
+    );
+    assert_eq!(
+        outputs["typed_batched"],
+        json!({ "name": "" }),
+        "the batch entry wrote its value as its CEL evaluated: {outputs}"
+    );
+}
+
 /// The names a long walk stocks its store with: `k000` up, written in reverse
 /// so the order the pages come back in is the store's rather than the input's.
 fn stock(count: usize) -> Vec<String> {
