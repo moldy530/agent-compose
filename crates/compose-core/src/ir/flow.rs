@@ -12,7 +12,8 @@ use crate::ast::common::{
     Address, Cel, ControlTarget, Duration, EdgeSource, EdgeTarget, Ident, Literal, PathExpr,
 };
 use crate::ast::flow::{
-    CoderWorkspace, FlowContext, Harness, PermissionMode, StoreCondition, StoreOp, WorkspaceAccess,
+    CoderWorkspace, FlowContext, Harness, PermissionMode, StoreCondition, StoreOp, StoreTtl,
+    WorkspaceAccess,
 };
 use crate::diag::{Span, Spanned};
 
@@ -275,6 +276,11 @@ pub struct StoreParams {
     /// `if_version:` — the version the key must hold for the write to apply.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub if_version: Option<Spanned<Cel>>,
+    /// `ttl:` — how long the key a `kv` write leaves lives: a duration, or
+    /// `never`; absent means the store's `default_ttl:`, if it declares one
+    /// (PRD resolved q69).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<Spanned<StoreTtl>>,
 }
 
 /// A store op's `value:`: one expression on a `vector upsert` and a `blob put`,

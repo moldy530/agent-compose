@@ -1,0 +1,16 @@
+# rule: a `kv` write's `ttl:` is a literal duration (`<positive integer><ms|s|m|h>`) or `never` (grammar 4.4, 11.4, PRD resolved q69)
+# at: /flow.demo/nodes/claim/ttl
+# via: /$defs/storeNode/properties/ttl/oneOf
+flow.demo:
+  outputs: {}
+  nodes:
+    claim:
+      store: store.leases
+      op: set
+      key: "'job-1'"
+      if: absent
+      value: { owner: "'me'" }
+      ttl: 5 minutes
+  edges:
+    - { from: start, to: claim }
+    - { from: claim, to: end }

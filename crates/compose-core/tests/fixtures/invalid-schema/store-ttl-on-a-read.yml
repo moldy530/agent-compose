@@ -1,0 +1,15 @@
+# rule: `ttl:` is a parameter of the four `kv` writes that leave a key holding a value — `set`, `merge`, `append`, `incr` — and a read writes nothing to expire (grammar 11.4, PRD resolved q69)
+# at: /flow.demo/nodes/load/ttl
+# via: /$defs/storeNode/allOf/0/then/properties/ttl
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    load:
+      store: store.memory
+      op: get
+      key: "execution.session_key"
+      ttl: 30s
+  edges:
+    - { from: start, to: load }
+    - { from: load, to: end }

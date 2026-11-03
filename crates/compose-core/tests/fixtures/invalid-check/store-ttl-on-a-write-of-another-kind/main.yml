@@ -1,0 +1,22 @@
+# rule: a `ttl:` is a `kv` write's, and the store decides the kind — a `set` with a `ttl:` on a `blob` store is refused against the store it names (grammar 11.4, PRD resolved q69)
+# code: invalid-value
+# message: node `keep` asks `store.artifacts` for a `set`, which a `blob` store does not take
+# at: main.yml:14:14
+# help: a `blob` store takes `put`, `get`, `delete`, `list` (grammar 11.4)
+version: "0.1"
+store.artifacts:
+  kind: blob
+  scope: global
+flow.f:
+  outputs: {}
+  nodes:
+    keep:
+      store: store.artifacts
+      op: set
+      key: "'report.txt'"
+      value:
+        title: "'t'"
+      ttl: 1h
+  edges:
+    - { from: start, to: keep }
+    - { from: keep, to: end }

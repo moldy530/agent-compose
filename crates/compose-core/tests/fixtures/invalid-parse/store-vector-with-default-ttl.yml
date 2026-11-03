@@ -1,0 +1,12 @@
+# rule: `default_ttl` is a `kv` key, and an expiry is a `kv` key's alone (grammar 11.1, PRD resolved q69)
+# code: conflicting-keys
+# message: `default_ttl` is not legal on a `vector` store
+# at: 12:3
+# help: an expiry is a `kv` key's: `default_ttl:` is how long the key a `kv` write leaves lives when the write names no `ttl:`, and no `vector` or `blob` op leaves one (grammar 11.1, PRD resolved q69)
+store.docs:
+  kind: vector
+  scope: global
+  embed:
+    model: text-embedding-3-small
+    provider: provider.openai
+  default_ttl: 24h

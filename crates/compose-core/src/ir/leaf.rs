@@ -72,7 +72,8 @@ use crate::ast::definition::{
 use crate::ast::deploy::{BackendProvider, EventSourceKind, PluginValue, TraceSinkFormat};
 use crate::ast::document::Reduce;
 use crate::ast::flow::{
-    CoderWorkspace, FlowContext, Harness, PermissionMode, StoreCondition, StoreOp, WorkspaceAccess,
+    CoderWorkspace, FlowContext, Harness, PermissionMode, StoreCondition, StoreOp, StoreTtl,
+    WorkspaceAccess,
 };
 use crate::ast::schema::{Number, ScalarKind, StringFormat, Surface};
 use crate::ast::trigger::{HmacAlgorithm, Respond, SignatureEncoding, TriggerMethod};
@@ -183,7 +184,7 @@ macro_rules! serialize_as_text {
     };
 }
 
-serialize_as_text!(Cel, Duration, Ident, PathExpr);
+serialize_as_text!(Cel, Duration, Ident, PathExpr, StoreTtl);
 
 /// A built-in is written as the **address** its entry key spells —
 /// `builtin.bash`, not `bash` — because that key is what the author wrote and

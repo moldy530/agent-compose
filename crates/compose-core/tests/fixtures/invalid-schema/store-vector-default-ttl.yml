@@ -1,0 +1,10 @@
+# rule: `default_ttl:` is a kv key — an expiry is a kv key's, and no vector op leaves one (grammar 11.1, PRD resolved q69)
+# at: /store.docs/default_ttl
+# via: /$defs/storeDef/allOf/1/then/properties/default_ttl
+store.docs:
+  kind: vector
+  scope: global
+  embed:
+    model: text-embedding-3-small
+    provider: provider.openai
+  default_ttl: 24h

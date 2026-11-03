@@ -1,0 +1,16 @@
+# rule: `ttl:` is on the four `kv` writes that leave a key holding a value, and a `delete` leaves none (grammar 11.4, PRD resolved q69)
+# code: invalid-value
+# message: `ttl` is not a parameter of the `delete` op
+# at: 13:7
+# help: `delete` takes `key`, `if_version`; `ttl:` is how long a `kv` write's key lives, and only `set`, `merge`, `append`, `incr` take one — a `delete` leaves no `kv` key holding a value to expire (grammar 11.4, PRD resolved q69)
+flow.demo:
+  outputs: {}
+  nodes:
+    release:
+      store: store.leases
+      op: delete
+      key: "'job-1'"
+      ttl: 30s
+  edges:
+    - { from: start, to: release }
+    - { from: release, to: end }

@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::ast::common::{Address, Ident, Interpolated, Literal};
+use crate::ast::common::{Address, Duration, Ident, Interpolated, Literal};
 use crate::ast::definition::{
     AgentAccess, Builtin, ProviderKind, RouteCondition, StoreKind, StoreScope,
 };
@@ -136,6 +136,11 @@ pub struct Store {
     /// `agent_access:` — absent means the default, `read_write`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_access: Option<AgentAccess>,
+    /// `default_ttl:` — `kv` only: how long the key a write that names no
+    /// `ttl:` leaves lives. Absent means such a key never expires (PRD resolved
+    /// q69).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_ttl: Option<Spanned<Duration>>,
 }
 
 /// A vector store's `embed:` block (grammar 11.2).

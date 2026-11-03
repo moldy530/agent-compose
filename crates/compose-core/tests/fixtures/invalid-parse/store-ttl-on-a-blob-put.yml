@@ -1,0 +1,18 @@
+# rule: `ttl:` is a `kv` write's parameter, and no `vector` or `blob` op takes one (grammar 11.4, PRD resolved q69)
+# code: invalid-value
+# message: `ttl` is not a parameter of the `put` op
+# at: 15:7
+# help: `put` takes `key`, `value`, `content_type`; `ttl:` is how long a `kv` write's key lives, and only `set`, `merge`, `append`, `incr` take one — a `put` leaves no `kv` key holding a value to expire (grammar 11.4, PRD resolved q69)
+flow.demo:
+  outputs: {}
+  nodes:
+    save:
+      store: store.artifacts
+      op: put
+      key: "'report.txt'"
+      value: "'the report'"
+      content_type: text/plain
+      ttl: 1h
+  edges:
+    - { from: start, to: save }
+    - { from: save, to: end }

@@ -78,6 +78,7 @@ Spec(
                         agent_access: Some(
                             Read @ 24:17..24:21,
                         ),
+                        default_ttl: None,
                     },
                 ),
                 span: 12:1..24:21,

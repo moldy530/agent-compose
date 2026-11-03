@@ -376,6 +376,7 @@ const storeLedger: stores.StoreBinding = {
   description: "Who holds what, and how often it was touched.",
   metadata: false,
   value: storeLedgerValueSchema,
+  defaultTtl: 86400000,
   backend: {
     provider: "sqlite",
     from: "the `local` target substitutes local storage for every store unconditionally",
@@ -1413,6 +1414,7 @@ const flowShapeNodeClaim: runtime.NodeDescriptor = {
       "hits": runtime.toJson(runtime.evaluate("0", roots)),
     },
     condition: "absent",
+    ttl: 90000,
   }),
   run: async (input, context, view) => ({
     output: await stores.runStoreOp(
@@ -1443,6 +1445,7 @@ const flowShapeNodeStamp: runtime.NodeDescriptor = {
     value: runtime.toJson(runtime.evaluate("state.latest", roots)),
     field: "marks",
     unique: true,
+    ttl: "never",
   }),
   run: async (input, context, view) => ({
     output: await stores.runStoreOp(
@@ -1472,6 +1475,7 @@ const flowShapeNodeTick: runtime.NodeDescriptor = {
     key: String(runtime.toJson(runtime.evaluate("input.goal", roots))),
     field: "hits",
     by: Number(runtime.toJson(runtime.evaluate("2", roots))),
+    ttl: 300000,
   }),
   run: async (input, context, view) => ({
     output: await stores.runStoreOp(

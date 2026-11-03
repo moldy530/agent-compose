@@ -1,0 +1,9 @@
+# rule: a store's `default_ttl:` is a literal duration; `never` is a write's override, and a store with no default already keeps its keys (grammar 4.4, 11.1, PRD resolved q69)
+# at: /store.sessions/default_ttl
+# via: /$defs/duration/pattern
+store.sessions:
+  kind: kv
+  scope: global
+  default_ttl: never
+  value_schema:
+    user: { type: string }
