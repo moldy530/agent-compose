@@ -526,6 +526,19 @@ export interface StoreSite {
 }
 
 /**
+ * Who issued an op, as far as what it does depends on it: one of the two
+ * consumption surfaces of PRD 5.8 — whose op is recorded, journaled and, on a
+ * node's write, keyed — or an **operator** at the project's command line (PRD
+ * resolved q72), whose op is none of those ([`runOperatorOp`]).
+ *
+ * What it decides below is narrow, and the same for an operator as for a node:
+ * a partial update its result's schema refuses is a plain `Error` for both, and
+ * a [`runtime.ToolCallRefused`] only for a tool, whose caller is a model that
+ * can make the call again (Decision D119, [`refused`]).
+ */
+type Issuer = StoreSite["via"] | "operator";
+
+/**
  * The ops that write, which are the ones a key and a dedupe apply to.
  *
  * Every other op is a **read**: recorded, answered out of the record on a
@@ -1801,7 +1814,7 @@ function decideKvWrite(
   op: StoreOp,
   params: StoreParams,
   held: Held | undefined,
-  via: StoreSite["via"],
+  via: Issuer,
 ): KvDecision {
   const key = required(params.key, "key", store);
   // A condition that does not hold answers what the key still holds, on a
@@ -1857,7 +1870,7 @@ function partialUpdate(
   key: string,
   params: StoreParams,
   held: Held | undefined,
-  via: StoreSite["via"],
+  via: Issuer,
 ): { readonly value: Record<string, unknown>; readonly changed: boolean } {
   const stored = absent(held) ? {} : held.value;
   if (stored === null || typeof stored !== "object" || Array.isArray(stored)) {
@@ -1897,7 +1910,7 @@ function admitted(
   op: StoreOp,
   key: string,
   value: unknown,
-  via: StoreSite["via"],
+  via: Issuer,
 ): void {
   const schema = store.value;
   if (schema === undefined) return;
@@ -1921,7 +1934,7 @@ function refused(
   op: StoreOp,
   key: string,
   detail: string,
-  via: StoreSite["via"],
+  via: Issuer,
 ): Error {
   const message = `\`${store.address}\` refused the \`${op}\` at key ${JSON.stringify(key)}: the value it would leave is one the store's \`value_schema\` does not admit — ${detail}. Nothing was written: a \`merge\`, \`append\` or \`incr\` holds the whole value it commits to the schema, what was already stored included (grammar 11.4, PRD resolved q68)`;
   return via === "tool" ? new runtime.ToolCallRefused(message) : new Error(message);
@@ -1990,7 +2003,7 @@ async function perform(
   scopeKey: string,
   execution: runtime.ExecutionIdentity,
   idempotencyKey: string | undefined,
-  via: StoreSite["via"],
+  via: Issuer,
   signal: AbortSignal,
 ): Promise<Applied> {
   if (store.kind === "blob") {
@@ -2065,7 +2078,7 @@ function localKv(
   params: StoreParams,
   scopeKey: string,
   database: Database,
-  via: StoreSite["via"],
+  via: Issuer,
 ): Record<string, unknown> {
   const now = localNow();
   switch (op) {
@@ -2884,7 +2897,7 @@ async function dialled(
   params: StoreParams,
   scopeKey: string,
   idempotencyKey: string | undefined,
-  via: StoreSite["via"],
+  via: Issuer,
 ): Promise<Applied> {
   const connection = await connectionFor(store);
   return await connection.apply(store, op, params, scopeKey, idempotencyKey, via);
@@ -2947,7 +2960,7 @@ class RemoteKv {
     params: StoreParams,
     scopeKey: string,
     idempotencyKey: string | undefined,
-    via: StoreSite["via"],
+    via: Issuer,
   ): Promise<Applied> {
     return this.#serial(() => this.#apply(store, op, params, scopeKey, idempotencyKey, via));
   }
@@ -3006,6 +3019,37 @@ class RemoteKv {
     });
   }
 
+  /**
+   * One page of a partition's live entries with their expiry — what an
+   * operator's `export` walks (PRD resolved q72, [`operatorPage`]).
+   *
+   * A read like [`#read`]'s: one statement, no transaction, the server's own
+   * clock in its `WHERE` — so a page sees exactly the keys a `get` would — and
+   * the first op on the store over this connection starts its store-wide
+   * sweep behind it, as every op's does.
+   */
+  page(store: StoreBinding, scopeKey: string, params: OperatorPageParams): Promise<OperatorPage> {
+    return this.#serial(async () => {
+      if (!this.#sweeps.has(store.name)) this.#startSweep(store);
+      const offset = clockOffset();
+      const read = operatorPageRead(params, {
+        from: "store_entries WHERE store = ? AND scope_key = ?",
+        bound: [store.name, scopeKey],
+        now: { sql: `(${this.#driver.dialect.clock}) + ?`, bound: [offset] },
+      });
+      return read.answer(await this.#all(read.query.sql, read.query.bound));
+    });
+  }
+
+  /**
+   * The instant this server says it is, shifted as every expiry it judges is
+   * ([`STORE_CLOCK_OFFSET`]) — what an operator's `import` turns a line's
+   * `expires_at` into a remaining `ttl` against (PRD resolved q72).
+   */
+  clock(): Promise<number> {
+    return this.#serial(() => this.#now());
+  }
+
   /** Give the connection back. */
   close(): Promise<void> {
     this.#closing = true;
@@ -3049,7 +3093,7 @@ class RemoteKv {
     params: StoreParams,
     scopeKey: string,
     idempotencyKey: string | undefined,
-    via: StoreSite["via"],
+    via: Issuer,
   ): Promise<Applied> {
     // The first op on a store over this connection starts its store-wide
     // sweep — **behind** this op, at the tail of the queue it is running on,
@@ -3129,7 +3173,7 @@ class RemoteKv {
     params: StoreParams,
     scopeKey: string,
     idempotencyKey: string | undefined,
-    via: StoreSite["via"],
+    via: Issuer,
   ): Promise<Applied | undefined> {
     const key = required(params.key, "key", store);
     await this.#run("BEGIN", []);
@@ -3541,6 +3585,238 @@ export async function releaseStores(): Promise<void> {
       }
     }),
   );
+}
+
+// ---------------------------------------------------------------------------
+// An operator's reads and writes (PRD resolved q72)
+// ---------------------------------------------------------------------------
+//
+// `agent-compose store` reads and writes one `kv` store with no flow written:
+// the compiler builds this project and launches its command line's `store`
+// verb (`./cli.ts`), which reaches the store through the three entry points
+// below. They share everything an op **is** with [`runStoreOp`] — the
+// partition a scope and an identity derive ([`partition`]), the arm the target
+// bound and its connection, the one liveness filter, the conditions, the
+// version sequence, the expiry a write leaves, the sweeps — because they call
+// the same [`perform`] and the same reads. So what an operator reads is what a
+// flow in that partition reads, and a key an operator writes is one the next
+// flow finds.
+//
+// What they bypass is exactly the **effect** machinery, and nothing else. An
+// operator's op belongs to no execution, so it is not journaled (no
+// `journaled` seam, no row in the journal), files no trace record, carries no
+// idempotency key — so a write is never deduped and leaves no ledger row — owns
+// no partition for [`releaseExecution`] to release ([`remember`]), and is
+// asked no replay question ([`inProcessState`]). A write is therefore recorded
+// **nowhere**: there is no execution to have made it and no history yet to
+// keep it in (PRD resolved q74's per-key history is where it will be recorded,
+// as actor `cli`, once that ships).
+//
+// Two kinds of store cannot be reached this way, and [`operatorRefusal`] says
+// so by name rather than answering out of the wrong place: a `vector` or
+// `blob` store, since the command is a `kv` surface; and a store whose rows
+// live only in the process that opened them ([`inProcessOnly`]) — a
+// `scope: execution` store on a backend this process opens itself, or one a
+// target bound to `provider: memory` — since the command is another process.
+
+/** One store an operator addresses, and which of its partitions (PRD resolved q72). */
+export interface OperatorTarget {
+  readonly store: StoreBinding;
+  /** `--session <key>`: the session identity a `scope: session` store partitions by. */
+  readonly session?: string;
+  /** `--execution <id>`: the execution a `scope: execution` store's partition belongs to. */
+  readonly execution?: string;
+}
+
+/** The ops an operator issues one at a time: grammar 11.4's `kv` rows the command line mirrors. */
+export type OperatorOp = "get" | "set" | "delete" | "list" | "count";
+
+/** One page of an operator's walk of a partition — what `export` reads. */
+export interface OperatorPageParams {
+  readonly prefix?: string;
+  /** The exclusive cursor, as a `list`'s `after:` (PRD resolved q70). */
+  readonly after?: string;
+  readonly limit: number;
+}
+
+/** One live entry, with its expiry, as an export writes it. */
+export interface OperatorEntry {
+  readonly key: string;
+  readonly value: unknown;
+  readonly version: number;
+  /** The instant it expires, in epoch milliseconds by the store's clock — `null` where it does not. */
+  readonly expiresAt: number | null;
+}
+
+/** A page of [`OperatorEntry`]s, and the cursor of the next where more remain. */
+export interface OperatorPage {
+  readonly entries: readonly OperatorEntry[];
+  readonly next?: string;
+}
+
+/**
+ * Every store the composition binds, in the order `./graph.ts` declared them —
+ * what the command line resolves an address against, and lists when one does
+ * not resolve.
+ */
+export function boundStores(): readonly StoreBinding[] {
+  return [...BOUND.values()];
+}
+
+/**
+ * Why an operator cannot address `store` from the command line, or
+ * `undefined` where one can (see the section header).
+ */
+export function operatorRefusal(store: StoreBinding): string | undefined {
+  if (store.kind !== "kv") {
+    return `\`${store.address}\` is a \`${store.kind}\` store, and the store command reads and writes \`kv\` stores: a \`${store.kind}\` store is reached through its own ops, from a flow (grammar 11.4, PRD resolved q72)`;
+  }
+  if (!inProcessOnly(store)) return undefined;
+  const lifetime =
+    store.backend.provider === "memory"
+      ? `bound to \`provider: memory\` (${store.backend.from})`
+      : `\`scope: execution\` on the \`${store.backend.provider}\` backend (${store.backend.from})`;
+  return `\`${store.address}\` is ${lifetime}, so its rows live only in the memory of the process that opened them — each execution's own — and this command is another process, with nothing there to read or write. A target that binds the store to \`postgres\` or \`mysql\` keeps those rows on a server, where this command reaches them (grammar 14.3, PRD resolved q63)`;
+}
+
+/** The identity and the partition an operator's op addresses, refused where it cannot be reached. */
+function operatorScope(target: OperatorTarget): {
+  readonly identity: runtime.ExecutionIdentity;
+  readonly scopeKey: string;
+} {
+  const { store } = target;
+  const refusal = operatorRefusal(store);
+  if (refusal !== undefined) throw new Error(refusal);
+  supported(store);
+  if (store.scope === "execution" && (target.execution ?? "") === "") {
+    throw new Error(
+      `\`${store.address}\` is \`scope: execution\`, so an operator names the execution whose partition it addresses (PRD resolved q72)`,
+    );
+  }
+  // The identity a flow instance carries, with only the half this store's scope
+  // reads filled in — so [`partition`] derives the partition the runtime would.
+  const identity: runtime.ExecutionIdentity = {
+    id: target.execution ?? "",
+    session_key: target.session ?? "",
+  };
+  return { identity, scopeKey: partition(store, identity) };
+}
+
+/**
+ * One op an operator issues against one partition, answered with the op's own
+ * row — exactly the row a store-op node's output carries (grammar 11.4).
+ *
+ * [`perform`] with **no idempotency key**, and nothing around it: no journal,
+ * no trace record, no execution's ownership (see the section header). A write
+ * runs the same read-modify-write a node's does, under the same lock, so its
+ * condition is decided against what the key holds as it commits and it takes
+ * the partition's next version — and a `set` is held to nothing here: the
+ * command line holds its value to the store's `value_schema` before it gets
+ * this far, as a node's `value:` is held to it at `validate`.
+ */
+export async function runOperatorOp(
+  target: OperatorTarget,
+  op: OperatorOp,
+  params: StoreParams,
+): Promise<Record<string, unknown>> {
+  const { identity, scopeKey } = operatorScope(target);
+  const answer = await perform(
+    target.store,
+    op,
+    params,
+    scopeKey,
+    identity,
+    undefined,
+    "operator",
+    // Nothing aborts an operator's op: the signal is a `vector` op's, for the
+    // embedding a `kv` op never computes.
+    new AbortController().signal,
+  );
+  return answer.row;
+}
+
+/**
+ * One page of a partition's live entries, with each one's expiry — what an
+ * operator's `export` walks, page after page, in the UTF-8 byte order a `list`
+ * answers in.
+ *
+ * A read: no transaction, no record, and the one liveness filter every read
+ * applies, so a key that has expired is not exported. On a dialled store it is
+ * one statement carrying the server's clock ([`RemoteKv`]'s `page`).
+ */
+export async function operatorPage(
+  target: OperatorTarget,
+  params: OperatorPageParams,
+): Promise<OperatorPage> {
+  const { identity, scopeKey } = operatorScope(target);
+  const { store } = target;
+  if (!opensInProcess(store.backend.provider)) {
+    return await (await connectionFor(store)).page(store, scopeKey, params);
+  }
+  const database = await open(store, identity);
+  const read = operatorPageRead(params, {
+    from: "entries WHERE scope_key = ?",
+    bound: [scopeKey],
+    now: { sql: "?", bound: [localNow()] },
+  });
+  return read.answer(database.all(read.query.sql, [...read.query.bound]) as Row[]);
+}
+
+/**
+ * The instant the store's clock reads — the server's on a dialled store, this
+ * process's otherwise, shifted by [`STORE_CLOCK_OFFSET`] either way — which is
+ * what an operator's `import` turns a line's absolute `expires_at` into a
+ * remaining `ttl` against (PRD resolved q69, q72).
+ */
+export async function operatorClock(target: OperatorTarget): Promise<number> {
+  operatorScope(target);
+  const { store } = target;
+  if (!opensInProcess(store.backend.provider)) return await (await connectionFor(store)).clock();
+  return localNow();
+}
+
+/**
+ * The statement one page of [`operatorPage`] runs, on every arm, and what its
+ * rows answer.
+ *
+ * A `list` page with its values ([`partitionRead`]) plus the one column a
+ * `list` does not answer: `expires_at`. One row past the page, so the extra
+ * row says whether another follows.
+ */
+function operatorPageRead(
+  params: OperatorPageParams,
+  rows: PartitionRows,
+): { readonly query: Query; readonly answer: (found: readonly Row[]) => OperatorPage } {
+  const prefix = underPrefix(params.prefix);
+  const cursor: Query =
+    params.after === undefined ? { sql: "1 = 1", bound: [] } : { sql: '"key" > ?', bound: [params.after] };
+  const alive = liveRows(rows.now);
+  return {
+    query: {
+      sql:
+        `SELECT "key", value, version, expires_at FROM ${rows.from} ` +
+        `AND ${prefix.sql} AND ${cursor.sql} AND ${alive.sql} ORDER BY "key" LIMIT ?`,
+      bound: [...rows.bound, ...prefix.bound, ...cursor.bound, ...alive.bound, params.limit + 1],
+    },
+    answer: (found) => {
+      const page = found.slice(0, params.limit);
+      const last = page[page.length - 1];
+      return {
+        entries: page.map((row) => {
+          const held = heldOf(row);
+          const expires = row["expires_at"];
+          return {
+            key: String(row["key"]),
+            value: held.value,
+            version: held.version,
+            // `BIGINT` arrives as a string from `pg` and a number elsewhere.
+            expiresAt: expires === null || expires === undefined ? null : Number(expires),
+          };
+        }),
+        ...(found.length > params.limit && last !== undefined ? { next: String(last["key"]) } : {}),
+      };
+    },
+  };
 }
 
 /** One row of the `blob` backend's idempotency ledger (grammar 9.4). */

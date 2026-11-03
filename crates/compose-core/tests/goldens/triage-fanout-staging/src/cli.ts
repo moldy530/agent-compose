@@ -6,8 +6,8 @@
 // the whole directory out and stop regenerating it.
 //
 // The project's own command line: what `agent-compose run`,
-// `agent-compose resume` and `agent-compose serve` launch (PRD 5.11,
-// grammar 13.2).
+// `agent-compose resume`, `agent-compose serve` and `agent-compose store`
+// launch (PRD 5.11, grammar 13.2, PRD resolved q72).
 //
 // The compiler builds this directory and then runs it — `bun src/index.ts run
 // flow.review --input goal=…`, or `node src/index.ts` under the fallback — which
@@ -19,7 +19,20 @@
 // src/index.ts run <flow> [--input k=v]... [--session <key>] [--format human|json]
 // src/index.ts resume <execution> [--format human|json]
 // src/index.ts serve [--host <host>] [--port <port>]
+// src/index.ts store <sub-verb> <store> [operands] [--session <key> | --execution <id>]
+//                    [--format human|json] [options]
 // ```
+//
+// # Reading and writing a store with no flow
+//
+// `store` is the operator's surface onto one `kv` store (PRD resolved q72):
+// `get`, `set`, `delete`, `list`, `count`, `export` and `import`, run against
+// this target's own backend through `./stores.ts`'s operator entry points.
+// The binary carries no database driver (PRD 5.12), which is why the compiler
+// launches this rather than opening a store itself — the same split `run` is.
+// An operator's write is **not an effect**: it belongs to no execution, so it
+// carries no idempotency key and leaves no journal row, no ledger row and no
+// trace record — it is recorded nowhere. See [`storeVerb`].
 //
 // # What `run` prints
 //
@@ -177,7 +190,18 @@ import {
   watchHumanPauses,
 } from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
-import { dataRoot, releaseStores, sweepBoundStores } from "./stores.ts";
+import { describeIssues } from "./runtime.ts";
+import {
+  boundStores,
+  dataRoot,
+  operatorClock,
+  operatorPage,
+  operatorRefusal,
+  releaseStores,
+  runOperatorOp,
+  sweepBoundStores,
+} from "./stores.ts";
+import type { OperatorTarget, StoreBinding, StoreParams } from "./stores.ts";
 import { httpTriggers, manualTriggers } from "./triggers.ts";
 
 /** What a `--format` selects. */
@@ -259,8 +283,9 @@ export async function main(argv: readonly string[]): Promise<number> {
     if (verb === "run") return await run(rest);
     if (verb === "resume") return await resumeVerb(rest);
     if (verb === "serve") return await serveVerb(rest);
+    if (verb === "store") return await storeVerb(rest);
     throw new UsageError(
-      `\`${verb ?? ""}\` is not a verb of this project: it takes \`run\`, \`resume\` or \`serve\` (see README.md)`,
+      `\`${verb ?? ""}\` is not a verb of this project: it takes \`run\`, \`resume\`, \`serve\` or \`store\` (see README.md)`,
     );
   } catch (error) {
     if (error instanceof UsageError) {
@@ -1365,6 +1390,687 @@ async function serveVerb(argv: readonly string[]): Promise<number> {
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// `store`: one `kv` store, read and written by an operator (PRD resolved q72)
+// ---------------------------------------------------------------------------
+
+/** What one `store` sub-verb takes: the operands after the store's address, and its own options. */
+interface StoreSubverb {
+  readonly operands: readonly string[];
+  readonly options: Readonly<Record<string, Arity>>;
+}
+
+/**
+ * The sub-verbs, each with what it takes beside the three every one of them
+ * does ([`STORE_PARTITION_OPTIONS`]). The options mirror the op parameters of
+ * grammar 11.4 they set: `--if` and `--if-version` are `if:` and
+ * `if_version:`, `--ttl` is `ttl:`, and `--after` and `--values` are a `list`'s
+ * `after:` and `include_values:`.
+ */
+const STORE_SUBVERBS: Readonly<Record<string, StoreSubverb>> = {
+  get: { operands: ["key"], options: {} },
+  set: { operands: ["key", "value"], options: { if: "single", "if-version": "single", ttl: "single" } },
+  delete: { operands: ["key"], options: { "if-version": "single" } },
+  list: {
+    operands: [],
+    options: { prefix: "single", limit: "single", after: "single", values: "flag" },
+  },
+  count: { operands: [], options: { prefix: "single" } },
+  export: { operands: [], options: { prefix: "single" } },
+  import: { operands: [], options: { "if-absent": "flag", file: "single" } },
+};
+
+/** What every `store` sub-verb takes: the partition, and the format. */
+const STORE_PARTITION_OPTIONS: Readonly<Record<string, Arity>> = {
+  session: "single",
+  execution: "single",
+  format: "single",
+};
+
+/** How many keys a `list` reads when `--limit` is not given, and the most it may read. */
+const STORE_LIST_DEFAULT = 100;
+const STORE_LIST_MAX = 1000;
+
+/** How many entries one page of an `export` reads. */
+const STORE_EXPORT_PAGE = 1000;
+
+/** The fields an exported line carries, in the order it writes them. */
+const EXPORTED_FIELDS = ["key", "value", "version", "expires_at"] as const;
+
+/**
+ * The latest instant a JavaScript `Date` can name: an `expires_at` past it — a
+ * `ttl:` of hundreds of thousands of years — is written as this rather than
+ * failing the export.
+ */
+const LAST_INSTANT = 8.64e15;
+
+/**
+ * `store <sub-verb> <store> [operands] [--session <key> | --execution <id>]
+ * [--format human|json] [options]` — read and write one `kv` store through this
+ * target's own backend, with no flow written (PRD resolved q72).
+ *
+ * The store is named by its address, its partition by the scope it declares:
+ * `--session` for a `scope: session` store, `--execution` for a
+ * `scope: execution` one, and neither for a `scope: global` one — each derived
+ * exactly as the runtime derives it, so this command sees what a flow in that
+ * partition sees. Everything reaches the store through `./stores.ts`'s
+ * operator entry points, which run the same ops a store-op node runs and
+ * bypass exactly the effect machinery: **an operator's write is not an
+ * effect** — it belongs to no execution, carries no idempotency key, writes no
+ * journal row and no ledger row, and is recorded nowhere.
+ *
+ * The exit codes are the project's, read for a store: `0` found or applied;
+ * `1` the answer is no — a `get` that found nothing, a condition that did not
+ * hold, a value the store's `value_schema` refused, or a backend that failed;
+ * `2` the command could not run — a flag, a store address, a sub-verb or a
+ * partition the command does not take.
+ */
+async function storeVerb(argv: readonly string[]): Promise<number> {
+  const [name, ...rest] = argv;
+  const known = Object.keys(STORE_SUBVERBS).map((held) => `\`${held}\``).join(", ");
+  const subverb = name !== undefined && Object.hasOwn(STORE_SUBVERBS, name) ? STORE_SUBVERBS[name] : undefined;
+  if (name === undefined || subverb === undefined) {
+    throw new UsageError(
+      name === undefined
+        ? `\`store\` takes a sub-verb: ${known}`
+        : `\`store ${name}\` is not a sub-verb of \`store\`: it takes ${known}`,
+    );
+  }
+  const verb = `store ${name}`;
+  const options = parse(verb, rest, { ...subverb.options, ...STORE_PARTITION_OPTIONS }, true);
+  const usage = `${verb} <store>${subverb.operands.map((operand) => ` <${operand}>`).join("")}`;
+  const [address, ...operands] = options.operands;
+  if (address === undefined) {
+    throw new UsageError(`\`${verb}\` takes a store address: \`${usage}\``);
+  }
+  if (operands.length !== subverb.operands.length) {
+    throw new UsageError(
+      `\`${verb}\` takes ${subverb.operands.length === 0 ? "nothing" : subverb.operands.map((operand) => `<${operand}>`).join(" ")} after the store, and was given ${operands.length === 0 ? "nothing" : operands.map((operand) => `\`${operand}\``).join(" ")}: \`${usage}\``,
+    );
+  }
+  const format = formatOf(options.single["format"]);
+  const target = operatorTarget(address, options.single["session"], options.single["execution"]);
+  const prefix = options.single["prefix"];
+  const prefixed = prefix === undefined ? {} : { prefix };
+  try {
+    switch (name) {
+      case "get":
+        return await storeGet(target, operands[0]!, format);
+      case "set":
+        return await storeSet(target, operands[0]!, operands[1]!, options.single, format);
+      case "delete":
+        return await storeDelete(target, operands[0]!, options.single["if-version"], format);
+      case "list": {
+        const after = options.single["after"];
+        const row = await runOperatorOp(target, "list", {
+          ...prefixed,
+          limit: limitOf(options.single["limit"]),
+          ...(after === undefined ? {} : { after }),
+          includeValues: options.flags.has("values"),
+        });
+        if (format === "json") return answered(row, 0);
+        const entries = row["entries"] as readonly { key: string; value: unknown; version: number }[] | undefined;
+        const keys = row["keys"] as readonly string[];
+        if (keys.length === 0) {
+          process.stderr.write(`${where(target)} holds no keys${prefix === undefined ? "" : ` under ${JSON.stringify(prefix)}`}${after === undefined ? "" : ` after ${JSON.stringify(after)}`}\n`);
+          return 0;
+        }
+        process.stdout.write(
+          entries === undefined
+            ? table(["key"], keys.map((key) => [key]))
+            : table(
+                ["key", "version", "value"],
+                entries.map((entry) => [entry.key, String(entry.version), compact(entry.value)]),
+              ),
+        );
+        const next = row["next"];
+        if (typeof next === "string") {
+          process.stdout.write(`next: ${next}  (\`--after ${next}\` reads the page after this one)\n`);
+        }
+        return 0;
+      }
+      case "count": {
+        const row = await runOperatorOp(target, "count", prefixed);
+        if (format === "json") return answered(row, 0);
+        process.stdout.write(table(["count"], [[String(row["count"])]]));
+        return 0;
+      }
+      case "export":
+        return await storeExport(target, prefix, format);
+      case "import":
+        return await storeImport(target, options.single["file"], options.flags.has("if-absent"), format);
+      default:
+        throw new UsageError(`\`${verb}\` is not a sub-verb of \`store\`: it takes ${known}`);
+    }
+  } catch (error) {
+    if (error instanceof UsageError) throw error;
+    // The answer is no, and the backend said why: a value the schema refused,
+    // a server that is not there, a provider this release does not open.
+    return failed(format, error instanceof Error ? error.message : String(error));
+  }
+}
+
+/**
+ * The store an address names and the partition the flags name, refused where
+ * the two do not fit the scope the store declares (grammar 11.1, 11.3).
+ *
+ * Every refusal is a usage error: nothing was read or written, and what fixes
+ * it is a different command line.
+ */
+function operatorTarget(
+  address: string,
+  session: string | undefined,
+  execution: string | undefined,
+): OperatorTarget {
+  const bound = boundStores();
+  const store = bound.find((held) => held.address === address);
+  if (store === undefined) {
+    const kv = bound.filter((held) => held.kind === "kv").map((held) => `\`${held.address}\``);
+    throw new UsageError(
+      `\`${address}\` is not a store of this composition: ${
+        kv.length === 0 ? "it declares no `kv` store" : `its \`kv\` stores are ${kv.join(", ")}`
+      }`,
+    );
+  }
+  const refusal = operatorRefusal(store);
+  if (refusal !== undefined) throw new UsageError(refusal);
+  const given = session !== undefined ? "--session" : execution !== undefined ? "--execution" : undefined;
+  if (session !== undefined && execution !== undefined) {
+    throw new UsageError(
+      `\`--session\` and \`--execution\` name two different partitions, and a store has one scope: \`${address}\` is \`scope: ${store.scope}\``,
+    );
+  }
+  switch (store.scope) {
+    case "global":
+      if (given !== undefined) {
+        throw new UsageError(
+          `\`${address}\` is \`scope: global\` — one partition for the whole project — so it takes neither \`--session\` nor \`--execution\`: drop \`${given}\``,
+        );
+      }
+      break;
+    case "session":
+      if (execution !== undefined) {
+        throw new UsageError(
+          `\`${address}\` is \`scope: session\`, partitioned by session rather than by execution: name the partition with \`--session <key>\` instead of \`--execution\` (grammar 11.3)`,
+        );
+      }
+      if (session === undefined || session === "") {
+        throw new UsageError(
+          `\`${address}\` is \`scope: session\`, so the partition to read or write is one session's: name it with \`--session <key>\`, the identity a run's \`--session\` supplies — after any \`session_key:\` its trigger declares (grammar 11.3)`,
+        );
+      }
+      break;
+    case "execution":
+      if (session !== undefined) {
+        throw new UsageError(
+          `\`${address}\` is \`scope: execution\`, partitioned by execution rather than by session: name the partition with \`--execution <id>\` instead of \`--session\` (grammar 11.1)`,
+        );
+      }
+      if (execution === undefined || execution === "") {
+        throw new UsageError(
+          `\`${address}\` is \`scope: execution\`, so the partition to read or write is one execution's: name it with \`--execution <id>\`, the id a \`run\` prints as \`execution: exec_…\` (grammar 11.1)`,
+        );
+      }
+      break;
+  }
+  return {
+    store,
+    ...(session === undefined ? {} : { session }),
+    ...(execution === undefined ? {} : { execution }),
+  };
+}
+
+/** `store get <store> <key>`: the value and version a key holds, exit `1` where it holds none. */
+async function storeGet(target: OperatorTarget, key: string, format: Format): Promise<number> {
+  const row = await runOperatorOp(target, "get", { key });
+  const found = row["found"] === true;
+  if (format === "json") return answered(row, found ? 0 : 1);
+  if (!found) {
+    process.stderr.write(`${JSON.stringify(key)} holds nothing in ${where(target)}\n`);
+    return 1;
+  }
+  process.stdout.write(table(["key", "version", "value"], [[key, String(row["version"]), compact(row["value"])]]));
+  return 0;
+}
+
+/**
+ * `store set <store> <key> <value> [--if absent|present] [--if-version <n>]
+ * [--ttl <duration>|never]` — `<value>` is JSON, or `-` to read it from
+ * standard input.
+ *
+ * The value is held to the store's `value_schema` by the emitted Zod before
+ * anything is written, which is the check a store-op node's `value:` meets at
+ * `validate` and a synthesized tool's meets at its argument schema: a store
+ * holds what its schema admits whoever wrote it.
+ */
+async function storeSet(
+  target: OperatorTarget,
+  key: string,
+  written: string,
+  single: Readonly<Record<string, string>>,
+  format: Format,
+): Promise<number> {
+  const text = written === "-" ? await readInput("`store set`'s value") : written;
+  let value: unknown;
+  try {
+    value = JSON.parse(text) as unknown;
+  } catch (error) {
+    throw new UsageError(
+      `the value of \`store set\` is read as JSON, and ${written === "-" ? "standard input" : JSON.stringify(written)} is not JSON (${error instanceof Error ? error.message : String(error)})`,
+    );
+  }
+  const params: StoreParams = {
+    key,
+    value,
+    ...conditionOf(single["if"], single["if-version"]),
+    ...ttlOf(single["ttl"]),
+  };
+  const refusal = schemaRefusal(target.store, value);
+  if (refusal !== undefined) {
+    throw new Error(
+      `\`${target.store.address}\` refused the value for ${JSON.stringify(key)}: ${refusal}. Nothing was written: a value is held to the store's \`value_schema\` before it reaches the store (grammar 11.1)`,
+    );
+  }
+  const row = await runOperatorOp(target, "set", params);
+  return wrote(target, key, row, format, ["key", "applied", "version"]);
+}
+
+/** `store delete <store> <key> [--if-version <n>]`. */
+async function storeDelete(
+  target: OperatorTarget,
+  key: string,
+  ifVersion: string | undefined,
+  format: Format,
+): Promise<number> {
+  const row = await runOperatorOp(target, "delete", {
+    key,
+    ...conditionOf(undefined, ifVersion),
+  });
+  return wrote(target, key, row, format, ["key", "deleted", "applied", "version"]);
+}
+
+/**
+ * Report one write's answer row, and answer its exit code: `0` where it
+ * applied, `1` where its condition did not hold — with the version the key
+ * holds, which is what the next compare-and-set needs (PRD resolved q68).
+ */
+function wrote(
+  target: OperatorTarget,
+  key: string,
+  row: Record<string, unknown>,
+  format: Format,
+  columns: readonly string[],
+): number {
+  const applied = row["applied"] === true;
+  const code = applied ? 0 : 1;
+  if (format === "json") return answered(row, code);
+  const cell = (column: string): string => {
+    if (column === "key") return key;
+    const held = row[column];
+    return held === undefined ? "—" : String(held);
+  };
+  process.stdout.write(table(columns, [columns.map(cell)]));
+  if (!applied) {
+    const version = row["version"];
+    process.stderr.write(
+      `the condition did not hold, so nothing was written: ${JSON.stringify(key)} ${
+        typeof version === "number" ? `holds version ${version}` : "holds nothing"
+      } in ${where(target)}\n`,
+    );
+  }
+  return code;
+}
+
+/**
+ * `store export <store> [--prefix <p>]` — every live entry of the partition
+ * as JSON Lines on stdout, one `{ key, value, version, expires_at }` per line
+ * in the UTF-8 byte order a `list` pages in, `expires_at` an ISO 8601 UTC
+ * instant and absent for a key that does not expire. A key that has expired
+ * is not exported (PRD resolved q69).
+ *
+ * The lines are the answer under both formats, so the summary goes to stderr:
+ * a sentence, or one JSON object.
+ */
+async function storeExport(
+  target: OperatorTarget,
+  prefix: string | undefined,
+  format: Format,
+): Promise<number> {
+  let after: string | undefined;
+  let written = 0;
+  for (;;) {
+    const page = await operatorPage(target, {
+      limit: STORE_EXPORT_PAGE,
+      ...(prefix === undefined ? {} : { prefix }),
+      ...(after === undefined ? {} : { after }),
+    });
+    let lines = "";
+    for (const entry of page.entries) {
+      lines += `${JSON.stringify({
+        key: entry.key,
+        value: entry.value,
+        version: entry.version,
+        ...(entry.expiresAt === null
+          ? {}
+          : { expires_at: new Date(Math.min(entry.expiresAt, LAST_INSTANT)).toISOString() }),
+      })}\n`;
+      written += 1;
+    }
+    await emit(lines);
+    if (page.next === undefined) break;
+    after = page.next;
+  }
+  process.stderr.write(
+    format === "json"
+      ? `${JSON.stringify({ written })}\n`
+      : `exported ${written} ${written === 1 ? "key" : "keys"} from ${where(target)}\n`,
+  );
+  return 0;
+}
+
+/** One line of an import, read and held to the store's schema. */
+interface ImportedLine {
+  readonly line: number;
+  readonly key: string;
+  readonly value: unknown;
+  /** Epoch milliseconds, or `null` for a key that does not expire. */
+  readonly expiresAt: number | null;
+}
+
+/**
+ * `store import <store> [--if-absent] [--file <path>]` — write each line of a
+ * JSON Lines document of `export`'s shape, read from standard input or from
+ * `--file`.
+ *
+ * **Every line is read and held to the schema before any is written**, so a
+ * file with a line the store refuses writes nothing and names each such line;
+ * a backend that fails part-way leaves the lines before it written and says
+ * how many. Each line is one write through the normal write path, so it takes
+ * the partition's **next** version — the exported `version` is not restored,
+ * because a version is the partition's sequence and a restored one could be a
+ * version some key already showed (PRD resolved q68). An `expires_at` still
+ * ahead of the store's clock becomes the `ttl` that leaves it there; one
+ * already past skips the line, which is counted; a line with none writes a key
+ * that does not expire, whatever the store's `default_ttl:` says, so an export
+ * and an import of it leave the same keys alive. `--if-absent` writes each
+ * line under `if: absent`, so a key the partition already holds is kept and
+ * counted rather than overwritten.
+ */
+async function storeImport(
+  target: OperatorTarget,
+  file: string | undefined,
+  ifAbsent: boolean,
+  format: Format,
+): Promise<number> {
+  const text = file === undefined ? await readInput("`store import`") : readImportFile(file);
+  const lines: ImportedLine[] = [];
+  const refused: { readonly line: number; readonly error: string }[] = [];
+  let read = 0;
+  text.split("\n").forEach((written, index) => {
+    if (written.trim() === "") return;
+    read += 1;
+    const parsed = importedLine(target.store, written, index + 1);
+    if ("error" in parsed) refused.push(parsed);
+    else lines.push(parsed);
+  });
+  if (refused.length > 0) {
+    const message = `${refused.length === 1 ? "a line" : `${refused.length} lines`} of the import could not be written to \`${target.store.address}\`, so none was`;
+    if (format === "json") {
+      process.stdout.write(`${JSON.stringify({ error: message, lines: refused }, null, 2)}\n`);
+    } else {
+      process.stderr.write(`error: ${message}:\n`);
+      for (const { line, error } of refused) process.stderr.write(`  line ${line}: ${error}\n`);
+    }
+    return 1;
+  }
+
+  // The store's own clock, read once and carried forward by this process's
+  // monotonic one, so each line's remaining `ttl` is judged against the instant
+  // its write is made rather than the instant the import started — by the
+  // clock the store dates expiry with (PRD resolved q69).
+  const anchor = await operatorClock(target);
+  const started = performance.now();
+  let written = 0;
+  let expired = 0;
+  let present = 0;
+  for (const entry of lines) {
+    let ttl: number | "never" = "never";
+    if (entry.expiresAt !== null) {
+      const remaining = entry.expiresAt - (anchor + (performance.now() - started));
+      if (remaining <= 0) {
+        expired += 1;
+        continue;
+      }
+      ttl = Math.ceil(remaining);
+    }
+    let row: Record<string, unknown>;
+    try {
+      row = await runOperatorOp(target, "set", {
+        key: entry.key,
+        value: entry.value,
+        ttl,
+        ...(ifAbsent ? { condition: "absent" as const } : {}),
+      });
+    } catch (error) {
+      throw new Error(
+        `line ${entry.line} could not be written (${error instanceof Error ? error.message : String(error)}); the ${written} ${written === 1 ? "line" : "lines"} before it ${written === 1 ? "was" : "were"} written, and nothing after it was`,
+      );
+    }
+    if (row["applied"] === true) written += 1;
+    else present += 1;
+  }
+  const summary = { read, written, skipped: expired + present, expired, present };
+  if (format === "json") return answered(summary, 0);
+  process.stdout.write(
+    table(
+      ["read", "written", "skipped", "expired", "present"],
+      [[read, written, expired + present, expired, present].map(String)],
+    ),
+  );
+  return 0;
+}
+
+/**
+ * One line of an import: an exported entry, held to the shape `export` writes
+ * and to the store's `value_schema` — or what is wrong with it, naming the line.
+ *
+ * A field `export` does not write is refused rather than ignored, D50's
+ * posture: an `expire_at` read as nothing would import a key that never
+ * expires. `version` is read and not used — the import assigns fresh versions —
+ * but held to being one, since a line that carries a version that is not one
+ * is a line something other than `export` wrote.
+ */
+function importedLine(
+  store: StoreBinding,
+  written: string,
+  line: number,
+): ImportedLine | { readonly line: number; readonly error: string } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(written) as unknown;
+  } catch (error) {
+    return { line, error: `not a JSON document (${error instanceof Error ? error.message : String(error)})` };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { line, error: `not an object of ${EXPORTED_FIELDS.map((field) => `\`${field}\``).join(", ")}` };
+  }
+  const entry = parsed as Record<string, unknown>;
+  for (const field of Object.keys(entry)) {
+    if (!(EXPORTED_FIELDS as readonly string[]).includes(field)) {
+      return {
+        line,
+        error: `\`${field}\` is not a field of an exported entry, which has ${EXPORTED_FIELDS.map((held) => `\`${held}\``).join(", ")}`,
+      };
+    }
+  }
+  const key = entry["key"];
+  if (typeof key !== "string") return { line, error: "`key` is not a string" };
+  if (!Object.hasOwn(entry, "value")) return { line, error: `${JSON.stringify(key)} has no \`value\`` };
+  const version = entry["version"];
+  if (version !== undefined && !(typeof version === "number" && Number.isInteger(version) && version >= 0)) {
+    return { line, error: `the \`version\` of ${JSON.stringify(key)} is ${JSON.stringify(version)}, which is not a version` };
+  }
+  const expires = entry["expires_at"];
+  let expiresAt: number | null = null;
+  if (expires !== undefined && expires !== null) {
+    // An instant, so a zone is part of it: `Date.parse` would read one without
+    // as this machine's local time, which is a different instant on every
+    // machine an export is carried to.
+    const instant =
+      typeof expires === "string" && ISO_INSTANT.test(expires) ? Date.parse(expires) : Number.NaN;
+    if (Number.isNaN(instant)) {
+      return {
+        line,
+        error: `the \`expires_at\` of ${JSON.stringify(key)} is ${JSON.stringify(expires)}, which is not an ISO 8601 instant`,
+      };
+    }
+    expiresAt = instant;
+  }
+  const refusal = schemaRefusal(store, entry["value"]);
+  if (refusal !== undefined) {
+    return { line, error: `\`${store.address}\`'s \`value_schema\` refuses the value of ${JSON.stringify(key)}: ${refusal}` };
+  }
+  return { line, key, value: entry["value"], expiresAt };
+}
+
+/** An ISO 8601 date and time with its zone — `Z` or an offset — which is what names one instant. */
+const ISO_INSTANT = /^[+-]?[0-9]{4,6}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(:[0-9]{2}(\.[0-9]+)?)?(Z|[+-][0-9]{2}:[0-9]{2})$/;
+
+/** What the store's `value_schema` refuses about `value`, or `undefined` where it admits it. */
+function schemaRefusal(store: StoreBinding, value: unknown): string | undefined {
+  const schema = store.value;
+  if (schema === undefined) return undefined;
+  const parsed = schema.safeParse(value);
+  if (parsed.success) return undefined;
+  return describeIssues(value, parsed.error?.issues ?? []);
+}
+
+/** The condition one write's flags name: `--if absent|present` or `--if-version <n>`, never both. */
+function conditionOf(
+  condition: string | undefined,
+  version: string | undefined,
+): Pick<StoreParams, "condition" | "ifVersion"> {
+  if (condition !== undefined && version !== undefined) {
+    throw new UsageError(
+      "`--if` and `--if-version` are two conditions, and a write takes one: `--if` asks whether the key holds a value and `--if-version` which version it holds — give `--if-version` alone to ask both (grammar 11.4)",
+    );
+  }
+  if (condition !== undefined) {
+    if (condition !== "absent" && condition !== "present") {
+      throw new UsageError(`\`--if ${condition}\` is not one of \`absent\`, \`present\``);
+    }
+    return { condition };
+  }
+  if (version !== undefined) {
+    if (!/^[0-9]+$/.test(version) || !Number.isSafeInteger(Number(version))) {
+      throw new UsageError(`\`--if-version ${version}\` is not a version: a version is a whole number, as \`get\` answers it`);
+    }
+    return { ifVersion: Number(version) };
+  }
+  return {};
+}
+
+/** Grammar 4.4's units, in milliseconds. */
+const DURATION_UNITS: Readonly<Record<string, number>> = { ms: 1, s: 1_000, m: 60_000, h: 3_600_000 };
+
+/** `--ttl <duration>|never`, as the `ttl:` of grammar 11.4 (PRD resolved q69). */
+function ttlOf(written: string | undefined): Pick<StoreParams, "ttl"> {
+  if (written === undefined) return {};
+  if (written === "never") return { ttl: "never" };
+  const matched = /^([0-9]+)(ms|s|m|h)$/.exec(written);
+  const unit = matched === null ? undefined : DURATION_UNITS[matched[2] ?? ""];
+  const amount = matched === null ? 0 : Number(matched[1]);
+  if (matched === null || unit === undefined || amount <= 0) {
+    throw new UsageError(
+      `\`--ttl ${written}\` is not a duration: it takes \`<integer>ms\`, \`<integer>s\`, \`<integer>m\` or \`<integer>h\` greater than zero, or \`never\` (grammar 4.4)`,
+    );
+  }
+  return { ttl: amount * unit };
+}
+
+/** `--limit <n>`, held to a page's 1..1000 (grammar 11.4). */
+function limitOf(written: string | undefined): number {
+  if (written === undefined) return STORE_LIST_DEFAULT;
+  const limit = /^[0-9]+$/.test(written) ? Number(written) : Number.NaN;
+  if (!Number.isInteger(limit) || limit < 1 || limit > STORE_LIST_MAX) {
+    throw new UsageError(`\`--limit ${written}\` is not a page size: a \`list\` reads 1 to ${STORE_LIST_MAX} keys at a time`);
+  }
+  return limit;
+}
+
+/**
+ * Everything standard input holds, for a value or an import read from it —
+ * refused where standard input is a terminal, which has nothing to read until
+ * somebody types it and would leave the command waiting with no prompt.
+ */
+async function readInput(what: string): Promise<string> {
+  if (process.stdin.isTTY === true) {
+    throw new UsageError(
+      `${what} reads standard input, and standard input is a terminal: redirect a file into it (\`< entries.jsonl\`) or pipe one in${what === "`store import`" ? ", or name it with `--file <path>`" : ""}`,
+    );
+  }
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : (chunk as Buffer));
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+/** The file `store import --file` names, read whole. */
+function readImportFile(file: string): string {
+  try {
+    return fs.readFileSync(file, "utf8");
+  } catch (error) {
+    throw new UsageError(
+      `\`--file ${file}\` cannot be read: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+/** Write `text` to stdout, waiting for the pipe to take it before the next page is read. */
+async function emit(text: string): Promise<void> {
+  if (text === "") return;
+  if (process.stdout.write(text)) return;
+  await new Promise<void>((resolve) => process.stdout.once("drain", () => resolve()));
+}
+
+/** Answer one JSON document on stdout, and the exit code it goes with. */
+function answered(document: unknown, code: number): number {
+  process.stdout.write(`${JSON.stringify(document, null, 2)}\n`);
+  return code;
+}
+
+/** Report a `store` op that failed — a value refused, a backend down — and answer `1`. */
+function failed(format: Format, message: string): number {
+  if (format === "json") return answered({ error: message }, 1);
+  process.stderr.write(`error: ${message}\n`);
+  return 1;
+}
+
+/** The store and the partition an op addressed, as a message names them. */
+function where(target: OperatorTarget): string {
+  const store = `\`${target.store.address}\``;
+  if (target.session !== undefined) return `${store} (session ${JSON.stringify(target.session)})`;
+  if (target.execution !== undefined) return `${store} (execution \`${target.execution}\`)`;
+  return store;
+}
+
+/** A value as one table cell: its JSON, on one line. */
+function compact(value: unknown): string {
+  return JSON.stringify(value) ?? "null";
+}
+
+/** A table for a person: a header row and one row per entry, columns aligned, the last unpadded. */
+function table(header: readonly string[], rows: readonly (readonly string[])[]): string {
+  const widths = header.map((title, column) =>
+    Math.max(title.length, ...rows.map((row) => (row[column] ?? "").length)),
+  );
+  const line = (cells: readonly string[]): string =>
+    cells
+      .map((cell, column) => (column === cells.length - 1 ? cell : cell.padEnd(widths[column] ?? 0)))
+      .join("  ")
+      .trimEnd();
+  return `${[header, ...rows].map(line).join("\n")}\n`;
+}
+
 /** The `--input k=v` arguments, read as the flow's declared field types. */
 function bindInputs(flow: CompiledFlow, given: readonly string[]): Record<string, unknown> {
   const inputs: Record<string, unknown> = {};
@@ -1492,11 +2198,14 @@ function coerce(flow: CompiledFlow, field: string, text: string): unknown {
   }
 }
 
-/** Whether an option may be given more than once. */
-type Arity = "single" | "repeatable";
+/**
+ * How an option is written: `--name value` once, `--name value` as often as
+ * wanted, or a bare `--name` that is on or off.
+ */
+type Arity = "single" | "repeatable" | "flag";
 
 /**
- * The flags one verb takes: `--name value`, some repeatable.
+ * The flags one verb takes: `--name value`, some repeatable, some bare.
  *
  * The verb declares **every** option it takes, and a `--name` outside that list
  * is a usage error rather than an entry nothing ever reads. That is D50's
@@ -1508,17 +2217,38 @@ type Arity = "single" | "repeatable";
  *
  * The options are declared in the order the README documents them, because that
  * order is what the refusal lists back.
+ *
+ * A verb that takes **operands** — `store`'s address, key and value — says so,
+ * and then a word that is not an option is one of them, wherever it stands,
+ * and everything after a bare `--` is one: which is how a key that begins with
+ * `--` is written, and how `agent-compose store` hands its operands on.
  */
 function parse(
   verb: string,
   argv: readonly string[],
   options: Readonly<Record<string, Arity>>,
-): { single: Record<string, string>; repeated: Record<string, string[]> } {
+  takesOperands = false,
+): {
+  single: Record<string, string>;
+  repeated: Record<string, string[]>;
+  flags: Set<string>;
+  operands: string[];
+} {
   const single: Record<string, string> = {};
   const repeated: Record<string, string[]> = {};
+  const flags = new Set<string>();
+  const operands: string[] = [];
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index]!;
+    if (takesOperands && argument === "--") {
+      operands.push(...argv.slice(index + 1));
+      break;
+    }
     if (!argument.startsWith("--")) {
+      if (takesOperands) {
+        operands.push(argument);
+        continue;
+      }
       throw new UsageError(`\`${argument}\` is not an option: every argument after the verb is \`--name value\``);
     }
     const name = argument.slice(2);
@@ -1533,6 +2263,10 @@ function parse(
         `\`--${name}\` is not an option of \`${verb}\`: it takes ${taken.length === 0 ? "no options" : taken.join(", ")} (see README.md)`,
       );
     }
+    if (arity === "flag") {
+      flags.add(name);
+      continue;
+    }
     const value = argv[index + 1];
     if (value === undefined) throw new UsageError(`\`--${name}\` takes a value`);
     index += 1;
@@ -1542,7 +2276,7 @@ function parse(
       single[name] = value;
     }
   }
-  return { single, repeated };
+  return { single, repeated, flags, operands };
 }
 
 function formatOf(given: string | undefined): Format {
