@@ -1,0 +1,47 @@
+---
+source: crates/agent-compose/tests/store_cli.rs
+expression: "String::from_utf8(output.stdout).expect(\"help is UTF-8\")"
+---
+Delete one key (exit 1 when `--if-version` declines)
+
+Usage: agent-compose store delete [OPTIONS] <PATH> <STORE> <KEY>
+
+Arguments:
+  <PATH>
+          Path to the spec entrypoint (conventionally `main.yml`)
+
+  <STORE>
+          The store, as a typed address (`store.<name>`)
+
+  <KEY>
+          The key to delete
+
+Options:
+      --session <KEY>
+          The session whose partition to address, for a `scope: session` store
+
+      --execution <ID>
+          The execution whose partition to address, for a `scope: execution` store
+
+      --target <NAME>
+          Deploy target whose backend the store is opened on
+          
+          [default: local]
+
+      --out <DIR>
+          Where to write the generated project [default: <project>/build/<target>]
+
+      --format <FORMAT>
+          How the store answers, and how a refused composition is reported
+
+          Possible values:
+          - human: A table on stdout, for a person; what went wrong on stderr
+          - json:  One JSON document on stdout — the op's answer row, or an import's summary (an export's lines are its stdout either way, and its summary goes to stderr)
+          
+          [default: human]
+
+      --if-version <VERSION>
+          Delete only where the key holds this version
+
+  -h, --help
+          Print help (see a summary with '-h')
