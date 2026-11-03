@@ -72,6 +72,7 @@ flow.report:
 | `outputs` | **yes** | the module's result surface |
 | `inputs` | no | default: no inputs |
 | `description` | no | **required** when the flow is used as an agent tool |
+| `finally` | no | a node of this flow that runs once when an instance ends — see [Finally](#finally) |
 
 Node ids are scoped to their flow — two flows may both have a node `review`.
 `start` and `end` are pseudo-nodes and may not be node ids.
@@ -178,5 +179,97 @@ shared part into a third flow, or break the cycle.
 Every node must be reachable from its flow's `start`, counting edges plus the
 two control-transfer positions — `on_error: { fallback: … }` and
 `human.on_timeout:`. A `cleanup` node reached only by a fallback is live code.
+So is the flow's `finally:` node, which is reachable because it is `finally:`.
 
-Normative source: `docs/grammar.md` §7, §7.1, §7.5, §7.7, §8.5
+## Finally
+
+`finally: <node id>` names the node an instance of the flow runs **once, when it
+ends** — whether the body completed, failed, or (once cancel exists) was
+cancelled. Inside that node, and nowhere else, `execution.outcome` says how
+(`completed`, `failed`, `cancelled`) and `execution.error` says why, where the
+body failed:
+
+```yaml spec
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.m:
+  provider: provider.p
+  id: claude-sonnet-4-5
+agent.drafter:
+  model: model.m
+  prompt: Draft what you are asked for.
+  output:
+    draft: { type: string }
+store.runs:
+  kind: kv
+  scope: global
+  value_schema:
+    outcome: { type: string }
+    error:   { type: string }
+state:
+  draft: { type: string, default: "" }
+flow.write_up:
+  inputs:
+    topic: { type: string }
+  outputs:
+    draft: { type: string }
+  nodes:
+    write:
+      agent: agent.drafter
+      input: "input.topic"
+    record:            # runs once, however `write` went
+      store: store.runs
+      op: set
+      key: "execution.id"
+      value:
+        outcome: "execution.outcome"
+        error: "has(execution.error) ? execution.error : ''"
+      retry: { max: 2, backoff: 1s }
+      timeout: 10s
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: end }
+  finally: record
+
+triggers:
+  cli: { type: manual, flow: flow.write_up }
+```
+
+**It is outside routing.** No edge names the finally node, at either end, and
+neither does an `on_error: { fallback: … }` or a `human.on_timeout:` — each is a
+compile error (`routed-finally`). It needs no `- { from: …, to: end }` either:
+it is on no branch.
+
+**It runs once per instance, innermost first.** The root instance of a run and
+every `flow:` node's, `map` dispatch's and flow-as-tool call's instance run
+their own flow's finally node when they end, so a subflow's finally node runs
+before the node that instantiated it settles, and the caller's runs at the
+caller's end. A detached `flow.*` dispatch is a child execution, and runs its
+own. A body that ended through `on_error: skip` or a `fallback:` to `end`
+**completed**, and its finally node reads `completed`.
+
+**A pause is not an end.** A run that parks at a `human` node runs no finally
+node; the resumed run answers the pause, runs the body on, and runs it when the
+instance ends. That is also why the finally node may not be a `human` node or
+reach one, through a subflow, a map or an agent's flow tools
+(`finally-interrupt`): a step that must always finish cannot wait on a person.
+
+**It changes nothing the instance produced.** The outputs are read before it
+runs, so a completed run stays completed — same outputs, exit code `0` — even
+when its finally node fails. Its own `retry:` and `timeout:` apply, through the
+whole policy chain; `on_error:` does not, at any level — once its retries are
+spent, its failure is `finally_error` on the execution's record (the journal row
+and the trace envelope), and `agent-compose run` prints it on one stderr line.
+
+**A restart runs it once.** The end of the instance is journaled before the
+finally node starts, and its own effects are journaled like any node's: a
+process killed in the middle of it resumes, replays the body, and runs it again
+only up to what it had not done yet.
+
+`execution.outcome` and `execution.error` anywhere but inside the finally node —
+an edge guard, another node's `input:`, a store key — are a compile error
+(`outcome-outside-finally`).
+
+Normative source: `docs/grammar.md` §7, §7.1, §7.5, §7.7, §7.9, §8.5, Decision D159

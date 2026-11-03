@@ -565,6 +565,7 @@ agent.worker:
 
 state:
   lease: { type: integer }
+  held: { type: boolean, default: false }
 
 flow.job:
   inputs:
@@ -579,7 +580,7 @@ flow.job:
       if: absent
       ttl: 1m
       value: { owner: "input.worker" }
-      writes: { version: lease }
+      writes: { version: lease, applied: held }
     first_half:
       agent: agent.worker
       input: "input.job"
@@ -590,15 +591,15 @@ flow.job:
       if_version: "state.lease"
       ttl: 10m
       value: { owner: "input.worker" }
-      writes: { version: lease }
+      writes: { version: lease, applied: held }
     second_half:
       agent: agent.worker
       input: "input.job"
-    release:          # let it go — if it is still the lease this run holds
+    release:          # however the run ends: let it go, if this run holds it
       store: store.leases
       op: delete
       key: "input.job"
-      if_version: "state.lease"
+      if_version: "state.held ? state.lease : -1"
   edges:
     - { from: start, to: claim }
     - { from: claim, to: first_half, when: "claim.output.applied" }
@@ -606,8 +607,8 @@ flow.job:
     - { from: first_half, to: keep }
     - { from: keep, to: second_half, when: "keep.output.applied" }
     - { from: keep, to: end, else: true }
-    - { from: second_half, to: release }
-    - { from: release, to: end }
+    - { from: second_half, to: end }
+  finally: release
 
 triggers:
   cli: { type: manual, flow: flow.job }
@@ -669,11 +670,18 @@ without waiting for it.
 minute; `keep` holds it for ten minutes from the moment it writes — its own
 `ttl: 10m`, which replaces what was left of the claim's minute rather than
 adding to it — only if it is still the version this run took (`state.lease`),
-and records the version it took in turn; `release`
-deletes it only if it still holds that version — so a run that lost its lease to
-expiry never deletes the next holder's. The release is an ordinary last node, so
-a run that fails before it leaves the lease to expire on its own; PRD resolved q76's
-`finally:` will make it run on failure too.
+and records the version it took in turn. `release` is the flow's **`finally:`
+node** (`agent-compose docs flows`): it runs once however the run ends — after
+the second half, and just as surely after a first or second half that failed —
+and deletes the key only if it still holds the version this run took. Two
+guards make that only this run's lease. `held` is what the claim and the keep
+*applied*, so a run whose claim was declined, or whose keep found the lease
+already gone, releases nothing — and `state.lease` there is the version of
+**somebody else's** lease, which a declined write answers with. And
+`if_version:` is the version this run took, so a run that lost its lease to
+expiry never deletes the next holder's even where it thinks it holds it. A run
+that dies outright — killed, not failed — runs no finally node in that process,
+so its lease expires on its own; the run's resume runs `release` when it ends.
 
 **The idempotency ledger is pruned when an execution settles.** Each keyed
 write leaves a ledger row so a retry of it answers rather than writing twice.

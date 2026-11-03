@@ -211,7 +211,11 @@ documents and no grammar section defines — prints one document:
 
 `status` is the envelope's three (§2). A run that produced no answer — `"failed"`
 or `"interrupted"` — answers with the same document, `error` in place of
-`outputs`, and the trace it did make. `trace_path` is absent when the file could
+`outputs`, and the trace it did make. A run whose `finally:` node failed carries
+the envelope's `finally_error` beside whichever of the two it has, and its exit
+code is the outcome's: a completed run whose cleanup failed still exits `0`.
+Under `--format human` the same failure is one line on stderr,
+`finally_error: <flow> node \`<id>\` failed: <error>`. `trace_path` is absent when the file could
 not be written (an unwritable data directory is not a reason to lose a run that
 otherwise succeeded) and when the run made no entries at all.
 
@@ -274,7 +278,9 @@ before an execution exists to report on.
 
 `outputs` and `error` are the same shape: each appears when the execution has
 one, so a `running` report is `execution_id`, `flow`, `trigger` and `status`,
-and nothing else.
+and nothing else. `finally_error` is a third of that shape (§2): on a stopped
+execution whose `finally:` node failed after its retries, beside a `status` and
+`outputs` it did not change.
 
 A **child execution** (§1.4) is reported here by its **own** id, exactly as
 every execution is — running, settled, or recovered by a later `serve` — and
@@ -322,6 +328,7 @@ in full, and what `run --format json` spreads into the record it prints.
 | `execution_id` | string | always | The execution the entries belong to — grammar §4.1's `execution.id`, and the prefix of every idempotency key in the document (grammar §9.4). On a child execution's envelope it is the **child's** own id — derived from `parent_execution` and `idempotency_key` (`docs/durability.md` §3.2) — under which its effects are journaled and every key in its entries is derived. |
 | `status` | `"completed"` \| `"failed"` \| `"interrupted"` | always | How the run ended: with an answer, without one, or holding a `human` pause it had no way to answer (grammar §8.7, §9). The third is told apart from the second because the two ask different things of whoever is reading — one is a run to look into, the other a question to answer — and because a reader may not decide it from the message text (§10.1). A child execution's envelope takes the first two only: a detached dispatch that could reach a `human` node is refused at build time (Decision D118), so a child never parks. |
 | `error` | string | on `"failed"` and `"interrupted"` | What stopped the run. Present on every document that carries neither answer, because such a run's last entry does not always say: a run stopped by the superstep ceiling has no aborting node to carry one. On `"interrupted"` it names the node that is waiting and where an answer would come from. |
+| `finally_error` | string | when a `finally:` node of the execution failed after its own retries | What that node raised, as `<flow> node \`<id>\` failed: <error>` — the **first** such failure in the execution, since a subflow instance's finally node and the root's can both fail (grammar §7.9, PRD resolved q76). It sits beside a `status` it does **not** change: a `"completed"` envelope carrying one is a run that produced its answer and whose cleanup failed afterwards, and its outputs are its body's. Never empty. The failed node's own entry carries its `error` too (§3.5), and every later failure is on its own entry. Carried on every envelope this document describes — the trace file, the sink export, `run --format json`'s record and a `serve` report — and on the execution's lifecycle row as `finallyError` (`docs/durability.md` §3.5). |
 | `entries` | array of [entries](#3-entries) | always, possibly empty | Every entry the run recorded, in the order §3.1 fixes. Empty only on a run that recorded none at all — one that failed before any node produced an entry, which takes a failure the node a run aborts at cannot account for, since that node contributes one (§9). The trace **file** is not written for such a run (§1.2), so an empty array reaches a reader only as `run --format json`'s `trace` or a `serve` report's — or as a child execution's export, which ships whatever its run recorded. |
 
 **A child execution's envelope** is this record with three more keys at its
@@ -360,7 +367,7 @@ retries are attempts at one execution, and `attempts` is where they are recorded
 | `outcome` | `"completed"` \| `"skipped"` \| `"failed"` | always | See §3.2. |
 | `attempts` | integer | always | How many attempts the node's `retry:` policy **made**, not how many it allowed (grammar §9.1) — a budget that ran out during the second of three made two. `0` when the node never ran: an input binding that could not be evaluated fails the execution before any attempt (grammar §4.1, §10.1). |
 | `writes` | array of strings | `"completed"`, `"skipped"`, possibly empty | The state channels this node wrote, by name (grammar §10.1). Empty on a skipped node, which writes nothing — and on a **completed** node that landed no channel: one whose `writes:` maps nothing, and one whose result omitted every field that is mapped (grammar §8.0, Decision D110). An empty array is therefore not a statement about `outcome`; read `outcome` for that. Absent on a failed entry: a node that failed produced no output to write from, and where the failure ended the run the superstep it died in lands nothing at all (§9). |
-| `routing` | [routing decision](#4-routing-decisions) | `"completed"`, `"skipped"`; on `"failed"` in the one case §9 names | What this node's outgoing edges answered. The one failed case is *no viable route*, where the edge decisions are the whole explanation; every other failure abandoned or never reached the decision. See §4 and §9. |
+| `routing` | [routing decision](#4-routing-decisions) | `"completed"`, `"skipped"` — except on a flow's `finally:` node (§3.5); on `"failed"` in the one case §9 names | What this node's outgoing edges answered. The one failed case is *no viable route*, where the edge decisions are the whole explanation; every other failure abandoned or never reached the decision. A `finally:` node's entry never carries it, whatever its outcome: the node has no edges, so there is no decision to record. See §4 and §9. |
 | `dispatches` | array of [dispatch records](#5-dispatch-records) | `map` nodes with a fan-out to report, possibly empty | What a fan-out dispatched, one record per source item in **index** order (grammar §8.6, PRD 5.6). A map over an **empty** array records `[]` — present and empty. The key is absent, rather than empty, exactly where the fan-out has nothing resolved to report: a map whose input binding failed, so no plan was ever built, and a map whose failure abandoned its plan with no dispatch resolved in it — which §5.2's `timeout:` is the reachable case of. A node that is not a `map` never carries the key. See §5. |
 | `toolDispatches` | array of [dispatch records](#5-dispatch-records) | nodes that ran an agent — an `agent:` node, or a `map` dispatching `agent.*` targets — whose tool loop resolved an outcome for a `flow.*` attached to that agent's `tools:` | What a **model** dispatched: one record per flow-as-tool call (grammar §5.4, PRD 5.1), in the order the calls were made — with the hedge §5 states for the records a `map` node could not put in source-item order. The same record type `dispatches` holds and a key of its own, because the two are different fan-outs a single entry can carry at once: a `map` over source items and a tool loop over the calls a model asked for. Present on every entry whose tool loop resolved an outcome for something, whatever became of the node — a call that ended it is in here with the ones before it — and never empty: a node that resolved none carries no key. The one call a record can be missing for is the one a node deadline caught **mid-flight** — caught while the instance it started was still running, so no outcome had resolved when the entry was written. A call the deadline catches earlier started no instance either, and has no half anywhere. §5.2 describes the shape for the other carrier and §5.3 for this one, and §5.3 is the binding account. See §5. |
 | `inner` | array of entries | `flow:` nodes that ran an instance | The trace of the subflow instance this node ran (grammar §8.5). Absent on a `flow:` node that ran none — one whose *input* could not be built — and on one whose own `timeout:` abandoned its instance mid-flight, which leaves no trace to carry. A **dispatched** instance is never here: a `map`'s items report under their own dispatch records (§5), including the item whose failure ended the map node. See §8. |
@@ -379,8 +386,11 @@ canonical write order read for the trace: two runs of one composition produce th
 entries in the same order whatever order the scheduler and the providers finished
 them in.
 
-One entry is outside that ordering, and it is always last: the entry of the node
-a **failed** run aborted at (§9).
+One entry is outside that ordering, and it is last but for one: the entry of the
+node a **failed** run aborted at (§9). The one after it is the entry of the
+flow's **`finally:` node**, where the flow declares one (§3.5): it runs once the
+instance has ended, so it is the instance's last entry on every outcome, after
+the entry that ended the body, with a `step` one past every step before it.
 
 Nested entries (`inner`, and a dispatch record's `inner`) have step numbers of
 their **own instance**, starting again at `1`. They are not interleaved with the
@@ -454,6 +464,35 @@ special case:
 * **held to the end of the run** — `outcome: "failed"` with neither `fallback`
   nor `routing`, `error` naming what was waited for and where an answer would
   have come from, and the document's `status` `"interrupted"`.
+
+### 3.5 A `finally:` node
+
+A flow's `finally:` node (grammar §7.9, PRD resolved q76) runs once when an
+instance of the flow ends — completed, failed, or cancelled — and its entry is an
+**ordinary entry**: `node` is its id, `traversal` is `0`, and it carries
+`outcome`, `attempts`, `writes`, `error` and every record its activity made
+(`stores`, `models`, `inner`, …) by §3's rules. Three things are its own:
+
+* **It carries no `routing`**, on any outcome. The node has no edges — nothing
+  routes to it and it routes to nothing — so there is no decision to record.
+* **It is the instance's last entry** (§3.1), with a `step` one past the last
+  step of the body, the aborting entry's included; a nested instance's finally
+  entry is the last entry of that instance's `inner`, so one that ran inside a
+  `flow:` node is found under that node's entry rather than after it.
+* **Its `outcome` is its own**, not the instance's. `"completed"` or
+  `"failed"` — never `"skipped"`, since no `on_error:` applies to the node — and a
+  `"failed"` one changes nothing the instance ran after: the run's `status` is
+  what the body made it, and the envelope carries the failure as `finally_error`
+  (§2). Its `writes` land after the instance's outputs were read, so they change
+  no output.
+
+How the instance ended — what the node read as `execution.outcome` and
+`execution.error` — is not on the entry: the entry before it says, and the
+envelope's `status` says for the root instance.
+
+A pause the run **parks** at is not an end, so a run that stops `"interrupted"`
+has no finally entry: the resumed run runs the body on, and the finally node at
+its end.
 
 ---
 
@@ -1194,10 +1233,13 @@ was still waiting (§3.4), and there is nothing else different about it. What is
 in it:
 
 * every entry that **landed** — the supersteps that completed before the failure;
-* then, last, the entry of the node the run **aborted at**.
+* then the entry of the node the run **aborted at**;
+* then, last, where the flow declares a `finally:` node and the run did not stop
+  at a pause, the finally node's entry (§3.5): a failure is an end, so the node
+  ran after the body failed, and its entry is after the one that failed it.
 
-The last entry is a `"failed"` entry with no `fallback`, and it is special in two
-ways, both consequences of how a superstep dies rather than choices:
+The aborting entry is a `"failed"` entry with no `fallback`, and it is special in
+two ways, both consequences of how a superstep dies rather than choices:
 
 * it records **no `writes`**. The superstep a run dies in lands none of them —
   every task's update in that step is discarded — so a `writes` array would name
@@ -1374,6 +1416,25 @@ cannot index by key, which is what it is. The ruling calls a batch one write
 and says nothing of the trace; its record's shape — a write with no key — is
 that statement read into §6, and §10.3's test finds nothing to bump, so
 `trace_version` stays `6`.
+
+**PRD resolved q76 is a release of the first two kinds, and the one that moves a
+presence cell for entries rather than records.** It added one field to the
+envelope, `finally_error` (§2) — optional, absent on every document a run without
+a failed `finally:` node writes, which is every document a composition written
+before the key could produce — and one entry a run may carry, a `finally:`
+node's (§3.5). That entry is an ordinary entry with one exception: a
+`"completed"` one carries **no `routing`**, which §3's `routing` row would
+otherwise have required. A cell that moved for records a reader of version `6`
+could already meet would be §10.3's bump; this one moved only for the entry of a
+node kind of position that did not exist — no composition before q76 has a
+`finally:` node, so no document written before it holds one — and every entry of
+every other node is present and absent exactly where it was. A reader that
+branches on `outcome` and reads `routing` where present (§10.1) reads a finally
+entry as a node that ran and routed nowhere, which is what it did. Nor is the
+order rule a bump: §3.1's one entry outside `(step, node)` order is still last
+but for the finally entry, whose `step` is past every other's, so it sorts last
+by the rule itself. The ruling states its trace change as additive; §10.3's test
+finds nothing to bump, so `trace_version` stays `6`.
 
 ### 10.3 What requires a version bump
 
@@ -1761,6 +1822,7 @@ run. A reader should treat all of it as untrusted:
 | `HarnessRecord.error` | what ended a coding-harness run (§7.6): the harness's own fatal-error text, or — when the run's answer failed the node's `output:` gate — this runtime's schema refusal with an excerpt of the offending value, under the same 120-character cap every other parse refusal is under. The harness's text is the *vendor's* rather than this process's, and a harness that quotes what a command printed puts that echo here |
 | `HarnessToolCall.error` | what one tool event of a harness run reported (§7.6.3). On a `"failed"` event it is the harness's own account of the failure; on a `"refused"` one it is the sentence the harness's permission surface handed its model, which for a node's `allow_tools:` is composed by this runtime and names the list |
 | `TraceDocument.error` | the same text, when that failure is what stopped the run |
+| `TraceDocument.finally_error` | the same text again, raised by a `finally:` node after its own retries (§2, §3.5) and headed by the node it names — so a cleanup whose subprocess printed what it was handed, or whose `http:` call was answered with a body, puts that here as surely as an aborting node puts it in `error`, on a run whose `status` says it completed |
 | `Refusal.detail` | what a provider answered: a status and a response body, truncated, or the socket failure that came back instead. Never the request, so the key it was signed with is not in it |
 | `BuiltinProgram.command`, `BuiltinProgram.path` | the **program the model wrote** for a built-in tool, carried verbatim and capped at 1000 characters each: the `bash` command's text, and the `files` path as the model asked for it (§7.4). Not what a system answered but what the model chose, so it is the one text here that is adversarial by construction wherever a model read something it should not have — a `command` is shell source and a `path` is arbitrary bytes, and neither is a name this runtime composed. `BuiltinProgram.change` beside them is this runtime's own sentence about an edit (`replaced one occurrence at line 12`) and carries nothing of the file |
 
@@ -2075,6 +2137,7 @@ or a row promising one nothing sets.
 | `agentcompose.trace_version` | root | `TRACE_VERSION` — how a reader on a collector pins the format (§1) |
 | `agentcompose.detached`, `agentcompose.parent_execution`, `agentcompose.idempotency_key` | root of a child execution's export | the envelope's lineage head — `detached` as a boolean, `parent_execution` and `idempotency_key` as strings (§2). How a collector tells a child execution from one a trigger started, and the pair it joins the child to its parent's stub record on (§1.4); on the root of no other export |
 | `agentcompose.error` | root, entry, dispatch, tool-call event | that record's `error` |
+| `agentcompose.finally_error` | root, where the envelope carries one | the envelope's `finally_error` (§2): what a `finally:` node raised after its retries. An attribute and never the span's status, because the run's outcome is what the status says (§12.4) and a finally node's failure does not change it (grammar §7.9) |
 | `agentcompose.instance_path` | entry, dispatch, store event, tool-call event, link | §8's path — an entry's derived, a dispatch's read off its `idempotencyKey` |
 | `agentcompose.node`, `agentcompose.step`, `agentcompose.traversal`, `agentcompose.outcome`, `agentcompose.attempts` | entry | the entry's own fields |
 | `agentcompose.writes` | entry | the entry's `writes`, as a string array |
