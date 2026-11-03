@@ -12063,8 +12063,9 @@ fn a_flow_pages_through_a_kv_store_counts_it_and_reads_many_keys_at_once() {
 /// set the new key if it is absent, delete the old — and routes on `applied`
 /// into a second move that asks the same of a store where the new key is now
 /// held. That one declines at its first entry and so applies **nothing**: its
-/// own delete, of a key the store does hold, is taken back with it, and the
-/// flow routes on `applied: false` to read the keys. What decides it is that
+/// own delete, of a key the store does hold, is never reached — a batch stops
+/// at the first entry that cannot land rather than skipping it — and the flow
+/// routes on `applied: false` to read the keys. What decides it is that
 /// last page: `closed/<name>` and `open/other`, and not `open/<name>` — the
 /// first batch's two entries both landed and the second's neither did. Then
 /// the trace: each batch is one **write** record, addressing no single key and

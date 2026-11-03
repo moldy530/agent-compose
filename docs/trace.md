@@ -1370,8 +1370,10 @@ of version `6` could have met changed — and none did: the cell gained the
 records of an op that did not exist, and every record of every other op is
 present and absent exactly where it was. A reader that branches on `effect` and
 ignores what it does not recognize (§10.1) reads a batch record as a write it
-cannot index by key, which is what it is. The ruling states its trace shape as
-a write with no key and makes no bump, so `trace_version` stays `6`.
+cannot index by key, which is what it is. The ruling calls a batch one write
+and says nothing of the trace; its record's shape — a write with no key — is
+that statement read into §6, and §10.3's test finds nothing to bump, so
+`trace_version` stays `6`.
 
 ### 10.3 What requires a version bump
 
