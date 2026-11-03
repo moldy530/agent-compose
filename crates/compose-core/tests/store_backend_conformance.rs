@@ -640,6 +640,12 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "an_expired_key_stays_invisible_until_a_write_removes_it",
     "the_write_sweep_removes_at_most_100_rows",
     "an_expired_key_leaves_storage_at_the_next_writes_to_its_partition",
+    // …and that write's sweep is its own partition's alone: two partitions of
+    // 50 expired keys each, fewer than one write's hundred together, and a
+    // write to one leaves the other's every row — what keeps a write's
+    // `DELETE` off rows another partition's writer is about to reach for
+    // (Decision D153).
+    "a_writes_sweep_takes_no_other_partitions_rows",
     "an_expired_key_leaves_storage_when_a_process_next_opens_the_store",
     "an_expired_key_leaves_storage_when_a_process_starts_without_reaching_the_store",
     // …where that open's sweep runs behind the process's first op rather than
@@ -647,6 +653,11 @@ const TRUE_EVERYWHERE: &[&str] = &[
     // removed all of it by the time the process lets go of the store.
     "a_first_op_answers_before_the_start_sweep_has_finished",
     "the_start_sweep_has_removed_the_backlog_when_the_process_lets_go",
+    // …in batches of at most 1000 rows, counted by a second process **between**
+    // two batches (`store-sweep-batches.mjs`), so that a sweep of one unbounded
+    // `DELETE` — which the two cases above would both pass — is caught: no op
+    // waits for more than the one batch in progress however large the backlog.
+    "the_start_sweep_takes_at_most_1000_rows_a_batch",
     "a_malformed_clock_offset_is_refused_by_name",
     // (d) the ledger a settled execution leaves is pruned, through the
     // runtime's own settle: N executions leave a bounded ledger and keep their
@@ -770,6 +781,14 @@ const TRUE_WHEN_DIALLED: &[&str] = &[
     "a_store_wide_sweep_and_a_write_never_deadlock",
     "a_store_wide_sweep_takes_no_key_a_write_refreshed",
     "a_store_wide_sweep_removes_the_whole_backlog",
+    // …and each batch of that sweep takes only the rows of the one partition
+    // whose sequence lock it holds — the store's oldest expired row's — and
+    // none of another's, counted between batches as above: a batch with no
+    // partition in its `DELETE` would hold rows a write to another partition
+    // reaches for under a lock that write does not take, which is the deadlock
+    // the lock exists to rule out (`StoreDialect.sweepPartition`, D153). The
+    // race above cannot tell the two apart: its backlog is one partition's.
+    "a_store_wide_sweep_batch_takes_only_its_own_partitions_rows",
     // PRD resolved q69 (d): a settlement prunes every store the composition
     // binds, so a bound store whose server accepts a connection and never
     // answers is one every settlement meets — and it delays neither the

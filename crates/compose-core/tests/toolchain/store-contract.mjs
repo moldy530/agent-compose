@@ -1610,6 +1610,42 @@ async function ledgerRows(store, prefix) {
 }
 
 {
+  // **…and that sweep is its own partition's, and no other's** (PRD resolved
+  // q69 (c), Decision D153). A write sweeps under the sequence lock of the
+  // partition it writes, and on a server that lock is what keeps its `DELETE`
+  // and every other one off each other's rows: a sweep that reached into a
+  // second partition would hold rows a write to that partition is about to
+  // reach for, under a lock that write does not take — the deadlock the lock
+  // exists to rule out. So two partitions each hold 50 expired keys, fewer than
+  // one write's 100 together, and a write to the first must leave the second's
+  // every one: a sweep with no partition in its `DELETE` takes all 100.
+  const store = kv("sweep_partition", "session");
+  const runs = {
+    a: ctx(execution("sweep_partition_a"), "a"),
+    b: ctx(execution("sweep_partition_b"), "b"),
+  };
+  await later(0, async () => {
+    for (const session of ["a", "b"]) {
+      await write(store, "set", { key: "kept", value: { n: -1 } }, runs[session]);
+      for (let index = 0; index < 50; index += 1) {
+        await write(store, "set", { key: `old-${String(index).padStart(2, "0")}`, value: { n: index }, ttl: HOUR }, runs[session]);
+      }
+    }
+  });
+  const partitions = async () => [await storedRows(store, "session/a"), await storedRows(store, "session/b")];
+  const seeded = await partitions();
+  await later(HOUR + MINUTE, () => write(store, "set", { key: "new", value: { n: 0 } }, runs.a));
+  const afterFirst = await partitions();
+  await later(HOUR + MINUTE, () => write(store, "set", { key: "new", value: { n: 0 } }, runs.b));
+  const afterSecond = await partitions();
+  // 50 expired and `kept` in each; the write to `a` leaves `kept` and itself
+  // there and all 51 in `b`, and the write to `b` then does the same there.
+  answer.a_writes_sweep_takes_no_other_partitions_rows =
+    same(seeded, [51, 51]) && same(afterFirst, [2, 51]) && same(afterSecond, [2, 2]);
+  answer.sweep_partition_trace = { seeded, afterFirst, afterSecond };
+}
+
+{
   // …or when a process next opens the store, whichever comes first: a process
   // whose first op on the store is a **read** still removes every expired key
   // of it, every partition included. The second process is real — the open is
@@ -1918,6 +1954,141 @@ if (provider !== "sqlite") {
     answer.first_op_trace = { atAnswer, afterRelease };
   } catch (error) {
     answer.first_op_error = String(error?.message ?? error);
+  } finally {
+    if (provider !== "sqlite") {
+      for (const table of ["store_entries", "store_applied", "store_sequences"]) {
+        await storage(`DELETE FROM ${table} WHERE store = ?`, [store.name]).catch(() => undefined);
+      }
+    }
+  }
+}
+
+{
+  // **The start sweep takes at most 1000 rows a batch, and on a server each
+  // batch takes only the rows of its own partition** (PRD resolved q69 (c),
+  // Decision D153). The bound is what keeps an op from waiting for more than
+  // the one batch in progress however large the backlog is — on SQLite a batch
+  // is a synchronous statement the event loop cannot interrupt, and on a server
+  // one holds a partition's sequence lock and this connection's queue — and the
+  // partition is what keeps a batch from deadlocking a write to another one. A
+  // case that counted the backlog *while* the sweep ran would pass one
+  // unbounded `DELETE`, so a second process counts it **between** the sweep's
+  // batches (`store-sweep-batches.mjs` says how, per arm), after each of
+  // several probes.
+  //
+  // Two partitions hold the backlog: `a` the ten oldest rows, `b` several
+  // batches' worth behind them. Every batch may take at most 1000 rows of the
+  // total; and on a server the first batch is `a`'s — the partition holding the
+  // store's oldest expired row — and must take all ten of it and nothing of
+  // `b`, where a batch with no partition in its `DELETE` takes 1000 rows of
+  // the store, at least 990 of them `b`'s. Every later batch changes one
+  // partition's count. The local sweep is the file's, so on SQLite only the
+  // bound is asked of it.
+  const store = kv("sweep_batches", "session");
+  const FIRST = 10;
+  const SECOND = 3_500;
+  /** One more than the batches the backlog takes, so the last count is past the sweep's end. */
+  const PROBES = 6;
+  const partitions = ["session/a", "session/b"];
+  /** A count, with a partition the backlog has left counted as zero rather than absent. */
+  const backlog = (counted) =>
+    Object.fromEntries(partitions.map((partition) => [partition, Number(counted?.[partition] ?? 0)]));
+  try {
+    // Each partition's sequence row — a store-wide batch takes its partition's
+    // lock first, so a partition without one is one it cannot sweep — and a
+    // key that never expires, beside the partition the probes write to.
+    for (const session of ["a", "b", "probe"]) {
+      await later(0, () => set(store, "kept", { n: 0 }, ctx(execution(`sweep_batches_${session}`), session)));
+    }
+    const clock =
+      provider === "sqlite"
+        ? Date.now()
+        : Number(
+            (
+              await storage(
+                provider === "postgres"
+                  ? "SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint AS now"
+                  : "SELECT CAST(FLOOR(UNIX_TIMESTAMP(NOW(3)) * 1000) AS SIGNED) AS now",
+                [],
+              )
+            )[0]?.now,
+          );
+    // Live to every probe for half an hour, and expired to the sweep, whose
+    // clock is an hour and a minute ahead: `a`'s rows first, then `b`'s, one
+    // millisecond apart.
+    const laid = [
+      ...Array.from({ length: FIRST }, (_, index) => ["session/a", `z-a-${index}`, clock + HOUR / 2]),
+      ...Array.from({ length: SECOND }, (_, index) => [
+        "session/b",
+        `z-b-${String(index).padStart(4, "0")}`,
+        clock + HOUR / 2 + MINUTE + index,
+      ]),
+    ];
+    for (let at = 0; at < laid.length; at += 2_000) {
+      const chunk = laid.slice(at, at + 2_000);
+      if (provider === "sqlite") {
+        await storage(undefined, undefined, [
+          store.name,
+          "INSERT INTO entries (scope_key, key, value, version, expires_at) VALUES " +
+            chunk.map(() => "(?, ?, ?, ?, ?)").join(", "),
+          chunk.flatMap(([partition, key, expiresAt]) => [partition, key, '{"n":0}', 0, expiresAt]),
+        ]);
+      } else {
+        await storage(
+          `INSERT INTO store_entries (store, scope_key, ${provider === "postgres" ? '"key"' : "`key`"}, value, version, expires_at) VALUES ` +
+            chunk.map(() => "(?, ?, ?, ?, ?, ?)").join(", "),
+          chunk.flatMap(([partition, key, expiresAt]) => [store.name, partition, key, '{"n":0}', 0, expiresAt]),
+        );
+      }
+    }
+    const before = backlog(
+      Object.fromEntries(
+        (
+          await storage(
+            "SELECT scope_key, COUNT(*) AS n FROM store_entries WHERE store = ? AND expires_at IS NOT NULL GROUP BY scope_key",
+            [store.name],
+            [store.name, "SELECT scope_key, COUNT(*) AS n FROM entries WHERE expires_at IS NOT NULL GROUP BY scope_key"],
+          )
+        ).map((row) => [String(row.scope_key), Number(row.n)]),
+      ),
+    );
+    const swept = await helper(
+      "store-sweep-batches.mjs",
+      [project, provider, data, JSON.stringify(store), String(PROBES)],
+      { ...process.env, [CLOCK]: String(HOUR + MINUTE) },
+    );
+    const failed = swept.answer.observed.find((counted) => counted?.error !== undefined);
+    const observed = swept.answer.observed.map(backlog);
+    const after = backlog(swept.answer.after);
+    const total = (counted) => partitions.reduce((sum, partition) => sum + counted[partition], 0);
+    const totals = [before, ...observed].map(total);
+    const taken = totals.slice(1).map((left, index) => totals[index] - left);
+    // Every probe found the sweep at most one batch further on, and at least one
+    // found it under way — neither untouched nor finished — so the counts are
+    // the sweep's own steps rather than its two ends.
+    answer.the_start_sweep_takes_at_most_1000_rows_a_batch =
+      failed === undefined &&
+      swept.answer.first?.found === true &&
+      same(before, { "session/a": FIRST, "session/b": SECOND }) &&
+      observed.length === PROBES &&
+      taken.every((n) => n >= 0 && n <= 1_000) &&
+      totals.some((n) => n > 0 && n < totals[0]) &&
+      total(after) === 0;
+    if (provider !== "sqlite") {
+      const steps = [before, ...observed];
+      answer.a_store_wide_sweep_batch_takes_only_its_own_partitions_rows =
+        failed === undefined &&
+        same(observed[0], { "session/a": 0, "session/b": SECOND }) &&
+        steps
+          .slice(1)
+          .every(
+            (counted, index) =>
+              partitions.filter((partition) => counted[partition] !== steps[index][partition]).length <= 1,
+          );
+    }
+    answer.sweep_batches_trace = { before, observed, after, failed, totals };
+  } catch (error) {
+    answer.sweep_batches_error = String(error?.message ?? error);
   } finally {
     if (provider !== "sqlite") {
       for (const table of ["store_entries", "store_applied", "store_sequences"]) {
