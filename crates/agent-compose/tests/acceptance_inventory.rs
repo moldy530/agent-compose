@@ -889,6 +889,14 @@ const CODEGEN: &[Criterion] = &[
                 "a_run_sheds_expired_keys_from_a_store_it_never_reaches",
                 Status::Live,
             ),
+            // …and the ledger's retention through the one exit a `serve` has:
+            // a stop with a detached delivery still running prunes what that
+            // delivery was holding back, since nothing comes back for a settled
+            // execution after it.
+            (
+                "a_stopped_serve_prunes_what_a_running_delivery_held_back",
+                Status::Live,
+            ),
         ],
     },
     Criterion {

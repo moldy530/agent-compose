@@ -4457,10 +4457,11 @@ Rules (PRD 5.8):
   twice (PRD resolved q29, q69). A `scope: execution` store's partition, ledger
   included, already dies with the run (§11.3). The prune runs behind the
   outcome and nothing of the outcome waits for it — each store on its own, a
-  dial bounded at ten seconds — and a command waits for it on its way out,
-  starting then a prune still waiting on deliveries the exit cuts off, whose
-  keyed writes are refused from then on. A prune that fails is said and changes
-  no outcome: the rows answer nothing again.
+  dial bounded at ten seconds — and a command waits for it on its way out (a
+  `run` or `resume` as it exits, a `serve` when it is stopped), starting then a
+  prune still waiting on deliveries the exit cuts off, whose keyed writes are
+  refused from then on. A prune that fails is said and changes no outcome: the
+  rows answer nothing again.
 - A store **write** performed inside a `map`-dispatched instance — `kv set`,
   `kv delete`, `kv merge`, `kv append`, `kv incr`, `vector upsert`,
   `vector delete`, `blob put`, `blob delete` — MUST be one of two forms (PRD 5.8,
@@ -11002,8 +11003,8 @@ front of them. When an execution's journal row closes `completed` or `failed`
 and its detached deliveries have finished, the ledger rows under its
 `<execution.id>/` prefix are deleted from every store the composition binds,
 which is every partition its keyed writes reached from any process — behind
-the outcome, which never waits for it, and before a command exits (§4.4, §8.8,
-§11.1, §11.4, §11.5, PRD resolved q69).
+the outcome, which never waits for it, and before a command exits, a stopped
+`serve` included (§4.4, §8.8, §11.1, §11.4, §11.5, PRD resolved q69).
 
 **Rationale**: a store several runs share has two growth problems a `kv` store
 had no answer to. The composition's own keys — a claim, a cache entry, a
@@ -11081,22 +11082,26 @@ means after everything still writing under that id, too: a detached `agent.*`
 or `tool.*` delivery outlives the run that dispatched it (§8.6 rule 7) and
 retries under the run's id, so the prune waits for those deliveries to finish
 — chained behind them, so the outcome does not. A command does not wait for
-them — `agent-compose run` exits under a delivery still in flight — so it
-starts such a prune on its way out instead: no process retries a settled
-execution's delivery once this one is gone (PRD resolved q65), and the delivery
-still running here until the exit is refused any keyed write from then on, so
-it can never apply one a second time for want of the row. **Nor does the
-outcome wait for the prune itself.** It visits every store the composition
-binds, and one of those can be on a server that is slow or does not answer;
-an outcome that waited would hand every bound store's reachability to every
-run, a store the run never touched included. So the prune runs behind the
-outcome, each store on its own, with a dial bounded at ten seconds, and a
-command waits for it before it exits. And it is every store the
-composition binds that is pruned, not the ones the settling process wrote: a
-placed node writes a dialled store from its worker (§14.1 rule 5), and the hub
-that settles never sees that write. A `kv` or `vector` store's ledger is keyed
-by the idempotency key alone, so the prefix is one range on a primary key in
-each, and a store the execution never wrote costs a seek that finds nothing; a
+them — `agent-compose run` exits under a delivery still in flight, and so does
+a `serve` that is stopped — so it starts such a prune on its way out instead,
+which for a `serve` is its stop: the one exit it has, and the one point after
+which nothing would ever run the prune, since recovery takes open executions
+alone. No process retries a settled execution's delivery once this one is gone
+(PRD resolved q65), and the delivery still running here until the exit is
+refused any keyed write from then on, so it can never apply one a second time
+for want of the row. **Nor does the outcome wait for the prune itself.** It
+visits every store the composition binds, and one of those can be on a server
+that is slow or does not answer; an outcome that waited would hand every bound
+store's reachability to every run, a store the run never touched included. So
+the prune runs behind the outcome, each store on its own, with a dial bounded
+at ten seconds, and a command waits for it before it exits — a stopped `serve`
+without closing anything under the executions it leaves running for the next
+start to recover. And it is every store the composition binds that is pruned,
+not the ones the settling process wrote: a placed node writes a dialled store
+from its worker (§14.1 rule 5), and the hub that settles never sees that write.
+A `kv` or `vector` store's ledger is keyed by the idempotency key alone, so the
+prefix is one range on a primary key in each, and a store the execution never
+wrote costs a seek that finds nothing; a
 `blob` store's is a directory per partition, which no placement can reach
 ([D131](#d131-a-process-local-store-is-refused-where-a-placement-can-open-it)),
 so the execution wrote it only in the partition its identity addresses, and it

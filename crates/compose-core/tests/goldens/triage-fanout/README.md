@@ -224,8 +224,10 @@ schedule for a diagnostic run: a comma-separated list of durations
 (`0s,1s,2s`), refused at launch if it is not one.
 
 Stopping it stops the graph: `agent-compose serve` passes `SIGINT` and `SIGTERM`
-on to this project, which closes the app and exits, so a supervisor that signals
-the command is not left with a listener behind it.
+on to this project, which closes the app, finishes the work its stores still
+have running — a settled execution's ledger prune, the start's sweep of expired
+keys — and exits, so a supervisor that signals the command is not left with a
+listener behind it.
 
 ### On Node instead
 
@@ -521,12 +523,13 @@ you delete the file — or, for a `kv` key written with a `ttl:` or under a
 the file at the next write to its partition (at most 100 rows a write) or the
 next `run`, `resume` or `serve` of this project, whichever comes first — each
 starts removing every expired key of every store it binds, behind its own work,
-and a `run` or `resume` finishes before it exits. The idempotency ledger a
-keyed write leaves beside its effect (the `applied` table of a SQLite store, the
-`applied` directory of a blob one — one entry per key) is pruned when the
-execution that wrote it settles, `completed` or `failed`, behind the run's
-answer and before a `run` exits, so it holds the open executions' rows and no
-history. The journal and the traces directory are not pruned.
+and a `run` or `resume` finishes before it exits, as a `serve` does when it is
+stopped. The idempotency ledger a keyed write leaves beside its effect (the
+`applied` table of a SQLite store, the `applied` directory of a blob one — one
+entry per key) is pruned when the execution that wrote it settles, `completed`
+or `failed`, behind the run's answer and before a `run` exits or a stopped
+`serve` does, so it holds the open executions' rows and no history. The journal
+and the traces directory are not pruned.
 Retention is yours: everything under `.agent-compose/` is safe to remove between
 runs, and removing it is what "start clean" means — at the cost, for the
 journal, of the executions it was holding open.

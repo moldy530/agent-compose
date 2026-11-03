@@ -12768,6 +12768,208 @@ fn a_run_sheds_expired_keys_from_a_store_it_never_reaches() {
     );
 }
 
+/// The composition [`a_stopped_serve_prunes_what_a_running_delivery_held_back`]
+/// serves: `flow.dispatch` hands each parcel to `agent.courier` through a
+/// **detached** `map`, so the execution settles while the delivery is still
+/// running, and the courier's one tool is `flow.record`, whose `store:` node
+/// makes a keyed write under the execution's id — the ledger row that is held
+/// back until the delivery finishes.
+const STOPPED_SERVE: &str = r#"version: "0.1"
+
+provider.mock:
+  kind: anthropic
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+
+model.smart:
+  provider: provider.mock
+  id: claude-sonnet-4-6
+  settings:
+    max_tokens: 4096
+
+store.tally:
+  kind: kv
+  scope: global
+  value_schema:
+    count: { type: integer }
+
+flow.record:
+  description: Count one parcel as delivered.
+  inputs:
+    parcel: { type: string }
+  outputs: {}
+  nodes:
+    bump:
+      store: store.tally
+      op: incr
+      key: "'delivered'"
+      field: count
+  edges:
+    - { from: start, to: bump }
+    - { from: bump, to: end }
+
+agent.courier:
+  description: Records one parcel, then says it is delivered.
+  model: model.smart
+  prompt: |
+    Record the parcel, then say it is delivered.
+  tools: [flow.record]
+  input:
+    parcel: { type: string }
+  output:
+    delivered: { type: string }
+
+flow.dispatch:
+  inputs:
+    parcels:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs: {}
+  nodes:
+    deliver:
+      map:
+        over: input.parcels
+        as: parcel
+        node: agent.courier
+        max_concurrency: 1
+        detach: true
+        input:
+          parcel: "parcel"
+  edges:
+    - { from: start, to: deliver }
+    - { from: deliver, to: end }
+
+triggers:
+  dispatch:
+    type: http
+    flow: flow.dispatch
+    method: POST
+    path: /dispatch
+    respond: async
+    input:
+      parcels: "payload.body.parcels"
+"#;
+
+/// **A `serve` that is stopped prunes the ledger a settled execution's running
+/// delivery was holding back** (PRD resolved q69 (d), with q65).
+///
+/// An execution's ledger rows go when it settles and the detached deliveries
+/// it started have finished, because those deliveries still write, and retry,
+/// under its id. A `serve` is stopped with deliveries still running — on every
+/// deploy — and nothing ever comes back for a *settled* execution: recovery
+/// takes open rows, and no process retries a settled execution's delivery once
+/// this one is gone. So a stop that exited without starting the prune its
+/// delivery was holding back would leave that execution's rows in the store
+/// for good, and a deployment's ledger would grow with its history.
+///
+/// Here the courier's first turn calls `flow.record`, whose keyed `incr`
+/// lands, and its second turn is held for two minutes, so the delivery is
+/// still running when the execution has completed — and the row is still
+/// there, which is the premise. Then the command is sent `SIGTERM`. It exits
+/// `0`, well inside the time the delivery would still have taken, and the
+/// execution's ledger row is gone from the store file while the count the
+/// write made stays.
+#[test]
+#[cfg(unix)]
+fn a_stopped_serve_prunes_what_a_running_delivery_held_back() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new("record", json!({ "parcel": "p-1" }))]),
+        ),
+        // The turn after the tool's answer, held past the stop: the delivery is
+        // still running when the command is signalled.
+        Script::new(
+            SONNET,
+            Outcome::text("Delivered.").after(Duration::from_secs(120)),
+        ),
+    ]);
+    let scratch = harness::Scratch::new("stopped-serve");
+    let entrypoint = scratch.path().join("main.yml");
+    std::fs::write(&entrypoint, STOPPED_SERVE).expect("the scratch spec is writable");
+    let Some(project) = harness::scratch_project("stopped-serve") else {
+        return;
+    };
+    let Some(mut served) =
+        harness::serve_entrypoint_into(&project, &entrypoint, &harness::environment(&provider))
+    else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let started = app
+        .post_json("/dispatch", &json!({ "parcels": ["p-1"] }))
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{}", started.text());
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    // The execution has settled: the detached `map` returned at dispatch.
+    harness::until(Duration::from_secs(30), || {
+        let report = app
+            .get(&format!("/executions/{execution}"))
+            .expect("the status route answers")
+            .json();
+        (report["status"] == "completed").then_some(())
+    });
+    // …and the delivery's keyed write has landed: the courier's second turn is
+    // asked for only once the tool it called has answered.
+    harness::until(Duration::from_secs(30), || {
+        (provider.snapshot().requests >= 2).then_some(())
+    });
+
+    let tally = project
+        .join(".agent-compose")
+        .join("stores")
+        .join("tally.sqlite");
+    let ledger = || {
+        harness::sqlite_rows(
+            &project,
+            &tally,
+            &format!(
+                "SELECT COUNT(*) AS n FROM applied WHERE substr(idempotency_key, 1, {}) = '{execution}/'",
+                execution.len() + 1
+            ),
+        )[0]["n"]
+            .clone()
+    };
+    assert_eq!(
+        ledger(),
+        json!(1),
+        "the delivery is still running, so the settled execution's ledger row is held back"
+    );
+
+    let stopping = std::time::Instant::now();
+    served.signal(libc::SIGTERM);
+    let status = served.wait();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a stop that was asked for is not a failure: {status:?}"
+    );
+    assert!(
+        stopping.elapsed() < Duration::from_secs(60),
+        "the stop prunes; it does not wait out the delivery itself ({:?})",
+        stopping.elapsed()
+    );
+
+    assert_eq!(
+        ledger(),
+        json!(0),
+        "the stop started the prune the running delivery was holding back, and waited \
+         for it: no process will come back for a settled execution (PRD resolved q65, q69)"
+    );
+    assert_eq!(
+        harness::sqlite_rows(&project, &tally, "SELECT key, value FROM entries"),
+        json!([{ "key": "delivered", "value": "{\"count\":1}" }]),
+        "…and the write the row was about stays"
+    );
+}
+
 /// A declared `manual` trigger's `session_key:` remaps the `--session` the CLI
 /// was given, and the run addresses the partition it names (grammar 13.2, 11.3).
 ///

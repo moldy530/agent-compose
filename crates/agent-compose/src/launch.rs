@@ -197,8 +197,10 @@ pub(crate) fn dependencies(out: &Path) -> Result<(), Refusal> {
 /// this process alone — which would leave the app listening with nothing above
 /// it, on a port an operator believes they released and holding the store data
 /// directory of a project they believe they stopped. The emitted app installs
-/// handlers of its own for both (`serve()` in `src/serve.ts` closes the app and
-/// exits), and they are unreachable unless something delivers the signal.
+/// handlers of its own for both (`serve()` in `src/serve.ts` closes the app,
+/// finishes the work its stores still have running for executions that already
+/// settled, and exits), and they are unreachable unless something delivers the
+/// signal.
 ///
 /// A `SIGKILL` cannot be forwarded, and nothing here pretends otherwise: a
 /// caller that must be able to end the whole tree without its cooperation puts

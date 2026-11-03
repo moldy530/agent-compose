@@ -240,13 +240,14 @@
 // how a placement's worker, a library caller and a connection redialled after
 // a loss sweep too. That sweep runs **behind** the ops, between them, one batch
 // of at most [`SWEEP_PER_BATCH`] rows at a time, so no op waits for more than
-// one batch however large the backlog is; and [`releaseStores`], on a
-// command's way out, waits for it to finish, so a command has removed what had
-// expired in every store it swept by the time it exits. Both sweeps run on an
-// index over the expiry, so neither reads a row that is not expired. On a
-// dialled store each batch is one partition's, taken under that partition's
-// version-sequence lock exactly as a write takes it, so a sweep and a write are
-// serialized rather than able to deadlock ([`RemoteKv`]'s `#sweepStep`).
+// one batch however large the backlog is; and [`drainStores`], on a
+// command's way out — a `run` or a `resume` exiting, a `serve` stopped — waits
+// for it to finish, so a command has removed what had expired in every store it
+// swept by the time it exits. Both sweeps run on an index over the expiry, so
+// neither reads a row that is not expired. On a dialled store each batch is one
+// partition's, taken under that partition's version-sequence lock exactly as a
+// write takes it, so a sweep and a write are serialized rather than able to
+// deadlock ([`RemoteKv`]'s `#sweepStep`).
 //
 // `AGENT_COMPOSE_STORE_CLOCK_OFFSET_MS` shifts the clock every arm reads by a
 // whole number of milliseconds — added to `Date.now()` locally and to the
@@ -286,11 +287,13 @@
 // not answering at all — cannot delay or withhold the run's answer: `runFlow`
 // returns when the row has closed. Each store is pruned on its own, so one
 // that does not answer holds up no other, and a dial that has not completed in
-// [`STORE_DIAL_MS`] fails. [`releaseStores`], on a command's way out, waits for
+// [`STORE_DIAL_MS`] fails. [`drainStores`], on a command's way out, waits for
 // every prune in flight — and starts the ones still waiting on detached
 // deliveries, which the exit is about to cut off — so a command's settled
-// executions leave no rows behind; a `serve` lets them finish in the
-// background.
+// executions leave no rows behind. A `run` or a `resume` makes that wait as it
+// exits ([`releaseStores`]); a `serve` lets its prunes finish in the background
+// while it serves and makes the same wait when it is stopped, which is the one
+// exit it has (`./serve.ts`).
 
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -824,7 +827,7 @@ function sweepLocalPartition(database: Database, scopeKey: string, now: number):
 }
 
 /**
- * The store-wide sweeps in flight on every backend, so [`releaseStores`] can
+ * The store-wide sweeps in flight on every backend, so [`drainStores`] can
  * let each finish before the process goes.
  */
 const SWEEPING = new Set<Promise<void>>();
@@ -848,7 +851,7 @@ function holdSweep(sweeping: Promise<void>): void {
  * one batch in progress — the driver is synchronous, so a batch is one step no
  * op lands inside, and a write's transaction is one no batch lands inside —
  * however large the backlog is. A writer in another process gets in between two
- * batches the same way. [`releaseStores`] waits for the rest, so a command that
+ * batches the same way. [`drainStores`] waits for the rest, so a command that
  * reached the store has removed its backlog by the time it exits.
  *
  * **Never an op's failure.** Every read and condition already treats an
@@ -1138,8 +1141,9 @@ export function bindsStores(bindings: readonly StoreBinding[]): void {
 }
 
 /**
- * The prunes in flight, so [`releaseStores`] lets each finish before it closes
- * the connection it runs over, and [`ledgerPrunesSettled`] can wait for them.
+ * The prunes in flight, so [`drainStores`] lets each finish before the process
+ * goes — and before [`releaseStores`] closes the connection one runs over — and
+ * [`ledgerPrunesSettled`] can wait for them.
  */
 const PRUNING = new Set<Promise<void>>();
 
@@ -1147,14 +1151,15 @@ const PRUNING = new Set<Promise<void>>();
  * The settled executions whose prune is waiting on their detached deliveries,
  * by execution id — each the identity the prune will be handed.
  *
- * Here rather than only in a promise chain so [`releaseStores`] can find them:
- * a command on its way out cuts those deliveries off, and a prune chained
- * behind a delivery the exit kills would never run.
+ * Here rather than only in a promise chain so [`drainStores`] can find them:
+ * a command on its way out — a `run` exiting, a `serve` stopped — cuts those
+ * deliveries off, and a prune chained behind a delivery the exit kills would
+ * never run.
  */
 const DEFERRED = new Map<string, runtime.ExecutionIdentity>();
 
 /**
- * The settled executions whose prune [`releaseStores`] started **ahead** of
+ * The settled executions whose prune [`drainStores`] started **ahead** of
  * their detached deliveries, which this process is letting go of.
  *
  * A keyed write under one of these ids is refused rather than made
@@ -1202,7 +1207,7 @@ const CUT_OFF = new Set<string>();
  *
  * **Behind the outcome, and nothing of it awaited.** This returns at once; the
  * prune is held in [`PRUNING`] (or [`DEFERRED`], while it waits) for
- * [`releaseStores`] and nothing else. Every bound store is visited, a store the
+ * [`drainStores`] and nothing else. Every bound store is visited, a store the
  * settling execution never reached included, and one of those can be slow or
  * not answer at all — so a settlement that waited for its prune would hand the
  * reachability of every store the composition binds to the outcome of every
@@ -1224,7 +1229,7 @@ export function pruneLedger(
   }
   DEFERRED.set(execution.id, execution);
   const resume = (): void => {
-    // Gone where [`releaseStores`] has already started it, ahead of the
+    // Gone where [`drainStores`] has already started it, ahead of the
     // deliveries its exit cut off.
     if (DEFERRED.get(execution.id) !== execution) return;
     DEFERRED.delete(execution.id);
@@ -1288,7 +1293,7 @@ async function pruneStore(
  * those finish.
  *
  * A settlement does not wait for its prune ([`pruneLedger`]), so this is how a
- * caller that needs to read what one left — a test, or [`releaseStores`] —
+ * caller that needs to read what one left — a test, or [`drainStores`] —
  * waits for it. Re-read until nothing is left, because a prune can start while
  * another finishes.
  */
@@ -1301,7 +1306,7 @@ export async function ledgerPrunesSettled(): Promise<void> {
 }
 
 /**
- * Refuse a keyed write under an execution whose ledger [`releaseStores`]
+ * Refuse a keyed write under an execution whose ledger [`drainStores`]
  * pruned ahead of its detached deliveries ([`CUT_OFF`]).
  *
  * The ledger row a retry of the write would be answered from is gone, so made
@@ -1377,7 +1382,7 @@ runtime.settlesLedgers(pruneLedger);
  * **Behind everything, in front of nothing.** Each store's sweep is the one an
  * open starts — one batch at a time between the ops — and a dial it needs is
  * made here in the background, bounded by [`STORE_DIAL_MS`], so no execution
- * waits for a store it never reaches; [`releaseStores`] waits for the rest on
+ * waits for a store it never reaches; [`drainStores`] waits for the rest on
  * a command's way out ([`SWEEPING`]).
  *
  * What is skipped is what holds nothing expired to this process: a
@@ -2456,7 +2461,7 @@ const STORE_BACKENDS: Partial<
  * ([`sweepBoundStores`]), so a server that accepts a connection and never
  * answers would otherwise hold a command's exit for as long as the socket
  * lived. Neither waits in front of an outcome; this is what bounds what
- * [`releaseStores`] waits for. An op's own dial fails the same way, which is
+ * [`drainStores`] waits for. An op's own dial fails the same way, which is
  * the node's error under its `retry:` rather than a run that never ends.
  * Ten seconds is `mysql2`'s own default, so the MySQL arm's behaviour is
  * unchanged and the Postgres arm's is the same; it is long past any server
@@ -3045,7 +3050,7 @@ class RemoteKv {
    * the one before it has finished — at the tail, behind every op that arrived
    * meanwhile. So the op that started the sweep runs first, and an op arriving
    * while it is under way waits for at most the one batch in progress, however
-   * large the backlog is. [`releaseStores`] waits for the rest, so a command
+   * large the backlog is. [`drainStores`] waits for the rest, so a command
    * that reached the store has removed its backlog by the time it exits; a
    * connection that is closed or lost first stops between two batches.
    *
@@ -3167,40 +3172,45 @@ class RemoteKv {
 }
 
 /**
- * Close every dialled connection this process opened.
+ * Finish what is still running over the stores, and close nothing: every
+ * settled execution's ledger prune ([`pruneLedger`]), and every store-wide
+ * sweep this process started ([`SWEEPING`]) — on SQLite and over each
+ * connection alike (PRD resolved q69).
  *
- * Called by `./cli.ts` on the way out of a `run` or a `resume`, beside
- * `releaseJournal()` and for that call's reason: a socket left open is a process
- * that does not exit. A `serve` holds them for as long as it serves.
+ * The wait every command makes on its way out: [`releaseStores`]'s first step
+ * for a `run` or a `resume`, and the whole of what `./serve.ts` does with its
+ * stores when a `serve` is stopped. A stop is the only point a `serve` meets
+ * where nothing comes after: a prune it leaves unfinished, or one still
+ * waiting on a delivery, is one no process will ever run, since a settled
+ * execution is never recovered (PRD resolved q65) — and a `serve` stopped on
+ * every deploy would leave every such execution's rows, so the ledger would
+ * grow with history after all. That wait is here, on the way out, rather than
+ * in front of an outcome or a first op, where it would stall whatever the
+ * command had come to do; a dial either one needs is bounded by
+ * [`STORE_DIAL_MS`], so a server that does not answer holds the exit for that
+ * long and no longer.
  *
- * Idempotent, and never the caller's failure: a connection that could not be
- * closed is one the server will reap, and the command that asked has already
- * done its work.
- *
- * **What is still running over the stores goes first**: every settled
- * execution's ledger prune ([`pruneLedger`]), and every store-wide sweep this
- * process started ([`SWEEPING`]) — on SQLite and over each connection alike —
- * so a command's settled executions leave no ledger rows and every store it
- * swept has lost what had expired there by the time it exits (PRD resolved
- * q69). That wait is here, on the way out, rather than in front of an outcome
- * or a first op, where it would stall whatever the command had come to do; a
- * dial either one needs is bounded by [`STORE_DIAL_MS`], so a server that
- * does not answer holds the exit for that long and no longer.
+ * **Nothing is closed**, which is what a `serve` needs of it: its executions
+ * still in flight keep running while it stops — it exits with them open, and
+ * the next start recovers each (`./serve.ts`) — and a store op one of them
+ * made over a connection closed under it would fail its node, which could
+ * settle an execution `failed` that the stop was meant to leave open.
  *
  * **A prune still waiting on detached deliveries starts now** ([`DEFERRED`]).
- * `agent-compose run` does not wait for an `agent.*` or `tool.*` delivery its
- * execution started — the exit cuts it off — so a prune chained behind one
- * would never run, and every such run would leave its execution's rows for
- * ever. Once this process is gone no delivery of a settled execution retries
- * anywhere (PRD resolved q65), so the rows answer nothing; what is left is the
- * delivery still running *here* until the exit, and a keyed write it makes
- * under that execution from now on is refused rather than made without its
- * ledger row ([`CUT_OFF`]).
+ * Neither `agent-compose run` nor a stopped `serve` waits for an `agent.*` or
+ * `tool.*` delivery an execution started — the exit cuts it off — so a prune
+ * chained behind one would never run, and every such execution would leave its
+ * rows for ever. Once this process is gone no delivery of a settled execution
+ * retries anywhere (PRD resolved q65), so the rows answer nothing; what is left
+ * is the delivery still running *here* until the exit, and a keyed write it
+ * makes under that execution from now on is refused rather than made without
+ * its ledger row ([`CUT_OFF`]).
  *
  * Re-read until nothing is left, because a prune can start while another
- * finishes.
+ * finishes — and, in a `serve`, because an execution still in flight can
+ * settle while this waits.
  */
-export async function releaseStores(): Promise<void> {
+export async function drainStores(): Promise<void> {
   for (;;) {
     for (const [id, execution] of DEFERRED) {
       DEFERRED.delete(id);
@@ -3208,9 +3218,29 @@ export async function releaseStores(): Promise<void> {
       startPrune(execution);
     }
     const running = [...PRUNING, ...SWEEPING];
-    if (running.length === 0) break;
+    if (running.length === 0) return;
     await Promise.all(running.map((held) => held.catch(() => undefined)));
   }
+}
+
+/**
+ * Close every dialled connection this process opened.
+ *
+ * Called by `./cli.ts` on the way out of a `run` or a `resume`, beside
+ * `releaseJournal()` and for that call's reason: a socket left open is a process
+ * that does not exit. A `serve` holds them for as long as it serves, and its
+ * stop makes the same wait without the close ([`drainStores`]).
+ *
+ * Idempotent, and never the caller's failure: a connection that could not be
+ * closed is one the server will reap, and the command that asked has already
+ * done its work.
+ *
+ * **What is still running over the stores goes first** ([`drainStores`]), so a
+ * command's settled executions leave no ledger rows and every store it swept
+ * has lost what had expired there by the time it exits (PRD resolved q69).
+ */
+export async function releaseStores(): Promise<void> {
+  await drainStores();
   const held = [...DIALLED.values()];
   DIALLED.clear();
   await Promise.all(

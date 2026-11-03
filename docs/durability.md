@@ -1406,7 +1406,14 @@ the executions in flight — a parent's or a child's, running or still queued fo
 permit — and that is the durability contract rather than a gap in it: each is an
 open row, so the next start recovers it, a child whose parent had already
 settled among them. What a stop costs is the one effect each was in the middle
-of, which is §2's window for any execution.
+of, which is §2's window for any execution. What it does wait for is the store
+work of the executions that have already **settled** — the deletion of their
+idempotency-ledger rows, started then for one still waiting on a detached
+delivery the exit cuts off, and the start's sweep of expired keys
+(`docs/topics/stores.md`, PRD resolved q69) — because a settled execution is
+the one the next start does not come back for, so rows a stop left behind would
+be rows no process ever removes. Each dial that wait makes is bounded at ten
+seconds, and nothing is closed under the executions still running beside it.
 
 ### 6.2 `run` journals; `resume` replays
 

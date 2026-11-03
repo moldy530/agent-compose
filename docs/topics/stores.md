@@ -431,11 +431,11 @@ process's ops and between them, in batches of at most 1000, so no op waits for
 more than the one batch in progress however large the backlog is; a command —
 `run` or `resume` — waits for the rest on its way out, so it has removed the
 backlog of every store it swept by the time it exits, and a `serve` finishes it
-in the background. Both sweeps read an index over the expiry, so neither reads
-a key that has not expired. On `postgres` and `mysql` each batch is one
-partition's and takes that partition's version lock first, exactly as a write
-does, so a sweep and a write to the same partition wait for each other's commit
-rather than deadlocking.
+in the background, or, stopped first, before it exits. Both sweeps read an
+index over the expiry, so neither reads a key that has not expired. On
+`postgres` and `mysql` each batch is one partition's and takes that partition's
+version lock first, exactly as a write does, so a sweep and a write to the same
+partition wait for each other's commit rather than deadlocking.
 `AGENT_COMPOSE_STORE_CLOCK_OFFSET_MS` shifts the clock every backend reads
 expiry by, in whole milliseconds, which is how a test moves time past an expiry
 without waiting for it.
@@ -458,16 +458,19 @@ run never reached, on a server that is slow or not answering, delays nothing
 the run reports. Each store is pruned on its own, a dial that has not completed
 in ten seconds fails (said on stderr, naming the store), and a `run` or
 `resume` waits for its prunes on its way out while a `serve` lets them finish in
-the background. A detached `agent` or `tool` delivery the execution started is
-still writing, and retrying, under its id, so the rows stay until those
-deliveries have finished — and a `run`, which exits without waiting for them,
-prunes on its way out regardless: nothing retries a settled execution's
-delivery once that process is gone, and the delivery still running in it until
-the exit is refused any keyed write from then on rather than making one its
-ledger can no longer answer. An execution that has not settled — parked at a
-`human` pause, stopped by a divergence, or left open by a crash — keeps every
-row, so its resume still writes nothing twice. The ledger therefore holds the
-open executions' rows, not history.
+the background — and waits for the ones still running when it is stopped
+(`SIGINT` or `SIGTERM`), before it exits. A detached `agent` or `tool` delivery
+the execution started is still writing, and retrying, under its id, so the rows
+stay until those deliveries have finished — and a `run`, which exits without
+waiting for them, prunes on its way out regardless, as a stopped `serve` does:
+nothing retries a settled execution's delivery once that process is gone, and
+the delivery still running in it until the exit is refused any keyed write from
+then on rather than making one its ledger can no longer answer. A process
+killed outright (`SIGKILL`, a crash) has no way out to prune on, and the rows of
+what had settled there stay, answering nothing. An execution that has not
+settled — parked at a `human` pause, stopped by a divergence, or left open by a
+crash — keeps every row, so its resume still writes nothing twice. The ledger
+therefore holds the open executions' rows, not history.
 
 ## Writes inside a `map`
 

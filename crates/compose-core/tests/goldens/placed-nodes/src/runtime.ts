@@ -14484,8 +14484,9 @@ export async function settleExecution(execution: string, error?: unknown): Promi
   // accepts a connection and says nothing, would hold `runFlow`, a `run` and
   // a `serve` sync trigger for as long as the socket lived. So the outcome is
   // the row's alone: `src/stores.ts` holds the prune, and a command waits for
-  // it on its way out (`releaseStores`), starting then the ones still waiting
-  // on deliveries the exit is about to cut off.
+  // it on its way out (`drainStores` — a `run` or a `resume` as it exits, a
+  // `serve` when it is stopped), starting then the ones still waiting on
+  // deliveries the exit is about to cut off.
   pruneLedgers(
     identity,
     deliveriesInFlight(execution) ? settleDetached(execution) : undefined,

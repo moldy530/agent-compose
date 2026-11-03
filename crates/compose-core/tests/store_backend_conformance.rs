@@ -682,6 +682,14 @@ const TRUE_EVERYWHERE: &[&str] = &[
     // than applying one its ledger can no longer answer.
     "a_command_letting_go_prunes_what_a_running_delivery_held_back",
     "a_delivery_cut_off_by_its_command_is_refused_a_keyed_write",
+    // …and so does a `serve` when it is stopped, the one exit it has: nothing
+    // comes back for a settled execution afterwards, so the stop starts the
+    // prune and refuses the delivery's keyed write the same way — while
+    // closing nothing under an execution still open, which writes on, is
+    // answered, and keeps its rows for the start that recovers it.
+    "a_stopped_serve_prunes_what_a_running_delivery_held_back",
+    "a_delivery_cut_off_by_a_stopped_serve_is_refused_a_keyed_write",
+    "an_open_execution_still_writes_while_a_serve_stops",
 ];
 
 /// The cases a backend with a **socket** must answer `true`, on top of those.

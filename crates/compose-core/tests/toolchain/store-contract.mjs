@@ -2320,6 +2320,73 @@ const gate = () => {
   }
 }
 
+{
+  // **A stopped `serve` drains its stores the same way, and closes nothing
+  // under the executions it leaves running.** A `serve` stopped on a deploy
+  // exits with deliveries still in flight, and recovery never comes back for a
+  // settled execution, so its stop starts the prune a running delivery was
+  // holding back exactly as a command letting go does (`stores.drainStores`) —
+  // and refuses that delivery's keyed write from then on. What it does not do
+  // is close a connection: the executions still open keep running while it
+  // stops, and the next start recovers them, so one that writes meanwhile is
+  // answered and keeps the ledger rows its resume will need.
+  const store = kv("ledger_drained", "global", URL_ENV, z.object({ count: z.number().int() }).strict());
+  stores.bindsStores([store]);
+  const id = execution("ledger_drained");
+  const open = execution("ledger_drained_open");
+  const { open: releaseRetry, opened: retry } = gate();
+  const { open: firstLanded, opened: landed } = gate();
+  const attempts = [];
+  let refused;
+  const bump = () => write(store, "incr", { key: "delivered", field: "count" }, ctx(id), `${id}/fan/0#agent/0/count/0`);
+  const running = (n) =>
+    write(store, "incr", { key: "running", field: "count" }, ctx(open), `${open}/step/${n}`);
+  try {
+    await begin_(id);
+    await begin_(open);
+    await dispatchDetached(id, async () => {
+      attempts.push(await bump());
+      firstLanded();
+      await retry;
+      try {
+        attempts.push(await bump());
+      } catch (error) {
+        refused = String(error?.message ?? error);
+      }
+      return { output: {} };
+    });
+    await landed;
+    await settle(id);
+    const before = await running(0);
+    const during = await ledgerRows(store, `${id}/`);
+    // The stop, with the delivery still holding its retry and the other
+    // execution still open.
+    await stores.drainStores();
+    const drained = await ledgerRows(store, `${id}/`);
+    const after = await running(1);
+    const kept = await ledgerRows(store, `${open}/`);
+    releaseRetry();
+    await runtime.settleDetached(id);
+    const held = await get(store, "delivered", ctx(execution("ledger_drained_read")));
+    answer.a_stopped_serve_prunes_what_a_running_delivery_held_back =
+      during === 1 && drained === 0;
+    answer.a_delivery_cut_off_by_a_stopped_serve_is_refused_a_keyed_write =
+      attempts.length === 1 &&
+      (refused ?? "").includes("has already deleted its idempotency ledger") &&
+      held.value?.count === 1;
+    answer.an_open_execution_still_writes_while_a_serve_stops =
+      before.applied === true &&
+      after.applied === true &&
+      after.value?.count === 2 &&
+      kept === 2;
+    answer.ledger_drained_trace = { during, drained, before, after, kept, attempts, refused, held };
+  } catch (error) {
+    answer.ledger_drained_error = String(error?.stack ?? error);
+  } finally {
+    runtime.closeExecution(open);
+  }
+}
+
 if (provider !== "sqlite") {
   // **A bound store whose server never answers delays no settlement and no
   // other store's prune, and holds a command's exit for its dial deadline

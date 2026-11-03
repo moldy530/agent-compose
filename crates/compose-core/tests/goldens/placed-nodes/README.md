@@ -224,8 +224,10 @@ schedule for a diagnostic run: a comma-separated list of durations
 (`0s,1s,2s`), refused at launch if it is not one.
 
 Stopping it stops the graph: `agent-compose serve` passes `SIGINT` and `SIGTERM`
-on to this project, which closes the app and exits, so a supervisor that signals
-the command is not left with a listener behind it.
+on to this project, which closes the app, finishes the work its stores still
+have running — a settled execution's ledger prune, the start's sweep of expired
+keys — and exits, so a supervisor that signals the command is not left with a
+listener behind it.
 
 ### On Node instead
 
