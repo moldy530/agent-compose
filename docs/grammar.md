@@ -3015,28 +3015,32 @@ load_prefs:
 |---|---|---|---|
 | `store` | `store.*` ref | yes | |
 | `op` | enum | yes | legal set depends on the store's `kind` (§11.4) |
-| `key`, `value`, `query`, `prefix`, `top_k`, `limit`, `filter`, `metadata`, `content_type`, `fields`, `field`, `unique`, `by`, `if`, `if_version` | per op | per op | §11.4 |
+| `key`, `value`, `query`, `prefix`, `top_k`, `limit`, `filter`, `metadata`, `content_type`, `fields`, `field`, `unique`, `by`, `if`, `if_version`, `after`, `include_values`, `keys` | per op | per op | §11.4 |
 
 A store-op node takes **no `input:` key**: its parameters are exactly the op's
 own row in §11.4, written out in the node, and none of them resolves by name
 from a channel or a flow input (§8.0). The op's output schema is derived from the
 store definition (§11.4) and is written by name like any other node output.
 
-**Which parameters are CEL.** Nine of the fifteen are, and they are exactly the
-row §4.1 scopes to `input`, `state`, and `execution`: `key`, `query`, `prefix`,
-`by` and `if_version` are one expression each; `value` is one expression on a
+**Which parameters are CEL.** Eleven of the eighteen are, and they are exactly
+the row §4.1 scopes to `input`, `state`, and `execution`: `key`, `query`,
+`prefix`, `after`, `by` and `if_version` are one expression each, and so is
+`keys`, whose result is a list of strings; `value` is one expression on a
 `vector upsert`, a `blob put` and a `kv append` and a field map of expressions on
 a `kv set`; `filter`, `metadata` and `fields` are maps of one expression per
-entry (§11.4). The other six are **literals**, not expressions: `top_k` and
+entry (§11.4). The other seven are **literals**, not expressions: `top_k` and
 `limit` are integers in the ranges §11.4 fixes, `content_type` is a media type
 string, which §4.3 puts in class 3 so it carries no env refs either, `field` is
-the name of one field of the store's `value_schema`, `unique` is a boolean and
-`if` is `absent` or `present`. A CEL string where §11.4 declares an integer is a
-type error, not a computed bound — a fan-out's cardinality is a schema bound
-(§3.5) and a store op's is a written-down one, and both are meant to be readable
-without running the graph, as are which field a partial update touches and what
-a write is conditioned on. All six are decidable in one file, so the published
-schema types them too (Appendix B).
+the name of one field of the store's `value_schema`, `unique` and
+`include_values` are booleans and `if` is `absent` or `present`. A CEL string
+where §11.4 declares an integer is a type error, not a computed bound — a
+fan-out's cardinality is a schema bound (§3.5) and a store op's is a
+written-down one, and both are meant to be readable without running the graph,
+as are which field a partial update touches, what a write is conditioned on and
+whether a page carries its values. All seven are decidable in one file, so the
+published schema types them too (Appendix B). A `get_many`'s `keys` carries the
+one bound no type decides — at most 1000 keys, and a list's length is not known
+until it is evaluated — so that bound is the run's to hold (§11.4).
 
 A store op's result may omit a field. A `get` that misses returns
 `found: false` and **no `value`**, so the `writes: { value: prefs }` above
@@ -3046,7 +3050,10 @@ fails the execution (§11.4, §4.1, Decision
 [D110](#d110-an-absent-value-fails-the-read-and-an-absent-output-field-writes-nothing)).
 A `kv` write's `version`, and a partial update's `value`, are absent on the same
 terms where §11.4 says they are — a write that declined against a key holding
-nothing — and are read the same way: route on `applied` first.
+nothing — and are read the same way: route on `applied` first. So is a `list`'s
+`next` on the last page of a walk, which is what a paging cycle routes on —
+`when: "has(page.output.next)"` — and a `get_many` entry's `value` and
+`version` where its `found` is `false`.
 
 ### 8.9 `coder`
 
@@ -4247,10 +4254,12 @@ see the `M`-is-absent rule below. `C` is one optional **condition**, `if:` or
 | `kv` | `get` | `key` (CEL string) | `{ value: V (optional), found: boolean, version: integer (optional) }` |
 | `kv` | `set` | `key`, `value` (map field→CEL matching `V`), `C` | `{ key: string, applied: boolean, version: integer (optional), deduped: boolean }` |
 | `kv` | `delete` | `key`, `if_version` (CEL int, optional) | `{ deleted: boolean, applied: boolean, version: integer (optional), deduped: boolean }` |
-| `kv` | `list` | `prefix` (CEL string, optional), `limit` (integer 1..1000, required) | `{ keys: array<string> }` |
+| `kv` | `list` | `prefix` (CEL string, optional), `limit` (integer 1..1000, required), `after` (CEL string, optional — the exclusive cursor), `include_values` (literal boolean, default `false`) | `{ keys: array<string>, next: string (optional), entries: array<{ key: string, value: V, version: integer }> }` — `entries` present exactly when `include_values: true` |
 | `kv` | `merge` | `key`, `fields` (map field→CEL, each a field of `V`), `C` | `{ key: string, applied: boolean, version: integer (optional), value: V (optional), deduped: boolean }` |
 | `kv` | `append` | `key`, `field` (an array field of `V`, literal), `value` (CEL, one item of it), `unique` (literal boolean, default `false`), `C` | as `merge` |
 | `kv` | `incr` | `key`, `field` (an `integer` or `number` field of `V`, literal), `by` (CEL number of the field's type, default `1`), `C` | as `merge` |
+| `kv` | `count` | `prefix` (CEL string, optional) | `{ count: integer }` |
+| `kv` | `get_many` | `keys` (CEL list of string, at most 1000) | `{ entries: array<{ key: string, value: V (optional), found: boolean, version: integer (optional) }> }` — one per key asked, in the order asked |
 | `vector` | `search` | `query` (CEL string), `top_k` (integer 1..100, required), `filter` (map metadata-field→CEL, optional) | `{ matches: array<{ id: string, score: number, text: string, metadata: M }> }` |
 | `vector` | `upsert` | `key`, `value` (CEL string — the text), `metadata` (map field→CEL, optional) | `{ id: string }` |
 | `vector` | `delete` | `key` | `{ deleted: boolean }` |
@@ -4328,6 +4337,61 @@ Rules (PRD 5.8):
   first ops that validate a *stored* value, so under a changed schema they fail
   naming the field the stored value lacks, and a `set` of the whole value is
   the repair.
+- **Reading at scale** (PRD resolved q70). A `kv` `list` is one **page** of a
+  partition's keys, and a walk of a partition too large for one answer is a
+  sequence of them:
+
+  - **Order.** A page holds keys in UTF-8 **byte** order — the order of their
+    code points — on every backend, never a collation that folds case or
+    accents: `B` before `a`, `a` before `a b` before `aB`, `é` after `z`.
+  - **The cursor.** `after:` is exclusive: a page holds the first `limit` keys
+    the store holds **after** it in that order, under the same `prefix:`.
+    `after:` is a position in the order rather than a key the store has to
+    hold, and a page with none starts at the partition's first key — which is
+    why the first page of a walk is a node with no `after:` rather than one
+    with `after: ''`, which would skip the empty key.
+  - **`next`.** A page answers `next` exactly when the partition holds more
+    keys after it under its `prefix:`, and `next` is then the page's own last
+    key — the `after:` of the page that follows. A last page answers no
+    `next` even when it is full: whether more remain is the store's answer,
+    not the page's length. A page with no `next` is the last, and the flow
+    routes on it — `when: "has(page.output.next)"` round a cycle (§7.4
+    clause 2), the `else:` out of it.
+  - **Keyset, not offset.** A page is defined by its cursor, so a walk sees
+    every key the partition held throughout it exactly once, however many
+    pages it takes: a key written behind the cursor mid-walk is not seen by
+    that walk, one written ahead of it is, one deleted ahead of it is not, and
+    no key comes back on two pages.
+  - **`include_values: true`** answers each key's `value` and `version` beside
+    it, as `entries`, in the page's order. The literal decides the field's
+    **presence**, not only its contents: a page that did not ask carries no
+    `entries` field, so `page.output.entries` is an unknown field and a compile
+    error there, exactly as Decision
+    [D114](#d114-a-vector-store-with-no-metadata_schema-derives-matches-with-no-metadata-field)
+    makes a match's `metadata` on a store with no `M` (Decision
+    [D154](#d154-a-kv-store-is-read-at-scale-a-page-at-a-time-and-a-pages-entries-are-there-when-its-node-asks)).
+  - `limit` keeps its range, 1..1000 **per page**; a walk has no bound of its
+    own.
+
+  `count` answers how many keys the partition holds under `prefix:` — the
+  whole partition without one — and agrees with a walk under the same
+  `prefix:`. `get_many` reads the keys of one list in one op and answers one
+  entry per key **asked**, in the order asked — a key named twice is answered
+  twice — each `{ key, found }` with `value` and `version` exactly when
+  `found`, which is a `get`'s answer one key at a time. A `keys:` list's
+  length is a run-time fact, so its bound is enforced when the node runs: a
+  `get_many` asked for more than 1000 keys **fails the node**, naming the count
+  and the bound, before anything is read — under the node's own `retry:` and
+  `on_error:`.
+
+  All three are **reads** (below): recorded with what they answered, answered
+  out of the record on a replay, carrying no idempotency key. Expiry (PRD
+  resolved q69) folds into them the way it folds into the conditions — an
+  expired key is skipped by a page, uncounted by a `count` and not found by a
+  `get_many` — and is not part of this entry. On a `blob` store `list` keeps its
+  one shape — `prefix:` and `limit:` and `{ keys }` — and `after:` or
+  `include_values:` there is a compile error naming the store: a cursor and the
+  values beside a page's keys are a `kv` page's.
 - **A store with no `M`.** `metadata_schema:` is optional on a `vector` store
   (§11.1), and a store that declares none has no metadata at all rather than
   empty metadata (Decision
@@ -4352,7 +4416,9 @@ Rules (PRD 5.8):
   may not return: the `kv get` and `blob get` rows are
   `{ value: … (optional), found: boolean }` — a `kv get` with its `version`
   beside them — and a miss returns `found: false` with no `value` (and no
-  `version`) at all. The `kv` writes' optional fields are the same case on the
+  `version`) at all. A `get_many` entry that misses is the same answer one key
+  at a time, and a last page's missing `next` is the same case on a `list`:
+  read it with `has()`. The `kv` writes' optional fields are the same case on the
   write side: a write that declined against a key holding nothing answers no
   `version`, and a partial update that did not apply answers no `value`; each is
   read and written exactly as below, and `applied` is the companion to route on.
@@ -4378,7 +4444,8 @@ Rules (PRD 5.8):
   answer, and a guard that reads `value` anyway is reading a value the op
   reported it does not have.
 - Store ops are **effects**: reads are recorded and replay consumes history, not
-  the live store; writes are at-least-once carrying the idempotency key of §9.4 —
+  the live store — `get`, `list`, `count`, `get_many` and `search` are the reads,
+  and carry no idempotency key; writes are at-least-once carrying the idempotency key of §9.4 —
   the execution id plus the store node's flattened instance path, which is what
   keeps two instantiations of one flow, and the repeating item indexes of nested
   maps, from deriving one key for two different writes.
@@ -6579,7 +6646,13 @@ The shapes are fixed *given the store definition* the op names: `V` and `M` come
 from it, and the one field whose very presence the definition decides is a
 match's `metadata`, which
 [D114](#d114-a-vector-store-with-no-metadata_schema-derives-matches-with-no-metadata-field)
-fixes for a store that declares no `metadata_schema`.
+fixes for a store that declares no `metadata_schema`. One field's presence is
+decided by the **node** instead — a `kv` page's `entries`, there exactly when
+the node's `include_values:` literal is `true`, which
+[D154](#d154-a-kv-store-is-read-at-scale-a-page-at-a-time-and-a-pages-entries-are-there-when-its-node-asks)
+fixes on D114's pattern; and the optional fields the catalog has grown since
+(`version`, a partial update's `value`, a page's `next`, a `get_many` entry's
+`value` and `version`) resolve through D110 as `value` on a `get` does.
 **Rationale**: PRD 5.8 requires schema-checked ops and name-based wiring of their
 results; without fixed output names, `writes:` and downstream guards would have
 nothing stable to bind. *PRD 5.8.*
@@ -10902,6 +10975,80 @@ entry.
 **Status**: shipped. *PRD 5.8, resolved q13, q29, q63, q68; §9.4, §11.3, §11.4,
 §11.5.*
 
+### D154. A `kv` store is read at scale a page at a time, and a page's `entries` are there when its node asks
+
+A `kv` `list` takes `after:` (CEL string, optional — the exclusive cursor, the
+last key of the page before) and `include_values:` (literal boolean, default
+`false`), and answers `{ keys, next, entries }`: `next` present exactly when the
+partition holds more keys after the page under its `prefix:`, and then the
+page's last key; `entries` — `{ key, value, version }` per key, in the page's
+order — present exactly when `include_values: true`. Pages are in UTF-8 byte
+order on every backend, keyset rather than offset. `count` takes `prefix:`
+(optional) and answers `{ count }`; `get_many` takes `keys:` (CEL list of
+string, at most 1000) and answers one `{ key, value, found, version }` per key
+asked, in the order asked, `value` and `version` exactly when `found`. All three
+are reads (§11.4, PRD resolved q70).
+
+**Rationale**: a `list` of at most 1000 keys with no way past them left a
+partition larger than that unreadable from a flow — the keys after the
+thousandth were not a page away, they were unreachable — and a flow that wanted
+the values had to issue one `get` per key, one node run per round trip. The
+ruling closes both without adding a query language (PRD 5.8 still excludes
+relational stores): a cursor is the one thing a walk needs, and a batch read is
+the one thing a list of keys needs.
+
+**An exclusive cursor, by key.** The cursor is the last key of the page
+before, so it costs a flow nothing to hold — it is in the page's own answer —
+and it means the same thing on every backend: "after this key, in byte order".
+An offset would be cheaper to write and wrong under concurrency, since a write
+landing behind it shifts every later page by one and a walk then skips or
+repeats a key; a key cursor moves no page still to come. **Byte order** is the
+one order all three arms can answer identically and the one a `kv` key needs —
+a key is the composition's own string, two keys differing in case or accent are
+two keys, and the order a cursor compares in must be the order the page sorts
+in, or a boundary skips a key.
+
+**`next` answers whether more remain, not whether the page is full.** A page
+that ends exactly at the partition's last key is full and is still the last, so
+`next` is decided by the store (a page reads one key past its `limit` to know),
+and a flow's exit condition is `has(page.output.next)` rather than arithmetic
+on a length. Its absence on the last page is D110's case: the `writes:` of a
+cursor channel performs no write there, so the channel keeps the last cursor a
+page answered.
+
+**Presence by a literal, D114's pattern one construct over.** Whether a page
+carries its values changes its derived output schema — the channel a name-based
+write of `entries` can land in, the Zod codegen emits, and whether
+`page.output.entries` type-checks — so it is decided by a literal in the node,
+readable without running the graph, as `top_k` decides a `search`'s bound. A
+page that did not ask has no `entries` field rather than an empty one, for
+D114's reason: an always-empty field is an inert surface nobody asked for.
+
+**`get_many`'s bound is a run-time refusal.** `keys:` is CEL, so how many keys
+it holds is known only when it is evaluated; 1000 is the bound the ruling sets
+and the static bound of `entries`, and a list past it fails the node by name
+before anything is read — a refusal the node's own `retry:`/`on_error:` see,
+rather than a silent truncation that would answer a different question.
+Duplicates are answered as asked, because "in the order given" is one entry per
+key given.
+
+**Reads, and only reads.** All three are recorded with their answer, replayed
+out of the record, and carry no idempotency key — exactly a `get` (PRD resolved
+q29). Expiry (PRD resolved q69) folds into them through the one liveness
+predicate every read applies, and is not part of this entry.
+
+**What this does not change.** The `blob` `list` keeps its one shape — `prefix:`
+and `limit:`, `{ keys }` — and `after:` or `include_values:` on it is a compile
+error naming the store, since a cursor and a page's values are a `kv` page's
+and the ruling is about `kv`. The `vector` rows are untouched. The agent tool
+surface (§11.5) is untouched at every access level: exposing these reads to a
+model is the parity item the ruling deferred. Decision
+[D34](#d34-the-store-op-catalog-is-normative-including-derived-output-schemas)
+gains three rows and the note on `entries`; nothing else in the decision log is
+amended.
+
+**Status**: shipped. *PRD 5.8, resolved q29, q63, q68, q70; §8.8, §11.4.*
+
 ## Appendix B — Editor integration
 
 [`schemas/agent-compose.schema.json`](../schemas/agent-compose.schema.json) is a
@@ -10992,8 +11139,8 @@ a literal in the same object: store-op parameter sets per `op` (§11.4), a `kv`
 write's two conditions as one or the other and never both, and the parameters
 that are literals rather than CEL — `top_k` and `limit` typed as integers in
 their ranges, `content_type` as a string carrying no env ref, `field` as an
-identifier, `unique` as a boolean and `if` as `absent` or `present` (§8.8,
-§11.4) — store definition key sets per `kind`, both the schema each kind
+identifier, `unique` and `include_values` as booleans and `if` as `absent` or
+`present` (§8.8, §11.4) — store definition key sets per `kind`, both the schema each kind
 requires and the ones it refuses, `metadata_schema` being `vector`'s alone
 (§11.1, D113) and the `provider:` a `vector` store's `embed:` block must name
 (§11.2, D116), provider key sets per `kind` — both halves, the required keys and

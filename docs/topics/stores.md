@@ -179,7 +179,9 @@ supplying `--session` is then a run-time requirement.
 | `kv` | `get` | `key` | `{ value: V (optional), found: boolean, version: integer (optional) }` |
 | `kv` | `set` | `key`, `value` (field map of CEL matching `V`), one optional condition | `{ key, applied: boolean, version: integer (optional), deduped: boolean }` |
 | `kv` | `delete` | `key`, `if_version` (optional) | `{ deleted: boolean, applied: boolean, version: integer (optional), deduped: boolean }` |
-| `kv` | `list` | `prefix` (optional), `limit` (1..1000, required) | `{ keys: array<string> }` |
+| `kv` | `list` | `prefix` (optional), `limit` (1..1000, required), `after` (optional cursor), `include_values` (optional literal, default `false`) | `{ keys: array<string>, next: string (optional), entries: array<{ key, value: V, version }> }` — `entries` only under `include_values: true` |
+| `kv` | `count` | `prefix` (optional) | `{ count: integer }` |
+| `kv` | `get_many` | `keys` (CEL list of string, at most 1000) | `{ entries: array<{ key, value: V (optional), found: boolean, version (optional) }> }`, in the order asked |
 | `kv` | `merge` | `key`, `fields` (field map of CEL, each a field of `V`), one optional condition | `{ key, applied, version (optional), value: V (optional), deduped }` |
 | `kv` | `append` | `key`, `field` (an array field of `V`), `value` (one item), `unique` (optional literal, default `false`), one optional condition | as `merge` |
 | `kv` | `incr` | `key`, `field` (an `integer`/`number` field of `V`), `by` (optional, default `1`), one optional condition | as `merge` |
@@ -196,12 +198,12 @@ error, not an ignored key. `op: get` with `top_k:` is rejected. So is an op the
 store's kind does not take — a `merge` on a `vector` store — which is
 `invalid-value` naming the ops the kind serves.
 
-Nine parameters are CEL over `input`/`state`/`execution` — `key`, `query`,
-`prefix`, `value`, `filter`, `metadata`, `fields`, `by`, `if_version`. Six are
-**literals**: `top_k` and `limit` are integers, `content_type` is a media type
-string, `field` is a field name, `unique` is a boolean, and `if` is `absent` or
-`present`. A CEL string where an integer is declared is a type error, not a
-computed bound.
+Eleven parameters are CEL over `input`/`state`/`execution` — `key`, `query`,
+`prefix`, `after`, `keys`, `value`, `filter`, `metadata`, `fields`, `by`,
+`if_version`. Seven are **literals**: `top_k` and `limit` are integers,
+`content_type` is a media type string, `field` is a field name, `unique` and
+`include_values` are booleans, and `if` is `absent` or `present`. A CEL string
+where an integer is declared is a type error, not a computed bound.
 
 A `store:` node takes **no `input:` key**: its parameters are exactly the op's
 row, and none of them resolves by name from a channel.
@@ -216,6 +218,110 @@ A `vector` store with **no** `metadata_schema` derives matches with no
 `metadata` field at all, so reading one is an unknown field, and `filter:`/
 `metadata:` naming any key is an error. Declaring `metadata_schema: {}` is a
 *declaration*: the field is present and can only hold `{}`.
+
+## Reading a large store: pages, `count`, `get_many`
+
+A `kv` `list` answers **one page**. A store too large for one answer is read a
+page at a time, each `list` taking the `next` the page before it answered as its
+`after:`:
+
+```yaml spec
+version: "0.1"
+store.orders:
+  kind: kv
+  scope: global
+  value_schema:
+    customer: { type: string }
+    total:    { type: number }
+
+state:
+  cursor:
+    type: string
+    default: ""
+  pages:
+    type: array
+    max_items: 100
+    items:
+      type: array
+      max_items: 1000
+      items: { type: string }
+    reduce: append
+  held:
+    type: integer
+    default: 0
+
+flow.audit:
+  inputs:
+    customer: { type: string }
+  outputs: {}
+  nodes:
+    first:
+      store: store.orders
+      op: list
+      prefix: "'order/'"
+      limit: 1000
+      writes: { keys: pages, next: cursor }
+    more:
+      store: store.orders
+      op: list
+      prefix: "'order/'"
+      after: "state.cursor"
+      limit: 1000
+      include_values: true
+      writes: { keys: pages, next: cursor }
+    total:
+      store: store.orders
+      op: count
+      prefix: "'order/'"
+      writes: { count: held }
+    recent:
+      store: store.orders
+      op: get_many
+      keys: "['order/' + input.customer + '/1', 'order/' + input.customer + '/2']"
+  edges:
+    - { from: start, to: first }
+    - { from: first, to: more, when: "has(first.output.next)" }
+    - { from: first, to: total, else: true }
+    - { from: more, to: more, when: "has(more.output.next)" }
+    - { from: more, to: total, else: true }
+    - { from: total, to: recent }
+    - { from: recent, to: end }
+
+triggers:
+  cli: { type: manual, flow: flow.audit }
+```
+
+**A page is the first `limit` keys after its cursor**, in UTF-8 **byte** order
+on every backend — `B` before `a`, `é` after `z` — under the same `prefix:`.
+`after:` is exclusive and need not be a key the store holds. A page answers
+`next` exactly when more keys remain, and `next` is then its own last key: the
+next page's `after:`. The **last page answers no `next`** — even when it is
+full — so a walk ends on `has(page.output.next)` going false, and a
+`writes: { next: cursor }` there performs no write: the channel keeps the last
+cursor a page answered. Pages are **keyset**, not offset: a key written behind
+the cursor mid-walk is not seen by that walk, one written ahead of it is, and
+no key is answered twice. `limit` is per page (1..1000); a walk has no bound of
+its own.
+
+**`include_values: true`** answers each key's `value` and `version` beside it,
+as `entries`, in the page's order. It is a literal because it decides whether
+the output **has** an `entries` field: a page that did not ask has none, and
+reading `page.output.entries` there is an unknown field.
+
+**`count`** answers how many keys the partition holds under `prefix:` (all of
+them, without one), and agrees with a walk under the same prefix. **`get_many`**
+reads the keys of one list in one op and answers one entry per key asked, in the
+order asked: `{ key, found }`, with `value` and `version` exactly when `found` —
+a `get`'s answer, one key at a time. A list's length is not known until it is
+evaluated, so its bound is enforced when the node runs: **more than 1000 keys
+fails the node**, naming the count and the bound, before anything is read.
+
+All three are **reads**: recorded with what they answered, answered out of the
+record when a resumed execution replays them, carrying no idempotency key and
+writing nothing to the ledger. On a `blob` store `list` keeps its one shape —
+`prefix:` and `limit:`, `{ keys }` — and `after:` or `include_values:` there
+is `invalid-value` naming the store. A model is offered none of these reads at
+any `agent_access:` level.
 
 ## Versions, conditions and partial updates
 
