@@ -156,11 +156,13 @@ fn pseudo(id: &str, kind: NodeKind) -> GraphNode {
         human: None,
         map: None,
         dispatch: None,
+        is_finally: false,
     }
 }
 
 fn graph_node(ir: &Ir, flow: &Flow, node: &Node) -> GraphNode {
     let mut held = pseudo(node.id.value.as_str(), kind_of(&node.kind));
+    held.is_finally = flow.is_finally(node);
     held.binding = binding_of(node);
     held.description = node
         .description
@@ -173,7 +175,7 @@ fn graph_node(ir: &Ir, flow: &Flow, node: &Node) -> GraphNode {
         .as_ref()
         .map(|writes| write_views(ir, writes))
         .unwrap_or_default();
-    held.policy = Some(policy_view(ir, node));
+    held.policy = Some(policy_view(ir, flow, node));
     held.schemas = schemas(
         input_schema(ir, node),
         output_schema(ir, node).map(|(source, fields)| SchemaView {
@@ -432,8 +434,14 @@ fn channel_reduce(state: Option<&Section<crate::ir::Channel>>, name: &str) -> Op
         .map(|reduce| reduce.as_str().to_string())
 }
 
-fn policy_view(ir: &Ir, node: &Node) -> PolicyView {
-    let resolved = policy::resolve(ir, node);
+fn policy_view(ir: &Ir, flow: &Flow, node: &Node) -> PolicyView {
+    // The chain codegen resolves, and for a `finally:` node that is its own:
+    // `on_error` from no level (grammar 7.9, Decision D159).
+    let resolved = if flow.is_finally(node) {
+        policy::resolve_finally(ir, node)
+    } else {
+        policy::resolve(ir, node)
+    };
     let (strategy, target) = match resolved.on_error.0 {
         Strategy::Fail => ("fail".to_string(), None),
         Strategy::Skip => ("skip".to_string(), None),
@@ -488,7 +496,9 @@ const fn level(at: Level) -> Option<PolicyLevel> {
     match at {
         Level::Node => Some(PolicyLevel::Node),
         Level::Defaults => Some(PolicyLevel::Defaults),
-        Level::BuiltIn => Some(PolicyLevel::BuiltIn),
+        // A `finally:` node's `on_error` is the built-in `fail` and no level can
+        // move it (grammar 7.9, Decision D159) — which is what `built_in` says.
+        Level::BuiltIn | Level::Finally => Some(PolicyLevel::BuiltIn),
         Level::Exempt => None,
     }
 }

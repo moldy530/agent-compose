@@ -793,7 +793,10 @@ function renderFlow(address) {
       el("rect", { width: 4, height: node.h, rx: 2, fill: kind.color }, group);
       const badge = el("text", { class: "kind", x: 14, y: 18, fill: kind.color }, group);
       const route = node.dispatch ? "  ·  " + routeName(node.dispatch) : "";
-      badge.textContent = kind.label + route;
+      /* The flow's `finally:` node, which no edge reaches: labelled, so a node
+         drawn apart reads as the one an instance runs when it ends. */
+      const ending = node.finally === true ? "  ·  finally" : "";
+      badge.textContent = kind.label + route + ending;
       const name = el("text", { class: "name", x: 14, y: 35 }, group);
       name.textContent = clip(node.id, 26);
       if (node.binding) {
@@ -978,7 +981,11 @@ function select(id) {
   let html =
     '<button class="pane-close" aria-label="Back to the flow overview" title="Back to the flow overview">&times;</button>' +
     '<div class="pane-kind" style="color:' + kind.color + '">' + esc(kind.label) +
-    (node.dispatch ? " · route " + esc(routeName(node.dispatch)) : "") + "</div>" +
+    (node.dispatch ? " · route " + esc(routeName(node.dispatch)) : "") +
+    (node.finally === true ? " · finally" : "") + "</div>" +
+    (node.finally === true
+      ? '<p class="desc">The flow\'s <code>finally:</code> node: run once when an instance ends — completed, failed, or cancelled — with no edge in or out.</p>'
+      : "") +
     '<div class="pane-addr">' + esc(node.id) + "</div>" +
     (node.binding ? '<div class="pane-sub mono">' + esc(node.binding) + "</div>" : "") +
     (node.description ? '<p class="desc">' + esc(node.description) + "</p>" : "");

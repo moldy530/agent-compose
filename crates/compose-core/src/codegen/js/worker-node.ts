@@ -234,6 +234,7 @@ class DispatchJournal implements Journal {
     _id: string,
     _status: Exclude<ExecutionStatus, "open">,
     _error?: string,
+    _finallyError?: string,
   ): Promise<void> {
     throw new WorkerJournalReach("close an execution");
   }

@@ -9597,6 +9597,17 @@ export interface TraceDocument {
    */
   readonly error?: string;
   /**
+   * What a `finally:` node of this execution raised after its own retries, where
+   * one did (grammar 7.9, PRD resolved q76, `docs/trace.md` §2): the first such
+   * failure, naming the flow and the node, as [`finallyErrorOf`] holds it.
+   *
+   * Beside a `status` it does **not** change — a `"completed"` run with one is a
+   * run that produced its answer and whose cleanup failed afterwards — and on
+   * any status a finally node can run under. Absent on every other envelope,
+   * never empty. The failed node's own entry carries its `error` too.
+   */
+  readonly finally_error?: string;
+  /**
    * Every entry the run recorded, ordered by `(step, node)` — the order
    * [`mergeRun`] folds them in.
    *
@@ -10057,15 +10068,32 @@ export function abortedEntry(error: unknown): TraceEntry | undefined {
 export class FlowFailure extends Error {
   /** The flow that was running. */
   readonly flow: string;
-  /** What landed, plus the entry of the node the run aborted at. */
+  /**
+   * What landed, plus the entry of the node the run aborted at — and, after it,
+   * the entry of the flow's `finally:` node where it declares one, which ran
+   * once the body had failed (grammar 7.9).
+   */
   readonly trace: readonly TraceEntry[];
+  /**
+   * What a `finally:` node of this execution raised after its own retries, where
+   * one did (grammar 7.9, PRD resolved q76): `finally_error` on the execution's
+   * record, beside a failure it does not change. See [`finallyErrorOf`].
+   */
+  readonly finallyError?: string;
 
-  constructor(flow: string, what: string, trace: readonly TraceEntry[], cause: unknown) {
+  constructor(
+    flow: string,
+    what: string,
+    trace: readonly TraceEntry[],
+    cause: unknown,
+    finallyError?: string,
+  ) {
     super(`\`${flow}\` ${what}: ${describe(cause)}`);
     this.name = "FlowFailure";
     this.flow = flow;
     this.trace = trace;
     this.cause = cause;
+    if (finallyError !== undefined) this.finallyError = finallyError;
   }
 }
 
@@ -10470,6 +10498,12 @@ export interface SubflowBinding extends Quiescible<GraphStateLike> {
   readonly outputs: readonly string[];
   /** The superstep ceiling one instance of it takes. */
   readonly recursionLimit: number;
+  /**
+   * The node its `finally:` names, where it declares one: run once when an
+   * instance of it ends, outside the compiled graph — no node of the graph has
+   * an edge to it (grammar 7.9, [`endInstance`]).
+   */
+  readonly finally?: NodeDescriptor;
 }
 
 /** What one instantiation supplies to the instance it starts (grammar 7.5). */
@@ -10562,45 +10596,58 @@ export async function runSubflow(
     binding.recursionLimit,
     instance.signal,
   );
-  const trace = state?.$run.trace ?? [];
-  if (error !== undefined) {
-    // The node that stopped the instance is part of the account of it, and it is
-    // the part a reader looks for first: it never reached the reducer, so the
-    // committed state does not have it. [`failedTrace`] recovers it from the
-    // error the way [`runFlow`] does for a top-level run — the boundary is a
-    // module boundary, not a reason to report less about what happened inside
-    // it (grammar 8.5, PRD 5.3).
-    throw new SubflowFailure(
-      binding.address,
-      "did not run to quiescence",
-      failedTrace(state, error),
-      error,
-    );
-  }
-  if (state === undefined) {
+  if (error === undefined && state === undefined) {
     // Unreachable: `streamMode: "values"` emits the state the instance started
     // from before any node has run.
     throw new SubflowFailure(
       binding.address,
       "produced no state",
-      trace,
+      [],
       new Error("the instance emitted no superstep"),
     );
   }
 
-  const held = state as unknown as Record<string, unknown>;
+  // The body's answer, decided **before** the instance's `finally:` node runs:
+  // what an instance produced is what its body produced, whatever its finally
+  // node then does (grammar 7.9). A failure that stopped the instance carries
+  // the node that stopped it — it never reached the reducer, so the committed
+  // state does not have it, and [`failedTrace`] recovers it from the error the
+  // way [`runFlow`] does for a top-level run (grammar 8.5, PRD 5.3).
+  let trace: readonly TraceEntry[] =
+    error === undefined ? (state?.$run.trace ?? []) : failedTrace(state, error);
+  let ended: unknown = error;
+  let what = "did not run to quiescence";
+  const held = (state ?? {}) as unknown as Record<string, unknown>;
   const output: Record<string, unknown> = {};
-  try {
-    for (const field of binding.outputs) {
-      output[field] = channelValue(
-        held,
-        field,
-        `\`${binding.address}\`'s output field \`${field}\``,
-      );
+  if (ended === undefined) {
+    try {
+      for (const field of binding.outputs) {
+        output[field] = channelValue(
+          held,
+          field,
+          `\`${binding.address}\`'s output field \`${field}\``,
+        );
+      }
+    } catch (cause) {
+      ended = cause;
+      what = "reached quiescence without an output";
     }
-  } catch (cause) {
-    throw new SubflowFailure(binding.address, "reached quiescence without an output", trace, cause);
   }
+
+  // The instance has ended — unless what stopped it is a pause the run parks
+  // at, or a record this run does not match, neither of which is an end
+  // ([`instanceEnding`]). Its `finally:` node runs now, once, innermost first:
+  // this is inside the `flow:` node's (or the dispatch's) own activity, so the
+  // node that instantiated it settles only after it has (grammar 7.9, PRD
+  // resolved q76). Its entry is the instance's last.
+  const closing = await endInstance(
+    binding.finally,
+    (state ?? initial) as GraphStateLike,
+    instanceEnding(instance.execution.id, ended),
+    trace,
+  );
+  if (closing !== undefined) trace = [...trace, closing.entry];
+  if (ended !== undefined) throw new SubflowFailure(binding.address, what, trace, ended);
 
   // On `context: inherit`, what the instance *added* is what goes back to the
   // caller's channel: the seeded turns are already there, and appending them
@@ -10613,6 +10660,293 @@ export async function runSubflow(
     ...(added.length === 0 ? {} : { history: added }),
     inner: trace,
   };
+}
+
+// ---------------------------------------------------------------------------
+// The end of an instance: a flow's `finally:` node (grammar 7.9)
+// ---------------------------------------------------------------------------
+
+/**
+ * How one flow instance ended (grammar 7.9, PRD resolved q76): what a
+ * `finally:` node reads as `execution.outcome`.
+ *
+ * `cancelled` is one of the three before anything produces it. PRD resolved
+ * q75's cancel is what will, through [`endInstance`] like the other two, and
+ * the value is here now so that a finally node written against it checks and
+ * runs today rather than at the release that adds the route.
+ */
+export type InstanceOutcome = "completed" | "failed" | "cancelled";
+
+/** What an instance's `finally:` node is told about the end it runs at. */
+export interface InstanceEnding {
+  readonly outcome: InstanceOutcome;
+  /**
+   * The error that ended the body, in `docs/trace.md` §3's shape — the aborting
+   * entry's own `error` — and absent on an instance that completed:
+   * `execution.error` inside the finally node, under grammar 4.1's absent-value
+   * rule.
+   */
+  readonly error?: string;
+}
+
+/** What running an instance's `finally:` node left behind. */
+export interface FinallyRun {
+  /**
+   * Its trace entry: an ordinary one, `node` its id, carrying `outcome`,
+   * `writes` and `error` like any — and **no `routing`**, because it has no
+   * edges to decide (`docs/trace.md` §3). It is the instance's last entry.
+   */
+  readonly entry: TraceEntry;
+  /** The instance's state with the finally node's writes applied. */
+  readonly state: GraphStateLike;
+}
+
+/**
+ * Whether what stopped an instance is an **end** of it, and which.
+ *
+ * `undefined` — no end at all — for the outcomes after which the execution's
+ * row stays open ([`staysOpen`]): a `human` pause the run parks at (exit `3`,
+ * `status: "interrupted"`), which the resumed run runs on from, and a replay
+ * divergence, after which nothing this generation does is in the record. A
+ * pause nobody is waiting for any more ([`HumanAbandoned`]) is not one either:
+ * it belongs to an instance whose result is already discarded, and whose
+ * attempt the node that owned it has finished with. Every other way out is an
+ * end: no error is `completed` — a body that ended through `on_error: skip` or
+ * a `fallback:` to `end` included (Decision D97) — and an error is `failed`.
+ */
+export function instanceEnding(execution: string, error: unknown): InstanceEnding | undefined {
+  if (staysOpen(execution, error) || abandonedOf(error) !== undefined) return undefined;
+  if (error === undefined) return { outcome: "completed" };
+  return { outcome: "failed", error: describe(error) };
+}
+
+/** The `execution` root inside a `finally:` node (grammar 4.1, 7.9). */
+const FINALLY_EXECUTION_SHAPE = {
+  properties: {
+    id: "string",
+    session_key: "string",
+    item_index: "int",
+    outcome: "string",
+    error: "string",
+  },
+} as const;
+
+/**
+ * The first failure a `finally:` node of each execution raised after its own
+ * retries — `finally_error` on the execution's record (grammar 7.9, PRD
+ * resolved q76).
+ *
+ * The **first**, because an execution has one record and several finally nodes
+ * may fail in it — a subflow's, then the root's — and the first is the one the
+ * rest ran after. Every one of them is also on its own trace entry, failed, with
+ * its own `error`, so nothing a second one said is lost. Read by
+ * [`settleExecution`] for the lifecycle row and by the run for the envelope, and
+ * released with the execution ([`closeExecution`]).
+ */
+const finallyFailures = new Map<string, string>();
+
+/** What `finally_error` holds for this execution, where a finally node failed. */
+export function finallyErrorOf(execution: string): string | undefined {
+  return finallyFailures.get(execution);
+}
+
+/**
+ * The end-of-instance seam: run a flow instance's `finally:` node, once, now
+ * that the instance has ended (grammar 7.9, PRD resolved q76).
+ *
+ * Every instance ends here — the root instance of an execution (`src/graph.ts`'s
+ * run), each `flow:` node's and each joined `map` dispatch's ([`runSubflow`]),
+ * and a child execution's root, which is a run of its own — and this is the one
+ * place what that means is written down:
+ *
+ * 1. **The boundary is journaled first** (`docs/durability.md` §3.10): a
+ *    `finally` record at the finally node's own site, holding how the instance
+ *    ended. A resumed generation that replays the body reaches this point again
+ *    and finds it — so the outcome the node reads is the one the first
+ *    generation recorded, and a replayed body that ended *differently* is a
+ *    [`ReplayDivergence`] rather than a second finally run under another
+ *    outcome. The node's own effects are ordinary journaled effects at that
+ *    site: a restart before they landed runs them live, once, and a restart
+ *    after replays them.
+ * 2. **The node runs under its own grammar 9.3 policy** — its `retry:` and
+ *    `timeout:`, levels 1–4 as any node — with `execution.outcome` and
+ *    `execution.error` in its roots, and nothing else differs from a node of
+ *    the body: its input is built from the instance's `input` and `state`, its
+ *    activity is the one its kind runs, its writes land through their channels'
+ *    reduce policies.
+ * 3. **Its failure changes nothing it ran after.** Once its retries are spent —
+ *    or where its input could not even be built — the error is
+ *    `finally_error` on the execution's record ([`finallyErrorOf`]) and on its
+ *    own entry, and the instance ends with the outcome it already had: a
+ *    completed run stays completed, its outputs and exit code what they were.
+ *    No `on_error:` applies at any level; a divergence is the one error that
+ *    still travels, because it is un-absorbable everywhere (PRD resolved q29).
+ *
+ * `undefined` where there is nothing to run: an instance of a flow with no
+ * `finally:`, and an `ending` of `undefined` — a stop that is not an end
+ * ([`instanceEnding`]).
+ *
+ * **The cancelled arm.** `ending.outcome` may be `"cancelled"`, and that is the
+ * whole of what PRD resolved q75's cancel will need from this seam: it is
+ * journaled, read and run exactly as the other two. Nothing in this release
+ * produces it — there is no cancel route yet — so the one caller that passes it
+ * is the test that drives this function directly.
+ */
+export async function endInstance(
+  descriptor: NodeDescriptor | undefined,
+  state: GraphStateLike,
+  ending: InstanceEnding | undefined,
+  body: readonly TraceEntry[],
+): Promise<FinallyRun | undefined> {
+  if (descriptor === undefined || ending === undefined) return undefined;
+  const run = state.$run;
+  // After every entry of the body, the aborting one included: the finally entry
+  // is the instance's last (`docs/trace.md` §9).
+  const step = 1 + body.reduce((latest, entry) => Math.max(latest, entry.step), run.step);
+  // Grammar 9.4's frame for the node, `<node id>/<traversal ordinal>`: the
+  // ordinal is always `0`, because the instance runs its finally node once and
+  // no edge can bring it round again — the same site [`instancePath`] derives
+  // for a body node's first traversal.
+  const traversal = 0;
+  const site = [...run.path, `${descriptor.node}/${traversal}`].join("/");
+  const policy = effectivePolicy(descriptor.policy, false, run.policy);
+
+  // 1. The boundary, recorded before the node runs.
+  let held: InstanceEnding = ending;
+  const recorder = recorderFor(run.execution.id, site);
+  if (recorder !== undefined) {
+    const slot = await recorder.claim("finally", {
+      node: descriptor.node,
+      outcome: ending.outcome,
+    });
+    if (slot.held?.kind === "value") {
+      held = slot.held.value as InstanceEnding;
+    } else if (slot.held === undefined) {
+      held = (await slot.keep({
+        outcome: ending.outcome,
+        ...(ending.error === undefined ? {} : { error: ending.error }),
+      })) as InstanceEnding;
+    }
+  }
+
+  // 2. The node, with the end in its `execution` root.
+  const execution = {
+    ...run.execution,
+    outcome: held.outcome,
+    ...(held.error === undefined ? {} : { error: held.error }),
+  };
+  const configuration: Roots = {
+    input: bindRoot(run.input, descriptor.shapes.input),
+    state: bindRoot(declared(state, descriptor.shapes.state), descriptor.shapes.state),
+    execution: bindRoot(execution, FINALLY_EXECUTION_SHAPE),
+  };
+  const view: NodeView = { state, run, roots: configuration };
+  const storeRecords: StoreRecord[] = [];
+  const modelCalls: ModelCall[] = [];
+  const innerTraces: TraceEntry[] = [];
+  const toolDispatched: DispatchRecord[] = [];
+  const harnessRuns: HarnessRecord[] = [];
+  // What the node did, whichever way it ended — read off the collectors exactly
+  // as [`runNode`] reads them, for its reason: an attempt that failed still
+  // made its calls and its writes (PRD 5.3, 5.8, 5.9).
+  const recorded = (): Partial<TraceEntry> => ({
+    ...(toolDispatched.length === 0 ? {} : { toolDispatches: [...toolDispatched] }),
+    ...(innerTraces.length === 0 ? {} : { inner: [...innerTraces] }),
+    ...(storeRecords.length === 0 ? {} : { stores: [...storeRecords] }),
+    ...(modelCalls.length === 0 ? {} : { models: settled(modelCalls) }),
+    ...(harnessRuns.length === 0 ? {} : { harness: [...harnessRuns] }),
+  });
+
+  let attempts = 0;
+  try {
+    // Inside the `try`, unlike a body node's: an input that cannot be built is
+    // still this node failing, and a finally node's failure has one meaning
+    // (grammar 7.9) — where a body node's would fail the execution past its
+    // `on_error:` (Decision D110), this one leaves the execution's outcome
+    // where the body left it.
+    const input = descriptor.input(configuration, view);
+    const answer = await runActivity(
+      descriptor.flow,
+      descriptor.node,
+      site,
+      policy,
+      run.execution,
+      (context) => descriptor.run(input, context, view),
+      storeRecords,
+      modelCalls,
+      innerTraces,
+      toolDispatched,
+      harnessRuns,
+    );
+    attempts = answer.attempts;
+    const update: Record<string, unknown> = {};
+    const written: string[] = [];
+    const fields = (answer.value.output ?? {}) as Record<string, unknown>;
+    for (const write of descriptor.writes) {
+      const value = fields[write.field];
+      // A field the result does not carry performs no write (Decision D110).
+      if (value === undefined) continue;
+      update[write.channel] = applyWrite(state[write.channel], value, write.reduce);
+      written.push(write.channel);
+    }
+    for (const batch of answer.value.channels ?? []) {
+      if (batch.values.length === 0) continue;
+      update[batch.channel] = batch.values.reduce(
+        (folded, value) => applyWrite(folded, value, batch.reduce),
+        state[batch.channel],
+      );
+      written.push(batch.channel);
+    }
+    const entry: TraceEntry = {
+      step,
+      flow: descriptor.flow,
+      node: descriptor.node,
+      traversal,
+      outcome: "completed",
+      attempts,
+      writes: written,
+      ...recorded(),
+      ...(answer.value.dispatches === undefined ? {} : { dispatches: answer.value.dispatches }),
+      ...(answer.value.inner === undefined
+        ? {}
+        : { inner: joined(innerTraces, answer.value.inner) }),
+      ...(answer.value.models === undefined
+        ? {}
+        : { models: settled(merged(modelCalls, answer.value.models)) }),
+    };
+    // What an agent finally node said is not added to the conversation the
+    // instance hands back on `context: inherit`: that is the body's, read before
+    // this node ran, like the outputs (grammar 7.9, 10.4).
+    return { entry, state: { ...state, ...update } as GraphStateLike };
+  } catch (error) {
+    // The one error a finally node does not absorb: a record this run does not
+    // match is un-absorbable by any policy at any depth (PRD resolved q29).
+    if (divergenceOf(error) !== undefined) throw error;
+    attempts = error instanceof NodeFailure ? error.attempts : attempts;
+    // Named by the node whichever way it failed: [`runActivity`]'s
+    // `NodeFailure` already reads `<flow> node \`<id>\` failed: …`, and an input
+    // that could not be built is said in the same words.
+    const failure =
+      error instanceof NodeFailure
+        ? error.message
+        : `${descriptor.flow} node \`${descriptor.node}\` failed: ${describe(error)}`;
+    if (!finallyFailures.has(run.execution.id)) {
+      finallyFailures.set(run.execution.id, failure);
+    }
+    const dispatched = dispatchesOf(error);
+    const entry: TraceEntry = {
+      step,
+      flow: descriptor.flow,
+      node: descriptor.node,
+      traversal,
+      outcome: "failed",
+      attempts,
+      ...recorded(),
+      ...(dispatched === undefined ? {} : { dispatches: dispatched }),
+      error: describe(error),
+    };
+    return { entry, state };
+  }
 }
 
 /**
@@ -12183,6 +12517,7 @@ export function traceDocument(settled: {
   readonly flow: string;
   readonly status: "completed" | "failed" | "interrupted";
   readonly error?: string;
+  readonly finallyError?: string;
   readonly entries: readonly TraceEntry[];
   readonly lineage?: Lineage;
 }): TraceDocument {
@@ -12200,6 +12535,7 @@ export function traceDocument(settled: {
     execution_id: settled.execution,
     status: settled.status,
     ...(settled.error === undefined ? {} : { error: settled.error }),
+    ...(settled.finallyError === undefined ? {} : { finally_error: settled.finallyError }),
     entries: settled.entries,
   };
 }
@@ -14463,10 +14799,13 @@ export async function settleExecution(execution: string, error?: unknown): Promi
   if (journal === undefined) return;
   if (staysOpen(execution, error)) return;
   await childrenBegun(execution);
+  // What a `finally:` node raised goes on the row beside the outcome it did not
+  // change (grammar 7.9, `docs/durability.md` §3.5).
+  const finallyError = finallyErrorOf(execution);
   if (error === undefined) {
-    await journal.end(execution, "completed");
+    await journal.end(execution, "completed", undefined, finallyError);
   } else {
-    await journal.end(execution, "failed", describe(error));
+    await journal.end(execution, "failed", describe(error), finallyError);
   }
   // **After** the row has closed, never before: a crash between the two leaves
   // ledger rows nothing will ask for again, and the other order could leave an
@@ -14672,6 +15011,7 @@ export function closeExecution(execution: string): void {
   settledJournals.delete(execution);
   openedExecutions.delete(execution);
   executionSessions.delete(execution);
+  finallyFailures.delete(execution);
   closeSession(execution);
 }
 
@@ -14819,6 +15159,12 @@ export interface ReportedExecution {
   readonly placements?: readonly unknown[];
   readonly outputs?: Record<string, unknown>;
   readonly error?: string;
+  /**
+   * What a `finally:` node raised after its own retries, beside a `status` it
+   * did not change (grammar 7.9, PRD resolved q76): the report's
+   * `finally_error`.
+   */
+  readonly finallyError?: string;
   readonly trace?: readonly TraceEntry[];
 }
 
@@ -14890,6 +15236,7 @@ export async function executionReport(
     ...(delivered.length === 0 ? {} : { deliveries: delivered.map(reportedDelivery) }),
     ...(execution.outputs === undefined ? {} : { outputs: execution.outputs }),
     ...(execution.error === undefined ? {} : { error: execution.error }),
+    ...(execution.finallyError === undefined ? {} : { finally_error: execution.finallyError }),
     ...(execution.trace === undefined
       ? {}
       : { trace_version: TRACE_VERSION, trace: execution.trace }),

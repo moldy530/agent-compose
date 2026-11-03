@@ -685,7 +685,18 @@ async function executing(
         : divergence !== undefined
           ? describe(divergence)
           : describe(error);
-    const written = writeTrace(address, execution, status, trace, job.lineage, reason);
+    // What a `finally:` node raised, beside the failure it did not change: the
+    // exit code is the failure's (grammar 7.9).
+    const finallyError = finallyFailure(undefined, error);
+    const written = writeTrace(
+      address,
+      execution,
+      status,
+      trace,
+      job.lineage,
+      reason,
+      finallyError,
+    );
     if (format === "json") {
       // The same record the completed run answers with, `error` where its
       // `outputs` would be — the trace file's path included, because a run that
@@ -697,6 +708,7 @@ async function executing(
             execution_id: execution,
             status,
             error: reason,
+            ...(finallyError === undefined ? {} : { finally_error: finallyError }),
             trace_version: TRACE_VERSION,
             trace,
             ...(written === undefined ? {} : { trace_path: written }),
@@ -714,13 +726,26 @@ async function executing(
           cause = (cause as { cause?: unknown }).cause;
         }
       }
+      sayFinallyFailure(finallyError);
       if (written !== undefined) process.stderr.write(`\ntrace: ${written}\n`);
     }
     return interrupt === undefined ? 1 : 3;
   }
 
   await prompting;
-  const written = writeTrace(address, execution, "completed", produced.trace, job.lineage);
+  // A completed run whose `finally:` node failed is still a completed run: its
+  // outputs are its body's, its exit code `0`, and the failure is one line on
+  // stderr and `finally_error` on the record (grammar 7.9, PRD resolved q76).
+  const finallyError = produced.finallyError;
+  const written = writeTrace(
+    address,
+    execution,
+    "completed",
+    produced.trace,
+    job.lineage,
+    undefined,
+    finallyError,
+  );
   if (format === "json") {
     process.stdout.write(
       `${JSON.stringify(
@@ -729,6 +754,7 @@ async function executing(
           execution_id: execution,
           status: "completed",
           outputs: produced.outputs,
+          ...(finallyError === undefined ? {} : { finally_error: finallyError }),
           trace_version: TRACE_VERSION,
           trace: produced.trace,
           ...(written === undefined ? {} : { trace_path: written }),
@@ -741,6 +767,7 @@ async function executing(
   }
   process.stdout.write(`${JSON.stringify(produced.outputs, null, 2)}\n`);
   process.stderr.write(render(produced.trace));
+  sayFinallyFailure(finallyError);
   if (written !== undefined) process.stderr.write(`\ntrace: ${written}\n`);
   return 0;
 }
@@ -804,6 +831,7 @@ async function journalExport(
   // there to pick up. Bounded like every other ladder on this ledger
   // (`docs/durability.md` §3.7): its end is a sentence on stderr and a trace file
   // that still holds the run.
+  const finallyError = finallyFailure(produced, error);
   await insisting(async () => {
     try {
       record = await shipTrace({
@@ -813,6 +841,7 @@ async function journalExport(
         // lifecycle row closes, and a run holding a pause leaves it open.
         status: produced === undefined ? "failed" : "completed",
         ...(produced === undefined ? { error: describe(error) } : {}),
+        ...(finallyError === undefined ? {} : { finallyError }),
         entries: trace ?? [],
       });
       return true;
@@ -870,6 +899,7 @@ async function owed(job: Job, produced: FlowRun | undefined, error: unknown): Pr
       produced === undefined
         ? (error as { trace?: readonly runtime.TraceEntry[] } | null)?.trace
         : produced.trace;
+    const finallyError = finallyFailure(produced, error);
     await intendDelivery({
       execution: job.execution,
       kind: "callback",
@@ -891,6 +921,7 @@ async function owed(job: Job, produced: FlowRun | undefined, error: unknown): Pr
           trigger: job.trigger ?? "manual",
           status: produced === undefined ? "failed" : "completed",
           ...(produced === undefined ? { error: describe(error) } : { outputs: produced.outputs }),
+          ...(finallyError === undefined ? {} : { finallyError }),
           ...(trace === undefined ? {} : { trace }),
         }),
       ),
@@ -2566,6 +2597,7 @@ function writeTrace(
   trace: readonly runtime.TraceEntry[],
   lineage: runtime.Lineage | undefined,
   error?: string,
+  finallyError?: string,
 ): string | undefined {
   // A run that failed before it started made no routing decisions, and an empty
   // file named as a trace would be a file a reader opens for nothing.
@@ -2582,6 +2614,7 @@ function writeTrace(
       flow: address,
       status,
       ...(error === undefined ? {} : { error }),
+      ...(finallyError === undefined ? {} : { finallyError }),
       entries: trace,
       ...(lineage === undefined ? {} : { lineage }),
     });
@@ -2592,6 +2625,26 @@ function writeTrace(
     // otherwise succeeded; stdout still carries the answer.
     return undefined;
   }
+}
+
+/**
+ * What a `finally:` node of this run raised after its own retries, where one
+ * did (grammar 7.9, PRD resolved q76) — off the answer for a run that produced
+ * one, and off the failure for a run that did not: `finally_error`, beside an
+ * outcome it did not change.
+ */
+function finallyFailure(produced: FlowRun | undefined, error: unknown): string | undefined {
+  if (produced !== undefined) return produced.finallyError;
+  return (error as { finallyError?: string } | null | undefined)?.finallyError;
+}
+
+/**
+ * The one line a run's report gives a failed `finally:` node, on stderr: the
+ * node and what it raised. Its exit code is the outcome's, which the finally
+ * node does not change (grammar 7.9).
+ */
+function sayFinallyFailure(finallyError: string | undefined): void {
+  if (finallyError !== undefined) process.stderr.write(`finally_error: ${finallyError}\n`);
 }
 
 /** The human report: one line per node, plus what its model and stores did. */

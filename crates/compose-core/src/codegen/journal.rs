@@ -1184,6 +1184,10 @@ mod tests {
             ("runHuman", runtime, "src/runtime.ts"),
             ("runCoder", runtime, "src/runtime.ts"),
             ("runStoreOp", stores, "src/stores.ts"),
+            // Not a call to the world: the boundary a flow instance crosses into
+            // its `finally:` node, journaled through the same seam so a resumed
+            // generation reads how the instance ended (grammar 7.9, §3.10).
+            ("endInstance", runtime, "src/runtime.ts"),
         ] {
             let body = function_body(source, site);
             assert!(
@@ -1196,15 +1200,15 @@ mod tests {
             );
         }
 
-        // …and no tenth. The count is over both emitted modules, because the
+        // …and no eleventh. The count is over both emitted modules, because the
         // document's table is.
         let reached = runtime.matches("journaled(").count()
             + runtime.matches(".claim(").count()
             + stores.matches("journaled(").count()
             + stores.matches(".claim(").count();
         assert_eq!(
-            reached, 9,
-            "`docs/durability.md` §3 says there are exactly nine effect sites and this build              has {reached}: a new one belongs in that table, and a lost one is a replay that              re-issues an effect"
+            reached, 10,
+            "`docs/durability.md` §3 says there are exactly ten journaled sites — nine effects              and the finally boundary — and this build has {reached}: a new one belongs in that              table, and a lost one is a replay that re-issues an effect"
         );
     }
 

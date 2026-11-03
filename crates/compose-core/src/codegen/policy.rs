@@ -54,6 +54,10 @@ pub enum Level {
     BuiltIn,
     /// The field is exempt from the chain entirely (Decision D102).
     Exempt,
+    /// A flow's `finally:` node's `on_error`, which no level supplies: its
+    /// failure has one meaning, `finally_error` on the execution's record
+    /// (grammar 7.9, Decision D159).
+    Finally,
 }
 
 impl Level {
@@ -65,6 +69,9 @@ impl Level {
             Self::Defaults => "`defaults:`",
             Self::BuiltIn => "the built-in",
             Self::Exempt => "exempt (Decision D102)",
+            Self::Finally => {
+                "no level, as a `finally:` node's failure is `finally_error` (Decision D159)"
+            }
         }
     }
 }
@@ -130,6 +137,24 @@ pub fn resolve<'ir>(ir: &'ir Ir, node: &'ir Node) -> Resolved<'ir> {
         retry,
         timeout,
         on_error,
+    }
+}
+
+/// Resolve a flow's **`finally:` node**'s policy (grammar 7.9, 9.3, Decision
+/// D159).
+///
+/// Its `retry` and `timeout` resolve through the chain exactly as any node's —
+/// level 2, then 3, then 4 here, and level 1 at run time — and its `on_error`
+/// from **no** level: the validator refuses the node's own key, and a strategy
+/// `defaults:` or an instantiating `policy:` would deliver is written for every
+/// node and applied to no finally node, because its failure has one meaning.
+/// `fail` is what is emitted, and the runtime reads no strategy for the node at
+/// all (`runtime.endInstance`).
+#[must_use]
+pub fn resolve_finally<'ir>(ir: &'ir Ir, node: &'ir Node) -> Resolved<'ir> {
+    Resolved {
+        on_error: (Strategy::Fail, Level::Finally),
+        ..resolve(ir, node)
     }
 }
 
