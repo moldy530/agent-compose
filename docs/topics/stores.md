@@ -441,11 +441,13 @@ nothing. `validate` refuses an `append` to a field that is not an array and an
 `incr` of one that is not an `integer` or `number` (`type-mismatch`), and a field
 the schema does not declare (`unknown-field`).
 
-**Every `kv` write answers `applied`, `version` and `deduped`**; a partial update
-also answers the whole `value` it left. A retried write — the same idempotency
-key, the same attempt — is answered with its first attempt's whole answer and
-`deduped: true`, so a retried claim that won answers `applied: true` again rather
-than losing to itself.
+**Every single-key `kv` write answers `applied`, `version` and `deduped`**; a
+partial update also answers the whole `value` it left. A `batch` (below) answers
+`applied` and `deduped` but no `version` of its own — it wrote many keys, so each
+entry's version is in its `results`, and a guard or a `writes:` on a batch reads
+those. A retried write — the same idempotency key, the same attempt — is
+answered with its first attempt's whole answer and `deduped: true`, so a retried
+claim that won answers `applied: true` again rather than losing to itself.
 
 **Schema evolution.** `value_schema` is checked on write: by CEL typing at
 `validate` for a node, by the emitted Zod at run time for a tool's arguments. A

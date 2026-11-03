@@ -4333,9 +4333,10 @@ Rules (PRD 5.8):
   value of it as its key's `version`. A sequence rather than a per-key counter,
   so a key deleted and set again never shows a version it showed before: the
   ABA race a compare-and-set exists to close stays closed across a delete. A
-  `get` returns it, `version` present exactly when `found`; every `kv` write
-  returns the version the key holds after it — so none after a `delete` that
-  applied, which leaves the key holding nothing.
+  `get` returns it, `version` present exactly when `found`; every single-key
+  `kv` write returns the version the key holds after it — so none after a
+  `delete` that applied, which leaves the key holding nothing — and a `batch`
+  returns each entry's in its `results`.
 - **Conditions.** `set`, `merge`, `append` and `incr` take one of `if: absent`,
   `if: present` (literals) or `if_version: <CEL int>`; `delete` takes
   `if_version:` alone. Both conditions at once is a compile error, decidable in
@@ -4398,14 +4399,19 @@ Rules (PRD 5.8):
   adds no field to any output row (Decision
   [D34](#d34-the-store-op-catalog-is-normative-including-derived-output-schemas)):
   an expired key is answered exactly as a key never written is.
-- **What a write answers.** Every `kv` write answers `applied`, `version` and
-  `deduped`, beside its own fields; a partial update answers the whole `value`
-  it left, present exactly when it applied. `deduped` is grammar 9.4's ledger
+- **What a write answers.** Every single-key `kv` write — `set`, `delete`,
+  `merge`, `append` and `incr` — answers `applied`, `version` and `deduped`,
+  beside its own fields; a partial update answers the whole `value` it left,
+  present exactly when it applied. A `batch` answers `applied` and `deduped` but
+  **no `version` of its own**: it wrote many keys, so each entry's version is in
+  its `results` (the batch below), and a guard or a `writes:` on a batch reads
+  `results`, never `output.version`. `deduped` is grammar 9.4's ledger
   answering: the ledger stores the op's **whole** answer, so a retried write —
   the same key, the same attempt — is answered with its first attempt's
-  `applied` and `version` and `deduped: true`, and a retried successful claim
-  never fails against its own first write. A synthesized tool's write carries no
-  key (§9.4), so its `deduped` is always `false`.
+  `applied` and `version` (a batch's `results` and `failed`) and
+  `deduped: true`, and a retried successful claim never fails against its own
+  first write. A synthesized tool's write carries no key (§9.4), so its
+  `deduped` is always `false`.
 - **A batch** (PRD resolved q71, Decision
   [D156](#d156-a-kv-batch-is-one-write-of-many-keys-and-its-list-is-a-literal)).
   A `batch` applies its `ops:` — a literal list of one to 100 `set` and

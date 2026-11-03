@@ -66,11 +66,13 @@
 // so the arms differ in how they lock and store a row and in nothing a write
 // means.
 //
-// Every `kv` write answers `{ applied, version, deduped }` beside its own
-// fields, and the idempotency ledger below stores that **whole** answer: a
-// retried write is answered with its first attempt's `applied` and `version`
-// and `deduped: true`, so a retried successful claim never fails against its
-// own first write.
+// Every single-key `kv` write answers `{ applied, version, deduped }` beside
+// its own fields — a `batch`, which wrote many keys, answers `applied` and
+// `deduped` with each entry's version in its `results` instead — and the
+// idempotency ledger below stores that **whole** answer: a retried write is
+// answered with its first attempt's `applied` and `version` and
+// `deduped: true`, so a retried successful claim never fails against its own
+// first write.
 //
 // # Reading at scale (PRD resolved q70)
 //
