@@ -521,8 +521,10 @@ rather than the operating system's — so two `agent-compose run`s sharing a
 `session` or `global` store contend for it, and the loser waits and then fails
 the node with `SQLite3Error: database is locked`. It fails loudly rather than
 corrupting anything, and a `serve` process — which runs its executions in **one**
-process — is not affected. `--target local` means one process, which is the same
-boundary the target draws everywhere else. A deployment that really has two is a
+process — is not affected by its own executions, but an `agent-compose store`
+command run beside a live `run` or `serve` is a second process on the same
+files and contends the same way. `--target local` means one process, which is
+the same boundary the target draws everywhere else. A deployment that really has two is a
 named target binding a **dialled** backend: a `kv` store on `postgres` or
 `mysql` is a connection rather than a file, every process reaching it reaches the
 same rows, and nothing else about the store changes — same ops, same scopes, same

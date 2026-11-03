@@ -951,8 +951,8 @@ fn launch(
     refused: Refused,
     arguments: &[String],
 ) -> ExitCode {
-    // The verb is the caller's, not this function's: all three commands come
-    // through here, and a `serve` told that "`run` takes a spec entrypoint" names
+    // The verb is the caller's, not this function's: every launching command
+    // (`run`, `resume`, `serve`, `store`) comes through here, and a `serve` told that "`run` takes a spec entrypoint" names
     // a command the caller did not type.
     if let Err(reason) = usable(entrypoint, command) {
         return fail(&reason);

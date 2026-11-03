@@ -285,6 +285,10 @@ are all usage errors and exit `2`; so is a store whose rows live only in the
 memory of the process running each execution — every `scope: execution` store
 under `--target local`, and any store bound to `provider: memory` — since this
 command is another process. A target binding the store to a server reaches it.
+For the same reason, under `--target local` a `store` command run beside a live
+`run` or `serve` is a second process on the same SQLite files: the one-process
+boundary the `targets` topic describes applies to it, and a write that contends
+with a running node waits and then fails with `database is locked`.
 A write to the partition of an execution that has already ended is a row
 nothing will delete, because the run released that partition when it settled.
 

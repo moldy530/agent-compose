@@ -254,8 +254,8 @@ pub(crate) fn spawn(runtime: &Path, out: &Path, arguments: &[String]) -> Result<
 /// targets, which is what makes reading them from a handler sound.
 ///
 /// The state is process-wide because signal dispositions are, so one
-/// [`Forwarding`] may exist at a time. `run` and `serve` each launch one child
-/// and wait for it, which is the only shape this binary has.
+/// [`Forwarding`] may exist at a time. `run`, `resume`, `serve` and `store` each
+/// launch one child and wait for it, which is the only shape this binary has.
 #[cfg(unix)]
 mod signals {
     use std::sync::atomic::{AtomicI32, Ordering};
