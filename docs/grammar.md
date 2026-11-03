@@ -11074,13 +11074,27 @@ q66; §4.3, §8.9, §14, §14.8.*
 
 ### D152. A `kv` key is versioned, and a conditional or partial write is serialized against every write to its key
 
+**Amended 2026-11-02** by
+[D156](#d156-a-kv-batch-is-one-write-of-many-keys-and-its-list-is-a-literal),
+which is PRD resolved q71: "every `kv` write answers `{ applied, version,
+deduped }`" is now true of every **single-key** write. A `batch` is a `kv` write
+of many keys and answers `{ applied, deduped, results, failed }` — no `version`
+of its own, each entry's being in its `results` — so a guard or a `writes:`
+reads a batch's versions there. What the entry is about is unchanged: every
+write that lands takes the next value of its partition's sequence, a batch's
+`set` entries included, a failed condition is an answer, and the ledger stores
+a write's whole answer, a batch's included. The amended text follows; the
+superseded sentence is quoted at the end so a reader of an older citation can
+see what moved.
+
 A `kv` partition keeps one monotonic version sequence and every write that lands
 takes its next value; `get` returns it. `set` takes `if: absent | present` or
 `if_version:`, `delete` takes `if_version:`, and a condition that does not hold
 answers `applied: false` rather than failing. `merge`, `append` and `incr` read,
 apply, validate the whole result against `V`, and commit in one transaction.
-Every `kv` write answers `{ applied, version, deduped }`, and the §9.4 ledger
-stores that whole answer. `agent_access:` gains `full` (§11.4, §11.5, PRD
+Every single-key `kv` write answers `{ applied, version, deduped }` — a `batch`
+answers its entries' versions in its `results` instead (D156) — and the §9.4
+ledger stores that whole answer. `agent_access:` gains `full` (§11.4, §11.5, PRD
 resolved q68).
 
 **Rationale**: a `kv set` replaces the whole value and, until this entry, per
@@ -11152,8 +11166,14 @@ and folds into the one predicate the conditions read; it is
 [D153](#d153-a-kv-key-may-expire-and-a-settled-executions-ledger-rows-are-deleted)'s,
 not this entry's.
 
-**Status**: shipped. *PRD 5.8, resolved q13, q29, q63, q68; §9.4, §11.3, §11.4,
-§11.5.*
+**What the amendment replaced**, verbatim: *"Every `kv` write answers
+`{ applied, version, deduped }`, and the §9.4 ledger stores that whole
+answer."* The sentence survives for every write that addresses one key — which,
+when it was written, was every `kv` write — and what moved is that a `batch`,
+which addresses many, answers no one `version`.
+
+**Status**: shipped, amended by resolved q71. *PRD 5.8, resolved q13, q29, q63,
+q68, q71; §9.4, §11.3, §11.4, §11.5.*
 
 ### D153. A `kv` key may expire, and a settled execution's ledger rows are deleted
 
@@ -11612,16 +11632,20 @@ for each other and never in a circle. A crash anywhere in that span is a
 transaction that never committed: SQLite's journal rolls it back at the next
 open, a server rolls back a session it lost.
 
-**What it builds on, and what it does not touch.** Each entry is q68's write
-(D152) and q69's expiry (D153), unchanged; D104 and §9.4 hold as written — one
-effect, one key — and D67 admits the batch untouched, since each entry is a
-keyed `kv` write. The trace files one write record for it with no `key`, its
-keys in the answer it carries (`docs/trace.md` §6). The reads (q70, D154), the
-operator's command line (q72, D155 — no `batch` sub-verb) and the agent tool
-surface (§11.5) are unchanged; no decision is amended.
+**What it builds on, what it narrows, and what it does not touch.** Each entry
+is q68's write (D152) and q69's expiry (D153), unchanged; D104 and §9.4 hold as
+written — one effect, one key — and D67 admits the batch untouched, since each
+entry is a keyed `kv` write. One sentence of D152 is narrowed, and D152 carries
+the amendment note: its "every `kv` write answers `{ applied, version,
+deduped }`" is now every **single-key** write's, because a batch is a `kv` write
+that answers its entries' versions in `results` and no `version` of its own.
+The trace files one write record for it with no `key`, its keys in the answer
+it carries (`docs/trace.md` §6). The reads (q70, D154), the operator's command
+line (q72, D155 — no `batch` sub-verb) and the agent tool surface (§11.5) are
+unchanged; no other decision is amended.
 
 **Status**: shipped. *PRD 5.8, resolved q29, q63, q68, q69, q71; §8.8, §9.4,
-§11.4, §11.5.*
+§11.4, §11.5; amends D152.*
 
 ## Appendix B — Editor integration
 
