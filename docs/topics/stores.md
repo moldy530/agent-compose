@@ -282,7 +282,7 @@ flow.audit:
     - { from: start, to: first }
     - { from: first, to: more, when: "has(first.output.next)" }
     - { from: first, to: total, else: true }
-    - { from: more, to: more, when: "has(more.output.next)" }
+    - { from: more, to: more, when: "has(more.output.next)", max_iterations: 98 }
     - { from: more, to: total, else: true }
     - { from: total, to: recent }
     - { from: recent, to: end }
@@ -300,8 +300,24 @@ full — so a walk ends on `has(page.output.next)` going false, and a
 `writes: { next: cursor }` there performs no write: the channel keeps the last
 cursor a page answered. Pages are **keyset**, not offset: a key written behind
 the cursor mid-walk is not seen by that walk, one written ahead of it is, and
-no key is answered twice. `limit` is per page (1..1000); a walk has no bound of
-its own.
+no key is answered twice.
+
+**A walk is a cycle, and its length is the cycle's bound.** `limit` is per page
+(1..1000); how many pages a walk takes is whatever bounds the `more -> more`
+back-edge, exactly as for any cycle. A back-edge carrying only
+`has(more.output.next)` is a CEL exit condition: legal, but it declares no
+number of passes, so the compiler's superstep ceiling — the safety net under
+every run — allows the cycle about a hundred passes through each of its nodes
+and fails a walk longer than that with `SuperstepCeiling`, however near the end
+it was. A walk that may take more pages says how many with `max_iterations:` on
+the back-edge (at most 1000), and the ceiling is sized from it. Here
+`max_iterations: 98` allows a hundred pages — `first`'s, the one `more` reads on
+entering the cycle, and 98 more — which is what `pages` holds. A budget that
+runs out leaves through the `else:` just as a last page does, so on a larger
+partition the walk stops short: `cursor` holds the last `next` a page answered
+(the `after:` a later walk resumes at), and `total`'s `count` is what shows the
+keys it did not reach. At 1000 keys a page, one budgeted back-edge reads about a
+million keys.
 
 **`include_values: true`** answers each key's `value` and `version` beside it,
 as `entries`, in the page's order. It is a literal because it decides whether

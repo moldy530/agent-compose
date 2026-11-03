@@ -140,6 +140,27 @@ state:
     type: integer
     default: -1
 
+  # …and the same three for `flow.long_walk`, whose pages are one key each and
+  # whose walk is longer than the superstep ceiling allows a cycle bounded by
+  # its guard alone.
+  walked:
+    description: The key of one page each, in the order the long walk read them.
+    type: array
+    max_items: 200
+    items:
+      type: array
+      max_items: 1
+      items: { type: string }
+    reduce: append
+  walk_cursor:
+    description: The last `next` a page of the long walk answered.
+    type: string
+    default: nothing was paged
+  walk_held:
+    description: How many entries the long walk's `count` found.
+    type: integer
+    default: -1
+
 provider.mock:
   kind: anthropic
   api_key: ${MOCK_API_KEY}
@@ -831,3 +852,159 @@ flow.catalogue:
     - { from: more, to: census, else: true }
     - { from: census, to: fetch }
     - { from: fetch, to: end }
+
+# …and the bound on a walk, which is the cycle's and nothing else's (grammar
+# 7.4, 11.4). A page is at most 1000 keys and a walk is as many pages as its
+# cycle runs, so what bounds a walk is what bounds any cycle. `flow.long_walk`
+# declares it — `max_iterations: 148` on the back-edge, so the walk reads at
+# most 150 pages: `first`'s, the one `more` reads on entering the cycle, and
+# one per traversal — and the compiler's superstep ceiling is sized from that
+# budget. `flow.long_walk_unbudgeted` is the same walk with the guard alone
+# (clause 2), which declares no number of passes, so the ceiling allows the
+# cycle its fixed allowance and no more: a walk of more pages than that fails
+# the run, however near it was to the end. One key a page, so a walk past the
+# allowance needs a hundred and fifty keys rather than a hundred and fifty
+# thousand. The channels the walk fills mean what `flow.catalogue`'s do: one
+# element per page, the cursor the last `next` a page answered, and the count
+# the partition's.
+store.stockroom:
+  kind: kv
+  scope: execution
+  description: One entry per name, keyed under `item/`, for the long walks.
+  value_schema:
+    name: { type: string }
+
+flow.stockroom_one:
+  description: Write one name's entry.
+  inputs:
+    name:
+      type: string
+  outputs: {}
+  nodes:
+    put:
+      store: store.stockroom
+      op: set
+      key: "'item/' + input.name"
+      value:
+        name: "input.name"
+  edges:
+    - { from: start, to: put }
+    - { from: put, to: end }
+
+flow.long_walk:
+  description: Write an entry per name, then walk them a key a page under a declared budget of pages, and count them.
+  inputs:
+    names:
+      type: array
+      max_items: 200
+      items: { type: string }
+  outputs:
+    walked:
+      type: array
+      max_items: 200
+      items:
+        type: array
+        max_items: 1
+        items: { type: string }
+    walk_cursor:
+      type: string
+    walk_held:
+      type: integer
+  nodes:
+    stock:
+      map:
+        over: input.names
+        as: name
+        node: flow.stockroom_one
+        max_concurrency: 8
+        input:
+          name: "name"
+    first:
+      store: store.stockroom
+      op: list
+      prefix: "'item/'"
+      limit: 1
+      writes:
+        keys: walked
+        next: walk_cursor
+    more:
+      store: store.stockroom
+      op: list
+      prefix: "'item/'"
+      after: "state.walk_cursor"
+      limit: 1
+      writes:
+        keys: walked
+        next: walk_cursor
+    census:
+      store: store.stockroom
+      op: count
+      prefix: "'item/'"
+      writes:
+        count: walk_held
+  edges:
+    - { from: start, to: stock }
+    - { from: stock, to: first }
+    - { from: first, to: more, when: "has(first.output.next)" }
+    - { from: first, to: census, else: true }
+    - { from: more, to: more, when: "has(more.output.next)", max_iterations: 148 }
+    - { from: more, to: census, else: true }
+    - { from: census, to: end }
+
+flow.long_walk_unbudgeted:
+  description: The same walk with its back-edge bounded by the guard alone.
+  inputs:
+    names:
+      type: array
+      max_items: 200
+      items: { type: string }
+  outputs:
+    walked:
+      type: array
+      max_items: 200
+      items:
+        type: array
+        max_items: 1
+        items: { type: string }
+    walk_held:
+      type: integer
+  nodes:
+    stock:
+      map:
+        over: input.names
+        as: name
+        node: flow.stockroom_one
+        max_concurrency: 8
+        input:
+          name: "name"
+    first:
+      store: store.stockroom
+      op: list
+      prefix: "'item/'"
+      limit: 1
+      writes:
+        keys: walked
+        next: walk_cursor
+    more:
+      store: store.stockroom
+      op: list
+      prefix: "'item/'"
+      after: "state.walk_cursor"
+      limit: 1
+      writes:
+        keys: walked
+        next: walk_cursor
+    census:
+      store: store.stockroom
+      op: count
+      prefix: "'item/'"
+      writes:
+        count: walk_held
+  edges:
+    - { from: start, to: stock }
+    - { from: stock, to: first }
+    - { from: first, to: more, when: "has(first.output.next)" }
+    - { from: first, to: census, else: true }
+    - { from: more, to: more, when: "has(more.output.next)" }
+    - { from: more, to: census, else: true }
+    - { from: census, to: end }

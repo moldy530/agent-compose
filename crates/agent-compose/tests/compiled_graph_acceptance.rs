@@ -12056,6 +12056,165 @@ fn a_flow_pages_through_a_kv_store_counts_it_and_reads_many_keys_at_once() {
     );
 }
 
+/// The names a long walk stocks its store with: `k000` up, written in reverse
+/// so the order the pages come back in is the store's rather than the input's.
+fn stock(count: usize) -> Vec<String> {
+    (0..count)
+        .rev()
+        .map(|index| format!("k{index:03}"))
+        .collect()
+}
+
+/// The keys of a long walk's pages, laid end to end, and how many pages held
+/// anything other than exactly one key.
+fn walked(outputs: &Value) -> (Vec<String>, usize) {
+    let pages = outputs["walked"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the walk wrote its pages: {outputs}"));
+    let uneven = pages
+        .iter()
+        .filter(|page| page.as_array().map(Vec::len) != Some(1))
+        .count();
+    let keys = pages
+        .iter()
+        .filter_map(Value::as_array)
+        .flatten()
+        .map(|key| key.as_str().unwrap_or_default().to_string())
+        .collect();
+    (keys, uneven)
+}
+
+/// A walk reads as many pages as its back-edge's budget says, past the
+/// allowance the superstep ceiling gives a cycle that declares none, and a
+/// budget that runs out ends the walk through its `else:` short of the
+/// partition's end (grammar 7.4, 11.4; PRD resolved q70).
+///
+/// A walk is a cycle, so its length is whatever bounds the cycle. On a
+/// partition of 150 keys walked a key a page, `flow.long_walk`'s
+/// `max_iterations: 148` is exactly enough — `first`'s page, the one `more`
+/// reads on entering the cycle, and 148 traversals — and the run reads every
+/// key once, in byte order, through more supersteps than
+/// [`a_walk_bounded_by_its_guard_alone_stops_at_the_superstep_ceiling`]'s
+/// unbudgeted twin is allowed. One key more and the budget is what ends it:
+/// the 150th page still answers a `next`, the exhausted back-edge is not taken
+/// (§7.3 rule 5), the `else:` is, and the flow finishes with the count saying
+/// what the walk did not reach and the cursor holding the `after:` a walk
+/// resuming from there would take.
+#[test]
+fn a_walk_with_a_budgeted_back_edge_reads_as_many_pages_as_it_declares() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let names = stock(150);
+    let mut expected: Vec<String> = names.iter().map(|name| format!("item/{name}")).collect();
+    expected.sort();
+    let Some(run) = harness::invoke_with(
+        "stores",
+        "flow.long_walk",
+        &json!({ "names": names }),
+        &harness::environment(&provider),
+    ) else {
+        return;
+    };
+    run.succeeded();
+    let outputs = run.outputs();
+    let (keys, uneven) = walked(&outputs);
+    assert_eq!(uneven, 0, "every page holds one key: {outputs}");
+    assert_eq!(
+        keys, expected,
+        "a 150-page walk reads every key once, in byte order: {outputs}"
+    );
+    assert_eq!(outputs["walk_held"], json!(150), "{outputs}");
+    assert_eq!(
+        run.entries("more").len(),
+        149,
+        "`more` read every page after the first: {:?}",
+        run.visited()
+    );
+
+    let names = stock(151);
+    let mut expected: Vec<String> = names.iter().map(|name| format!("item/{name}")).collect();
+    expected.sort();
+    let Some(run) = harness::invoke_with(
+        "stores",
+        "flow.long_walk",
+        &json!({ "names": names }),
+        &harness::environment(&provider),
+    ) else {
+        return;
+    };
+    run.succeeded();
+    let outputs = run.outputs();
+    let (keys, _) = walked(&outputs);
+    assert_eq!(
+        keys,
+        expected[..150],
+        "the budget allows 150 pages, and the walk reads exactly those: {outputs}"
+    );
+    assert_eq!(
+        outputs["walk_held"],
+        json!(151),
+        "…and leaves through its `else:` to the `count`, which sees the key the \
+         walk did not reach: {outputs}"
+    );
+    assert_eq!(
+        outputs["walk_cursor"],
+        expected[149].as_str(),
+        "the cursor is the last page's `next` — its own last key, so a walk \
+         resuming `after:` it starts at the first key this one never read: {outputs}"
+    );
+    let last = run.entries("more");
+    let last = last.last().expect("`more` ran");
+    assert_eq!(
+        last["stores"][0]["answer"]["next"],
+        expected[149].as_str(),
+        "the page the budget stopped at still answered a `next`: {last}"
+    );
+}
+
+/// A walk whose back-edge carries its guard and nothing else is stopped by the
+/// superstep ceiling once it takes more pages than the ceiling's allowance for
+/// a cycle no composition bound counts (grammar 7.4 clause 2, 11.4; PRD
+/// resolved q70).
+///
+/// `has(more.output.next)` is a CEL exit condition, which grammar 7.4 accepts
+/// and calls no termination proof: nothing in the composition says how many
+/// passes it takes, so the ceiling is sized from a fixed allowance per node of
+/// the cycle rather than from the walk. On the same 150 keys
+/// [`a_walk_with_a_budgeted_back_edge_reads_as_many_pages_as_it_declares`]
+/// walks to the end, this twin fails the run partway, naming the ceiling and
+/// the `max_iterations:` that would have declared the walk's length — which is
+/// what grammar 11.4 tells a walk longer than that to carry.
+#[test]
+fn a_walk_bounded_by_its_guard_alone_stops_at_the_superstep_ceiling() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(run) = harness::invoke_with(
+        "stores",
+        "flow.long_walk_unbudgeted",
+        &json!({ "names": stock(150) }),
+        &harness::environment(&provider),
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    let supersteps = run.trace().len();
+    assert!(
+        failure.contains(&format!("ceiling of {supersteps} supersteps"))
+            && failure.contains("max_iterations"),
+        "the run stops at the ceiling, which names the bound the walk lacked: {failure}"
+    );
+    let pages = run.entries("more").len();
+    assert!(
+        (1..149).contains(&pages),
+        "the walk was stopped partway, short of the 149 pages after the first it \
+         needed: {pages} — {:?}",
+        run.visited()
+    );
+    assert!(
+        run.entries("census").is_empty(),
+        "nothing after the walk ran: {:?}",
+        run.visited()
+    );
+}
+
 /// A model that **calls** a synthesized store tool reaches the same backend the
 /// store-op nodes do, with the arguments it supplied (grammar 11.5, PRD 5.8).
 ///

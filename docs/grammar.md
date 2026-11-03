@@ -4370,8 +4370,25 @@ Rules (PRD 5.8):
     [D114](#d114-a-vector-store-with-no-metadata_schema-derives-matches-with-no-metadata-field)
     makes a match's `metadata` on a store with no `M` (Decision
     [D154](#d154-a-kv-store-is-read-at-scale-a-page-at-a-time-and-a-pages-entries-are-there-when-its-node-asks)).
-  - `limit` keeps its range, 1..1000 **per page**; a walk has no bound of its
-    own.
+  - **A walk is a cycle, and §7.4 bounds it.** `limit` keeps its range,
+    1..1000, **per page**; how many pages a walk takes is its cycle's to say,
+    and this entry adds no bound of its own. A back-edge carrying the
+    `has(page.output.next)` guard and nothing else is clause 2's CEL exit
+    condition, which declares no number of passes — so the compiler's
+    superstep ceiling, the safety net beneath every run and not a bound of the
+    composition's (`docs/trace.md`), allows such a cycle about a hundred passes
+    through each of its nodes and fails a walk longer than that with
+    `SuperstepCeiling`, however near the partition's end it was. A walk that
+    may take more pages declares how many: `max_iterations:` on the back-edge
+    (clause 1, 1..1000 traversals), which the ceiling is then sized from. In
+    the usual shape — a first page, then a one-node cycle — a walk reads at
+    most the budget plus two pages: the first page, the one the cycle reads on
+    entry, and one per traversal; at 1000 keys a page, that is about a million
+    keys. A budget that runs out leaves through the `else:` exactly as a last
+    page does (§7.3 rules 4 and 5), so a walk it ends stops short of the
+    partition's end with its cursor channel holding the last `next` a page
+    answered — the `after:` a walk resuming from there takes — and a `count`
+    beside the walk is how the flow tells the two ends apart.
 
   `count` answers how many keys the partition holds under `prefix:` — the
   whole partition without one — and agrees with a walk under the same
@@ -11015,6 +11032,18 @@ and a flow's exit condition is `has(page.output.next)` rather than arithmetic
 on a length. Its absence on the last page is D110's case: the `writes:` of a
 cursor channel performs no write there, so the channel keeps the last cursor a
 page answered.
+
+**A walk's bound is its cycle's.** The ruling bounds a page, not a walk, and
+adds nothing more: a walk is a cycle, and §7.4 already says what bounds one. So
+a walk is exactly as bounded as its composition makes it — by its guard alone
+(clause 2), which declares no number of passes and which the superstep
+ceiling's fixed allowance therefore stops at about a hundred pages, or by
+`max_iterations:` on its back-edge (clause 1), which reads as many pages as it
+declares and sizes the ceiling to match — rather than by a walk-level bound a
+second mechanism would have to agree with. §11.4 tells a walk that may run long
+to carry a budget, because the alternative is a correct walk the safety net
+fails partway through, and a budget that runs out ends the walk through its
+`else:` like a last page, leaving the cursor where a later walk resumes.
 
 **Presence by a literal, D114's pattern one construct over.** Whether a page
 carries its values changes its derived output schema — the channel a name-based

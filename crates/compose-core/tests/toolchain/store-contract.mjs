@@ -652,6 +652,62 @@ async function bulkSeed(store, scopeKey, seeded) {
 }
 
 /**
+ * Take every row of `store` back off the server — or its file off the disk —
+ * and answer whether none is left.
+ *
+ * [`bulkSeed`]'s other half. Every store this runner names is run-unique, so
+ * no later run reads what this one left; but nothing deletes it either, and the
+ * server a developer points this suite at keeps it: a hundred thousand rows a
+ * run, per dialled arm, accumulating until the disk is full. So the walk hands
+ * its rows back when it is done, whether its cases passed or not. Only this
+ * run's store, by its run-unique name, because the server is shared with
+ * whatever else is pointed at it.
+ *
+ * The SQLite arm's file is removed rather than emptied: the store's own handle
+ * is still open on it, and an unlinked file is one nothing reaches again.
+ */
+async function forget(store) {
+  if (provider === "sqlite") {
+    const file = path.join(data, "stores", `${stores.encodeKey(store.name)}.sqlite`);
+    for (const left of [file, `${file}-journal`, `${file}.lock`]) {
+      fs.rmSync(left, { recursive: true, force: true });
+    }
+    return !fs.existsSync(file);
+  }
+  return await sweep("=", store.name);
+}
+
+/**
+ * Delete the server's rows of every store whose name stands in `relation` to
+ * `operand` — in every table a store keeps rows in, entries, ledger and
+ * version sequence alike — and answer whether none is left.
+ *
+ * MySQL's `REPEATABLE READ` default would have each `DELETE` take next-key
+ * locks over the range it scans and the gap past it, and that gap is between
+ * this run's stores and whatever another suite sharing the server is writing
+ * beside them. `READ COMMITTED` locks the rows deleted and nothing else, which
+ * is all a cleanup needs; Postgres takes no gap locks at any level.
+ */
+async function sweep(relation, operand) {
+  const admin = await openServer(process.env[URL_ENV]);
+  const placeholder = provider === "postgres" ? "$1" : "?";
+  try {
+    if (provider === "mysql") await rows(admin, "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED");
+    let left = 0;
+    for (const table of ["store_entries", "store_applied", "store_sequences"]) {
+      await rows(admin, `DELETE FROM ${table} WHERE store ${relation} ${placeholder}`, [operand]);
+      const [held] = await rows(admin, `SELECT COUNT(*) AS n FROM ${table} WHERE store ${relation} ${placeholder}`, [
+        operand,
+      ]);
+      left += Number(held?.n);
+    }
+    return left === 0;
+  } finally {
+    await admin.end().catch(() => undefined);
+  }
+}
+
+/**
  * How many keys the large walk seeds — on every arm, because PRD resolved
  * q70's verification is "a flow reads every key of a 100,000-key store page
  * by page on each arm and sees each key once". Reported, so the Rust side
@@ -663,13 +719,16 @@ answer.walk_keys = WALK_KEYS;
 /** The marks a seeded key's tail is drawn from: case, accents, CJK, astral. */
 const MIXED = ["a", "B", "z", "É", "é", "Ω", "中", "😀", "＀", "A b"];
 
-{
+/** The large walk's store, named outside its case so the `finally` can forget it. */
+const WALKED = kv("walk", "global");
+
+try {
   // **A walk of a large store, page by page.** Half the keys sit under `p/`
   // and half under `q/`, and every one carries a mark from [`MIXED`], so the
   // byte order the pages come back in is not the order the keys were written
   // in, and a page boundary falls between keys whose order a UTF-16 or a
   // case-folding comparison would answer differently.
-  const store = kv("walk", "global");
+  const store = WALKED;
   const run = ctx(execution("walk"));
   // Opened through the store first, so the rows go into this release's schema.
   answer.a_fresh_store_counts_nothing = (await stores.runStoreOp(store, "count", {}, run, node())).count === 0;
@@ -779,6 +838,14 @@ const MIXED = ["a", "B", "z", "É", "é", "Ω", "中", "😀", "＀", "A b"];
     answer.get_many_refusal = String(error?.message ?? error).replaceAll(store.address, "<store>");
   }
   answer.a_refused_get_many_files_no_record = run.storeRecords.length === before;
+} finally {
+  // A hundred thousand rows are given back however the walk went, and a
+  // cleanup that failed says so beside the cases rather than in place of them.
+  try {
+    answer.the_walk_gives_its_rows_back = await forget(WALKED);
+  } catch (error) {
+    answer.walk_cleanup_error = String(error?.message ?? error);
+  }
 }
 
 {
@@ -2010,6 +2077,19 @@ if (provider !== "sqlite") {
       (await get(store, "before", run)).value?.held === "first";
   } catch (error) {
     answer.redial_error = String(error?.message ?? error);
+  }
+}
+
+// **Every other row this run wrote**, on a server, for [`forget`]'s reason at
+// a smaller scale: a few hundred rows a run, one of them past 64 KiB, that no
+// later run reads and nothing else deletes. Every store this file names starts
+// with [`RUN`], which is hex after a letter and so holds no `LIKE` wildcard.
+// The SQLite arm's files are in the data directory its caller throws away.
+if (provider !== "sqlite") {
+  try {
+    answer.the_run_gives_its_rows_back = await sweep("LIKE", `${RUN}%`);
+  } catch (error) {
+    answer.run_cleanup_error = String(error?.message ?? error);
   }
 }
 

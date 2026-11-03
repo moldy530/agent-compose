@@ -677,6 +677,10 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "get_many_answers_a_key_asked_twice_twice",
     "get_many_of_no_keys_answers_no_entries",
     "a_refused_get_many_files_no_record",
+    // …and the walk hands its hundred thousand rows back when it is done — the
+    // server a developer points this suite at keeps whatever a run leaves, and
+    // a run-unique store nothing reads again is still a disk filling up.
+    "the_walk_gives_its_rows_back",
     // A keyset cursor: a write landing mid-walk moves no page still to come.
     "after_the_last_key_answers_an_empty_last_page",
     "a_write_mid_walk_moves_no_later_page",
@@ -774,6 +778,10 @@ const TRUE_WHEN_DIALLED: &[&str] = &[
     // the lost one had already committed.
     "a_lost_connection_is_redialled",
     "a_redialled_store_still_holds_what_it_wrote",
+    // A server keeps what a run leaves on it, so the run takes every row of its
+    // own run-unique stores back off it at the end (the large walk's hundred
+    // thousand go first, in that case's own `finally`: `TRUE_EVERYWHERE`).
+    "the_run_gives_its_rows_back",
 ];
 
 /// **A target that binds both dialled arms gets one module, and it compiles.**

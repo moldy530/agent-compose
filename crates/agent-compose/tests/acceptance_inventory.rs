@@ -565,6 +565,19 @@ const CODEGEN: &[Criterion] = &[
                 "a_run_that_reaches_the_superstep_ceiling_says_which_bound_was_missing",
                 Status::Live,
             ),
+            // …and both clauses on the cycle PRD resolved q70 makes ordinary: a
+            // walk of a `kv` store a page at a time. A budgeted back-edge reads
+            // as many pages as it declares, past the ceiling's allowance for a
+            // guard alone, and ends through its `else:` when the budget runs
+            // out; the same walk on its guard alone is stopped by the ceiling.
+            (
+                "a_walk_with_a_budgeted_back_edge_reads_as_many_pages_as_it_declares",
+                Status::Live,
+            ),
+            (
+                "a_walk_bounded_by_its_guard_alone_stops_at_the_superstep_ceiling",
+                Status::Live,
+            ),
         ],
     },
     Criterion {
