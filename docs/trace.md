@@ -1336,6 +1336,15 @@ op a composition written against this release performs, and every such record
 is a `"write"` with a `key`, which is what a reader that branches on `effect`
 already handles.
 
+**PRD resolved q69 changes nothing here, and says so because it could have.** A
+`kv` key's expiry is the store's, not the record's: a `ttl:` adds no field to an
+op's output (grammar §11.4), so §6's records carry nothing new, and a read of a
+key that has expired answers — and is recorded — exactly as a read of a key
+never written: a `get`'s `answer` is `{ found: false }`, a `list`'s `keys` omit
+it. Nor does the pruning of a settled execution's idempotency ledger touch a
+record: §6's `idempotencyKey` and `deduped` are what the write carried and found
+when it ran, and that run's trace is already written. `trace_version` stays `6`.
+
 ### 10.3 What requires a version bump
 
 `trace_version` MUST be incremented for any change that would make a reader

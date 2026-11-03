@@ -1995,8 +1995,12 @@ Stated by resolved q28, and restated here so a reader is not left to infer it:
   machine recovers every execution the one that died left open (§10). The
   exclusion is about the backend rather than about the format.
 * **journal compaction** — nothing is pruned. The file grows with the effects a
-  project has ever issued, exactly as the stores' idempotency ledger does, and
-  retention is deleting it.
+  project has ever issued, and retention is deleting it. The stores'
+  idempotency ledger no longer grows the same way: a keyed write's ledger row is
+  deleted when the execution that wrote it settles, because a settled execution
+  never resumes (PRD resolved q65, q69; `docs/grammar.md` §11.4) — which is a
+  prune the journal's own record of that settlement licenses, not a compaction
+  of the journal.
 
 And one this document states rather than defers, because it is a property of the
 backend v1 binds rather than a feature left out:

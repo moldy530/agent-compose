@@ -6,7 +6,8 @@ Two keys that may not appear together both appear. The pairs are not arbitrary
 — in each one, honouring both is impossible or one of them is inert:
 
 - `when:` and `else:` on one edge; `metadata_schema:` on a `blob` store, which
-  no `blob` op and no synthesized `blob` tool reads;
+  no `blob` op and no synthesized `blob` tool reads; `default_ttl:` on a
+  `vector` or `blob` store, which no op of either kind leaves a key to expire;
 - `node:` and `route_by:` on one `map`, which are the two dispatch forms;
 - a map-level `input:`/`writes:`/`detach:` on a `route_by:` map, where each
   belongs per route;
@@ -37,5 +38,6 @@ Drop one. The message names both keys and which construct they are on, and in
 most of these one of the two is the one you meant — the other arrived by
 copy-paste from a construct that does take it.
 
-Grammar: `docs/grammar.md` §6, §7.2, §8.3, §8.6, §11.1, §13.3, Decision D113.
+Grammar: `docs/grammar.md` §6, §7.2, §8.3, §8.6, §11.1, §13.3, Decisions D113,
+D153.
 Topics: `agent-compose docs stores`, `agent-compose docs maps`.
