@@ -70,7 +70,12 @@ import {
   openJournal,
   replayedFailure,
 } from "./journal.ts";
-import { holdRemotePause, registerParkedWork, registersHumanNode } from "./runtime.ts";
+import {
+  handsOutPlacedNodes,
+  holdRemotePause,
+  registerParkedWork,
+  registersHumanNode,
+} from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
 
 // ---------------------------------------------------------------------------
@@ -1185,6 +1190,10 @@ export function mountWorkerRoutes(app: FastifyInstance): void {
   // that could not be run rather than a window nobody notices.
   const timings = meshTimings();
   mounted = true;
+  // From here this process hands placed nodes to workers, so a settled
+  // execution's ledger prune asks again, as it starts, whether one is still
+  // being run under its keys (`./runtime.ts`, PRD resolved q69).
+  handsOutPlacedNodes();
 
   // Registered **before** `./serve.ts`'s own recovery hook, so the rows a dead
   // process left `dispatched` are ended before the replays that reach them start

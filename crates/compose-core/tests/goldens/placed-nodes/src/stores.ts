@@ -1149,14 +1149,20 @@ const PRUNING = new Set<Promise<void>>();
 
 /**
  * The settled executions whose prune is waiting on their detached deliveries,
- * by execution id — each the identity the prune will be handed.
+ * by execution id — each the prune it will start ([`Deferred`]).
  *
  * Here rather than only in a promise chain so [`drainStores`] can find them:
  * a command on its way out — a `run` exiting, a `serve` stopped — cuts those
  * deliveries off, and a prune chained behind a delivery the exit kills would
  * never run.
  */
-const DEFERRED = new Map<string, runtime.ExecutionIdentity>();
+const DEFERRED = new Map<string, Deferred>();
+
+/** One prune [`DEFERRED`] holds: what [`startPrune`] will be handed. */
+interface Deferred {
+  readonly execution: runtime.ExecutionIdentity;
+  readonly held: (() => Promise<boolean>) | undefined;
+}
 
 /**
  * The settled executions whose prune [`drainStores`] started **ahead** of
@@ -1182,6 +1188,16 @@ const CUT_OFF = new Set<string>();
  * settles. A row of an execution the journal still holds open is never
  * touched — the prefix is this execution's alone — so a resume still writes
  * nothing twice (PRD resolved q29).
+ *
+ * **Nor is one a worker may still be writing under.** A placed node's runner
+ * whose dispatch the hub superseded goes on running on its worker, and writes
+ * a dialled store under the same keys as the retry that replaced it, so its
+ * late write is answered from the retry's row for as long as the row is there
+ * (PRD resolved q63). The runtime asks the journal before it calls this and
+ * hands no such execution over at all (`runtime.settlesLedgers`); `held`,
+ * where it is given, is that question asked again as the prune starts — for
+ * an execution a delivery still in flight may have handed a placed node of to
+ * a worker meanwhile — and a `true` from it leaves every row where it is.
  *
  * **Every store, not the ones this process wrote** ([`BOUND`]). A `kv` or
  * `vector` file's ledger and a dialled store's are keyed by the idempotency
@@ -1222,28 +1238,33 @@ const CUT_OFF = new Set<string>();
 export function pruneLedger(
   execution: runtime.ExecutionIdentity,
   after: Promise<void> | undefined,
+  held: (() => Promise<boolean>) | undefined,
 ): void {
+  const deferred: Deferred = { execution, held };
   if (after === undefined) {
-    startPrune(execution);
+    startPrune(deferred);
     return;
   }
-  DEFERRED.set(execution.id, execution);
+  DEFERRED.set(execution.id, deferred);
   const resume = (): void => {
     // Gone where [`drainStores`] has already started it, ahead of the
     // deliveries its exit cut off.
-    if (DEFERRED.get(execution.id) !== execution) return;
+    if (DEFERRED.get(execution.id) !== deferred) return;
     DEFERRED.delete(execution.id);
-    startPrune(execution);
+    startPrune(deferred);
   };
   void after.then(resume, resume);
 }
 
 /** Start one settled execution's prune, held in [`PRUNING`] until it ends. */
-function startPrune(execution: runtime.ExecutionIdentity): void {
+function startPrune({ execution, held }: Deferred): void {
   const prefix = `${execution.id}/`;
-  const pruning = Promise.all(
-    [...BOUND.values()].map((store) => pruneStore(store, execution, prefix)),
-  ).then(() => undefined);
+  const pruning = (async () => {
+    // A worker may still be running a placed node of it, writing under these
+    // keys (see [`pruneLedger`]): the rows stay, and are what answer it.
+    if (held !== undefined && (await held().catch(() => true))) return;
+    await Promise.all([...BOUND.values()].map((store) => pruneStore(store, execution, prefix)));
+  })();
   PRUNING.add(pruning);
   void pruning.finally(() => PRUNING.delete(pruning));
 }
@@ -3212,10 +3233,10 @@ class RemoteKv {
  */
 export async function drainStores(): Promise<void> {
   for (;;) {
-    for (const [id, execution] of DEFERRED) {
+    for (const [id, deferred] of DEFERRED) {
       DEFERRED.delete(id);
       CUT_OFF.add(id);
-      startPrune(execution);
+      startPrune(deferred);
     }
     const running = [...PRUNING, ...SWEEPING];
     if (running.length === 0) return;

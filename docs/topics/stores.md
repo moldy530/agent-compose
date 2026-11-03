@@ -469,8 +469,21 @@ then on rather than making one its ledger can no longer answer. A process
 killed outright (`SIGKILL`, a crash) has no way out to prune on, and the rows of
 what had settled there stay, answering nothing. An execution that has not
 settled — parked at a `human` pause, stopped by a divergence, or left open by a
-crash — keeps every row, so its resume still writes nothing twice. The ledger
-therefore holds the open executions' rows, not history.
+crash — keeps every row, so its resume still writes nothing twice. So does an
+execution a worker may still be running a placed node of. When the hub
+supersedes a dispatch — the worker's session went quiet past the liveness
+window, the artifact it ran was replaced, the node's deadline ran out — the
+attempt is over, but the worker's node runner is not: it goes on, writing
+`postgres` and `mysql` stores under the same keys as the retry that replaced
+it, and its late writes are answered from the retry's rows rather than applied
+a second time only while those rows are there. Nothing tells the hub when such
+a runner stops, so an execution with a dispatch a worker was handed and no
+result ended is never pruned — its rows stay, as every execution's did before
+the ledger was pruned at all. A `serve` asks the same question again when a
+prune it held back for a detached delivery starts, since that delivery may
+have handed a node out in the meantime. The ledger therefore holds the open
+executions' rows, and those of the executions a worker may still be writing
+for, not history.
 
 ## Writes inside a `map`
 

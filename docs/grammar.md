@@ -11004,7 +11004,9 @@ and its detached deliveries have finished, the ledger rows under its
 `<execution.id>/` prefix are deleted from every store the composition binds,
 which is every partition its keyed writes reached from any process — behind
 the outcome, which never waits for it, and before a command exits, a stopped
-`serve` included (§4.4, §8.8, §11.1, §11.4, §11.5, PRD resolved q69).
+`serve` included — unless a worker may still be running one of its placed
+nodes: an execution with a dispatch a worker was handed and no result ended
+keeps every row (§4.4, §8.8, §11.1, §11.4, §11.5, PRD resolved q69).
 
 **Rationale**: a store several runs share has two growth problems a `kv` store
 had no answer to. The composition's own keys — a claim, a cache entry, a
@@ -11109,6 +11111,31 @@ is pruned there. A resume of an unsettled execution finds every row it wrote,
 so it still writes nothing twice (PRD resolved q29). The ledger is still the
 server's on a dialled backend — D149's clause stands; this prunes it — and a
 child execution's rows are its own prefix, so they go when the child settles.
+
+**Not under a runner the hub let go of.** "Everything still writing under that
+id" has one member no process of the hub's can wait for: a placed node's
+runner whose dispatch the hub superseded (`docs/distributed.md` §3.4, §6.3).
+A supersession — the session gone quiet past the liveness window, the artifact
+replaced, the node's deadline spent, the issuing hub replaced — ends the
+attempt and not the runner: the worker does not stop a runner its session
+lost, and the runner writes a dialled store directly (§14.1 rule 5) under the
+§9.4 key the retry that replaced it wrote under too. PRD resolved q63's "applies
+once even when the two attempts are two processes" is that late write being
+answered from the retry's row, which a prune at settlement would take away —
+and the hub learns nothing when the runner stops, since a late result is
+refused (`409`) and a worker that never comes back sends none. So the
+premise "a settled execution never resumes, so its rows answer nothing" is
+read as narrowly as it is true: an execution with a dispatch a session was
+handed and no result settled is not pruned, which the journal's dispatch rows
+answer at settlement — the one place dispatch state is held
+(`docs/distributed.md` §8 rule 3). A dispatch no worker took had no runner, and one a result
+settled had one that has finished, the result being a runner's last line, so
+neither holds anything back. A detached delivery still in flight at settlement
+can reach a placed node afterwards, so a process that hands placed nodes out —
+a `serve` whose target places something — asks again as the prune it held
+back starts. What this costs is the rows of those executions, kept as every
+execution's were before this decision: proportional to the supersessions a
+deployment sees rather than to its history.
 
 **What it does not touch.** `scope:` is orthogonal
 ([D35](#d35-scope-is-required-on-store-definitions)): an execution-scoped key may

@@ -690,6 +690,22 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "a_stopped_serve_prunes_what_a_running_delivery_held_back",
     "a_delivery_cut_off_by_a_stopped_serve_is_refused_a_keyed_write",
     "an_open_execution_still_writes_while_a_serve_stops",
+    // …and nothing is pruned under a placed node a worker may still be
+    // running: a supersession ends the attempt and not the worker's runner,
+    // which writes under the same keys as the retry that replaced it, so an
+    // execution whose dispatch a worker was handed and no result ended keeps
+    // every row, and the runner's late write after settlement is answered from
+    // one. A dispatch a result settled, or one no worker took, holds nothing.
+    "a_superseded_placed_dispatch_keeps_its_executions_ledger_rows",
+    "a_superseded_runners_late_write_after_settlement_still_dedupes",
+    "a_placed_dispatch_still_held_at_settlement_keeps_its_executions_ledger_rows",
+    "a_placed_dispatch_a_result_settled_does_not_hold_the_prune",
+    "a_placed_dispatch_no_worker_took_does_not_hold_the_prune",
+    // …and in a process that hands placed nodes out, the prune a delivery held
+    // back asks again as it starts, so a node that delivery handed to a worker
+    // after the settlement holds it the same way.
+    "a_node_a_delivery_hands_out_after_settlement_holds_the_prune_when_superseded",
+    "a_node_a_delivery_hands_out_after_settlement_is_pruned_behind_its_result",
 ];
 
 /// The cases a backend with a **socket** must answer `true`, on top of those.
@@ -733,6 +749,17 @@ const TRUE_WHEN_DIALLED: &[&str] = &[
     // keys are alive — the row holds the server's instant with this process's
     // clock ten days off.
     "expiry_is_computed_by_the_servers_clock",
+    // …and every read judges that row by the same clock: with this process's
+    // clock ten days ahead or behind, a `get` and a `list` find the key while
+    // the server's clock holds it alive and miss it once that clock (moved by
+    // the store offset) is past its expiry.
+    "a_dialled_read_finds_a_key_the_servers_clock_holds_alive",
+    "a_dialled_read_misses_a_key_the_servers_clock_holds_expired",
+    // …and so does the store-wide sweep a connection's first op starts: a
+    // process whose clock runs ten days fast takes no key the server's clock
+    // holds alive, and one ten days slow still takes a key it holds expired.
+    "a_store_wide_sweep_keeps_a_key_the_servers_clock_holds_alive",
+    "a_store_wide_sweep_takes_a_key_the_servers_clock_holds_expired",
     // PRD resolved q69 (c): the two halves of the cleanup schedule — a write's
     // sweep of its partition and the store-wide sweep a connection's first op
     // starts — run at once in two processes over one backlog without either

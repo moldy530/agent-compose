@@ -1937,6 +1937,30 @@ if (provider !== "sqlite") {
   answer.a_malformed_clock_offset_is_refused_by_name = (refused ?? "").includes(CLOCK);
 }
 
+/** Ten days: how far off this process's own clock is put by [`skewed`]. */
+const TEN_DAYS = 10 * 24 * HOUR;
+
+/**
+ * Run `work` with **this process's** clock — `Date.now` itself, not the store
+ * clock [`later`] moves — `shift` milliseconds off, and put it back once `work`
+ * has finished, every await inside it included.
+ */
+const skewed = async (shift, work) => {
+  const realNow = Date.now;
+  Date.now = () => realNow() + shift;
+  try {
+    return await work();
+  } finally {
+    Date.now = realNow;
+  }
+};
+
+/** The server's own clock in epoch milliseconds, spelled here rather than borrowed from the arm. */
+const SERVER_NOW =
+  provider === "postgres"
+    ? "SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint AS server_now"
+    : "SELECT CAST(FLOOR(UNIX_TIMESTAMP(NOW(3)) * 1000) AS SIGNED) AS server_now";
+
 if (provider !== "sqlite") {
   // **A dialled store's expiry is the server's clock's**, so two writers whose
   // own clocks disagree still agree about which keys are alive. This process's
@@ -1945,14 +1969,9 @@ if (provider !== "sqlite") {
   // server's clock.
   const store = kv("server_clock", "global");
   const run = ctx(execution("server_clock"));
-  const realNow = Date.now;
-  Date.now = () => realNow() + 10 * 24 * HOUR;
-  let written;
-  try {
-    written = await write(store, "set", { key: "k", value: { n: 1 }, ttl: HOUR }, run);
-  } finally {
-    Date.now = realNow;
-  }
+  const written = await skewed(TEN_DAYS, () =>
+    write(store, "set", { key: "k", value: { n: 1 }, ttl: HOUR }, run),
+  );
   // The server's own clock, spelled here rather than borrowed from the arm, so
   // the case does not take the arm's word for what that clock is. Epoch time
   // is zone-free on Postgres; MySQL's `UNIX_TIMESTAMP()` with no argument is
@@ -1966,7 +1985,110 @@ if (provider !== "sqlite") {
   const ahead = Number(held?.expires_at) - Number(held?.server_now);
   answer.expiry_is_computed_by_the_servers_clock =
     written?.applied === true && ahead > HOUR - MINUTE && ahead < HOUR + MINUTE;
-  answer.server_clock_trace = { ahead };
+
+  // **…and so is every read's.** A `get` and a `list` judge that row by the
+  // server's clock too, with this process's ten days ahead and ten days behind:
+  // the key is found while the server's clock holds it alive, and is absent
+  // once the store clock is moved past its expiry. A read dated by this
+  // process instead would miss it while it is alive (ahead) and still find it
+  // once it has expired (behind) — and would disagree with the `if: absent` a
+  // writer on the same server is judged by.
+  const reads = {};
+  for (const [label, shift] of [
+    ["ahead", TEN_DAYS],
+    ["behind", -TEN_DAYS],
+  ]) {
+    for (const [moment, offset] of [
+      ["alive", 0],
+      ["expired", HOUR + MINUTE],
+    ]) {
+      reads[`${label}_${moment}`] = await skewed(shift, () =>
+        later(offset, async () => ({
+          got: await get(store, "k", run),
+          listed: (await list(store, run)).keys,
+        })),
+      );
+    }
+  }
+  const found = (read) => read.got.found === true && read.got.value?.n === 1 && same(read.listed, ["k"]);
+  const missed = (read) => same(read.got, { found: false }) && same(read.listed, []);
+  answer.a_dialled_read_finds_a_key_the_servers_clock_holds_alive =
+    found(reads.ahead_alive) && found(reads.behind_alive);
+  answer.a_dialled_read_misses_a_key_the_servers_clock_holds_expired =
+    missed(reads.ahead_expired) && missed(reads.behind_expired);
+  answer.server_clock_trace = { ahead, reads };
+}
+
+if (provider !== "sqlite") {
+  // **…and so is a store-wide sweep's.** What the sweep a connection's first op
+  // on a store starts removes is what had expired by the server's clock at
+  // that op, whatever this process's clock says — so a writer's live key is
+  // never taken by a process whose clock runs fast, and an expired one is not
+  // left by a process whose clock runs slow. Two stores, each laid down
+  // straight into storage (its partition's sequence row with it, which a sweep
+  // batch locks), so this process's first op on each is a `get` that starts
+  // its sweep; each is then swept to the end with this process's clock ten
+  // days off. Ahead: a key alive on the server's clock stays, and one expired
+  // on both clocks goes, which is the proof that the sweep ran. Behind, with
+  // the store clock moved past a key's expiry: that key goes, and one alive on
+  // both clocks stays.
+  const fast = kv("server_clock_sweep_fast", "global");
+  const slow = kv("server_clock_sweep_slow", "global");
+  const key = provider === "postgres" ? '"key"' : "`key`";
+  try {
+    const serverNow = Number((await storage(SERVER_NOW, []))[0]?.server_now);
+    const lay = async (store, rows) => {
+      await storage("INSERT INTO store_sequences (store, scope_key, last) VALUES (?, ?, ?)", [
+        store.name,
+        "global",
+        rows.length,
+      ]);
+      await storage(
+        `INSERT INTO store_entries (store, scope_key, ${key}, value, version, expires_at) VALUES ` +
+          rows.map(() => "(?, ?, ?, ?, ?, ?)").join(", "),
+        rows.flatMap(([name, expiresAt], index) => [store.name, "global", name, '{"n":1}', index + 1, expiresAt]),
+      );
+    };
+    await lay(fast, [
+      ["alive", serverNow + HOUR],
+      ["expired", serverNow - HOUR],
+    ]);
+    await lay(slow, [
+      ["due", serverNow + HOUR],
+      ["far", serverNow + 2 * TEN_DAYS],
+    ]);
+    const run = ctx(execution("server_clock_sweep"));
+    // `drainStores` is the wait a command makes for its sweeps on its way out,
+    // made inside the skew so the instant the sweep reads is read under it.
+    await skewed(TEN_DAYS, async () => {
+      await get(fast, "probe", run);
+      await stores.drainStores();
+    });
+    await skewed(-TEN_DAYS, () =>
+      later(HOUR + MINUTE, async () => {
+        await get(slow, "probe", run);
+        await stores.drainStores();
+      }),
+    );
+    const kept = async (store) =>
+      (await storage(`SELECT ${key} AS k FROM store_entries WHERE store = ? ORDER BY ${key}`, [store.name])).map(
+        (row) => String(row.k),
+      );
+    const fastKept = await kept(fast);
+    const slowKept = await kept(slow);
+    answer.a_store_wide_sweep_keeps_a_key_the_servers_clock_holds_alive = same(fastKept, ["alive"]);
+    answer.a_store_wide_sweep_takes_a_key_the_servers_clock_holds_expired = same(slowKept, ["far"]);
+    answer.server_clock_sweep_trace = { fastKept, slowKept };
+  } catch (error) {
+    answer.server_clock_sweep_error = String(error?.message ?? error);
+  } finally {
+    // This run's rows, and only them: the server is shared.
+    for (const store of [fast, slow]) {
+      for (const table of ["store_entries", "store_applied", "store_sequences"]) {
+        await storage(`DELETE FROM ${table} WHERE store = ?`, [store.name]).catch(() => undefined);
+      }
+    }
+  }
 }
 
 // --- Ledger retention (PRD resolved q69) --------------------------------------
@@ -2441,6 +2563,162 @@ if (provider !== "sqlite") {
     delete process.env[SILENT_URL_ENV];
     for (const socket of sockets) socket.destroy();
     await new Promise((resolve) => listener.close(resolve));
+  }
+}
+
+// --- A placed node a worker may still be running (PRD resolved q69, q63) ------
+//
+// The hub superseding a placed node's dispatch — the session holding it gone
+// quiet past the liveness window, the artifact it was issued under replaced,
+// its node's deadline spent — ends the *attempt*, not the worker's node runner
+// (`docs/distributed.md` §6.3): the runner goes on, writing a dialled store
+// directly under the same grammar 9.4 keys as the retry that replaced it, and
+// its late write is answered from the retry's ledger row (PRD resolved q63) for
+// exactly as long as that row is there. So a settlement leaves every row of an
+// execution a worker was handed a node of that no result has ended. Driven
+// through the hub's own dispatch rows in the journal — parked, claimed by a
+// session, then superseded, still held, or settled by a result — and the
+// runtime's own settle.
+
+/**
+ * Lay down one placed dispatch of `id` at `wait` and take it as far as `end`:
+ * `parked` (no worker took it), `superseded` before any worker took it
+ * (`dropped`), or claimed by a session and then left `held`, `superseded` or
+ * `settled` by a result.
+ */
+const placedDispatch = async (handle, id, wait, end) => {
+  const row = await handle.park({
+    execution: id,
+    wait,
+    id: `dsp_${id}_${wait.replaceAll("/", "_")}`,
+    placement: "laptop",
+    node: "flow.probe.count",
+    site: "count",
+    inputs: {},
+    parkedAt: new Date().toISOString(),
+  });
+  if (end === "dropped") {
+    await handle.supersedeDispatch(row.id, "the hub stopped waiting for this dispatch: the node execution ended");
+    return;
+  }
+  if (end === "parked") return;
+  await handle.claimDispatch(row.id, `ses_${id}`);
+  if (end === "superseded") {
+    await handle.supersedeDispatch(row.id, "the session holding it stopped making requests");
+  } else if (end === "settled") {
+    await handle.settleDispatch(row.id, { kind: "value", value: {} });
+  }
+};
+
+{
+  const store = kv("ledger_placed_runner", "global", URL_ENV, z.object({ count: z.number().int() }).strict());
+  stores.bindsStores([store]);
+  const handle = await journal.openJournal();
+  const bump = (id) => write(store, "incr", { key: id, field: "count" }, ctx(id), `${id}/count/0`);
+  const counted = async (id) => (await get(store, id, ctx(execution("ledger_placed_runner_read")))).value?.count;
+  const left = {};
+  try {
+    // The finding's own sequence: the first worker's dispatch is superseded,
+    // the retry's — a second dispatch — lands the `incr` and is settled by its
+    // result, the execution settles, and then the first worker's runner, still
+    // going, issues the same `incr` under the same key.
+    const superseded = execution("ledger_runner_superseded");
+    await begin_(superseded);
+    await placedDispatch(handle, superseded, "count/0", "superseded");
+    await placedDispatch(handle, superseded, "count/1", "settled");
+    const retried = await bump(superseded);
+    await settle(superseded);
+    left.superseded = await ledgerRows(store, `${superseded}/`);
+    const late = await bump(superseded);
+    answer.a_superseded_placed_dispatch_keeps_its_executions_ledger_rows = left.superseded === 1;
+    answer.a_superseded_runners_late_write_after_settlement_still_dedupes =
+      retried.applied === true &&
+      retried.deduped === false &&
+      late.deduped === true &&
+      (await counted(superseded)) === 1;
+
+    // A dispatch a session still holds as its execution settles is a runner
+    // the hub has not ended at all — the execution failing around a placed
+    // node that is still running, its supersession not yet written.
+    const held = execution("ledger_runner_held");
+    await begin_(held);
+    await placedDispatch(handle, held, "count/0", "held");
+    await bump(held);
+    await settle(held, new Error("another branch failed"));
+    left.held = await ledgerRows(store, `${held}/`);
+    answer.a_placed_dispatch_still_held_at_settlement_keeps_its_executions_ledger_rows = left.held === 1;
+
+    // …while a dispatch a result settled had a runner that has finished, and
+    // one no worker took had none: neither holds anything back.
+    const settledByResult = execution("ledger_runner_settled");
+    await begin_(settledByResult);
+    await placedDispatch(handle, settledByResult, "count/0", "settled");
+    await bump(settledByResult);
+    await settle(settledByResult);
+    left.settled = await ledgerRows(store, `${settledByResult}/`);
+    const untaken = execution("ledger_runner_untaken");
+    await begin_(untaken);
+    await placedDispatch(handle, untaken, "count/0", "dropped");
+    await placedDispatch(handle, untaken, "count/1", "parked");
+    await bump(untaken);
+    await settle(untaken);
+    left.untaken = await ledgerRows(store, `${untaken}/`);
+    answer.a_placed_dispatch_a_result_settled_does_not_hold_the_prune = left.settled === 0;
+    answer.a_placed_dispatch_no_worker_took_does_not_hold_the_prune = left.untaken === 0;
+    answer.ledger_placed_runner_trace = { left, retried, late };
+  } catch (error) {
+    answer.ledger_placed_runner_error = String(error?.stack ?? error);
+  }
+}
+
+{
+  // **…and in a hub, a delivery still in flight at settlement can hand a node
+  // out afterwards**: a detached `map` delivery outlives its run (grammar 8.6
+  // rule 7) and may reach a placed component, so a process that hands placed
+  // nodes to workers asks the journal again as the prune it was holding back
+  // starts. Two executions, each settling under a delivery that then hands a
+  // node of it to a worker: one dispatch is superseded and its execution keeps
+  // its rows; the other is settled by its result and its rows go — which is
+  // also the proof that both deferred prunes ran.
+  const store = kv("ledger_handed_out", "global", URL_ENV, z.object({ count: z.number().int() }).strict());
+  stores.bindsStores([store]);
+  const handle = await journal.openJournal();
+  const bump = (id) => write(store, "incr", { key: id, field: "count" }, ctx(id), `${id}/fan/0#agent/0/count/0`);
+  // What `./mesh.ts` marks as it mounts the worker routes of a `serve`.
+  runtime.handsOutPlacedNodes();
+  const ends = {
+    [execution("ledger_handed_superseded")]: "superseded",
+    [execution("ledger_handed_settled")]: "settled",
+  };
+  const { open: handOut, opened: handing } = gate();
+  const handed = [];
+  try {
+    for (const [id, end] of Object.entries(ends)) {
+      await begin_(id);
+      await dispatchDetached(id, async () => {
+        await handing;
+        await placedDispatch(handle, id, "fan/0/count/0", end);
+        handed.push(await bump(id));
+        return { output: {} };
+      });
+      await settle(id);
+    }
+    handOut();
+    for (const id of Object.keys(ends)) await runtime.settleDetached(id);
+    const [superseded, settledByResult] = Object.keys(ends);
+    let gone = await ledgerRows(store, `${settledByResult}/`);
+    for (let polls = 0; gone !== 0 && polls < 50; polls += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      gone = await ledgerRows(store, `${settledByResult}/`);
+    }
+    await stores.ledgerPrunesSettled();
+    const kept = await ledgerRows(store, `${superseded}/`);
+    answer.a_node_a_delivery_hands_out_after_settlement_holds_the_prune_when_superseded =
+      handed.length === 2 && handed.every((written) => written.applied === true) && kept === 1;
+    answer.a_node_a_delivery_hands_out_after_settlement_is_pruned_behind_its_result = gone === 0;
+    answer.ledger_handed_out_trace = { kept, gone, handed };
+  } catch (error) {
+    answer.ledger_handed_out_error = String(error?.stack ?? error);
   }
 }
 
