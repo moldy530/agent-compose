@@ -907,6 +907,21 @@ impl Walk<'_> {
                             "a node's output object is `{id}.output.<field>`, and it is readable only from an edge guard and from `map.over` (grammar 4.1, Decision D42)"
                         ),
                     ),
+                    // The two members `execution` carries at one site only:
+                    // how the instance ended, which exists inside the node that
+                    // runs after it has and nowhere before (grammar 4.1, 7.9,
+                    // Decision D159). Named rather than suggested away, because
+                    // the spelling is right and the site is what is wrong.
+                    Origin::Execution if field == "outcome" || field == "error" => (
+                        DiagnosticCode::OutcomeOutsideFinally,
+                        format!(
+                            "`{spelling}` is readable only inside its flow's `finally:` node, and this is {}",
+                            self.scope.surface
+                        ),
+                        format!(
+                            "`execution.{field}` says how the instance ended, so it exists in the one node that runs once it has — the node a flow's `finally:` names — and in no edge guard or other node, which all run before the end: move the read into the finally node, or route on the node output or channel that decided it (grammar 4.1, 7.9, Decision D159)"
+                        ),
+                    ),
                     origin => (
                         DiagnosticCode::UnknownField,
                         format!("`{spelling}` names no field of {}", describe(origin)),

@@ -1,0 +1,22 @@
+# rule: no edge routes to a flow's `finally:` node (grammar 7.9, Decision D159)
+# code: routed-finally
+# message: the edge `work` → `cleanup` of `flow.f` routes to `cleanup`, which is the flow's `finally:` node
+# at: main.yml:21:7
+# label: main.yml:22:12 `finally:` names it here
+# help: a finally node is outside routing: the instance ending is what runs it, once, whatever the outcome — so nothing routes to it, it routes to nothing, and it needs no edge to be reachable (grammar 7.8 clause 4). Delete this, and route the branch to `end` where it is done (grammar 7.9, Decision D159)
+#
+# The finally node is outside routing, so the edge into it is the one mistake,
+# and it needs no edge out: grammar 7.6.3 rule 1 does not apply to it.
+version: "0.1"
+flow.f:
+  outputs: {}
+  nodes:
+    work:
+      exec: { command: "true" }
+    cleanup:
+      exec: { command: "true" }
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+    - { from: work, to: cleanup }
+  finally: cleanup

@@ -1,0 +1,17 @@
+# rule: `execution.error` is read only inside the flow's `finally:` node, `has()` included (grammar 4.1, 7.9, Decision D159)
+# code: outcome-outside-finally
+# message: `execution.error` is readable only inside its flow's `finally:` node, and this is the `input:` binding of node `work`
+# at: main.yml:14:24
+# help: `execution.error` says how the instance ended, so it exists in the one node that runs once it has — the node a flow's `finally:` names — and in no edge guard or other node, which all run before the end: move the read into the finally node, or route on the node output or channel that decided it (grammar 4.1, 7.9, Decision D159)
+#
+# A flow with no `finally:` at all has no node where the read is legal.
+version: "0.1"
+flow.f:
+  outputs: {}
+  nodes:
+    work:
+      exec: { command: "true" }
+      input: { failed: "has(execution.error)" }
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }

@@ -37,6 +37,11 @@
 //!    that reads that output evaluates false and a node whose edges are all
 //!    guarded has a pass on which none is taken (rule 3, Decision D97).
 //!
+//! A flow's **`finally:` node** is asked neither: it runs once when its instance
+//! ends rather than on a branch, so there is no branch for it to retire, and
+//! every edge naming it is refused on its own account (grammar 7.9, Decision
+//! D159).
+//!
 //! Rule 3 is stated over the node's **own** `on_error:` key, which is where
 //! grammar 7.6.3 and 9.2 both state it. The chain of grammar 9.3 can also
 //! deliver `skip` from `defaults:` or from an instantiating `flow:` node's
@@ -57,6 +62,13 @@ use super::{Ctx, FlowCx, guards};
 /// Check every node of one flow.
 pub(crate) fn check<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>) {
     for at in 0..graph.nodes().len() {
+        // The `finally:` node is exempt from both rules, and it is the one node
+        // that is: it is not on a branch, so it has no branch to retire, and an
+        // edge leaving it is a mistake of its own (grammar 7.6.3, 7.9, Decision
+        // D159, and see [`finally`](super::finally)).
+        if graph.finally() == Some(at) {
+            continue;
+        }
         if exits(ctx, cx, graph, at) {
             exhaustive(ctx, cx, graph, at);
         }

@@ -1,0 +1,26 @@
+# rule: a flow's `finally:` node is never a `human` node (grammar 7.9, 8.7, Decision D159)
+# code: finally-interrupt
+# message: `ask`, the `finally:` node of `flow.f`, is a `human` node
+# at: main.yml:26:12
+# label: main.yml:16:5 the `human` node is declared here
+# help: a finally node runs once when its instance ends, and a step that must always finish cannot park on a question: it may be no `human` node and reach none — through a `flow:` node, a `map`'s dispatch targets, or the `flow.*` tools of an agent it calls. Take the pause out of what it runs (grammar 7.9, 8.7, 7.7, Decision D159)
+#
+# A step that must always finish cannot park on a question: the `finally:`
+# value is where the diagnostic points, and the label is the node it names.
+version: "0.1"
+flow.f:
+  outputs: {}
+  nodes:
+    work:
+      exec: { command: "true" }
+    ask:
+      human:
+        input:
+          note: { type: string }
+        output:
+          ok: { type: boolean }
+      input: { note: "'done'" }
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: ask

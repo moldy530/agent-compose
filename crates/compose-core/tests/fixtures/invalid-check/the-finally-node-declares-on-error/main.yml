@@ -1,0 +1,24 @@
+# rule: a flow's `finally:` node declares no `on_error:` - its failure is `finally_error` and nothing else (grammar 7.9, 9.2, Decision D159)
+# code: routed-finally
+# message: `cleanup`, the `finally:` node of `flow.f`, declares `on_error:`
+# at: main.yml:20:17
+# label: main.yml:24:12 `finally:` names it here
+# help: a finally node's failure has one meaning: once its own `retry:` and `timeout:` are spent, the error is recorded as `finally_error` on the execution's record and the instance's outcome stays what it was — so no strategy can apply to it, and `skip` or `fallback` would route out of a node that routes nowhere. Delete the key (grammar 7.9, 9.2, Decision D159)
+#
+# Its own `retry:` and `timeout:` are legal and stay: grammar 9.3's chain
+# applies to it like any node, and only the strategy has nothing to decide.
+version: "0.1"
+flow.f:
+  outputs: {}
+  nodes:
+    work:
+      exec: { command: "true" }
+    cleanup:
+      exec: { command: "true" }
+      retry: { max: 2, backoff: 1s }
+      timeout: 30s
+      on_error: skip
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: cleanup

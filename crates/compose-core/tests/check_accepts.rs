@@ -2913,3 +2913,87 @@ flow.main:
 "#,
     );
 }
+
+/// A flow's `finally:` node, of every kind that may be one, reading the two
+/// fields only it may read (grammar 4.1, 7.9, Decision D159, PRD resolved q76).
+///
+/// The accepting half of `routed-finally`, `finally-interrupt` and
+/// `outcome-outside-finally`: the node has no edge in or out and is reachable
+/// anyway (grammar 7.8 clause 4), it takes its own `retry:` and `timeout:`
+/// (grammar 9.3), `execution.outcome` compares against its enum and
+/// `has(execution.error)` asks before `execution.error` is read. A `flow:`
+/// finally node whose subflow has a finally of its own nests; a `map` finally
+/// node fans out over a channel, the one kind of source it can have; and a
+/// `defaults:` `on_error:` reaching the finally node from level 3 is no error,
+/// because it is written for every node and applied to no finally node.
+#[test]
+fn a_finally_node_of_every_kind_reads_how_its_instance_ended() {
+    accepts(
+        "finally-node",
+        r#"
+defaults:
+  on_error: skip
+state:
+  notes:
+    type: array
+    max_items: 4
+    items: { type: string }
+    default: []
+agent.closer:
+  model: model.m
+  prompt: Close out the run you are told about.
+  output:
+    closed: { type: boolean }
+flow.inner:
+  outputs: {}
+  nodes:
+    step:
+      exec: { command: "true" }
+      on_error: fail
+    inner_cleanup:
+      exec: { command: "true" }
+      input: { outcome: "execution.outcome" }
+  edges:
+    - { from: start, to: step }
+    - { from: step, to: end }
+  finally: inner_cleanup
+flow.by_agent:
+  outputs: {}
+  nodes:
+    work: { exec: { command: "true" } }
+    close_out:
+      agent: agent.closer
+      input: "execution.outcome == 'failed' && has(execution.error) ? execution.error : execution.outcome"
+      retry: { max: 2, backoff: 1s }
+      timeout: 30s
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: close_out
+flow.by_flow:
+  outputs: {}
+  nodes:
+    work: { exec: { command: "true" } }
+    wrap_up:
+      flow: flow.inner
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: wrap_up
+flow.by_map:
+  outputs: {}
+  nodes:
+    work: { exec: { command: "true" } }
+    close_each:
+      map:
+        over: "state.notes"
+        node: agent.closer
+        max_concurrency: 2
+        input: "item + ': ' + execution.outcome"
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: close_each
+"#,
+    );
+}
