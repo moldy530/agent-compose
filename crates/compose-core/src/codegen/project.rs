@@ -1803,6 +1803,40 @@ mod tests {
         readme(ir, &crate::codegen::env::Partition::of(ir))
     }
 
+    /// The README documents every verb the emitted command line dispatches,
+    /// as the command a reader types (`bun src/index.ts <verb>`).
+    ///
+    /// The verbs are read off `src/cli.ts`'s own `main` — each
+    /// `if (verb === "…")` — rather than listed here, so a verb the command
+    /// line grows is one this README has to name before it ships: an ejected
+    /// project has no compiler beside it, and the README is where its reader
+    /// learns what `bun src/index.ts store …` does (PRD resolved q72).
+    #[test]
+    fn the_readme_documents_every_verb_the_emitted_command_line_takes() {
+        let cli = include_str!("js/cli.ts");
+        let verbs: Vec<&str> = cli
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("if (verb === \""))
+            .filter_map(|rest| rest.split('"').next())
+            .collect();
+        assert_eq!(
+            verbs,
+            ["run", "resume", "serve", "store"],
+            "the emitted command line's verbs, as `main` dispatches them"
+        );
+        let readme = readme_of(&ir_of("version: \"0.1\"\n")).contents;
+        for verb in verbs {
+            assert!(
+                readme.contains(&format!("bun src/index.ts {verb} ")),
+                "the emitted README does not show `bun src/index.ts {verb} …`"
+            );
+            assert!(
+                readme.contains(&format!("`{verb}` ")),
+                "the emitted README does not say what `{verb}` does"
+            );
+        }
+    }
+
     /// A `module:` binding's `dependencies:` are folded into the generated
     /// manifest, which stays pure-generated (PRD resolved q49, D133).
     ///

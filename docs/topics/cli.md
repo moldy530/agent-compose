@@ -317,7 +317,8 @@ own answer row for `get`, `set`, `delete`, `list` and `count` — the row a
 store-op node's output carries — and the summary for `import`. `export`'s lines
 are its stdout under both formats, so its summary — `{"written": n}` under
 `--format json` — goes to stderr. A failure under `--format json` is
-`{"error": …}`, with `lines` naming each refused line of an import.
+`{"error": …}`, with `lines` naming each refused line of an import; a usage
+error is a sentence on stderr under either format, as every verb's is.
 
 **An operator's write is not an effect, and is recorded nowhere.** It belongs to
 no execution, carries no idempotency key — so `deduped` is always `false` — and
