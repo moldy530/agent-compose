@@ -3016,14 +3016,16 @@ load_prefs:
 |---|---|---|---|
 | `store` | `store.*` ref | yes | |
 | `op` | enum | yes | legal set depends on the store's `kind` (§11.4) |
-| `key`, `value`, `query`, `prefix`, `top_k`, `limit`, `filter`, `metadata`, `content_type`, `fields`, `field`, `unique`, `by`, `if`, `if_version`, `ttl`, `after`, `include_values`, `keys` | per op | per op | §11.4 |
+| `key`, `value`, `query`, `prefix`, `top_k`, `limit`, `filter`, `metadata`, `content_type`, `fields`, `field`, `unique`, `by`, `if`, `if_version`, `ttl`, `after`, `include_values`, `keys`, `ops` | per op | per op | §11.4 |
 
 A store-op node takes **no `input:` key**: its parameters are exactly the op's
 own row in §11.4, written out in the node, and none of them resolves by name
 from a channel or a flow input (§8.0). The op's output schema is derived from the
 store definition (§11.4) and is written by name like any other node output.
 
-**Which parameters are CEL.** Eleven of the nineteen are, and they are exactly
+**Which parameters are CEL.** Eleven of the twenty are, eight are literals, and
+the twentieth — a `batch`'s `ops` — is a literal **list** whose entries hold
+both. The eleven are exactly
 the row §4.1 scopes to `input`, `state`, and `execution`: `key`, `query`,
 `prefix`, `after`, `by` and `if_version` are one expression each, and so is
 `keys`, whose result is a list of strings; `value` is one expression on a
@@ -3044,6 +3046,17 @@ published schema types them too (Appendix B). A `get_many`'s `keys` carries the
 one bound no type decides — at most 1000 keys, and a list's length is not known
 until it is evaluated — so that bound is the run's to hold (§11.4).
 
+`ops` is counted in neither column because it is the one parameter that is a
+**list** (PRD resolved q71, Decision
+[D156](#d156-a-kv-batch-is-one-write-of-many-keys-and-its-list-is-a-literal)):
+the list itself is a literal — written out in the node, one to 100 entries, so
+how many entries a batch holds and which op each is are readable without
+running the graph — and each entry is a single `set` or `delete` spelled as
+that op is, its `op`, `if` and `ttl` literals of the eight's kind and its
+`key`, `if_version` and `value` CEL of the eleven's. Its bounds are therefore
+decidable in one file, and refused at parse and by the published schema alike,
+where a `get_many`'s are the run's.
+
 A store op's result may omit a field. A `get` that misses returns
 `found: false` and **no `value`**, so the `writes: { value: prefs }` above
 performs no write on that pass and `prefs` keeps what it held; a guard wanting
@@ -3055,7 +3068,9 @@ terms where §11.4 says they are — a write that declined against a key holding
 nothing — and are read the same way: route on `applied` first. So is a `list`'s
 `next` on the last page of a walk, which is what a paging cycle routes on —
 `when: "has(page.output.next)"` — and a `get_many` entry's `value` and
-`version` where its `found` is `false`.
+`version` where its `found` is `false`. So, last, are a `batch`'s `failed`,
+present exactly when `applied` is `false`, and the `version` of a result its
+`delete` entry answered.
 
 ### 8.9 `coder`
 
@@ -4282,6 +4297,7 @@ key holding a value (the expiry rule below).
 | `kv` | `incr` | `key`, `field` (an `integer` or `number` field of `V`, literal), `by` (CEL number of the field's type, default `1`), `C`, `T` | as `merge` |
 | `kv` | `count` | `prefix` (CEL string, optional) | `{ count: integer }` |
 | `kv` | `get_many` | `keys` (CEL list of string, at most 1000) | `{ entries: array<{ key: string, value: V (optional), found: boolean, version: integer (optional) }> }` — one per key asked, in the order asked |
+| `kv` | `batch` | `ops` (literal list of 1..100 entries, required): each `{ op: set \| delete (literal), key (CEL string), value (map field→CEL matching `V`; `set` only, required there), C, T (`set` only) }` — a `delete` entry's `C` is `if_version` alone | `{ applied: boolean, deduped: boolean, results: array<{ key: string, version: integer (optional) }>, failed: integer (optional) }` — one result per entry, in entry order, `version` absent on a `delete` entry's; `failed` present exactly when `applied` is `false`, and `results` then empty |
 | `vector` | `search` | `query` (CEL string), `top_k` (integer 1..100, required), `filter` (map metadata-field→CEL, optional) | `{ matches: array<{ id: string, score: number, text: string, metadata: M }> }` |
 | `vector` | `upsert` | `key`, `value` (CEL string — the text), `metadata` (map field→CEL, optional) | `{ id: string }` |
 | `vector` | `delete` | `key` | `{ deleted: boolean }` |
@@ -4390,6 +4406,43 @@ Rules (PRD 5.8):
   `applied` and `version` and `deduped: true`, and a retried successful claim
   never fails against its own first write. A synthesized tool's write carries no
   key (§9.4), so its `deduped` is always `false`.
+- **A batch** (PRD resolved q71, Decision
+  [D156](#d156-a-kv-batch-is-one-write-of-many-keys-and-its-list-is-a-literal)).
+  A `batch` applies its `ops:` — a literal list of one to 100 `set` and
+  `delete` entries — to one `kv` store, in one partition, in **one
+  transaction** on every backend: every entry lands or none does, so a crash
+  anywhere inside it leaves all of it or nothing.
+
+  - **Each entry is its single op.** A `set` entry takes `key` and `value` —
+    a field map checked against `V` and total, exactly as a `set`'s — and may
+    carry one of `if:` and `if_version:` and a `ttl:`; a `delete` entry takes
+    `key` and may carry `if_version:` alone. Its row is checked as the single
+    op's is, in one file and by the published schema; an entry naming another
+    op — a partial update, which reads the value it changes — is refused, and
+    so is a list that is empty or longer than 100.
+  - **In order, and the first entry that cannot land decides.** Entries apply
+    in the order written, each reading its key as the entries before it left
+    it — a key named twice is the second entry's after the first's — and each
+    `set` entry takes the partition's next version in that order. An entry
+    whose condition does not hold applies **nothing** of the batch, the
+    entries before it included, and the batch answers `applied: false`,
+    `results: []` and `failed:` that entry's index (from 0) — a normal result
+    an edge routes on, as a declined `set`'s is. A `set` entry whose value `V`
+    refuses — held to the emitted Zod as the batch reaches it, beside the CEL
+    typing every entry gets at `validate` — **fails the node**, naming the
+    entry, with nothing written and no version consumed.
+  - **Expiry per entry.** Each `set` entry's key takes its own expiry from
+    the one clock the batch reads — its `ttl`, else the store's
+    `default_ttl:`, else none — exactly as a single write's; a `delete` entry
+    leaves nothing to expire. The partition is swept once, as one write sweeps
+    it.
+  - **One effect, one key, one ledger row.** A batch is one write: it carries
+    the node's §9.4 idempotency key, and the ledger row it leaves holds its
+    **whole** answer — the decline included — so a retried batch is answered
+    `deduped: true` with the first attempt's `applied`, `results` and `failed`,
+    and applies nothing a second time.
+  - **A node's alone.** No `agent_access:` level synthesizes a batch tool
+    (§11.5).
 - **Schema evolution.** `value_schema` is checked on **write**: CEL typing at
   `validate` for a store-op node, the emitted Zod at run time for a tool's
   arguments. A `get` returns the stored JSON unparsed, so a stored value that no
@@ -4524,7 +4577,8 @@ Rules (PRD 5.8):
   reported it does not have.
 - Store ops are **effects**: reads are recorded and replay consumes history, not
   the live store — `get`, `list`, `count`, `get_many` and `search` are the reads,
-  and carry no idempotency key; writes are at-least-once carrying the idempotency key of §9.4 —
+  and carry no idempotency key; writes — a `batch` among them, one write however
+  many entries it holds — are at-least-once carrying the idempotency key of §9.4 —
   the execution id plus the store node's flattened instance path, which is what
   keeps two instantiations of one flow, and the repeating item indexes of nested
   maps, from deriving one key for two different writes.
@@ -4548,7 +4602,7 @@ Rules (PRD 5.8):
   refused from then on. A prune that fails is said and changes no outcome: the
   rows answer nothing again.
 - A store **write** performed inside a `map`-dispatched instance — `kv set`,
-  `kv delete`, `kv merge`, `kv append`, `kv incr`, `vector upsert`,
+  `kv delete`, `kv merge`, `kv append`, `kv incr`, `kv batch`, `vector upsert`,
   `vector delete`, `blob put`, `blob delete` — MUST be one of two forms (PRD 5.8,
   Decision
   [D67](#d67-store-writes-inside-a-map-item-derived-key-or-a-keyed-kv-write)):
@@ -4635,7 +4689,10 @@ Rules (PRD 5.8):
   `incr` is serialized against every other write to the key, so a constant key
   inside a `map` with one of them is N instances each landing their change —
   which is what authors reach for the exemption to mean, and what the partial
-  updates make safe. Its final value can still depend on completion order and
+  updates make safe. A `batch` is a list of keyed `kv` writes, so it is form 2
+  whatever its entries' keys (PRD resolved q71): N instances' batches are N
+  transactions, serialized on their partition, each landing whole or not at
+  all. Its final value can still depend on completion order and
   is therefore *not* deterministic — which is sound here and would not be for a
   channel, because store reads are recorded and a replay consumes history rather
   than the live store (PRD 5.8), so no store value ever feeds the graph's own
@@ -4658,6 +4715,12 @@ calls — PRD 5.8):
 `<name>` is the store's local name (`store.user_prefs` → `user_prefs_get`). A
 synthesized tool name that collides with an attached `tool.*`/`flow.*` tool name
 is a compile error.
+
+No row names a `batch`, and no level grants one (PRD resolved q71): a batch is
+a store-op node's alone. Its list is a literal the author writes down — which
+keys move together, under which conditions — and a model handed it would be
+handed up to a hundred writes as one call with none of them readable before it
+ran.
 
 **`full` is PRD resolved q68's third level** (Decision
 [D152](#d152-a-kv-key-is-versioned-and-a-conditional-or-partial-write-is-serialized-against-every-write-to-its-key)):
@@ -6753,7 +6816,12 @@ the node's `include_values:` literal is `true`, which
 [D154](#d154-a-kv-store-is-read-at-scale-a-page-at-a-time-and-a-pages-entries-are-there-when-its-node-asks)
 fixes on D114's pattern; and the optional fields the catalog has grown since
 (`version`, a partial update's `value`, a page's `next`, a `get_many` entry's
-`value` and `version`) resolve through D110 as `value` on a `get` does.
+`value` and `version`, a `batch`'s `failed` and its results' `version`) resolve
+through D110 as `value` on a `get` does. The catalog's one **list-valued**
+parameter is a `batch`'s `ops`, a literal list whose entries are the `set` and
+`delete` rows — so its row is fixed like every other, entry by entry, and its
+output's `results` is bounded by the entries the node writes
+([D156](#d156-a-kv-batch-is-one-write-of-many-keys-and-its-list-is-a-literal)).
 **Rationale**: PRD 5.8 requires schema-checked ops and name-based wiring of their
 results; without fixed output names, `writes:` and downstream guards would have
 nothing stable to bind. *PRD 5.8.*
@@ -11450,6 +11518,97 @@ D154 are what it is built on, and none is amended.
 
 **Status**: shipped. *PRD 5.12, resolved q23, q68, q69, q70, q72, q74; §11.1, §11.3, §11.4.*
 
+### D156. A `kv` batch is one write of many keys, and its list is a literal
+
+A `batch` op on a `kv` store takes `ops:` — a literal list of 1 to 100 entries,
+each `{ op: set | delete, key, value?, if?, if_version?, ttl? }`, every entry
+exactly the single op of its name — and applies them to one partition in
+**one transaction** on every backend: all of them or none. The entries apply in
+order, each reading its key as the ones before it left it, each `set` entry
+taking the partition's next version and its own expiry; the first entry whose
+condition does not hold applies nothing of the batch and answers
+`applied: false` with its index as `failed`, and a `set` entry whose value `V`
+refuses fails the node with nothing written. The batch carries the node's one
+§9.4 key and its whole answer is one ledger row, so a retry answers what the
+first attempt did. It answers
+`{ applied, deduped, results: array<{ key, version (optional) }>, failed (optional) }`,
+is admitted inside a `map` as a keyed `kv` write, and is offered to no agent
+(§8.8, §11.4, §11.5, PRD resolved q71).
+
+**Rationale**: a `kv` write addresses one key, so moving a record — set it under
+its new key, delete the old — or claiming a job and recording its owner were
+two nodes with a crash between them, and the run that recovered found the
+record twice or not at all. Every arm already holds a transaction around one
+write; the ruling's answer is to hold the **same** transaction around several,
+and each clause below is what keeps the batch exactly that rather than a second
+kind of write.
+
+**One op with a list, not a node form.** The catalogue's first list-valued
+parameter, and the alternative it was chosen over is the obvious one: a node
+form — a block of store nodes, or edges marked "together" — that the compiler
+gathers into one transaction. That would put a transaction boundary in the
+graph, where every node is one effect with one key (D104, §9.4), one record in
+the trace and one step a replay answers; a node form would be several nodes
+that are one effect, and every one of those statements would grow an exception.
+As one op it is one node: one key, one ledger row, one record, one output an
+edge routes on — and the catalogue's normativity (D34) holds of it unchanged,
+since its row is the `set` and `delete` rows, entry by entry, and its output is
+derived from the store like any other. A list is new to the catalogue; what it
+holds is not.
+
+**A literal list.** The entries are written out in the node, so how many there
+are, which op each is and what each is conditioned on are readable without
+running the graph, as every other parameter's literal half is (§8.8), and the
+bound — 1 to 100 — is decided in one file: refused at parse and by the published
+schema, where a `get_many`'s CEL list is bounded at run time. It is also what
+bounds the output's `results`, one per entry, for a channel to hold (§3.5).
+A computed list of writes is a different question — what a fan-out of `kv`
+writes is — and the ruling does not ask it.
+
+**The first entry that cannot land decides.** The entries apply in the order
+written, inside the transaction, so a later entry reads what an earlier one
+left — a key named twice is in order, and a condition on an entry is a
+condition on the state the entries before it made. A declined entry rolls the
+batch back to before its first entry rather than skipping itself, because the
+ruling's "all or none" is about the batch, not its entries: a move whose
+delete half declined is not a move. Its answer is an answer — `applied: false`
+and the index, an edge's to route on, exactly a declined `set`'s posture
+(D152) — and so it is the ledger row too: a retry of a declined batch is handed
+the decline, never re-run against a state that changed since, which is the
+same "the ledger answers whole" D152 gives every write. `failed` names the
+entry because one `applied` cannot say which of a hundred conditions lost.
+
+**A value is held to `V` twice.** Every `set` entry's value is CEL-typed against
+`V` at `validate`, as a `set`'s is, and the batch holds it to the emitted Zod
+again as it reaches it — the check the partial updates already make of the
+value they commit. A single `set` writes what its CEL evaluated; a batch cannot,
+because one value `V` refuses on a bound, a pattern or an enum no type decides
+would otherwise land beside the entries that fit. So it fails the node, naming
+the entry, and the transaction takes the earlier entries and the versions they
+took with it.
+
+**Taken once, applied N times.** On every arm the batch is one write's shape
+with N entries inside it: the partition's sequence lock and the ledger check
+once, the clock read once (D153), the partition swept once, a savepoint before
+the first entry so a decline can roll the entries back while its ledger row
+still commits, and then each entry's own row lock, read, decision and write.
+Sequence first and entries after is the order every write already takes its
+locks in, so two batches — or a batch and a write — over overlapping keys wait
+for each other and never in a circle. A crash anywhere in that span is a
+transaction that never committed: SQLite's journal rolls it back at the next
+open, a server rolls back a session it lost.
+
+**What it builds on, and what it does not touch.** Each entry is q68's write
+(D152) and q69's expiry (D153), unchanged; D104 and §9.4 hold as written — one
+effect, one key — and D67 admits the batch untouched, since each entry is a
+keyed `kv` write. The trace files one write record for it with no `key`, its
+keys in the answer it carries (`docs/trace.md` §6). The reads (q70, D154), the
+operator's command line (q72, D155 — no `batch` sub-verb) and the agent tool
+surface (§11.5) are unchanged; no decision is amended.
+
+**Status**: shipped. *PRD 5.8, resolved q29, q63, q68, q69, q71; §8.8, §9.4,
+§11.4, §11.5.*
+
 ## Appendix B — Editor integration
 
 [`schemas/agent-compose.schema.json`](../schemas/agent-compose.schema.json) is a
@@ -11541,7 +11700,9 @@ write's two conditions as one or the other and never both, and the parameters
 that are literals rather than CEL — `top_k` and `limit` typed as integers in
 their ranges, `content_type` as a string carrying no env ref, `field` as an
 identifier, `unique` and `include_values` as booleans, `if` as `absent` or
-`present` and `ttl` as a duration or `never` (§8.8, §11.4) — store definition
+`present` and `ttl` as a duration or `never` (§8.8, §11.4), and a `batch`'s
+`ops` as a list of 1 to 100 entries, each entry's `op` as `set` or `delete` and
+its keys that op's row, one condition at most (§11.4, D156) — store definition
 key sets per `kind`, both the schema each kind requires and the ones it refuses,
 `metadata_schema` being `vector`'s alone (§11.1, D113), `default_ttl` being
 `kv`'s alone and a duration (§11.1, D153), and the `provider:` a `vector`

@@ -19,6 +19,8 @@ Two keys that may not appear together both appear. The pairs are not arbitrary
   both `bearer:` and `hmac:`, where one request carries one credential;
 - an inline node's `input:` beside the in-block key that would carry it —
   `body:` on a body-bearing method, `query:` on `GET`/`HEAD`;
+- `if:` and `if_version:` on one `kv` write — a single write, or one entry of a
+  `batch` — which are two answers to one condition;
 - two implementation bindings on one `tool.*`.
 
 ## A spec that triggers it
