@@ -32,11 +32,13 @@
 //!    in storage — an `export` → edit → `import` round trip at fresh versions
 //!    with a remaining `expires_at` honoured and an expired line skipped, an
 //!    `export` of more keys than a page holds writing each once, in byte
-//!    order, with a summary that counts them all, a schema-refused import line
-//!    named by number and a schema-refused `set` value — each exiting `2`, a
-//!    command line to fix rather than an answer of no — `--if-absent` seeding
-//!    without overwriting, the wrong scope flags and an unknown address
-//!    exiting `2`, and the `--format json` shapes — [`drive`], once per arm;
+//!    order, with a summary that counts them all, an import reading a line's
+//!    `expires_at` against the store's own clock rather than this machine's, a
+//!    schema-refused import line named by number and a schema-refused `set`
+//!    value — each exiting `2`, a command line to fix rather than an answer of
+//!    no — `--if-absent` seeding without overwriting, the wrong scope flags and
+//!    an unknown address exiting `2`, and the `--format json` shapes —
+//!    [`drive`], once per arm;
 //!  * a store's `default_ttl:` taken by a `set` with no `--ttl` and not by an
 //!    import line with no `expires_at` — [`drive`] too;
 //!  * a command whose standard output will not take its answer — a pipe whose
@@ -770,6 +772,34 @@ fn instant(line: &Value) -> i64 {
     ((days * 24 + hour) * 60 + minute) * 60_000 + second * 1000 + millis
 }
 
+/// An instant in epoch milliseconds as the ISO 8601 UTC instant an export
+/// writes — [`instant`] read backwards.
+fn iso(millis: i64) -> String {
+    let days = millis.div_euclid(86_400_000);
+    let of_day = millis.rem_euclid(86_400_000);
+    // The civil date from days, Howard Hinnant's algorithm.
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let of_era = shifted - era * 146_097;
+    let year_of_era = (of_era - of_era / 1460 + of_era / 36_524 - of_era / 146_096) / 365;
+    let of_year = of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let from_march = (5 * of_year + 2) / 153;
+    let day = of_year - (153 * from_march + 2) / 5 + 1;
+    let month = if from_march < 10 {
+        from_march + 3
+    } else {
+        from_march - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        of_day / 3_600_000,
+        of_day / 60_000 % 60,
+        of_day / 1000 % 60,
+        of_day % 1000
+    )
+}
+
 /// Every claim of the ruling, on one arm.
 #[allow(
     clippy::too_many_lines,
@@ -1123,6 +1153,72 @@ fn drive(arm: &Arm) {
         after["page/a"].get("expires_at").is_none(),
         "a line with no `expires_at` imports a key that does not expire"
     );
+
+    // What remains of a line's `expires_at` is measured against **the store's
+    // own clock** — the one every read and every `--ttl` is dated by, which on
+    // a dialled arm is the server's — never this machine's (PRD resolved q69,
+    // D155). Here that clock runs two hours ahead: a line due an hour from now
+    // is already past to it, so it is skipped and counted as expired, and one
+    // due three hours from now has an hour left, which is the `ttl` its write
+    // takes — so the key the store holds expires at the very instant the line
+    // named. Measured against this machine's clock instead, the first would be
+    // written as live and the second would keep three hours, from a clock two
+    // hours ahead.
+    let now = now_millis();
+    let (lapsed, kept) = (iso(now + HOUR), iso(now + 3 * HOUR));
+    assert_eq!(
+        instant(&json!({ "expires_at": &kept })),
+        now + 3 * HOUR,
+        "the instants this case writes read back as the instants it meant"
+    );
+    let clocked = format!(
+        "{}\n{}\n",
+        json!({ "key": "clocked/lapsed", "value": { "text": "lapsed" }, "expires_at": &lapsed }),
+        json!({ "key": "clocked/kept", "value": { "text": "kept" }, "expires_at": &kept })
+    );
+    let imported = project.store_with(
+        "import",
+        &[&notes, "--format", "json"],
+        Given {
+            input: Some(&clocked),
+            ..past()
+        },
+    );
+    assert_eq!(
+        imported.exits(0).json(),
+        json!({ "read": 2, "written": 1, "skipped": 1, "expired": 1, "present": 0 }),
+        "a line due an hour from now is past to a store whose clock is two hours ahead"
+    );
+    project.store("get", &[&notes, "clocked/lapsed"]).exits(1);
+    let held = by_key(
+        &project
+            .store_with("export", &[&notes, "--prefix", "clocked/"], past())
+            .exits(0)
+            .lines(),
+    );
+    assert_eq!(
+        held.keys().collect::<Vec<_>>(),
+        ["clocked/kept"],
+        "only the line with time left on the store's clock was written: {held:?}"
+    );
+    let drift = instant(&held["clocked/kept"]) - (now + 3 * HOUR);
+    assert!(
+        (-1_000..5_000).contains(&drift),
+        "the line's remaining hour by the store's clock became its `ttl`, so it expires when \
+         the line said ({kept}), not two hours later: {}",
+        held["clocked/kept"]
+    );
+    project
+        .store_with(
+            "get",
+            &[&notes, "clocked/kept"],
+            Given {
+                environment: &[(CLOCK_OFFSET, "14400000")],
+                ..Given::default()
+            },
+        )
+        .exits(1);
+    project.store("delete", &[&notes, "clocked/kept"]).exits(0);
 
     // An export longer than one page: it follows each page's cursor to the
     // last, so every key is written exactly once, in byte order, and the
@@ -1537,7 +1633,7 @@ fn drive(arm: &Arm) {
         "the run journaled its own reads: {effects}"
     );
     for operator_only in [
-        "page/", "lease", "brief", "other/x", "bulk/", "refused/", "seed/b",
+        "page/", "lease", "brief", "other/x", "bulk/", "refused/", "seed/b", "clocked/",
     ] {
         assert!(
             !rows
