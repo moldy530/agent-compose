@@ -10897,7 +10897,10 @@ constant key. The op catalogue is per kind, and with three ops that only one
 kind takes, which kind takes an op is now checked against the store a node
 names rather than left to a comment. Expiry (PRD resolved q69) counts as absent
 and folds into the one predicate the conditions read; it is not part of this
-entry. *PRD 5.8, resolved q13, q29, q63, q68; §9.4, §11.3, §11.4, §11.5.*
+entry.
+
+**Status**: shipped. *PRD 5.8, resolved q13, q29, q63, q68; §9.4, §11.3, §11.4,
+§11.5.*
 
 ## Appendix B — Editor integration
 
