@@ -118,6 +118,28 @@ state:
     type: boolean
     default: false
 
+  # What `flow.catalogue` reads back a page at a time: one element per page,
+  # the cursor each page hands the next, and what a `count` answered — each
+  # with a default no read produces, so a page that answered nothing, a cursor
+  # that never moved and a count that never ran all fail the assertions.
+  pages:
+    description: The keys of one page each, in the order the pages came back.
+    type: array
+    max_items: 8
+    items:
+      type: array
+      max_items: 3
+      items: { type: string }
+    reduce: append
+  cursor:
+    description: The last key of the page read most recently — the next page's `after:`.
+    type: string
+    default: nothing was paged
+  held:
+    description: How many entries `flow.catalogue`'s `count` found.
+    type: integer
+    default: -1
+
 provider.mock:
   kind: anthropic
   api_key: ${MOCK_API_KEY}
@@ -709,3 +731,103 @@ flow.tally:
     - { from: seed, to: each }
     - { from: each, to: read }
     - { from: read, to: end }
+
+# PRD resolved q70, end to end: a `kv` store written by a fan-out and then read
+# back the way a flow reads one too large for one answer — a page at a time,
+# each `list` taking the `next` the page before it answered as its `after:`,
+# until a page answers none. A cycle bounded by its exit condition (grammar
+# 7.4 clause 2): `has(more.output.next)` is the cursor's own presence, and the
+# last page has none. Then a `count` of what the walk saw, and a `get_many` of
+# one key the store holds and one it does not. `pages` is an `append` channel,
+# so every page's `keys` is one element of it (Decision D58), and `cursor`
+# keeps the last `next` a page answered, since the page that answers none
+# writes nothing (Decision D110).
+store.catalogue:
+  kind: kv
+  scope: execution
+  description: One entry per name, keyed under `item/`.
+  value_schema:
+    name: { type: string }
+
+flow.catalogue_one:
+  description: Write one name's entry.
+  inputs:
+    name:
+      type: string
+  outputs: {}
+  nodes:
+    put:
+      store: store.catalogue
+      op: set
+      key: "'item/' + input.name"
+      value:
+        name: "input.name"
+  edges:
+    - { from: start, to: put }
+    - { from: put, to: end }
+
+flow.catalogue:
+  description: Write an entry per name, then page through them, count them, and read two back by key.
+  inputs:
+    names:
+      type: array
+      max_items: 8
+      items: { type: string }
+  outputs:
+    pages:
+      type: array
+      max_items: 8
+      items:
+        type: array
+        max_items: 3
+        items: { type: string }
+    cursor:
+      type: string
+    held:
+      type: integer
+  nodes:
+    stock:
+      map:
+        over: input.names
+        as: name
+        node: flow.catalogue_one
+        max_concurrency: 4
+        input:
+          name: "name"
+    first:
+      store: store.catalogue
+      op: list
+      prefix: "'item/'"
+      limit: 3
+      writes:
+        keys: pages
+        next: cursor
+    more:
+      store: store.catalogue
+      op: list
+      prefix: "'item/'"
+      after: "state.cursor"
+      limit: 3
+      include_values: true
+      writes:
+        keys: pages
+        next: cursor
+    census:
+      store: store.catalogue
+      op: count
+      prefix: "'item/'"
+      writes:
+        count: held
+    fetch:
+      store: store.catalogue
+      op: get_many
+      keys: "['item/' + input.names[0], 'item/nobody']"
+  edges:
+    - { from: start, to: stock }
+    - { from: stock, to: first }
+    - { from: first, to: more, when: "has(first.output.next)" }
+    - { from: first, to: census, else: true }
+    - { from: more, to: more, when: "has(more.output.next)" }
+    - { from: more, to: census, else: true }
+    - { from: census, to: fetch }
+    - { from: fetch, to: end }

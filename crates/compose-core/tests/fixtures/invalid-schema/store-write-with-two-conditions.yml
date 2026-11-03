@@ -1,6 +1,6 @@
 # rule: a `kv` write takes one condition, so `if:` and `if_version:` together are refused (grammar 11.4, PRD resolved q68)
 # at: /flow.demo/nodes/claim
-# via: /$defs/storeNode/allOf/12/not
+# via: /$defs/storeNode/allOf/14/not
 flow.demo:
   outputs:
     draft: { type: string }

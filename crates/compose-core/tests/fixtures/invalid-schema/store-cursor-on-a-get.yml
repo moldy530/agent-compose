@@ -1,0 +1,15 @@
+# rule: a store op's parameter set is its own row, and `after:` is a `list`'s cursor (grammar 11.4, PRD resolved q70)
+# at: /flow.work/nodes/load/after
+# via: /$defs/storeNode/allOf/0/then/properties/after
+flow.work:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    load:
+      store: store.notes
+      op: get
+      key: "'k'"
+      after: "'j'"
+  edges:
+    - { from: start, to: load }
+    - { from: load, to: end }

@@ -870,6 +870,14 @@ const CODEGEN: &[Criterion] = &[
                 "a_partial_update_the_store_refuses_goes_back_to_the_model",
                 Status::Live,
             ),
+            // PRD resolved q70 on the node surface: a flow pages through a
+            // `kv` store with `list` and `after:`, counts it, and reads two
+            // keys in one `get_many` — and every one of them is a read the
+            // trace files with its answer and no key.
+            (
+                "a_flow_pages_through_a_kv_store_counts_it_and_reads_many_keys_at_once",
+                Status::Live,
+            ),
         ],
     },
     Criterion {
@@ -1360,6 +1368,13 @@ const DURABILITY: &[Criterion] = &[
             // out of one composition (`docs/durability.md` §11.1).
             (
                 "a_replayed_store_read_is_the_row_the_recording_generation_went_on_with",
+                Status::Live,
+            ),
+            // …and PRD resolved q70's two reads, across a store that moved
+            // while the execution was down: a resumed `count` and `get_many`
+            // answer what the first generation read.
+            (
+                "a_resumed_run_answers_a_count_and_a_get_many_out_of_the_record",
                 Status::Live,
             ),
         ],

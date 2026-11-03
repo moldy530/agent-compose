@@ -27,6 +27,16 @@
 //! all rather than empty metadata, so `filter:` and `metadata:` there have no
 //! legal key and naming any is an error against the store (Decision D114).
 //!
+//! # Reading at scale (PRD resolved q70)
+//!
+//! A `kv` `list` is one page past an exclusive cursor: `after:` is one string
+//! expression and `include_values:` a literal the parser has already read. A
+//! page is a `kv` store's, so on a `blob` `list` — the other kind that takes
+//! `list` — both are refused against the store. `count` and `get_many` are
+//! `kv` ops, which [`model::kind_takes`] decides like every other row; a
+//! `get_many`'s `keys:` is a list-of-strings expression whose **length** is a
+//! run-time fact, so the most one reads is the runtime's to enforce.
+//!
 //! # Keying a write inside a fan-out
 //!
 //! A store write performed inside a `map`-dispatched instance must have an
@@ -122,10 +132,47 @@ pub(crate) fn store_node<'a>(
         );
     }
 
+    // A `kv` page's two parameters (PRD resolved q70). `list` is one op of
+    // two kinds and the page is `kv`'s: a `blob` `list` keeps its one shape —
+    // a prefix and a limit — so naming either there is refused against the
+    // store, the way a version is on a `vector`/`blob` `delete` above.
+    if definition.kind != StoreKind::Kv {
+        for (name, span) in [
+            ("after", params.after.as_ref().map(|after| &after.span)),
+            (
+                "include_values",
+                params.include_values.as_ref().map(|include| &include.span),
+            ),
+        ] {
+            let Some(span) = span else {
+                continue;
+            };
+            ctx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidValue,
+                    span.clone(),
+                    format!(
+                        "`{name}` is not a parameter of a `{}` `{}`: a cursor and the values beside its keys are a `kv` page's, and `{}` is `kind: {}`",
+                        definition.kind.as_str(),
+                        op.as_str(),
+                        store.value,
+                        definition.kind.as_str()
+                    ),
+                )
+                .with_help(
+                    "a `blob` `list` answers one prefix of a store's keys up to its `limit:`; to page through a store, keep the records in a `kv` store (grammar 11.4, PRD resolved q70)",
+                ),
+            );
+        }
+    }
+
     for (name, expression) in [
         ("key", params.key.as_ref()),
         ("query", params.query.as_ref()),
         ("prefix", params.prefix.as_ref()),
+        // Analyzed on any kind, so a mistake inside it is reported beside the
+        // refusal above rather than after it is repaired.
+        ("after", params.after.as_ref()),
     ] {
         let Some(expression) = expression else {
             continue;
@@ -137,6 +184,21 @@ pub(crate) fn store_node<'a>(
             &analysis,
             &Type::String,
             &format!("`{name}` of {subject}"),
+        );
+    }
+
+    // A `get_many`'s keys are one expression, and its result is a list of
+    // strings. How many it holds is not static — a CEL list's length is a run
+    // time fact — so the most one reads (`GET_MANY_MAX_KEYS`) is enforced
+    // where the node runs, failing it by name (grammar 11.4, PRD resolved q70).
+    if let Some(keys) = &params.keys {
+        let analysis = expr::analyze(ctx, keys, &scope);
+        expr::expect(
+            ctx,
+            keys,
+            &analysis,
+            &Type::List(std::sync::Arc::new(Type::String)),
+            &format!("`keys` of {subject}"),
         );
     }
 

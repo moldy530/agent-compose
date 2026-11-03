@@ -1,0 +1,30 @@
+# rule: `get_many` is a `kv` op, decided against the definition the node names (grammar 11.4, PRD resolved q70)
+# code: invalid-value
+# message: node `fetch` asks `store.docs` for a `get_many`, which a `vector` store does not take
+# at: main.yml:25:14
+# help: a `vector` store takes `search`, `upsert`, `delete` (grammar 11.4)
+version: "0.1"
+provider.embeddings:
+  kind: openai_compatible
+  base_url: ${EMBED_URL}
+store.docs:
+  kind: vector
+  scope: global
+  embed:
+    model: text-embedding-3-small
+    provider: provider.embeddings
+    dimensions: 8
+  metadata_schema:
+    source: { type: string }
+flow.f:
+  inputs:
+    ids: { type: array, max_items: 10, items: { type: string } }
+  outputs: {}
+  nodes:
+    fetch:
+      store: store.docs
+      op: get_many
+      keys: "input.ids"
+  edges:
+    - { from: start, to: fetch }
+    - { from: fetch, to: end }

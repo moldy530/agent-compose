@@ -1,0 +1,21 @@
+# rule: a `list`'s `after` is one expression whose result is a string — the last key of the page before (grammar 11.4, PRD resolved q70)
+# code: type-mismatch
+# message: `after` of node `page` must evaluate to a string, found an integer
+# at: main.yml:18:14
+version: "0.1"
+store.notes:
+  kind: kv
+  scope: global
+  value_schema:
+    body: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    page:
+      store: store.notes
+      op: list
+      limit: 100
+      after: "3"
+  edges:
+    - { from: start, to: page }
+    - { from: page, to: end }

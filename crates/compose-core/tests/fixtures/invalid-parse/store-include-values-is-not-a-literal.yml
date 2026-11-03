@@ -1,0 +1,16 @@
+# rule: `include_values` is a literal boolean, not CEL — it decides whether a page's derived output has `entries` at all, so it is readable without running the graph (grammar 8.8, 11.4, Decision D154)
+# code: wrong-type
+# message: expected a boolean for `include_values`, found a string
+# at: 13:23
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    page:
+      store: store.memory
+      op: list
+      limit: 100
+      include_values: "state.wanted"
+  edges:
+    - { from: start, to: page }
+    - { from: page, to: end }

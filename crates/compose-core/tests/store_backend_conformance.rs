@@ -452,6 +452,50 @@ fn every_store_backend_answers_the_same_contract() {
             Some(&vec![Value::from("😀alpha")]),
             "the `{provider}` store answers a longer astral `prefix:` with the wrong keys"
         );
+
+        // PRD resolved q70: the walk was the ruling's size on this arm, and a
+        // mixed set walked three keys at a time comes back in byte order — the
+        // cursor's comparison agreeing with the column's sort, on every arm.
+        assert_eq!(
+            answered.get("walk_keys").and_then(Value::as_u64),
+            Some(100_000),
+            "the `{provider}` walk seeded another number of keys than the ruling's 100,000"
+        );
+        assert_eq!(
+            answered.get("walk_pages").and_then(Value::as_u64),
+            Some(100),
+            "the `{provider}` store took another number of 1000-key pages to walk 100,000 keys"
+        );
+        let paged: Vec<Value> = PAGED_ORDER.iter().map(|key| Value::from(*key)).collect();
+        assert_eq!(
+            answered.get("paged_order").and_then(Value::as_array),
+            Some(&paged),
+            "the `{provider}` store pages a mixed set in another order than UTF-8 byte order, so \
+             two backends would disagree about which keys a page holds (grammar 11.4, PRD \
+             resolved q70)"
+        );
+        assert_eq!(
+            answered
+                .get("after_a_key_the_store_does_not_hold")
+                .and_then(Value::as_array),
+            Some(&vec![
+                Value::from("aB"),
+                Value::from("ab"),
+                Value::from("b")
+            ]),
+            "the `{provider}` store answers a cursor it does not hold as a key with the wrong page"
+        );
+        assert_eq!(
+            answered.get("get_many_refusal").and_then(Value::as_str),
+            Some(GET_MANY_REFUSAL),
+            "the `{provider}` store refuses a `get_many` of 1001 keys with another message"
+        );
+        notice(&format!(
+            "note: the `{provider}` store seeded {} keys in {} ms and walked them in {} ms",
+            answered.get("walk_keys").unwrap_or(&Value::Null),
+            answered.get("walk_seed_ms").unwrap_or(&Value::Null),
+            answered.get("walk_ms").unwrap_or(&Value::Null),
+        ));
     }
     assert!(
         driven.contains(&"sqlite"),
@@ -605,7 +649,94 @@ const TRUE_EVERYWHERE: &[&str] = &[
     // another write's read-modify-write waits for its commit and builds on it.
     "the_window_was_open_when_the_second_write_arrived",
     "a_write_inside_another_writes_window_waits_and_builds_on_it",
+    // PRD resolved q70: a 100,000-key store walked page by page, bulk-seeded
+    // beside the store rather than written through it. The pages laid end to
+    // end are the sorted key set — gapless, duplicate-free and in byte order —
+    // with and without a prefix; every page but the last is full and its
+    // `next` is its own last key, and the last answers none even when it is
+    // full; `count` agrees with the walk.
+    "a_fresh_store_counts_nothing",
+    "a_walk_sees_every_key_exactly_once_in_byte_order",
+    "a_walk_answers_no_key_twice",
+    "every_page_but_the_last_is_full_and_its_next_is_its_last_key",
+    "the_last_page_answers_no_next",
+    "a_full_last_page_answers_no_next",
+    "a_page_without_include_values_answers_no_entries",
+    "a_walk_under_a_prefix_sees_every_prefixed_key_exactly_once",
+    "a_prefixed_walks_last_page_is_short_and_answers_no_next",
+    "count_agrees_with_the_walk",
+    "count_answers_an_integer",
+    // `include_values: true` carries each key's value and version, in order.
+    "include_values_entries_carry_each_keys_value_and_version",
+    "a_valued_walk_sees_every_key_once",
+    // `get_many` of 1000 keys answers one entry per key asked, in the order
+    // asked, with `found` and — only where found — `value` and `version`;
+    // 1001 fails the op before anything is read or recorded.
+    "get_many_of_1000_keys_answers_one_entry_per_key_in_order",
+    "get_many_answers_found_with_value_and_version_or_neither",
+    "get_many_answers_a_key_asked_twice_twice",
+    "get_many_of_no_keys_answers_no_entries",
+    "a_refused_get_many_files_no_record",
+    // A keyset cursor: a write landing mid-walk moves no page still to come.
+    "after_the_last_key_answers_an_empty_last_page",
+    "a_write_mid_walk_moves_no_later_page",
+    // The trace and the replay: all three are reads — recorded with their
+    // answer, carrying no key, no idempotency key and no `deduped`, writing no
+    // ledger row — and a resumed generation answers them out of the record.
+    "a_list_page_record_is_a_read_with_no_key",
+    "a_count_record_is_a_read_with_no_key",
+    "a_get_many_record_is_a_read_with_no_key",
+    "the_reads_wrote_no_ledger_row",
+    "a_replayed_count_answers_out_of_the_record",
+    "a_replayed_get_many_answers_out_of_the_record",
+    "a_replayed_page_answers_out_of_the_record",
 ];
+
+/// The order every arm pages a mixed set in: UTF-8 byte order, which Rust's
+/// own `str` ordering is — so [`the_paged_order_is_byte_order`] holds the
+/// constant to the definition rather than to a second hand-sorted copy.
+const PAGED_ORDER: &[&str] = &[
+    "A",
+    "B",
+    "Z",
+    "a",
+    "a b",
+    "aB",
+    "ab",
+    "b",
+    "z",
+    "É",
+    "ß",
+    "é",
+    "Ω",
+    "中",
+    "＀",
+    "\u{1F600}",
+];
+
+/// The refusal a `get_many` of 1001 keys fails its node with, word for word,
+/// the store's address aside (PRD resolved q70, grammar 11.4).
+const GET_MANY_REFUSAL: &str = "a `get_many` on `<store>` was asked for 1001 keys, and one \
+     `get_many` reads at most 1000 (grammar 11.4, PRD resolved q70): read them in slices of 1000 \
+     or fewer, or walk the store a page at a time with `list` and `after:`";
+
+/// [`PAGED_ORDER`] is sorted the way the arms are promised to sort, which is
+/// byte order — not the order a UTF-16 or a case-folding comparison answers.
+#[test]
+fn the_paged_order_is_byte_order() {
+    let mut sorted = PAGED_ORDER.to_vec();
+    sorted.sort_unstable();
+    assert_eq!(sorted, PAGED_ORDER);
+    let utf16 = {
+        let mut keys = PAGED_ORDER.to_vec();
+        keys.sort_by(|left, right| left.encode_utf16().cmp(right.encode_utf16()));
+        keys
+    };
+    assert_ne!(
+        utf16, PAGED_ORDER,
+        "the set is chosen so that a UTF-16 comparison orders it differently"
+    );
+}
 
 /// The cases a backend with a **socket** must answer `true`, on top of those.
 ///

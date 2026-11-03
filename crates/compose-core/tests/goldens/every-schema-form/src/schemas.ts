@@ -376,6 +376,49 @@ export const flowShapeNodeDropOutput = z.object({
 }).strict();
 export type FlowShapeNodeDropOutput = z.infer<typeof flowShapeNodeDropOutput>;
 
+/**
+ * `flow.shape` node `page` — what the `list` of `store.ledger` answers, derived from the op and the store (grammar 11.4, Decision D34).
+ */
+export const flowShapeNodePageOutput = z.object({
+  keys: z.array(z.string()).max(50),
+  next: z.string(),
+  entries: z.array(z.object({
+    key: z.string(),
+    value: z.object({
+      owner: z.string(),
+      marks: z.array(z.string()).max(8),
+      hits: z.number().int(),
+    }).strict(),
+    version: z.number().int(),
+  }).strict()).max(50),
+}).strict();
+export type FlowShapeNodePageOutput = z.infer<typeof flowShapeNodePageOutput>;
+
+/**
+ * `flow.shape` node `tally` — what the `count` of `store.ledger` answers, derived from the op and the store (grammar 11.4, Decision D34).
+ */
+export const flowShapeNodeTallyOutput = z.object({
+  count: z.number().int(),
+}).strict();
+export type FlowShapeNodeTallyOutput = z.infer<typeof flowShapeNodeTallyOutput>;
+
+/**
+ * `flow.shape` node `fetch` — what the `get_many` of `store.ledger` answers, derived from the op and the store (grammar 11.4, Decision D34).
+ */
+export const flowShapeNodeFetchOutput = z.object({
+  entries: z.array(z.object({
+    key: z.string(),
+    value: z.object({
+      owner: z.string(),
+      marks: z.array(z.string()).max(8),
+      hits: z.number().int(),
+    }).strict(),
+    found: z.boolean(),
+    version: z.number().int(),
+  }).strict()).max(1000),
+}).strict();
+export type FlowShapeNodeFetchOutput = z.infer<typeof flowShapeNodeFetchOutput>;
+
 /** `store.docs` — the metadata a match carries (grammar 11.1). */
 export const storeDocsMetadataSchema = z.object({
   source: z.string(),

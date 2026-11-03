@@ -11917,6 +11917,145 @@ fn a_map_of_partial_updates_at_one_key_keeps_every_item() {
     );
 }
 
+/// A flow reads a `kv` store too large for one answer a page at a time, counts
+/// it and reads several keys in one op (grammar 11.4, PRD resolved q70).
+///
+/// `flow.catalogue` writes seven entries through a fan-out and then walks
+/// them three at a time: each `list` takes the `next` the page before it
+/// answered as its `after:`, and the cycle leaves through its `else:` on the
+/// page that answers none. What decides it is the order and the boundaries —
+/// the pages laid end to end are the seven keys in byte order, each exactly
+/// once, the last page is the short one, and the cursor the flow kept is the
+/// last full page's last key, because a page with no `next` writes nothing
+/// (Decision D110). Then the trace, which is where a read's record is
+/// observable: every page, the `count` and the `get_many` are **reads** —
+/// filed with what they answered, addressing no single key and carrying no
+/// idempotency key, though the emitted graph hands one to every store op it
+/// runs (`docs/trace.md` §6).
+#[test]
+fn a_flow_pages_through_a_kv_store_counts_it_and_reads_many_keys_at_once() {
+    let provider = MockProvider::start().expect("a loopback port");
+    // Written in an order nothing sorted, with a capital and an accent, so the
+    // order the pages come back in is the store's and not the input's.
+    let names = [
+        "mango", "Apple", "kiwi", "éclair", "banana", "fig", "cherry",
+    ];
+    let Some(run) = harness::invoke_with(
+        "stores",
+        "flow.catalogue",
+        &json!({ "names": names }),
+        &harness::environment(&provider),
+    ) else {
+        return;
+    };
+    run.succeeded();
+    // One node's store records, flattened across its trace entries in step
+    // order — the same reading `store_records` makes of a `run`'s trace.
+    let records = |node: &str| -> Vec<Value> {
+        run.entries(node)
+            .into_iter()
+            .filter_map(|entry| entry["stores"].as_array().cloned())
+            .flatten()
+            .collect()
+    };
+    let outputs = run.outputs();
+    assert_eq!(
+        outputs["pages"],
+        json!([
+            ["item/Apple", "item/banana", "item/cherry"],
+            ["item/fig", "item/kiwi", "item/mango"],
+            ["item/éclair"],
+        ]),
+        "seven keys, three to a page, in UTF-8 byte order and each exactly once: {outputs}"
+    );
+    assert_eq!(
+        outputs["cursor"], "item/mango",
+        "the cursor is the last `next` a page answered — the last page answered none: {outputs}"
+    );
+    assert_eq!(
+        outputs["held"],
+        json!(7),
+        "the `count` agrees with the walk: {outputs}"
+    );
+
+    // Every page is a read, and the ones after the first carry their values.
+    let pages: Vec<Value> = ["first", "more"].into_iter().flat_map(&records).collect();
+    assert_eq!(pages.len(), 3, "one record per page: {pages:#?}");
+    for record in &pages {
+        assert_eq!(record["op"], "list", "{record}");
+        assert_eq!(record["effect"], "read", "{record}");
+        for absent in ["key", "idempotencyKey", "deduped", "applied", "version"] {
+            assert!(
+                record.get(absent).is_none(),
+                "a page addresses no single key and carries no `{absent}`: {record}"
+            );
+        }
+    }
+    assert_eq!(pages[0]["answer"]["next"], "item/cherry", "{:#?}", pages[0]);
+    assert!(
+        pages[0]["answer"].get("entries").is_none(),
+        "a page that did not ask for its values carries none: {:#?}",
+        pages[0]
+    );
+    let last = &pages[2]["answer"];
+    assert!(
+        last.get("next").is_none(),
+        "the last page answers no `next`: {last}"
+    );
+    assert_eq!(
+        last["entries"][0]["key"], "item/éclair",
+        "`include_values: true` answers each key beside its value: {last}"
+    );
+    assert_eq!(
+        last["entries"][0]["value"],
+        json!({ "name": "éclair" }),
+        "{last}"
+    );
+    assert!(
+        last["entries"][0]["version"].is_u64(),
+        "…and its version: {last}"
+    );
+
+    let count = records("census");
+    assert_eq!(count.len(), 1, "{count:#?}");
+    assert_eq!(count[0]["op"], "count");
+    assert_eq!(count[0]["effect"], "read");
+    assert_eq!(count[0]["answer"], json!({ "count": 7 }));
+    assert!(
+        count[0].get("key").is_none() && count[0].get("idempotencyKey").is_none(),
+        "{:#?}",
+        count[0]
+    );
+
+    let many = records("fetch");
+    assert_eq!(many.len(), 1, "{many:#?}");
+    assert_eq!(many[0]["op"], "get_many");
+    assert_eq!(many[0]["effect"], "read");
+    assert!(
+        many[0].get("key").is_none()
+            && many[0].get("idempotencyKey").is_none()
+            && many[0].get("deduped").is_none(),
+        "{:#?}",
+        many[0]
+    );
+    let entries = many[0]["answer"]["entries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a `get_many` answers entries: {:#?}", many[0]));
+    assert_eq!(entries.len(), 2, "one entry per key asked: {entries:#?}");
+    assert_eq!(
+        entries[0]["key"], "item/mango",
+        "in the order asked: {entries:#?}"
+    );
+    assert_eq!(entries[0]["found"], true);
+    assert_eq!(entries[0]["value"], json!({ "name": "mango" }));
+    assert!(entries[0]["version"].is_u64(), "{entries:#?}");
+    assert_eq!(
+        entries[1],
+        json!({ "key": "item/nobody", "found": false }),
+        "a key the store does not hold answers `found: false` and no value or version"
+    );
+}
+
 /// A model that **calls** a synthesized store tool reaches the same backend the
 /// store-op nodes do, with the arguments it supplied (grammar 11.5, PRD 5.8).
 ///
@@ -19607,6 +19746,144 @@ fn a_replayed_store_read_is_the_row_the_recording_generation_went_on_with() {
         asked[0].body_text.contains("read it back"),
         "the live call is the second node's, asked about what the agent answered: {}",
         asked[0].body_text
+    );
+}
+
+/// A resumed generation answers a `count` and a `get_many` out of the record
+/// rather than out of the live store (PRD resolved q70, q29).
+///
+/// `flow.surveyed` counts the entries under `survey/` and fetches two keys of
+/// them, then calls a model — and the run is killed during that call, so both
+/// reads are behind the frontier. While the execution is down `flow.stocked`
+/// writes another key under `survey/`: the very key the `get_many` asks for
+/// second. A resume that read the live store would count two and find it; the
+/// record says one and not found, and that is what the resumed run reports.
+/// Then a fresh run of the same flow counts two, which is what makes the
+/// replayed answer evidence rather than coincidence: the store really moved.
+/// Both records are reads — filed with what they answered, no key and no
+/// `deduped` (`docs/trace.md` §6).
+#[test]
+fn a_resumed_run_answers_a_count_and_a_get_many_out_of_the_record() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "a surveyed note" })).after(Duration::from_secs(120)),
+    ));
+
+    let Some((project, built)) = harness::build_under_toolchain("durability", "resume-surveyed")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the durability fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let environment = harness::environment(&provider);
+
+    let stocked = harness::run_into(
+        &project,
+        "durability",
+        "flow.stocked",
+        &[("topic", "durability")],
+        None,
+        &environment,
+    );
+    stocked.succeeded();
+
+    let killed = harness::crash_run(
+        &project,
+        &["run", "flow.surveyed", "--input", "topic=durability"],
+        &environment,
+        |_| provider.snapshot().requests >= 1,
+    );
+
+    // The world moves while the execution is down.
+    let moved = harness::run_into(
+        &project,
+        "durability",
+        "flow.stocked",
+        &[("topic", "later")],
+        None,
+        &environment,
+    );
+    moved.succeeded();
+
+    provider.reset();
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "a surveyed note" })),
+    ));
+    let resumed = harness::resume(
+        &project,
+        "durability",
+        &killed.execution,
+        Some("json"),
+        &environment,
+    );
+    resumed.succeeded();
+    let answered = resumed.outputs();
+    assert_eq!(answered["status"], "completed", "{answered}");
+    assert_eq!(
+        answered["outputs"]["surveyed"],
+        json!(1),
+        "the replayed `count` is the one the first generation read, not the live store's two: \
+         {answered}"
+    );
+    let trace = answered["trace"].as_array().expect("a trace");
+    let record = |node: &str| -> Value {
+        trace
+            .iter()
+            .find(|entry| entry["node"] == node)
+            .and_then(|entry| entry["stores"].as_array())
+            .and_then(|records| records.first().cloned())
+            .unwrap_or_else(|| panic!("the `{node}` node's read is on its entry: {answered}"))
+    };
+    let census = record("census");
+    let fetch = record("fetch");
+    for (read, op) in [(&census, "count"), (&fetch, "get_many")] {
+        assert_eq!(read["op"], op, "{read}");
+        assert_eq!(read["effect"], "read", "{read}");
+        for absent in ["key", "idempotencyKey", "deduped"] {
+            assert!(
+                read.get(absent).is_none(),
+                "a `{op}` addresses no single key and carries no `{absent}`: {read}"
+            );
+        }
+    }
+    assert_eq!(census["answer"], json!({ "count": 1 }), "{census}");
+    assert_eq!(
+        fetch["answer"]["entries"][1],
+        json!({ "key": "survey/later", "found": false }),
+        "the key written while the execution was down is not found by the replayed read: {fetch}"
+    );
+    assert_eq!(fetch["answer"]["entries"][0]["found"], true, "{fetch}");
+    assert_eq!(
+        provider.snapshot().requests,
+        1,
+        "only the killed model call was made again"
+    );
+
+    // A fresh run reads the live store, which did move.
+    provider.reset();
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "a fresh note" })),
+    ));
+    let fresh = harness::run_into(
+        &project,
+        "durability",
+        "flow.surveyed",
+        &[("topic", "durability")],
+        None,
+        &environment,
+    );
+    fresh.succeeded();
+    assert_eq!(
+        fresh.outputs()["surveyed"],
+        json!(2),
+        "a live `count` sees the key the resumed one did not: {}",
+        fresh.stderr()
     );
 }
 

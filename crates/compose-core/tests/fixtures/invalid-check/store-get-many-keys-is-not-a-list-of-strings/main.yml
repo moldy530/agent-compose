@@ -1,0 +1,22 @@
+# rule: a `get_many`'s `keys` is one expression whose result is a list of strings (grammar 11.4, PRD resolved q70)
+# code: type-mismatch
+# message: `keys` of node `fetch` must evaluate to a list of strings, found a string
+# at: main.yml:19:13
+version: "0.1"
+store.notes:
+  kind: kv
+  scope: global
+  value_schema:
+    body: { type: string }
+flow.f:
+  inputs:
+    id: { type: string }
+  outputs: {}
+  nodes:
+    fetch:
+      store: store.notes
+      op: get_many
+      keys: "input.id"
+  edges:
+    - { from: start, to: fetch }
+    - { from: fetch, to: end }

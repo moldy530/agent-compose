@@ -1,0 +1,15 @@
+# rule: a store op's parameter set is its own row, and `keys:` is a `get_many`'s (grammar 11.4, PRD resolved q70)
+# at: /flow.work/nodes/page/keys
+# via: /$defs/storeNode/allOf/5/then/properties/keys
+flow.work:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    page:
+      store: store.notes
+      op: list
+      limit: 100
+      keys: "['a', 'b']"
+  edges:
+    - { from: start, to: page }
+    - { from: page, to: end }

@@ -1,0 +1,19 @@
+# rule: `count` is a `kv` op, decided against the definition the node names (grammar 11.4, PRD resolved q70)
+# code: invalid-value
+# message: node `tally` asks `store.artifacts` for a `count`, which a `blob` store does not take
+# at: main.yml:14:14
+# help: a `blob` store takes `put`, `get`, `delete`, `list` (grammar 11.4)
+version: "0.1"
+store.artifacts:
+  kind: blob
+  scope: global
+flow.f:
+  outputs: {}
+  nodes:
+    tally:
+      store: store.artifacts
+      op: count
+      prefix: "'reports/'"
+  edges:
+    - { from: start, to: tally }
+    - { from: tally, to: end }

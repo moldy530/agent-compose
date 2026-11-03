@@ -560,6 +560,62 @@ fn the_published_schema_accepts_a_keyless_provider_that_names_its_endpoint() {
     }
 }
 
+/// **The published schema takes the reads of PRD resolved q70 in every shape
+/// the grammar admits** (grammar 11.4).
+///
+/// The `invalid-schema/` corpus pins the refusals — `include_values` as CEL,
+/// `after:` on a `get`, `keys:` on a `list`, a `get_many` without `keys`, a
+/// `count` with a `limit` — and nothing in `examples/` reaches a page, a
+/// `count` or a `get_many`, so without this the accepted half is pinned by
+/// nothing: a `then` block that refused `after:` on a `list` too would leave
+/// every negative fixture passing and every paging flow underlined in red.
+/// The ops' **op** enum is the AST's own catalogue, so a new op is a new
+/// member here without an edit.
+#[test]
+fn the_published_schema_accepts_a_page_a_count_and_a_get_many() {
+    let validator = compile_schema();
+    let nodes = [
+        json!({ "store": "store.notes", "op": "list", "limit": 100 }),
+        json!({ "store": "store.notes", "op": "list", "limit": 1000, "prefix": "'goal/'", "after": "state.cursor" }),
+        json!({ "store": "store.notes", "op": "list", "limit": 1, "after": "state.cursor", "include_values": true }),
+        json!({ "store": "store.notes", "op": "list", "limit": 1, "include_values": false }),
+        json!({ "store": "store.notes", "op": "count" }),
+        json!({ "store": "store.notes", "op": "count", "prefix": "'goal/'" }),
+        json!({ "store": "store.notes", "op": "get_many", "keys": "['a', input.key]", "writes": { "entries": "held" } }),
+    ];
+    for node in nodes {
+        let instance = json!({
+            "flow.work": {
+                "outputs": {},
+                "nodes": { "read": node },
+                "edges": [{ "from": "start", "to": "read" }, { "from": "read", "to": "end" }],
+            },
+        });
+        let errors = validation_errors(&validator, &instance);
+        assert!(
+            errors.is_empty(),
+            "the published schema must accept this legal read:\n{}\n{}",
+            serde_json::to_string_pretty(&instance).expect("a printable instance"),
+            errors.join("\n")
+        );
+    }
+    let schema = read_schema();
+    let published: Vec<&str> = schema["$defs"]["storeNode"]["properties"]["op"]["enum"]
+        .as_array()
+        .expect("the store op is an enum")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let catalogue: Vec<&str> = compose_core::ast::flow::StoreOp::ALL
+        .iter()
+        .map(|op| op.as_str())
+        .collect();
+    assert_eq!(
+        published, catalogue,
+        "the published op enum is grammar 11.4's catalogue, in its order"
+    );
+}
+
 /// **The published schema takes every `permission_mode:` the grammar spells,
 /// and no other** (grammar 8.9, Decision D146, PRD resolved q60 ruling a).
 ///

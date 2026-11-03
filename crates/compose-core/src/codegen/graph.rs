@@ -1366,6 +1366,12 @@ fn store_tool_description(
             "Add one item to an array field of the value at a key in"
         }
         crate::ast::flow::StoreOp::Incr => "Add to a numeric field of the value at a key in",
+        // No access level synthesizes these two (grammar 11.5): exposing the
+        // reads PRD resolved q70 added to a model is the parity item that
+        // entry deferred, and `check::model::store_tools` is where that is
+        // decided. The match is total, so they are worded like the rest.
+        crate::ast::flow::StoreOp::Count => "Count the keys under a prefix in",
+        crate::ast::flow::StoreOp::GetMany => "Read several stored values by key from",
     };
     match &store.description {
         Some(description) => format!("{what} `{address}`. {}", description.value.trim()),
@@ -1969,7 +1975,8 @@ fn input_builder(
 /// One store op's parameters, as the object `stores.runStoreOp` takes.
 ///
 /// The literals of grammar 8.8 and 11.4 — `top_k`, `limit`, `content_type`,
-/// and PRD resolved q68's `field`, `unique` and `if` — are written out as
+/// PRD resolved q68's `field`, `unique` and `if`, and q70's `include_values` —
+/// are written out as
 /// literals rather than evaluated: a store op's bound is a written-down number,
 /// and which field a partial update touches and what it is conditioned on are
 /// readable without running the graph, exactly as a fan-out's bound is a schema
@@ -1980,6 +1987,7 @@ fn store_params(op: crate::ast::flow::StoreOp, params: &crate::ir::flow::StorePa
         ("key", params.key.as_ref()),
         ("query", params.query.as_ref()),
         ("prefix", params.prefix.as_ref()),
+        ("after", params.after.as_ref()),
     ] {
         let Some(expression) = expression else {
             continue;
@@ -1987,6 +1995,16 @@ fn store_params(op: crate::ast::flow::StoreOp, params: &crate::ir::flow::StorePa
         text.push_str(&format!(
             "    {key}: String(runtime.toJson(runtime.evaluate({}, roots))),\n",
             names::string(expression.value.as_str())
+        ));
+    }
+    // A `get_many`'s keys are a list, so they are the expression's JSON as it
+    // is; `src/stores.ts` holds them to a list of at most 1000 strings when
+    // the op runs, which is the half of the row a CEL type cannot decide (PRD
+    // resolved q70).
+    if let Some(keys) = &params.keys {
+        text.push_str(&format!(
+            "    keys: runtime.toJson(runtime.evaluate({}, roots)),\n",
+            names::string(keys.value.as_str())
         ));
     }
     match &params.value {
@@ -2058,6 +2076,9 @@ fn store_params(op: crate::ast::flow::StoreOp, params: &crate::ir::flow::StorePa
     }
     if let Some(unique) = params.unique {
         text.push_str(&format!("    unique: {unique},\n"));
+    }
+    if let Some(include) = &params.include_values {
+        text.push_str(&format!("    includeValues: {},\n", include.value));
     }
     // A number either way: the field an `incr` adds to is an `integer` or a
     // `number` (grammar 11.4), and a CEL `int` is a JavaScript number once it
