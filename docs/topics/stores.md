@@ -84,7 +84,7 @@ triggers:
 | `embed` | `vector` **required**; illegal on others | see below |
 | `backend` | no | a bare alias naming an abstract slot; never provider config |
 | `description` | no | LLM-facing for agent-attached stores |
-| `agent_access` | no | `read` \| `read_write` (default) \| `full` |
+| `agent_access` | no | `read` \| `read_write` (default) \| `full` (`kv` only) |
 
 `metadata_schema` on a `blob` store is `conflicting-keys`: nothing in this
 grammar reads it — no `blob` op takes a `metadata` or `filter` parameter and no
@@ -353,18 +353,21 @@ execution id and the store node's flattened instance path.
 | kind | `agent_access: read` | `read_write` (default) | `full` |
 |---|---|---|---|
 | `kv` | `<name>_get` | `<name>_get`, `<name>_set` | those, and `<name>_merge`, `<name>_append`, `<name>_incr`, `<name>_delete` |
-| `vector` | `<name>_search` | `<name>_search`, `<name>_upsert` | as `read_write` |
-| `blob` | `<name>_get`, `<name>_list` | `<name>_get`, `<name>_list`, `<name>_put` | as `read_write` |
+| `vector` | `<name>_search` | `<name>_search`, `<name>_upsert` | illegal |
+| `blob` | `<name>_get`, `<name>_list` | `<name>_get`, `<name>_list`, `<name>_put` | illegal |
 
 `full` is opt-in because the writes past a whole-value `set` are a different
 authority: a model that can delete a key can remove what a run depends on. It
 grants all four on every `kv` store, whatever `value_schema` declares: where it
 declares no array field, `<name>_append` has no field to name and refuses every
 call, and so does `<name>_incr` where it declares no `integer` or `number` one —
-each says so in its own description. `<name>_set` takes the conditions
-at `read_write` — a condition narrows a write — as `if` (`absent`, `present`, or
-empty for none) and `if_version` (`-1` for none); an append's field and item
-arrive together as `item`, naming one array field: `{"item": {"tags": "x"}}`.
+each says so in its own description. `full` is a `kv` level: on a `vector` or
+`blob` store it is `invalid-value`, because it is defined by the `kv` writes it
+adds and those kinds have none of them — `read_write` is the widest they take.
+`<name>_set` takes the conditions at `read_write` — a condition narrows a
+write — as `if` (`absent`, `present`, or empty for none) and `if_version` (`-1`
+for none); an append's field and item arrive together as `item`, naming one
+array field: `{"item": {"tags": "x"}}`.
 
 `<name>` is the store's local name, so `store.user_prefs` gives `user_prefs_get`.
 A synthesized name colliding with an attached tool name is

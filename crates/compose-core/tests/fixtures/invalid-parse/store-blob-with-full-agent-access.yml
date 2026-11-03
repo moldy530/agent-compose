@@ -1,0 +1,10 @@
+# rule: `agent_access: full` is a `kv` level (grammar 11.5, PRD resolved q68)
+# code: invalid-value
+# message: `agent_access: full` is not legal on a `blob` store
+# at: 10:17
+# help: `full` is a `kv` level: it adds a `kv` store's `merge`, `append`, `incr` and `delete` tools to `read_write`'s, and a `vector` or `blob` store has none of them to add; `read_write` (the default) is the widest level this kind takes (grammar 11.5, PRD resolved q68)
+store.artifacts:
+  kind: blob
+  scope: global
+  description: Reports the agent files.
+  agent_access: full

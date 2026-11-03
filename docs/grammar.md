@@ -4146,7 +4146,7 @@ store.docs:
 | `embed` | block | `vector` required; others illegal | §11.2 |
 | `backend` | identifier (bare alias) | no | abstract slot; never provider config |
 | `description` | string | no | LLM-facing for agent-attached stores |
-| `agent_access` | `read` \| `read_write` \| `full` | no (default `read_write`) | how much of the synthesized tool surface an attaching agent gets (§11.5) |
+| `agent_access` | `read` \| `read_write` \| `full` | no (default `read_write`); `full` is `kv` only | how much of the synthesized tool surface an attaching agent gets (§11.5) |
 
 **`metadata_schema` is a `vector` key.** Nothing in this grammar reads a `blob`
 store's metadata: no `blob` op takes a `metadata` or a `filter` parameter — `put`
@@ -4487,8 +4487,8 @@ calls — PRD 5.8):
 | kind | `agent_access: read` | `agent_access: read_write` (default) | `agent_access: full` |
 |---|---|---|---|
 | `kv` | `<name>_get` | `<name>_get`, `<name>_set` | `<name>_get`, `<name>_set`, `<name>_merge`, `<name>_append`, `<name>_incr`, `<name>_delete` |
-| `vector` | `<name>_search` | `<name>_search`, `<name>_upsert` | as `read_write` |
-| `blob` | `<name>_get`, `<name>_list` | `<name>_get`, `<name>_list`, `<name>_put` | as `read_write` |
+| `vector` | `<name>_search` | `<name>_search`, `<name>_upsert` | illegal |
+| `blob` | `<name>_get`, `<name>_list` | `<name>_get`, `<name>_list`, `<name>_put` | illegal |
 
 `<name>` is the store's local name (`store.user_prefs` → `user_prefs_get`). A
 synthesized tool name that collides with an attached `tool.*`/`flow.*` tool name
@@ -4505,9 +4505,11 @@ field, `<name>_append`'s `item` has no property to name and every call is
 refused; where it declares no `integer` or `number` field, `<name>_incr`'s
 `field` is a plain string rather than an enum of none, and every call is refused
 too, since whatever it names leaves a value `V` does not admit. Each tool's
-description says so, and each refusal goes back to the model (below). A
-`vector` or `blob` store's writes are the ones `read_write` already grants, so
-`full` there grants exactly that.
+description says so, and each refusal goes back to the model (below). **`full`
+is a `kv` level**: the ruling defines it by the `kv` writes it adds and says
+nothing of a kind that has none of them, so on a `vector` or `blob` store it is
+`invalid-value` rather than a second spelling of `read_write` — which is the
+widest level those kinds take.
 
 Each tool's arguments are its row of §11.4 with the expressions replaced by what
 the model supplies, and they are held to that schema before the store sees them.
@@ -6603,9 +6605,9 @@ is [D116](#d116-embedprovider-is-required-and-no-backend-serves-embeddings)'s.
 **PRD-extending** — see this appendix's preamble. **Amended 2026-11-02** by
 [D152](#d152-a-kv-key-is-versioned-and-a-conditional-or-partial-write-is-serialized-against-every-write-to-its-key),
 which is PRD resolved q68: the enum gains a third level, `full`, granting a
-`kv` store's partial updates and `delete` beside `read_write`'s tools, and
-`read_write`'s `<name>_set` gains the condition arguments. The default and the
-narrowing this entry is about are unchanged.
+`kv` store's partial updates and `delete` beside `read_write`'s tools — legal on
+a `kv` store alone — and `read_write`'s `<name>_set` gains the condition
+arguments. The default and the narrowing this entry is about are unchanged.
 
 Default `read_write`, narrowable to `read`, widenable to `full` (§11.5). **Rationale**: PRD 5.8 synthesizes
 `get`/`set` pairs, so `read_write` is the settled default; a declarative way to
@@ -10882,7 +10884,11 @@ depends on — so it is a third level an author opts into
 ([D37](#d37-agent_access-narrows-the-synthesized-store-tool-surface)). It grants
 all four on every `kv` store — the set the ruling names — so a `V` with no array
 or no numeric field still offers `<name>_append` or `<name>_incr`, and each
-refuses every call back to the model (§11.5).
+refuses every call back to the model (§11.5). It is a `kv` level and nothing
+else: the ruling names `kv`'s tools, and what `full` would mean on a kind with
+no write past `read_write`'s is a question it did not ask, so a `vector` or
+`blob` store declaring it is refused at parse rather than handed an answer
+nobody ratified.
 
 **What this amends, and what it does not.** D149's "per key, last write wins" is
 now the posture of a plain unconditional `set` alone; D67 is untouched and every
@@ -11137,7 +11143,7 @@ store.<name>:
                                     # provider.* ref and is required; a storage
                                     # backend never computes vectors (D116)
   backend: <alias>
-  agent_access: read|read_write|full   # full: kv merge/append/incr/delete tools
+  agent_access: read|read_write|full   # full is kv only: merge/append/incr/delete
 
 provider.<name>: { kind: ..., api_key: "${ENV}", base_url: "${ENV}", ... }
                  # keys beyond kind/description are per kind — 12.1's row is

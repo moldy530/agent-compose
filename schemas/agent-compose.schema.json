@@ -1902,7 +1902,7 @@
         },
         "description": { "description": "Documentation; LLM-facing for agent-attached stores.", "type": "string" },
         "agent_access": {
-          "description": "How much of this store's synthesized tool surface an attaching agent gets (default read_write): `read` withholds the writes, `read_write` adds the whole-value write, and `full` adds a kv store's partial updates and delete - merge, append, incr, delete (grammar 11.5, PRD resolved q68).",
+          "description": "How much of this store's synthesized tool surface an attaching agent gets (default read_write): `read` withholds the writes, `read_write` adds the whole-value write, and `full` adds a kv store's partial updates and delete - merge, append, incr, delete. `full` is a kv level and is refused on a vector or blob store (grammar 11.5, PRD resolved q68).",
           "enum": ["read", "read_write", "full"]
         }
       },
@@ -1919,16 +1919,24 @@
         {
           "if": { "properties": { "kind": { "const": "vector" } }, "required": ["kind"] },
           "then": {
-            "description": "A vector store declares `embed:` and MAY declare `metadata_schema:`; `value_schema` is kv's (grammar 11.1).",
+            "description": "A vector store declares `embed:` and MAY declare `metadata_schema:`; `value_schema` is kv's (grammar 11.1), and so is `agent_access: full`, whose extra tools are a kv store's writes (grammar 11.5, PRD resolved q68).",
             "required": ["embed"],
-            "properties": { "value_schema": false }
+            "properties": {
+              "value_schema": false,
+              "agent_access": { "enum": ["read", "read_write"] }
+            }
           }
         },
         {
           "if": { "properties": { "kind": { "const": "blob" } }, "required": ["kind"] },
           "then": {
-            "description": "A blob store declares neither schema: `value_schema` is kv's, and no blob op reads metadata, so `metadata_schema` would be inert (grammar 11.1, Decision D113).",
-            "properties": { "value_schema": false, "metadata_schema": false, "embed": false }
+            "description": "A blob store declares neither schema: `value_schema` is kv's, and no blob op reads metadata, so `metadata_schema` would be inert (grammar 11.1, Decision D113). `agent_access: full` is kv's too, whose extra tools are a kv store's writes (grammar 11.5, PRD resolved q68).",
+            "properties": {
+              "value_schema": false,
+              "metadata_schema": false,
+              "embed": false,
+              "agent_access": { "enum": ["read", "read_write"] }
+            }
           }
         }
       ]

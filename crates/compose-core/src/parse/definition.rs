@@ -660,6 +660,29 @@ fn store(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> StoreDef {
     let agent_access = fields
         .take("agent_access")
         .and_then(|node| lexical::keyword(node, "`agent_access`", AGENT_ACCESS, cx));
+    // `full` is a `kv` level. PRD resolved q68 defines it by `kv`'s tools —
+    // `read_write`'s plus `merge`, `append`, `incr` and `delete` — and says
+    // nothing of what it would grant on a kind with none of them, so it is
+    // refused there rather than read as an alias of `read_write`.
+    if let (Some(kind), Some(access)) = (kind.as_ref(), agent_access.as_ref())
+        && access.value == AgentAccess::Full
+        && kind.value != StoreKind::Kv
+    {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidValue,
+                access.span.clone(),
+                format!(
+                    "`agent_access: full` is not legal on a `{}` store",
+                    kind.value.as_str()
+                ),
+            )
+            .with_label(kind.span.clone(), "the kind is declared here")
+            .with_help(
+                "`full` is a `kv` level: it adds a `kv` store's `merge`, `append`, `incr` and `delete` tools to `read_write`'s, and a `vector` or `blob` store has none of them to add; `read_write` (the default) is the widest level this kind takes (grammar 11.5, PRD resolved q68)",
+            ),
+        );
+    }
 
     StoreDef {
         kind,

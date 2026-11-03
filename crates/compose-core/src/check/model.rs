@@ -932,9 +932,13 @@ pub(crate) fn numeric_fields(value_schema: Option<&FieldMap>) -> Vec<&Field> {
 /// the access level's and not the schema's, so a `V` with no array field still
 /// offers `<name>_append` — whose `item` then has no field to name, so every
 /// call is refused back to the model ([`store_tool_input`]) — and one with no
-/// numeric field still offers `<name>_incr`. A `vector` or `blob` store's
-/// writes are the ones `read_write` already grants, so `full` there grants
-/// exactly that.
+/// numeric field still offers `<name>_incr`.
+///
+/// `full` is a `kv` level alone: the ruling defines it by `kv`'s tools, and the
+/// parser refuses it on a `vector` or `blob` store (`parse::definition`), so no
+/// validated composition reaches those two arms with it. They answer
+/// `read_write`'s set — never more — because the match has to be total, and an
+/// IR that skipped the parser is still not handed a write it did not ask for.
 pub(crate) fn store_tools(kind: StoreKind, access: AgentAccess) -> Vec<StoreOp> {
     match (kind, access) {
         (StoreKind::Kv, AgentAccess::Read) => vec![StoreOp::Get],
@@ -1668,7 +1672,10 @@ mod tests {
     /// Grammar 11.5's table read through `agent_access:`: `full` adds a `kv`
     /// store's partial updates and `delete` — all four, whatever `V` declares,
     /// which is the set PRD resolved q68 names — and `read_write` keeps exactly
-    /// the two tools it always had.
+    /// the two tools it always had. `full` on a `vector` or `blob` store is a
+    /// parse error (`invalid-parse/store-blob-with-full-agent-access.yml`), so
+    /// all this asserts of those arms is that they grant `read_write`'s set and
+    /// nothing past it.
     #[test]
     fn full_access_adds_the_partial_updates_and_delete_and_read_write_does_not() {
         assert_eq!(
@@ -1694,7 +1701,7 @@ mod tests {
         assert_eq!(
             store_tools(StoreKind::Vector, AgentAccess::Full),
             store_tools(StoreKind::Vector, AgentAccess::ReadWrite),
-            "a `vector` store's writes are the ones `read_write` already grants"
+            "an IR that skipped the parser's refusal is handed no write it did not ask for"
         );
         assert_eq!(
             store_tools(StoreKind::Blob, AgentAccess::Full),
