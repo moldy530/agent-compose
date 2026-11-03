@@ -1,0 +1,17 @@
+# rule: a store op's parameter list is exact, and `after:` is a `list`'s cursor (grammar 11.4, PRD resolved q70)
+# code: invalid-value
+# message: `after` is not a parameter of the `get` op
+# at: 14:7
+# help: `get` takes `key`
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    load:
+      store: store.memory
+      op: get
+      key: "execution.session_key"
+      after: "'k'"
+  edges:
+    - { from: start, to: load }
+    - { from: load, to: end }

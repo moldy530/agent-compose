@@ -396,6 +396,8 @@ fn node_kind<'ir>(kind: &'ir NodeKind, site: &str, found: &mut Vec<Expression<'i
                 (params.prefix.as_ref(), "prefix"),
                 (params.by.as_ref(), "by"),
                 (params.if_version.as_ref(), "if_version"),
+                (params.after.as_ref(), "after"),
+                (params.keys.as_ref(), "keys"),
             ] {
                 if let Some(source) = expression {
                     found.push(Expression {
@@ -533,7 +535,9 @@ mod tests {
         r"`flow.surfaces` node `keep`'s `key:` = state.note",
         r"`flow.surfaces` node `keep`'s `metadata:` `tag` = 'b'",
         r"`flow.surfaces` node `keep`'s `value:` = state.note",
+        r"`flow.surfaces` node `listing`'s `after:` = state.note + '/'",
         r"`flow.surfaces` node `listing`'s `prefix:` = state.note",
+        r"`flow.surfaces` node `many`'s `keys:` = [state.note]",
         r"`flow.surfaces` node `named`'s `input:` `q` = state.note",
         r"`flow.surfaces` node `plan`'s `input:` `text` = input.goal",
         r"`flow.surfaces` node `routed`'s `map` route `default` `input:` `text` = finding.kind",
@@ -700,6 +704,12 @@ flow.surfaces:
       op: list
       limit: 10
       prefix: "state.note"
+      after: "state.note + '/'"
+
+    many:
+      store: store.notes
+      op: get_many
+      keys: "[state.note]"
 
     fan:
       map:
@@ -752,7 +762,8 @@ flow.surfaces:
     - { from: named, to: save }
     - { from: save, to: find }
     - { from: find, to: keep }
-    - { from: keep, to: listing }
+    - { from: keep, to: many }
+    - { from: many, to: listing }
     - { from: listing, to: sub, when: "state.note != ''" }
     - { from: listing, to: end, else: true }
     - { from: sub, to: end }

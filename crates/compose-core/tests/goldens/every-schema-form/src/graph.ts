@@ -305,6 +305,64 @@ const flowShapeNodeDropShape: runtime.Shape = {
   }
 };
 
+/** `flow.shape` node `page` — the `page.output` root its guards read. */
+const flowShapeNodePageShape: runtime.Shape = {
+  "properties": {
+    "entries": {
+      "items": {
+        "properties": {
+          "key": "string",
+          "value": {
+            "properties": {
+              "hits": "int",
+              "marks": {
+                "items": "string"
+              },
+              "owner": "string"
+            }
+          },
+          "version": "int"
+        }
+      }
+    },
+    "keys": {
+      "items": "string"
+    },
+    "next": "string"
+  }
+};
+
+/** `flow.shape` node `tally` — the `tally.output` root its guards read. */
+const flowShapeNodeTallyShape: runtime.Shape = {
+  "properties": {
+    "count": "int"
+  }
+};
+
+/** `flow.shape` node `fetch` — the `fetch.output` root its guards read. */
+const flowShapeNodeFetchShape: runtime.Shape = {
+  "properties": {
+    "entries": {
+      "items": {
+        "properties": {
+          "found": "bool",
+          "key": "string",
+          "value": {
+            "properties": {
+              "hits": "int",
+              "marks": {
+                "items": "string"
+              },
+              "owner": "string"
+            }
+          },
+          "version": "int"
+        }
+      }
+    }
+  }
+};
+
 /**
  * `provider.aws` — a `bedrock` connection (grammar 12.1). Every value is read when a node calls it, never at import: a build carries no credential and `./index.ts` is where their presence is checked (PRD 5.9).
  */
@@ -1552,6 +1610,90 @@ const flowShapeNodeDrop: runtime.NodeDescriptor = {
   }),
   writes: [],
   edges: [
+    { to: "page" },
+  ],
+};
+
+/** `flow.shape` node `page` — a `list` on `store.ledger` (grammar 8.8). */
+const flowShapeNodePage: runtime.NodeDescriptor = {
+  flow: "flow.shape",
+  node: "page",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from the built-in, `on_error` from the built-in.
+  policy: {
+    onError: "fail",
+  },
+  shapes: { input: flowShapeShape, state: stateShape, output: flowShapeNodePageShape },
+  input: (roots) => ({
+    prefix: String(runtime.toJson(runtime.evaluate("'goal/'", roots))),
+    after: String(runtime.toJson(runtime.evaluate("state.latest", roots))),
+    limit: 50,
+    includeValues: true,
+  }),
+  run: async (input, context, view) => ({
+    output: await stores.runStoreOp(
+      storeLedger,
+      "list",
+      input as stores.StoreParams,
+      context,
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "page")].join("/") },
+    ),
+  }),
+  writes: [],
+  edges: [
+    { to: "tally" },
+  ],
+};
+
+/** `flow.shape` node `tally` — a `count` on `store.ledger` (grammar 8.8). */
+const flowShapeNodeTally: runtime.NodeDescriptor = {
+  flow: "flow.shape",
+  node: "tally",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from the built-in, `on_error` from the built-in.
+  policy: {
+    onError: "fail",
+  },
+  shapes: { input: flowShapeShape, state: stateShape, output: flowShapeNodeTallyShape },
+  input: (roots) => ({
+    prefix: String(runtime.toJson(runtime.evaluate("'goal/'", roots))),
+  }),
+  run: async (input, context, view) => ({
+    output: await stores.runStoreOp(
+      storeLedger,
+      "count",
+      input as stores.StoreParams,
+      context,
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "tally")].join("/") },
+    ),
+  }),
+  writes: [],
+  edges: [
+    { to: "fetch" },
+  ],
+};
+
+/** `flow.shape` node `fetch` — a `get_many` on `store.ledger` (grammar 8.8). */
+const flowShapeNodeFetch: runtime.NodeDescriptor = {
+  flow: "flow.shape",
+  node: "fetch",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from the built-in, `on_error` from the built-in.
+  policy: {
+    onError: "fail",
+  },
+  shapes: { input: flowShapeShape, state: stateShape, output: flowShapeNodeFetchShape },
+  input: (roots) => ({
+    keys: runtime.toJson(runtime.evaluate("[input.goal, state.latest]", roots)),
+  }),
+  run: async (input, context, view) => ({
+    output: await stores.runStoreOp(
+      storeLedger,
+      "get_many",
+      input as stores.StoreParams,
+      context,
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "fetch")].join("/") },
+    ),
+  }),
+  writes: [],
+  edges: [
     { to: END },
   ],
 };
@@ -1590,6 +1732,15 @@ function flowShape() {
       ends: ["drop"],
     })
     .addNode("drop", (state: GraphState) => runtime.runNode(flowShapeNodeDrop, state), {
+      ends: ["page"],
+    })
+    .addNode("page", (state: GraphState) => runtime.runNode(flowShapeNodePage, state), {
+      ends: ["tally"],
+    })
+    .addNode("tally", (state: GraphState) => runtime.runNode(flowShapeNodeTally, state), {
+      ends: ["fetch"],
+    })
+    .addNode("fetch", (state: GraphState) => runtime.runNode(flowShapeNodeFetch, state), {
       ends: [END],
     })
     .addEdge(START, "shape")
@@ -1607,7 +1758,7 @@ const flowShapeGraph = flowShape();
 const flowShapeBinding: runtime.SubflowBinding = {
   address: "flow.shape",
   outputs: ["draft", "notes"],
-  recursionLimit: 36,
+  recursionLimit: 39,
   stream: (initial, options) =>
     flowShapeGraph.stream(initial, {
       ...options,
@@ -1699,7 +1850,7 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
     inputKinds: { "goal": "string", "goals": "json", },
     outputs: ["draft", "notes"],
     sessionStores: [],
-    recursionLimit: 36,
+    recursionLimit: 39,
     parse: (inputs: unknown) =>
       runtime.parseResult(flowShapeInputs, inputs, "the `inputs:` of `flow.shape`") as Record<string, unknown>,
     stream: (initial, options) =>

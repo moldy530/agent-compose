@@ -72,6 +72,20 @@
 // and `deduped: true`, so a retried successful claim never fails against its
 // own first write.
 //
+// # Reading at scale (PRD resolved q70)
+//
+// A `kv` `list` is one **page**: the first `limit` keys after an exclusive
+// cursor (`after:`, the last key of the page before), in UTF-8 byte order on
+// every arm, with a `next` exactly when more remain and — under
+// `include_values: true` — each key's value and version beside it. `count`
+// answers how many keys a prefix holds, and `get_many` reads up to 1000 keys
+// in one statement and answers them in the order asked. All three are reads:
+// recorded, answered out of the record on a replay, carrying no idempotency
+// key. They are one implementation every `kv` arm runs ([`partitionRead`]),
+// and which rows they see goes through one fragment ([`liveRows`]): the keys
+// alive at the op's clock, so a key whose time is up is neither listed,
+// counted nor read (PRD resolved q69).
+//
 // Grammar 14.3's other providers — `redis`, `chroma`, `pgvector`, `qdrant`,
 // `s3`, `gcs` — are still M3's ("production `storage_backends` behind the store
 // plugin interface"), and a binding that resolves to one says so at the op
@@ -217,14 +231,16 @@
 // and a write that declined changes nothing, its key's expiry included.
 //
 // **An expired key is absent**, at the instant it expires and to everything:
-// `get` and `list` do not see it, and neither does any condition — `if: absent`
-// holds of it, `if: present` and `if_version:` do not — so a `set` with
-// `if: absent` on an expired key applies and takes it, which with PRD resolved
-// q68's versions is a lease. There is one notion of "alive" and it is
-// [`live`]: a write reads its key through it under the write's lock, and the SQL
-// reads carry the same inequality as [`LIVE`]. Expiry consumes no version — the
-// sequence is never touched by it — so a key set again after expiring takes the
-// partition's next one, which is past every version the key ever showed.
+// `get`, `list`, `count` and `get_many` do not see it, and neither does any
+// condition — `if: absent` holds of it, `if: present` and `if_version:` do not
+// — so a `set` with `if: absent` on an expired key applies and takes it, which
+// with PRD resolved q68's versions is a lease. There is one notion of "alive"
+// and it is [`live`]: a write reads its key through it under the write's lock,
+// and the SQL reads carry the same inequality as [`liveClause`], which every
+// read of many keys applies through [`liveRows`]. Expiry consumes no version —
+// the sequence is never touched by it — so a key set again after expiring
+// takes the partition's next one, which is past every version the key ever
+// showed.
 //
 // **Removal is lazy, on a stated schedule.** An expired row stays in storage,
 // invisible, until one of two things happens first: a write to its partition,
@@ -426,8 +442,11 @@ export interface StoreBinding {
 // What an op takes (grammar 11.4)
 // ---------------------------------------------------------------------------
 
-/** The ops of grammar 11.4's catalog — its seven, and PRD resolved q68's three. */
-export type StoreOp = "get" | "set" | "delete" | "list" | "search" | "upsert" | "put" | "merge" | "append" | "incr";
+/**
+ * The ops of grammar 11.4's catalog — its seven, PRD resolved q68's three
+ * partial updates, and q70's two reads.
+ */
+export type StoreOp = "get" | "set" | "delete" | "list" | "search" | "upsert" | "put" | "merge" | "append" | "incr" | "count" | "get_many";
 
 /** The literal conditions a `kv` write's `if:` takes (grammar 11.4). */
 export type StoreCondition = "absent" | "present";
@@ -478,6 +497,19 @@ export interface StoreParams {
    * (PRD resolved q69). Absent means the default, where there is one.
    */
   readonly ttl?: number | "never";
+  /**
+   * `after:` — a `kv` `list`'s exclusive cursor: the last key of the page
+   * before, as its `next` answered it (PRD resolved q70).
+   */
+  readonly after?: string;
+  /** `include_values:` — a `kv` `list` that answers its keys' values too. */
+  readonly includeValues?: boolean;
+  /**
+   * `keys:` — what a `get_many` reads. The expression's JSON as it evaluated,
+   * so a list of strings is what [`getManyKeys`] holds it to rather than what
+   * the type says it already is.
+   */
+  readonly keys?: unknown;
 }
 
 /** Where an op was issued from, and what key it carries (grammar 9.4). */
@@ -493,7 +525,13 @@ export interface StoreSite {
   readonly idempotencyKey?: string;
 }
 
-/** The ops that write, which are the ones a key and a dedupe apply to. */
+/**
+ * The ops that write, which are the ones a key and a dedupe apply to.
+ *
+ * Every other op is a **read**: recorded, answered out of the record on a
+ * replay, and carrying no idempotency key — a `list` page and PRD resolved
+ * q70's `count` and `get_many` exactly as a `get` (PRD resolved q29).
+ */
 function writes(op: StoreOp): boolean {
   return (
     op === "set" ||
@@ -1516,6 +1554,11 @@ export async function runStoreOp(
   const execution = context.execution;
   const scopeKey = partition(store, execution);
   const key = params.key;
+  // A `get_many`'s keys are a CEL list whose length nothing knew before the
+  // node ran, so the most one reads is held here — before the journal, so a
+  // refused read is a node failure rather than an effect anybody recorded, and
+  // a replay refuses it the same way (PRD resolved q70).
+  if (op === "get_many") getManyKeys(store, params);
 
   // At-least-once, deduped on the key (grammar 9.4). Asked before the effect and
   // recorded with it in one transaction, so an attempt that failed half way
@@ -1701,7 +1744,8 @@ interface Held {
  * resolved q69): every arm reads the row a write holds through [`heldRow`],
  * which answers `undefined` for one [`live`] says has expired — so the
  * conditions, the decline and the partial updates see an expired key exactly
- * as they see a missing one, and a `get` and a `list` do by the same inequality.
+ * as they see a missing one, and a `get`, a `list`, a `count` and a `get_many`
+ * do by the same inequality ([`liveRows`]).
  */
 function absent(held: Held | undefined): held is undefined {
   return held === undefined;
@@ -1714,7 +1758,7 @@ function absent(held: Held | undefined): held is undefined {
 function heldRow(row: Row | null | undefined, now: number): Held | undefined {
   if (row === null || row === undefined) return undefined;
   if (!live(row["expires_at"], now)) return undefined;
-  return { value: JSON.parse(String(row["value"])) as unknown, version: Number(row["version"]) };
+  return heldOf(row);
 }
 
 /** What one `kv` write decided, given what its key held. */
@@ -2035,8 +2079,21 @@ function localKv(
         ? { found: false }
         : { value: held.value, found: true, version: held.version };
     }
+    // The reads of PRD resolved q70, as statements every arm shares
+    // ([`partitionRead`]): SQLite takes them as they are written, and judges
+    // a key's expiry by the op's clock, bound (PRD resolved q69).
     case "list":
-      return tabular(store, op, params, scopeKey, database, undefined, now);
+    case "count":
+    case "get_many": {
+      const read = partitionRead(store, op, params, {
+        from: "entries WHERE scope_key = ?",
+        bound: [scopeKey],
+        now: { sql: "?", bound: [now] },
+      });
+      return read.answer(
+        read.query === undefined ? [] : (database.all(read.query.sql, [...read.query.bound]) as Row[]),
+      );
+    }
     case "set":
     case "delete":
     case "merge":
@@ -2114,10 +2171,8 @@ function nextLocalVersion(database: Database, scopeKey: string): number {
 }
 
 /**
- * The `vector` rows of grammar 11.4's catalog, and the `kv` `list` — which
- * answers the keys alive at `now`, the clock [`localKv`] read for the op, so
- * an expired key is not listed (PRD resolved q69). A `vector` row never
- * expires, and no `vector` op reads a clock.
+ * The `vector` rows of grammar 11.4's catalog. A `vector` row never expires,
+ * and no `vector` op reads a clock.
  */
 function tabular(
   store: StoreBinding,
@@ -2126,7 +2181,6 @@ function tabular(
   scopeKey: string,
   database: Database,
   vector: number[] | undefined,
-  now?: number,
 ): Record<string, unknown> {
   switch (op) {
     case "delete": {
@@ -2136,23 +2190,6 @@ function tabular(
         key,
       ]);
       return { deleted: result.changes > 0 };
-    }
-    case "list": {
-      const limit = required(params.limit, "limit", store);
-      const prefix = params.prefix ?? "";
-      const rows = database.all(
-        "SELECT key FROM entries WHERE scope_key = ? AND substr(key, 1, ?) = ? " +
-          `AND ${liveClause("?")} ORDER BY key LIMIT ?`,
-        // Characters, not JavaScript string length. SQLite's `substr` over TEXT
-        // counts **characters**, and a JavaScript `.length` counts UTF-16 code
-        // units — so an emoji in the prefix makes the two disagree by one per
-        // astral character, and the comparison silently answers with the wrong
-        // keys (usually none) for a `prefix:` grammar 11.4 puts no restriction
-        // on. Spreading the string iterates code points, which is what SQLite
-        // is counting on the other side.
-        [scopeKey, [...prefix].length, prefix, now ?? localNow(), limit],
-      ) as Row[];
-      return { keys: rows.map((row) => String(row["key"])) };
     }
     case "upsert": {
       const key = required(params.key, "key", store);
@@ -2210,6 +2247,245 @@ function tabular(
     }
     default:
       throw new Error(`\`${store.address}\` is \`kind: ${store.kind}\` and takes no \`${op}\``);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Reading many keys at once: a page, a count, a `get_many` (PRD resolved q70)
+// ---------------------------------------------------------------------------
+//
+// One implementation of the three, as statements every `kv` arm runs: SQLite
+// takes them as they are written and a dialled arm through its placeholder
+// dialect, so the cursor, the order a page comes back in, what `next` means and
+// which keys a `count` counts are decided once — and "the runtime cannot tell
+// which arm answered" stays true of them by construction rather than by review.
+// The only thing an arm supplies is where its partition's rows are
+// ([`PartitionRows`]).
+//
+// **The order is UTF-8 byte order on every arm**, and each arm's key column is
+// what decides it: SQLite's default `BINARY` collation compares the UTF-8 the
+// file holds with `memcmp`, the Postgres arm declares the column `COLLATE "C"`,
+// and the MySQL arm `utf8mb4_0900_bin`, a NO PAD binary collation, with
+// `max_sort_length` sized past the column so a sort compares the whole key. A
+// comparison between the column and a bound value is decided by the column's
+// collation on every arm — a column's collation outranks a parameter's or a
+// literal's on both servers — so the cursor's `"key" > ?` is the same byte
+// comparison `ORDER BY "key"` sorts by, and a page boundary can neither skip a
+// key the order put after it nor repeat one it put before. UTF-8 byte order is
+// code-point order, which is also [`byUtf8Bytes`] — the order a `blob` `list`
+// sorts its file names in.
+//
+// **A page is keyset, not offset.** It is "the first `limit` keys after the
+// cursor", asked for as `limit + 1` so the extra row says whether any remain:
+// `next` is present exactly when one does, and is the last key of the page,
+// which is the cursor the page after it takes. On SQLite and Postgres the
+// cursor is a range scan of the partition's primary key, so a walk costs a
+// page per page however deep it has gone; the MySQL arm's primary key is a
+// hash (`MYSQL_STORE_SCHEMA`), so its partition index narrows the range on the
+// key's leading characters and the page is sorted from there — the same
+// answer, at a cost that grows with what is left of the walk. And a write
+// landing mid-walk moves no page the walk has yet to read: a key added behind
+// the cursor is not seen by this walk, one added ahead of it is, a key deleted
+// ahead of it is not, and nothing already answered is answered twice — which
+// an offset could promise none of.
+//
+// **Which rows are live is one fragment, [`liveRows`].** Every read of many
+// rows applies it, on every arm, and the single-row reads answer through
+// [`heldRow`]. Both are [`live`]'s one inequality — a row with no expiry, or
+// one whose expiry is still ahead of the op's clock — which is how PRD
+// resolved q69's expiry makes a key whose time is up invisible to every read
+// and uncounted by every `count`: a page, its `count`, a `get_many` and a
+// `get` cannot come to disagree about which keys a partition holds. The clock
+// sits inside the clause: bound on the local backend, the server's own on a
+// dialled one, so a read there is one statement judged by the clock its
+// writers dated their keys with.
+
+/** The most keys one `get_many` reads (grammar 11.4, PRD resolved q70). */
+const GET_MANY_MAX_KEYS = 1000;
+
+/** One statement and what it binds, in `?` placeholders. */
+interface Query {
+  readonly sql: string;
+  readonly bound: readonly Bound[];
+}
+
+/**
+ * Where one `kv` partition's rows are: a table and the condition that selects
+ * the partition in it, in `?` placeholders, with what those bind, and the
+ * instant the read judges a key's expiry by — the whole of what differs
+ * between the arms for a read of many rows.
+ */
+interface PartitionRows {
+  readonly from: string;
+  readonly bound: readonly Bound[];
+  /**
+   * The op's clock, as an expression and what it binds: the instant the local
+   * backend read for the op, bound as a `?`, and the server's own clock
+   * shifted by [`STORE_CLOCK_OFFSET`] on a dialled one (PRD resolved q69).
+   */
+  readonly now: Query;
+}
+
+/** A read of many rows, planned: what to ask, and what the rows answer. */
+interface PartitionRead {
+  /** `undefined` where there is nothing to ask — a `get_many` of no keys. */
+  readonly query: Query | undefined;
+  readonly answer: (rows: readonly Row[]) => Record<string, unknown>;
+}
+
+/**
+ * The row filter every multi-row `kv` read applies, on every arm: which
+ * stored rows are live at `now`.
+ *
+ * [`live`]'s inequality, as [`liveClause`] writes it over the op's clock: a
+ * row with no expiry, or one whose expiry is still ahead of `now`. "A key whose
+ * time is up is invisible to every read" (PRD resolved q69) is true because it
+ * is this one place for a `list`, a `count` and a `get_many`, and [`heldRow`]
+ * — the same inequality — for a single key, and nowhere else.
+ */
+function liveRows(now: Query): Query {
+  return { sql: liveClause(now.sql), bound: now.bound };
+}
+
+/**
+ * The `prefix:` filter, as one condition on the key column — the empty prefix
+ * when there is none, which every key has.
+ *
+ * Characters, not JavaScript string length. `SUBSTR` over text counts
+ * **characters** on all three servers, and a JavaScript `.length` counts UTF-16
+ * code units — so an emoji in the prefix makes the two disagree by one per
+ * astral character, and the comparison silently answers with the wrong keys
+ * (usually none) for a `prefix:` grammar 11.4 puts no restriction on. Spreading
+ * the string iterates code points, which is what the servers count.
+ */
+function underPrefix(prefix: string | undefined): Query {
+  const held = prefix ?? "";
+  return { sql: 'SUBSTR("key", 1, ?) = ?', bound: [[...held].length, held] };
+}
+
+/**
+ * A `get_many`'s keys, held to what grammar 11.4's row says they are: a list
+ * of at most [`GET_MANY_MAX_KEYS`] strings.
+ *
+ * `validate` types the expression as a list of strings, and its **length** is
+ * the half no type decides — so the bound is a refusal the node fails with,
+ * by its own retry and error policy, naming the count and the bound. The shape
+ * is checked too, for the value a `dyn` expression can still produce.
+ */
+function getManyKeys(store: StoreBinding, params: StoreParams): readonly string[] {
+  const keys = params.keys;
+  if (!Array.isArray(keys) || keys.some((key) => typeof key !== "string")) {
+    throw new Error(
+      `the \`keys\` of a \`get_many\` on \`${store.address}\` evaluated to ${excerpt(keys)}, which is not a list of strings (grammar 11.4)`,
+    );
+  }
+  if (keys.length > GET_MANY_MAX_KEYS) {
+    throw new Error(
+      `a \`get_many\` on \`${store.address}\` was asked for ${keys.length} keys, and one \`get_many\` reads at most ${GET_MANY_MAX_KEYS} (grammar 11.4, PRD resolved q70): read them in slices of ${GET_MANY_MAX_KEYS} or fewer, or walk the store a page at a time with \`list\` and \`after:\``,
+    );
+  }
+  return keys as readonly string[];
+}
+
+/** A stored row's value and version, as every `kv` read answers them. */
+function heldOf(row: Row): Held {
+  return { value: JSON.parse(String(row["value"])) as unknown, version: Number(row["version"]) };
+}
+
+/**
+ * One of PRD resolved q70's reads of a partition — a `list` page, a `count`,
+ * a `get_many` — as the statement an arm runs over `rows` and the answer its
+ * result is.
+ */
+function partitionRead(
+  store: StoreBinding,
+  op: StoreOp,
+  params: StoreParams,
+  rows: PartitionRows,
+): PartitionRead {
+  const alive = liveRows(rows.now);
+  switch (op) {
+    case "list": {
+      const limit = required(params.limit, "limit", store);
+      const prefix = underPrefix(params.prefix);
+      const values = params.includeValues === true;
+      const cursor: Query =
+        params.after === undefined ? { sql: "1 = 1", bound: [] } : { sql: '"key" > ?', bound: [params.after] };
+      const query: Query = {
+        sql:
+          `SELECT "key"${values ? ", value, version" : ""} FROM ${rows.from} ` +
+          `AND ${prefix.sql} AND ${cursor.sql} AND ${alive.sql} ORDER BY "key" LIMIT ?`,
+        // One past the page, so the extra row says whether another follows.
+        bound: [...rows.bound, ...prefix.bound, ...cursor.bound, ...alive.bound, limit + 1],
+      };
+      return {
+        query,
+        answer: (found) => {
+          const page = found.slice(0, limit);
+          const last = page[page.length - 1];
+          return {
+            keys: page.map((row) => String(row["key"])),
+            // The cursor of the page after this one, there exactly when the
+            // extra row was — so a page that ends the partition answers none,
+            // and writes nothing (Decision D110).
+            ...(found.length > limit && last !== undefined ? { next: String(last["key"]) } : {}),
+            ...(values
+              ? {
+                  entries: page.map((row) => {
+                    const held = heldOf(row);
+                    return { key: String(row["key"]), value: held.value, version: held.version };
+                  }),
+                }
+              : {}),
+          };
+        },
+      };
+    }
+    case "count": {
+      const prefix = underPrefix(params.prefix);
+      return {
+        query: {
+          sql: `SELECT COUNT(*) AS held FROM ${rows.from} AND ${prefix.sql} AND ${alive.sql}`,
+          bound: [...rows.bound, ...prefix.bound, ...alive.bound],
+        },
+        // `BIGINT` arrives as a string from `pg` and a number elsewhere.
+        answer: (found) => ({ count: Number(found[0]?.["held"] ?? 0) }),
+      };
+    }
+    case "get_many": {
+      const keys = getManyKeys(store, params);
+      // One statement however many keys, each asked for once: a key named
+      // twice is answered twice below, out of one row.
+      const distinct = [...new Set(keys)];
+      return {
+        query:
+          distinct.length === 0
+            ? undefined
+            : {
+                sql:
+                  `SELECT "key", value, version FROM ${rows.from} ` +
+                  `AND "key" IN (${distinct.map(() => "?").join(", ")}) AND ${alive.sql}`,
+                bound: [...rows.bound, ...distinct, ...alive.bound],
+              },
+        answer: (found) => {
+          const byKey = new Map<string, Held>();
+          for (const row of found) byKey.set(String(row["key"]), heldOf(row));
+          return {
+            // In the order asked, one entry per key asked for. A miss answers
+            // `found: false` and no `value` or `version`, which is a `get`'s
+            // miss one key at a time (Decision D110, PRD resolved q68).
+            entries: keys.map((key) => {
+              const held = byKey.get(key);
+              return absent(held)
+                ? { key, found: false }
+                : { key, value: held.value, found: true, version: held.version };
+            }),
+          };
+        },
+      };
+    }
+    default:
+      throw new Error(`\`${store.address}\` is \`kind: kv\` and reads no \`${op}\` of many keys`);
   }
 }
 
@@ -3003,11 +3279,12 @@ class RemoteKv {
     scopeKey: string,
   ): Promise<Record<string, unknown>> {
     // A read is one statement, so it carries the server's clock in its own
-    // `WHERE` rather than asking for it first: an expired key is not found and
-    // not listed, by the clock every writer of this store dated it with (PRD
-    // resolved q69).
-    const alive = liveClause(`(${this.#driver.dialect.clock}) + ?`);
+    // `WHERE` rather than asking for it first: an expired key is not found,
+    // listed, counted or read by a `get_many`, by the clock every writer of
+    // this store dated it with (PRD resolved q69).
     const offset = clockOffset();
+    const clock: Query = { sql: `(${this.#driver.dialect.clock}) + ?`, bound: [offset] };
+    const alive = liveClause(clock.sql);
     switch (op) {
       case "get": {
         const key = required(params.key, "key", store);
@@ -3028,17 +3305,19 @@ class RemoteKv {
               version: Number(found[0]?.["version"]),
             };
       }
-      case "list": {
-        const limit = required(params.limit, "limit", store);
-        const prefix = params.prefix ?? "";
-        const rows = await this.#all(
-          'SELECT "key" FROM store_entries WHERE store = ? AND scope_key = ? ' +
-            `AND SUBSTR("key", 1, ?) = ? AND ${alive} ORDER BY "key" LIMIT ?`,
-          // Characters, not JavaScript string length — the local backend's note
-          // on `substr` applies to both servers, which count characters too.
-          [store.name, scopeKey, [...prefix].length, prefix, offset, limit],
-        );
-        return { keys: rows.map((row) => String(row["key"])) };
+      // The reads of PRD resolved q70, as the statements every arm shares
+      // ([`partitionRead`]), over this server's placeholder dialect — and its
+      // clock, so a page, a `count` and a `get_many` judge a key's expiry by
+      // the same instant a `get` does.
+      case "list":
+      case "count":
+      case "get_many": {
+        const read = partitionRead(store, op, params, {
+          from: "store_entries WHERE store = ? AND scope_key = ?",
+          bound: [store.name, scopeKey],
+          now: clock,
+        });
+        return read.answer(read.query === undefined ? [] : await this.#all(read.query.sql, read.query.bound));
       }
       default:
         throw new Error(`\`${store.address}\` is \`kind: ${store.kind}\` and takes no \`${op}\``);

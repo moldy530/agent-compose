@@ -1,0 +1,14 @@
+# rule: a `get_many` takes its `keys` (grammar 11.4, PRD resolved q70)
+# code: missing-key
+# message: missing required key `keys` in node `fetch`: the `get_many` op takes `keys`
+# at: 10:7
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    fetch:
+      store: store.memory
+      op: get_many
+  edges:
+    - { from: start, to: fetch }
+    - { from: fetch, to: end }

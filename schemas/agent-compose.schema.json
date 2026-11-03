@@ -1488,8 +1488,8 @@
       "properties": {
         "store": { "description": "The store definition to operate on.", "$ref": "#/$defs/storeRef" },
         "op": {
-          "description": "The operation. Legal values depend on the store's kind: kv = get|set|delete|list|merge|append|incr, vector = search|upsert|delete, blob = get|put|delete|list. Each op's output schema is derived and fixed (grammar 11.4). A `get` that misses returns `found: false` and no `value` or `version`, so a `writes:` of `value` performs no write that pass and reading `<node>.output.value` fails the execution - route on `found` instead (Decision D110). A kv write answers `applied`: a write whose `if:`/`if_version:` condition did not hold changes nothing and answers `applied: false` - a result to route on, never a node error (PRD resolved q68).",
-          "enum": ["get", "set", "delete", "list", "search", "upsert", "put", "merge", "append", "incr"]
+          "description": "The operation. Legal values depend on the store's kind: kv = get|set|delete|list|merge|append|incr|count|get_many, vector = search|upsert|delete, blob = get|put|delete|list. Each op's output schema is derived and fixed (grammar 11.4). A `get` that misses returns `found: false` and no `value` or `version`, so a `writes:` of `value` performs no write that pass and reading `<node>.output.value` fails the execution - route on `found` instead (Decision D110). A kv write answers `applied`: a write whose `if:`/`if_version:` condition did not hold changes nothing and answers `applied: false` - a result to route on, never a node error (PRD resolved q68). A kv `list` is one page: its `next` is the cursor of the page after it and is absent on the last page, and its `entries` are present only under `include_values: true`; `count` and `get_many` are reads (PRD resolved q70).",
+          "enum": ["get", "set", "delete", "list", "search", "upsert", "put", "merge", "append", "incr", "count", "get_many"]
         },
         "key": { "description": "CEL key expression. Inside a map-dispatched instance a write's key must derive from the item.", "$ref": "#/$defs/cel" },
         "value": {
@@ -1536,6 +1536,9 @@
           "description": "kv set/merge/append/incr only: how long the key the write leaves lives - a literal duration (e.g. 30s, 5m, 24h), or `never`, which clears an expiry the store's `default_ttl:` would set. Not CEL. Every write that lands refreshes the key's expiry to its own ttl, else the store's default, else none; an expired key is absent to every read and every condition, so `if: absent` on one applies (grammar 11.4, PRD resolved q69).",
           "oneOf": [{ "$ref": "#/$defs/duration" }, { "const": "never" }]
         },
+        "after": { "description": "kv list only: CEL string, the exclusive cursor - the last key of the page before, as its `next` answered it. The page holds the keys after it in byte order, under the same `prefix` (PRD resolved q70).", "$ref": "#/$defs/cel" },
+        "include_values": { "description": "kv list only: answer each key's value and version beside it, as `entries` (default false). A literal, not CEL: it decides whether the derived output has an `entries` field at all (PRD resolved q70).", "type": "boolean" },
+        "keys": { "description": "kv get_many only: CEL list of strings, the keys to read - at most 1000, which the run enforces, since a list's length is not known before it runs. Answered one entry per key, in the order given (PRD resolved q70).", "$ref": "#/$defs/cel" },
         "writes": { "description": "Write remap over the op's derived output fields.", "$ref": "#/$defs/writes" },
         "retry": { "$ref": "#/$defs/retry" },
         "timeout": { "description": "Wall-clock bound on this node.", "$ref": "#/$defs/duration" },
@@ -1563,7 +1566,10 @@
               "unique": false,
               "by": false,
               "if": false,
-              "ttl": false
+              "ttl": false,
+              "after": false,
+              "include_values": false,
+              "keys": false
             }
           }
         },
@@ -1586,7 +1592,10 @@
               "fields": false,
               "field": false,
               "unique": false,
-              "by": false
+              "by": false,
+              "after": false,
+              "include_values": false,
+              "keys": false
             }
           }
         },
@@ -1607,7 +1616,10 @@
               "by": false,
               "if": false,
               "if_version": false,
-              "ttl": false
+              "ttl": false,
+              "after": false,
+              "include_values": false,
+              "keys": false
             }
           }
         },
@@ -1628,14 +1640,17 @@
               "by": false,
               "if": false,
               "if_version": false,
-              "ttl": false
+              "ttl": false,
+              "after": false,
+              "include_values": false,
+              "keys": false
             }
           }
         },
         {
           "if": { "properties": { "op": { "const": "list" } }, "required": ["op"] },
           "then": {
-            "description": "`list` takes an optional `prefix` and a required `limit`. Grammar 11.4.",
+            "description": "`list` takes an optional `prefix` and a required `limit`; on a kv store also an optional `after` cursor and an optional `include_values` literal (a blob list takes neither, which `validate` decides against the store). Grammar 11.4, PRD resolved q70.",
             "required": ["limit"],
             "properties": {
               "key": false,
@@ -1651,7 +1666,8 @@
               "by": false,
               "if": false,
               "if_version": false,
-              "ttl": false
+              "ttl": false,
+              "keys": false
             }
           }
         },
@@ -1673,7 +1689,10 @@
               "by": false,
               "if": false,
               "if_version": false,
-              "ttl": false
+              "ttl": false,
+              "after": false,
+              "include_values": false,
+              "keys": false
             }
           }
         },
@@ -1713,7 +1732,10 @@
               "content_type": false,
               "field": false,
               "unique": false,
-              "by": false
+              "by": false,
+              "after": false,
+              "include_values": false,
+              "keys": false
             }
           }
         },
@@ -1732,7 +1754,10 @@
               "metadata": false,
               "content_type": false,
               "fields": false,
-              "by": false
+              "by": false,
+              "after": false,
+              "include_values": false,
+              "keys": false
             }
           }
         },
@@ -1751,7 +1776,63 @@
               "metadata": false,
               "content_type": false,
               "fields": false,
-              "unique": false
+              "unique": false,
+              "after": false,
+              "include_values": false,
+              "keys": false
+            }
+          }
+        },
+        {
+          "if": { "properties": { "op": { "const": "count" } }, "required": ["op"] },
+          "then": {
+            "description": "`kv count` takes an optional `prefix`. Grammar 11.4, PRD resolved q70.",
+            "properties": {
+              "key": false,
+              "value": false,
+              "query": false,
+              "top_k": false,
+              "limit": false,
+              "filter": false,
+              "metadata": false,
+              "content_type": false,
+              "fields": false,
+              "field": false,
+              "unique": false,
+              "by": false,
+              "if": false,
+              "if_version": false,
+              "ttl": false,
+              "after": false,
+              "include_values": false,
+              "keys": false
+            }
+          }
+        },
+        {
+          "if": { "properties": { "op": { "const": "get_many" } }, "required": ["op"] },
+          "then": {
+            "description": "`kv get_many` takes `keys`. Grammar 11.4, PRD resolved q70.",
+            "required": ["keys"],
+            "properties": {
+              "key": false,
+              "value": false,
+              "query": false,
+              "top_k": false,
+              "prefix": false,
+              "limit": false,
+              "filter": false,
+              "metadata": false,
+              "content_type": false,
+              "fields": false,
+              "field": false,
+              "unique": false,
+              "by": false,
+              "if": false,
+              "if_version": false,
+              "ttl": false,
+              "after": false,
+              "include_values": false
             }
           }
         },

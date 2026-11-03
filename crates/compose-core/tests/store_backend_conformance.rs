@@ -452,6 +452,50 @@ fn every_store_backend_answers_the_same_contract() {
             Some(&vec![Value::from("😀alpha")]),
             "the `{provider}` store answers a longer astral `prefix:` with the wrong keys"
         );
+
+        // PRD resolved q70: the walk was the ruling's size on this arm, and a
+        // mixed set walked three keys at a time comes back in byte order — the
+        // cursor's comparison agreeing with the column's sort, on every arm.
+        assert_eq!(
+            answered.get("walk_keys").and_then(Value::as_u64),
+            Some(100_000),
+            "the `{provider}` walk seeded another number of keys than the ruling's 100,000"
+        );
+        assert_eq!(
+            answered.get("walk_pages").and_then(Value::as_u64),
+            Some(100),
+            "the `{provider}` store took another number of 1000-key pages to walk 100,000 keys"
+        );
+        let paged: Vec<Value> = PAGED_ORDER.iter().map(|key| Value::from(*key)).collect();
+        assert_eq!(
+            answered.get("paged_order").and_then(Value::as_array),
+            Some(&paged),
+            "the `{provider}` store pages a mixed set in another order than UTF-8 byte order, so \
+             two backends would disagree about which keys a page holds (grammar 11.4, PRD \
+             resolved q70)"
+        );
+        assert_eq!(
+            answered
+                .get("after_a_key_the_store_does_not_hold")
+                .and_then(Value::as_array),
+            Some(&vec![
+                Value::from("aB"),
+                Value::from("ab"),
+                Value::from("b")
+            ]),
+            "the `{provider}` store answers a cursor it does not hold as a key with the wrong page"
+        );
+        assert_eq!(
+            answered.get("get_many_refusal").and_then(Value::as_str),
+            Some(GET_MANY_REFUSAL),
+            "the `{provider}` store refuses a `get_many` of 1001 keys with another message"
+        );
+        notice(&format!(
+            "note: the `{provider}` store seeded {} keys in {} ms and walked them in {} ms",
+            answered.get("walk_keys").unwrap_or(&Value::Null),
+            answered.get("walk_seed_ms").unwrap_or(&Value::Null),
+            answered.get("walk_ms").unwrap_or(&Value::Null),
+        ));
     }
     assert!(
         driven.contains(&"sqlite"),
@@ -612,6 +656,16 @@ const TRUE_EVERYWHERE: &[&str] = &[
     // expiry consumes no version.
     "a_key_with_a_ttl_is_readable_before_it_expires",
     "an_expired_key_is_absent_to_get_and_list",
+    // …and to PRD resolved q70's reads alike, through the one liveness
+    // fragment every read of many keys applies: a `count` stops counting it, a
+    // `get_many` answers it `found: false`, and a page skips it — the page's
+    // `next` included, which a page reading the expired row as its "one more"
+    // would still answer. The row is still stored while they read past it, so
+    // it is each read's own filter that keeps it out, not a sweep.
+    "an_expired_key_is_uncounted_by_count",
+    "an_expired_key_is_not_found_by_get_many",
+    "an_expired_key_is_skipped_by_a_page_and_its_next",
+    "the_expired_key_was_still_stored_when_those_reads_skipped_it",
     "if_absent_declines_a_key_that_has_not_expired",
     "if_present_and_if_version_decline_an_expired_key_with_no_version",
     "if_absent_applies_on_an_expired_key",
@@ -717,7 +771,98 @@ const TRUE_EVERYWHERE: &[&str] = &[
     // after the settlement holds it the same way.
     "a_node_a_delivery_hands_out_after_settlement_holds_the_prune_when_superseded",
     "a_node_a_delivery_hands_out_after_settlement_is_pruned_behind_its_result",
+    // PRD resolved q70: a 100,000-key store walked page by page, bulk-seeded
+    // beside the store rather than written through it. The pages laid end to
+    // end are the sorted key set — gapless, duplicate-free and in byte order —
+    // with and without a prefix; every page but the last is full and its
+    // `next` is its own last key, and the last answers none even when it is
+    // full; `count` agrees with the walk.
+    "a_fresh_store_counts_nothing",
+    "a_walk_sees_every_key_exactly_once_in_byte_order",
+    "a_walk_answers_no_key_twice",
+    "every_page_but_the_last_is_full_and_its_next_is_its_last_key",
+    "the_last_page_answers_no_next",
+    "a_full_last_page_answers_no_next",
+    "a_page_without_include_values_answers_no_entries",
+    "a_walk_under_a_prefix_sees_every_prefixed_key_exactly_once",
+    "a_prefixed_walks_last_page_is_short_and_answers_no_next",
+    "count_agrees_with_the_walk",
+    "count_answers_an_integer",
+    // `include_values: true` carries each key's value and version, in order.
+    "include_values_entries_carry_each_keys_value_and_version",
+    "a_valued_walk_sees_every_key_once",
+    // `get_many` of 1000 keys answers one entry per key asked, in the order
+    // asked, with `found` and — only where found — `value` and `version`;
+    // 1001 fails the op before anything is read or recorded.
+    "get_many_of_1000_keys_answers_one_entry_per_key_in_order",
+    "get_many_answers_found_with_value_and_version_or_neither",
+    "get_many_answers_a_key_asked_twice_twice",
+    "get_many_of_no_keys_answers_no_entries",
+    "a_refused_get_many_files_no_record",
+    // …and the walk hands its hundred thousand rows back when it is done — the
+    // server a developer points this suite at keeps whatever a run leaves, and
+    // a run-unique store nothing reads again is still a disk filling up.
+    "the_walk_gives_its_rows_back",
+    // A keyset cursor: a write landing mid-walk moves no page still to come.
+    "after_the_last_key_answers_an_empty_last_page",
+    "a_write_mid_walk_moves_no_later_page",
+    // The trace and the replay: all three are reads — recorded with their
+    // answer, carrying no key, no idempotency key and no `deduped`, writing no
+    // ledger row — and a resumed generation answers them out of the record.
+    "a_list_page_record_is_a_read_with_no_key",
+    "a_count_record_is_a_read_with_no_key",
+    "a_get_many_record_is_a_read_with_no_key",
+    "the_reads_wrote_no_ledger_row",
+    "a_replayed_count_answers_out_of_the_record",
+    "a_replayed_get_many_answers_out_of_the_record",
+    "a_replayed_page_answers_out_of_the_record",
 ];
+
+/// The order every arm pages a mixed set in: UTF-8 byte order, which Rust's
+/// own `str` ordering is — so [`the_paged_order_is_byte_order`] holds the
+/// constant to the definition rather than to a second hand-sorted copy.
+const PAGED_ORDER: &[&str] = &[
+    "A",
+    "B",
+    "Z",
+    "a",
+    "a b",
+    "aB",
+    "ab",
+    "b",
+    "z",
+    "É",
+    "ß",
+    "é",
+    "Ω",
+    "中",
+    "＀",
+    "\u{1F600}",
+];
+
+/// The refusal a `get_many` of 1001 keys fails its node with, word for word,
+/// the store's address aside (PRD resolved q70, grammar 11.4).
+const GET_MANY_REFUSAL: &str = "a `get_many` on `<store>` was asked for 1001 keys, and one \
+     `get_many` reads at most 1000 (grammar 11.4, PRD resolved q70): read them in slices of 1000 \
+     or fewer, or walk the store a page at a time with `list` and `after:`";
+
+/// [`PAGED_ORDER`] is sorted the way the arms are promised to sort, which is
+/// byte order — not the order a UTF-16 or a case-folding comparison answers.
+#[test]
+fn the_paged_order_is_byte_order() {
+    let mut sorted = PAGED_ORDER.to_vec();
+    sorted.sort_unstable();
+    assert_eq!(sorted, PAGED_ORDER);
+    let utf16 = {
+        let mut keys = PAGED_ORDER.to_vec();
+        keys.sort_by(|left, right| left.encode_utf16().cmp(right.encode_utf16()));
+        keys
+    };
+    assert_ne!(
+        utf16, PAGED_ORDER,
+        "the set is chosen so that a UTF-16 comparison orders it differently"
+    );
+}
 
 /// The cases a backend with a **socket** must answer `true`, on top of those.
 ///
@@ -761,9 +906,9 @@ const TRUE_WHEN_DIALLED: &[&str] = &[
     // clock ten days off.
     "expiry_is_computed_by_the_servers_clock",
     // …and every read judges that row by the same clock: with this process's
-    // clock ten days ahead or behind, a `get` and a `list` find the key while
-    // the server's clock holds it alive and miss it once that clock (moved by
-    // the store offset) is past its expiry.
+    // clock ten days ahead or behind, a `get`, a `list`, a `count` and a
+    // `get_many` find the key while the server's clock holds it alive and miss
+    // it once that clock (moved by the store offset) is past its expiry.
     "a_dialled_read_finds_a_key_the_servers_clock_holds_alive",
     "a_dialled_read_misses_a_key_the_servers_clock_holds_expired",
     // …and so does the store-wide sweep a connection's first op starts: a
@@ -797,6 +942,10 @@ const TRUE_WHEN_DIALLED: &[&str] = &[
     "a_store_that_never_answers_delays_no_settlement",
     "a_store_that_never_answers_delays_no_other_stores_prune",
     "a_store_that_never_answers_holds_a_command_for_its_dial_deadline_alone",
+    // A server keeps what a run leaves on it, so the run takes every row of its
+    // own run-unique stores back off it at the end (the large walk's hundred
+    // thousand go first, in that case's own `finally`: `TRUE_EVERYWHERE`).
+    "the_run_gives_its_rows_back",
 ];
 
 /// **A target that binds both dialled arms gets one module, and it compiles.**

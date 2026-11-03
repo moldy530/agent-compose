@@ -1,0 +1,17 @@
+# rule: a store op's parameter list is exact, and `keys:` is a `get_many`'s (grammar 11.4, PRD resolved q70)
+# code: invalid-value
+# message: `keys` is not a parameter of the `list` op
+# at: 14:7
+# help: `list` takes `limit`, `prefix`, `after`, `include_values`
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    page:
+      store: store.memory
+      op: list
+      limit: 100
+      keys: "['a', 'b']"
+  edges:
+    - { from: start, to: page }
+    - { from: page, to: end }

@@ -483,6 +483,25 @@ flow.shape:
       op: delete
       key: "input.goal"
       if_version: "4"
+    # The reads of PRD resolved q70: one page past a CEL cursor carrying its
+    # values — so the derived row holds `entries` beside `keys` and `next` —
+    # a `count` under a prefix, and a `get_many` whose `entries` are bounded by
+    # the most one reads rather than by anything the node declares.
+    page:
+      store: store.ledger
+      op: list
+      prefix: "'goal/'"
+      after: "state.latest"
+      limit: 50
+      include_values: true
+    tally:
+      store: store.ledger
+      op: count
+      prefix: "'goal/'"
+    fetch:
+      store: store.ledger
+      op: get_many
+      keys: "[input.goal, state.latest]"
   edges:
     - { from: start, to: shape }
     - { from: shape, to: ask }
@@ -495,7 +514,10 @@ flow.shape:
     - { from: stamp, to: tick }
     - { from: tick, to: tidy }
     - { from: tidy, to: drop }
-    - { from: drop, to: end }
+    - { from: drop, to: page }
+    - { from: page, to: tally }
+    - { from: tally, to: fetch }
+    - { from: fetch, to: end }
 
 # The trigger surface of grammar 13.3, in the two spellings that make its
 # emitted table more than a type declaration.

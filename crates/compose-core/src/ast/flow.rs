@@ -449,7 +449,8 @@ pub enum StoreOp {
     Set,
     /// `kv`/`vector`/`blob`: remove one key.
     Delete,
-    /// `kv`/`blob`: enumerate keys under a prefix.
+    /// `kv`/`blob`: enumerate keys under a prefix — on `kv`, one page of them
+    /// past an exclusive cursor (PRD resolved q70).
     List,
     /// `vector`: similarity search.
     Search,
@@ -463,11 +464,25 @@ pub enum StoreOp {
     Append,
     /// `kv`: add to a numeric field of one key's value.
     Incr,
+    /// `kv`: how many keys a partition holds under a prefix (PRD resolved q70).
+    Count,
+    /// `kv`: read up to [`GET_MANY_MAX_KEYS`] keys in one op, answered in the
+    /// order they were asked for (PRD resolved q70).
+    GetMany,
 }
+
+/// The most keys one `kv` `get_many` reads (grammar 11.4, PRD resolved q70).
+///
+/// A `keys:` list is a CEL expression, so its length is not known until the
+/// node runs: the bound is enforced there, failing the node, and it is also the
+/// static bound of the `entries` the op answers — what lets a `get_many`'s
+/// result be written to a bounded channel at all (grammar 3.5).
+pub const GET_MANY_MAX_KEYS: i64 = 1000;
 
 impl StoreOp {
     /// Every op: grammar 11.4's original seven in the order its table first
-    /// listed them, then the three partial updates PRD resolved q68 added.
+    /// listed them, then the three partial updates PRD resolved q68 added, then
+    /// the two reads PRD resolved q70 added.
     pub const ALL: &'static [Self] = &[
         Self::Get,
         Self::Set,
@@ -479,6 +494,8 @@ impl StoreOp {
         Self::Merge,
         Self::Append,
         Self::Incr,
+        Self::Count,
+        Self::GetMany,
     ];
 
     /// The keyword that names this op.
@@ -495,11 +512,14 @@ impl StoreOp {
             Self::Merge => "merge",
             Self::Append => "append",
             Self::Incr => "incr",
+            Self::Count => "count",
+            Self::GetMany => "get_many",
         }
     }
 
     /// Whether this op writes — the ops an idempotency key and a dedupe apply
-    /// to (grammar 9.4, 11.4).
+    /// to (grammar 9.4, 11.4). `count` and `get_many` are reads, recorded and
+    /// replayed like `get` and `list` and carrying no key (PRD resolved q70).
     #[must_use]
     pub const fn writes(self) -> bool {
         matches!(
@@ -526,6 +546,8 @@ impl StoreOp {
             Self::Merge => &["key", "fields"],
             Self::Append => &["key", "field", "value"],
             Self::Incr => &["key", "field"],
+            Self::Count => &[],
+            Self::GetMany => &["keys"],
         }
     }
 
@@ -543,6 +565,11 @@ impl StoreOp {
     /// key holding a value — `set`, `merge`, `append`, `incr`. Each is a `kv` op
     /// alone, so the row is the whole rule: a `delete` leaves nothing to
     /// expire, and a read writes nothing to give an expiry to.
+    ///
+    /// The paging of PRD resolved q70 takes `delete`'s shape on `list`: `after:`
+    /// and `include_values:` are a `kv` page's, and `list` is one op of two
+    /// kinds, so a `blob` `list` naming either is refused against its store by
+    /// the validator too.
     #[must_use]
     pub const fn optional_parameters(self) -> &'static [&'static str] {
         match self {
@@ -551,7 +578,9 @@ impl StoreOp {
             Self::Set | Self::Merge => &["if", "if_version", "ttl"],
             Self::Append => &["unique", "if", "if_version", "ttl"],
             Self::Incr => &["by", "if", "if_version", "ttl"],
-            Self::List => &["prefix"],
+            Self::List => &["prefix", "after", "include_values"],
+            Self::Count => &["prefix"],
+            Self::GetMany => &[],
             Self::Search => &["filter"],
             Self::Upsert => &["metadata"],
             Self::Put => &["content_type"],
@@ -664,6 +693,14 @@ pub struct StoreOpParams {
     pub if_version: Option<Spanned<Cel>>,
     /// `ttl:` — how long the key a `kv` write leaves lives (PRD resolved q69).
     pub ttl: Option<Spanned<StoreTtl>>,
+    /// `after:` — a `kv` `list`'s exclusive cursor: the last key of the page
+    /// before (PRD resolved q70).
+    pub after: Option<Spanned<Cel>>,
+    /// `include_values:` — a `kv` `list` that answers each key's value and
+    /// version beside it.
+    pub include_values: Option<Spanned<bool>>,
+    /// `keys:` — the list of keys a `get_many` reads.
+    pub keys: Option<Spanned<Cel>>,
 }
 
 /// Per-item error strategy on a `map` node (grammar 8.6 rule 10,

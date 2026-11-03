@@ -11917,6 +11917,304 @@ fn a_map_of_partial_updates_at_one_key_keeps_every_item() {
     );
 }
 
+/// A flow reads a `kv` store too large for one answer a page at a time, counts
+/// it and reads several keys in one op (grammar 11.4, PRD resolved q70).
+///
+/// `flow.catalogue` writes seven entries through a fan-out and then walks
+/// them three at a time: each `list` takes the `next` the page before it
+/// answered as its `after:`, and the cycle leaves through its `else:` on the
+/// page that answers none. What decides it is the order and the boundaries —
+/// the pages laid end to end are the seven keys in byte order, each exactly
+/// once, the last page is the short one, and the cursor the flow kept is the
+/// last full page's last key, because a page with no `next` writes nothing
+/// (Decision D110). Then the trace, which is where a read's record is
+/// observable: every page, the `count` and the `get_many` are **reads** —
+/// filed with what they answered, addressing no single key and carrying no
+/// idempotency key, though the emitted graph hands one to every store op it
+/// runs (`docs/trace.md` §6).
+#[test]
+fn a_flow_pages_through_a_kv_store_counts_it_and_reads_many_keys_at_once() {
+    let provider = MockProvider::start().expect("a loopback port");
+    // Written in an order nothing sorted, with a capital and an accent, so the
+    // order the pages come back in is the store's and not the input's.
+    let names = [
+        "mango", "Apple", "kiwi", "éclair", "banana", "fig", "cherry",
+    ];
+    let Some(run) = harness::invoke_with(
+        "stores",
+        "flow.catalogue",
+        &json!({ "names": names }),
+        &harness::environment(&provider),
+    ) else {
+        return;
+    };
+    run.succeeded();
+    // One node's store records, flattened across its trace entries in step
+    // order — the same reading `store_records` makes of a `run`'s trace.
+    let records = |node: &str| -> Vec<Value> {
+        run.entries(node)
+            .into_iter()
+            .filter_map(|entry| entry["stores"].as_array().cloned())
+            .flatten()
+            .collect()
+    };
+    let outputs = run.outputs();
+    assert_eq!(
+        outputs["pages"],
+        json!([
+            ["item/Apple", "item/banana", "item/cherry"],
+            ["item/fig", "item/kiwi", "item/mango"],
+            ["item/éclair"],
+        ]),
+        "seven keys, three to a page, in UTF-8 byte order and each exactly once: {outputs}"
+    );
+    assert_eq!(
+        outputs["cursor"], "item/mango",
+        "the cursor is the last `next` a page answered — the last page answered none: {outputs}"
+    );
+    assert_eq!(
+        outputs["held"],
+        json!(7),
+        "the `count` agrees with the walk: {outputs}"
+    );
+
+    // Every page is a read, and the ones after the first carry their values.
+    let pages: Vec<Value> = ["first", "more"].into_iter().flat_map(&records).collect();
+    assert_eq!(pages.len(), 3, "one record per page: {pages:#?}");
+    for record in &pages {
+        assert_eq!(record["op"], "list", "{record}");
+        assert_eq!(record["effect"], "read", "{record}");
+        for absent in ["key", "idempotencyKey", "deduped", "applied", "version"] {
+            assert!(
+                record.get(absent).is_none(),
+                "a page addresses no single key and carries no `{absent}`: {record}"
+            );
+        }
+    }
+    assert_eq!(pages[0]["answer"]["next"], "item/cherry", "{:#?}", pages[0]);
+    assert!(
+        pages[0]["answer"].get("entries").is_none(),
+        "a page that did not ask for its values carries none: {:#?}",
+        pages[0]
+    );
+    let last = &pages[2]["answer"];
+    assert!(
+        last.get("next").is_none(),
+        "the last page answers no `next`: {last}"
+    );
+    assert_eq!(
+        last["entries"][0]["key"], "item/éclair",
+        "`include_values: true` answers each key beside its value: {last}"
+    );
+    assert_eq!(
+        last["entries"][0]["value"],
+        json!({ "name": "éclair" }),
+        "{last}"
+    );
+    assert!(
+        last["entries"][0]["version"].is_u64(),
+        "…and its version: {last}"
+    );
+
+    let count = records("census");
+    assert_eq!(count.len(), 1, "{count:#?}");
+    assert_eq!(count[0]["op"], "count");
+    assert_eq!(count[0]["effect"], "read");
+    assert_eq!(count[0]["answer"], json!({ "count": 7 }));
+    assert!(
+        count[0].get("key").is_none() && count[0].get("idempotencyKey").is_none(),
+        "{:#?}",
+        count[0]
+    );
+
+    let many = records("fetch");
+    assert_eq!(many.len(), 1, "{many:#?}");
+    assert_eq!(many[0]["op"], "get_many");
+    assert_eq!(many[0]["effect"], "read");
+    assert!(
+        many[0].get("key").is_none()
+            && many[0].get("idempotencyKey").is_none()
+            && many[0].get("deduped").is_none(),
+        "{:#?}",
+        many[0]
+    );
+    let entries = many[0]["answer"]["entries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a `get_many` answers entries: {:#?}", many[0]));
+    assert_eq!(entries.len(), 2, "one entry per key asked: {entries:#?}");
+    assert_eq!(
+        entries[0]["key"], "item/mango",
+        "in the order asked: {entries:#?}"
+    );
+    assert_eq!(entries[0]["found"], true);
+    assert_eq!(entries[0]["value"], json!({ "name": "mango" }));
+    assert!(entries[0]["version"].is_u64(), "{entries:#?}");
+    assert_eq!(
+        entries[1],
+        json!({ "key": "item/nobody", "found": false }),
+        "a key the store does not hold answers `found: false` and no value or version"
+    );
+}
+
+/// The names a long walk stocks its store with: `k000` up, written in reverse
+/// so the order the pages come back in is the store's rather than the input's.
+fn stock(count: usize) -> Vec<String> {
+    (0..count)
+        .rev()
+        .map(|index| format!("k{index:03}"))
+        .collect()
+}
+
+/// The keys of a long walk's pages, laid end to end, and how many pages held
+/// anything other than exactly one key.
+fn walked(outputs: &Value) -> (Vec<String>, usize) {
+    let pages = outputs["walked"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the walk wrote its pages: {outputs}"));
+    let uneven = pages
+        .iter()
+        .filter(|page| page.as_array().map(Vec::len) != Some(1))
+        .count();
+    let keys = pages
+        .iter()
+        .filter_map(Value::as_array)
+        .flatten()
+        .map(|key| key.as_str().unwrap_or_default().to_string())
+        .collect();
+    (keys, uneven)
+}
+
+/// A walk reads as many pages as its back-edge's budget says, past the
+/// allowance the superstep ceiling gives a cycle that declares none, and a
+/// budget that runs out ends the walk through its `else:` short of the
+/// partition's end (grammar 7.4, 11.4; PRD resolved q70).
+///
+/// A walk is a cycle, so its length is whatever bounds the cycle. On a
+/// partition of 150 keys walked a key a page, `flow.long_walk`'s
+/// `max_iterations: 148` is exactly enough — `first`'s page, the one `more`
+/// reads on entering the cycle, and 148 traversals — and the run reads every
+/// key once, in byte order, through more supersteps than
+/// [`a_walk_bounded_by_its_guard_alone_stops_at_the_superstep_ceiling`]'s
+/// unbudgeted twin is allowed. One key more and the budget is what ends it:
+/// the 150th page still answers a `next`, the exhausted back-edge is not taken
+/// (§7.3 rule 5), the `else:` is, and the flow finishes with the count saying
+/// what the walk did not reach and the cursor holding the `after:` a walk
+/// resuming from there would take.
+#[test]
+fn a_walk_with_a_budgeted_back_edge_reads_as_many_pages_as_it_declares() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let names = stock(150);
+    let mut expected: Vec<String> = names.iter().map(|name| format!("item/{name}")).collect();
+    expected.sort();
+    let Some(run) = harness::invoke_with(
+        "stores",
+        "flow.long_walk",
+        &json!({ "names": names }),
+        &harness::environment(&provider),
+    ) else {
+        return;
+    };
+    run.succeeded();
+    let outputs = run.outputs();
+    let (keys, uneven) = walked(&outputs);
+    assert_eq!(uneven, 0, "every page holds one key: {outputs}");
+    assert_eq!(
+        keys, expected,
+        "a 150-page walk reads every key once, in byte order: {outputs}"
+    );
+    assert_eq!(outputs["walk_held"], json!(150), "{outputs}");
+    assert_eq!(
+        run.entries("more").len(),
+        149,
+        "`more` read every page after the first: {:?}",
+        run.visited()
+    );
+
+    let names = stock(151);
+    let mut expected: Vec<String> = names.iter().map(|name| format!("item/{name}")).collect();
+    expected.sort();
+    let Some(run) = harness::invoke_with(
+        "stores",
+        "flow.long_walk",
+        &json!({ "names": names }),
+        &harness::environment(&provider),
+    ) else {
+        return;
+    };
+    run.succeeded();
+    let outputs = run.outputs();
+    let (keys, _) = walked(&outputs);
+    assert_eq!(
+        keys,
+        expected[..150],
+        "the budget allows 150 pages, and the walk reads exactly those: {outputs}"
+    );
+    assert_eq!(
+        outputs["walk_held"],
+        json!(151),
+        "…and leaves through its `else:` to the `count`, which sees the key the \
+         walk did not reach: {outputs}"
+    );
+    assert_eq!(
+        outputs["walk_cursor"],
+        expected[149].as_str(),
+        "the cursor is the last page's `next` — its own last key, so a walk \
+         resuming `after:` it starts at the first key this one never read: {outputs}"
+    );
+    let last = run.entries("more");
+    let last = last.last().expect("`more` ran");
+    assert_eq!(
+        last["stores"][0]["answer"]["next"],
+        expected[149].as_str(),
+        "the page the budget stopped at still answered a `next`: {last}"
+    );
+}
+
+/// A walk whose back-edge carries its guard and nothing else is stopped by the
+/// superstep ceiling once it takes more pages than the ceiling's allowance for
+/// a cycle no composition bound counts (grammar 7.4 clause 2, 11.4; PRD
+/// resolved q70).
+///
+/// `has(more.output.next)` is a CEL exit condition, which grammar 7.4 accepts
+/// and calls no termination proof: nothing in the composition says how many
+/// passes it takes, so the ceiling is sized from a fixed allowance per node of
+/// the cycle rather than from the walk. On the same 150 keys
+/// [`a_walk_with_a_budgeted_back_edge_reads_as_many_pages_as_it_declares`]
+/// walks to the end, this twin fails the run partway, naming the ceiling and
+/// the `max_iterations:` that would have declared the walk's length — which is
+/// what grammar 11.4 tells a walk longer than that to carry.
+#[test]
+fn a_walk_bounded_by_its_guard_alone_stops_at_the_superstep_ceiling() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(run) = harness::invoke_with(
+        "stores",
+        "flow.long_walk_unbudgeted",
+        &json!({ "names": stock(150) }),
+        &harness::environment(&provider),
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    let supersteps = run.trace().len();
+    assert!(
+        failure.contains(&format!("ceiling of {supersteps} supersteps"))
+            && failure.contains("max_iterations"),
+        "the run stops at the ceiling, which names the bound the walk lacked: {failure}"
+    );
+    let pages = run.entries("more").len();
+    assert!(
+        (1..149).contains(&pages),
+        "the walk was stopped partway, short of the 149 pages after the first it \
+         needed: {pages} — {:?}",
+        run.visited()
+    );
+    assert!(
+        run.entries("census").is_empty(),
+        "nothing after the walk ran: {:?}",
+        run.visited()
+    );
+}
+
 /// A model that **calls** a synthesized store tool reaches the same backend the
 /// store-op nodes do, with the arguments it supplied (grammar 11.5, PRD 5.8).
 ///
@@ -20242,6 +20540,144 @@ fn a_replayed_store_read_is_the_row_the_recording_generation_went_on_with() {
         asked[0].body_text.contains("read it back"),
         "the live call is the second node's, asked about what the agent answered: {}",
         asked[0].body_text
+    );
+}
+
+/// A resumed generation answers a `count` and a `get_many` out of the record
+/// rather than out of the live store (PRD resolved q70, q29).
+///
+/// `flow.surveyed` counts the entries under `survey/` and fetches two keys of
+/// them, then calls a model — and the run is killed during that call, so both
+/// reads are behind the frontier. While the execution is down `flow.stocked`
+/// writes another key under `survey/`: the very key the `get_many` asks for
+/// second. A resume that read the live store would count two and find it; the
+/// record says one and not found, and that is what the resumed run reports.
+/// Then a fresh run of the same flow counts two, which is what makes the
+/// replayed answer evidence rather than coincidence: the store really moved.
+/// Both records are reads — filed with what they answered, no key and no
+/// `deduped` (`docs/trace.md` §6).
+#[test]
+fn a_resumed_run_answers_a_count_and_a_get_many_out_of_the_record() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "a surveyed note" })).after(Duration::from_secs(120)),
+    ));
+
+    let Some((project, built)) = harness::build_under_toolchain("durability", "resume-surveyed")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the durability fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let environment = harness::environment(&provider);
+
+    let stocked = harness::run_into(
+        &project,
+        "durability",
+        "flow.stocked",
+        &[("topic", "durability")],
+        None,
+        &environment,
+    );
+    stocked.succeeded();
+
+    let killed = harness::crash_run(
+        &project,
+        &["run", "flow.surveyed", "--input", "topic=durability"],
+        &environment,
+        |_| provider.snapshot().requests >= 1,
+    );
+
+    // The world moves while the execution is down.
+    let moved = harness::run_into(
+        &project,
+        "durability",
+        "flow.stocked",
+        &[("topic", "later")],
+        None,
+        &environment,
+    );
+    moved.succeeded();
+
+    provider.reset();
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "a surveyed note" })),
+    ));
+    let resumed = harness::resume(
+        &project,
+        "durability",
+        &killed.execution,
+        Some("json"),
+        &environment,
+    );
+    resumed.succeeded();
+    let answered = resumed.outputs();
+    assert_eq!(answered["status"], "completed", "{answered}");
+    assert_eq!(
+        answered["outputs"]["surveyed"],
+        json!(1),
+        "the replayed `count` is the one the first generation read, not the live store's two: \
+         {answered}"
+    );
+    let trace = answered["trace"].as_array().expect("a trace");
+    let record = |node: &str| -> Value {
+        trace
+            .iter()
+            .find(|entry| entry["node"] == node)
+            .and_then(|entry| entry["stores"].as_array())
+            .and_then(|records| records.first().cloned())
+            .unwrap_or_else(|| panic!("the `{node}` node's read is on its entry: {answered}"))
+    };
+    let census = record("census");
+    let fetch = record("fetch");
+    for (read, op) in [(&census, "count"), (&fetch, "get_many")] {
+        assert_eq!(read["op"], op, "{read}");
+        assert_eq!(read["effect"], "read", "{read}");
+        for absent in ["key", "idempotencyKey", "deduped"] {
+            assert!(
+                read.get(absent).is_none(),
+                "a `{op}` addresses no single key and carries no `{absent}`: {read}"
+            );
+        }
+    }
+    assert_eq!(census["answer"], json!({ "count": 1 }), "{census}");
+    assert_eq!(
+        fetch["answer"]["entries"][1],
+        json!({ "key": "survey/later", "found": false }),
+        "the key written while the execution was down is not found by the replayed read: {fetch}"
+    );
+    assert_eq!(fetch["answer"]["entries"][0]["found"], true, "{fetch}");
+    assert_eq!(
+        provider.snapshot().requests,
+        1,
+        "only the killed model call was made again"
+    );
+
+    // A fresh run reads the live store, which did move.
+    provider.reset();
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "a fresh note" })),
+    ));
+    let fresh = harness::run_into(
+        &project,
+        "durability",
+        "flow.surveyed",
+        &[("topic", "durability")],
+        None,
+        &environment,
+    );
+    fresh.succeeded();
+    assert_eq!(
+        fresh.outputs()["surveyed"],
+        json!(2),
+        "a live `count` sees the key the resumed one did not: {}",
+        fresh.stderr()
     );
 }
 

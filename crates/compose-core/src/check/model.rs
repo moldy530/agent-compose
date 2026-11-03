@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use crate::ast::common::{Ident, Literal};
 use crate::ast::definition::{AgentAccess, Builtin, StoreKind};
-use crate::ast::flow::StoreOp;
+use crate::ast::flow::{GET_MANY_MAX_KEYS, StoreOp};
 use crate::ast::schema::{Number, ScalarKind, Surface};
 use crate::cel::ty::{ObjectShape, Origin, Property, Type, UnionShape, UnionVariant};
 use crate::diag::{Span, Spanned};
@@ -769,17 +769,25 @@ pub(crate) fn http_default_output(span: &Span) -> FieldMap {
 
 /// A store op's derived output schema (grammar 11.4, Decision D34).
 ///
-/// Two of the row's shapes are decided by the node rather than by the store:
-/// a `search`'s `matches` and a `list`'s `keys` are bounded by the `top_k` and
-/// `limit` the node declares, which is the only bound either result has and is
-/// what lets one be written to a bounded channel at all (grammar 3.5).
+/// Three of the row's shapes are decided by the node rather than by the store:
+/// a `search`'s `matches` and a `list`'s `keys` (and `entries`) are bounded by
+/// the `top_k` and `limit` the node declares, which is the only bound either
+/// result has and is what lets one be written to a bounded channel at all
+/// (grammar 3.5); a `get_many`'s `entries` by [`GET_MANY_MAX_KEYS`], the most
+/// one reads; and whether a `kv` `list` answers `entries` at all by the
+/// `include_values` literal the node declares (Decision D154) — the same
+/// presence-by-literal Decision D114 gives a match's `metadata`, decided by the
+/// node here rather than by the store.
 ///
-/// The catalog marks three fields optional — `value` on a `kv`/`blob` `get`,
+/// The catalog marks five fields optional — `value` on a `kv`/`blob` `get`,
 /// absent on a miss; `version` on every `kv` row that carries one, absent where
-/// the key holds nothing; and `value` on a partial update, absent where its
-/// condition did not hold — and that is a runtime fact with no static
-/// consequence (Decision D110: the read fails, the write does not happen), so
-/// the synthesized map carries every field alike.
+/// the key holds nothing; `value` on a partial update, absent where its
+/// condition did not hold; a `list`'s `next`, absent on the last page; and a
+/// `get_many` entry's `value` and `version`, absent where `found` is `false` —
+/// and that is a runtime fact with no static consequence (Decision D110: the
+/// read fails, the write does not happen), so the synthesized map carries every
+/// field alike. A store row is never parsed against it (`codegen::graph`), so
+/// nothing refuses the answer that leaves one out.
 ///
 /// A `kv` **write**'s row is PRD resolved q68's: `applied` says whether the
 /// write's condition held and it landed, `version` is the key's version after
@@ -793,6 +801,7 @@ pub(crate) fn store_output(
     value_schema: Option<&FieldMap>,
     metadata_schema: Option<&FieldMap>,
     bound: Option<i64>,
+    include_values: bool,
     span: &Span,
 ) -> FieldMap {
     let string = || scalar_node(ScalarKind::String, span);
@@ -844,6 +853,59 @@ pub(crate) fn store_output(
                 ("value", stored()),
                 ("deduped", boolean()),
             ],
+            span,
+        ),
+        // One page of a `kv` partition's keys, past an exclusive cursor (PRD
+        // resolved q70): `next` is the cursor of the page after it, present
+        // exactly when one remains, and `entries` is there exactly when the
+        // node's `include_values:` literal is `true` (Decision D154).
+        (StoreKind::Kv, StoreOp::List) => {
+            let mut fields = vec![
+                ("keys", array_node(string(), bound, span)),
+                ("next", string()),
+            ];
+            if include_values {
+                fields.push((
+                    "entries",
+                    array_node(
+                        object_node(
+                            vec![
+                                ("key", string()),
+                                ("value", stored()),
+                                ("version", version()),
+                            ],
+                            span,
+                        ),
+                        bound,
+                        span,
+                    ),
+                ));
+            }
+            field_map(fields, span)
+        }
+        (StoreKind::Kv, StoreOp::Count) => field_map(
+            vec![("count", scalar_node(ScalarKind::Integer, span))],
+            span,
+        ),
+        // One entry per key asked for, in the order asked — so its bound is the
+        // most keys one `get_many` reads, not anything the store holds.
+        (StoreKind::Kv, StoreOp::GetMany) => field_map(
+            vec![(
+                "entries",
+                array_node(
+                    object_node(
+                        vec![
+                            ("key", string()),
+                            ("value", stored()),
+                            ("found", boolean()),
+                            ("version", version()),
+                        ],
+                        span,
+                    ),
+                    Some(GET_MANY_MAX_KEYS),
+                    span,
+                ),
+            )],
             span,
         ),
         (_, StoreOp::List) => field_map(vec![("keys", array_node(string(), bound, span))], span),
@@ -1723,6 +1785,216 @@ mod tests {
         assert!(kind_takes(StoreKind::Vector, StoreOp::Delete));
     }
 
+    /// The agent tool surface is untouched by PRD resolved q70: a model is
+    /// offered exactly the tools it was offered before the reads at scale
+    /// existed, at every access level and on every kind — exposing `count`,
+    /// `get_many` or a `kv` page to a model is the parity item that entry
+    /// deferred, and this is what notices one arriving unannounced.
+    #[test]
+    fn the_reads_at_scale_add_no_tool_at_any_access_level() {
+        let expected: [(StoreKind, AgentAccess, &[StoreOp]); 9] = [
+            (StoreKind::Kv, AgentAccess::Read, &[StoreOp::Get]),
+            (
+                StoreKind::Kv,
+                AgentAccess::ReadWrite,
+                &[StoreOp::Get, StoreOp::Set],
+            ),
+            (
+                StoreKind::Kv,
+                AgentAccess::Full,
+                &[
+                    StoreOp::Get,
+                    StoreOp::Set,
+                    StoreOp::Merge,
+                    StoreOp::Append,
+                    StoreOp::Incr,
+                    StoreOp::Delete,
+                ],
+            ),
+            (StoreKind::Vector, AgentAccess::Read, &[StoreOp::Search]),
+            (
+                StoreKind::Vector,
+                AgentAccess::ReadWrite,
+                &[StoreOp::Search, StoreOp::Upsert],
+            ),
+            (
+                StoreKind::Vector,
+                AgentAccess::Full,
+                &[StoreOp::Search, StoreOp::Upsert],
+            ),
+            (
+                StoreKind::Blob,
+                AgentAccess::Read,
+                &[StoreOp::Get, StoreOp::List],
+            ),
+            (
+                StoreKind::Blob,
+                AgentAccess::ReadWrite,
+                &[StoreOp::Get, StoreOp::List, StoreOp::Put],
+            ),
+            (
+                StoreKind::Blob,
+                AgentAccess::Full,
+                &[StoreOp::Get, StoreOp::List, StoreOp::Put],
+            ),
+        ];
+        for (kind, access, tools) in expected {
+            let synthesized = store_tools(kind, access);
+            assert_eq!(synthesized, tools, "{} at {access:?}", kind.as_str());
+            assert!(
+                !synthesized.contains(&StoreOp::Count) && !synthesized.contains(&StoreOp::GetMany),
+                "no access level offers PRD resolved q70's reads to a model"
+            );
+        }
+        assert!(
+            !store_tools(StoreKind::Kv, AgentAccess::Full).contains(&StoreOp::List),
+            "nor a `kv` page"
+        );
+    }
+
+    /// `count` and `get_many` are `kv` ops and reads: recorded and replayed,
+    /// carrying no idempotency key (PRD resolved q70, q29).
+    #[test]
+    fn count_and_get_many_are_reads_of_a_kv_store_alone() {
+        for op in [StoreOp::Count, StoreOp::GetMany] {
+            assert!(kind_takes(StoreKind::Kv, op), "{}", op.as_str());
+            assert!(!kind_takes(StoreKind::Vector, op), "{}", op.as_str());
+            assert!(!kind_takes(StoreKind::Blob, op), "{}", op.as_str());
+            assert!(!op.writes(), "{} is a read", op.as_str());
+        }
+        assert!(!StoreOp::List.writes());
+        assert_eq!(StoreOp::Count.required_parameters(), &[] as &[&str]);
+        assert_eq!(StoreOp::Count.optional_parameters(), &["prefix"]);
+        assert_eq!(StoreOp::GetMany.required_parameters(), &["keys"]);
+        assert_eq!(
+            StoreOp::List.optional_parameters(),
+            &["prefix", "after", "include_values"]
+        );
+    }
+
+    /// The names of a derived row's fields, in order — and of an array
+    /// field's items, where the row's first field is one.
+    fn names(fields: &FieldMap) -> Vec<String> {
+        fields
+            .fields
+            .iter()
+            .map(|field| field.name.value.to_string())
+            .collect()
+    }
+
+    /// The item fields of one array field of a derived row, and its bound.
+    fn items(fields: &FieldMap, name: &str) -> (Vec<String>, Option<i64>) {
+        let field = fields
+            .fields
+            .iter()
+            .find(|field| field.name.value.as_str() == name)
+            .unwrap_or_else(|| panic!("no `{name}` in {:?}", names(fields)));
+        let TypeForm::Array(array) = &field.ty.form else {
+            panic!("`{name}` is an array");
+        };
+        let item = match &array.items.form {
+            TypeForm::Object(object) => names(&object.properties),
+            _ => Vec::new(),
+        };
+        (item, array.max_items)
+    }
+
+    /// A `kv` `list`'s row: `keys` and `next` always, and `entries` exactly
+    /// when the node's `include_values:` literal is `true` — presence decided
+    /// by a literal in the node, Decision D114's pattern (D154). A `blob`
+    /// `list` keeps its one field whatever it is asked.
+    #[test]
+    fn a_kv_page_derives_entries_exactly_when_include_values_is_true() {
+        let value = field_map(
+            vec![("body", scalar_node(ScalarKind::String, &span()))],
+            &span(),
+        );
+        let page = |include| {
+            store_output(
+                StoreKind::Kv,
+                StoreOp::List,
+                Some(&value),
+                None,
+                Some(25),
+                include,
+                &span(),
+            )
+        };
+        assert_eq!(names(&page(false)), ["keys", "next"]);
+        let valued = page(true);
+        assert_eq!(names(&valued), ["keys", "next", "entries"]);
+        assert_eq!(
+            items(&valued, "entries"),
+            (
+                vec!["key".into(), "value".into(), "version".into()],
+                Some(25)
+            ),
+            "an entry is a key, its value and its version, bounded like the page"
+        );
+        assert_eq!(items(&valued, "keys").1, Some(25));
+        assert_eq!(
+            names(&store_output(
+                StoreKind::Blob,
+                StoreOp::List,
+                None,
+                None,
+                Some(25),
+                true,
+                &span()
+            )),
+            ["keys"]
+        );
+    }
+
+    /// A `count` answers one integer; a `get_many` one entry per key asked,
+    /// bounded by the most one reads rather than by anything the node says.
+    #[test]
+    fn a_count_and_a_get_many_derive_their_rows() {
+        let value = field_map(
+            vec![("body", scalar_node(ScalarKind::String, &span()))],
+            &span(),
+        );
+        let counted = store_output(
+            StoreKind::Kv,
+            StoreOp::Count,
+            Some(&value),
+            None,
+            None,
+            false,
+            &span(),
+        );
+        assert_eq!(names(&counted), ["count"]);
+        assert!(matches!(
+            &counted.fields[0].ty.form,
+            TypeForm::Scalar(Scalar {
+                kind: ScalarKind::Integer,
+                ..
+            })
+        ));
+        let many = store_output(
+            StoreKind::Kv,
+            StoreOp::GetMany,
+            Some(&value),
+            None,
+            None,
+            false,
+            &span(),
+        );
+        assert_eq!(names(&many), ["entries"]);
+        assert_eq!(
+            items(&many, "entries"),
+            (
+                vec![
+                    "key".into(),
+                    "value".into(),
+                    "found".into(),
+                    "version".into()
+                ],
+                Some(GET_MANY_MAX_KEYS)
+            )
+        );
+    }
+
     #[test]
     fn a_vector_store_with_no_metadata_schema_derives_no_metadata_field() {
         let derived = store_output(
@@ -1731,6 +2003,7 @@ mod tests {
             None,
             None,
             Some(5),
+            false,
             &span(),
         );
         let Some(matches) = derived.fields.first() else {

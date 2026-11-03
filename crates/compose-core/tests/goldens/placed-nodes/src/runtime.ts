@@ -9757,7 +9757,10 @@ export interface StoreRecord {
   readonly via: "node" | "tool";
   /** The store's lifetime, and with it which partition was addressed. */
   readonly scope: "execution" | "session" | "global";
-  /** The key the op addressed, on the ops that address one. */
+  /**
+   * The key the op addressed, on the ops that address one — absent on a
+   * `list`, a `count`, a `get_many` and a `search`, which address none.
+   */
   readonly key?: string;
   /** What a read answered — the history a replay consumes. */
   readonly answer?: unknown;

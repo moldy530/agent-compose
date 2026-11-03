@@ -468,6 +468,10 @@ pub fn surfaces(ir: &Ir) -> Vec<Surface<'_>> {
                                         definition.value_schema.as_ref(),
                                         definition.metadata_schema.as_ref(),
                                         params.top_k.or(params.limit),
+                                        params
+                                            .include_values
+                                            .as_ref()
+                                            .is_some_and(|include| include.value),
                                         &node.span,
                                     )),
                                 });
@@ -2318,6 +2322,53 @@ flow.f:\n  outputs: {}\n  nodes:\n    probe:\n      exec:\n        command: \"tr
                 "`{node}` is a partial update and answers as `merge` does"
             );
         }
+    }
+
+    /// A composition reaching every read PRD resolved q70 adds, three pages
+    /// apart in what `include_values:` says.
+    const KV_READS: &str = concat!(
+        "version: \"0.1\"\n",
+        "store.notes:\n  kind: kv\n  scope: global\n  value_schema:\n",
+        "    title: { type: string }\n",
+        "flow.f:\n  inputs:\n    cursor: { type: string }\n  outputs: {}\n  nodes:\n",
+        "    bare: { store: store.notes, op: list, limit: 10 }\n",
+        "    unvalued: { store: store.notes, op: list, limit: 10, after: \"input.cursor\", ",
+        "include_values: false }\n",
+        "    valued: { store: store.notes, op: list, limit: 10, after: \"input.cursor\", ",
+        "include_values: true }\n",
+        "    tally: { store: store.notes, op: count, prefix: \"'n/'\" }\n",
+        "    fetch: { store: store.notes, op: get_many, keys: \"[input.cursor]\" }\n",
+        "  edges:\n",
+        "    - { from: start, to: bare }\n    - { from: bare, to: unvalued }\n",
+        "    - { from: unvalued, to: valued }\n    - { from: valued, to: tally }\n",
+        "    - { from: tally, to: fetch }\n    - { from: fetch, to: end }\n",
+    );
+
+    /// The Zod a `kv` page, a `count` and a `get_many` derive (grammar 11.4,
+    /// Decision D34): `entries` on a page exactly when its `include_values:`
+    /// literal is `true` — absent where the node says nothing and where it says
+    /// `false` (Decision D154, the D114 pattern) — and a `get_many`'s bounded
+    /// by the most one reads. `next`, and an entry's `value` and `version`, are
+    /// spelled required like every other field a store row may leave out
+    /// (D110): a store row is never parsed against its schema.
+    #[test]
+    fn a_kv_reads_derived_output_follows_its_row_and_its_include_values_literal() {
+        let keys =
+            "z.object({\n  keys: z.array(z.string()).max(10),\n  next: z.string(),\n}).strict()";
+        assert_eq!(schema_of(KV_READS, "flow.f.node.bare.output"), keys);
+        assert_eq!(schema_of(KV_READS, "flow.f.node.unvalued.output"), keys);
+        assert_eq!(
+            schema_of(KV_READS, "flow.f.node.valued.output"),
+            "z.object({\n  keys: z.array(z.string()).max(10),\n  next: z.string(),\n  entries: z.array(z.object({\n    key: z.string(),\n    value: z.object({\n      title: z.string(),\n    }).strict(),\n    version: z.number().int(),\n  }).strict()).max(10),\n}).strict()"
+        );
+        assert_eq!(
+            schema_of(KV_READS, "flow.f.node.tally.output"),
+            "z.object({\n  count: z.number().int(),\n}).strict()"
+        );
+        assert_eq!(
+            schema_of(KV_READS, "flow.f.node.fetch.output"),
+            "z.object({\n  entries: z.array(z.object({\n    key: z.string(),\n    value: z.object({\n      title: z.string(),\n    }).strict(),\n    found: z.boolean(),\n    version: z.number().int(),\n  }).strict()).max(1000),\n}).strict()"
+        );
     }
 
     /// The tool surface `agent_access: full` synthesizes: `set`'s conditions as

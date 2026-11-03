@@ -1,0 +1,26 @@
+# rule: a `kv` page carries `entries` only when its node's `include_values:` literal is `true`, so reading them off a page that did not ask is an unknown field — presence decided by a literal in the node (grammar 11.4, Decision D154)
+# code: unknown-field
+# message: `page.output.entries` names no field of `page`'s output
+# at: main.yml:24:38
+# help: the declared fields are `keys`, `next`
+version: "0.1"
+store.notes:
+  kind: kv
+  scope: global
+  value_schema:
+    body: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    page:
+      store: store.notes
+      op: list
+      limit: 100
+    after:
+      exec:
+        command: "true"
+  edges:
+    - { from: start, to: page }
+    - { from: page, to: after, when: "size(page.output.entries) > 0" }
+    - { from: page, to: end, else: true }
+    - { from: after, to: end }

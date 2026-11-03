@@ -523,6 +523,9 @@ fn store_params(source: &ast_flow::StoreOpParams) -> Option<ir::flow::StoreParam
         condition: source.condition.clone(),
         if_version: source.if_version.clone(),
         ttl: source.ttl.clone(),
+        after: source.after.clone(),
+        include_values: source.include_values.clone(),
+        keys: source.keys.clone(),
     })
 }
 

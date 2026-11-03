@@ -1,0 +1,14 @@
+# rule: a `count` takes an optional `prefix` and nothing else — how many keys there are is not a page (grammar 11.4, PRD resolved q70)
+# at: /flow.work/nodes/tally/limit
+# via: /$defs/storeNode/allOf/12/then/properties/limit
+flow.work:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    tally:
+      store: store.notes
+      op: count
+      limit: 100
+  edges:
+    - { from: start, to: tally }
+    - { from: tally, to: end }

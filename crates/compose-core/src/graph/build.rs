@@ -637,6 +637,17 @@ fn store_params(params: &StoreParams) -> Vec<BindingView> {
     if let Some(ttl) = &params.ttl {
         push("ttl", ttl.value.as_str().to_string());
     }
+    // A `kv` page's cursor and its values, and a `get_many`'s keys (PRD
+    // resolved q70).
+    if let Some(after) = &params.after {
+        push("after", after.value.as_str().to_string());
+    }
+    if let Some(include) = &params.include_values {
+        push("include_values", include.value.to_string());
+    }
+    if let Some(keys) = &params.keys {
+        push("keys", keys.value.as_str().to_string());
+    }
     held
 }
 
@@ -1201,6 +1212,10 @@ fn output_schema(ir: &Ir, node: &Node) -> Option<(SchemaSource, FieldMap)> {
                     declared.value_schema.as_ref(),
                     declared.metadata_schema.as_ref(),
                     bound,
+                    params
+                        .include_values
+                        .as_ref()
+                        .is_some_and(|include| include.value),
                     &node.span,
                 ),
             ))

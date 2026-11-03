@@ -224,10 +224,11 @@ pub struct Human {
 
 /// The parameters of a store op (grammar 11.4).
 ///
-/// Nine of the fifteen are CEL; `top_k`, `limit`, `content_type`, `field`,
-/// `unique` and `if` are literals (grammar 8.8, 11.4), so a bound — and which
-/// field a partial update touches, and what it is conditioned on — is readable
-/// without running the graph.
+/// Eleven of the nineteen are CEL; `top_k`, `limit`, `content_type`, `field`,
+/// `unique`, `include_values`, `if` and `ttl` are literals (grammar 8.8, 11.4),
+/// so a bound — and which field a partial update touches, what it is
+/// conditioned on, how long the key it leaves lives, and whether a page carries
+/// its values — is readable without running the graph.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct StoreParams {
     /// `key:`
@@ -281,6 +282,16 @@ pub struct StoreParams {
     /// (PRD resolved q69).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttl: Option<Spanned<StoreTtl>>,
+    /// `after:` — a `kv` `list`'s exclusive cursor (PRD resolved q70).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<Spanned<Cel>>,
+    /// `include_values:` — a `kv` `list` that answers its keys' values and
+    /// versions too; absent means `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_values: Option<Spanned<bool>>,
+    /// `keys:` — the list of keys a `get_many` reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keys: Option<Spanned<Cel>>,
 }
 
 /// A store op's `value:`: one expression on a `vector upsert` and a `blob put`,

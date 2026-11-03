@@ -623,6 +623,8 @@ const STORE_OPS: &[(&str, StoreOp)] = &[
     ("merge", StoreOp::Merge),
     ("append", StoreOp::Append),
     ("incr", StoreOp::Incr),
+    ("count", StoreOp::Count),
+    ("get_many", StoreOp::GetMany),
 ];
 
 /// The two literal conditions a `kv` write's `if:` takes (grammar 11.4, PRD
@@ -780,6 +782,9 @@ const STORE_PARAMS: &[&str] = &[
     "if",
     "if_version",
     "ttl",
+    "after",
+    "include_values",
+    "keys",
 ];
 
 /// The `kv` writes that take a `ttl:` (grammar 11.4, PRD resolved q69), named
@@ -957,6 +962,23 @@ fn store_params(
     // A literal like `field:` and `if:`: how long a key lives is readable
     // without running the graph (PRD resolved q69).
     params.ttl = store_param(fields, &legal, "ttl").and_then(|node| store_ttl(node, cx));
+
+    // The reads of PRD resolved q70: a `list`'s cursor and the `get_many`'s
+    // keys are expressions, and whether a page carries its values is a literal
+    // — the presence of the `entries` it answers is decided by it, so it has to
+    // be readable without running the graph (Decision D154).
+    params.after =
+        store_param(fields, &legal, "after").and_then(|node| lexical::cel(node, "`after`", cx));
+    params.include_values =
+        store_param(fields, &legal, "include_values").and_then(|node| match &node.value {
+            Yaml::Bool(value) => Some(Spanned::new(*value, node.span.clone())),
+            _ => {
+                cx.wrong_type(node, "`include_values`", "a boolean");
+                None
+            }
+        });
+    params.keys =
+        store_param(fields, &legal, "keys").and_then(|node| lexical::cel(node, "`keys`", cx));
 
     // One condition per write. Both are legal in the row, so the row's own
     // check above admits them; together they would be two answers to one
