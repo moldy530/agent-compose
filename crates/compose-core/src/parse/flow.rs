@@ -6,7 +6,7 @@ use crate::ast::definition::Settings;
 use crate::ast::flow::{
     CoderBlock, CoderWorkspace, Edge, FlowContext, FlowDef, FlowNode, Harness, HumanBlock,
     ItemError, MapBlock, MapDispatch, MapRoute, NODE_KIND_KEYS, Node as FlowNodeAst, NodeKind,
-    PermissionMode, StoreNode, StoreOp, StoreOpParams, StoreValue, WorkspaceAccess,
+    PermissionMode, StoreCondition, StoreNode, StoreOp, StoreOpParams, StoreValue, WorkspaceAccess,
 };
 use crate::ast::policy::PolicyBlock;
 use crate::ast::schema::Surface;
@@ -619,6 +619,16 @@ const STORE_OPS: &[(&str, StoreOp)] = &[
     ("search", StoreOp::Search),
     ("upsert", StoreOp::Upsert),
     ("put", StoreOp::Put),
+    ("merge", StoreOp::Merge),
+    ("append", StoreOp::Append),
+    ("incr", StoreOp::Incr),
+];
+
+/// The two literal conditions a `kv` write's `if:` takes (grammar 11.4, PRD
+/// resolved q68).
+const STORE_CONDITIONS: &[(&str, StoreCondition)] = &[
+    ("absent", StoreCondition::Absent),
+    ("present", StoreCondition::Present),
 ];
 
 fn node_kind(
@@ -762,6 +772,12 @@ const STORE_PARAMS: &[&str] = &[
     "filter",
     "metadata",
     "content_type",
+    "fields",
+    "field",
+    "unique",
+    "by",
+    "if",
+    "if_version",
 ];
 
 fn store_params(
@@ -849,12 +865,56 @@ fn store_params(
 
     params.value = store_param(fields, &legal, "value").and_then(|node| match op.value {
         // `kv set` writes a value_schema-shaped object; `vector upsert` and
-        // `blob put` write one string (grammar 11.4).
+        // `blob put` write one string, and a `kv append` one item of whatever
+        // its array holds (grammar 11.4).
         StoreOp::Set => {
             binding::bindings(node, "`value`", NameForm::Identifier, cx).map(StoreValue::Fields)
         }
         _ => lexical::cel(node, "`value`", cx).map(StoreValue::Expression),
     });
+
+    // The partial updates of PRD resolved q68: `merge`'s field map, the one
+    // field an `append` or an `incr` addresses — a **name**, not an
+    // expression, so which field a write touches is readable without running
+    // the graph — and the two literals and one expression beside them.
+    params.fields = store_param(fields, &legal, "fields")
+        .and_then(|node| binding::bindings(node, "`fields`", NameForm::Identifier, cx));
+    params.field = store_param(fields, &legal, "field")
+        .and_then(|node| lexical::text(node, "`field`", cx))
+        .and_then(|text| lexical::identifier(&text, "`field`", cx));
+    params.unique = store_param(fields, &legal, "unique").and_then(|node| match &node.value {
+        Yaml::Bool(value) => Some(Spanned::new(*value, node.span.clone())),
+        _ => {
+            cx.wrong_type(node, "`unique`", "a boolean");
+            None
+        }
+    });
+    params.by = store_param(fields, &legal, "by").and_then(|node| lexical::cel(node, "`by`", cx));
+    params.condition = store_param(fields, &legal, "if")
+        .and_then(|node| lexical::keyword(node, "`if`", STORE_CONDITIONS, cx));
+    params.if_version = store_param(fields, &legal, "if_version")
+        .and_then(|node| lexical::cel(node, "`if_version`", cx));
+
+    // One condition per write. Both are legal in the row, so the row's own
+    // check above admits them; together they would be two answers to one
+    // question — and `if: absent` beside a version is a write that can never
+    // apply — so the pair is refused here, where the file alone decides it
+    // (grammar 11.4, PRD resolved q68).
+    if let (Some(condition), Some(version)) =
+        (params.condition.as_ref(), params.if_version.as_ref())
+    {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::ConflictingKeys,
+                version.span.clone(),
+                format!("{subject} declares both `if:` and `if_version:`, and a write takes one condition"),
+            )
+            .with_label(condition.span.clone(), "the other condition is declared here")
+            .with_help(
+                "`if:` asks whether the key holds a value and `if_version:` which version it holds, and only a key holding a value holds a version — so `if_version:` alone already asks `if: present` as well, and beside `if: absent` it could never apply: keep one (grammar 11.4)",
+            ),
+        );
+    }
 
     params
 }

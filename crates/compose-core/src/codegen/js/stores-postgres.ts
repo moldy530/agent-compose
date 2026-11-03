@@ -71,15 +71,36 @@ const POSTGRES_STORE_SCHEMA_LOCK: readonly [number, number] = [0x6167_656e, 0x74
 const POSTGRES_CONCURRENT_CREATOR: readonly string[] = ["23505", "42P07", "42710"];
 
 /**
- * The schema, created on first open and never migrated.
+ * The schema, created on first open and brought forward where an earlier
+ * release created it.
  *
  * `IF NOT EXISTS` throughout, so a second open of a store this build already
- * created does nothing — which is all a physical schema can be asked for here: a
- * dialled store is created by this release or a later one, so there is no older
- * database whose columns have to be probed for. The whole of it is **one
- * transaction holding [`POSTGRES_STORE_SCHEMA_LOCK`]**, because `IF NOT EXISTS`
- * is not atomic against a concurrent creator and a store is opened concurrently
- * by design.
+ * created does nothing. One migration exists, and it is the `DO` block below:
+ * PRD resolved q68 gave every `kv` key a `version`, and a database the previous
+ * release created has `store_entries` without it. Its rows take `0`, which no
+ * write of this release hands out — a partition's sequence starts past what it
+ * holds — so a key answering `version: 0` is one nothing has written since the
+ * upgrade. The whole of it is **one transaction holding
+ * [`POSTGRES_STORE_SCHEMA_LOCK`]**, because `IF NOT EXISTS` is not atomic
+ * against a concurrent creator and a store is opened concurrently by design.
+ *
+ * **The migration is probed rather than attempted**, and the reason is a lock
+ * rather than an error. `ALTER TABLE … ADD COLUMN IF NOT EXISTS` takes
+ * `ACCESS EXCLUSIVE` on `store_entries` *before* it looks for the column, so as
+ * a bare statement it would run on every open — every process start, and every
+ * redial after a lost connection — and every open would queue behind every
+ * transaction touching the table, plain readers and a `pg_dump` included, while
+ * every other process's store ops queued behind the open. The `DO` block reads
+ * `pg_attribute` instead, which locks nothing, and runs the `ALTER` only on the
+ * one open that finds the column missing. `'store_entries'::regclass` resolves
+ * the name through `search_path` exactly as the `ALTER` would, so the table
+ * probed is the table altered; the `IF NOT EXISTS` stays on the `ALTER` for a
+ * creator outside [`POSTGRES_STORE_SCHEMA_LOCK`]. Nothing else here conflicts
+ * with a reader: `CREATE TABLE IF NOT EXISTS` finds the name taken and does
+ * nothing, and `CREATE INDEX IF NOT EXISTS` takes `SHARE` on `store_applied`,
+ * which waits only for an in-flight write to that table. The conformance case
+ * `an_open_does_not_wait_on_a_reader` holds a reader's lock on every table this
+ * creates and opens beside it.
  *
  * **`COLLATE "C"` on every column a statement compares or orders by**, and it is
  * a correctness choice rather than a preference. A `kv` key is the
@@ -106,6 +127,11 @@ const POSTGRES_CONCURRENT_CREATOR: readonly string[] = ["23505", "42P07", "42710
  * first attempt gave instead of applying the effect again. `scope_key` is on the
  * row rather than in the key so that an execution-scoped partition can be
  * deleted whole when its run ends.
+ *
+ * `store_sequences` holds each partition's version sequence — the last version
+ * it handed out — and its row is also the lock every write to the partition
+ * takes first (`RemoteKv`'s `#write`). `BIGINT` on both sides of it, because a
+ * sequence that only counts up should not be the thing that runs out.
  */
 const POSTGRES_STORE_SCHEMA = `
 BEGIN;
@@ -115,8 +141,19 @@ CREATE TABLE IF NOT EXISTS store_entries (
   scope_key TEXT COLLATE "C" NOT NULL,
   "key"     TEXT COLLATE "C" NOT NULL,
   value     TEXT NOT NULL,
+  version   BIGINT NOT NULL DEFAULT 0,
   PRIMARY KEY (store, scope_key, "key")
 );
+DO $migrate$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_attribute
+    WHERE attrelid = 'store_entries'::regclass AND attname = 'version' AND NOT attisdropped
+  ) THEN
+    ALTER TABLE store_entries ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0;
+  END IF;
+END
+$migrate$;
 CREATE TABLE IF NOT EXISTS store_applied (
   store           TEXT COLLATE "C" NOT NULL,
   scope_key       TEXT COLLATE "C" NOT NULL,
@@ -126,8 +163,41 @@ CREATE TABLE IF NOT EXISTS store_applied (
   PRIMARY KEY (store, idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS store_applied_partition ON store_applied (store, scope_key);
+CREATE TABLE IF NOT EXISTS store_sequences (
+  store     TEXT COLLATE "C" NOT NULL,
+  scope_key TEXT COLLATE "C" NOT NULL,
+  last      BIGINT NOT NULL,
+  PRIMARY KEY (store, scope_key)
+);
 COMMIT;
 `;
+
+/**
+ * What makes a write's reads see what the previous writer committed:
+ * `READ COMMITTED`, asserted on the session rather than assumed of the server.
+ *
+ * It is Postgres's *default*, and a default is what a database or a role can
+ * change — `ALTER DATABASE … SET default_transaction_isolation`, or a role's
+ * own setting — while `RemoteKv`'s `#write` opens every write with a bare
+ * `BEGIN`. Under `REPEATABLE READ` or `SERIALIZABLE` a transaction's snapshot
+ * is taken at its first statement, which is the sequence row's
+ * `SELECT … FOR UPDATE` — the one that waits. A write queued there behind
+ * another one's commit then finds the row it waited for "concurrently updated"
+ * and is refused with `40001` instead of serializing behind it: a claim, an
+ * append or an increment that fails the node where PRD resolved q68 promises it
+ * queues. Under `READ COMMITTED` the lock that waited reads the row its holder
+ * committed, which is what `#write` is built on, and the MySQL arm asserts the
+ * same level on its own session for its own reasons (`MYSQL_STORE_ISOLATION`)
+ * — so the two servers answer one write the same way (PRD resolved q63).
+ *
+ * The session's characteristics rather than each `BEGIN`'s, so that every
+ * statement this connection sends runs at it: the autocommit insert that
+ * creates a partition's sequence row too, which two first writes to one
+ * partition race, and the schema's own transaction. Sent on every open, before
+ * the schema, so a redialled connection carries it as the first one did.
+ */
+const POSTGRES_STORE_ISOLATION =
+  "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED";
 
 /**
  * Create it, and treat a creator that got there first as having created it.
@@ -314,6 +384,7 @@ async function openPostgresStore(
   });
   await client.connect();
   try {
+    await client.query(POSTGRES_STORE_ISOLATION);
     await createPostgresStoreSchema(client);
   } catch (error) {
     await client.end().catch(() => undefined);

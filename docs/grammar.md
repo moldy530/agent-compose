@@ -3015,32 +3015,38 @@ load_prefs:
 |---|---|---|---|
 | `store` | `store.*` ref | yes | |
 | `op` | enum | yes | legal set depends on the store's `kind` (§11.4) |
-| `key`, `value`, `query`, `prefix`, `top_k`, `limit`, `filter`, `metadata`, `content_type` | per op | per op | §11.4 |
+| `key`, `value`, `query`, `prefix`, `top_k`, `limit`, `filter`, `metadata`, `content_type`, `fields`, `field`, `unique`, `by`, `if`, `if_version` | per op | per op | §11.4 |
 
 A store-op node takes **no `input:` key**: its parameters are exactly the op's
 own row in §11.4, written out in the node, and none of them resolves by name
 from a channel or a flow input (§8.0). The op's output schema is derived from the
 store definition (§11.4) and is written by name like any other node output.
 
-**Which parameters are CEL.** Six of the nine are, and they are exactly the row
-§4.1 scopes to `input`, `state`, and `execution`: `key`, `query`, and `prefix`
-are one expression each; `value` is one expression on a `vector upsert` and a
-`blob put` and a field map of expressions on a `kv set`; `filter` and `metadata`
-are maps of one expression per entry (§11.4). The other three are **literals**,
-not expressions: `top_k` and `limit` are integers in the ranges §11.4 fixes, and
-`content_type` is a media type string, which §4.3 puts in class 3 so it carries
-no env refs either. A CEL string where §11.4 declares an integer is a type
-error, not a computed bound — a fan-out's cardinality is a schema bound (§3.5)
-and a store op's is a written-down one, and both are meant to be readable
-without running the graph. All three are decidable in one file, so the published
+**Which parameters are CEL.** Nine of the fifteen are, and they are exactly the
+row §4.1 scopes to `input`, `state`, and `execution`: `key`, `query`, `prefix`,
+`by` and `if_version` are one expression each; `value` is one expression on a
+`vector upsert`, a `blob put` and a `kv append` and a field map of expressions on
+a `kv set`; `filter`, `metadata` and `fields` are maps of one expression per
+entry (§11.4). The other six are **literals**, not expressions: `top_k` and
+`limit` are integers in the ranges §11.4 fixes, `content_type` is a media type
+string, which §4.3 puts in class 3 so it carries no env refs either, `field` is
+the name of one field of the store's `value_schema`, `unique` is a boolean and
+`if` is `absent` or `present`. A CEL string where §11.4 declares an integer is a
+type error, not a computed bound — a fan-out's cardinality is a schema bound
+(§3.5) and a store op's is a written-down one, and both are meant to be readable
+without running the graph, as are which field a partial update touches and what
+a write is conditioned on. All six are decidable in one file, so the published
 schema types them too (Appendix B).
 
-`get` is the one op whose result may omit a field. On a miss it returns
+A store op's result may omit a field. A `get` that misses returns
 `found: false` and **no `value`**, so the `writes: { value: prefs }` above
 performs no write on that pass and `prefs` keeps what it held; a guard wanting
 to know reads `load_prefs.output.found`, because reading the absent `value`
 fails the execution (§11.4, §4.1, Decision
 [D110](#d110-an-absent-value-fails-the-read-and-an-absent-output-field-writes-nothing)).
+A `kv` write's `version`, and a partial update's `value`, are absent on the same
+terms where §11.4 says they are — a write that declined against a key holding
+nothing — and are read the same way: route on `applied` first.
 
 ### 8.9 `coder`
 
@@ -4140,7 +4146,7 @@ store.docs:
 | `embed` | block | `vector` required; others illegal | §11.2 |
 | `backend` | identifier (bare alias) | no | abstract slot; never provider config |
 | `description` | string | no | LLM-facing for agent-attached stores |
-| `agent_access` | `read` \| `read_write` | no (default `read_write`) | narrows the synthesized tool surface |
+| `agent_access` | `read` \| `read_write` \| `full` | no (default `read_write`); `full` is `kv` only | how much of the synthesized tool surface an attaching agent gets (§11.5) |
 
 **`metadata_schema` is a `vector` key.** Nothing in this grammar reads a `blob`
 store's metadata: no `blob` op takes a `metadata` or a `filter` parameter — `put`
@@ -4233,14 +4239,18 @@ position, so it accepts `provider.*` and nothing else (§2.3).
 Legal ops per kind, with their parameters and derived output schema. `V` is the
 store's `value_schema` object, which a `kv` store always declares (§11.1); `M`
 is its `metadata_schema` object, which a `vector` store MAY leave undeclared —
-see the `M`-is-absent rule below.
+see the `M`-is-absent rule below. `C` is one optional **condition**, `if:` or
+`if_version:` and never both (the conditions rule below).
 
 | kind | `op` | Parameters | Output |
 |---|---|---|---|
-| `kv` | `get` | `key` (CEL string) | `{ value: V (optional), found: boolean }` |
-| `kv` | `set` | `key`, `value` (map field→CEL matching `V`) | `{ key: string }` |
-| `kv` | `delete` | `key` | `{ deleted: boolean }` |
+| `kv` | `get` | `key` (CEL string) | `{ value: V (optional), found: boolean, version: integer (optional) }` |
+| `kv` | `set` | `key`, `value` (map field→CEL matching `V`), `C` | `{ key: string, applied: boolean, version: integer (optional), deduped: boolean }` |
+| `kv` | `delete` | `key`, `if_version` (CEL int, optional) | `{ deleted: boolean, applied: boolean, version: integer (optional), deduped: boolean }` |
 | `kv` | `list` | `prefix` (CEL string, optional), `limit` (integer 1..1000, required) | `{ keys: array<string> }` |
+| `kv` | `merge` | `key`, `fields` (map field→CEL, each a field of `V`), `C` | `{ key: string, applied: boolean, version: integer (optional), value: V (optional), deduped: boolean }` |
+| `kv` | `append` | `key`, `field` (an array field of `V`, literal), `value` (CEL, one item of it), `unique` (literal boolean, default `false`), `C` | as `merge` |
+| `kv` | `incr` | `key`, `field` (an `integer` or `number` field of `V`, literal), `by` (CEL number of the field's type, default `1`), `C` | as `merge` |
 | `vector` | `search` | `query` (CEL string), `top_k` (integer 1..100, required), `filter` (map metadata-field→CEL, optional) | `{ matches: array<{ id: string, score: number, text: string, metadata: M }> }` |
 | `vector` | `upsert` | `key`, `value` (CEL string — the text), `metadata` (map field→CEL, optional) | `{ id: string }` |
 | `vector` | `delete` | `key` | `{ deleted: boolean }` |
@@ -4258,8 +4268,66 @@ Rules (PRD 5.8):
   `op: get` with `top_k:` is rejected, not ignored. Because `op:` is a literal in
   the node itself, this is decidable per file and the published JSON Schema
   enforces it too (Appendix B).
+- **The kind takes the op.** Which kind a store is is the store's, not the
+  node's, so an op its kind does not take — a `search` on a `kv` store, a
+  `merge` on a `vector` one — is a compile error naming the store and the ops
+  its kind takes, decided against the definition the node names (Decision
+  [D152](#d152-a-kv-key-is-versioned-and-a-conditional-or-partial-write-is-serialized-against-every-write-to-its-key)).
 - `value` on a `kv` `set` is schema-checked against `value_schema`; `filter` and
-  `metadata` keys are schema-checked against `metadata_schema`.
+  `metadata` keys are schema-checked against `metadata_schema`. The same check
+  runs on three more rows (PRD resolved q68): a `merge`'s `fields` against
+  `value_schema` — not total, since a merge names the fields it changes; an
+  `append`'s `field` MUST be an **array** field of `V` and its `value` one item
+  of that array's `items:` type; and an `incr`'s `field` MUST be an `integer` or
+  `number` field and its `by` a value of that field's type. A field `V` does not
+  declare is `unknown-field`, and the wrong kind of field is `type-mismatch`.
+- **Versions.** A `kv` partition — one store and one scope key (§11.3) — keeps
+  one monotonic integer **sequence**, and every write that lands takes the next
+  value of it as its key's `version`. A sequence rather than a per-key counter,
+  so a key deleted and set again never shows a version it showed before: the
+  ABA race a compare-and-set exists to close stays closed across a delete. A
+  `get` returns it, `version` present exactly when `found`; every `kv` write
+  returns the version the key holds after it — so none after a `delete` that
+  applied, which leaves the key holding nothing.
+- **Conditions.** `set`, `merge`, `append` and `incr` take one of `if: absent`,
+  `if: present` (literals) or `if_version: <CEL int>`; `delete` takes
+  `if_version:` alone. Both conditions at once is a compile error, decidable in
+  one file and refused by the published schema too. A condition that does not
+  hold **applies nothing** and answers `applied: false`, with the key's current
+  `version` where it holds one — a declined `delete` too — a normal result an
+  edge routes on
+  (`when: "claim.output.applied"`), never a node error. A write with no
+  condition answers `applied: true` whenever it ran. A condition is a `kv`
+  key's: `if_version:` on a `vector` or `blob` `delete` is a compile error
+  naming the store.
+- **Partial updates.** A `merge`, an `append` and an `incr` each read what the
+  key holds, apply themselves, validate the **whole** result against `V`, and
+  commit — in one transaction, serialized against every other write to that
+  key on every backend (Decision
+  [D152](#d152-a-kv-key-is-versioned-and-a-conditional-or-partial-write-is-serialized-against-every-write-to-its-key)),
+  so two concurrent appends keep both items and two merges of different fields
+  keep both fields. On an absent key a `merge` creates the value and has to
+  satisfy `V` whole, an `append` starts from `[]` and an `incr` from `0`. An
+  `append` with `unique: true` adds only an item the array does not already
+  hold (compared as JSON); an item it holds changes nothing and is answered
+  `applied: true` with the key's current `version` and `value`. A result `V`
+  refuses **fails the node** — naming the field — and changes nothing.
+- **What a write answers.** Every `kv` write answers `applied`, `version` and
+  `deduped`, beside its own fields; a partial update answers the whole `value`
+  it left, present exactly when it applied. `deduped` is grammar 9.4's ledger
+  answering: the ledger stores the op's **whole** answer, so a retried write —
+  the same key, the same attempt — is answered with its first attempt's
+  `applied` and `version` and `deduped: true`, and a retried successful claim
+  never fails against its own first write. A synthesized tool's write carries no
+  key (§9.4), so its `deduped` is always `false`.
+- **Schema evolution.** `value_schema` is checked on **write**: CEL typing at
+  `validate` for a store-op node, the emitted Zod at run time for a tool's
+  arguments. A `get` returns the stored JSON unparsed, so a stored value that no
+  longer fits a changed schema is not refused there — it fails only where a CEL
+  read reaches a field it lacks (D110). `merge`, `append` and `incr` are the
+  first ops that validate a *stored* value, so under a changed schema they fail
+  naming the field the stored value lacks, and a `set` of the whole value is
+  the repair.
 - **A store with no `M`.** `metadata_schema:` is optional on a `vector` store
   (§11.1), and a store that declares none has no metadata at all rather than
   empty metadata (Decision
@@ -4280,10 +4348,15 @@ Rules (PRD 5.8):
   only ever hold `{}`, and the set of legal `filter:`/`metadata:` keys is the
   same empty one. The difference between the two spellings is exactly whether a
   match carries the field.
-- **A `get` that misses.** `value` is the one output field in this catalog its
-  op may not return: the `kv get` and `blob get` rows are
-  `{ value: … (optional), found: boolean }`, and a miss returns `found: false`
-  with no `value` at all. Both halves are what §8.0 states for writing an absent
+- **A `get` that misses.** `value` is the output field in this catalog a read
+  may not return: the `kv get` and `blob get` rows are
+  `{ value: … (optional), found: boolean }` — a `kv get` with its `version`
+  beside them — and a miss returns `found: false` with no `value` (and no
+  `version`) at all. The `kv` writes' optional fields are the same case on the
+  write side: a write that declined against a key holding nothing answers no
+  `version`, and a partial update that did not apply answers no `value`; each is
+  read and written exactly as below, and `applied` is the companion to route on.
+  Both halves are what §8.0 states for writing an absent
   field and §4.1 for reading an absent value (Decision
   [D110](#d110-an-absent-value-fails-the-read-and-an-absent-output-field-writes-nothing)):
 
@@ -4310,15 +4383,16 @@ Rules (PRD 5.8):
   keeps two instantiations of one flow, and the repeating item indexes of nested
   maps, from deriving one key for two different writes.
 - A store **write** performed inside a `map`-dispatched instance — `kv set`,
-  `kv delete`, `vector upsert`, `vector delete`, `blob put`, `blob delete` — MUST
-  be one of two forms (PRD 5.8, Decision
+  `kv delete`, `kv merge`, `kv append`, `kv incr`, `vector upsert`,
+  `vector delete`, `blob put`, `blob delete` — MUST be one of two forms (PRD 5.8,
+  Decision
   [D67](#d67-store-writes-inside-a-map-item-derived-key-or-a-keyed-kv-write)):
 
   1. **item-derived key** — the `key:` expression is *item-derived* in the sense
      fixed below, so concurrent instances address disjoint keys. Legal for every
      kind.
-  2. **a keyed `kv` write** — `op: set` or `op: delete` on a `kv` store with any
-     legal `key:` expression, including one constant across instances.
+  2. **a keyed `kv` write** — any write on a `kv` store with any legal `key:`
+     expression, including one constant across instances.
 
   Anything else — a `vector` or `blob` write whose key is not item-derived — is a
   compile error naming the node and the store.
@@ -4389,15 +4463,20 @@ Rules (PRD 5.8):
   which is the same one-flow-two-sites fact stated once for the static rule and
   once for the runtime one.
 
-  The `kv` exemption is not a loophole: a `kv` write replaces the whole value at
-  a slot the author named, so concurrent instances writing one key are a declared
-  overwrite, the store-side counterpart of `reduce: last_wins` (§10.2). Its final
-  value depends on completion order and is therefore *not* deterministic — which
-  is sound here and would not be for a channel, because store reads are recorded
-  and a replay consumes history rather than the live store (PRD 5.8), so no store
-  value ever feeds the graph's own scheduling. A `blob` or `vector` write has no
-  such story: it is bulk content at a document id, so a shared key from N
-  instances is N documents' worth of data landing in one slot.
+  The `kv` exemption is not a loophole: a `kv` write addresses a slot the author
+  named, so concurrent instances writing one key are many writers on one
+  record. A `set` replaces the whole value there, a declared overwrite, the
+  store-side counterpart of `reduce: last_wins` (§10.2); a `merge`, `append` or
+  `incr` is serialized against every other write to the key, so a constant key
+  inside a `map` with one of them is N instances each landing their change —
+  which is what authors reach for the exemption to mean, and what the partial
+  updates make safe. Its final value can still depend on completion order and
+  is therefore *not* deterministic — which is sound here and would not be for a
+  channel, because store reads are recorded and a replay consumes history rather
+  than the live store (PRD 5.8), so no store value ever feeds the graph's own
+  scheduling. A `blob` or `vector` write has no such story: it is bulk content
+  at a document id, so a shared key from N instances is N documents' worth of
+  data landing in one slot.
 
 ### 11.5 Agent-attached stores
 
@@ -4405,18 +4484,47 @@ Listing a store in an agent's `stores:` synthesizes LLM-facing tools from the
 store's kind and schema (nondeterministic, agent-invoked, recorded as tool
 calls — PRD 5.8):
 
-| kind | `agent_access: read` | `agent_access: read_write` (default) |
-|---|---|---|
-| `kv` | `<name>_get` | `<name>_get`, `<name>_set` |
-| `vector` | `<name>_search` | `<name>_search`, `<name>_upsert` |
-| `blob` | `<name>_get`, `<name>_list` | `<name>_get`, `<name>_list`, `<name>_put` |
+| kind | `agent_access: read` | `agent_access: read_write` (default) | `agent_access: full` |
+|---|---|---|---|
+| `kv` | `<name>_get` | `<name>_get`, `<name>_set` | `<name>_get`, `<name>_set`, `<name>_merge`, `<name>_append`, `<name>_incr`, `<name>_delete` |
+| `vector` | `<name>_search` | `<name>_search`, `<name>_upsert` | illegal |
+| `blob` | `<name>_get`, `<name>_list` | `<name>_get`, `<name>_list`, `<name>_put` | illegal |
 
 `<name>` is the store's local name (`store.user_prefs` → `user_prefs_get`). A
 synthesized tool name that collides with an attached `tool.*`/`flow.*` tool name
 is a compile error.
 
+**`full` is PRD resolved q68's third level** (Decision
+[D152](#d152-a-kv-key-is-versioned-and-a-conditional-or-partial-write-is-serialized-against-every-write-to-its-key)):
+the writes beyond a whole-value `set` are a different authority — a model that
+can delete a key can remove what a run depends on — so an author opts into them
+by name, and every composition written before it keeps exactly the tools it had.
+The set is the access level's, not the schema's: `full` grants all six tools on
+every `kv` store, which is the set the ruling names. Where `V` declares no array
+field, `<name>_append`'s `item` has no property to name and every call is
+refused; where it declares no `integer` or `number` field, `<name>_incr`'s
+`field` is a plain string rather than an enum of none, and every call is refused
+too, since whatever it names leaves a value `V` does not admit. Each tool's
+description says so, and each refusal goes back to the model (below). **`full`
+is a `kv` level**: the ruling defines it by the `kv` writes it adds and says
+nothing of a kind that has none of them, so on a `vector` or `blob` store it is
+`invalid-value` rather than a second spelling of `read_write` — which is the
+widest level those kinds take.
+
 Each tool's arguments are its row of §11.4 with the expressions replaced by what
 the model supplies, and they are held to that schema before the store sees them.
+The `kv` writes' conditions are arguments too — `<name>_set` stays at
+`read_write` with them, because a condition narrows a write rather than widening
+it — offered as `if` (a string: `absent`, `present`, or empty for none, the
+default) and `if_version` (an integer, `-1` for none, the default), since a
+tool's optional argument is spelled with a `default:` and neither has a value of
+its own type that means "none". One row is folded rather than copied, because
+its second half is typed by its first: an `append`'s `field` and `value` arrive
+as `item`, an object whose properties are `V`'s array fields each typed as its
+item, naming exactly one — `{"item": {"tags": "urgent"}}`. A call naming both
+conditions, or an `item` naming other than one field, is refused back to the
+model like any argument the schema refuses, and so is a partial update whose
+result `V` refuses: the arguments were the model's, and nothing was written.
 A call the schema refuses — a `top_k` outside `1..=100`, a `value` the store's
 `value_schema` does not admit — is **returned to the model** as an error tool
 result, the way it is at the other two tool surfaces (§5.4, §6, Decision
@@ -5517,8 +5625,11 @@ A store bound to any other provider compiles and then refuses at its first op,
 naming the backend and where the binding came from; those land behind the store
 plugin interface in M3 (PRD §7). A dialled backend is **multi-writer by design**
 — it takes no writer guard, two processes reaching it are two readers of one
-store, and the concurrency posture per key is last write wins
-(Decision [D149](#d149-a-dialled-kv-store-is-multi-writer-and-per-key-last-write-wins)).
+store, and the concurrency posture per key is last write wins for a plain `set`
+(Decision [D149](#d149-a-dialled-kv-store-is-multi-writer-and-per-key-last-write-wins))
+while a conditional or partial write is serialized against every other write to
+its key (Decision
+[D152](#d152-a-kv-key-is-versioned-and-a-conditional-or-partial-write-is-serialized-against-every-write-to-its-key)).
 
 ### 14.4 `event_sources` (RESERVED — parsed and validated, no-op in v0)
 
@@ -6491,9 +6602,14 @@ is [D116](#d116-embedprovider-is-required-and-no-backend-serves-embeddings)'s.
 
 ### D37. `agent_access` narrows the synthesized store tool surface
 
-**PRD-extending** — see this appendix's preamble.
+**PRD-extending** — see this appendix's preamble. **Amended 2026-11-02** by
+[D152](#d152-a-kv-key-is-versioned-and-a-conditional-or-partial-write-is-serialized-against-every-write-to-its-key),
+which is PRD resolved q68: the enum gains a third level, `full`, granting a
+`kv` store's partial updates and `delete` beside `read_write`'s tools — legal on
+a `kv` store alone — and `read_write`'s `<name>_set` gains the condition
+arguments. The default and the narrowing this entry is about are unchanged.
 
-Default `read_write`, narrowable to `read`. **Rationale**: PRD 5.8 synthesizes
+Default `read_write`, narrowable to `read`, widenable to `full` (§11.5). **Rationale**: PRD 5.8 synthesizes
 `get`/`set` pairs, so `read_write` is the settled default; a declarative way to
 withhold writes costs one enum and serves the same least-privilege posture as
 placement isolation. **Status**: ratified — PRD §9.13 accepts the key and its
@@ -9076,7 +9192,8 @@ so the repair this rule recommends is one a build of this release runs rather
 than a direction of travel. That those backends take **no writer guard** is the
 same fact read from the other end: this rule is what governs who may reach a
 store, so two processes reaching a dialled one are two readers of one store by
-construction, and per key the last write wins.
+construction, and per key a plain `set`'s last write wins (a conditional or
+partial write is serialized against the others to its key, D152).
 
 *Why execution rather than membership.* The rule reads exactly the closure rule 4
 reads, and for the same reason: the whole artifact reaches every worker (PRD
@@ -10419,6 +10536,18 @@ q27–q29, q32, q42, q45, q62; §14, §14.7, §4.3.*
 
 ### D149. A dialled `kv` store is multi-writer, and per key last write wins
 
+**Amended 2026-11-02** by
+[D152](#d152-a-kv-key-is-versioned-and-a-conditional-or-partial-write-is-serialized-against-every-write-to-its-key),
+which is PRD resolved q68: "per key, last write wins" is now the posture of a
+plain unconditional `set` only. A conditional or partial write is serialized
+against every other write to its key, on every backend — a dialled arm takes a
+row lock on the partition's version sequence and on the key before it reads —
+and every `kv` write answers whether it applied. What the entry is actually
+about is unchanged: a dialled store is multi-writer, takes no writer guard, and
+enforces the idempotency key on the server. The amended text follows; the
+superseded sentence is quoted at the end so a reader of an older citation can
+see what moved.
+
 `mysql` joins §14.3's `kv` row beside `postgres`, and both are **implemented**
 for that kind: a store bound to either is opened over a connection, answers
 §11.4's catalogue, partitions by §11.3's scopes and records and deduplicates
@@ -10445,11 +10574,15 @@ take a session-scoped lock because a journal has exactly one writer (PRD resolve
 q42). A store is the opposite **by design**: §14.1 rule 5 refuses a placement
 over a store the reaching process opens for itself, and admits a dialled one
 precisely because two processes reaching it are two readers of one store. Locking
-it would take that away. So the posture is stated rather than prevented: **per
-key, last write wins** — two writers setting one key leave whichever statement
-the server ran second, and two writers at different keys never meet. A
-composition that needs more than that is asking for a transaction across nodes,
-which a `kv` store is not.
+it would take that away. So no lock outlives one op, and the posture of a plain
+unconditional `set` is stated rather than prevented: **per key, last write
+wins** — two writers setting one key leave whichever committed second, and two
+writers at different partitions never meet. A conditional or partial write holds
+its partition's sequence row and its key's entry for the length of its own
+transaction and no longer, which serializes it against every other write to the
+key without guarding the store (D152). A composition that needs more than one
+key to move together is asking for a transaction across nodes, which a `kv`
+store is not.
 
 **What the backend does enforce is the idempotency key.** PRD 5.8 makes a store
 write at-least-once with a key derived from `execution_id + node + item_index`,
@@ -10475,8 +10608,16 @@ column is text rather than a JSON type, because it holds the JSON this runtime
 produced and a JSON type would normalize what comes back. MySQL's is `LONGTEXT`,
 because `TEXT` stops at 64 KiB and a `value:` does not. The contract is a
 conformance suite run against SQLite always and against real servers in CI, the
-way the journal's is (PRD resolved q62). *PRD 5.8, 5.10, 5.12, resolved q9, q13,
-q45, q62, q63; §11.3, §11.4, §11.5, §14.1, §14.3, §4.3.*
+way the journal's is (PRD resolved q62).
+
+**What the amendment replaced**, verbatim: *"So the posture is stated rather than
+prevented: **per key, last write wins** — two writers setting one key leave
+whichever statement the server ran second, and two writers at different keys
+never meet."* The sentence survives for the op it was about — a plain `set` —
+and what moved is that it is no longer the posture of every write.
+**Status**: ratified — PRD resolved q63, amended by resolved q68. *PRD 5.8,
+5.10, 5.12, resolved q9, q13, q45, q62, q63, q68; §11.3, §11.4, §11.5, §14.1,
+§14.3, §4.3.*
 
 ### D150. A detached `flow.*` dispatch starts a child execution
 
@@ -10679,6 +10820,88 @@ resolved q66 follows — and the list of sections `local` refuses stays two.
 **Status**: shipped. *PRD 5.8, 5.12, resolved q18, q40, q49, q57, q58, q59, q60,
 q66; §4.3, §8.9, §14, §14.8.*
 
+### D152. A `kv` key is versioned, and a conditional or partial write is serialized against every write to its key
+
+A `kv` partition keeps one monotonic version sequence and every write that lands
+takes its next value; `get` returns it. `set` takes `if: absent | present` or
+`if_version:`, `delete` takes `if_version:`, and a condition that does not hold
+answers `applied: false` rather than failing. `merge`, `append` and `incr` read,
+apply, validate the whole result against `V`, and commit in one transaction.
+Every `kv` write answers `{ applied, version, deduped }`, and the §9.4 ledger
+stores that whole answer. `agent_access:` gains `full` (§11.4, §11.5, PRD
+resolved q68).
+
+**Rationale**: a `kv set` replaces the whole value and, until this entry, per
+key last write won
+([D149](#d149-a-dialled-kv-store-is-multi-writer-and-per-key-last-write-wins)) —
+so a claim was get-then-route-then-set with a race in the middle, and two
+writers merging fields into one record silently dropped each other's, which are
+the two things a store several runs share is for. Each half of the ruling closes
+one of them without giving up what made a `kv` store simple.
+
+**A sequence, not a per-key counter.** A counter per key restarts when the key
+is deleted, so a reader holding `version: 3` of a key that was deleted and set
+again would see `3` again and take its compare-and-set as current — the ABA race
+the condition exists to close. A per-partition sequence never repeats a value,
+deleted keys included, and costs one row per partition: the row holding the last
+version handed out, which is also the row every write to the partition locks
+first on a dialled server. A version is a key's, so it is absent where the key
+holds nothing.
+
+**A failed condition is an answer.** `applied: false` is a normal result an edge
+routes on — the losing side of a claim is a branch, not an error, and a node
+`retry:` re-running the claim would only lose it again. It carries the key's
+current `version` where one exists, which is what the next compare-and-set
+needs. `delete` takes `if_version:` alone because an absent key has nothing to
+delete — `if: absent` would never apply and `if: present` is the unconditional
+delete — and both conditions at once are two answers to one question, refused
+in one file.
+
+**One transaction, serialized per key.** A partial update reads the stored
+value, so it is a read-modify-write, and the only way two of them can both land
+is for the second to read what the first committed. SQLite's serialized writer
+gives that locally (`BEGIN IMMEDIATE`); a dialled server gives it with row locks,
+the partition's sequence row and then the key's entry, always in that order so
+two writers cannot wait on each other in a circle. Validating the **whole**
+result against `V` — not only what the op supplied — is what keeps a store's
+values well-typed when the stored half is old, and makes these the first ops
+that check a stored value: under a changed schema they fail naming the field,
+where a `get` answers the stored JSON as it is.
+
+**The ledger answers whole.** A retried write is the same effect site carrying
+the same §9.4 key; were the ledger to hold only "applied", a retried `if:
+absent` claim would re-read the key, find its own first write, and answer
+`applied: false` — failing against itself. Holding the first attempt's whole
+answer hands it back `applied: true` with the same version and `deduped: true`,
+which is why `deduped` joins the node output where q57's trace record kept it
+alone.
+
+**`full` rather than widening `read_write`.** A condition narrows a write, so a
+`<name>_set` with condition arguments stays at `read_write` and every existing
+composition keeps the tools it had. A `merge`, `append`, `incr` or `delete` is a
+different authority — a model that can delete a key can remove what a run
+depends on — so it is a third level an author opts into
+([D37](#d37-agent_access-narrows-the-synthesized-store-tool-surface)). It grants
+all four on every `kv` store — the set the ruling names — so a `V` with no array
+or no numeric field still offers `<name>_append` or `<name>_incr`, and each
+refuses every call back to the model (§11.5). It is a `kv` level and nothing
+else: the ruling names `kv`'s tools, and what `full` would mean on a kind with
+no write past `read_write`'s is a question it did not ask, so a `vector` or
+`blob` store declaring it is refused at parse rather than handed an answer
+nobody ratified.
+
+**What this amends, and what it does not.** D149's "per key, last write wins" is
+now the posture of a plain unconditional `set` alone; D67 is untouched and every
+new op is a keyed `kv` write it already exempts, which the ops now make safe at a
+constant key. The op catalogue is per kind, and with three ops that only one
+kind takes, which kind takes an op is now checked against the store a node
+names rather than left to a comment. Expiry (PRD resolved q69) counts as absent
+and folds into the one predicate the conditions read; it is not part of this
+entry.
+
+**Status**: shipped. *PRD 5.8, resolved q13, q29, q63, q68; §9.4, §11.3, §11.4,
+§11.5.*
+
 ## Appendix B — Editor integration
 
 [`schemas/agent-compose.schema.json`](../schemas/agent-compose.schema.json) is a
@@ -10765,10 +10988,12 @@ authority. The schema cannot see across files, so it does not check:
   through other files, so only the validator can require it there.
 
 What the schema *does* enforce beyond plain shape, because the deciding value is
-a literal in the same object: store-op parameter sets per `op` (§11.4) and the
-three parameters that are literals rather than CEL — `top_k` and `limit` typed
-as integers in their ranges, `content_type` as a string carrying no env ref
-(§8.8, §11.4) — store definition key sets per `kind`, both the schema each kind
+a literal in the same object: store-op parameter sets per `op` (§11.4), a `kv`
+write's two conditions as one or the other and never both, and the parameters
+that are literals rather than CEL — `top_k` and `limit` typed as integers in
+their ranges, `content_type` as a string carrying no env ref, `field` as an
+identifier, `unique` as a boolean and `if` as `absent` or `present` (§8.8,
+§11.4) — store definition key sets per `kind`, both the schema each kind
 requires and the ones it refuses, `metadata_schema` being `vector`'s alone
 (§11.1, D113) and the `provider:` a `vector` store's `embed:` block must name
 (§11.2, D116), provider key sets per `kind` — both halves, the required keys and
@@ -10921,7 +11146,7 @@ store.<name>:
                                     # provider.* ref and is required; a storage
                                     # backend never computes vectors (D116)
   backend: <alias>
-  agent_access: read|read_write
+  agent_access: read|read_write|full   # full is kv only: merge/append/incr/delete
 
 provider.<name>: { kind: ..., api_key: "${ENV}", base_url: "${ENV}", ... }
                  # keys beyond kind/description are per kind — 12.1's row is
@@ -10959,7 +11184,11 @@ model.<name>:    { route: [model.<a>, model.<b>], route_on: [...] }
 { human: { input, output, timeout?, on_timeout? }, input: <field map>, writes: {...},
                      on_error }             # no retry/timeout, at any level (D102)
 { store: store.<s>, op: <op>,     # params are exactly the op's row (11.4):
-                     # get/delete: key | set: key,value | list: prefix?,limit
+                     # get: key | delete: key,if_version? | list: prefix?,limit
+                     # set: key,value,C? | merge: key,fields,C?
+                     # append: key,field,value,unique?,C? | incr: key,field,by?,C?
+                     # C = if: absent|present  XOR  if_version: <CEL int>;
+                     # a condition that does not hold answers applied:false
                      # search: query,top_k,filter? | upsert: key,value,metadata?
                      # put: key,value,content_type?
                      # top_k/limit/content_type are literals, not CEL (8.8)

@@ -457,10 +457,17 @@ pub enum StoreOp {
     Upsert,
     /// `blob`: write one object.
     Put,
+    /// `kv`: merge fields into one key's value (PRD resolved q68).
+    Merge,
+    /// `kv`: append one item to an array field of one key's value.
+    Append,
+    /// `kv`: add to a numeric field of one key's value.
+    Incr,
 }
 
 impl StoreOp {
-    /// Every op, in the order grammar 11.4 lists them.
+    /// Every op: grammar 11.4's original seven in the order its table first
+    /// listed them, then the three partial updates PRD resolved q68 added.
     pub const ALL: &'static [Self] = &[
         Self::Get,
         Self::Set,
@@ -469,6 +476,9 @@ impl StoreOp {
         Self::Search,
         Self::Upsert,
         Self::Put,
+        Self::Merge,
+        Self::Append,
+        Self::Incr,
     ];
 
     /// The keyword that names this op.
@@ -482,7 +492,26 @@ impl StoreOp {
             Self::Search => "search",
             Self::Upsert => "upsert",
             Self::Put => "put",
+            Self::Merge => "merge",
+            Self::Append => "append",
+            Self::Incr => "incr",
         }
+    }
+
+    /// Whether this op writes — the ops an idempotency key and a dedupe apply
+    /// to (grammar 9.4, 11.4).
+    #[must_use]
+    pub const fn writes(self) -> bool {
+        matches!(
+            self,
+            Self::Set
+                | Self::Delete
+                | Self::Upsert
+                | Self::Put
+                | Self::Merge
+                | Self::Append
+                | Self::Incr
+        )
     }
 
     /// The parameters this op takes, required ones first — the exact row of
@@ -494,18 +523,54 @@ impl StoreOp {
             Self::Set | Self::Upsert | Self::Put => &["key", "value"],
             Self::List => &["limit"],
             Self::Search => &["query", "top_k"],
+            Self::Merge => &["key", "fields"],
+            Self::Append => &["key", "field", "value"],
+            Self::Incr => &["key", "field"],
         }
     }
 
     /// The optional parameters this op takes.
+    ///
+    /// The conditions of PRD resolved q68 are here: `if:` and `if_version:` on
+    /// every `kv` write but `delete`, which takes `if_version:` alone — an
+    /// absent key has nothing to delete, so `if: absent` would be a delete that
+    /// can never apply and `if: present` the unconditional one under another
+    /// name. `delete` is one op of three kinds and a version is a `kv` key's,
+    /// so a `vector`/`blob` `delete` naming one is refused against its store by
+    /// the validator rather than here (grammar 11.4).
     #[must_use]
     pub const fn optional_parameters(self) -> &'static [&'static str] {
         match self {
-            Self::Get | Self::Delete | Self::Set => &[],
+            Self::Get => &[],
+            Self::Delete => &["if_version"],
+            Self::Set | Self::Merge => &["if", "if_version"],
+            Self::Append => &["unique", "if", "if_version"],
+            Self::Incr => &["by", "if", "if_version"],
             Self::List => &["prefix"],
             Self::Search => &["filter"],
             Self::Upsert => &["metadata"],
             Self::Put => &["content_type"],
+        }
+    }
+}
+
+/// The literal condition a `kv` write's `if:` names (grammar 11.4, PRD resolved
+/// q68).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreCondition {
+    /// Write only when the key holds nothing.
+    Absent,
+    /// Write only when the key holds a value.
+    Present,
+}
+
+impl StoreCondition {
+    /// The keyword that names this condition.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Present => "present",
         }
     }
 }
@@ -555,6 +620,18 @@ pub struct StoreOpParams {
     pub metadata: Option<Bindings>,
     /// `content_type:`
     pub content_type: Option<Spanned<String>>,
+    /// `fields:` — a `merge`'s field map of CEL.
+    pub fields: Option<Bindings>,
+    /// `field:` — the one field of `V` an `append` or an `incr` addresses.
+    pub field: Option<Spanned<Ident>>,
+    /// `unique:` — an `append` that adds only an item the array lacks.
+    pub unique: Option<Spanned<bool>>,
+    /// `by:` — what an `incr` adds.
+    pub by: Option<Spanned<Cel>>,
+    /// `if:` — `absent` or `present`.
+    pub condition: Option<Spanned<StoreCondition>>,
+    /// `if_version:` — the version the key must hold.
+    pub if_version: Option<Spanned<Cel>>,
 }
 
 /// Per-item error strategy on a `map` node (grammar 8.6 rule 10,

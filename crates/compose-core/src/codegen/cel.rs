@@ -394,6 +394,8 @@ fn node_kind<'ir>(kind: &'ir NodeKind, site: &str, found: &mut Vec<Expression<'i
                 (params.key.as_ref(), "key"),
                 (params.query.as_ref(), "query"),
                 (params.prefix.as_ref(), "prefix"),
+                (params.by.as_ref(), "by"),
+                (params.if_version.as_ref(), "if_version"),
             ] {
                 if let Some(source) = expression {
                     found.push(Expression {
@@ -420,6 +422,11 @@ fn node_kind<'ir>(kind: &'ir NodeKind, site: &str, found: &mut Vec<Expression<'i
             bindings(
                 params.metadata.as_ref(),
                 &format!("{site}'s `metadata:`"),
+                found,
+            );
+            bindings(
+                params.fields.as_ref(),
+                &format!("{site}'s `fields:`"),
                 found,
             );
         }

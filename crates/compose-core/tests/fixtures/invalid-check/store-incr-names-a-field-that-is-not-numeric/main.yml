@@ -1,0 +1,24 @@
+# rule: a `kv incr` adds to an `integer` or `number` field of `value_schema` (grammar 11.4, PRD resolved q68)
+# code: type-mismatch
+# message: `incr` adds to a numeric field, and `label` of `store.counters` is a string
+# at: main.yml:21:14
+# label: main.yml:12:5 the field is declared here
+# help: name an `integer` or `number` field — `store.counters` declares `hits` — or write the field with `merge` (grammar 11.4)
+version: "0.1"
+store.counters:
+  kind: kv
+  scope: global
+  value_schema:
+    label: { type: string }
+    hits: { type: integer }
+flow.f:
+  outputs: {}
+  nodes:
+    count:
+      store: store.counters
+      op: incr
+      key: "'k'"
+      field: label
+  edges:
+    - { from: start, to: count }
+    - { from: count, to: end }

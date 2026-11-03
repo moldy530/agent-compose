@@ -25,10 +25,14 @@
 // file can take away without touching the others.
 // Prints one JSON object of everything the suite asserts about.
 
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { pathToFileURL } from "node:url";
+import fs from "node:fs";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 import process from "node:process";
+
+import { z } from "zod";
 
 const [, , project, provider, data] = process.argv;
 if (project === undefined || provider === undefined || data === undefined) {
@@ -43,6 +47,9 @@ process.env["AGENT_COMPOSE_DATA_DIR"] = data;
 const at = (relative) => pathToFileURL(path.resolve(project, relative)).href;
 const stores = await import(at("src/stores.ts"));
 const journal = await import(at("src/journal.ts"));
+// The module `src/stores.ts` imports, so `ToolCallRefused` here is the class it
+// throws rather than a second copy of it.
+const runtime = await import(at("src/runtime.ts"));
 
 /** The variable each of the five connections reads its address from. */
 const URL_ENV = "AGENT_COMPOSE_STORE_URL";
@@ -93,13 +100,20 @@ const LONG_KEY = `long-${"k".repeat(1019)}`;
  */
 const LONG_SESSION = "世".repeat(100);
 
-/** One binding, on the backend this run is driving. */
-const kv = (name, scope, variable = URL_ENV) => ({
+/**
+ * One binding, on the backend this run is driving.
+ *
+ * `value` is the store's `value_schema` as the emitted Zod, which is what a
+ * partial update holds its result to (PRD resolved q68); a binding the cases
+ * below only `set` and `get` through needs none.
+ */
+const kv = (name, scope, variable = URL_ENV, value = undefined) => ({
   address: `store.${RUN}_${name}`,
   name: `${RUN}_${name}`,
   kind: "kv",
   scope,
   metadata: false,
+  ...(value === undefined ? {} : { value }),
   backend: {
     provider,
     from: "the `kv` default of the `remote` target",
@@ -148,7 +162,15 @@ const list = (store, run, prefix = undefined, limit = 50) =>
  * a connection deliberately being killed.
  */
 async function openKiller() {
-  const address = process.env[KILLED_URL_ENV];
+  return await openServer(process.env[KILLED_URL_ENV]);
+}
+
+/**
+ * A connection of this file's own to `address`, with the pinned driver — the
+ * killer's, and the one the reader and the earlier release's schema below are
+ * spoken over. See [`openKiller`].
+ */
+async function openServer(address) {
   if (provider === "postgres") {
     const pg = await import("pg");
     const Client = pg.Client ?? pg.default.Client;
@@ -211,15 +233,29 @@ async function holdTheKey(killer, store, key) {
  * MySQL is asked by the statement text — `mysql2` interpolates parameters on the
  * client, so the blocked `INSERT` carries this run's unique store name — and
  * Postgres by state, since `pg` binds parameters on the server and its
- * `pg_stat_activity.query` holds `$1` where the name would be.
+ * `pg_stat_activity.query` holds `$1` where the name would be — and by the
+ * session waiting on a **lock**, among **client** backends: an autovacuum worker
+ * reports `state = 'active'` with `autovacuum: VACUUM … store_entries` as its
+ * query, and the cases above write that table often enough to wake one, so a
+ * filter on the text alone finds two sessions and names neither.
+ *
+ * **The Postgres view is cleared before every poll**, and that is what makes it
+ * a poll at all. The killer asks from inside the transaction holding the lock,
+ * and Postgres hands a transaction one snapshot of the activity view at its
+ * first read and the same one on every read after (`stats_fetch_consistency`):
+ * a first poll that landed while the store was still on the statements before
+ * the one that blocks — a write locks its partition's sequence row and reads
+ * its key before it inserts — would be the answer to all hundred.
  */
 async function waitingOn(killer, store) {
   const found = async () => {
     if (provider === "postgres") {
+      await rows(killer, "SELECT pg_stat_clear_snapshot()");
       return await rows(
         killer,
         "SELECT pid AS id FROM pg_stat_activity WHERE datname = current_database() " +
-          "AND pid <> pg_backend_pid() AND state = 'active' AND query LIKE '%store_entries%'",
+          "AND pid <> pg_backend_pid() AND backend_type = 'client backend' " +
+          "AND state = 'active' AND wait_event_type = 'Lock' AND query LIKE '%store_entries%'",
       );
     }
     return await rows(
@@ -287,6 +323,115 @@ const answer = {};
   answer.every_opener_wrote_through_its_own_connection = held.every(
     (row, index) => row.found === true && row.value?.opener === index,
   );
+}
+
+// --- An open beside a reader -------------------------------------------------
+
+if (provider !== "sqlite") {
+  // A dialled store runs its schema on **every** open — every process start,
+  // and every redial after a lost connection — so a statement in it that waits
+  // on a reader is a `serve` that cannot open for as long as a `pg_dump` or an
+  // operator's open transaction lasts, and every other process's store ops
+  // queue behind the open's own lock request meanwhile. Postgres takes
+  // `ACCESS EXCLUSIVE` for an `ALTER TABLE … ADD COLUMN IF NOT EXISTS` before it
+  // looks for the column, which is why the arm probes for the one migration it
+  // has rather than attempting it (`stores-postgres.ts`).
+  //
+  // The reader is the lock a `get` takes, held open: a transaction that has
+  // read every table the schema names. A fresh variable is a fresh connection,
+  // so the `get` beside it is an open and runs the whole schema.
+  const READER_URL_ENV = "AGENT_COMPOSE_STORE_URL_READER";
+  process.env[READER_URL_ENV] = process.env[URL_ENV];
+  const store = kv("beside_a_reader", "global", READER_URL_ENV);
+  const run = ctx(execution("beside_a_reader"));
+  const reader = await openServer(process.env[URL_ENV]);
+  let opening;
+  try {
+    await begin(reader);
+    for (const table of ["store_entries", "store_applied", "store_sequences"]) {
+      await rows(reader, `SELECT COUNT(*) AS held FROM ${table}`);
+    }
+    // Settled into a string the moment the promise exists: a rejection nothing
+    // is listening to yet would end this process.
+    opening = get(store, "anything", run).then(
+      () => "answered",
+      (error) => `refused: ${String(error?.message ?? error)}`,
+    );
+    const waited = await Promise.race([
+      opening,
+      new Promise((resolve) => setTimeout(() => resolve("still waiting after 3 s"), 3_000)),
+    ]);
+    answer.an_open_does_not_wait_on_a_reader = waited === "answered";
+    answer.open_beside_a_reader = waited;
+  } catch (error) {
+    answer.open_beside_a_reader = String(error?.message ?? error);
+  } finally {
+    // Released before the open is awaited, so an open that *is* waiting on the
+    // reader finishes and this runner fails the case rather than hanging.
+    await rollback(reader).catch(() => undefined);
+    if (opening !== undefined) await opening;
+    await reader.end().catch(() => undefined);
+  }
+}
+
+// --- First writes into distinct partitions, at once --------------------------
+
+{
+  // The other half of what a write's isolation level decides, and the half a
+  // case about one key cannot see. A `kv` write locks the key it reads, and
+  // every **first** write of a key — every `if: absent` claim, every append
+  // that starts a list — reads a key that is not there yet. Under InnoDB's
+  // default `REPEATABLE READ` that read takes a gap lock spanning the index
+  // between two existing rows, so two writers in two different partitions
+  // whose keys fall in one gap each hold one and then wait on the other's to
+  // insert: a deadlock the server breaks by failing one of them, between
+  // writes that share nothing. The MySQL arm asserts `READ COMMITTED` on its
+  // session and refuses a session that will not hold it
+  // (`MYSQL_STORE_ISOLATION`), which is what this case is the test of; the
+  // single-partition race above passes under either level.
+  //
+  // Eight connections to one server, each making the first two writes of a
+  // fresh `session` partition per round — a claim and an append — at once
+  // with the seven others. On the local backend the eight are one handle and
+  // the case says what it says about distinct partitions.
+  const PARTITION_URL_ENVS = Array.from({ length: 8 }, (_, index) => `AGENT_COMPOSE_STORE_URL_PART_${index}`);
+  if (provider !== "sqlite") {
+    for (const variable of PARTITION_URL_ENVS) process.env[variable] = process.env[URL_ENV];
+  }
+  const schema = z.object({ owner: z.string().optional(), items: z.array(z.string()).optional() }).strict();
+  const writers = PARTITION_URL_ENVS.map((variable) => kv("partitions", "session", variable, schema));
+  const ROUNDS = 40;
+  const failures = [];
+  let landed = 0;
+  for (let round = 0; round < ROUNDS; round += 1) {
+    const settled = await Promise.allSettled(
+      writers.map(async (store, index) => {
+        const run = ctx(execution(`partition_${round}_${index}`), `partition-${round}-${index}`);
+        const claimed = await stores.runStoreOp(
+          store,
+          "set",
+          { key: "claim", value: { owner: `writer-${index}` }, condition: "absent" },
+          run,
+          node(`pt/${round}/${index}/claim`),
+        );
+        const appended = await stores.runStoreOp(
+          store,
+          "append",
+          { key: "list", field: "items", value: `round-${round}` },
+          run,
+          node(`pt/${round}/${index}/append`),
+        );
+        return claimed.applied === true && appended.applied === true;
+      }),
+    );
+    for (const outcome of settled) {
+      if (outcome.status === "rejected") failures.push(String(outcome.reason?.message ?? outcome.reason));
+      else if (outcome.value) landed += 1;
+    }
+  }
+  answer.concurrent_first_writes_into_distinct_partitions_all_land =
+    failures.length === 0 && landed === ROUNDS * writers.length;
+  answer.partition_failures = { count: failures.length, first: failures.slice(0, 3) };
 }
 
 // --- Round trip: unicode, size, and the types `value_schema` admits ----------
@@ -468,11 +613,14 @@ const answer = {};
   const key = `${execution("dedupe")}/write/0`;
   const first = await set(store, "k", { attempt: "first" }, run, key);
   // The redelivery: the same effect site, carrying the key its first attempt
-  // carried. It must apply **once** — the answer is the first attempt's and the
-  // stored value has not moved.
+  // carried. It must apply **once** — the answer is the first attempt's, whole,
+  // marked `deduped`, and the stored value has not moved (PRD resolved q68).
   const second = await set(store, "k", { attempt: "REWRITTEN" }, run, key);
   answer.a_double_delivered_write_lands_once =
-    same(first, second) && (await get(store, "k", run)).value?.attempt === "first";
+    first.deduped === false &&
+    second.deduped === true &&
+    same({ ...first, deduped: true }, second) &&
+    (await get(store, "k", run)).value?.attempt === "first";
   answer.the_second_delivery_is_recorded_as_deduped = same(
     run.storeRecords.filter((record) => record.idempotencyKey === key).map((r) => r.deduped),
     [false, true],
@@ -536,6 +684,576 @@ const answer = {};
   const applied = deduped[0] === false ? "mine" : "theirs";
   answer.a_concurrent_double_delivery_leaves_the_applied_value =
     (await get(mine, "k", ctx(id))).value?.attempt === applied;
+}
+
+// --- Versions, conditions and partial updates (PRD resolved q68) ------------
+
+/** The value schema the partial-update cases hold their results to. */
+const RECORD = z
+  .object({
+    title: z.string(),
+    tags: z.array(z.string()),
+    count: z.number().int(),
+    note: z.string().optional(),
+  })
+  .strict();
+
+/** A write with a condition, as a store-op node issues one. */
+const write = (store, op, params, run, key_ = undefined) =>
+  stores.runStoreOp(store, op, params, run, node(key_));
+
+/** What a promise rejected with, or `undefined` when it settled. */
+const refusal = async (promise) => {
+  try {
+    await promise;
+    return undefined;
+  } catch (error) {
+    return String(error?.message ?? error);
+  }
+};
+
+{
+  // A version is a per-partition **sequence**, not a per-key counter: every
+  // landed write takes the next value, so a key deleted and set again never
+  // shows a version it showed before — the ABA race a compare-and-set exists
+  // to close stays closed across a delete.
+  const store = kv("versions", "global");
+  const run = ctx(execution("versions"));
+  const first = await set(store, "k", { n: 1 }, run, "v/1");
+  const read = await get(store, "k", run);
+  const second = await set(store, "k", { n: 2 }, run, "v/2");
+  const other = await set(store, "other", { n: 0 }, run, "v/3");
+  const removed = await write(store, "delete", { key: "k" }, run, "v/4");
+  const again = await set(store, "k", { n: 3 }, run, "v/5");
+  answer.a_set_answers_applied_and_the_version_it_took =
+    first.applied === true &&
+    Number.isInteger(first.version) &&
+    first.deduped === false &&
+    first.key === "k";
+  answer.a_get_answers_the_version_its_key_holds =
+    read.found === true && read.version === first.version;
+  answer.a_miss_answers_no_version = !("version" in (await get(store, "nothing", run)));
+  answer.versions_rise_with_every_write_to_a_partition =
+    second.version > first.version && other.version > second.version;
+  answer.a_version_is_never_reused_across_a_delete =
+    removed.applied === true &&
+    removed.deleted === true &&
+    again.version > other.version &&
+    ![first.version, second.version, other.version].includes(again.version);
+  answer.version_trace = [first.version, second.version, other.version, again.version];
+}
+
+{
+  // `if: absent` and `if: present`, and what a condition that does not hold
+  // answers: `applied: false`, the key's current version where it has one, and
+  // nothing written — a result an edge routes on rather than a failure.
+  const store = kv("conditions", "global");
+  const run = ctx(execution("conditions"));
+  const claimed = await write(store, "set", { key: "job", value: { owner: "a" }, condition: "absent" }, run, "c/1");
+  const lost = await write(store, "set", { key: "job", value: { owner: "b" }, condition: "absent" }, run, "c/2");
+  const held = await get(store, "job", run);
+  answer.if_absent_applies_once_and_then_declines =
+    claimed.applied === true &&
+    lost.applied === false &&
+    lost.version === claimed.version &&
+    held.value?.owner === "a" &&
+    held.version === claimed.version;
+  const nobody = await write(store, "set", { key: "nobody", value: { owner: "c" }, condition: "present" }, run, "c/3");
+  answer.if_present_declines_an_absent_key_with_no_version =
+    nobody.applied === false &&
+    !("version" in nobody) &&
+    (await get(store, "nobody", run)).found === false;
+  const updated = await write(store, "set", { key: "job", value: { owner: "a2" }, condition: "present" }, run, "c/4");
+  answer.if_present_applies_to_a_key_that_holds_a_value =
+    updated.applied === true && updated.version > claimed.version;
+}
+
+{
+  // `if_version:` — compare-and-set on the version a read answered.
+  const store = kv("cas", "global");
+  const run = ctx(execution("cas"));
+  const start = await set(store, "k", { n: 1 }, run, "cas/1");
+  const won = await write(store, "set", { key: "k", value: { n: 2 }, ifVersion: start.version }, run, "cas/2");
+  const stale = await write(store, "set", { key: "k", value: { n: 3 }, ifVersion: start.version }, run, "cas/3");
+  const held = await get(store, "k", run);
+  answer.if_version_applies_when_the_version_matches =
+    won.applied === true && won.version > start.version;
+  answer.if_version_declines_a_stale_version_and_answers_the_current_one =
+    stale.applied === false && stale.version === won.version && held.value?.n === 2;
+  const absent = await write(store, "set", { key: "nothing", value: { n: 0 }, ifVersion: 0 }, run, "cas/4");
+  answer.if_version_declines_an_absent_key =
+    absent.applied === false && !("version" in absent);
+  const kept = await write(store, "delete", { key: "k", ifVersion: start.version }, run, "cas/5");
+  const stillThere = await get(store, "k", run);
+  const gone = await write(store, "delete", { key: "k", ifVersion: won.version }, run, "cas/6");
+  answer.a_conditional_delete_declines_a_stale_version_and_applies_a_current_one =
+    kept.applied === false &&
+    kept.deleted === false &&
+    stillThere.found === true &&
+    gone.applied === true &&
+    gone.deleted === true &&
+    (await get(store, "k", run)).found === false;
+  // A declined delete answers the version the key still holds, exactly as a
+  // declined `set` does — it is what the next compare-and-set needs — and one
+  // that applied answers none, because the key then holds nothing (PRD
+  // resolved q68 (b), (d)).
+  const nothing = await write(store, "delete", { key: "k", ifVersion: won.version }, run, "cas/7");
+  answer.a_declined_delete_answers_the_version_the_key_holds =
+    kept.version === won.version &&
+    stillThere.version === won.version &&
+    !("version" in gone) &&
+    nothing.applied === false &&
+    !("version" in nothing);
+  answer.declined_delete = kept;
+}
+
+{
+  // The ledger stores the op's **whole** answer, so a retried conditional
+  // write — the same key, the same attempt — is answered with its first
+  // attempt's `applied` and `version`, `deduped: true`, and never fails against
+  // its own first write.
+  const store = kv("retried_claim", "global");
+  const run = ctx(execution("retried_claim"));
+  const key = `${execution("retried_claim")}/claim/0`;
+  const first = await write(store, "set", { key: "job", value: { owner: "me" }, condition: "absent" }, run, key);
+  const retried = await write(store, "set", { key: "job", value: { owner: "me" }, condition: "absent" }, run, key);
+  answer.a_retried_claim_answers_applied_and_deduped =
+    first.applied === true &&
+    first.deduped === false &&
+    retried.applied === true &&
+    retried.deduped === true &&
+    retried.version === first.version;
+  // …and over two connections at once, where the ledger's primary key is what
+  // arbitrates.
+  const mine = kv("retried_race", "global", URL_ENV);
+  const theirs = kv("retried_race", "global", OTHER_URL_ENV);
+  const raceKey = `${execution("retried_race")}/claim/0`;
+  const both = await Promise.all([
+    write(mine, "set", { key: "job", value: { owner: "x" }, condition: "absent" }, ctx(execution("retried_race")), raceKey),
+    write(theirs, "set", { key: "job", value: { owner: "x" }, condition: "absent" }, ctx(execution("retried_race")), raceKey),
+  ]);
+  answer.a_concurrently_retried_claim_is_applied_once_and_answered_twice =
+    both.every((row) => row.applied === true) &&
+    both[0].version === both[1].version &&
+    same(both.map((row) => row.deduped).sort(), [false, true]);
+}
+
+{
+  // …and the other half of "the answer its first attempt gave": a retried
+  // write whose first attempt **declined** is answered with that decline —
+  // `applied: false`, the version the key held then, `deduped: true` — even
+  // where the key has since been freed and the same request made fresh would
+  // apply. The ledger answers the attempt, not the key, so a losing claim
+  // retried after the winner let go does not quietly become a second winner
+  // (PRD resolved q68 (d)). A declined partial update is the same: its retry
+  // answers the decline, and writes nothing, whatever the key holds by then.
+  const store = kv("retried_decline", "global");
+  const run = ctx(execution("retried_decline"));
+  const losing = `${execution("retried_decline")}/claim/b`;
+  const winner = await write(store, "set", { key: "job", value: { owner: "a" }, condition: "absent" }, run, "rdc/a");
+  const lost = await write(store, "set", { key: "job", value: { owner: "b" }, condition: "absent" }, run, losing);
+  const freed = await write(store, "delete", { key: "job" }, run, "rdc/free");
+  const retried = await write(store, "set", { key: "job", value: { owner: "b" }, condition: "absent" }, run, losing);
+  answer.a_retried_declined_write_answers_its_first_decline =
+    winner.applied === true &&
+    lost.applied === false &&
+    lost.version === winner.version &&
+    lost.deduped === false &&
+    freed.applied === true &&
+    retried.applied === false &&
+    retried.version === winner.version &&
+    retried.deduped === true &&
+    (await get(store, "job", run)).found === false;
+  answer.retried_decline = retried;
+
+  const records = kv("retried_decline_merge", "global", URL_ENV, RECORD);
+  const merging = `${execution("retried_decline")}/merge/0`;
+  const whole = { title: "t", tags: [], count: 0 };
+  const missed = await write(records, "merge", { key: "r", fields: whole, condition: "present" }, run, merging);
+  const seeded = await set(records, "r", { title: "seeded", tags: [], count: 1 }, run, "rdc/seed");
+  const remissed = await write(records, "merge", { key: "r", fields: whole, condition: "present" }, run, merging);
+  const held = await get(records, "r", run);
+  answer.a_retried_declined_partial_update_writes_nothing =
+    missed.applied === false &&
+    !("version" in missed) &&
+    remissed.applied === false &&
+    remissed.deduped === true &&
+    !("version" in remissed) &&
+    held.version === seeded.version &&
+    held.value?.title === "seeded";
+}
+
+{
+  // `incr`, `append`, `merge` on a key that holds nothing: an `incr` starts
+  // from 0, an `append` from [], a `merge` creates the value and must satisfy
+  // the schema whole.
+  const store = kv("partials", "global", URL_ENV, RECORD);
+  const run = ctx(execution("partials"));
+  const created = await write(store, "merge", { key: "r", fields: { title: "t", tags: [], count: 0 } }, run, "p/1");
+  const appended = await write(store, "append", { key: "r", field: "tags", value: "x" }, run, "p/2");
+  const twice = await write(store, "append", { key: "r", field: "tags", value: "y" }, run, "p/3");
+  const unique = await write(store, "append", { key: "r", field: "tags", value: "x", unique: true }, run, "p/4");
+  const bumped = await write(store, "incr", { key: "r", field: "count", by: 5 }, run, "p/5");
+  const merged = await write(store, "merge", { key: "r", fields: { note: "kept" } }, run, "p/6");
+  const held = await get(store, "r", run);
+  answer.a_merge_creates_a_value_that_satisfies_the_schema =
+    created.applied === true && same(created.value, { title: "t", tags: [], count: 0 });
+  answer.an_append_adds_one_item_to_the_end =
+    same(appended.value?.tags, ["x"]) && same(twice.value?.tags, ["x", "y"]);
+  answer.a_unique_append_of_a_held_item_changes_nothing =
+    unique.applied === true && unique.version === twice.version && same(unique.value?.tags, ["x", "y"]);
+  answer.an_incr_adds_by_to_the_field = bumped.value?.count === 5;
+  answer.a_merge_keeps_every_field_it_does_not_name =
+    same(merged.value, { title: "t", tags: ["x", "y"], count: 5, note: "kept" }) &&
+    same(held.value, merged.value) &&
+    held.version === merged.version;
+
+  // An `incr` on a key holding nothing at all, against a schema it alone
+  // satisfies, starts from 0.
+  const counter = kv("counter_only", "global", URL_ENV, z.object({ count: z.number().int() }).strict());
+  const one = await write(counter, "incr", { key: "c", field: "count" }, run, "p/7");
+  const three = await write(counter, "incr", { key: "c", field: "count", by: 2 }, run, "p/8");
+  answer.an_incr_from_absent_starts_at_zero =
+    one.applied === true && one.value?.count === 1 && three.value?.count === 3;
+  const list = kv("list_only", "global", URL_ENV, z.object({ items: z.array(z.string()) }).strict());
+  const firstItem = await write(list, "append", { key: "l", field: "items", value: "a" }, run, "p/9");
+  answer.an_append_from_absent_starts_from_an_empty_array = same(firstItem.value, { items: ["a"] });
+}
+
+{
+  // A merge whose result the schema refuses fails — and leaves the row exactly
+  // as it was, version included. The refusal names the field.
+  const store = kv("refused", "global", URL_ENV, RECORD);
+  const run = ctx(execution("refused"));
+  const start = await set(store, "r", { title: "t", tags: ["a"], count: 1 }, run, "x/1");
+  const failed = await refusal(write(store, "merge", { key: "r", fields: { count: "not a number" } }, run, "x/2"));
+  const held = await get(store, "r", run);
+  answer.a_merge_the_schema_refuses_fails_naming_the_field =
+    typeof failed === "string" && failed.includes("count") && failed.includes("value_schema");
+  answer.a_merge_the_schema_refuses_leaves_the_row_unchanged =
+    same(held.value, { title: "t", tags: ["a"], count: 1 }) && held.version === start.version;
+  answer.refused_merge = failed ?? null;
+  // On an absent key a merge has to supply the whole value.
+  const partial = await refusal(write(store, "merge", { key: "fresh", fields: { title: "only" } }, run, "x/3"));
+  answer.a_merge_on_an_absent_key_must_satisfy_the_schema_whole =
+    typeof partial === "string" && partial.includes("tags") && (await get(store, "fresh", run)).found === false;
+  // A failed op is not a ledger entry: nothing was applied, so a retry under
+  // the same key is a fresh attempt rather than a replay of the failure.
+  const retried = await write(store, "merge", { key: "r", fields: { count: 2 } }, run, "x/2");
+  answer.a_refused_merge_leaves_no_ledger_row = retried.applied === true && retried.deduped === false;
+}
+
+{
+  // Decision D119's split, read at the op: a partial update whose result `V`
+  // refuses is the **author's** failure on a store-op node — a plain error,
+  // which the node's `retry:`/`on_error:` decide — and the **model's** on a
+  // synthesized tool, a `ToolCallRefused` the agent loop hands back to it. One
+  // op, one backend, one refusal; only who asked differs. So does an `item`
+  // naming other than one field, which the tool refuses before the store sees
+  // it. Every refusal here leaves the row as it was.
+  const store = kv("tool_refusals", "global", URL_ENV, z.object({ items: z.array(z.string()).max(1) }).strict());
+  const run = ctx(execution("tool_refusals"));
+  const start = await set(store, "r", { items: ["only"] }, run, "tr/0");
+  const caught = async (promise) => {
+    try {
+      await promise;
+      return undefined;
+    } catch (error) {
+      return error;
+    }
+  };
+  const fromNode = await caught(write(store, "append", { key: "r", field: "items", value: "one too many" }, run, "tr/1"));
+  const fromTool = await caught(stores.runStoreTool(store, "append", { key: "r", item: { items: "one too many" } }, run));
+  const merged = await caught(stores.runStoreTool(store, "merge", { key: "fresh", fields: {} }, run));
+  const none = await caught(stores.runStoreTool(store, "append", { key: "r", item: {} }, run));
+  const two = await caught(stores.runStoreTool(store, "append", { key: "r", item: { items: "a", other: "b" } }, run));
+  const held = await get(store, "r", run);
+  const toModel = (error) => error instanceof runtime.ToolCallRefused;
+  answer.a_refused_partial_update_fails_a_node_and_goes_back_to_a_model =
+    fromNode instanceof Error &&
+    !toModel(fromNode) &&
+    String(fromNode.message).includes("value_schema") &&
+    toModel(fromTool) &&
+    String(fromTool.message).includes("value_schema") &&
+    toModel(merged) &&
+    toModel(none) &&
+    String(none.message).includes("naming no field") &&
+    toModel(two) &&
+    String(two.message).includes("naming 2 fields") &&
+    same(held.value, { items: ["only"] }) &&
+    held.version === start.version &&
+    (await get(store, "fresh", run)).found === false;
+  answer.tool_refusal_classes = [fromNode, fromTool, merged, none, two].map((error) =>
+    error === undefined ? "none" : `${error.name}: ${String(error.message).slice(0, 60)}`,
+  );
+}
+
+{
+  // Schema evolution, written down: a value stored under one schema and read
+  // by a partial update under another is validated whole, so the op fails
+  // naming the field the stored value lacks — `get` would have answered it as
+  // stored.
+  const before = kv("evolved", "global", URL_ENV, z.object({ title: z.string() }).strict());
+  const after = kv("evolved", "global", URL_ENV, RECORD);
+  const run = ctx(execution("evolved"));
+  await set(before, "r", { title: "old" }, run, "e/1");
+  const failed = await refusal(write(after, "incr", { key: "r", field: "count" }, run, "e/2"));
+  answer.a_partial_update_under_a_changed_schema_fails_naming_the_field =
+    typeof failed === "string" && failed.includes("tags");
+  answer.a_get_under_a_changed_schema_answers_the_stored_value =
+    same((await get(after, "r", run)).value, { title: "old" });
+}
+
+{
+  // Two concurrent appends keep both items, on two connections at once.
+  const mine = kv("append_race", "global", URL_ENV, z.object({ items: z.array(z.string()) }).strict());
+  const theirs = kv("append_race", "global", OTHER_URL_ENV, z.object({ items: z.array(z.string()) }).strict());
+  const run = ctx(execution("append_race"));
+  const items = Array.from({ length: 10 }, (_, index) => `item-${index}`);
+  await Promise.all(
+    items.map((item, index) =>
+      write(index % 2 === 0 ? mine : theirs, "append", { key: "shared", field: "items", value: item }, run, `ar/${index}`),
+    ),
+  );
+  const held = await get(mine, "shared", run);
+  answer.two_connections_appending_at_once_keep_every_item =
+    same([...(held.value?.items ?? [])].sort(), [...items].sort());
+}
+
+{
+  // …and on a server whose **default** isolation is stricter than the
+  // `READ COMMITTED` the arms' writes are built for. A default is what a
+  // database or a role can change (`ALTER DATABASE … SET
+  // default_transaction_isolation`), and under a snapshot a write queued
+  // behind another one's commit finds the row it waited for "concurrently
+  // updated": on Postgres it fails with `40001` instead of serializing behind
+  // it. So each dialled arm asserts the level on its own session (PRD resolved
+  // q63: one contract on every arm; q68: the writes serialize rather than
+  // fail). The Postgres connections here are opened with
+  // `default_transaction_isolation=serializable` in their startup options; a
+  // stock MySQL server already defaults to `REPEATABLE READ`, so its arm is
+  // asked the same question by the server it is given. On SQLite the case is
+  // the two-connection race above, which it has to answer the same way.
+  const STRICT_URL_ENV = "AGENT_COMPOSE_STORE_URL_STRICT";
+  const OTHER_STRICT_URL_ENV = "AGENT_COMPOSE_STORE_URL_STRICT_B";
+  if (provider !== "sqlite") {
+    const strict = new URL(process.env[URL_ENV]);
+    if (provider === "postgres") {
+      strict.searchParams.set("options", "-c default_transaction_isolation=serializable");
+    }
+    process.env[STRICT_URL_ENV] = strict.href;
+    process.env[OTHER_STRICT_URL_ENV] = strict.href;
+  }
+  const schema = z.object({ items: z.array(z.string()) }).strict();
+  const mine = kv("strict_race", "global", STRICT_URL_ENV, schema);
+  const theirs = kv("strict_race", "global", OTHER_STRICT_URL_ENV, schema);
+  const run = ctx(execution("strict_race"));
+  const items = Array.from({ length: 20 }, (_, index) => `item-${index}`);
+  const settled = await Promise.allSettled(
+    items.map((item, index) =>
+      write(index % 2 === 0 ? mine : theirs, "append", { key: "shared", field: "items", value: item }, run, `sr/${index}`),
+    ),
+  );
+  const failures = settled
+    .filter((outcome) => outcome.status === "rejected")
+    .map((outcome) => String(outcome.reason?.message ?? outcome.reason));
+  const held = await get(mine, "shared", run);
+  answer.writes_serialize_whatever_isolation_the_server_defaults_to =
+    failures.length === 0 && same([...(held.value?.items ?? [])].sort(), [...items].sort());
+  answer.strict_isolation_failures = failures.slice(0, 3);
+}
+
+{
+  // A tool write carries no idempotency key and so no `deduped` on its record,
+  // whichever op it ran; a node write's record carries `applied` and `version`
+  // beside them.
+  const store = kv("records", "global", URL_ENV, RECORD);
+  const run = ctx(execution("records"));
+  await write(store, "set", { key: "r", value: { title: "t", tags: [], count: 0 }, condition: "absent" }, run, "rec/1");
+  await stores.runStoreOp(store, "incr", { key: "r", field: "count" }, run, { via: "tool" });
+  const [fromNode, fromTool] = run.storeRecords;
+  answer.a_node_write_record_carries_applied_version_and_its_key =
+    fromNode?.applied === true &&
+    Number.isInteger(fromNode?.version) &&
+    fromNode?.idempotencyKey === "rec/1" &&
+    fromNode?.deduped === false;
+  answer.a_tool_write_record_carries_applied_and_version_but_no_key =
+    fromTool?.via === "tool" &&
+    fromTool?.applied === true &&
+    fromTool?.version > fromNode?.version &&
+    !("idempotencyKey" in (fromTool ?? {})) &&
+    !("deduped" in (fromTool ?? {}));
+}
+
+{
+  // **Two processes**, each with its own handle or its own server connection,
+  // racing one store from one agreed instant. See `store-race.mjs`.
+  const race = path.join(path.dirname(fileURLToPath(import.meta.url)), "store-race.mjs");
+  const startAt = Date.now() + 2_500;
+  const spawned = ["a", "b"].map(
+    (role) =>
+      new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, [race, project, provider, data, RUN, role, String(startAt)], {
+          env: process.env,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let out = "";
+        let err = "";
+        child.stdout.on("data", (chunk) => (out += chunk));
+        child.stderr.on("data", (chunk) => (err += chunk));
+        child.on("error", reject);
+        child.on("close", (code) =>
+          code === 0 ? resolve(JSON.parse(out)) : reject(new Error(`racer ${role} exited ${code}: ${err}`)),
+        );
+      }),
+  );
+  try {
+    const [a, b] = await Promise.all(spawned);
+    const rounds = a.claims.length;
+    const claimStore = kv("race_claims", "global");
+    const winners = [];
+    let exactlyOne = rounds > 0 && rounds === b.claims.length;
+    for (let round = 0; round < rounds; round += 1) {
+      const applied = [a.claims[round].applied, b.claims[round].applied].filter(Boolean).length;
+      const held = await get(claimStore, `claim-${round}`, ctx(execution("race_read")));
+      const winner = a.claims[round].applied ? "a" : "b";
+      winners.push(winner);
+      if (applied !== 1 || held.value?.owner !== winner) exactlyOne = false;
+    }
+    answer.two_processes_claiming_one_key_get_exactly_one_applied = exactlyOne;
+    answer.race_winners = winners.join("");
+    // Every partial update answers the whole value it left at the version it
+    // took, so the two processes' answers, put in version order, are the key's
+    // history replayed — and each one has to be the one before it with its
+    // own change applied. That is a stronger reading than the final value:
+    // a lost update (a write that read before the other's commit and wrote
+    // after it) is invisible there whenever the loser writes again later, and
+    // every process here writes again every round. Distinct versions are part
+    // of it, since two writes taking one version leave no order to replay.
+    const history = (pick) =>
+      ["a", "b"]
+        .flatMap((role) => pick(role === "a" ? a : b).map((row, round) => ({ role, round, row })))
+        .sort((left, right) => left.row.version - right.row.version);
+    const ordered = (rows) =>
+      rows.every((entry) => entry.row.applied === true && Number.isInteger(entry.row.version)) &&
+      new Set(rows.map((entry) => entry.row.version)).size === rows.length;
+    const appended = history((side) => side.appends);
+    const lists = await get(kv("race_lists", "global"), "shared", ctx(execution("race_read")));
+    const expected = ["a", "b"].flatMap((role) => Array.from({ length: rounds }, (_, i) => `${role}-${i}`));
+    answer.two_processes_appending_at_once_keep_every_item =
+      same([...(lists.value?.items ?? [])].sort(), [...expected].sort()) &&
+      ordered(appended) &&
+      appended.every((entry, index) =>
+        same(
+          entry.row.value?.items,
+          appended.slice(0, index + 1).map((earlier) => `${earlier.role}-${earlier.round}`),
+        ),
+      );
+    const incremented = history((side) => side.incrs);
+    const counters = await get(kv("race_counters", "global"), "shared", ctx(execution("race_read")));
+    answer.two_processes_incrementing_at_once_lose_no_increment =
+      counters.value?.count === rounds * 2 &&
+      ordered(incremented) &&
+      incremented.every((entry, index) => entry.row.value?.count === index + 1);
+    const merged = history((side) => side.merges);
+    const records = await get(kv("race_records", "global"), "shared", ctx(execution("race_read")));
+    const latest = {};
+    answer.two_processes_merging_different_fields_keep_both =
+      records.value?.a === rounds - 1 &&
+      records.value?.b === rounds - 1 &&
+      ordered(merged) &&
+      merged.every((entry) => {
+        latest[entry.role] = entry.round;
+        return entry.row.value?.a === latest.a && entry.row.value?.b === latest.b;
+      });
+    // Every write that landed in one partition took a distinct version, and
+    // each process saw its own versions rise.
+    const versions = [...a.appends, ...b.appends].map((row) => row.version);
+    const rising = (rows) => rows.every((row, i) => i === 0 || row.version > rows[i - 1].version);
+    answer.two_processes_never_take_one_version =
+      new Set(versions).size === versions.length &&
+      rising(a.appends) &&
+      rising(b.appends) &&
+      lists.version === Math.max(...versions);
+  } catch (error) {
+    answer.race_error = String(error?.message ?? error);
+  }
+}
+
+{
+  // **A write that arrives inside another write's read-modify-write window
+  // waits for that write's commit, and builds on it.** The race above starts
+  // its writes together, and on SQLite a write's transaction is a few
+  // synchronous microseconds, so two racers almost never overlap inside one:
+  // it would pass a store that read its key outside the lock it writes under.
+  // Here the window is held open on purpose — `store-window.mjs` is a second
+  // process whose merge validates against a schema that spins for a second and
+  // a half, and a partial update validates between reading its key and writing
+  // it, inside its transaction — and this process writes the same key only
+  // once the other's marker says the window is open. Correctly serialized,
+  // this write waits on the other's lock (`BEGIN IMMEDIATE`'s on SQLite, the
+  // partition's sequence row on a server), reads what it committed, and keeps
+  // both fields; a store that let it land inside the window would have the
+  // other's write overwrite it a moment later.
+  const script = path.join(path.dirname(fileURLToPath(import.meta.url)), "store-window.mjs");
+  const marker = path.join(data, `${RUN}-window.marker`);
+  const schema = z.object({ a: z.number().int().optional(), b: z.number().int().optional() }).strict();
+  const mine = kv("window", "global", OTHER_URL_ENV, schema);
+  const run = ctx(execution("window"));
+  try {
+    // Opened first, so this side's file or connection is not what it waits on.
+    await get(mine, "warm", run);
+    // A dialled arm writes nothing under the data directory, so it may not be
+    // there yet; the marker is written into it.
+    fs.mkdirSync(data, { recursive: true });
+    const holder = new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [script, project, provider, data, RUN, marker], {
+        env: process.env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let out = "";
+      let err = "";
+      child.stdout.on("data", (chunk) => (out += chunk));
+      child.stderr.on("data", (chunk) => (err += chunk));
+      child.on("error", reject);
+      child.on("close", (code) =>
+        code === 0 ? resolve(JSON.parse(out)) : reject(new Error(`the window holder exited ${code}: ${err}`)),
+      );
+    });
+    // A rejection nothing is listening to yet would end this process, and the
+    // holder can fail before the marker ever appears.
+    const settled = holder.then(
+      (row) => ({ row }),
+      (error) => ({ error }),
+    );
+    const deadline = Date.now() + 30_000;
+    let open = false;
+    while (Date.now() < deadline) {
+      if (fs.existsSync(marker)) {
+        open = true;
+        break;
+      }
+      const early = await Promise.race([settled, new Promise((resolve) => setTimeout(resolve, 5))]);
+      if (early !== undefined) break;
+    }
+    answer.the_window_was_open_when_the_second_write_arrived = open;
+    const late = open
+      ? await write(mine, "merge", { key: "shared", fields: { b: 1 } }, run, `${RUN}/window/b`)
+      : undefined;
+    const outcome = await settled;
+    if (outcome.error !== undefined) throw outcome.error;
+    const early = outcome.row;
+    const held = await get(mine, "shared", run);
+    answer.a_write_inside_another_writes_window_waits_and_builds_on_it =
+      open &&
+      same(early.value, { a: 1 }) &&
+      same(late?.value, { a: 1, b: 1 }) &&
+      late.version > early.version &&
+      same(held.value, { a: 1, b: 1 });
+    answer.window = { early, late: late ?? null, held: held.value ?? null };
+  } catch (error) {
+    answer.window_error = String(error?.message ?? error);
+  }
 }
 
 // --- Two writers, one store, last write wins ---------------------------------
@@ -628,6 +1346,211 @@ const answer = {};
   answer.a_replayed_write_is_not_applied_again =
     (await get(store, "k", live)).value?.generation === "moved";
   await journal.releaseJournal();
+}
+
+// --- A store an earlier release created --------------------------------------
+
+/**
+ * The schema the release before PRD resolved q68 created, on each backend —
+ * `entries`/`store_entries` with no `version` column and no sequence table —
+ * copied from that release's `src/stores.ts`, `stores-postgres.ts` and
+ * `stores-mysql.ts` rather than derived from this one's, because what is under
+ * test is that this release opens *that* one.
+ */
+const EARLIER_SCHEMA = {
+  sqlite: [
+    `CREATE TABLE entries (
+  scope_key TEXT NOT NULL,
+  key       TEXT NOT NULL,
+  value     TEXT NOT NULL,
+  metadata  TEXT,
+  embedding TEXT,
+  PRIMARY KEY (scope_key, key)
+)`,
+    `CREATE TABLE applied (
+  idempotency_key TEXT PRIMARY KEY,
+  op              TEXT NOT NULL,
+  result          TEXT NOT NULL
+)`,
+  ],
+  postgres: [
+    `CREATE TABLE store_entries (
+  store     TEXT COLLATE "C" NOT NULL,
+  scope_key TEXT COLLATE "C" NOT NULL,
+  "key"     TEXT COLLATE "C" NOT NULL,
+  value     TEXT NOT NULL,
+  PRIMARY KEY (store, scope_key, "key")
+)`,
+    `CREATE TABLE store_applied (
+  store           TEXT COLLATE "C" NOT NULL,
+  scope_key       TEXT COLLATE "C" NOT NULL,
+  idempotency_key TEXT COLLATE "C" NOT NULL,
+  op              TEXT NOT NULL,
+  result          TEXT NOT NULL,
+  PRIMARY KEY (store, idempotency_key)
+)`,
+    "CREATE INDEX store_applied_partition ON store_applied (store, scope_key)",
+  ],
+  mysql: [
+    `CREATE TABLE store_entries (
+  store      VARCHAR(128)  CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  scope_key  VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  \`key\`      VARCHAR(2048) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL,
+  value      LONGTEXT NOT NULL,
+  scope_hash BINARY(32) AS (UNHEX(SHA2(scope_key, 256))) STORED NOT NULL,
+  key_hash   BINARY(32) AS (UNHEX(SHA2(\`key\`, 256))) STORED NOT NULL,
+  PRIMARY KEY (store, scope_hash, key_hash),
+  KEY store_entries_partition (store, scope_key(255), \`key\`(191))
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE store_applied (
+  store           VARCHAR(128)  CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  scope_key       VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  idempotency_key VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  op              VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  result          LONGTEXT NOT NULL,
+  PRIMARY KEY (store, idempotency_key),
+  KEY store_applied_partition (store, scope_key(255))
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
+  ],
+};
+
+{
+  // **A deployment upgrading in place.** PRD resolved q68 gave every `kv` key a
+  // `version`, so a store file or a database the release before it created
+  // has an entries table without the column — and every op of this release
+  // reads it. Each arm brings that table forward at its open (SQLite's
+  // `migrateStoreFile`, the Postgres arm's probed `ALTER`, the MySQL arm's
+  // `MYSQL_STORE_VERSION_COLUMN` with its duplicate-column race), and its rows
+  // take version `0`, which no write of this release hands out. Left
+  // unchecked, a migration that did nothing would pass every case above —
+  // they all run against a schema this release created — and fail every op of
+  // every deployment that upgraded, with `no such column: version`.
+  //
+  // So the earlier schema is laid down by hand, holding one row and the ledger
+  // row its write left — on SQLite the store's own file, on a server a
+  // database of this run's own, since the tables every case above wrote to are
+  // this release's already — and this release then opens it from four
+  // connections at once, which on MySQL is four openers racing the probe and
+  // the `ALTER`.
+  const LEGACY_URL_ENVS = [
+    "AGENT_COMPOSE_STORE_URL_LEGACY",
+    "AGENT_COMPOSE_STORE_URL_LEGACY_B",
+    "AGENT_COMPOSE_STORE_URL_LEGACY_C",
+    "AGENT_COMPOSE_STORE_URL_LEGACY_D",
+  ];
+  const openers = LEGACY_URL_ENVS.map((variable) => kv("legacy", "global", variable));
+  const name = openers[0].name;
+  const LEDGER_KEY = `${execution("legacy")}/write/0`;
+  const row = JSON.stringify({ text: "old" });
+  // What the earlier release's ledger held for a `set`: its whole answer then,
+  // which carried neither `applied` nor `version`.
+  const recorded = JSON.stringify({ key: "old" });
+  const database = `${RUN}_legacy`;
+  let created = false;
+  try {
+    if (provider === "sqlite") {
+      const module = await import("node-sqlite3-wasm");
+      const { Database } = module.default ?? module;
+      const directory = path.join(data, "stores");
+      fs.mkdirSync(directory, { recursive: true });
+      const file = new Database(path.join(directory, `${stores.encodeKey(name)}.sqlite`));
+      try {
+        for (const statement of EARLIER_SCHEMA.sqlite) file.exec(statement);
+        file.run("INSERT INTO entries (scope_key, key, value) VALUES (?, ?, ?)", ["global", "old", row]);
+        file.run("INSERT INTO applied (idempotency_key, op, result) VALUES (?, ?, ?)", [
+          LEDGER_KEY,
+          "set",
+          recorded,
+        ]);
+      } finally {
+        file.close();
+      }
+    } else {
+      const admin = await openServer(process.env[URL_ENV]);
+      try {
+        await rows(admin, `CREATE DATABASE ${database}`);
+        created = true;
+      } finally {
+        await admin.end().catch(() => undefined);
+      }
+      const address = new URL(process.env[URL_ENV]);
+      address.pathname = `/${database}`;
+      for (const variable of LEGACY_URL_ENVS) process.env[variable] = address.href;
+      const seeder = await openServer(address.href);
+      try {
+        for (const statement of EARLIER_SCHEMA[provider]) await rows(seeder, statement);
+        const [entry, ledger] =
+          provider === "postgres"
+            ? [
+                'INSERT INTO store_entries (store, scope_key, "key", value) VALUES ($1, $2, $3, $4)',
+                "INSERT INTO store_applied (store, scope_key, idempotency_key, op, result) VALUES ($1, $2, $3, $4, $5)",
+              ]
+            : [
+                "INSERT INTO store_entries (store, scope_key, `key`, value) VALUES (?, ?, ?, ?)",
+                "INSERT INTO store_applied (store, scope_key, idempotency_key, op, result) VALUES (?, ?, ?, ?, ?)",
+              ];
+        await rows(seeder, entry, [name, "global", "old", row]);
+        await rows(seeder, ledger, [name, "global", LEDGER_KEY, "set", recorded]);
+      } finally {
+        await seeder.end().catch(() => undefined);
+      }
+    }
+
+    const run = ctx(execution("legacy"));
+    const opened = await Promise.allSettled(openers.map((store) => get(store, "old", run)));
+    answer.an_earlier_releases_store_takes_every_opener_at_once = opened.every(
+      (outcome) => outcome.status === "fulfilled",
+    );
+    answer.legacy_opening_errors = opened
+      .filter((outcome) => outcome.status === "rejected")
+      .map((outcome) => String(outcome.reason?.message ?? outcome.reason));
+    const [store, other] = openers;
+    const held = await get(store, "old", run);
+    answer.a_key_an_earlier_release_wrote_answers_version_zero =
+      held.found === true && same(held.value, { text: "old" }) && held.version === 0;
+    // The earlier release's ledger row still answers its write's redelivery,
+    // as a write that applied — every write that release made was
+    // unconditional and landed — and the stored value does not move.
+    const redelivered = await set(store, "old", { text: "REWRITTEN" }, run, LEDGER_KEY);
+    answer.a_write_an_earlier_release_recorded_still_dedupes =
+      redelivered.applied === true &&
+      redelivered.deduped === true &&
+      (await get(other, "old", run)).value?.text === "old";
+    // `if_version: 0` names exactly a key nothing has written since the
+    // upgrade, and the partition's sequence starts past what it holds.
+    const compared = await write(store, "set", { key: "old", value: { text: "new" }, ifVersion: 0 }, run, "lg/1");
+    const next = await set(store, "fresh", { text: "fresh" }, run, "lg/2");
+    answer.if_version_zero_names_a_key_an_earlier_release_wrote =
+      compared.applied === true && compared.version === 1;
+    answer.an_upgraded_partitions_sequence_starts_past_what_it_holds =
+      next.applied === true &&
+      next.version === 2 &&
+      (await get(other, "old", run)).version === 1 &&
+      (await get(other, "fresh", run)).version === 2;
+    answer.legacy_trace = {
+      held: held.version ?? null,
+      compared: compared.version ?? null,
+      next: next.version ?? null,
+    };
+  } catch (error) {
+    answer.legacy_error = String(error?.message ?? error);
+  } finally {
+    // Every connection this run holds is closed before the database goes —
+    // which the case above already does mid-run, so the cases below redial —
+    // and a dialled run's database is its own, so it is dropped rather than
+    // left on a server a developer keeps.
+    await stores.releaseStores();
+    if (created) {
+      const admin = await openServer(process.env[URL_ENV]);
+      await rows(
+        admin,
+        provider === "postgres"
+          ? `DROP DATABASE IF EXISTS ${database} WITH (FORCE)`
+          : `DROP DATABASE IF EXISTS ${database}`,
+      ).catch(() => undefined);
+      await admin.end().catch(() => undefined);
+    }
+  }
 }
 
 // --- A connection the server took away, and the redial that follows ----------

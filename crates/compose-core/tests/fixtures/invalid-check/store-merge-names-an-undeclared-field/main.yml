@@ -1,0 +1,25 @@
+# rule: a `kv merge`'s fields are checked against `value_schema`, as a `set`'s value is (grammar 11.4, PRD resolved q68)
+# code: unknown-field
+# message: `verbosty` is not a field `store.prefs` declares
+# at: main.yml:22:9
+# label: main.yml:12:5 the store's schema is declared here
+# help: did you mean `verbosity`?
+version: "0.1"
+store.prefs:
+  kind: kv
+  scope: global
+  value_schema:
+    theme: { type: string }
+    verbosity: { enum: [low, high] }
+flow.f:
+  outputs: {}
+  nodes:
+    tweak:
+      store: store.prefs
+      op: merge
+      key: "'k'"
+      fields:
+        verbosty: "'low'"
+  edges:
+    - { from: start, to: tweak }
+    - { from: tweak, to: end }

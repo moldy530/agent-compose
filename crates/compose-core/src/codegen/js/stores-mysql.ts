@@ -17,7 +17,8 @@ import { createConnection } from "mysql2/promise";
 import type { Connection, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 
 /**
- * The schema, created on first open and never migrated.
+ * The schema, created on first open and brought forward where an earlier
+ * release created it ([`MYSQL_STORE_VERSION_COLUMN`]).
  *
  * `IF NOT EXISTS` throughout, and the index declared **inside** the table
  * because MySQL has no `CREATE INDEX IF NOT EXISTS` and a second open must not
@@ -117,6 +118,11 @@ import type { Connection, ResultSetHeader, RowDataPacket } from "mysql2/promise"
  * 5.8), every frame of which this compiler composes out of identifiers and
  * decimals, so 2048 ASCII bytes beside `store`'s 128 is 2176 and inside the
  * limit.
+ *
+ * `store_sequences` holds each partition's version sequence (PRD resolved q68)
+ * — the last version it handed out — and its row is also the lock every write
+ * to the partition takes first (`RemoteKv`'s `#write`). Its key is the
+ * ledger's arithmetic again: `store` and an ASCII `scope_key`, 2176 bytes.
  */
 const MYSQL_STORE_SCHEMA = [
   `CREATE TABLE IF NOT EXISTS store_entries (
@@ -124,6 +130,7 @@ const MYSQL_STORE_SCHEMA = [
   scope_key  VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   \`key\`      VARCHAR(2048) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL,
   value      LONGTEXT NOT NULL,
+  version    BIGINT NOT NULL DEFAULT 0,
   scope_hash BINARY(32) AS (UNHEX(SHA2(scope_key, 256))) STORED NOT NULL,
   key_hash   BINARY(32) AS (UNHEX(SHA2(\`key\`, 256))) STORED NOT NULL,
   PRIMARY KEY (store, scope_hash, key_hash),
@@ -138,7 +145,33 @@ const MYSQL_STORE_SCHEMA = [
   PRIMARY KEY (store, idempotency_key),
   KEY store_applied_partition (store, scope_key(255))
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
+  `CREATE TABLE IF NOT EXISTS store_sequences (
+  store      VARCHAR(128)  CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  scope_key  VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  last       BIGINT NOT NULL,
+  PRIMARY KEY (store, scope_key)
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
 ];
+
+/**
+ * The one migration: the `version` column PRD resolved q68 gave every `kv` key,
+ * on a `store_entries` the previous release created without it.
+ *
+ * Probed rather than attempted, because MySQL has no `ADD COLUMN IF NOT
+ * EXISTS`; and a concurrent opener that added it between the probe and the
+ * `ALTER` is answered with [`MYSQL_DUPLICATE_COLUMN`], which is the column
+ * being there. Its rows take `0`, which no write of this release hands out —
+ * a partition's sequence starts past what it holds.
+ */
+const MYSQL_STORE_VERSION_COLUMN = {
+  probe:
+    "SELECT COUNT(*) AS held FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() " +
+    "AND TABLE_NAME = 'store_entries' AND COLUMN_NAME = 'version'",
+  add: "ALTER TABLE store_entries ADD COLUMN version BIGINT NOT NULL DEFAULT 0 AFTER value",
+};
+
+/** MySQL's "that column is already there" — `ER_DUP_FIELDNAME`. */
+const MYSQL_DUPLICATE_COLUMN = 1060;
 
 /**
  * MySQL's "that table is already there" — the one error a concurrent creator
@@ -179,8 +212,10 @@ const MYSQL_TABLE_EXISTS = 1050;
  * asserted at the open instead ([`mysqlIsBelowFloor`]) and the hook keeps the
  * spelling that is not deprecated.
  */
-function duplicateKeyOverwrite(_target: string, column: string): string {
-  return `AS excluded ON DUPLICATE KEY UPDATE ${column} = excluded.${column}`;
+function duplicateKeyOverwrite(_target: string, columns: readonly string[]): string {
+  return `AS excluded ON DUPLICATE KEY UPDATE ${columns
+    .map((column) => `${column} = excluded.${column}`)
+    .join(", ")}`;
 }
 
 /**
@@ -253,6 +288,31 @@ const MYSQL_STORE_AUTOCOMMIT = "SET SESSION autocommit = 1";
 const MYSQL_STORE_SORT_LENGTH = "SET SESSION max_sort_length = 8192";
 
 /**
+ * What makes a write's reads see what the previous writer committed, and lock
+ * nothing but the rows they find.
+ *
+ * InnoDB's default is `REPEATABLE READ`, and it costs a write here two things.
+ * A plain read inside a transaction answers a snapshot rather than the latest
+ * commit; and a locking read of a key that is **not** there — every first
+ * write of a key, and every `if: absent` — takes a gap lock that spans the
+ * index between two existing rows, so two writers in two different partitions
+ * whose keys happen to sit in one gap each hold one and then wait on the
+ * other's to insert: a deadlock the server breaks by failing one of them.
+ * `READ COMMITTED` is the level the Postgres arm asserts on its session too
+ * (`POSTGRES_STORE_ISOLATION`), and Postgres's default besides: each statement
+ * reads the latest committed rows, and a search locks the records it finds and
+ * no gaps. The partition's sequence row is what serializes a write
+ * against every other write to its partition (`RemoteKv`'s `#write`), so
+ * nothing here needs the stronger level — and asserting this one is what lets
+ * the two servers answer one write the same way.
+ *
+ * A server logging `binlog_format = STATEMENT` refuses an InnoDB write under
+ * this level with an error that says so, rather than writing one; `ROW`, the
+ * default since 5.7.7, and `MIXED` take it.
+ */
+const MYSQL_STORE_ISOLATION = "SET SESSION transaction_isolation = 'READ-COMMITTED'";
+
+/**
  * …and what the session really carries once it has been sent, beside the server
  * it was sent to.
  *
@@ -261,7 +321,15 @@ const MYSQL_STORE_SORT_LENGTH = "SET SESSION max_sort_length = 8192";
  * moment the `autocommit` read-back is, which is before any DDL runs.
  */
 const MYSQL_STORE_SESSION_HELD =
-  "SELECT @@session.autocommit AS autocommit, VERSION() AS version";
+  "SELECT @@session.autocommit AS autocommit, @@session.transaction_isolation AS isolation, " +
+  "VERSION() AS version";
+
+/** What a session that would not read committed rows is refused with. */
+function storeWritesWouldReadASnapshot(where: string, isolation: string): Error {
+  return new Error(
+    `the \`mysql\` store backend at \`\${${where}}\` is at \`${isolation}\` on this session even though it was asked for \`READ-COMMITTED\`: a \`kv\` write reads what its key holds and decides on it, so under a snapshot two writers would each decide against a value the other had already replaced (PRD resolved q68). Take the override off this server or its \`init_connect\`, or bind this store to a server that honours a session's isolation level`,
+  );
+}
 
 /** What a session that would not commit is refused with. */
 function storeWritesWouldNotCommit(where: string): Error {
@@ -481,8 +549,9 @@ class MysqlStoreDriver implements StoreDriver {
  * because a `?flags=` on the URL is only consulted where this option is absent —
  * which is also what keeps an operator's URL from taking it back off.
  * Nothing else this arm runs reads an affected-rows that the flag changes: a
- * `DELETE`'s count is the same under both, and no statement here is a bare
- * `UPDATE`.
+ * `DELETE`'s count is the same under both, and the one bare `UPDATE` — a
+ * partition's version sequence moving on (PRD resolved q68) — is run for its
+ * effect and its count is never read.
  */
 async function openMysqlStore(
   url: string,
@@ -522,6 +591,7 @@ async function openMysqlStore(
     // inside a transaction nobody will commit.
     await connection.query(MYSQL_STORE_AUTOCOMMIT);
     await connection.query(MYSQL_STORE_SORT_LENGTH);
+    await connection.query(MYSQL_STORE_ISOLATION);
     // `CONCAT_WS` rather than `CONCAT`, because a server whose `sql_mode` is
     // empty would otherwise be handed a list with a leading comma — an empty
     // mode name, which MySQL refuses. `NULLIF` is what turns the empty string
@@ -540,6 +610,12 @@ async function openMysqlStore(
     // `1`, so a driver that one day hands it back in some other shape costs
     // nothing rather than costing every MySQL deployment its open.
     if (Number.isFinite(autocommit) && autocommit !== 1) throw storeWritesWouldNotCommit(where);
+    // …and the isolation level, by the same rule: refused only where the
+    // server answered a level and it is definitely another one.
+    const isolation = session[0]?.["isolation"];
+    if (typeof isolation === "string" && isolation !== "" && isolation !== "READ-COMMITTED") {
+      throw storeWritesWouldReadASnapshot(where, isolation);
+    }
     // …and the server itself, refused **before** the DDL rather than after it:
     // a server under the floor takes these tables and refuses every keyed write
     // afterwards, so an open that created them and then failed would leave an
@@ -561,6 +637,14 @@ async function openMysqlStore(
         // ordinary case at a mesh's start-up rather than an edge one. See
         // [`MYSQL_TABLE_EXISTS`].
         if ((error as { errno?: unknown } | null)?.errno !== MYSQL_TABLE_EXISTS) throw error;
+      }
+    }
+    const [probed] = await connection.query<RowDataPacket[]>(MYSQL_STORE_VERSION_COLUMN.probe);
+    if (Number(probed[0]?.["held"]) === 0) {
+      try {
+        await connection.query(MYSQL_STORE_VERSION_COLUMN.add);
+      } catch (error) {
+        if ((error as { errno?: unknown } | null)?.errno !== MYSQL_DUPLICATE_COLUMN) throw error;
       }
     }
   } catch (error) {

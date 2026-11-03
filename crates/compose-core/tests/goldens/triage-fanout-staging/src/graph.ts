@@ -33,6 +33,7 @@ import {
   flowTriageNodeEscalateOutput,
   flowTriageNodeVerifyOutput,
   storeDocsToolSearchInput,
+  storeTriageMemoryValueSchema,
   toolCheckoutInput,
   toolDeadLetterInput,
   toolDeadLetterOutput,
@@ -158,7 +159,10 @@ const flowTriageNodeSummarizeShape: runtime.Shape = {
  */
 const flowTriageNodeRememberShape: runtime.Shape = {
   "properties": {
-    "key": "string"
+    "applied": "bool",
+    "deduped": "bool",
+    "key": "string",
+    "version": "int"
   }
 };
 
@@ -275,6 +279,7 @@ const storeTriageMemory: stores.StoreBinding = {
   scope: "session",
   description: "What this session has already triaged.",
   metadata: false,
+  value: storeTriageMemoryValueSchema,
   backend: {
     provider: "postgres",
     from: "the `kv` default of the `staging` target",

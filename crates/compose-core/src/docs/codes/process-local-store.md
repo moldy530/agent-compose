@@ -126,7 +126,9 @@ storage_backends:
 ```
 
 Such a store is deliberately **multi-writer** — it takes no writer guard, because
-this rule is what governs who may reach it — and per key the last write wins.
+this rule is what governs who may reach it. A plain `set` is last-write-wins per
+key, and a conditional write or a `merge`/`append`/`incr` is serialized against
+every other write to its key.
 
 **For a `vector` or a `blob` store that repair is still a deployment rather than
 an edit**: `validate` and `build` take the block, and the first store op throws —

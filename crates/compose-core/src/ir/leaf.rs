@@ -72,7 +72,7 @@ use crate::ast::definition::{
 use crate::ast::deploy::{BackendProvider, EventSourceKind, PluginValue, TraceSinkFormat};
 use crate::ast::document::Reduce;
 use crate::ast::flow::{
-    CoderWorkspace, FlowContext, Harness, PermissionMode, StoreOp, WorkspaceAccess,
+    CoderWorkspace, FlowContext, Harness, PermissionMode, StoreCondition, StoreOp, WorkspaceAccess,
 };
 use crate::ast::schema::{Number, ScalarKind, StringFormat, Surface};
 use crate::ast::trigger::{HmacAlgorithm, Respond, SignatureEncoding, TriggerMethod};
@@ -158,6 +158,7 @@ serialize_as_keyword!(
     RouteCondition,
     ScalarKind,
     SignatureEncoding,
+    StoreCondition,
     StoreKind,
     StoreOp,
     StoreScope,

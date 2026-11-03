@@ -515,6 +515,12 @@ fn store_params(source: &ast_flow::StoreOpParams) -> Option<ir::flow::StoreParam
         filter: source.filter.as_ref().map(bindings),
         metadata: source.metadata.as_ref().map(bindings),
         content_type: source.content_type.clone(),
+        fields: source.fields.as_ref().map(bindings),
+        field: source.field.clone(),
+        unique: source.unique.as_ref().map(|value| value.value),
+        by: source.by.clone(),
+        condition: source.condition.clone(),
+        if_version: source.if_version.clone(),
     })
 }
 

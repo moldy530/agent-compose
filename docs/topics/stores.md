@@ -84,7 +84,7 @@ triggers:
 | `embed` | `vector` **required**; illegal on others | see below |
 | `backend` | no | a bare alias naming an abstract slot; never provider config |
 | `description` | no | LLM-facing for agent-attached stores |
-| `agent_access` | no | `read` \| `read_write` (default) |
+| `agent_access` | no | `read` \| `read_write` (default) \| `full` (`kv` only) |
 
 `metadata_schema` on a `blob` store is `conflicting-keys`: nothing in this
 grammar reads it — no `blob` op takes a `metadata` or `filter` parameter and no
@@ -136,7 +136,10 @@ than a file, and nothing else about it changes: the same ops below, the same
 scope partitions, the same recorded reads and deduplicated writes, so a graph
 moved between backends addresses the same rows and cannot tell which answered. It
 is deliberately **multi-writer** — no writer guard, because the placement rule
-above is what governs who may reach a store — and per key the last write wins.
+above is what governs who may reach a store — and a plain unconditional `set` is
+last-write-wins per key, while a conditional or partial write is serialized
+against every other write to its key (see *Versions, conditions and partial
+updates* below).
 Each dialled store creates its tables at the first op of whichever process
 reaches it first, and several processes of one placement doing that at the same
 moment is the ordinary start-up rather than a race to lose. The one place a
@@ -173,10 +176,13 @@ supplying `--session` is then a run-time requirement.
 
 | kind | `op` | Parameters | Output |
 |---|---|---|---|
-| `kv` | `get` | `key` | `{ value: V (optional), found: boolean }` |
-| `kv` | `set` | `key`, `value` (field map of CEL matching `V`) | `{ key: string }` |
-| `kv` | `delete` | `key` | `{ deleted: boolean }` |
+| `kv` | `get` | `key` | `{ value: V (optional), found: boolean, version: integer (optional) }` |
+| `kv` | `set` | `key`, `value` (field map of CEL matching `V`), one optional condition | `{ key, applied: boolean, version: integer (optional), deduped: boolean }` |
+| `kv` | `delete` | `key`, `if_version` (optional) | `{ deleted: boolean, applied: boolean, version: integer (optional), deduped: boolean }` |
 | `kv` | `list` | `prefix` (optional), `limit` (1..1000, required) | `{ keys: array<string> }` |
+| `kv` | `merge` | `key`, `fields` (field map of CEL, each a field of `V`), one optional condition | `{ key, applied, version (optional), value: V (optional), deduped }` |
+| `kv` | `append` | `key`, `field` (an array field of `V`), `value` (one item), `unique` (optional literal, default `false`), one optional condition | as `merge` |
+| `kv` | `incr` | `key`, `field` (an `integer`/`number` field of `V`), `by` (optional, default `1`), one optional condition | as `merge` |
 | `vector` | `search` | `query`, `top_k` (1..100, required), `filter` (optional) | `{ matches: array<{ id, score, text, metadata: M }> }` |
 | `vector` | `upsert` | `key`, `value` (the text), `metadata` (optional) | `{ id: string }` |
 | `vector` | `delete` | `key` | `{ deleted: boolean }` |
@@ -186,12 +192,16 @@ supplying `--session` is then a run-time requirement.
 | `blob` | `list` | `prefix` (optional), `limit` (1..1000, required) | `{ keys: array<string> }` |
 
 **A row's parameter list is exact**: a parameter the op does not take is an
-error, not an ignored key. `op: get` with `top_k:` is rejected.
+error, not an ignored key. `op: get` with `top_k:` is rejected. So is an op the
+store's kind does not take — a `merge` on a `vector` store — which is
+`invalid-value` naming the ops the kind serves.
 
-Six parameters are CEL over `input`/`state`/`execution` — `key`, `query`,
-`prefix`, `value`, `filter`, `metadata`. Three are **literals**: `top_k` and
-`limit` are integers, and `content_type` is a media type string. A CEL string
-where an integer is declared is a type error, not a computed bound.
+Nine parameters are CEL over `input`/`state`/`execution` — `key`, `query`,
+`prefix`, `value`, `filter`, `metadata`, `fields`, `by`, `if_version`. Six are
+**literals**: `top_k` and `limit` are integers, `content_type` is a media type
+string, `field` is a field name, `unique` is a boolean, and `if` is `absent` or
+`present`. A CEL string where an integer is declared is a type error, not a
+computed bound.
 
 A `store:` node takes **no `input:` key**: its parameters are exactly the op's
 row, and none of them resolves by name from a channel.
@@ -207,6 +217,102 @@ A `vector` store with **no** `metadata_schema` derives matches with no
 `metadata:` naming any key is an error. Declaring `metadata_schema: {}` is a
 *declaration*: the field is present and can only hold `{}`.
 
+## Versions, conditions and partial updates
+
+What a store several runs share needs: a claim that cannot be won twice, and
+writers that change one field of a record without dropping each other's.
+
+```yaml spec
+version: "0.1"
+store.jobs:
+  kind: kv
+  scope: global
+  value_schema:
+    owner:    { type: string }
+    attempts: { type: integer }
+    log:
+      type: array
+      max_items: 100
+      items: { type: string }
+
+flow.work:
+  inputs:
+    job:    { type: string }
+    worker: { type: string }
+  outputs: {}
+  nodes:
+    claim:
+      store: store.jobs
+      op: set
+      key: "input.job"
+      if: absent
+      value:
+        owner: "input.worker"
+        attempts: "0"
+        log: "[]"
+    count:
+      store: store.jobs
+      op: incr
+      key: "input.job"
+      field: attempts
+    note:
+      store: store.jobs
+      op: append
+      key: "input.job"
+      field: log
+      value: "'claimed by ' + input.worker"
+  edges:
+    - { from: start, to: claim }
+    - { from: claim, to: count, when: "claim.output.applied" }
+    - { from: claim, to: end, else: true }
+    - { from: count, to: note }
+    - { from: note, to: end }
+
+triggers:
+  cli: { type: manual, flow: flow.work }
+```
+
+**Every `kv` key carries a `version`**, drawn from one monotonic sequence per
+partition: every write that lands takes the next value, and `get` answers it
+beside the value (`version` is present exactly when `found` is). A sequence
+rather than a per-key counter, so a key deleted and set again never shows a
+version it showed before.
+
+**A write may be conditional.** `set`, `merge`, `append` and `incr` take one of
+`if: absent`, `if: present`, or `if_version: <CEL int>`; `delete` takes
+`if_version:`. Both at once is `conflicting-keys`. A condition that does not hold
+**writes nothing** and answers `applied: false` — with the key's current
+`version` where it holds one, a declined `delete` included — which is a result
+an edge routes on, as `claim` above does, never a node error. A `delete` that
+applied answers no `version`: the key holds nothing. `if_version:` on a `vector`
+or `blob` `delete` is `invalid-value`: a version is a `kv` key's.
+
+**`merge`, `append` and `incr` write part of a value.** Each reads what the key
+holds, applies itself, validates the **whole** result against `value_schema`, and
+commits, in one transaction serialized against every other write to that key — so
+two runs appending at once keep both items, and two runs merging different fields
+keep both fields. On an absent key `merge` creates the value and has to supply
+everything the schema requires, `append` starts from `[]` and `incr` from `0`.
+`unique: true` on an `append` adds only an item the array does not already hold.
+A result the schema refuses **fails the node**, names the field, and changes
+nothing. `validate` refuses an `append` to a field that is not an array and an
+`incr` of one that is not an `integer` or `number` (`type-mismatch`), and a field
+the schema does not declare (`unknown-field`).
+
+**Every `kv` write answers `applied`, `version` and `deduped`**; a partial update
+also answers the whole `value` it left. A retried write — the same idempotency
+key, the same attempt — is answered with its first attempt's whole answer and
+`deduped: true`, so a retried claim that won answers `applied: true` again rather
+than losing to itself.
+
+**Schema evolution.** `value_schema` is checked on write: by CEL typing at
+`validate` for a node, by the emitted Zod at run time for a tool's arguments. A
+`get` returns the stored JSON as it is, so a value written under an older schema
+is not refused there — it fails only when a CEL read reaches a field it lacks. A
+`merge`, `append` or `incr` validates the value it is building on too, so under a
+changed schema it **fails naming the field** the stored value lacks; a `set` of
+the whole value is the repair.
+
 ## Writes inside a `map`
 
 A store **write** performed inside a `map`-dispatched instance must be one of
@@ -216,8 +322,9 @@ two forms:
    `execution.item_index`, or reads an `input.<field>` whose binding *at that
    dispatch site* references the item binding or the index. Legal for every
    kind.
-2. a **keyed `kv` write** — `set` or `delete` on a `kv` store with any legal
-   key, including one constant across instances.
+2. a **keyed `kv` write** — any write on a `kv` store (`set`, `delete`,
+   `merge`, `append`, `incr`) with any legal key, including one constant across
+   instances.
 
 Anything else — a `vector` or `blob` write whose key is not item-derived — is
 `unkeyed-map-write`. A field bound from `state.*`, from the enclosing flow's
@@ -230,21 +337,37 @@ this rule and then fails type-checking with `type-mismatch`. The spelling that
 satisfies both is a string-valued expression that reads the index —
 `key: "state.tasks[execution.item_index]"`.
 
-The `kv` exemption is not a loophole. A `kv` write replaces the whole value at a
-slot the author named, so concurrent instances writing one key are a declared
-overwrite — the store-side counterpart of `reduce: last_wins`. A `blob` or
-`vector` write has no such story: it is bulk content at a document id.
+The `kv` exemption is not a loophole. A `kv` write addresses a slot the author
+named: a `set` replaces the whole value there, so concurrent instances setting
+one key are a declared overwrite — the store-side counterpart of
+`reduce: last_wins` — and a `merge`, `append` or `incr` is serialized against
+every other write to the key, so a `map` whose instances all append to one key
+keeps every instance's item. A `blob` or `vector` write has no such story: it is
+bulk content at a document id.
 
 Store writes are at-least-once and carry an idempotency key derived from the
 execution id and the store node's flattened instance path.
 
 ## Agent-attached stores
 
-| kind | `agent_access: read` | `read_write` (default) |
-|---|---|---|
-| `kv` | `<name>_get` | `<name>_get`, `<name>_set` |
-| `vector` | `<name>_search` | `<name>_search`, `<name>_upsert` |
-| `blob` | `<name>_get`, `<name>_list` | `<name>_get`, `<name>_list`, `<name>_put` |
+| kind | `agent_access: read` | `read_write` (default) | `full` |
+|---|---|---|---|
+| `kv` | `<name>_get` | `<name>_get`, `<name>_set` | those, and `<name>_merge`, `<name>_append`, `<name>_incr`, `<name>_delete` |
+| `vector` | `<name>_search` | `<name>_search`, `<name>_upsert` | illegal |
+| `blob` | `<name>_get`, `<name>_list` | `<name>_get`, `<name>_list`, `<name>_put` | illegal |
+
+`full` is opt-in because the writes past a whole-value `set` are a different
+authority: a model that can delete a key can remove what a run depends on. It
+grants all four on every `kv` store, whatever `value_schema` declares: where it
+declares no array field, `<name>_append` has no field to name and refuses every
+call, and so does `<name>_incr` where it declares no `integer` or `number` one —
+each says so in its own description. `full` is a `kv` level: on a `vector` or
+`blob` store it is `invalid-value`, because it is defined by the `kv` writes it
+adds and those kinds have none of them — `read_write` is the widest they take.
+`<name>_set` takes the conditions at `read_write` — a condition narrows a
+write — as `if` (`absent`, `present`, or empty for none) and `if_version` (`-1`
+for none); an append's field and item arrive together as `item`, naming one
+array field: `{"item": {"tags": "x"}}`.
 
 `<name>` is the store's local name, so `store.user_prefs` gives `user_prefs_get`.
 A synthesized name colliding with an attached tool name is
@@ -253,7 +376,9 @@ A synthesized name colliding with an attached tool name is
 Each tool's arguments are its op row with the expressions replaced by what the
 model supplies, held to that schema **before the store sees them**. A call the
 schema refuses is returned to the model as an error tool result and reaches no
-backend — a refused call leaves no store record. A **backend** that could not
-answer fails the agent node instead.
+backend — a refused call leaves no store record. So is a call naming both
+conditions, and a partial update whose result `value_schema` refuses: the
+arguments were the model's, and nothing was written. A **backend** that could
+not answer fails the agent node instead.
 
 Normative source: `docs/grammar.md` §8.8, §11, §11.1–11.5, §14.3

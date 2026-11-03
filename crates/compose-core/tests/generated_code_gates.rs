@@ -3993,10 +3993,11 @@ fn the_local_store_backends_partition_dedupe_and_encode_what_they_are_given() {
 /// WebAssembly module over `node:fs`, and a difference between the two engines
 /// would be a difference in what every store in every emitted project does.
 fn the_local_backends_behaved(answer: &Value) {
-    // The `kv` catalogue of grammar 11.4, row by row.
+    // The `kv` catalogue of grammar 11.4, row by row — a hit carrying the
+    // version its write took from the partition's sequence (PRD resolved q68).
     assert_eq!(
         answer["kvHit"],
-        json!({ "value": { "theme": "dark" }, "found": true })
+        json!({ "value": { "theme": "dark" }, "found": true, "version": 1 })
     );
     assert_eq!(
         answer["kvMiss"],
@@ -4009,16 +4010,24 @@ fn the_local_backends_behaved(answer: &Value) {
         json!({ "keys": ["b"] }),
         "`prefix:` filters, and the answer is in key order"
     );
-    assert_eq!(answer["kvDeleted"], json!({ "deleted": true }));
+    assert_eq!(
+        answer["kvDeleted"],
+        json!({ "deleted": true, "applied": true, "deduped": false })
+    );
     assert_eq!(
         answer["kvDeletedAgain"],
-        json!({ "deleted": false }),
-        "a delete of nothing deleted nothing"
+        json!({ "deleted": false, "applied": true, "deduped": false }),
+        "a delete of nothing deleted nothing, and with no condition it applied"
     );
 
     // At-least-once, deduped on grammar 9.4's key: the repeated write answers
-    // what the first attempt answered and does **not** happen twice.
-    assert_eq!(answer["dedupedWrite"], json!({ "key": "a" }));
+    // what the first attempt answered — the whole answer, `applied` and
+    // `version` included, marked `deduped` (PRD resolved q68) — and does
+    // **not** happen twice.
+    assert_eq!(
+        answer["dedupedWrite"],
+        json!({ "key": "a", "applied": true, "version": 1, "deduped": true })
+    );
     assert_eq!(
         answer["afterDedupedWrite"]["value"]["theme"], "dark",
         "a write whose key the backend had already applied is not applied again"
@@ -4137,7 +4146,7 @@ fn the_local_backends_behaved(answer: &Value) {
     // `scope: session` — one store, one partition per session key.
     assert_eq!(
         answer["sessionSame"],
-        json!({ "value": { "text": "mine" }, "found": true }),
+        json!({ "value": { "text": "mine" }, "found": true, "version": 1 }),
         "a later execution under the same session key reads what the first wrote"
     );
     assert_eq!(
@@ -4219,7 +4228,7 @@ fn the_local_backends_behaved(answer: &Value) {
     );
     assert_eq!(
         answer["sealedRead"],
-        json!({ "value": { "theme": "dark" }, "found": true }),
+        json!({ "value": { "theme": "dark" }, "found": true, "version": 1 }),
         "…and the write it took is the one a later read answers with"
     );
     assert_eq!(

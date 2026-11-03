@@ -1,0 +1,17 @@
+# rule: a `kv append`'s `value:` is one CEL item, never a field map (grammar 11.4, PRD resolved q68)
+# at: /flow.demo/nodes/tag/value
+# via: /$defs/cel/type
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    tag:
+      store: store.notes
+      op: append
+      key: "'k'"
+      field: tags
+      value:
+        tags: "'x'"
+  edges:
+    - { from: start, to: tag }
+    - { from: tag, to: end }

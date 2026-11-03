@@ -1,0 +1,20 @@
+# rule: a version is a `kv` key's, so `if_version:` on a `blob` or `vector` `delete` is refused against its store (grammar 11.4, PRD resolved q68)
+# code: invalid-value
+# message: `if_version` is not a parameter of a `blob` `delete`: a version is what a `kv` key carries, and `store.artifacts` is `kind: blob`
+# at: main.yml:17:19
+# help: only a `kv` store's writes are versioned and conditional, so drop `if_version:`, or keep the record in a `kv` store (grammar 11.4, PRD resolved q68)
+version: "0.1"
+store.artifacts:
+  kind: blob
+  scope: global
+flow.f:
+  outputs: {}
+  nodes:
+    drop:
+      store: store.artifacts
+      op: delete
+      key: "'report.txt'"
+      if_version: "3"
+  edges:
+    - { from: start, to: drop }
+    - { from: drop, to: end }

@@ -5,10 +5,23 @@
 //! Grammar 11.4's table is normative in both directions: which parameters an op
 //! takes — which the parser already decides, because `op:` is a literal in the
 //! same node — and what those parameters *hold*, which needs the store
-//! definition and so is decided here. `value` on a `kv set` is checked against
-//! the store's `value_schema`, `filter` and `metadata` keys against its
-//! `metadata_schema`, and every other parameter is one expression whose result
-//! must be a string.
+//! definition and so is decided here. So is the one half of the row the parser
+//! cannot read: **which kind** takes the op, since the kind is the store's and
+//! the store may be declared in another file. `value` on a `kv set` is checked
+//! against the store's `value_schema`, `filter` and `metadata` keys against its
+//! `metadata_schema`, and `key`, `query` and `prefix` are each one expression
+//! whose result must be a string.
+//!
+//! # The partial updates and the conditions (PRD resolved q68)
+//!
+//! `merge`, `append` and `incr` are the schema check of a `set` extended to
+//! three more rows. A `merge`'s `fields:` is checked like a `set`'s `value:`
+//! except that it is not total — it names the fields it changes. An `append`'s
+//! `field:` must be an **array** field of `V` and its `value:` one item of it;
+//! an `incr`'s `field:` must be an `integer` or `number` field and its `by:` a
+//! value of that field's type. `if_version:` is an integer expression, and a
+//! version is a `kv` key's: the one op that takes it on another kind — `delete`
+//! — is refused there.
 //!
 //! A `vector` store that declares **no** `metadata_schema` has no metadata at
 //! all rather than empty metadata, so `filter:` and `metadata:` there have no
@@ -33,26 +46,19 @@
 //! statically; implicit invocation is not a trigger and is quantified over by
 //! nothing (Decision D64).
 
-use crate::ast::common::Address;
+use crate::ast::common::{Address, Ident};
 use crate::ast::definition::{StoreKind, StoreScope};
 use crate::ast::flow::StoreOp;
+use crate::ast::schema::ScalarKind;
 use crate::cel::ty::Type;
 use crate::diag::{Diagnostic, DiagnosticCode, Spanned};
 use crate::ir::binding::Bindings;
 use crate::ir::flow::{Node, NodeKind, StoreParams, StoreValue};
-use crate::ir::schema::FieldMap;
+use crate::ir::schema::{FieldMap, TypeForm};
 use crate::ir::trigger::TriggerKind;
 
-use super::model::default_of;
+use super::model::{self, default_of};
 use super::{Ctx, FlowCx, expr, field_names, reach, text};
-
-/// The ops that write (grammar 11.4).
-const fn writes(op: StoreOp) -> bool {
-    matches!(
-        op,
-        StoreOp::Set | StoreOp::Delete | StoreOp::Upsert | StoreOp::Put
-    )
-}
 
 /// Check one store-op node's parameters against its row and its store
 /// (grammar 11.4).
@@ -61,6 +67,7 @@ pub(crate) fn store_node<'a>(
     cx: &FlowCx<'a>,
     node: &'a Node,
     store: &Spanned<Address>,
+    op: StoreOp,
     params: &'a StoreParams,
 ) {
     let id = text(&node.id).to_string();
@@ -69,6 +76,51 @@ pub(crate) fn store_node<'a>(
     let Some(definition) = ctx.store(&store.value) else {
         return;
     };
+
+    // The half of the row only the store can answer: which kind serves this
+    // op. Nothing further is read off a node whose op its store does not
+    // take — every other rule below is written for a row that exists.
+    if !model::kind_takes(definition.kind, op) {
+        let kind = definition.kind;
+        ctx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidValue,
+                store.span.clone(),
+                format!(
+                    "{subject} asks `{}` for a `{}`, which a `{}` store does not take",
+                    store.value,
+                    op.as_str(),
+                    kind.as_str()
+                ),
+            )
+            .with_help(format!(
+                "a `{}` store takes {} (grammar 11.4)",
+                kind.as_str(),
+                crate::parse::reader::list(kind.operations())
+            )),
+        );
+        return;
+    }
+    if definition.kind != StoreKind::Kv
+        && let Some(version) = &params.if_version
+    {
+        ctx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidValue,
+                version.span.clone(),
+                format!(
+                    "`if_version` is not a parameter of a `{}` `{}`: a version is what a `kv` key carries, and `{}` is `kind: {}`",
+                    definition.kind.as_str(),
+                    op.as_str(),
+                    store.value,
+                    definition.kind.as_str()
+                ),
+            )
+            .with_help(
+                "only a `kv` store's writes are versioned and conditional, so drop `if_version:`, or keep the record in a `kv` store (grammar 11.4, PRD resolved q68)",
+            ),
+        );
+    }
 
     for (name, expression) in [
         ("key", params.key.as_ref()),
@@ -116,6 +168,37 @@ pub(crate) fn store_node<'a>(
         None => {}
     }
 
+    if let Some(fields) = &params.fields
+        && let Some(schema) = definition.value_schema.as_ref()
+    {
+        schema_bindings(
+            ctx,
+            fields,
+            &scope,
+            schema,
+            &format!("`fields` of {subject}"),
+            &store.value.to_string(),
+            false,
+        );
+    }
+    if let Some(field) = &params.field
+        && let Some(schema) = definition.value_schema.as_ref()
+    {
+        partial_field(ctx, &scope, &subject, store, op, schema, field, params);
+    }
+    if let Some(version) = &params.if_version
+        && definition.kind == StoreKind::Kv
+    {
+        let analysis = expr::analyze(ctx, version, &scope);
+        expr::expect(
+            ctx,
+            version,
+            &analysis,
+            &Type::Int,
+            &format!("`if_version` of {subject}"),
+        );
+    }
+
     for (name, map) in [
         ("filter", params.filter.as_ref()),
         ("metadata", params.metadata.as_ref()),
@@ -153,6 +236,171 @@ pub(crate) fn store_node<'a>(
                 }
             }
         }
+    }
+}
+
+/// The one field an `append` or an `incr` addresses, and the expression that
+/// goes with it: an array field and one of its items, or a numeric field and a
+/// value of its type (grammar 11.4, PRD resolved q68).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each is one fact the two rows read, and a struct would only rename them"
+)]
+fn partial_field(
+    ctx: &mut Ctx,
+    scope: &crate::cel::Scope,
+    subject: &str,
+    store: &Spanned<Address>,
+    op: StoreOp,
+    schema: &FieldMap,
+    field: &Spanned<Ident>,
+    params: &StoreParams,
+) {
+    let name = field.value.as_str();
+    let Some(declared) = schema.field(name) else {
+        let known = field_names(schema);
+        let help = crate::parse::reader::suggest(name, &known).map_or_else(
+            || {
+                if known.is_empty() {
+                    format!("`{}` declares no fields there", store.value)
+                } else {
+                    format!(
+                        "the declared fields are {}",
+                        crate::parse::reader::list(&known)
+                    )
+                }
+            },
+            |field| format!("did you mean `{field}`?"),
+        );
+        ctx.push(
+            Diagnostic::error(
+                DiagnosticCode::UnknownField,
+                field.span.clone(),
+                format!("`{name}` is not a field `{}` declares", store.value),
+            )
+            .with_label(schema.span.clone(), "the store's schema is declared here")
+            .with_help(help),
+        );
+        // The expression is still read, so a mistake in it is reported beside
+        // this one rather than after the field is repaired.
+        for expression in [
+            params.value.as_ref().and_then(expression_of),
+            params.by.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            expr::analyze(ctx, expression, scope);
+        }
+        return;
+    };
+    let is = model::describe_form(&declared.ty.form);
+    match op {
+        StoreOp::Append => {
+            let TypeForm::Array(array) = &declared.ty.form else {
+                let arrays: Vec<&str> = model::array_fields(Some(schema))
+                    .into_iter()
+                    .map(|(field, _)| field.name.value.as_str())
+                    .collect();
+                ctx.push(
+                    Diagnostic::error(
+                        DiagnosticCode::TypeMismatch,
+                        field.span.clone(),
+                        format!(
+                            "`append` adds one item to an array field, and `{name}` of `{}` is {is}",
+                            store.value
+                        ),
+                    )
+                    .with_label(declared.name.span.clone(), "the field is declared here")
+                    .with_help(if arrays.is_empty() {
+                        format!(
+                            "`{}` declares no array field, so nothing it stores can be appended to: write the whole value with `set`, or change one field with `merge` (grammar 11.4)",
+                            store.value
+                        )
+                    } else {
+                        format!(
+                            "name an array field — `{}` declares {} — or write the field with `merge` (grammar 11.4)",
+                            store.value,
+                            crate::parse::reader::list(&arrays)
+                        )
+                    }),
+                );
+                if let Some(value) = params.value.as_ref().and_then(expression_of) {
+                    expr::analyze(ctx, value, scope);
+                }
+                return;
+            };
+            if let Some(value) = params.value.as_ref().and_then(expression_of) {
+                let analysis = expr::analyze(ctx, value, scope);
+                expr::expect_field(
+                    ctx,
+                    value,
+                    &analysis,
+                    &array.items,
+                    &format!("`value` of {subject}, one item of `{name}`,"),
+                );
+            }
+        }
+        StoreOp::Incr => {
+            let numeric = matches!(
+                &declared.ty.form,
+                TypeForm::Scalar(scalar)
+                    if matches!(scalar.kind, ScalarKind::Integer | ScalarKind::Number)
+            );
+            if !numeric {
+                let numbers: Vec<&str> = model::numeric_fields(Some(schema))
+                    .into_iter()
+                    .map(|field| field.name.value.as_str())
+                    .collect();
+                ctx.push(
+                    Diagnostic::error(
+                        DiagnosticCode::TypeMismatch,
+                        field.span.clone(),
+                        format!(
+                            "`incr` adds to a numeric field, and `{name}` of `{}` is {is}",
+                            store.value
+                        ),
+                    )
+                    .with_label(declared.name.span.clone(), "the field is declared here")
+                    .with_help(if numbers.is_empty() {
+                        format!(
+                            "`{}` declares no `integer` or `number` field, so nothing it stores can be added to: write the field with `merge` (grammar 11.4)",
+                            store.value
+                        )
+                    } else {
+                        format!(
+                            "name an `integer` or `number` field — `{}` declares {} — or write the field with `merge` (grammar 11.4)",
+                            store.value,
+                            crate::parse::reader::list(&numbers)
+                        )
+                    }),
+                );
+                if let Some(by) = &params.by {
+                    expr::analyze(ctx, by, scope);
+                }
+                return;
+            }
+            if let Some(by) = &params.by {
+                let analysis = expr::analyze(ctx, by, scope);
+                expr::expect_field(
+                    ctx,
+                    by,
+                    &analysis,
+                    &declared.ty,
+                    &format!("`by` of {subject}, added to `{name}`,"),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The one expression a `value:` holds, where it holds one rather than a field
+/// map.
+const fn expression_of(value: &StoreValue) -> Option<&Spanned<crate::ast::common::Cel>> {
+    match value {
+        StoreValue::Expression { value } => Some(value),
+        StoreValue::Fields { .. } => None,
     }
 }
 
@@ -243,15 +491,18 @@ pub(crate) fn check_map_writes(ctx: &mut Ctx) {
             let NodeKind::Store { store, op, params } = &node.kind else {
                 continue;
             };
-            if !writes(*op) {
+            if !op.writes() {
                 continue;
             }
             let Some(definition) = ctx.store(&store.value) else {
                 continue;
             };
-            // A `kv` write replaces the whole value at a slot the author named,
-            // so concurrent instances sharing a key are a declared overwrite —
-            // the store-side counterpart of `reduce: last_wins` (Decision D67).
+            // A `kv` write addresses a slot the author named, so concurrent
+            // instances sharing a key are many writers on one record: a `set`
+            // is a declared overwrite — the store-side counterpart of `reduce:
+            // last_wins` — and a `merge`, `append` or `incr` is serialized
+            // against every other write to its key, so each instance's change
+            // lands (Decisions D67, D152).
             if definition.kind == StoreKind::Kv {
                 continue;
             }

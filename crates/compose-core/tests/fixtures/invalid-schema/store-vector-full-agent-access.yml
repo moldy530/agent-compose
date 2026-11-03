@@ -1,0 +1,12 @@
+# rule: `agent_access: full` is a kv level — its extra tools are a kv store's `merge`, `append`, `incr` and `delete`, so a vector store takes `read` or `read_write` (grammar 11.5, PRD resolved q68)
+# at: /store.notes/agent_access
+# via: /$defs/storeDef/allOf/1/then/properties/agent_access/enum
+store.notes:
+  kind: vector
+  scope: global
+  description: Notes the agent searches.
+  agent_access: full
+  embed:
+    model: text-embedding-3-small
+    provider: provider.openai
+    dimensions: 1536
