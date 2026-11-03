@@ -36,9 +36,15 @@
 //!    `expires_at` against the store's own clock rather than this machine's, a
 //!    schema-refused import line named by number and a schema-refused `set`
 //!    value — each exiting `2`, a command line to fix rather than an answer of
-//!    no — `--if-absent` seeding without overwriting, the wrong scope flags and
-//!    an unknown address exiting `2`, and the `--format json` shapes —
-//!    [`drive`], once per arm;
+//!    no — an import the backend stops part-way naming the line it stopped at
+//!    and how many it wrote before it, exit `1`, `--if-absent` seeding without
+//!    overwriting, the wrong scope flags and an unknown address exiting `2`,
+//!    and the `--format json` shapes — [`drive`], once per arm;
+//!  * a store whose rows live only in each execution's process — bound to
+//!    `provider: memory` by a named target — refused by every sub-verb with
+//!    exit `2` rather than answered out of an empty database —
+//!    [`a_store_a_target_binds_to_memory_is_refused_rather_than_read_from_an_empty_one`],
+//!    beside [`drive`]'s `scope: execution` under `--target local`;
 //!  * a store's `default_ttl:` taken by a `set` with no `--ttl` and not by an
 //!    import line with no `expires_at` — [`drive`] too;
 //!  * a command whose standard output will not take its answer — a pipe whose
@@ -62,7 +68,9 @@
 //!    and never among its lines —
 //!    [`a_refused_composition_is_reported_beside_an_exports_summary_not_among_its_lines`];
 //!  * clap's own surface for the verb and each sub-verb, pinned byte for byte —
-//!    [`the_store_help_pages_are_pinned`].
+//!    [`the_store_help_pages_are_pinned`] — and what clap refuses, in its own
+//!    words and before anything is built —
+//!    [`the_store_command_line_refuses_what_it_cannot_parse`].
 
 #[path = "compiled_graph_acceptance/harness.rs"]
 mod harness;
@@ -77,7 +85,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use harness::toolchain::required;
-use harness::{Scratch, bun, journal_rows, scratch_project, seal, sqlite_rows};
+use harness::{Scratch, bun, journal_rows, scratch_project, seal, sqlite_rows, sqlite_sql};
 
 /// Where a reachable Postgres is named — `store_backend_conformance`'s variable.
 const POSTGRES_URL: &str = "AGENT_COMPOSE_TEST_POSTGRES_URL";
@@ -108,7 +116,8 @@ const CLOSED_PIPE_PATIENCE: Duration = Duration::from_secs(180);
 struct Arm {
     /// The `provider:` keyword, as grammar §14.3 spells it.
     provider: &'static str,
-    /// The variable holding a reachable server, or `None` for SQLite.
+    /// The variable holding a reachable server, or `None` for a backend the
+    /// store's own process opens.
     variable: Option<&'static str>,
 }
 
@@ -123,6 +132,14 @@ const POSTGRES: Arm = Arm {
 const MYSQL: Arm = Arm {
     provider: "mysql",
     variable: Some(MYSQL_URL),
+};
+/// Not a backend the command reaches but one it refuses: a named target binding
+/// the stores' alias to `provider: memory`, whose rows live in each execution's
+/// own process
+/// ([`a_store_a_target_binds_to_memory_is_refused_rather_than_read_from_an_empty_one`]).
+const MEMORY: Arm = Arm {
+    provider: "memory",
+    variable: None,
 };
 
 /// The composition every arm is driven against, with its stores named `suffix`.
@@ -265,6 +282,9 @@ struct Project {
     out: PathBuf,
     target: &'static str,
     provider: &'static str,
+    /// Whether the stores are rows on a server, which outlive the case unless
+    /// it deletes them.
+    dialled: bool,
     environment: Vec<(String, String)>,
     /// The run-unique names of the five stores, without `store.`.
     notes: String,
@@ -304,6 +324,16 @@ impl Project {
         let entrypoint = source.path().join("main.yml");
         std::fs::write(&entrypoint, composition(&suffix)).expect("the scratch area is writable");
         let (target, environment) = match address {
+            None if arm.provider == "memory" => {
+                std::fs::create_dir_all(source.path().join("deploy"))
+                    .expect("the scratch area is writable");
+                std::fs::write(
+                    source.path().join("deploy/memory.yml"),
+                    "version: \"0.1\"\nstorage_backends:\n  aliases:\n    cli_db: { provider: memory }\n",
+                )
+                .expect("the scratch area is writable");
+                ("memory", Vec::new())
+            }
             None => ("local", Vec::new()),
             Some(address) => {
                 std::fs::create_dir_all(source.path().join("deploy"))
@@ -325,6 +355,7 @@ impl Project {
             out,
             target,
             provider: arm.provider,
+            dialled: arm.variable.is_some(),
             environment,
             notes: format!("notes_{suffix}"),
             leases: format!("leases_{suffix}"),
@@ -530,7 +561,7 @@ impl Project {
 
     /// Rows a statement answers on this arm's server — `None` on SQLite.
     fn server(&self, sql: &str, parameters: &Value) -> Option<Value> {
-        if self.provider == "sqlite" {
+        if !self.dialled {
             return None;
         }
         let script = self.script();
@@ -593,7 +624,7 @@ impl Project {
 /// directory with the SQLite files in it, and the rows on a dialled server.
 impl Drop for Project {
     fn drop(&mut self) {
-        if self.provider != "sqlite" {
+        if self.dialled {
             let script = self.script();
             for table in ["store_entries", "store_applied", "store_sequences"] {
                 let sql = format!("DELETE FROM {table} WHERE store IN (?, ?, ?, ?)");
@@ -1363,6 +1394,118 @@ fn drive(arm: &Arm) {
         .exits(2);
     project.store("get", &[&notes, "refused/set"]).exits(1);
 
+    // A backend that fails part-way through an import is another matter: the
+    // lines before the one it refused are written, and stay written, so the
+    // command says which line it stopped at and how many it wrote before it —
+    // exit `1`, the store failing rather than the file (D155, the `cli` topic).
+    // Every line here is one the schema admits, so it is the backend that
+    // refuses the one marked: on SQLite a trigger this case installs on the
+    // store's own file, and on a server a key its own column will not hold —
+    // longer than MySQL's `VARCHAR(2048)`, or holding the NUL a Postgres
+    // `text` never can.
+    let store_file = project
+        .out
+        .join(".agent-compose/stores")
+        .join(format!("{}.sqlite", project.notes));
+    let unwritable = match project.provider {
+        "sqlite" => {
+            let installed = sqlite_sql(
+                &project.out,
+                &store_file,
+                "CREATE TRIGGER partway_refused BEFORE INSERT ON entries \
+                 WHEN NEW.key = 'partway/refused' \
+                 BEGIN SELECT RAISE(ABORT, 'the case refuses this key'); END;",
+            );
+            assert!(
+                installed.status.success(),
+                "the trigger is installed on {}:\n{}",
+                store_file.display(),
+                String::from_utf8_lossy(&installed.stderr)
+            );
+            "partway/refused".to_string()
+        }
+        "mysql" => format!("partway/{}", "k".repeat(3000)),
+        _ => "partway/\u{0}".to_string(),
+    };
+    // One line per name, keyed under `partway/` — and `refused`, the key the
+    // backend will not take.
+    let partway = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| {
+                let key = if *name == "refused" {
+                    unwritable.clone()
+                } else {
+                    format!("partway/{name}")
+                };
+                format!("{}\n", json!({ "key": key, "value": { "text": name } }))
+            })
+            .collect::<String>()
+    };
+    let stopped = project.store_with(
+        "import",
+        &[&notes],
+        Given {
+            input: Some(&partway(&["a", "refused", "c"])),
+            ..Given::default()
+        },
+    );
+    assert!(
+        stopped
+            .exits(1)
+            .stderr()
+            .contains("error: line 2 could not be written (")
+            && stopped
+                .stderr()
+                .contains("); the 1 line before it was written, and nothing after it was"),
+        "an import a backend stopped part-way names the line it stopped at and how many were \
+         written before it:\n{}",
+        stopped.stderr()
+    );
+    project.store("get", &[&notes, "partway/a"]).exits(0);
+    project.store("get", &[&notes, "partway/c"]).exits(1);
+    let stopped = project.store_with(
+        "import",
+        &[&notes, "--format", "json"],
+        Given {
+            input: Some(&partway(&["a", "b", "refused", "c"])),
+            ..Given::default()
+        },
+    );
+    let error = stopped.exits(1).json();
+    assert!(
+        error["error"].as_str().is_some_and(|error| {
+            error.starts_with("line 3 could not be written (")
+                && error
+                    .ends_with("); the 2 lines before it were written, and nothing after it was")
+        }),
+        "…answered as `{{ error }}` under `--format json`: {error}"
+    );
+    assert_eq!(
+        error
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["error"],
+        "{error}"
+    );
+    project.store("get", &[&notes, "partway/b"]).exits(0);
+    project.store("get", &[&notes, "partway/c"]).exits(1);
+    for key in ["partway/a", "partway/b"] {
+        project.store("delete", &[&notes, key]).exits(0);
+    }
+    if project.provider == "sqlite" {
+        let dropped = sqlite_sql(&project.out, &store_file, "DROP TRIGGER partway_refused;");
+        assert!(
+            dropped.status.success(),
+            "the trigger is dropped from {}:\n{}",
+            store_file.display(),
+            String::from_utf8_lossy(&dropped.stderr)
+        );
+    }
+
     // `--if-absent` seeds without overwriting — and `--file` is read from where
     // the command was typed, not from the build directory the child runs in.
     project
@@ -1633,7 +1776,7 @@ fn drive(arm: &Arm) {
         "the run journaled its own reads: {effects}"
     );
     for operator_only in [
-        "page/", "lease", "brief", "other/x", "bulk/", "refused/", "seed/b", "clocked/",
+        "page/", "lease", "brief", "other/x", "bulk/", "refused/", "partway/", "seed/b", "clocked/",
     ] {
         assert!(
             !rows
@@ -2014,6 +2157,87 @@ fn a_store_command_against_a_mysql_server_that_is_not_there_exits_1() {
     no_server(&MYSQL);
 }
 
+/// A store a **named** target binds to `provider: memory` is refused, exit `2`,
+/// by every sub-verb and for every scope — never answered out of the empty
+/// database the command's own process would open for it (D155, the `cli`
+/// topic: "any store bound to `provider: memory` … since this command is
+/// another process").
+///
+/// The rows of such a store live only in the memory of the process running each
+/// execution, so an answer would be a lie of either kind: a `get` saying "not
+/// found", exit `1`, of a key a running flow holds, or a `set` saying
+/// "applied", exit `0`, of a row that dies with the command. `--target local`'s
+/// `scope: execution` stores are the other half of the same refusal, and
+/// [`drive`] asks it of the SQLite arm; this is the half a deploy file chooses.
+#[test]
+fn a_store_a_target_binds_to_memory_is_refused_rather_than_read_from_an_empty_one() {
+    let Some(project) = Project::new(&MEMORY) else {
+        return;
+    };
+    let notes = format!("store.{}", project.notes);
+    let visits = format!("store.{}", project.visits);
+    let scratch = format!("store.{}", project.scratch);
+    let line = format!(
+        "{}\n",
+        json!({ "key": "memory/k", "value": { "text": "lost" } })
+    );
+    for (sub_verb, arguments) in [
+        ("get", vec![notes.as_str(), "memory/k"]),
+        ("get", vec![notes.as_str(), "memory/k", "--format", "json"]),
+        (
+            "set",
+            vec![notes.as_str(), "memory/k", r#"{"text":"lost"}"#],
+        ),
+        (
+            "set",
+            vec![
+                notes.as_str(),
+                "memory/k",
+                r#"{"text":"lost"}"#,
+                "--format",
+                "json",
+            ],
+        ),
+        ("delete", vec![notes.as_str(), "memory/k"]),
+        ("list", vec![notes.as_str()]),
+        ("count", vec![notes.as_str(), "--format", "json"]),
+        ("export", vec![notes.as_str()]),
+        ("import", vec![notes.as_str()]),
+        (
+            "get",
+            vec![visits.as_str(), "memory/k", "--session", SESSION],
+        ),
+        (
+            "get",
+            vec![scratch.as_str(), "memory/k", "--execution", "exec_x"],
+        ),
+    ] {
+        let refused = project.store_with(
+            sub_verb,
+            &arguments,
+            Given {
+                input: (sub_verb == "import").then_some(line.as_str()),
+                ..Given::default()
+            },
+        );
+        refused.exits(2);
+        assert!(
+            refused.stderr().contains("is bound to `provider: memory`")
+                && refused.stderr().contains("memory of the process"),
+            "`store {sub_verb} {}` says the store's rows are not this process's to reach:\n{}",
+            arguments.join(" "),
+            refused.stderr()
+        );
+        assert_eq!(
+            refused.stdout(),
+            "",
+            "`store {sub_verb} {}` answers nothing: an empty database's answer would be a \
+             wrong one",
+            arguments.join(" ")
+        );
+    }
+}
+
 /// clap's own pages for the verb and each sub-verb, byte for byte.
 ///
 /// `--help` is the first thing a coding agent reads (PRD resolved q23), and a
@@ -2047,68 +2271,155 @@ fn the_store_help_pages_are_pinned() {
 }
 
 /// What clap refuses before anything is built: a sub-verb that does not exist,
-/// a missing operand, two conditions, a page size out of range, and both
-/// partition flags at once — every one exit `2`.
+/// a missing operand, two conditions, a value `--if` does not take, a page size
+/// out of range, and both partition flags at once — every one exit `2`, with
+/// clap's own words for it.
+///
+/// Each names a composition that is there and a store it declares, so the only
+/// thing wrong with the command line is the thing the case is about. The exit
+/// code alone cannot say clap refused it: a missing entrypoint exits `2` too,
+/// and so does a case that got past clap — refused again by the emitted verb in
+/// words of its own, or stopped by a build directory with nothing installed in
+/// it. What tells clap's refusal apart is what it says and that nothing was
+/// built — the `--out` it was handed does not exist, and nothing else was
+/// written beside the composition.
 #[test]
 fn the_store_command_line_refuses_what_it_cannot_parse() {
-    for arguments in [
-        &["store"][..],
-        &["store", "frob", "main.yml", "store.notes"],
-        &["store", "get", "main.yml", "store.notes"],
-        &[
-            "store",
-            "set",
-            "main.yml",
-            "store.notes",
-            "k",
-            "{}",
-            "--if",
-            "absent",
-            "--if-version",
-            "1",
-        ],
-        &[
-            "store",
-            "set",
-            "main.yml",
-            "store.notes",
-            "k",
-            "{}",
-            "--if",
-            "maybe",
-        ],
-        &["store", "list", "main.yml", "store.notes", "--limit", "0"],
-        &[
-            "store",
-            "list",
-            "main.yml",
-            "store.notes",
-            "--limit",
-            "1001",
-        ],
-        &[
-            "store",
-            "get",
-            "main.yml",
-            "store.notes",
-            "k",
-            "--session",
-            "a",
-            "--execution",
-            "b",
-        ],
-    ] {
+    let source = Scratch::new("store-cli-unparsed");
+    let entrypoint = source.path().join("main.yml");
+    let suffix = run_unique();
+    std::fs::write(&entrypoint, composition(&suffix)).expect("the scratch area is writable");
+    let main = entrypoint.to_str().expect("a UTF-8 scratch path");
+    let notes = format!("store.notes_{suffix}");
+    let visits = format!("store.visits_{suffix}");
+    let out = source.path().join("build");
+    let built = out.to_str().expect("a UTF-8 scratch path");
+    let cases: [(Vec<&str>, &[&str]); 8] = [
+        (
+            vec!["store"],
+            &["Usage: agent-compose store <COMMAND>", "Commands:"],
+        ),
+        (
+            vec!["store", "frob", "--out", built, main, &notes],
+            &["error: unrecognized subcommand 'frob'"],
+        ),
+        (
+            vec!["store", "get", "--out", built, main, &notes],
+            &[
+                "error: the following required arguments were not provided:",
+                "<KEY>",
+            ],
+        ),
+        (
+            vec![
+                "store",
+                "set",
+                "--out",
+                built,
+                main,
+                &notes,
+                "k",
+                r#"{"text":"x"}"#,
+                "--if",
+                "absent",
+                "--if-version",
+                "1",
+            ],
+            &[
+                "error: the argument '--if <CONDITION>' cannot be used with '--if-version <VERSION>'",
+            ],
+        ),
+        (
+            vec![
+                "store",
+                "set",
+                "--out",
+                built,
+                main,
+                &notes,
+                "k",
+                r#"{"text":"x"}"#,
+                "--if",
+                "maybe",
+            ],
+            &[
+                "error: invalid value 'maybe' for '--if <CONDITION>'",
+                "[possible values: absent, present]",
+            ],
+        ),
+        (
+            vec![
+                "store", "list", "--out", built, main, &notes, "--limit", "0",
+            ],
+            &["error: invalid value '0' for '--limit <N>': 0 is not in 1..=1000"],
+        ),
+        (
+            vec![
+                "store", "list", "--out", built, main, &notes, "--limit", "1001",
+            ],
+            &["error: invalid value '1001' for '--limit <N>': 1001 is not in 1..=1000"],
+        ),
+        (
+            vec![
+                "store",
+                "get",
+                "--out",
+                built,
+                main,
+                &visits,
+                "k",
+                "--session",
+                "a",
+                "--execution",
+                "b",
+            ],
+            &["error: the argument '--session <KEY>' cannot be used with '--execution <ID>'"],
+        ),
+    ];
+    for (arguments, says) in cases {
         let output = Command::new(env!("CARGO_BIN_EXE_agent-compose"))
-            .args(arguments)
+            .args(&arguments)
+            .current_dir(source.path())
             .env("NO_COLOR", "1")
+            .stdin(Stdio::null())
             .output()
             .expect("the command runs");
+        let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(
             output.status.code(),
             Some(2),
-            "`agent-compose {}` is a usage error:\n{}",
+            "`agent-compose {}` is a usage error:\n{stderr}",
             arguments.join(" "),
-            String::from_utf8_lossy(&output.stderr)
+        );
+        for said in says {
+            assert!(
+                stderr.contains(said),
+                "`agent-compose {}` is refused by clap, which says `{said}`:\n{stderr}",
+                arguments.join(" "),
+            );
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "",
+            "`agent-compose {}` answers nothing on stdout",
+            arguments.join(" "),
+        );
+        let beside: Vec<String> = std::fs::read_dir(source.path())
+            .expect("the scratch area is readable")
+            .map(|entry| {
+                entry
+                    .expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            beside,
+            ["main.yml"],
+            "`agent-compose {}` was refused before anything was built: neither its `--out` nor \
+             any other build directory exists",
+            arguments.join(" "),
         );
     }
 }

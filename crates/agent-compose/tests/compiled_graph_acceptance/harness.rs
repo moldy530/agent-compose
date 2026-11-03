@@ -2076,6 +2076,16 @@ pub fn sqlite_rows(project: &Path, file: &Path, query: &str) -> Value {
     })
 }
 
+/// Run a SQL script against one SQLite file a built project's runtime wrote —
+/// [`sqlite_rows`]'s writing half, as [`journal_sql`] is [`journal_rows`]'s.
+///
+/// For the claims only a store's own file can be made to stage: a backend that
+/// refuses one write of several, which no well-formed op does of its own, is a
+/// trigger the case installs on the file and drops again.
+pub fn sqlite_sql(project: &Path, file: &Path, sql: &str) -> Output {
+    sqlite_driver(project, file, sql, false)
+}
+
 fn journal_driver(project: &Path, sql: &str, query: bool) -> Output {
     sqlite_driver(
         project,
