@@ -317,7 +317,11 @@ runs out leaves through the `else:` just as a last page does, so on a larger
 partition the walk stops short: `cursor` holds the last `next` a page answered
 (the `after:` a later walk resumes at), and `total`'s `count` is what shows the
 keys it did not reach. At 1000 keys a page, one budgeted back-edge reads about a
-million keys.
+million keys. On SQLite and Postgres each page costs the same however deep the
+walk is, because the cursor is a range scan of the partition's primary key. On
+MySQL the primary key is a hash, so each page is sorted from what remains of the
+partition and a page costs more the more is left: a 100,000-key walk takes a few
+seconds there against a fraction of one on the other two, with the same answers.
 
 **`include_values: true`** answers each key's `value` and `version` beside it,
 as `entries`, in the page's order. It is a literal because it decides whether
