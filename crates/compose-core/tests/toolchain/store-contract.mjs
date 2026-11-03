@@ -245,6 +245,30 @@ async function holdTheKey(killer, store, key) {
 }
 
 /**
+ * Take — and keep — the lock a keyed write's **ledger** insert has to wait for:
+ * an uncommitted ledger row under `key` in `store`, on the primary key
+ * `(store, idempotency_key)` every arm's claim conflicts on.
+ *
+ * Both servers run a store's writes at `READ COMMITTED`, and neither shows a
+ * row another transaction has not committed to a plain read — so the write's
+ * own ledger check, made before its effect, finds nothing and the write goes
+ * ahead. It is the write's ledger insert, after every statement of its effect,
+ * that meets the row and waits on it: `ON CONFLICT DO NOTHING` and
+ * `ON DUPLICATE KEY UPDATE` both wait for the transaction that inserted a
+ * conflicting row to end rather than answer before it has.
+ */
+async function holdTheLedgerRow(killer, store, key) {
+  const result = JSON.stringify({ held: "by the killer" });
+  await rows(
+    killer,
+    provider === "postgres"
+      ? "INSERT INTO store_applied (store, scope_key, idempotency_key, op, result) VALUES ($1, $2, $3, $4, $5)"
+      : "INSERT INTO store_applied (store, scope_key, idempotency_key, op, result) VALUES (?, ?, ?, ?, ?)",
+    [store, "global", key, "batch", result],
+  );
+}
+
+/**
  * The session id of the store's connection, once the server can see it waiting.
  *
  * Polled rather than assumed, because "the statement is in flight" is the whole
@@ -277,8 +301,17 @@ async function holdTheKey(killer, store, key) {
  * a first poll that landed while the store was still on the statements before
  * the one that blocks — a write locks its partition's sequence row and reads
  * its key before it inserts — would be the answer to all hundred.
+ *
+ * **`table` is the table the blocked statement writes** — `store_entries` for
+ * a write held at its key ([`holdTheKey`]), `store_applied` for one held at its
+ * ledger row ([`holdTheLedgerRow`]) — and both arms ask for it, so a poll lands
+ * on the statement the killer's lock is in front of and on no earlier one. On
+ * Postgres, whose query text carries no store name, the session must also be
+ * one **this killer** blocks (`pg_blocking_pids`): the text and the wait alone
+ * would match another run's store on the same server — a second suite pointed
+ * at one database — and this one would end it.
  */
-async function waitingOn(killer, store) {
+async function waitingOn(killer, store, table = "store_entries") {
   const found = async () => {
     if (provider === "postgres") {
       await rows(killer, "SELECT pg_stat_clear_snapshot()");
@@ -286,7 +319,9 @@ async function waitingOn(killer, store) {
         killer,
         "SELECT pid AS id FROM pg_stat_activity WHERE datname = current_database() " +
           "AND pid <> pg_backend_pid() AND backend_type = 'client backend' " +
-          "AND state = 'active' AND wait_event_type = 'Lock' AND query LIKE '%store_entries%'",
+          "AND state = 'active' AND wait_event_type = 'Lock' AND query LIKE $1 " +
+          "AND pg_backend_pid() = ANY (pg_blocking_pids(pid))",
+        [`%${table}%`],
       );
     }
     return await rows(
@@ -294,8 +329,8 @@ async function waitingOn(killer, store) {
       "SELECT DISTINCT t.PROCESSLIST_ID AS id FROM performance_schema.data_lock_waits w " +
         "JOIN performance_schema.threads t ON t.THREAD_ID = w.REQUESTING_THREAD_ID " +
         "WHERE t.PROCESSLIST_DB = DATABASE() AND t.PROCESSLIST_ID <> CONNECTION_ID() " +
-        "AND t.PROCESSLIST_INFO LIKE ?",
-      [`%${store}%`],
+        "AND t.PROCESSLIST_INFO LIKE ? AND t.PROCESSLIST_INFO LIKE ?",
+      [`%${store}%`, `%${table}%`],
     );
   };
   for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -3393,6 +3428,159 @@ if (provider !== "sqlite") {
     await rollback(killer).catch(() => undefined);
     if (blocked !== undefined) await blocked;
     await killer.end().catch(() => undefined);
+  }
+}
+
+/**
+ * Run one statement against a SQLite store's own file, over a handle of this
+ * file's — [`storage`]'s, for a statement that changes the file's schema
+ * rather than reads its rows. The store's own handle stays open beside it and
+ * sees the change at its next statement, as SQLite has every connection to one
+ * file see another's.
+ */
+async function inStoreFile(store, statement) {
+  const module = await import("node-sqlite3-wasm");
+  const { Database } = module.default ?? module;
+  const database = new Database(path.join(data, "stores", `${stores.encodeKey(store.name)}.sqlite`));
+  try {
+    database.exec("PRAGMA busy_timeout = 5000;");
+    database.exec(statement);
+  } finally {
+    database.close();
+  }
+}
+
+{
+  // **A batch that fails at its ledger row leaves none of it** — the window
+  // the two cases above cannot reach, because both end a batch before its
+  // ledger insert. PRD resolved q71: "its whole answer is the ledger row, so a
+  // retry answers what the first attempt did" — which holds only if that row
+  // commits in the batch's own transaction. Written after the `COMMIT`, it
+  // leaves a window in which every entry has landed and nothing records it,
+  // and a retry under the same §9.4 key runs the batch again: its `set`s take
+  // a second run of versions and its `if: absent` entries decline what the
+  // first attempt wrote. Each arm is made to fail at exactly that insert, the
+  // only way a test can reach into it:
+  //
+  // - **on a server**, a connection of this file's holds an uncommitted ledger
+  //   row under the batch's own key ([`holdTheLedgerRow`]). The batch's ledger
+  //   check does not see it, so it writes every entry and then waits on its
+  //   own ledger insert — every entry still uncommitted, which an insert of
+  //   each key proves — and the server ends that session;
+  // - **on SQLite**, a trigger in the store's file refuses that one ledger
+  //   row, and says in its refusal that every entry was visible to it — which,
+  //   in a file one writer holds, means written by this batch.
+  //
+  // What is left either way is the seed and nothing of the batch: no key, no
+  // version, no ledger row — so a retry applies once, and its own ledger row
+  // answers the one after it. With the ledger insert moved past the `COMMIT`
+  // on either arm, the entries are there and this case is `false`.
+  const LEDGER_URL_ENV = "AGENT_COMPOSE_STORE_URL_BATCH_LEDGER";
+  if (provider !== "sqlite") process.env[LEDGER_URL_ENV] = process.env[URL_ENV];
+  const store = kv("batch_unledgered", "global", LEDGER_URL_ENV, BATCHED);
+  const run = ctx(execution("batch_unledgered"));
+  const key = `${execution("batch_unledgered")}/move/0`;
+  const ops = [
+    { op: "set", key: "first", value: { n: 1 } },
+    { op: "set", key: "second", value: { n: 2 } },
+    { op: "delete", key: "seeded" },
+  ];
+  // The trigger's two refusals: the first only where the batch's three
+  // entries are all in the file as it reaches its ledger row.
+  const WRITTEN = "the probe refuses this ledger row with every entry of its batch written";
+  const UNWRITTEN = "the probe refuses this ledger row before every entry of its batch was written";
+  const TRIGGER = "refuse_the_batch_ledger_row";
+  const killer = provider === "sqlite" ? undefined : await openServer(process.env[URL_ENV]);
+  let blocked;
+  try {
+    const seeded = await set(store, "seeded", { n: 0 }, run, `${RUN}/batch_unledgered/seed`);
+    // What the batch failed with, and whether it failed where this case says:
+    // at its ledger row, with every entry written inside its transaction.
+    let refused;
+    let atTheLedgerRow;
+    if (killer === undefined) {
+      const literal = (text) => `'${text.replaceAll("'", "''")}'`;
+      await inStoreFile(
+        store,
+        `CREATE TRIGGER ${TRIGGER} BEFORE INSERT ON applied WHEN NEW.idempotency_key = ${literal(key)} ` +
+          `BEGIN SELECT RAISE(ABORT, ${literal(WRITTEN)}) WHERE ` +
+          "(SELECT COUNT(*) FROM entries WHERE scope_key = 'global' AND key IN ('first', 'second')) = 2 " +
+          "AND NOT EXISTS (SELECT 1 FROM entries WHERE scope_key = 'global' AND key = 'seeded'); " +
+          `SELECT RAISE(ABORT, ${literal(UNWRITTEN)}); END`,
+      );
+      try {
+        refused = (await refusal(batch(store, ops, run, key))) ?? "";
+      } finally {
+        await inStoreFile(store, `DROP TRIGGER IF EXISTS ${TRIGGER}`);
+      }
+      atTheLedgerRow = refused.includes(WRITTEN);
+    } else {
+      await begin(killer);
+      await holdTheLedgerRow(killer, store.name, key);
+      blocked = batch(store, ops, run, key).then(
+        () => undefined,
+        (error) => String(error?.message ?? error),
+      );
+      const victim = await waitingOn(killer, store.name, "store_applied");
+      answer.the_batch_was_caught_waiting_on_its_ledger_row = victim !== undefined;
+      // Read only once the kill is in, as the redial case below says: a batch
+      // still waiting on a lock nothing has released would hang this runner.
+      if (victim === undefined) throw new Error("the batch was never seen waiting on its ledger row");
+      const held = await Promise.all(["first", "second", "seeded"].map((entry) => heldUncommitted(store, entry)));
+      answer.batch_unledgered_held = held;
+      answer.the_batch_caught_at_its_ledger_row_held_every_entry_uncommitted = held.every((one) => one === true);
+      await kill(killer, victim);
+      refused = (await blocked) ?? "";
+      // Before anything dials again — the redial's schema waits on this
+      // transaction's lock — and after the kill, so the batch never finds the
+      // row gone and claims it.
+      await rollback(killer).catch(() => undefined);
+      atTheLedgerRow =
+        answer.the_batch_caught_at_its_ledger_row_held_every_entry_uncommitted &&
+        refused.includes(`lost its connection to the \`${provider}\` store backend`);
+    }
+    answer.batch_unledgered_refusal = refused;
+    const [first, second, still] = await Promise.all(
+      ["first", "second", "seeded"].map((entry) => get(store, entry, run)),
+    );
+    const left = {
+      first: first.found,
+      second: second.found,
+      seeded: still,
+      last: await sequenceLast(store),
+      ledger: await ledgerRows(store, key),
+    };
+    answer.batch_unledgered_left = left;
+    answer.a_batch_that_fails_at_its_ledger_row_leaves_none_of_it =
+      atTheLedgerRow &&
+      left.first === false &&
+      left.second === false &&
+      still.value?.n === 0 &&
+      still.version === seeded.version &&
+      left.last === seeded.version &&
+      left.ledger === 0;
+    const retried = await batch(store, ops, run, key);
+    const again = await batch(store, [{ op: "delete", key: "first" }], run, key);
+    answer.a_batch_that_failed_at_its_ledger_row_is_retried_once =
+      retried.applied === true &&
+      retried.deduped === false &&
+      same(retried.results, [
+        { key: "first", version: seeded.version + 1 },
+        { key: "second", version: seeded.version + 2 },
+        { key: "seeded" },
+      ]) &&
+      again.deduped === true &&
+      same(again.results, retried.results) &&
+      (await get(store, "first", run)).found === true &&
+      (await ledgerRows(store, key)) === 1;
+  } catch (error) {
+    answer.batch_unledgered_error = String(error?.message ?? error);
+  } finally {
+    if (killer !== undefined) {
+      await rollback(killer).catch(() => undefined);
+      if (blocked !== undefined) await blocked;
+      await killer.end().catch(() => undefined);
+    }
   }
 }
 

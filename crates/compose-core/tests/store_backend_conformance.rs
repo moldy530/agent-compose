@@ -855,6 +855,16 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "the_killed_batch_had_written_its_first_entry",
     "a_batch_killed_mid_transaction_leaves_none_of_it",
     "a_batch_retried_after_its_crash_applies_once",
+    // …and one that fails at its ledger row, the statement after its last
+    // entry, which no crash above reaches: the row commits in the batch's own
+    // transaction, so a batch that fails there — its session ended by the
+    // server while its insert waits on a ledger row held under its key, or
+    // the row refused by a trigger in the store's file — leaves none of its
+    // entries, no version and no ledger row, and its retry applies once and
+    // answers the retry after it. A ledger row written after the `COMMIT`
+    // fails the first: every entry would be there with nothing recording it.
+    "a_batch_that_fails_at_its_ledger_row_leaves_none_of_it",
+    "a_batch_that_failed_at_its_ledger_row_is_retried_once",
     // Two processes racing batches over the same six keys in opposite orders
     // (`store-batch-race.mjs`): the partition's sequence is locked before any
     // key, so the two wait for each other rather than in a circle — every
@@ -1003,6 +1013,13 @@ const TRUE_WHEN_DIALLED: &[&str] = &[
     "the_ended_batch_had_written_its_first_entry",
     "a_batch_whose_connection_the_server_ends_mid_transaction_leaves_none_of_it",
     "a_batch_whose_connection_ended_is_retried_once",
+    // …and the premise of the ledger-row case above on a server: the batch
+    // was caught waiting on the ledger row this runner's connection holds
+    // under its key, with every one of its entries still uncommitted — an
+    // insert of each key waits on it — so the session the server ends is one
+    // whose entries and ledger row are one transaction.
+    "the_batch_was_caught_waiting_on_its_ledger_row",
+    "the_batch_caught_at_its_ledger_row_held_every_entry_uncommitted",
     // A server keeps what a run leaves on it, so the run takes every row of its
     // own run-unique stores back off it at the end (the large walk's hundred
     // thousand go first, in that case's own `finally`: `TRUE_EVERYWHERE`).
