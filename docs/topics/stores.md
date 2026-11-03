@@ -85,6 +85,7 @@ triggers:
 | `backend` | no | a bare alias naming an abstract slot; never provider config |
 | `description` | no | LLM-facing for agent-attached stores |
 | `agent_access` | no | `read` \| `read_write` (default) \| `full` (`kv` only) |
+| `default_ttl` | no; `kv` only | a duration: how long the key a write that names no `ttl:` leaves lives — see *Expiry and leases* below |
 
 `metadata_schema` on a `blob` store is `conflicting-keys`: nothing in this
 grammar reads it — no `blob` op takes a `metadata` or `filter` parameter and no
@@ -177,12 +178,12 @@ supplying `--session` is then a run-time requirement.
 | kind | `op` | Parameters | Output |
 |---|---|---|---|
 | `kv` | `get` | `key` | `{ value: V (optional), found: boolean, version: integer (optional) }` |
-| `kv` | `set` | `key`, `value` (field map of CEL matching `V`), one optional condition | `{ key, applied: boolean, version: integer (optional), deduped: boolean }` |
+| `kv` | `set` | `key`, `value` (field map of CEL matching `V`), one optional condition, `ttl` (optional) | `{ key, applied: boolean, version: integer (optional), deduped: boolean }` |
 | `kv` | `delete` | `key`, `if_version` (optional) | `{ deleted: boolean, applied: boolean, version: integer (optional), deduped: boolean }` |
 | `kv` | `list` | `prefix` (optional), `limit` (1..1000, required) | `{ keys: array<string> }` |
-| `kv` | `merge` | `key`, `fields` (field map of CEL, each a field of `V`), one optional condition | `{ key, applied, version (optional), value: V (optional), deduped }` |
-| `kv` | `append` | `key`, `field` (an array field of `V`), `value` (one item), `unique` (optional literal, default `false`), one optional condition | as `merge` |
-| `kv` | `incr` | `key`, `field` (an `integer`/`number` field of `V`), `by` (optional, default `1`), one optional condition | as `merge` |
+| `kv` | `merge` | `key`, `fields` (field map of CEL, each a field of `V`), one optional condition, `ttl` (optional) | `{ key, applied, version (optional), value: V (optional), deduped }` |
+| `kv` | `append` | `key`, `field` (an array field of `V`), `value` (one item), `unique` (optional literal, default `false`), one optional condition, `ttl` (optional) | as `merge` |
+| `kv` | `incr` | `key`, `field` (an `integer`/`number` field of `V`), `by` (optional, default `1`), one optional condition, `ttl` (optional) | as `merge` |
 | `vector` | `search` | `query`, `top_k` (1..100, required), `filter` (optional) | `{ matches: array<{ id, score, text, metadata: M }> }` |
 | `vector` | `upsert` | `key`, `value` (the text), `metadata` (optional) | `{ id: string }` |
 | `vector` | `delete` | `key` | `{ deleted: boolean }` |
@@ -197,11 +198,11 @@ store's kind does not take — a `merge` on a `vector` store — which is
 `invalid-value` naming the ops the kind serves.
 
 Nine parameters are CEL over `input`/`state`/`execution` — `key`, `query`,
-`prefix`, `value`, `filter`, `metadata`, `fields`, `by`, `if_version`. Six are
+`prefix`, `value`, `filter`, `metadata`, `fields`, `by`, `if_version`. Seven are
 **literals**: `top_k` and `limit` are integers, `content_type` is a media type
-string, `field` is a field name, `unique` is a boolean, and `if` is `absent` or
-`present`. A CEL string where an integer is declared is a type error, not a
-computed bound.
+string, `field` is a field name, `unique` is a boolean, `if` is `absent` or
+`present`, and `ttl` is a duration (`30s`, `5m`, `24h`) or `never`. A CEL string
+where an integer is declared is a type error, not a computed bound.
 
 A `store:` node takes **no `input:` key**: its parameters are exactly the op's
 row, and none of them resolves by name from a channel.
@@ -312,6 +313,134 @@ is not refused there — it fails only when a CEL read reaches a field it lacks.
 `merge`, `append` or `incr` validates the value it is building on too, so under a
 changed schema it **fails naming the field** the stored value lacks; a `set` of
 the whole value is the repair.
+
+## Expiry and leases
+
+A key can be told how long it lives, and a key whose time is up is gone to
+everything that reads it — which, with versions, is a lease: a job only one run
+may hold, which frees itself if the run holding it dies.
+
+```yaml spec
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.m:
+  provider: provider.p
+  id: claude-sonnet-4-5
+
+store.leases:
+  kind: kv
+  scope: global
+  value_schema:
+    owner: { type: string }
+
+agent.worker:
+  model: model.m
+  prompt: Do the next part of the job you are given.
+  output:
+    done: { type: boolean }
+
+state:
+  lease: { type: integer }
+
+flow.job:
+  inputs:
+    job:    { type: string }
+    worker: { type: string }
+  outputs: {}
+  nodes:
+    claim:            # take the job for a minute — or learn that someone has it
+      store: store.leases
+      op: set
+      key: "input.job"
+      if: absent
+      ttl: 1m
+      value: { owner: "input.worker" }
+      writes: { version: lease }
+    first_half:
+      agent: agent.worker
+      input: "input.job"
+    keep:             # still ours? then hold it for ten minutes from now
+      store: store.leases
+      op: set
+      key: "input.job"
+      if_version: "state.lease"
+      ttl: 10m
+      value: { owner: "input.worker" }
+      writes: { version: lease }
+    second_half:
+      agent: agent.worker
+      input: "input.job"
+    release:          # let it go — if it is still the lease this run holds
+      store: store.leases
+      op: delete
+      key: "input.job"
+      if_version: "state.lease"
+  edges:
+    - { from: start, to: claim }
+    - { from: claim, to: first_half, when: "claim.output.applied" }
+    - { from: claim, to: end, else: true }
+    - { from: first_half, to: keep }
+    - { from: keep, to: second_half, when: "keep.output.applied" }
+    - { from: keep, to: end, else: true }
+    - { from: second_half, to: release }
+    - { from: release, to: end }
+
+triggers:
+  cli: { type: manual, flow: flow.job }
+```
+
+**`ttl:` on a write; `default_ttl:` on the store.** `set`, `merge`, `append` and
+`incr` take `ttl:` — a duration (`30s`, `5m`, `24h`) or `never` — and a `kv`
+store may declare `default_ttl:`, a duration, for every write that names none,
+a synthesized tool's included (a tool takes no `ttl` argument). `ttl: never`
+overrides a default. Either on a read, a `delete`, or a `vector`/`blob` op or
+store is an error naming why.
+
+**A write sets the expiry; it does not carry one forward.** The key expires at
+the store's clock at the write plus its `ttl` — the **server's** clock on a
+`postgres` or `mysql` store, so every process writing it agrees about time, and
+this process's on SQLite. Every write that applies sets the expiry again: to its
+own `ttl`, else the store's default, else to **none** — so `keep` above, a write
+with a fresh `ttl`, extends the lease, and a write naming no `ttl` on a store
+with no default makes the key permanent. An `append` with `unique: true` that
+found its item already there refreshes it too. A write whose condition did not
+hold changes nothing, its key's expiry included.
+
+**An expired key is absent** to `get`, to `list`, and to every condition:
+`if: absent` holds of it and `if: present` and `if_version:` do not. So the
+second worker's `claim` above declines while the lease is held, and applies the
+moment it has expired — whether the first worker finished or died. Expiry takes
+no version: a key set again after expiring takes its partition's next one, so an
+`if_version:` from before the expiry can never match the key after it.
+
+**What the code does about storage, exactly.** An expired key is invisible the
+instant it expires, and leaves storage at whichever comes first: the next write
+to its partition, which deletes **at most 100** of that partition's expired keys
+before it reads its own key; or the next process to open the store — a process's
+first op on a SQLite store file, or a connection's first op on a `postgres` or
+`mysql` store — which deletes **every** expired key of the store, all partitions,
+in batches of 1000. Both read an index over the expiry, so neither reads a key
+that has not expired. `AGENT_COMPOSE_STORE_CLOCK_OFFSET_MS` shifts the clock
+every backend reads expiry by, in whole milliseconds, which is how a test moves
+time past an expiry without waiting for it.
+
+**The lease, as above.** `claim` takes the key only if nobody holds it, for a
+minute; `keep` holds it ten more minutes only if it is still the version this
+run took (`state.lease`), and records the version it took in turn; `release`
+deletes it only if it still holds that version — so a run that lost its lease to
+expiry never deletes the next holder's. The release is an ordinary last node, so
+a run that fails before it leaves the lease to expire on its own; PRD resolved q76's
+`finally:` will make it run on failure too.
+
+**The idempotency ledger is pruned when an execution settles.** Each keyed
+write leaves a ledger row so a retry of it answers rather than writing twice.
+When the execution that wrote it settles — `completed` or `failed` — its rows go,
+in every store it wrote; a child execution's go when the child settles. An
+execution that has not settled — parked at a `human` pause, or one a crash left
+open — keeps every row, so its resume still writes nothing twice. The ledger
+therefore holds the open executions' rows, not history.
 
 ## Writes inside a `map`
 

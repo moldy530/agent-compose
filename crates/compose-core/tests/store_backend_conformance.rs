@@ -605,6 +605,48 @@ const TRUE_EVERYWHERE: &[&str] = &[
     // another write's read-modify-write waits for its commit and builds on it.
     "the_window_was_open_when_the_second_write_arrived",
     "a_write_inside_another_writes_window_waits_and_builds_on_it",
+    // PRD resolved q69 (a)–(b), expiry, with the store's clock moved by the
+    // module's own offset rather than slept through: a key with a `ttl` is
+    // read until its expiry and is absent from it on, to every read and every
+    // condition — so `if: absent` takes an expired key, which is a lease, and
+    // expiry consumes no version.
+    "a_key_with_a_ttl_is_readable_before_it_expires",
+    "an_expired_key_is_absent_to_get_and_list",
+    "if_absent_declines_a_key_that_has_not_expired",
+    "if_present_and_if_version_decline_an_expired_key_with_no_version",
+    "if_absent_applies_on_an_expired_key",
+    "a_key_set_again_after_expiring_takes_the_next_version",
+    // …a write refreshes the expiry to its own `ttl`, else the store's
+    // `default_ttl:`, else clears it; `ttl: never` beats a default; and a
+    // declined write changes nothing.
+    "a_write_refreshes_expiry_to_its_own_ttl",
+    "a_write_with_no_ttl_and_no_default_clears_expiry",
+    "a_declined_write_leaves_expiry_unchanged",
+    "a_write_with_no_ttl_takes_the_store_default",
+    "ttl_never_clears_a_store_default",
+    "a_writes_own_ttl_beats_the_store_default",
+    "a_unique_append_that_changes_nothing_still_refreshes_expiry",
+    "merge_append_and_incr_each_take_a_ttl",
+    // (c) the cleanup schedule: invisible at once, out of storage at the next
+    // write to the partition — at most 100 rows a write — or the next process
+    // to open the store, whichever comes first.
+    "an_expired_key_stays_invisible_until_a_write_removes_it",
+    "the_write_sweep_removes_at_most_100_rows",
+    "an_expired_key_leaves_storage_at_the_next_writes_to_its_partition",
+    "an_expired_key_leaves_storage_when_a_process_next_opens_the_store",
+    "a_malformed_clock_offset_is_refused_by_name",
+    // (d) the ledger a settled execution leaves is pruned, through the
+    // runtime's own settle: N executions leave a bounded ledger and keep their
+    // data, an unsettled one keeps its rows and its resume still dedupes, and
+    // a child's rows go when the child settles.
+    "an_open_executions_writes_hold_their_ledger_rows",
+    "settled_executions_leave_no_ledger_rows",
+    "a_settled_executions_data_stays",
+    "an_unsettled_executions_ledger_rows_are_kept",
+    "a_resume_of_an_unsettled_execution_still_dedupes",
+    "a_prune_reaches_only_its_own_executions_prefix",
+    "a_childs_ledger_rows_go_when_the_child_settles",
+    "a_parents_ledger_rows_go_when_the_parent_settles",
 ];
 
 /// The cases a backend with a **socket** must answer `true`, on top of those.
@@ -643,6 +685,11 @@ const TRUE_WHEN_DIALLED: &[&str] = &[
     // the lost one had already committed.
     "a_lost_connection_is_redialled",
     "a_redialled_store_still_holds_what_it_wrote",
+    // PRD resolved q69 (a): a dialled store's expiry is the **server's** clock
+    // plus the `ttl`, so writers whose own clocks disagree agree about which
+    // keys are alive — the row holds the server's instant with this process's
+    // clock ten days off.
+    "expiry_is_computed_by_the_servers_clock",
 ];
 
 /// **A target that binds both dialled arms gets one module, and it compiles.**

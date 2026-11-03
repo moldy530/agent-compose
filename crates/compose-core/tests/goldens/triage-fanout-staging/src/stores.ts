@@ -203,21 +203,64 @@
 // waits [`LOCK_WAIT_MS`] and then treats a lock still standing as a corpse,
 // exactly as the journal does and under the same rule that makes it sound.
 //
+// # Expiry (PRD resolved q69)
+//
+// A `kv` write may say how long the key it leaves lives — `ttl:` on `set`,
+// `merge`, `append` and `incr`, `default_ttl:` on the store for a write that
+// names none, `ttl: never` to clear a default — and the key then carries an
+// absolute `expires_at`: the store's clock at the write plus the `ttl`, in
+// epoch milliseconds. The **store's** clock: the server's on a dialled arm, so
+// two processes writing one store agree about time whatever their own clocks
+// say, and the process's on SQLite and `memory`, which have no other. Every
+// write that lands sets it again — to its own `ttl`, else the default, else to
+// nothing — so a write refreshes an expiry and a write with neither clears it,
+// and a write that declined changes nothing, its key's expiry included.
+//
+// **An expired key is absent**, at the instant it expires and to everything:
+// `get` and `list` do not see it, and neither does any condition — `if: absent`
+// holds of it, `if: present` and `if_version:` do not — so a `set` with
+// `if: absent` on an expired key applies and takes it, which with PRD resolved
+// q68's versions is a lease. There is one notion of "alive" and it is
+// [`live`]: a write reads its key through it under the write's lock, and the SQL
+// reads carry the same inequality as [`LIVE`]. Expiry consumes no version — the
+// sequence is never touched by it — so a key set again after expiring takes the
+// partition's next one, which is past every version the key ever showed.
+//
+// **Removal is lazy, on a stated schedule.** An expired row stays in storage,
+// invisible, until one of two things happens first: a write to its partition,
+// which inside its own transaction deletes at most [`SWEEP_PER_WRITE`] of that
+// partition's expired rows before it reads its key; or the first op a process
+// makes on the store — the open of a SQLite file, the first op over a dialled
+// connection — which deletes **every** expired row of the store, in batches of
+// [`SWEEP_PER_BATCH`] so no statement holds a lock for long. Both run on an index
+// over the expiry, so neither reads a row that is not expired, and the write's
+// sweep is bounded however large the backlog is.
+//
+// `AGENT_COMPOSE_STORE_CLOCK_OFFSET_MS` shifts the clock every arm reads by a
+// whole number of milliseconds — added to `Date.now()` locally and to the
+// server's clock inside the statement on a dialled arm — which is how a test
+// moves time forward past an expiry without waiting for it ([`clockOffset`]).
+//
 // # Retention
 //
-// Nothing here is pruned, and for a `session` or `global` store that is the
-// point: what was written stays until the file is deleted. The one part of that
-// which is not the composition's own data is the **idempotency ledger** — the
-// `applied` table, one row per keyed write — which is a durable structure
-// serving an at-least-once guarantee, and which therefore grows with the number
-// of keyed writes a store has ever taken. It cannot be trimmed by age here: a
-// key's row is what makes a retry of that effect site answer instead of writing
-// twice, and an execution is past replaying only when its journal says so —
-// which is a question about a different file, and one journal compaction would
-// have to answer (out of durability v1's scope, `docs/durability.md` §12). So
-// the ledger's lifetime is the store file's, retention is deleting the
-// directory, and the emitted `README.md` says that where it says where the data
-// lives.
+// What was written to a `session` or `global` store stays until it expires or
+// the file is deleted, which is the point of those scopes. The one part of a
+// store that is not the composition's own data is the **idempotency ledger** —
+// the `applied` table, one row per keyed write — which serves an at-least-once
+// guarantee and is kept exactly as long as that guarantee has someone to serve:
+// a ledger row is what makes a retry of its effect site answer instead of
+// writing twice, and an execution can retry only while its journal row is open.
+// Every grammar 9.4 key begins `<execution id>/`, and PRD resolved q65 makes a
+// settled execution one that never resumes, so when an execution's row closes
+// `completed` or `failed`, [`pruneLedger`] deletes the rows under that prefix in
+// every store partition the execution's keyed writes reached — a child
+// execution's under the child's own id, when the child settles. An execution
+// the journal still holds open keeps every row, so its resume writes nothing
+// twice (PRD resolved q29). The ledger therefore grows with the executions that
+// are open rather than with history. Which partitions an execution wrote is
+// noted in this process at each keyed op, outside the journaled seam, so a
+// resumed generation — which replays every op its record holds through
+// [`runStoreOp`] — notes the ones its earlier generations wrote too.
 
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -333,6 +376,15 @@ export interface StoreBinding {
    * which no binding `./graph.ts` emits is.
    */
   readonly value?: runtime.ResultSchema<unknown>;
+  /**
+   * `default_ttl:`, in milliseconds — on a `kv` store that declares one.
+   *
+   * The expiry a write that names no `ttl:` gives the key it leaves (PRD
+   * resolved q69): a store-op node's that wrote none, and every synthesized
+   * tool's, whose arguments carry no `ttl` at all. Absent means such a key
+   * never expires.
+   */
+  readonly defaultTtl?: number;
   /** The backend the active target resolved (grammar 11.3, 14.2). */
   readonly backend: BackendBinding;
 }
@@ -387,6 +439,12 @@ export interface StoreParams {
   readonly condition?: StoreCondition;
   /** `if_version:` — the version the key must hold for the write to apply. */
   readonly ifVersion?: number;
+  /**
+   * `ttl:` — how long the key a `kv` write leaves lives, in milliseconds, or
+   * `"never"`, which clears an expiry the store's `default_ttl:` would set
+   * (PRD resolved q69). Absent means the default, where there is one.
+   */
+  readonly ttl?: number | "never";
 }
 
 /** Where an op was issued from, and what key it carries (grammar 9.4). */
@@ -419,6 +477,83 @@ function writes(op: StoreOp): boolean {
 function kvWrite(store: StoreBinding, op: StoreOp): boolean {
   return store.kind === "kv" && writes(op);
 }
+
+// ---------------------------------------------------------------------------
+// When a key expires (PRD resolved q69)
+// ---------------------------------------------------------------------------
+
+/**
+ * The variable that shifts every store's expiry clock, in whole milliseconds.
+ *
+ * A test's hook rather than a deployment's setting — it is how the store
+ * contract moves time past an expiry on every arm without sleeping through it,
+ * and read at every op so one process can step its clock between two of them.
+ * It shifts the clock an arm already reads rather than replacing it: added to
+ * `Date.now()` on the local backends, and to the server's own clock **inside the
+ * statement** on a dialled one, so two writers on one server still agree about
+ * time with it set. A value that is not an integer is refused rather than read
+ * as `0`, which is D50's posture on an environment variable: a test that believes
+ * it moved the clock and did not would pass for the wrong reason.
+ */
+export const STORE_CLOCK_OFFSET = "AGENT_COMPOSE_STORE_CLOCK_OFFSET_MS";
+
+/** What [`STORE_CLOCK_OFFSET`] adds to the clock; `0` where it is unset. */
+function clockOffset(): number {
+  const written = process.env[STORE_CLOCK_OFFSET];
+  if (written === undefined) return 0;
+  if (!/^-?[0-9]+$/.test(written.trim())) {
+    throw new Error(
+      `\`${STORE_CLOCK_OFFSET}\` is set to ${JSON.stringify(written)}, which is not a whole number of milliseconds: it shifts the clock a \`kv\` store's expiry is read against (PRD resolved q69), so give it an integer such as \`60000\`, or unset it`,
+    );
+  }
+  return Number(written.trim());
+}
+
+/** The local backends' clock: this process's, in epoch milliseconds. */
+function localNow(): number {
+  return Date.now() + clockOffset();
+}
+
+/**
+ * The instant the key a `kv` write leaves expires, given the write's clock —
+ * or `null`, for a key that does not.
+ *
+ * The write's own `ttl:` first, then the store's `default_ttl:`; `ttl: never`
+ * is an answer of its own and beats a default, so it is not a missing value
+ * the default could fill. Held below `Number.MAX_SAFE_INTEGER` so a `ttl:` of
+ * centuries is still an integer every arm's column stores exactly.
+ */
+function expiryOf(store: StoreBinding, params: StoreParams, now: number): number | null {
+  const ttl = params.ttl ?? store.defaultTtl;
+  if (ttl === undefined || ttl === "never") return null;
+  return Math.min(now + ttl, Number.MAX_SAFE_INTEGER);
+}
+
+/**
+ * Whether a key whose expiry is `expiresAt` is still alive at `now`.
+ *
+ * **The** notion of alive, and its one inequality: a key with no expiry is
+ * alive, and one with an expiry is alive strictly before it. [`liveClause`] is
+ * the same inequality in SQL, for the reads that filter rows in a statement.
+ */
+function live(expiresAt: unknown, now: number): boolean {
+  return expiresAt === null || expiresAt === undefined || Number(expiresAt) > now;
+}
+
+/**
+ * [`live`] as a clause over a row's `expires_at`, against `now` — a bound `?`
+ * on the local backend, and the server's own clock on a dialled one, so that a
+ * read there is one statement answered by the clock its writers wrote with.
+ */
+function liveClause(now: string): string {
+  return `(expires_at IS NULL OR expires_at > ${now})`;
+}
+
+/** At most how many expired rows one write removes from its partition. */
+const SWEEP_PER_WRITE = 100;
+
+/** How many expired rows one statement of a store-wide sweep removes. */
+const SWEEP_PER_BATCH = 1_000;
 
 // ---------------------------------------------------------------------------
 // Where the data lives
@@ -562,17 +697,22 @@ function handleKey(store: StoreBinding, execution: runtime.ExecutionIdentity): s
  * past every one the partition has shown, which `MAX(version)` over what is
  * stored would not. A `vector` store's file has both and uses neither.
  *
- * A file an earlier release created has `entries` without the column, and
- * [`migrateStoreFile`] adds it.
+ * `expires_at` is a `kv` key's too (PRD resolved q69): the epoch millisecond it
+ * expires at, or `NULL` for a key that does not — an integer, so the expiry is
+ * a comparison SQLite makes in a statement rather than a parse.
+ *
+ * A file an earlier release created has `entries` without one column or both,
+ * and [`migrateStoreFile`] adds them.
  */
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS entries (
-  scope_key TEXT NOT NULL,
-  key       TEXT NOT NULL,
-  value     TEXT NOT NULL,
-  metadata  TEXT,
-  embedding TEXT,
-  version   INTEGER NOT NULL DEFAULT 0,
+  scope_key  TEXT NOT NULL,
+  key        TEXT NOT NULL,
+  value      TEXT NOT NULL,
+  metadata   TEXT,
+  embedding  TEXT,
+  version    INTEGER NOT NULL DEFAULT 0,
+  expires_at INTEGER,
   PRIMARY KEY (scope_key, key)
 );
 CREATE TABLE IF NOT EXISTS applied (
@@ -587,25 +727,89 @@ CREATE TABLE IF NOT EXISTS sequences (
 `;
 
 /**
- * Give a store file an earlier release created the column a version needs.
+ * The two indexes an expiry is found through (PRD resolved q69), partial so a
+ * key that never expires costs neither of them anything.
+ *
+ * `entries_partition_expiry` is what a write's bounded sweep of its own
+ * partition reads, and `entries_expiry` what a store-wide one at open reads:
+ * each finds the expired rows and only those, so neither sweep's cost depends
+ * on how many live rows sit beside them. Created after [`migrateStoreFile`] has
+ * the column there, because an index over a column a file from an earlier
+ * release lacks is a statement that file refuses.
+ */
+const EXPIRY_INDEXES = `
+CREATE INDEX IF NOT EXISTS entries_partition_expiry ON entries (scope_key, expires_at)
+  WHERE expires_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS entries_expiry ON entries (expires_at) WHERE expires_at IS NOT NULL;
+`;
+
+/**
+ * Give a store file an earlier release created the columns a version and an
+ * expiry need, and the indexes an expiry is found through.
  *
  * `CREATE TABLE IF NOT EXISTS` leaves a table that is already there as it is,
- * so a file from before PRD resolved q68 keeps an `entries` with no `version`.
- * Its rows take `0`, which no write of this release hands out — the sequence
- * starts past what the partition holds — so a key a `get` answers `version: 0`
- * is one nothing has written since the upgrade, and an `if_version: 0` names
- * exactly it. Two processes opening one old file at once race to add the
+ * so a file from before PRD resolved q68 keeps an `entries` with no `version`,
+ * and one from before q69 an `entries` with no `expires_at`. A `version` column
+ * added here gives its rows `0`, which no write of this release hands out — the
+ * sequence starts past what the partition holds — so a key a `get` answers
+ * `version: 0` is one nothing has written since the upgrade, and an
+ * `if_version: 0` names exactly it. An `expires_at` column added here gives its
+ * rows `NULL`: a key written before expiry existed never expires until a write
+ * gives it a `ttl`. Two processes opening one old file at once race to add a
  * column, and the loser's "duplicate column" is the column being there.
  */
 function migrateStoreFile(database: Database): void {
   const columns = database.all("PRAGMA table_info(entries)") as Row[];
-  if (columns.some((column) => column["name"] === "version")) return;
-  try {
-    database.exec("ALTER TABLE entries ADD COLUMN version INTEGER NOT NULL DEFAULT 0");
-  } catch (error) {
-    if (!String((error as Error | undefined)?.message ?? error).includes("duplicate column")) {
-      throw error;
+  const held = (name: string): boolean => columns.some((column) => column["name"] === name);
+  for (const [name, definition] of [
+    ["version", "version INTEGER NOT NULL DEFAULT 0"],
+    ["expires_at", "expires_at INTEGER"],
+  ] as const) {
+    if (held(name)) continue;
+    try {
+      database.exec(`ALTER TABLE entries ADD COLUMN ${definition}`);
+    } catch (error) {
+      if (!String((error as Error | undefined)?.message ?? error).includes("duplicate column")) {
+        throw error;
+      }
     }
+  }
+  database.exec(EXPIRY_INDEXES);
+}
+
+/**
+ * Remove at most [`SWEEP_PER_WRITE`] expired rows from one partition — a
+ * write's half of the cleanup schedule (PRD resolved q69), run inside its
+ * transaction before it reads its key.
+ *
+ * Through `entries_partition_expiry`, so it reads the expired rows and nothing
+ * else: a partition with a backlog of a million costs a write a hundred
+ * deletes, and the next write a hundred more.
+ */
+function sweepLocalPartition(database: Database, scopeKey: string, now: number): void {
+  database.run(
+    "DELETE FROM entries WHERE rowid IN (SELECT rowid FROM entries WHERE scope_key = ? " +
+      `AND expires_at IS NOT NULL AND expires_at <= ? LIMIT ${SWEEP_PER_WRITE})`,
+    [scopeKey, now],
+  );
+}
+
+/**
+ * Remove every expired row of one store file — the open's half of the
+ * schedule (PRD resolved q69), run once per process per file.
+ *
+ * In batches of [`SWEEP_PER_BATCH`], each its own statement and so its own
+ * transaction: a backlog is removed without one lock held across all of it,
+ * and a writer in another process gets in between two batches.
+ */
+function sweepLocalStore(database: Database, now: number): void {
+  for (;;) {
+    const removed = database.run(
+      "DELETE FROM entries WHERE rowid IN (SELECT rowid FROM entries WHERE " +
+        `expires_at IS NOT NULL AND expires_at <= ? LIMIT ${SWEEP_PER_BATCH})`,
+      [now],
+    );
+    if (removed.changes < SWEEP_PER_BATCH) return;
   }
 }
 
@@ -649,6 +853,7 @@ function breakStaleLock(file: string): boolean {
 async function migrated(
   Database: SqliteModule["Database"],
   file: string,
+  now: number,
 ): Promise<InstanceType<SqliteModule["Database"]>> {
   const deadline = Date.now() + LOCK_WAIT_MS;
   let broke = false;
@@ -662,6 +867,10 @@ async function migrated(
       database.exec(`PRAGMA busy_timeout = ${LOCK_WAIT_MS};`);
       database.exec(SCHEMA);
       migrateStoreFile(database);
+      // The open is this process's first op on the file, which is the second
+      // half of PRD resolved q69's schedule: every key whose time is up leaves
+      // storage now, whatever the writes since have swept.
+      sweepLocalStore(database, now);
       return database;
     } catch (error) {
       database.close();
@@ -687,19 +896,24 @@ function open(store: StoreBinding, execution: runtime.ExecutionIdentity): Promis
   if (held !== undefined) return held;
 
   const opening = (async () => {
+    // Read before anything is opened, so a clock offset nobody can read fails
+    // this op by name rather than inside [`migrated`]'s retry loop.
+    const now = localNow();
     const { Database } = await sqlite();
     if (store.scope === "execution" || store.backend.provider === "memory") {
       // Nothing on disk: an execution-scoped store dies with the run, and
       // `provider: memory` says so outright. Nothing to contend over either —
       // an in-memory database is this process's alone — so it is opened
-      // directly rather than through the deadline [`migrated`] keeps.
+      // directly rather than through the deadline [`migrated`] keeps. Nothing
+      // to sweep at its open either: it was created empty a moment ago.
       const opened = new Database(":memory:");
       opened.exec(SCHEMA);
+      migrateStoreFile(opened);
       return opened;
     }
     const directory = path.join(dataRoot(), "stores");
     fs.mkdirSync(directory, { recursive: true });
-    return await migrated(Database, path.join(directory, `${encodeKey(store.name)}.sqlite`));
+    return await migrated(Database, path.join(directory, `${encodeKey(store.name)}.sqlite`), now);
   })();
   // Registered before the first `await` inside it, so a concurrent caller finds
   // this promise rather than opening a second handle. A failed open is dropped
@@ -822,6 +1036,132 @@ export function releaseExecution(id: string, parked = false): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// The ledger a settled execution leaves (PRD resolved q69)
+// ---------------------------------------------------------------------------
+
+/**
+ * Per execution, the store partitions its keyed writes left ledger rows in —
+ * what [`pruneLedger`] visits when the execution settles.
+ *
+ * Keyed by store address, because a store's partition for one execution is
+ * fixed by its scope (grammar 11.3): one execution writes one partition of each
+ * store. A `scope: execution` store is not here: its whole partition, ledger
+ * included, already dies with the run ([`releaseExecution`]).
+ */
+const LEDGERS = new Map<string, Map<string, { readonly store: StoreBinding; readonly scopeKey: string }>>();
+
+/**
+ * Note that this execution's keyed write reached a store partition, so its
+ * settlement can prune the ledger rows it left there.
+ *
+ * Called from [`runStoreOp`] **outside** the journaled seam, for [`remember`]'s
+ * reason: a resumed generation answers its record's writes out of the journal
+ * without entering the backend, and it is still the generation that settles —
+ * so the partitions an earlier generation wrote are noted by the replay of the
+ * very ops that wrote them, and the prune that follows reaches every one.
+ */
+function noteLedger(store: StoreBinding, execution: string, scopeKey: string): void {
+  if (store.scope === "execution") return;
+  let held = LEDGERS.get(execution);
+  if (held === undefined) {
+    held = new Map();
+    LEDGERS.set(execution, held);
+  }
+  held.set(store.address, { store, scopeKey });
+}
+
+/**
+ * Delete the idempotency ledger rows an execution left, now that it has settled
+ * — or, with `settled: false`, forget the partitions it noted without touching
+ * them, because its journal row stays open and a resume will note them again.
+ *
+ * Every grammar 9.4 key begins `<execution id>/`, so the rows are exactly those
+ * under that prefix, in every partition this execution's keyed writes reached:
+ * a ledger row is a retry's answer, a settled execution never resumes (PRD
+ * resolved q65), and nothing will ask for these again (PRD resolved q69). A
+ * child execution's rows are under the child's own id, and go when the child
+ * settles. A row of an execution the journal still holds open is never
+ * touched — the prefix is this execution's alone — so a resume still writes
+ * nothing twice (PRD resolved q29).
+ *
+ * Registered with the runtime as this module loads ([`runtime.settlesLedgers`]),
+ * which calls it after the execution's row has closed: a crash between the two
+ * leaves rows nothing will ask for, which is harmless, where the other order
+ * could leave an open execution without the rows its resume depends on.
+ *
+ * **Never the execution's failure.** A store that could not be pruned is one
+ * whose rows stay, which costs storage and changes no answer; it is said on
+ * stderr naming the store, and every other store is still pruned.
+ */
+export async function pruneLedger(execution: string, settled = true): Promise<void> {
+  const held = LEDGERS.get(execution);
+  if (held === undefined) return;
+  LEDGERS.delete(execution);
+  if (!settled) return;
+  const prefix = `${execution}/`;
+  for (const { store, scopeKey } of held.values()) {
+    try {
+      if (store.kind === "blob") {
+        pruneBlobLedger(store, scopeKey, prefix);
+      } else if (!opensInProcess(store.backend.provider)) {
+        await (await connectionFor(store)).prune(store.name, scopeKey, prefix);
+      } else {
+        const database = await open(store, { id: execution, session_key: "" });
+        database.run(
+          "DELETE FROM applied WHERE idempotency_key >= ? AND idempotency_key < ?",
+          [prefix, prefixEnd(prefix)],
+        );
+      }
+    } catch (error) {
+      process.stderr.write(
+        `warning: the ledger rows execution \`${execution}\` left in \`${store.address}\` could not be pruned (${error instanceof Error ? error.message : String(error)}); they stay where they are and answer nothing, since a settled execution never resumes (PRD resolved q69)\n`,
+      );
+    }
+  }
+}
+
+/**
+ * The least string past every string that begins with `prefix` — which ends
+ * `/`, so it is the prefix with that byte moved on to `0`.
+ *
+ * A range rather than a `LIKE` or a `substr`, because a range is what each
+ * arm's primary key on the ledger answers by seeking: the rows under the prefix
+ * are one contiguous run of a byte-ordered index, and every ledger key column is
+ * byte-ordered (SQLite's default `BINARY`, `COLLATE "C"`, `ascii_bin`).
+ */
+function prefixEnd(prefix: string): string {
+  return `${prefix.slice(0, -1)}0`;
+}
+
+/**
+ * The `blob` backend's half of [`pruneLedger`]: the markers of one partition
+ * whose key begins with `prefix`.
+ *
+ * A marker is named by its key's digest ([`markerName`]), so the key is read out
+ * of the marker itself; a staged `.partial` is a write still in flight, and a
+ * marker that does not parse is left for the write that is still making it.
+ */
+function pruneBlobLedger(store: StoreBinding, scopeKey: string, prefix: string): void {
+  const ledger = path.join(blobRoot(store, scopeKey), "applied");
+  if (!fs.existsSync(ledger)) return;
+  for (const name of fs.readdirSync(ledger)) {
+    if (name.endsWith(".partial")) continue;
+    const marker = path.join(ledger, name);
+    let entry: Partial<LedgerEntry>;
+    try {
+      entry = JSON.parse(fs.readFileSync(marker, "utf8")) as Partial<LedgerEntry>;
+    } catch {
+      continue;
+    }
+    if (typeof entry.key === "string" && entry.key.startsWith(prefix)) {
+      fs.rmSync(marker, { force: true });
+    }
+  }
+}
+
+runtime.settlesLedgers(pruneLedger);
+
 /**
  * Run `work` inside a transaction, rolling back whatever it did if it throws.
  *
@@ -891,8 +1231,11 @@ export async function runStoreOp(
   const idempotencyKey = writes(op) ? site.idempotencyKey : undefined;
 
   // What `scope: execution` makes this run the owner of, noted **outside** the
-  // seam below because a replayed op never enters it (see [`remember`]).
+  // seam below because a replayed op never enters it (see [`remember`]) — and
+  // for the same reason, where a keyed write leaves its ledger row, which this
+  // execution's settlement prunes (see [`noteLedger`]).
   remember(store, execution, scopeKey);
+  if (idempotencyKey !== undefined) noteLedger(store, execution.id, scopeKey);
 
   // Both halves of PRD 5.8's replay discipline go through the journal, and this
   // is where "replay consumes history, not the live store" stops being a
@@ -1051,17 +1394,34 @@ interface Held {
  *
  * One predicate, so that every reading of "absent" — the condition, the
  * declined answer's missing `version`, and a partial update starting from
- * nothing — is this one. A key whose time is up will count as absent here and
- * nowhere else (PRD resolved q69).
+ * nothing — is this one. A key whose time is up is absent here too (PRD
+ * resolved q69): every arm reads the row a write holds through [`heldRow`],
+ * which answers `undefined` for one [`live`] says has expired — so the
+ * conditions, the decline and the partial updates see an expired key exactly
+ * as they see a missing one, and a `get` and a `list` do by the same inequality.
  */
 function absent(held: Held | undefined): held is undefined {
   return held === undefined;
+}
+
+/**
+ * What one stored row holds, as of `now` — or `undefined` where it holds nothing,
+ * which is a row that is not there **or** one whose time is up.
+ */
+function heldRow(row: Row | null | undefined, now: number): Held | undefined {
+  if (row === null || row === undefined) return undefined;
+  if (!live(row["expires_at"], now)) return undefined;
+  return { value: JSON.parse(String(row["value"])) as unknown, version: Number(row["version"]) };
 }
 
 /** What one `kv` write decided, given what its key held. */
 type KvDecision =
   | { readonly effect: "none"; readonly answer: Record<string, unknown> }
   | { readonly effect: "remove"; readonly answer: Record<string, unknown> }
+  // Applied, and left the value and the version as they were — an `append` with
+  // `unique: true` whose item is already there — but a write that applied
+  // refreshes its key's expiry like any other (PRD resolved q69).
+  | { readonly effect: "touch"; readonly answer: Record<string, unknown> }
   | {
       readonly effect: "write";
       readonly value: unknown;
@@ -1084,9 +1444,10 @@ function conditionHolds(params: StoreParams, held: Held | undefined): boolean {
  * `merge`, `append` or `incr` computes the whole value it would leave and holds
  * it to the store's `value_schema` before anything is written; one the schema
  * refuses throws, and the caller's transaction takes nothing with it. An
- * `append` with `unique: true` whose item is already there changes nothing and
- * takes no version: it is answered as applied — the item is in the array —
- * with the version and the value the key already holds.
+ * `append` with `unique: true` whose item is already there changes neither the
+ * value nor the version: it is answered as applied — the item is in the array
+ * — with the version and the value the key already holds, and its key's expiry
+ * is refreshed as every applied write's is (PRD resolved q69).
  */
 function decideKvWrite(
   store: StoreBinding,
@@ -1123,7 +1484,7 @@ function decideKvWrite(
   admitted(store, op, key, result.value, via);
   if (!result.changed && !absent(held)) {
     return {
-      effect: "none",
+      effect: "touch",
       answer: { key, applied: true, version: held.version, value: result.value },
     };
   }
@@ -1346,6 +1707,10 @@ async function perform(
  * and does it — taking the partition's next version where something lands
  * ([`nextLocalVersion`]). The transaction is SQLite's serialized writer, so
  * nothing lands between the read and the write.
+ *
+ * The clock is read once, inside the transaction, and is the op's whole notion
+ * of now (PRD resolved q69): what is alive to its read, what its sweep removes,
+ * and when the key it leaves expires.
  */
 function localKv(
   store: StoreBinding,
@@ -1355,37 +1720,51 @@ function localKv(
   database: Database,
   via: StoreSite["via"],
 ): Record<string, unknown> {
+  const now = localNow();
   switch (op) {
     case "get": {
       const key = required(params.key, "key", store);
-      const held = localHeld(database, scopeKey, key);
+      const held = localHeld(database, scopeKey, key, now);
       // A miss answers `found: false` and **no** `value` or `version` at all
-      // (Decision D110, PRD resolved q68).
+      // (Decision D110, PRD resolved q68) — an expired key included, which is
+      // absent (PRD resolved q69).
       return held === undefined
         ? { found: false }
         : { value: held.value, found: true, version: held.version };
     }
     case "list":
-      return tabular(store, op, params, scopeKey, database, undefined);
+      return tabular(store, op, params, scopeKey, database, undefined, now);
     case "set":
     case "delete":
     case "merge":
     case "append":
     case "incr": {
       const key = required(params.key, "key", store);
-      const decision = decideKvWrite(store, op, params, localHeld(database, scopeKey, key), via);
+      // A write to a partition is the first half of the cleanup schedule: at
+      // most a hundred of its expired rows leave storage, before the key is
+      // read so that one of them may be this key (PRD resolved q69).
+      sweepLocalPartition(database, scopeKey, now);
+      const decision = decideKvWrite(store, op, params, localHeld(database, scopeKey, key, now), via);
       switch (decision.effect) {
         case "none":
           return { ...decision.answer, deduped: false };
         case "remove":
           database.run("DELETE FROM entries WHERE scope_key = ? AND key = ?", [scopeKey, key]);
           return { ...decision.answer, deduped: false };
+        case "touch":
+          database.run("UPDATE entries SET expires_at = ? WHERE scope_key = ? AND key = ?", [
+            expiryOf(store, params, now),
+            scopeKey,
+            key,
+          ]);
+          return { ...decision.answer, deduped: false };
         case "write": {
           const version = nextLocalVersion(database, scopeKey);
           database.run(
-            "INSERT INTO entries (scope_key, key, value, version) VALUES (?, ?, ?, ?) " +
-              "ON CONFLICT (scope_key, key) DO UPDATE SET value = excluded.value, version = excluded.version",
-            [scopeKey, key, JSON.stringify(decision.value), version],
+            "INSERT INTO entries (scope_key, key, value, version, expires_at) VALUES (?, ?, ?, ?, ?) " +
+              "ON CONFLICT (scope_key, key) DO UPDATE SET value = excluded.value, " +
+              "version = excluded.version, expires_at = excluded.expires_at",
+            [scopeKey, key, JSON.stringify(decision.value), version, expiryOf(store, params, now)],
           );
           return { ...decision.answer(version), deduped: false };
         }
@@ -1398,14 +1777,16 @@ function localKv(
   throw new Error(`\`${store.address}\` is \`kind: kv\` and takes no \`${op}\``);
 }
 
-/** What one key of a local store holds, or `undefined` where it holds nothing. */
-function localHeld(database: Database, scopeKey: string, key: string): Held | undefined {
+/**
+ * What one key of a local store holds at `now`, or `undefined` where it holds
+ * nothing — an expired key included ([`heldRow`]).
+ */
+function localHeld(database: Database, scopeKey: string, key: string, now: number): Held | undefined {
   const found = database.get(
-    "SELECT value, version FROM entries WHERE scope_key = ? AND key = ?",
+    "SELECT value, version, expires_at FROM entries WHERE scope_key = ? AND key = ?",
     [scopeKey, key],
   ) as Row | null;
-  if (found === null) return undefined;
-  return { value: JSON.parse(String(found["value"])) as unknown, version: Number(found["version"]) };
+  return heldRow(found, now);
 }
 
 /**
@@ -1429,7 +1810,11 @@ function nextLocalVersion(database: Database, scopeKey: string): number {
   return Number(held["last"]);
 }
 
-/** The `vector` rows of grammar 11.4's catalog, and the `kv` `list`. */
+/**
+ * The `vector` rows of grammar 11.4's catalog, and the `kv` `list` — which
+ * answers the keys alive at `now`, so an expired key is not listed (PRD
+ * resolved q69). A `vector` row never expires: its `expires_at` is `NULL`.
+ */
 function tabular(
   store: StoreBinding,
   op: StoreOp,
@@ -1437,6 +1822,7 @@ function tabular(
   scopeKey: string,
   database: Database,
   vector: number[] | undefined,
+  now: number = localNow(),
 ): Record<string, unknown> {
   switch (op) {
     case "delete": {
@@ -1451,7 +1837,8 @@ function tabular(
       const limit = required(params.limit, "limit", store);
       const prefix = params.prefix ?? "";
       const rows = database.all(
-        "SELECT key FROM entries WHERE scope_key = ? AND substr(key, 1, ?) = ? ORDER BY key LIMIT ?",
+        "SELECT key FROM entries WHERE scope_key = ? AND substr(key, 1, ?) = ? " +
+          `AND ${liveClause("?")} ORDER BY key LIMIT ?`,
         // Characters, not JavaScript string length. SQLite's `substr` over TEXT
         // counts **characters**, and a JavaScript `.length` counts UTF-16 code
         // units — so an emoji in the prefix makes the two disagree by one per
@@ -1459,7 +1846,7 @@ function tabular(
         // keys (usually none) for a `prefix:` grammar 11.4 puts no restriction
         // on. Spreading the string iterates code points, which is what SQLite
         // is counting on the other side.
-        [scopeKey, [...prefix].length, prefix, limit],
+        [scopeKey, [...prefix].length, prefix, now, limit],
       ) as Row[];
       return { keys: rows.map((row) => String(row["key"])) };
     }
@@ -1609,11 +1996,18 @@ function tabular(
 // about what round-tripped. The column is text because the interface's payload
 // is text.
 //
-// # Retention
+// # Expiry and retention
 //
-// Nothing here is pruned either, and the module header's note on the idempotency
-// ledger applies verbatim — with one addition a dialled backend has and a file
-// does not. A `scope: execution` store's rows really do outlive the process, so
+// The module header's notes on expiry and on the idempotency ledger apply
+// verbatim, with the clock moved: every expiry a dialled store reads or writes
+// is computed by the **server's** clock (`StoreDialect.clock`), so two processes
+// whose own clocks disagree still agree about which keys are alive. A write
+// reads that clock once, inside its transaction, after its locks — so the
+// instant it judges its key by and the instant it writes an expiry from are one
+// — and a read is one statement that carries the clock in its own `WHERE`.
+//
+// And with one addition a dialled backend has and a file does not. A
+// `scope: execution` store's rows really do outlive the process, so
 // [`releaseExecution`] deletes that execution's partition when the run **ends**
 // (and leaves it where the run only parked, which is the world a resume is
 // promised). A delete that could not be made leaves rows under an execution id
@@ -1624,19 +2018,23 @@ function tabular(
 /** The providers this release dials for a `kv` store (PRD resolved q63). */
 const DIALLED_KV: readonly BackendProvider[] = ["postgres", "mysql"];
 
-/** A value a statement binds to a `?`. */
-type Bound = string | number;
+/** A value a statement binds to a `?` — `null` for a key that never expires. */
+type Bound = string | number | null;
 
 /**
- * How one server spells the three things the statements below differ in.
+ * How one server spells the things the statements below differ in.
  *
- * Three, and no more than three: the ops are **one** implementation of grammar
- * 11.4 rather than two that have to be kept in step, which is the whole reason
- * this interface is narrow. A fourth entry would be a place two backends could
- * come to mean different things, and the conformance suite would be proving it
- * rather than the servers. The schema is not here for the same reason it is not
- * a statement: a DDL is how a backend spells the *shape* these statements need,
- * which really is per-backend, so each arm holds its own and runs it at open.
+ * Six, and each is a spelling rather than a meaning: the ops are **one**
+ * implementation of grammar 11.4 rather than two that have to be kept in step,
+ * which is the whole reason this interface is narrow. An entry that decided
+ * something would be a place two backends could come to mean different things,
+ * and the conformance suite would be proving it rather than the servers. The
+ * first three are PRD resolved q63's; the other three are q69's, because an
+ * expiry needs the one thing a statement cannot carry portably — the server's
+ * own clock — and a bounded `DELETE`, which the two servers spell differently.
+ * The schema is not here for the same reason it is not a statement: a DDL is
+ * how a backend spells the *shape* these statements need, which really is
+ * per-backend, so each arm holds its own and runs it at open.
  */
 interface StoreDialect {
   /**
@@ -1659,6 +2057,29 @@ interface StoreDialect {
    * one the whole dedupe rests on.
    */
   readonly ignore: (target: string, noop: string) => string;
+  /**
+   * The server's clock, as an expression answering an integer of epoch
+   * milliseconds (PRD resolved q69).
+   *
+   * The server's rather than this process's, because a dialled store is
+   * multi-writer by design: an expiry two processes computed from two clocks
+   * would be one each believed and neither shared. Every statement that reads or
+   * writes an expiry reads this, plus [`STORE_CLOCK_OFFSET`]'s shift.
+   */
+  readonly clock: string;
+  /**
+   * A `DELETE` of at most `limit` expired rows of **one** partition — a write's
+   * sweep, run inside its transaction under the partition's sequence lock.
+   * Binds the store, the partition and `now`, in that order.
+   */
+  readonly sweepPartition: (limit: number) => string;
+  /**
+   * A `DELETE` of at most `limit` expired rows of a **whole** store — one batch
+   * of the sweep a connection's first op on the store makes. Binds the store and
+   * `now`. It runs beside other processes' writes, so it must never wait on a
+   * row one of them holds in a way that could make that writer wait on it.
+   */
+  readonly sweepStore: (limit: number) => string;
 }
 
 /** What one server's connection does, and the whole of it. */
@@ -1872,6 +2293,17 @@ class RemoteKv {
   /** The tail of the queue every op chains onto. */
   #queue: Promise<unknown> = Promise.resolve();
 
+  /**
+   * The stores this connection has swept whole, by name — the open's half of
+   * PRD resolved q69's schedule, made once per store per connection.
+   *
+   * Per connection rather than per process because a connection is what a
+   * dialled store's "open" is: a process starting is its first connection, and
+   * a connection redialled after a loss sweeps again, which costs a statement
+   * that finds nothing.
+   */
+  readonly #swept = new Set<string>();
+
   constructor(driver: StoreDriver) {
     this.#driver = driver;
   }
@@ -1901,6 +2333,26 @@ class RemoteKv {
           scopeKey,
         ]);
       }
+    });
+  }
+
+  /**
+   * Delete the ledger rows a settled execution left in one partition: every
+   * idempotency key under `prefix`, which is `<execution id>/` (PRD resolved
+   * q69, [`pruneLedger`]).
+   *
+   * A range on the ledger's primary key, so the server seeks to the run of rows
+   * under the prefix rather than reading the partition's ledger; one statement,
+   * because the rows are this settled execution's alone and nothing else is
+   * writing them.
+   */
+  prune(store: string, scopeKey: string, prefix: string): Promise<unknown> {
+    return this.#serial(async () => {
+      await this.#run(
+        "DELETE FROM store_applied WHERE store = ? AND scope_key = ? " +
+          "AND idempotency_key >= ? AND idempotency_key < ?",
+        [store, scopeKey, prefix, prefixEnd(prefix)],
+      );
     });
   }
 
@@ -1948,6 +2400,10 @@ class RemoteKv {
     idempotencyKey: string | undefined,
     via: StoreSite["via"],
   ): Promise<Applied> {
+    if (!this.#swept.has(store.name)) {
+      this.#swept.add(store.name);
+      await this.#sweepStore(store);
+    }
     if (!writes(op)) {
       return { row: await this.#read(store, op, params, scopeKey), deduped: false };
     }
@@ -2037,15 +2493,24 @@ class RemoteKv {
           return { row: redelivered(store, op, String(result)), deduped: true };
         }
       }
+      // The server's clock, read once and after the locks: the instant this
+      // write judges its key by, sweeps by and dates the key it leaves from
+      // (PRD resolved q69).
+      const now = await this.#now();
+      // A write to a partition is the first half of the cleanup schedule: at
+      // most a hundred of its expired rows leave storage — under the
+      // partition's sequence lock, so no other write to it is in flight — before
+      // the key is read, so that one of them may be this key.
+      await this.#run(this.#driver.dialect.sweepPartition(SWEEP_PER_WRITE), [
+        store.name,
+        scopeKey,
+        now,
+      ]);
       const found = await this.#all(
-        'SELECT value, version FROM store_entries WHERE store = ? AND scope_key = ? AND "key" = ? FOR UPDATE',
+        'SELECT value, version, expires_at FROM store_entries WHERE store = ? AND scope_key = ? AND "key" = ? FOR UPDATE',
         [store.name, scopeKey, key],
       );
-      const stored = found[0];
-      const held: Held | undefined =
-        stored === undefined
-          ? undefined
-          : { value: JSON.parse(String(stored["value"])) as unknown, version: Number(stored["version"]) };
+      const held = heldRow(found[0], now);
       const decision = decideKvWrite(store, op, params, held, via);
       switch (decision.effect) {
         case "none":
@@ -2058,6 +2523,13 @@ class RemoteKv {
           );
           row = { ...decision.answer, deduped: false };
           break;
+        case "touch":
+          await this.#run(
+            'UPDATE store_entries SET expires_at = ? WHERE store = ? AND scope_key = ? AND "key" = ?',
+            [expiryOf(store, params, now), store.name, scopeKey, key],
+          );
+          row = { ...decision.answer, deduped: false };
+          break;
         case "write": {
           const version = last + 1;
           await this.#run(
@@ -2065,9 +2537,20 @@ class RemoteKv {
             [version, store.name, scopeKey],
           );
           await this.#run(
-            'INSERT INTO store_entries (store, scope_key, "key", value, version) VALUES (?, ?, ?, ?, ?) ' +
-              this.#driver.dialect.overwrite('(store, scope_key, "key")', ["value", "version"]),
-            [store.name, scopeKey, key, JSON.stringify(decision.value), version],
+            'INSERT INTO store_entries (store, scope_key, "key", value, version, expires_at) VALUES (?, ?, ?, ?, ?, ?) ' +
+              this.#driver.dialect.overwrite('(store, scope_key, "key")', [
+                "value",
+                "version",
+                "expires_at",
+              ]),
+            [
+              store.name,
+              scopeKey,
+              key,
+              JSON.stringify(decision.value),
+              version,
+              expiryOf(store, params, now),
+            ],
           );
           row = { ...decision.answer(version), deduped: false };
           break;
@@ -2122,12 +2605,19 @@ class RemoteKv {
     params: StoreParams,
     scopeKey: string,
   ): Promise<Record<string, unknown>> {
+    // A read is one statement, so it carries the server's clock in its own
+    // `WHERE` rather than asking for it first: an expired key is not found and
+    // not listed, by the clock every writer of this store dated it with (PRD
+    // resolved q69).
+    const alive = liveClause(`(${this.#driver.dialect.clock}) + ?`);
+    const offset = clockOffset();
     switch (op) {
       case "get": {
         const key = required(params.key, "key", store);
         const found = await this.#all(
-          'SELECT value, version FROM store_entries WHERE store = ? AND scope_key = ? AND "key" = ?',
-          [store.name, scopeKey, key],
+          'SELECT value, version FROM store_entries WHERE store = ? AND scope_key = ? AND "key" = ? ' +
+            `AND ${alive}`,
+          [store.name, scopeKey, key, offset],
         );
         const value = found[0]?.["value"];
         // A miss answers `found: false` and **no** `value` or `version` at
@@ -2146,15 +2636,61 @@ class RemoteKv {
         const prefix = params.prefix ?? "";
         const rows = await this.#all(
           'SELECT "key" FROM store_entries WHERE store = ? AND scope_key = ? ' +
-            'AND SUBSTR("key", 1, ?) = ? ORDER BY "key" LIMIT ?',
+            `AND SUBSTR("key", 1, ?) = ? AND ${alive} ORDER BY "key" LIMIT ?`,
           // Characters, not JavaScript string length — the local backend's note
           // on `substr` applies to both servers, which count characters too.
-          [store.name, scopeKey, [...prefix].length, prefix, limit],
+          [store.name, scopeKey, [...prefix].length, prefix, offset, limit],
         );
         return { keys: rows.map((row) => String(row["key"])) };
       }
       default:
         throw new Error(`\`${store.address}\` is \`kind: ${store.kind}\` and takes no \`${op}\``);
+    }
+  }
+
+  /** The server's clock, shifted by [`STORE_CLOCK_OFFSET`], in epoch milliseconds. */
+  async #now(): Promise<number> {
+    const offset = clockOffset();
+    const answered = await this.#all(`SELECT (${this.#driver.dialect.clock}) AS now`, []);
+    const now = Number(answered[0]?.["now"]);
+    if (!Number.isFinite(now)) {
+      throw new Error(
+        `this store backend answered ${JSON.stringify(answered[0]?.["now"] ?? null)} for its own clock, which is not a number of milliseconds: a \`kv\` key's expiry is computed by the server's clock (PRD resolved q69)`,
+      );
+    }
+    return now + offset;
+  }
+
+  /**
+   * Remove every expired row of one store — the sweep a connection's first op
+   * on a store makes, which is the second half of PRD resolved q69's schedule.
+   *
+   * In batches of [`SWEEP_PER_BATCH`], each one statement and so one short
+   * transaction, until a batch finds fewer than it may take. Each batch skips
+   * or waits only on rows a writer holds as a writer would, never holding one a
+   * writer then needs (`StoreDialect.sweepStore`), so it cannot deadlock a
+   * write.
+   *
+   * **Never the op's failure.** The sweep is housekeeping in front of an op
+   * that does not depend on it — every read and condition already treats an
+   * expired row as absent — so a sweep the server refused is said on stderr
+   * and the op runs; a connection that is really gone fails the op's own
+   * statement next, with the sentence that names it.
+   */
+  async #sweepStore(store: StoreBinding): Promise<void> {
+    try {
+      const now = await this.#now();
+      for (;;) {
+        const removed = await this.#run(this.#driver.dialect.sweepStore(SWEEP_PER_BATCH), [
+          store.name,
+          now,
+        ]);
+        if (removed < SWEEP_PER_BATCH) return;
+      }
+    } catch (error) {
+      process.stderr.write(
+        `warning: \`${store.address}\` could not remove its expired keys at open (${error instanceof Error ? error.message : String(error)}); they stay invisible to every read and condition, and a write to each one's partition removes them (PRD resolved q69)\n`,
+      );
     }
   }
 }
@@ -2587,12 +3123,15 @@ const POSTGRES_CONCURRENT_CREATOR: readonly string[] = ["23505", "42P07", "42710
  * release created it.
  *
  * `IF NOT EXISTS` throughout, so a second open of a store this build already
- * created does nothing. One migration exists, and it is the `DO` block below:
- * PRD resolved q68 gave every `kv` key a `version`, and a database the previous
- * release created has `store_entries` without it. Its rows take `0`, which no
- * write of this release hands out — a partition's sequence starts past what it
- * holds — so a key answering `version: 0` is one nothing has written since the
- * upgrade. The whole of it is **one transaction holding
+ * created does nothing. The migrations are the `DO` block below. PRD resolved
+ * q68 gave every `kv` key a `version`, and a database an earlier release
+ * created has `store_entries` without it: its rows take `0`, which no write of
+ * this release hands out — a partition's sequence starts past what it holds —
+ * so a key answering `version: 0` is one nothing has written since the
+ * upgrade. PRD resolved q69 gave every key an `expires_at`, `NULL` on every row
+ * an earlier release wrote, which is a key that never expires; and the two
+ * partial indexes an expiry is found through, which a key that never expires
+ * costs nothing in. The whole of it is **one transaction holding
  * [`POSTGRES_STORE_SCHEMA_LOCK`]**, because `IF NOT EXISTS` is not atomic
  * against a concurrent creator and a store is opened concurrently by design.
  *
@@ -2649,11 +3188,12 @@ const POSTGRES_STORE_SCHEMA = `
 BEGIN;
 SELECT pg_advisory_xact_lock(${POSTGRES_STORE_SCHEMA_LOCK[0]}, ${POSTGRES_STORE_SCHEMA_LOCK[1]});
 CREATE TABLE IF NOT EXISTS store_entries (
-  store     TEXT COLLATE "C" NOT NULL,
-  scope_key TEXT COLLATE "C" NOT NULL,
-  "key"     TEXT COLLATE "C" NOT NULL,
-  value     TEXT NOT NULL,
-  version   BIGINT NOT NULL DEFAULT 0,
+  store      TEXT COLLATE "C" NOT NULL,
+  scope_key  TEXT COLLATE "C" NOT NULL,
+  "key"      TEXT COLLATE "C" NOT NULL,
+  value      TEXT NOT NULL,
+  version    BIGINT NOT NULL DEFAULT 0,
+  expires_at BIGINT,
   PRIMARY KEY (store, scope_key, "key")
 );
 DO $migrate$
@@ -2663,6 +3203,20 @@ BEGIN
     WHERE attrelid = 'store_entries'::regclass AND attname = 'version' AND NOT attisdropped
   ) THEN
     ALTER TABLE store_entries ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_attribute
+    WHERE attrelid = 'store_entries'::regclass AND attname = 'expires_at' AND NOT attisdropped
+  ) THEN
+    ALTER TABLE store_entries ADD COLUMN IF NOT EXISTS expires_at BIGINT;
+  END IF;
+  IF to_regclass('store_entries_partition_expiry') IS NULL THEN
+    CREATE INDEX IF NOT EXISTS store_entries_partition_expiry
+      ON store_entries (store, scope_key, expires_at) WHERE expires_at IS NOT NULL;
+  END IF;
+  IF to_regclass('store_entries_expiry') IS NULL THEN
+    CREATE INDEX IF NOT EXISTS store_entries_expiry
+      ON store_entries (store, expires_at) WHERE expires_at IS NOT NULL;
   END IF;
 END
 $migrate$;
@@ -2752,11 +3306,46 @@ function numberedStoreBind(sql: string): string {
   return sql.replace(/\?/g, () => `$${++next}`);
 }
 
+/**
+ * The server's clock in epoch milliseconds (PRD resolved q69).
+ *
+ * `clock_timestamp()` rather than `now()`, because `now()` is the instant the
+ * **transaction** began: a write that waited on its partition's sequence lock
+ * would judge its key — and date the key it leaves — by a clock that stopped
+ * while it queued. Floored like `Date.now()`, so the local arm and this one
+ * round the same way.
+ */
+const POSTGRES_STORE_CLOCK = "FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint";
+
+/**
+ * A bounded `DELETE` over the rows a sub-select finds, which is how Postgres
+ * spells `DELETE … LIMIT` — it has no other.
+ *
+ * **`FOR UPDATE SKIP LOCKED`**, so a sweep never waits on a row another
+ * transaction holds: a write sweeping its own partition is already serialized
+ * against every other write to it by the sequence lock, and a store-wide sweep
+ * beside them takes the expired rows nobody holds and leaves the rest for the
+ * next sweep — which is what makes a sweep unable to be either half of a
+ * deadlock with a write. `ctid` is the row's own address, so the outer delete
+ * removes exactly the rows the sub-select locked; they cannot move while it
+ * holds them. Both read through a partial index over `expires_at`, so neither
+ * reads a row that has not expired.
+ */
+function postgresSweep(where: string, limit: number): string {
+  return (
+    "DELETE FROM store_entries WHERE ctid = ANY(ARRAY(SELECT ctid FROM store_entries " +
+    `WHERE ${where} AND expires_at <= ? LIMIT ${limit} FOR UPDATE SKIP LOCKED))`
+  );
+}
+
 /** Postgres speaks the standard upsert in both of its forms. */
 const POSTGRES_STORE_DIALECT: StoreDialect = {
   bind: numberedStoreBind,
   overwrite: standardOverwrite,
   ignore: standardIgnore,
+  clock: POSTGRES_STORE_CLOCK,
+  sweepPartition: (limit) => postgresSweep("store = ? AND scope_key = ?", limit),
+  sweepStore: (limit) => postgresSweep("store = ?", limit),
 };
 
 /**

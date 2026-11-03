@@ -75,12 +75,15 @@ const POSTGRES_CONCURRENT_CREATOR: readonly string[] = ["23505", "42P07", "42710
  * release created it.
  *
  * `IF NOT EXISTS` throughout, so a second open of a store this build already
- * created does nothing. One migration exists, and it is the `DO` block below:
- * PRD resolved q68 gave every `kv` key a `version`, and a database the previous
- * release created has `store_entries` without it. Its rows take `0`, which no
- * write of this release hands out — a partition's sequence starts past what it
- * holds — so a key answering `version: 0` is one nothing has written since the
- * upgrade. The whole of it is **one transaction holding
+ * created does nothing. The migrations are the `DO` block below. PRD resolved
+ * q68 gave every `kv` key a `version`, and a database an earlier release
+ * created has `store_entries` without it: its rows take `0`, which no write of
+ * this release hands out — a partition's sequence starts past what it holds —
+ * so a key answering `version: 0` is one nothing has written since the
+ * upgrade. PRD resolved q69 gave every key an `expires_at`, `NULL` on every row
+ * an earlier release wrote, which is a key that never expires; and the two
+ * partial indexes an expiry is found through, which a key that never expires
+ * costs nothing in. The whole of it is **one transaction holding
  * [`POSTGRES_STORE_SCHEMA_LOCK`]**, because `IF NOT EXISTS` is not atomic
  * against a concurrent creator and a store is opened concurrently by design.
  *
@@ -137,11 +140,12 @@ const POSTGRES_STORE_SCHEMA = `
 BEGIN;
 SELECT pg_advisory_xact_lock(${POSTGRES_STORE_SCHEMA_LOCK[0]}, ${POSTGRES_STORE_SCHEMA_LOCK[1]});
 CREATE TABLE IF NOT EXISTS store_entries (
-  store     TEXT COLLATE "C" NOT NULL,
-  scope_key TEXT COLLATE "C" NOT NULL,
-  "key"     TEXT COLLATE "C" NOT NULL,
-  value     TEXT NOT NULL,
-  version   BIGINT NOT NULL DEFAULT 0,
+  store      TEXT COLLATE "C" NOT NULL,
+  scope_key  TEXT COLLATE "C" NOT NULL,
+  "key"      TEXT COLLATE "C" NOT NULL,
+  value      TEXT NOT NULL,
+  version    BIGINT NOT NULL DEFAULT 0,
+  expires_at BIGINT,
   PRIMARY KEY (store, scope_key, "key")
 );
 DO $migrate$
@@ -151,6 +155,20 @@ BEGIN
     WHERE attrelid = 'store_entries'::regclass AND attname = 'version' AND NOT attisdropped
   ) THEN
     ALTER TABLE store_entries ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_attribute
+    WHERE attrelid = 'store_entries'::regclass AND attname = 'expires_at' AND NOT attisdropped
+  ) THEN
+    ALTER TABLE store_entries ADD COLUMN IF NOT EXISTS expires_at BIGINT;
+  END IF;
+  IF to_regclass('store_entries_partition_expiry') IS NULL THEN
+    CREATE INDEX IF NOT EXISTS store_entries_partition_expiry
+      ON store_entries (store, scope_key, expires_at) WHERE expires_at IS NOT NULL;
+  END IF;
+  IF to_regclass('store_entries_expiry') IS NULL THEN
+    CREATE INDEX IF NOT EXISTS store_entries_expiry
+      ON store_entries (store, expires_at) WHERE expires_at IS NOT NULL;
   END IF;
 END
 $migrate$;
@@ -240,11 +258,46 @@ function numberedStoreBind(sql: string): string {
   return sql.replace(/\?/g, () => `$${++next}`);
 }
 
+/**
+ * The server's clock in epoch milliseconds (PRD resolved q69).
+ *
+ * `clock_timestamp()` rather than `now()`, because `now()` is the instant the
+ * **transaction** began: a write that waited on its partition's sequence lock
+ * would judge its key — and date the key it leaves — by a clock that stopped
+ * while it queued. Floored like `Date.now()`, so the local arm and this one
+ * round the same way.
+ */
+const POSTGRES_STORE_CLOCK = "FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint";
+
+/**
+ * A bounded `DELETE` over the rows a sub-select finds, which is how Postgres
+ * spells `DELETE … LIMIT` — it has no other.
+ *
+ * **`FOR UPDATE SKIP LOCKED`**, so a sweep never waits on a row another
+ * transaction holds: a write sweeping its own partition is already serialized
+ * against every other write to it by the sequence lock, and a store-wide sweep
+ * beside them takes the expired rows nobody holds and leaves the rest for the
+ * next sweep — which is what makes a sweep unable to be either half of a
+ * deadlock with a write. `ctid` is the row's own address, so the outer delete
+ * removes exactly the rows the sub-select locked; they cannot move while it
+ * holds them. Both read through a partial index over `expires_at`, so neither
+ * reads a row that has not expired.
+ */
+function postgresSweep(where: string, limit: number): string {
+  return (
+    "DELETE FROM store_entries WHERE ctid = ANY(ARRAY(SELECT ctid FROM store_entries " +
+    `WHERE ${where} AND expires_at <= ? LIMIT ${limit} FOR UPDATE SKIP LOCKED))`
+  );
+}
+
 /** Postgres speaks the standard upsert in both of its forms. */
 const POSTGRES_STORE_DIALECT: StoreDialect = {
   bind: numberedStoreBind,
   overwrite: standardOverwrite,
   ignore: standardIgnore,
+  clock: POSTGRES_STORE_CLOCK,
+  sweepPartition: (limit) => postgresSweep("store = ? AND scope_key = ?", limit),
+  sweepStore: (limit) => postgresSweep("store = ?", limit),
 };
 
 /**

@@ -12368,6 +12368,290 @@ fn a_session_scoped_store_outlives_the_execution_that_wrote_it() {
     );
 }
 
+/// The model the published lease's agent binds (`docs/topics/stores.md`).
+const LEASE_MODEL: &str = "claude-sonnet-4-5";
+
+/// The variable the emitted `src/stores.ts` shifts its expiry clock by, in
+/// milliseconds (PRD resolved q69).
+const STORE_CLOCK: &str = "AGENT_COMPOSE_STORE_CLOCK_OFFSET_MS";
+
+/// The lease `docs/topics/stores.md` publishes under *Expiry and leases*, byte
+/// for byte — so what this suite runs is what a reader copies.
+fn published_lease() -> String {
+    let topic = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/topics/stores.md"),
+    )
+    .expect("the stores topic is readable");
+    let (_, section) = topic
+        .split_once("## Expiry and leases")
+        .expect("the stores topic has an *Expiry and leases* section");
+    let (_, block) = section
+        .split_once("```yaml spec\n")
+        .expect("the section opens with a `yaml spec` block");
+    let (lease, _) = block.split_once("```").expect("the block closes");
+    lease.to_string()
+}
+
+/// The one store record a node of a lease run filed (`docs/trace.md` §6).
+fn lease_record(run: &harness::Invocation, node: &str) -> Value {
+    run.entries(node)
+        .first()
+        .and_then(|entry| entry["stores"].get(0))
+        .cloned()
+        .unwrap_or_else(|| panic!("`{node}` filed no store record: {:?}", run.trace()))
+}
+
+/// **The published lease runs: a claim applies, a second claim declines, a keep
+/// extends it, and a release deletes it** (PRD resolved q69 with q68).
+///
+/// The composition is the one `docs/topics/stores.md` publishes, read out of the
+/// topic rather than copied into a fixture, and it runs six times against one
+/// store, with the store's clock moved by the emitted module's own offset
+/// rather than slept through:
+///
+/// 1. worker `a` claims the job and dies in its first half — the lease stays,
+///    because nothing released it;
+/// 2. worker `b`, at the same instant, is refused the claim and ends;
+/// 3. a minute and a second later the claim has expired, so `b` takes it — the
+///    version one past `a`'s, since expiry consumes none — keeps it for ten
+///    minutes, and dies in its second half;
+/// 4. two minutes after that — past the claim's minute, inside the keep's ten —
+///    worker `c` is refused: the keep extended the lease;
+/// 5. past the keep's ten, `c` takes it, keeps it, finishes, and releases;
+/// 6. at that same instant `d` takes it at once: the release deleted it, so
+///    there was no expiry to wait out.
+///
+/// And the ledger, read out of the store's own file at the end: every one of
+/// the six executions settled, `completed` or `failed`, so none of the keyed
+/// writes they made left a row behind.
+#[test]
+fn the_published_lease_claims_declines_keeps_and_releases() {
+    let scratch = harness::Scratch::new("published-lease");
+    let entrypoint = scratch.path().join("main.yml");
+    std::fs::write(&entrypoint, published_lease()).expect("the scratch spec is writable");
+    // One data directory for every run, so the six builds share one store.
+    let data = scratch.path().join("data");
+
+    let provider = MockProvider::start().expect("a loopback port");
+    let mut environment = harness::environment(&provider);
+    environment.push((
+        "ANTHROPIC_API_KEY".to_string(),
+        "mock-provider-key".to_string(),
+    ));
+    environment.push((
+        "AGENT_COMPOSE_DATA_DIR".to_string(),
+        data.display().to_string(),
+    ));
+    let done = || Outcome::structured(json!({ "done": true }));
+    let run = |worker: &str, clock: u64, halves: Vec<Outcome>| {
+        provider.enqueue_all(
+            halves
+                .into_iter()
+                .map(|outcome| Script::new(LEASE_MODEL, outcome)),
+        );
+        let mut at = environment.clone();
+        at.push((STORE_CLOCK.to_string(), clock.to_string()));
+        harness::invoke_entrypoint(
+            &entrypoint,
+            "the published lease",
+            "flow.job",
+            &json!({ "job": "job-1", "worker": worker }),
+            &at,
+            Some(REDIRECT_TO_MOCK),
+        )
+    };
+    let minute: u64 = 60_000;
+
+    // 1. `a` claims, and dies before it keeps or releases anything.
+    let Some(first) = run("a", 0, vec![Outcome::server_error()]) else {
+        return;
+    };
+    first.failed();
+    let claimed = lease_record(&first, "claim");
+    assert_eq!(claimed["applied"], json!(true), "{claimed}");
+    let held = claimed["version"]
+        .as_i64()
+        .expect("a claim that applied has a version");
+    assert!(
+        first.entries("keep").is_empty() && first.entries("release").is_empty(),
+        "the run ended in its first half: {:?}",
+        first.visited()
+    );
+
+    // 2. `b`, at the same instant: the lease is held, so the claim declines and
+    // answers the holder's version.
+    let Some(second) = run("b", 0, vec![]) else {
+        return;
+    };
+    second.succeeded();
+    let refused = lease_record(&second, "claim");
+    assert_eq!(refused["applied"], json!(false), "{refused}");
+    assert_eq!(refused["version"], json!(held));
+    assert_eq!(second.visited(), ["claim"], "a declined claim ends the run");
+
+    // 3. A minute and a second on, the claim has expired: `b` takes it with the
+    // partition's very next version, keeps it, and dies in its second half.
+    let expired = minute + 1_000;
+    let Some(third) = run("b", expired, vec![done(), Outcome::server_error()]) else {
+        return;
+    };
+    third.failed();
+    let retaken = lease_record(&third, "claim");
+    assert_eq!(
+        retaken["applied"],
+        json!(true),
+        "an expired lease is absent: {retaken}"
+    );
+    assert_eq!(
+        retaken["version"],
+        json!(held + 1),
+        "expiry consumed no version"
+    );
+    let kept = lease_record(&third, "keep");
+    assert_eq!(kept["applied"], json!(true), "{kept}");
+    assert_eq!(kept["version"], json!(held + 2));
+
+    // 4. Two minutes later — past the claim's minute, inside the keep's ten —
+    // `c` is refused: the keep moved the expiry.
+    let Some(fourth) = run("c", expired + 2 * minute, vec![]) else {
+        return;
+    };
+    fourth.succeeded();
+    let extended = lease_record(&fourth, "claim");
+    assert_eq!(
+        extended["applied"],
+        json!(false),
+        "the keep's fresh `ttl` extended the lease past the claim's: {extended}"
+    );
+    assert_eq!(extended["version"], json!(held + 2));
+
+    // 5. Past the keep's ten minutes, `c` takes it, keeps it, finishes, and
+    // releases.
+    let lapsed = expired + 11 * minute;
+    let Some(fifth) = run("c", lapsed, vec![done(), done()]) else {
+        return;
+    };
+    fifth.succeeded();
+    assert_eq!(
+        fifth.visited(),
+        ["claim", "first_half", "keep", "second_half", "release"]
+    );
+    assert_eq!(lease_record(&fifth, "claim")["version"], json!(held + 3));
+    assert_eq!(lease_record(&fifth, "keep")["version"], json!(held + 4));
+    let released = lease_record(&fifth, "release");
+    assert_eq!(released["applied"], json!(true), "{released}");
+    assert!(
+        released.get("version").is_none(),
+        "a delete that applied leaves the key holding nothing: {released}"
+    );
+
+    // 6. …so `d`, at that same instant, takes it at once.
+    let Some(sixth) = run("d", lapsed, vec![Outcome::server_error()]) else {
+        return;
+    };
+    sixth.failed();
+    let after = lease_record(&sixth, "claim");
+    assert_eq!(
+        after["applied"],
+        json!(true),
+        "the release deleted the lease: {after}"
+    );
+    assert_eq!(after["version"], json!(held + 5));
+
+    // Every execution settled, completed or failed, so the ledger holds none of
+    // the keyed writes they made — while the lease `d` took is still there.
+    let file = data.join("stores").join("leases.sqlite");
+    let ledger = harness::sqlite_rows(&sixth.project, &file, "SELECT COUNT(*) AS n FROM applied");
+    assert_eq!(
+        ledger[0]["n"],
+        json!(0),
+        "a settled execution's ledger rows are deleted (PRD resolved q69)"
+    );
+    let rows = harness::sqlite_rows(
+        &sixth.project,
+        &file,
+        "SELECT key, value FROM entries ORDER BY key",
+    );
+    assert_eq!(
+        rows,
+        json!([{ "key": "job-1", "value": "{\"owner\":\"d\"}" }]),
+        "the store keeps the data the ledger's rows were about"
+    );
+}
+
+/// **A settled run leaves no ledger rows in any kind of store it wrote** — the
+/// `applied` table of a `vector` store's file and the marker directory of a
+/// `blob` one, beside the `kv` rows the lease case reads (PRD resolved q69).
+///
+/// `flow.ground` makes one keyed write to each — the trace says so, with the
+/// key it carried and `deduped: false` — and both stores are `scope: global`,
+/// so their files outlive the run. Once it has settled, neither holds the row
+/// that write left.
+#[test]
+fn a_settled_run_leaves_no_ledger_rows_in_a_vector_or_a_blob_store() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(project) = harness::scratch_project("ledger-kinds") else {
+        return;
+    };
+    let environment = harness::environment(&provider);
+    let run = harness::run_into(
+        &project,
+        "stores",
+        "flow.ground",
+        &[("text", "the quick brown fox")],
+        None,
+        &environment,
+    );
+    run.succeeded();
+    for node in ["index", "keep"] {
+        let records = store_records(&run, node);
+        assert!(
+            records.iter().any(|record| record["effect"] == "write"
+                && record["deduped"] == json!(false)
+                && record["idempotencyKey"].is_string()),
+            "`{node}` made a keyed write that applied: {records:?}"
+        );
+    }
+
+    let data = project.join(".agent-compose");
+    let ledger = harness::sqlite_rows(
+        &project,
+        &data.join("stores").join("docs.sqlite"),
+        "SELECT COUNT(*) AS n FROM applied",
+    );
+    assert_eq!(
+        ledger[0]["n"],
+        json!(0),
+        "the vector store's ledger is pruned"
+    );
+    let markers = data
+        .join("blobs")
+        .join("artifacts")
+        .join("global")
+        .join("applied");
+    let left: Vec<String> = std::fs::read_dir(&markers)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        left.is_empty(),
+        "the blob store's ledger is pruned: {left:?}"
+    );
+    assert!(
+        data.join("blobs")
+            .join("artifacts")
+            .join("global")
+            .join("values")
+            .read_dir()
+            .is_ok_and(|mut entries| entries.next().is_some()),
+        "…and the blob it wrote is still there"
+    );
+}
+
 /// A declared `manual` trigger's `session_key:` remaps the `--session` the CLI
 /// was given, and the run addresses the partition it names (grammar 13.2, 11.3).
 ///
@@ -19280,6 +19564,30 @@ fn a_replayed_prefix_re_issues_neither_its_store_write_nor_its_subprocess() {
         1,
         "the first generation ran the subprocess once"
     );
+    // The killed generation's keyed write left its ledger row, and nothing
+    // settled the execution, so the row is there for the resume (PRD resolved
+    // q29, q69).
+    let ledger_file = project
+        .join(".agent-compose")
+        .join("stores")
+        .join("ledger.sqlite");
+    let ledger_rows = |project: &Path| {
+        harness::sqlite_rows(
+            project,
+            &ledger_file,
+            &format!(
+                "SELECT COUNT(*) AS n FROM applied WHERE substr(idempotency_key, 1, {}) = '{}/'",
+                killed.execution.len() + 1,
+                killed.execution
+            ),
+        )[0]["n"]
+            .clone()
+    };
+    assert_eq!(
+        ledger_rows(&project),
+        json!(1),
+        "an execution the journal holds open keeps its ledger rows"
+    );
 
     provider.reset();
     provider.enqueue(Script::new(
@@ -19322,6 +19630,15 @@ fn a_replayed_prefix_re_issues_neither_its_store_write_nor_its_subprocess() {
         write["deduped"], false,
         "a replayed write is not applied a second time, so the backend never saw \
          its key twice: {write}"
+    );
+    // …and the resumed generation settled it, so the row the first generation
+    // left is gone — noted again by the replay of the write that left it, which
+    // never reached the backend (PRD resolved q69).
+    assert_eq!(
+        ledger_rows(&project),
+        json!(0),
+        "a settled execution's ledger rows are deleted, a generation it resumed \
+         from included"
     );
 
     // The execution is closed now, and a second resume says so rather than

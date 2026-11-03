@@ -870,6 +870,19 @@ const CODEGEN: &[Criterion] = &[
                 "a_partial_update_the_store_refuses_goes_back_to_the_model",
                 Status::Live,
             ),
+            // PRD resolved q69 through a compiled graph: the lease the stores
+            // topic publishes — claim, a refused second claim, a keep that
+            // extends it and a release that deletes it — run against one store
+            // with its clock moved, and the ledger a settled execution leaves
+            // pruned from every kind of store it wrote.
+            (
+                "the_published_lease_claims_declines_keeps_and_releases",
+                Status::Live,
+            ),
+            (
+                "a_settled_run_leaves_no_ledger_rows_in_a_vector_or_a_blob_store",
+                Status::Live,
+            ),
         ],
     },
     Criterion {

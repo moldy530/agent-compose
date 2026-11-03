@@ -515,15 +515,18 @@ remove — and left standing it would refuse every later open of that file, for
 ever. So a lock still there after the wait is treated as its dead owner's and
 removed. Two processes *running* against one project is still the case above.
 
-**Nothing here is pruned.** A store keeps what was written to it until you
-delete the file, and that includes the idempotency ledger a keyed write leaves
+**What is pruned, and what is not.** A store keeps what was written to it until
+you delete the file — or, for a `kv` key written with a `ttl:` or under a
+`default_ttl:`, until it expires: an expired key is invisible at once and leaves
+the file at the next write to its partition (at most 100 rows a write) or the
+next time a process opens the store. The idempotency ledger a keyed write leaves
 beside its effect (the `applied` table of a SQLite store, the `applied`
-directory of a blob one — one entry per key) — so a long-lived
-`global` store's ledger grows with the number of writes ever made to it, and so
-do the journal and the traces directory. Retention is yours: everything under
-`.agent-compose/` is safe to remove between runs, and removing it is what "start
-clean" means — at the cost, for the journal, of the executions it was holding
-open.
+directory of a blob one — one entry per key) is pruned when the execution that
+wrote it settles, `completed` or `failed`, so it holds the open executions'
+rows and no history. The journal and the traces directory are not pruned.
+Retention is yours: everything under `.agent-compose/` is safe to remove between
+runs, and removing it is what "start clean" means — at the cost, for the
+journal, of the executions it was holding open.
 
 ## Where a built-in tool works, and what it may run
 

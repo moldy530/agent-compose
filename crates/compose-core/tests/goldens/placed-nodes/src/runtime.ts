@@ -14442,9 +14442,51 @@ export async function settleExecution(execution: string, error?: unknown): Promi
   await childrenBegun(execution);
   if (error === undefined) {
     await journal.end(execution, "completed");
-    return;
+  } else {
+    await journal.end(execution, "failed", describe(error));
   }
-  await journal.end(execution, "failed", describe(error));
+  // **After** the row has closed, never before: a crash between the two leaves
+  // ledger rows nothing will ask for again, and the other order could leave an
+  // execution the journal still holds open without the rows its resume needs.
+  await pruneLedgers(execution, true);
+}
+
+/**
+ * What prunes the idempotency ledger an execution's keyed store writes left —
+ * `src/stores.ts`'s `pruneLedger`, registered as that module loads.
+ *
+ * A registration rather than an import because the emitted import graph has
+ * one direction: `src/stores.ts` imports this module, and this module imports
+ * nothing that imports it. Called with `settled: true` once an execution's row
+ * has closed `completed` or `failed` — every grammar 9.4 key begins with the
+ * execution's id, and a settled execution never resumes (PRD resolved q65), so
+ * its rows answer nothing again (PRD resolved q69) — and with `settled: false`
+ * when a generation closes without settling, which forgets what it noted and
+ * deletes nothing.
+ */
+let ledgerPrune: ((execution: string, settled: boolean) => Promise<void>) | undefined;
+
+/** Register [`ledgerPrune`]. See there. */
+export function settlesLedgers(prune: (execution: string, settled: boolean) => Promise<void>): void {
+  ledgerPrune = prune;
+}
+
+/**
+ * Run [`ledgerPrune`], which is **never** the execution's outcome: the row has
+ * already closed, and rows that could not be pruned are rows nothing reads. The
+ * prune says so per store on its own; this is what stops anything it did not
+ * catch from becoming the run's failure.
+ */
+async function pruneLedgers(execution: string, settled: boolean): Promise<void> {
+  const prune = ledgerPrune;
+  if (prune === undefined) return;
+  try {
+    await prune(execution, settled);
+  } catch (failure) {
+    process.stderr.write(
+      `warning: the store ledger execution \`${execution}\` left could not be pruned (${describe(failure)}); its rows stay and answer nothing (PRD resolved q69)\n`,
+    );
+  }
 }
 
 /**
@@ -14481,6 +14523,11 @@ export function closeExecution(execution: string): void {
   settledJournals.delete(execution);
   openedExecutions.delete(execution);
   closeSession(execution);
+  // A generation that did not settle — parked, diverged, or one whose close
+  // failed — leaves its ledger rows where they are, for the resume that replays
+  // it, and this process forgets which partitions they were in: that resume
+  // notes them again as it replays the writes (PRD resolved q69).
+  void pruneLedgers(execution, false);
 }
 
 /**

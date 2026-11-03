@@ -1256,6 +1256,458 @@ const refusal = async (promise) => {
   }
 }
 
+// --- Expiry (PRD resolved q69) ------------------------------------------------
+//
+// Every case here moves time with the store module's own clock hook rather than
+// by sleeping: `AGENT_COMPOSE_STORE_CLOCK_OFFSET_MS` is read at every op and
+// shifts the clock the arm already reads — `Date.now()` on SQLite, the server's
+// clock inside the statement on a dialled one — so "an hour later" is one
+// environment variable away, on every arm, and the margins can be minutes
+// rather than the milliseconds a real wait would leave.
+
+/** The variable `src/stores.ts` reads its clock offset from. */
+const CLOCK = stores.STORE_CLOCK_OFFSET;
+
+/** An hour: the `ttl` most cases below write, in milliseconds. */
+const HOUR = 3_600_000;
+
+/** A minute, which is every margin either side of an expiry below. */
+const MINUTE = 60_000;
+
+/** Run `work` with the store clock `offset` milliseconds ahead, and put it back. */
+const later = async (offset, work) => {
+  const before = process.env[CLOCK];
+  process.env[CLOCK] = String(offset);
+  try {
+    return await work();
+  } finally {
+    if (before === undefined) delete process.env[CLOCK];
+    else process.env[CLOCK] = before;
+  }
+};
+
+/**
+ * Rows of a store's storage as they really are — expired ones included —
+ * answered by a connection this file opens itself, the way an operator would
+ * look: SQLite's file with the pinned driver, a server over its own socket.
+ * `sql` is written once with `?` placeholders over the dialled schema
+ * (`store_entries`, `store_applied`), and the SQLite form drops the `store`
+ * column, which a file per store does not have.
+ */
+async function storage(sql, parameters, sqliteSql = undefined, sqliteParameters = undefined) {
+  if (provider === "sqlite") {
+    const module = await import("node-sqlite3-wasm");
+    const { Database } = module.default ?? module;
+    const [file, statement, bound] = sqliteSql;
+    const database = new Database(path.join(data, "stores", `${stores.encodeKey(file)}.sqlite`));
+    try {
+      database.exec("PRAGMA busy_timeout = 5000;");
+      return database.all(statement, bound ?? sqliteParameters ?? []);
+    } finally {
+      database.close();
+    }
+  }
+  const server = await openServer(process.env[URL_ENV]);
+  try {
+    let next = 0;
+    const spelled = provider === "postgres" ? sql.replace(/\?/g, () => `$${++next}`) : sql;
+    return await rows(server, spelled, parameters);
+  } finally {
+    await server.end().catch(() => undefined);
+  }
+}
+
+/** How many rows one partition of a store holds in storage, expired ones included. */
+async function storedRows(store, scopeKey) {
+  const counted = await storage(
+    "SELECT COUNT(*) AS n FROM store_entries WHERE store = ? AND scope_key = ?",
+    [store.name, scopeKey],
+    [store.name, "SELECT COUNT(*) AS n FROM entries WHERE scope_key = ?", [scopeKey]],
+  );
+  return Number(counted[0]?.n);
+}
+
+/** How many ledger rows a store holds under one key prefix. */
+async function ledgerRows(store, prefix) {
+  const counted = await storage(
+    "SELECT COUNT(*) AS n FROM store_applied WHERE store = ? AND SUBSTR(idempotency_key, 1, ?) = ?",
+    [store.name, prefix.length, prefix],
+    [
+      store.name,
+      "SELECT COUNT(*) AS n FROM applied WHERE substr(idempotency_key, 1, ?) = ?",
+      [prefix.length, prefix],
+    ],
+  );
+  return Number(counted[0]?.n);
+}
+
+{
+  // A key with a `ttl` is there until its expiry and absent from it on, to
+  // `get` and to `list` alike — and absent the way a key never written is: no
+  // `value`, no `version`.
+  const store = kv("expiry", "global");
+  const run = ctx(execution("expiry"));
+  await later(0, () => write(store, "set", { key: "k", value: { n: 1 }, ttl: HOUR }, run, "e/1"));
+  await later(0, () => write(store, "set", { key: "kept", value: { n: 2 } }, run, "e/2"));
+  const before = await later(HOUR - MINUTE, () => get(store, "k", run));
+  const listedBefore = await later(HOUR - MINUTE, () => list(store, run));
+  const after = await later(HOUR + MINUTE, () => get(store, "k", run));
+  const listedAfter = await later(HOUR + MINUTE, () => list(store, run));
+  answer.a_key_with_a_ttl_is_readable_before_it_expires =
+    before.found === true && before.value?.n === 1 && same(listedBefore.keys, ["k", "kept"]);
+  answer.an_expired_key_is_absent_to_get_and_list =
+    same(after, { found: false }) && same(listedAfter.keys, ["kept"]);
+  answer.expiry_trace = { before, after, listedBefore, listedAfter };
+}
+
+{
+  // Every condition treats an expired key as absent: `if: present` and
+  // `if_version:` decline it with no version to answer, and `if: absent`
+  // applies and takes it — which, with a version, is a lease. Expiry consumes
+  // no version: the key set again takes the partition's very next one.
+  const store = kv("lease", "global");
+  const run = ctx(execution("lease"));
+  const claim = await later(0, () =>
+    write(store, "set", { key: "job", value: { owner: "a" }, condition: "absent", ttl: HOUR }, run, "l/1"),
+  );
+  const held = await later(HOUR - MINUTE, () =>
+    write(store, "set", { key: "job", value: { owner: "b" }, condition: "absent", ttl: HOUR }, run, "l/2"),
+  );
+  const present = await later(HOUR + MINUTE, () =>
+    write(store, "set", { key: "job", value: { owner: "c" }, condition: "present" }, run, "l/3"),
+  );
+  const versioned = await later(HOUR + MINUTE, () =>
+    write(store, "set", { key: "job", value: { owner: "c" }, ifVersion: claim.version }, run, "l/4"),
+  );
+  const retaken = await later(HOUR + MINUTE, () =>
+    write(store, "set", { key: "job", value: { owner: "b" }, condition: "absent", ttl: HOUR }, run, "l/5"),
+  );
+  answer.if_absent_declines_a_key_that_has_not_expired =
+    claim.applied === true && held.applied === false && held.version === claim.version;
+  answer.if_present_and_if_version_decline_an_expired_key_with_no_version =
+    present.applied === false &&
+    !("version" in present) &&
+    versioned.applied === false &&
+    !("version" in versioned);
+  answer.if_absent_applies_on_an_expired_key = retaken.applied === true;
+  answer.a_key_set_again_after_expiring_takes_the_next_version =
+    retaken.version === claim.version + 1 &&
+    (await later(HOUR + MINUTE, () => get(store, "job", run))).value?.owner === "b";
+  answer.lease_trace = { claim, held, present, versioned, retaken };
+}
+
+{
+  // A write refreshes its key's expiry to its own `ttl`; a write naming none on
+  // a store with no default clears it; and a write that declined changes
+  // nothing, the expiry included.
+  const store = kv("refresh", "global", URL_ENV, RECORD);
+  const run = ctx(execution("refresh"));
+  const value = { title: "t", tags: [], count: 0 };
+  await later(0, () => write(store, "set", { key: "r", value, ttl: HOUR }, run, "r/1"));
+  await later(HOUR / 2, () =>
+    write(store, "merge", { key: "r", fields: { note: "kept" }, ttl: HOUR }, run, "r/2"),
+  );
+  const refreshed = await later(HOUR + HOUR / 4, () => get(store, "r", run));
+  const lapsed = await later(HOUR + HOUR / 2 + MINUTE, () => get(store, "r", run));
+
+  await later(0, () => write(store, "set", { key: "c", value, ttl: HOUR }, run, "r/3"));
+  await later(HOUR / 2, () => write(store, "incr", { key: "c", field: "count" }, run, "r/4"));
+  const cleared = await later(10 * HOUR, () => get(store, "c", run));
+
+  await later(0, () => write(store, "set", { key: "d", value, ttl: HOUR }, run, "r/5"));
+  const declined = await later(HOUR / 2, () =>
+    write(store, "set", { key: "d", value, condition: "absent", ttl: "never" }, run, "r/6"),
+  );
+  const unchanged = await later(HOUR + MINUTE, () => get(store, "d", run));
+
+  answer.a_write_refreshes_expiry_to_its_own_ttl =
+    refreshed.found === true && refreshed.value?.note === "kept" && lapsed.found === false;
+  answer.a_write_with_no_ttl_and_no_default_clears_expiry =
+    cleared.found === true && cleared.value?.count === 1;
+  answer.a_declined_write_leaves_expiry_unchanged =
+    declined.applied === false && unchanged.found === false;
+  answer.refresh_trace = { refreshed, lapsed, cleared, declined, unchanged };
+}
+
+{
+  // `default_ttl:` stands in for a write that names no `ttl`, and `ttl: never`
+  // beats it — on a write that sets the key afresh and on one that clears an
+  // expiry the default gave it — as does a write's own duration.
+  const store = { ...kv("defaulted", "global"), defaultTtl: HOUR };
+  const run = ctx(execution("defaulted"));
+  await later(0, () => write(store, "set", { key: "plain", value: { n: 1 } }, run, "d/1"));
+  await later(0, () => write(store, "set", { key: "never", value: { n: 2 }, ttl: "never" }, run, "d/2"));
+  await later(0, () => write(store, "set", { key: "longer", value: { n: 3 }, ttl: 3 * HOUR }, run, "d/3"));
+  await later(0, () => write(store, "set", { key: "cleared", value: { n: 4 } }, run, "d/4"));
+  await later(HOUR / 2, () =>
+    write(store, "set", { key: "cleared", value: { n: 5 }, ttl: "never" }, run, "d/5"),
+  );
+  const at = (key) => later(2 * HOUR, () => get(store, key, run));
+  const [plain, never, longer, cleared] = [
+    await at("plain"),
+    await at("never"),
+    await at("longer"),
+    await at("cleared"),
+  ];
+  answer.a_write_with_no_ttl_takes_the_store_default = plain.found === false;
+  answer.ttl_never_clears_a_store_default = never.found === true && cleared.value?.n === 5;
+  answer.a_writes_own_ttl_beats_the_store_default = longer.found === true;
+  answer.default_trace = { plain, never, longer, cleared };
+}
+
+{
+  // The partial updates take a `ttl` like a `set`: an `append` and an `incr`
+  // that create their key date it, and an `append` with `unique: true` whose
+  // item is already there — which changes neither value nor version — still
+  // refreshes the expiry, because it applied.
+  const store = kv("partial_expiry", "global", URL_ENV, RECORD);
+  const run = ctx(execution("partial_expiry"));
+  await later(0, () =>
+    write(store, "set", { key: "u", value: { title: "u", tags: ["a"], count: 0 }, ttl: HOUR }, run, "p/2"),
+  );
+  const same_ = await later(HOUR / 2, () =>
+    write(store, "append", { key: "u", field: "tags", value: "a", unique: true, ttl: HOUR }, run, "p/3"),
+  );
+  const refreshed = await later(HOUR + HOUR / 4, () => get(store, "u", run));
+  await later(0, () =>
+    write(store, "set", { key: "a", value: { title: "a", tags: [], count: 0 } }, run, "p/4"),
+  );
+  await later(0, () => write(store, "append", { key: "a", field: "tags", value: "x", ttl: HOUR }, run, "p/5"));
+  await later(0, () => write(store, "incr", { key: "a", field: "count", ttl: 3 * HOUR }, run, "p/6"));
+  const appended = await later(2 * HOUR, () => get(store, "a", run));
+  await later(0, () =>
+    write(store, "merge", { key: "m", fields: { title: "m", tags: [], count: 1 }, ttl: HOUR }, run, "p/7"),
+  );
+  const merged = await later(HOUR + MINUTE, () => get(store, "m", run));
+  answer.a_unique_append_that_changes_nothing_still_refreshes_expiry =
+    same_.applied === true && refreshed.found === true && refreshed.version === same_.version;
+  answer.merge_append_and_incr_each_take_a_ttl =
+    appended.found === true && same(appended.value?.tags, ["x"]) && merged.found === false;
+  answer.partial_expiry_trace = { same: same_, refreshed, appended, merged };
+}
+
+{
+  // **An expired key is invisible at once and leaves storage lazily**: it is
+  // still a row until a write to its partition sweeps it — and that sweep is
+  // bounded, so a backlog of 150 loses 100 to one write and the rest to the
+  // next.
+  const store = kv("sweep", "global");
+  const run = ctx(execution("sweep"));
+  await later(0, async () => {
+    // One key that never expires, beside 150 that do, so every count below is
+    // the expired rows still stored plus the ones that are alive.
+    await write(store, "set", { key: "kept", value: { n: -1 } }, run);
+    for (let index = 0; index < 150; index += 1) {
+      await write(store, "set", { key: `old-${String(index).padStart(3, "0")}`, value: { n: index }, ttl: HOUR }, run);
+    }
+  });
+  const seeded = await storedRows(store, "global");
+  const listed = await later(HOUR + MINUTE, () => list(store, run, undefined, 1000));
+  const read = await later(HOUR + MINUTE, () => get(store, "old-007", run));
+  const beforeSweep = await storedRows(store, "global");
+  await later(HOUR + MINUTE, () => write(store, "set", { key: "new-1", value: { n: 0 } }, run));
+  const afterOne = await storedRows(store, "global");
+  await later(HOUR + MINUTE, () => write(store, "set", { key: "new-2", value: { n: 0 } }, run));
+  const afterTwo = await storedRows(store, "global");
+  answer.an_expired_key_stays_invisible_until_a_write_removes_it =
+    seeded === 151 && beforeSweep === 151 && same(listed.keys, ["kept"]) && read.found === false;
+  // 150 expired and one alive; one write removes 100 and adds itself.
+  answer.the_write_sweep_removes_at_most_100_rows = afterOne === 151 - 100 + 1;
+  // …and the next removes the other 50: `kept`, `new-1` and `new-2` are left.
+  answer.an_expired_key_leaves_storage_at_the_next_writes_to_its_partition = afterTwo === 3;
+  answer.sweep_trace = { seeded, beforeSweep, afterOne, afterTwo };
+}
+
+{
+  // …or when a process next opens the store, whichever comes first: a process
+  // whose first op on the store is a **read** still removes every expired key
+  // of it, every partition included. The second process is real — the open is
+  // per process on SQLite, and per connection on a server — and it reads the
+  // clock the parent hands it.
+  const script = path.join(path.dirname(fileURLToPath(import.meta.url)), "store-expiry-open.mjs");
+  const store = kv("reopen_expiry", "session", THIRD_URL_ENV);
+  try {
+    for (const session of ["a", "b"]) {
+      const run = ctx(execution(`reopen_expiry_${session}`), session);
+      await later(0, async () => {
+        for (let index = 0; index < 3; index += 1) {
+          await write(store, "set", { key: `k${index}`, value: { n: index }, ttl: HOUR }, run);
+        }
+        await write(store, "set", { key: "kept", value: { n: 9 } }, run);
+      });
+    }
+    const before = [await storedRows(store, "session/a"), await storedRows(store, "session/b")];
+    const opened = await new Promise((resolve, reject) => {
+      const child = spawn(
+        process.execPath,
+        [script, project, provider, data, JSON.stringify(store), "a"],
+        {
+          env: { ...process.env, [CLOCK]: String(HOUR + MINUTE) },
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+      let out = "";
+      let err = "";
+      child.stdout.on("data", (chunk) => (out += chunk));
+      child.stderr.on("data", (chunk) => (err += chunk));
+      child.on("error", reject);
+      child.on("close", (code) =>
+        code === 0 ? resolve(JSON.parse(out)) : reject(new Error(`the opener exited ${code}: ${err}`)),
+      );
+    });
+    const after = [await storedRows(store, "session/a"), await storedRows(store, "session/b")];
+    answer.an_expired_key_leaves_storage_when_a_process_next_opens_the_store =
+      same(before, [4, 4]) && same(after, [1, 1]) && opened.found === false;
+    answer.reopen_trace = { before, after, opened };
+  } catch (error) {
+    answer.reopen_error = String(error?.message ?? error);
+  }
+}
+
+{
+  // A clock offset nobody can read fails the op by name rather than being
+  // read as no offset — a test that believed it moved the clock and did not
+  // would pass for the wrong reason.
+  const store = kv("bad_clock", "global");
+  const run = ctx(execution("bad_clock"));
+  const refused = await later("an hour", () => refusal(get(store, "k", run)));
+  answer.a_malformed_clock_offset_is_refused_by_name = (refused ?? "").includes(CLOCK);
+}
+
+if (provider !== "sqlite") {
+  // **A dialled store's expiry is the server's clock's**, so two writers whose
+  // own clocks disagree still agree about which keys are alive. This process's
+  // clock is moved ten days ahead for the write; what the row holds is the
+  // server's instant plus the `ttl`, and the key is alive to a reader on the
+  // server's clock.
+  const store = kv("server_clock", "global");
+  const run = ctx(execution("server_clock"));
+  const realNow = Date.now;
+  Date.now = () => realNow() + 10 * 24 * HOUR;
+  let written;
+  try {
+    written = await write(store, "set", { key: "k", value: { n: 1 }, ttl: HOUR }, run);
+  } finally {
+    Date.now = realNow;
+  }
+  // The server's own clock, spelled here rather than borrowed from the arm, so
+  // the case does not take the arm's word for what that clock is. Epoch time
+  // is zone-free on Postgres; MySQL's `UNIX_TIMESTAMP()` with no argument is
+  // too, at a second's resolution — well inside the margin.
+  const [held] = await storage(
+    provider === "postgres"
+      ? 'SELECT expires_at, FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint AS server_now FROM store_entries WHERE store = ? AND "key" = ?'
+      : "SELECT expires_at, UNIX_TIMESTAMP() * 1000 AS server_now FROM store_entries WHERE store = ? AND `key` = ?",
+    [store.name, "k"],
+  );
+  const ahead = Number(held?.expires_at) - Number(held?.server_now);
+  answer.expiry_is_computed_by_the_servers_clock =
+    written?.applied === true && ahead > HOUR - MINUTE && ahead < HOUR + MINUTE;
+  answer.server_clock_trace = { ahead };
+}
+
+// --- Ledger retention (PRD resolved q69) --------------------------------------
+//
+// Driven through the runtime's own lifecycle — `openExecution`, then
+// `settleExecution` and `closeExecution`, exactly as `runFlow` calls them — so
+// what prunes the ledger is the hook a settled execution really reaches, over
+// this arm's store.
+
+/** Begin one execution's journal row, as `runFlow` does before its graph. */
+const begin_ = (id, extra = {}) =>
+  runtime.openExecution({
+    execution: id,
+    flow: "flow.probe",
+    trigger: "manual",
+    inputs: {},
+    sessionKey: "",
+    ...extra,
+  });
+
+/** Settle and close one execution, as `runFlow` does on its way out. */
+const settle = async (id, error = undefined) => {
+  try {
+    await runtime.settleExecution(id, error);
+  } finally {
+    runtime.closeExecution(id);
+  }
+};
+
+{
+  // **A store taking writes across N executions holds a bounded ledger**: each
+  // keyed write leaves a row while its execution is open, and the row goes when
+  // the execution settles — completed or failed — while the data it wrote
+  // stays.
+  const store = kv("ledger", "global");
+  const ids = Array.from({ length: 6 }, (_, index) => execution(`ledger_${index}`));
+  const held = [];
+  for (const [index, id] of ids.entries()) {
+    await begin_(id);
+    for (let write_ = 0; write_ < 3; write_ += 1) {
+      await set(store, `k-${index}-${write_}`, { n: write_ }, ctx(id), `${id}/save/${write_}`);
+    }
+    held.push(await ledgerRows(store, `${id}/`));
+    await settle(id, index % 2 === 0 ? undefined : new Error("this execution failed"));
+  }
+  const left = await ledgerRows(store, `exec_${RUN}_ledger_`);
+  const data = (await list(store, ctx(execution("ledger_read")), "k-", 1000)).keys.length;
+  answer.an_open_executions_writes_hold_their_ledger_rows = held.every((count) => count === 3);
+  answer.settled_executions_leave_no_ledger_rows = left === 0;
+  answer.a_settled_executions_data_stays = data === 18;
+  answer.ledger_trace = { held, left, data };
+}
+
+{
+  // **An execution the journal still holds open keeps every row**, so its
+  // resume still writes nothing twice; and a prune is the settled execution's
+  // own prefix, never another's whose id merely begins with it.
+  const store = kv("ledger_open", "global");
+  const parked = execution("ledger_open_1");
+  const neighbour = execution("ledger_open_10");
+  await begin_(parked);
+  await set(store, "a", { n: 1 }, ctx(parked), `${parked}/save/0`);
+  // A generation that stops without settling — a crash, a parked pause.
+  runtime.closeExecution(parked);
+  await begin_(neighbour);
+  await set(store, "b", { n: 1 }, ctx(neighbour), `${neighbour}/save/0`);
+  const kept = await ledgerRows(store, `${parked}/`);
+  // The resume: the same write at the same site is answered from the ledger.
+  await begin_(parked, { resuming: true });
+  const resumed = await set(store, "a", { n: 2 }, ctx(parked), `${parked}/save/0`);
+  await settle(parked);
+  const pruned = await ledgerRows(store, `${parked}/`);
+  const neighbourKept = await ledgerRows(store, `${neighbour}/`);
+  await settle(neighbour);
+  answer.an_unsettled_executions_ledger_rows_are_kept = kept === 1;
+  answer.a_resume_of_an_unsettled_execution_still_dedupes =
+    resumed.deduped === true && resumed.applied === true &&
+    (await get(store, "a", ctx(execution("ledger_open_read")))).value?.n === 1;
+  answer.a_prune_reaches_only_its_own_executions_prefix = pruned === 0 && neighbourKept === 1;
+  answer.ledger_open_trace = { kept, resumed, pruned, neighbourKept };
+}
+
+{
+  // **A child execution's rows go when the child settles**, under the child's
+  // own id, while its parent — still open — keeps its own.
+  const store = kv("ledger_child", "global");
+  const parent = execution("ledger_parent");
+  await begin_(parent);
+  await set(store, "p", { n: 1 }, ctx(parent), `${parent}/dispatch/0/0/save/0`);
+  const dispatch = `${parent}/dispatch/0/0`;
+  const child = runtime.childExecutionId(parent, dispatch);
+  await begin_(child, { lineage: { parent, idempotencyKey: dispatch } });
+  await set(store, "c", { n: 1 }, ctx(child), `${child}/save/0`);
+  const before = [await ledgerRows(store, `${parent}/`), await ledgerRows(store, `${child}/`)];
+  await settle(child);
+  const childSettled = [await ledgerRows(store, `${parent}/`), await ledgerRows(store, `${child}/`)];
+  await settle(parent);
+  const parentSettled = await ledgerRows(store, `${parent}/`);
+  answer.a_childs_ledger_rows_go_when_the_child_settles =
+    same(before, [1, 1]) && same(childSettled, [1, 0]);
+  answer.a_parents_ledger_rows_go_when_the_parent_settles = parentSettled === 0;
+  answer.ledger_child_trace = { before, childSettled, parentSettled };
+}
+
 // --- Two writers, one store, last write wins ---------------------------------
 
 {
