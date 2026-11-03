@@ -1118,7 +1118,8 @@ fn batch_entry(mut fields: Fields<'_>, subject: &str, cx: &mut Cx) -> BatchEntry
 
     // The keys a `delete` entry does not take, each refused with the reason
     // the single `delete` row gives it.
-    if let Some(op) = op.as_ref().filter(|op| op.value == BatchOp::Delete) {
+    let deletes = op.as_ref().is_some_and(|op| op.value == BatchOp::Delete);
+    if let Some(op) = op.as_ref().filter(|_| deletes) {
         for (name, why) in [
             (
                 "value",
@@ -1150,19 +1151,23 @@ fn batch_entry(mut fields: Fields<'_>, subject: &str, cx: &mut Cx) -> BatchEntry
         }
     }
 
+    // A key refused above is not read again: reading it would parse it a
+    // second time and report its YAML too, so `{ op: delete, value: 5 }` — one
+    // mistake — would also draw "expected a mapping for `value`", and `if:`
+    // beside `if_version:` a `conflicting-keys` as well, each pointing at the
+    // value rather than at the key that has to go. The single `delete` reads
+    // its row through `store_param` for the same reason.
     let key = fields
         .take("key")
         .and_then(|node| lexical::cel(node, "`key`", cx));
-    let value = fields
-        .take("value")
+    let value = entry_param(&mut fields, deletes, "value")
         .and_then(|node| binding::bindings(node, "`value`", NameForm::Identifier, cx));
-    let condition = fields
-        .take("if")
+    let condition = entry_param(&mut fields, deletes, "if")
         .and_then(|node| lexical::keyword(node, "`if`", STORE_CONDITIONS, cx));
     let if_version = fields
         .take("if_version")
         .and_then(|node| lexical::cel(node, "`if_version`", cx));
-    let ttl = fields.take("ttl").and_then(|node| store_ttl(node, cx));
+    let ttl = entry_param(&mut fields, deletes, "ttl").and_then(|node| store_ttl(node, cx));
 
     if let Some(op) = &op {
         // A missing key is reported against the entry, and only when it is
@@ -1227,6 +1232,16 @@ fn batch_entry(mut fields: Fields<'_>, subject: &str, cx: &mut Cx) -> BatchEntry
         ttl,
         span,
     }
+}
+
+/// The value under one key a `set` entry takes, unless the entry is a `delete`
+/// — whose `value`, `if` and `ttl` [`batch_entry`] has already refused by name,
+/// exactly as [`store_param`] leaves a single op's refused parameter unread.
+fn entry_param<'a>(fields: &mut Fields<'a>, deletes: bool, name: &'static str) -> Option<&'a Node> {
+    if deletes {
+        return None;
+    }
+    fields.take(name)
 }
 
 /// A `batch` entry's `op:` — the literal `set` or `delete`.
