@@ -42,6 +42,7 @@
 //! | [`cycles`] | 7.4 | every SCC is bounded, and every bounded edge has an escape |
 //! | [`convergence`] | 7.6.1, 7.6.2, 10.2 | forks and co-takeable pairs, balanced convergence, and the concurrent-branch half of the reduced-channel rule |
 //! | [`reachable`] | 7.8 | every node is reachable from its flow's `start` |
+//! | [`finally`] | 7.9, 8.7 | a flow's `finally:` node: nothing routes to it or from it, it is no `human` node and reaches none, and it declares no `on_error:` |
 //! | [`components`] | 7.5, 7.7, 13.3 | recursion, and a `respond: sync` trigger's flow reaching a `human` node |
 //! | [`placements`] | 14.1 | an attached tool's placement against the placement of every agent that attaches it, and a store on a process-local backend against the processes that can open it |
 //! | [`fanout`] | 8.6 | `map.over` dominance, and `detach:` under a durably checkpointed target |
@@ -85,6 +86,7 @@ pub(crate) mod convergence;
 pub(crate) mod cycles;
 pub(crate) mod expr;
 pub(crate) mod fanout;
+pub(crate) mod finally;
 pub(crate) mod graph;
 pub(crate) mod guards;
 pub(crate) mod harnesses;
@@ -163,9 +165,14 @@ pub fn check(ir: &Ir) -> Vec<Diagnostic> {
         let DefinitionBody::Flow(flow) = &definition.body else {
             continue;
         };
-        let cx = FlowCx { address, flow };
+        let cx = FlowCx {
+            address,
+            flow,
+            finally: false,
+        };
         let graph = graph::Graph::new(flow);
         reachable::check(&mut ctx, &cx, &graph);
+        finally::check(&mut ctx, &cx, &graph);
         routing::check(&mut ctx, &cx, &graph);
         cycles::check(&mut ctx, &cx, &graph);
         let forks = convergence::check(&mut ctx, &cx, &graph);
@@ -183,9 +190,21 @@ pub fn check(ir: &Ir) -> Vec<Diagnostic> {
 }
 
 fn flow_definition<'a>(ctx: &mut Ctx<'a>, address: &'a str, flow: &'a Flow) {
-    let cx = FlowCx { address, flow };
+    let cx = FlowCx {
+        address,
+        flow,
+        finally: false,
+    };
     channels::flow_outputs(ctx, &cx);
     for node in &flow.nodes {
+        // A node's own expressions are checked under a context that says
+        // whether they are the `finally:` node's, because that is the one
+        // node whose `execution` root carries `outcome` and `error`
+        // (grammar 4.1, 7.9, Decision D159).
+        let cx = FlowCx {
+            finally: flow.is_finally(node),
+            ..cx
+        };
         bindings::node(ctx, &cx, node);
         bindings::builtin_node_targets(ctx, node);
         channels::node_writes(ctx, &cx, node);
@@ -212,6 +231,14 @@ pub(crate) struct FlowCx<'a> {
     pub(crate) address: &'a str,
     /// The definition.
     pub(crate) flow: &'a Flow,
+    /// Whether the expressions being checked are the flow's **`finally:`
+    /// node's** own — its input bindings, its block's expressions, its
+    /// per-item bindings — which is the one place `execution.outcome` and
+    /// `execution.error` are in scope (grammar 4.1, 7.9, Decision D159).
+    /// `false` for everything stated over the flow as a whole, edge guards
+    /// included: a guard is never the finally node's, because nothing routes
+    /// to it or from it.
+    pub(crate) finally: bool,
 }
 
 /// What a construct accepts as its input (grammar 8.0, 5.3).

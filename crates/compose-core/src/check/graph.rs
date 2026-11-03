@@ -130,6 +130,11 @@ pub(crate) struct Graph<'a> {
     /// [`Graph::distances`] relaxes in, shared by every branch it is asked
     /// about. Computed on first use, for the same reason.
     acyclic_order: OnceCell<Vec<usize>>,
+    /// The flow's `finally:` node, by index (grammar 7.9). Not a vertex of
+    /// either relation above: nothing transfers control to it and it transfers
+    /// control to nothing, so it enters this graph only where grammar 7.8
+    /// clause 4 says it does — as a node reachable because it is `finally:`.
+    finally: Option<usize>,
 }
 
 impl<'a> Graph<'a> {
@@ -223,6 +228,10 @@ impl<'a> Graph<'a> {
             cyclic,
             reachable: OnceCell::new(),
             acyclic_order: OnceCell::new(),
+            finally: flow
+                .finally
+                .as_ref()
+                .and_then(|named| index.get(named.value.as_str()).copied()),
         }
     }
 
@@ -375,6 +384,13 @@ impl<'a> Graph<'a> {
         if dominator == node {
             return true;
         }
+        // The one node grammar 7.8 reaches without an edge path that *is* asked
+        // about: the `finally:` node runs however its instance ended, which may
+        // be before any other node ran at all, so no node of the flow dominates
+        // it (grammar 7.9, Decision D159).
+        if self.finally == Some(node) {
+            return false;
+        }
         if !walk(self.nodes.len(), &self.successors, self.entries())[node] {
             return true;
         }
@@ -386,9 +402,22 @@ impl<'a> Graph<'a> {
 
     /// Every node reachable from `start` over the **control-transfer** relation:
     /// edges, `on_error: { fallback: … }`, and `human.on_timeout:`
-    /// (grammar 7.8, Decision D95).
+    /// (grammar 7.8, Decision D95) — and the flow's `finally:` node, which is
+    /// reachable because it is `finally:` (grammar 7.8 clause 4, Decision
+    /// D159): every instance that ends runs it, so it is live code whatever the
+    /// edges say, exactly as a node addressed only by a fallback is.
     pub(crate) fn addressable(&self) -> Vec<bool> {
-        walk(self.nodes.len(), &self.transfers, self.entries())
+        walk(
+            self.nodes.len(),
+            &self.transfers,
+            self.entries().chain(self.finally),
+        )
+    }
+
+    /// The flow's `finally:` node, by index, where it declares one that
+    /// resolved (grammar 7.9).
+    pub(crate) const fn finally(&self) -> Option<usize> {
+        self.finally
     }
 
     /// The step distances from a fork to every node it delivers to, over the

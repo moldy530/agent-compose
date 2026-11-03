@@ -170,11 +170,14 @@ const TOPICS_WITHOUT_A_RUNNABLE_EXAMPLE: &[(&str, &str)] = &[
 /// that says which edit produces the quiet report.
 const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
     "conflicting-connection-variable",
+    "finally-interrupt",
     "invalid-path-expression",
     "missing-callback-allowlist",
     "missing-capability",
     "missing-credential",
+    "outcome-outside-finally",
     "reserved-harness-setting",
+    "routed-finally",
     "shared-workspace",
     "unbalanced-convergence",
     "undefined-channel",

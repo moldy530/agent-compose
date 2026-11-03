@@ -1,0 +1,25 @@
+# rule: no `human.on_timeout:` names a flow's `finally:` node (grammar 7.9, 8.7, Decision D159)
+# code: routed-finally
+# message: the `human` node `ask` of `flow.f` times out to `cleanup`, which is the flow's `finally:` node
+# at: main.yml:18:21
+# label: main.yml:25:12 `finally:` names it here
+# help: a finally node is outside routing: the instance ending is what runs it, once, whatever the outcome — so nothing routes to it, it routes to nothing, and it needs no edge to be reachable (grammar 7.8 clause 4). Delete this, and route the branch to `end` where it is done (grammar 7.9, Decision D159)
+version: "0.1"
+flow.f:
+  outputs: {}
+  nodes:
+    ask:
+      human:
+        input:
+          note: { type: string }
+        output:
+          ok: { type: boolean }
+        timeout: 1h
+        on_timeout: cleanup
+      input: { note: "'approve?'" }
+    cleanup:
+      exec: { command: "true" }
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+  finally: cleanup

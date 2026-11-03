@@ -81,6 +81,27 @@ fn dominance<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>, at: usiz
     if graph.dominates(producer, at) {
         return;
     }
+    if graph.finally() == Some(at) {
+        ctx.push(
+            Diagnostic::error(
+                DiagnosticCode::NonDominatingSource,
+                map.over.span.clone(),
+                format!(
+                    "`over` of the `map` of node `{}` in `{}` reads `{root}`, and nothing dominates a flow's `finally:` node",
+                    graph.id(at),
+                    cx.address
+                ),
+            )
+            .with_label(
+                graph.node(producer).id.span.clone(),
+                "the producer is declared here",
+            )
+            .with_help(
+                "the finally node runs however its instance ended — which may be before the producer ran at all — so a node output is never guaranteed to exist there: fan out over a state channel, which holds its `default:` or the last value written (grammar 7.9, 8.6 rule 11, Decisions D76, D159)",
+            ),
+        );
+        return;
+    }
     ctx.push(
         Diagnostic::error(
             DiagnosticCode::NonDominatingSource,

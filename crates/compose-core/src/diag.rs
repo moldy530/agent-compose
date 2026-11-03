@@ -397,6 +397,13 @@ pub enum DiagnosticCode {
     UnknownField,
     /// Two declared types meet and the source cannot land in the target.
     TypeMismatch,
+    /// An expression reads `execution.outcome` or `execution.error` anywhere
+    /// but inside its flow's `finally:` node, the one place either exists
+    /// (grammar 4.1, 7.9, Decision D159, PRD resolved q76). Its own class rather
+    /// than an [`UnknownField`](Self::UnknownField): the field is spelled right
+    /// and is a member of the root — at another site — so the repair is moving
+    /// the read, never correcting it.
+    OutcomeOutsideFinally,
 
     // --- state (grammar 10) -----------------------------------------------
     /// A `state.*` read, a `writes:` destination, or a flow `outputs:` field
@@ -578,6 +585,18 @@ pub enum DiagnosticCode {
     /// A **detached** `map` dispatch reaches a `human` node (grammar 8.6 rule 7,
     /// 8.7, Decision D118).
     DetachedInterrupt,
+    /// A flow's `finally:` node is a `human` node, or reaches one (grammar 7.9,
+    /// 8.7, Decision D159, PRD resolved q76): a step that must always finish
+    /// cannot park. The third interrupt-freedom rule over grammar 7.7's relation,
+    /// beside [`SyncTriggerInterrupt`](Self::SyncTriggerInterrupt) and
+    /// [`DetachedInterrupt`](Self::DetachedInterrupt).
+    FinallyInterrupt,
+    /// An edge, an `on_error: { fallback: … }` or a `human.on_timeout:` names a
+    /// flow's `finally:` node, or an edge leaves it — or the node declares an
+    /// `on_error:` of its own (grammar 7.9, Decision D159, PRD resolved q76).
+    /// The finally node is outside routing: nothing transfers control to it, it
+    /// transfers control to nothing, and its failure has one meaning.
+    RoutedFinally,
 
     // --- triggers (grammar 13.3) ------------------------------------------
     /// Two `http` triggers declare one route: the same effective `path:` at the
@@ -721,6 +740,7 @@ impl DiagnosticCode {
         Self::UnknownRoot,
         Self::UnknownField,
         Self::TypeMismatch,
+        Self::OutcomeOutsideFinally,
         Self::UndefinedChannel,
         Self::UnreducedWrite,
         Self::ConflictingWrites,
@@ -754,6 +774,8 @@ impl DiagnosticCode {
         Self::NonDominatingSource,
         Self::UnsupportedDetach,
         Self::DetachedInterrupt,
+        Self::FinallyInterrupt,
+        Self::RoutedFinally,
         Self::DuplicateRoute,
         Self::ConflictingSessionKey,
         Self::MissingCallbackAllowlist,
@@ -811,6 +833,7 @@ impl DiagnosticCode {
             Self::UnknownRoot => "unknown-root",
             Self::UnknownField => "unknown-field",
             Self::TypeMismatch => "type-mismatch",
+            Self::OutcomeOutsideFinally => "outcome-outside-finally",
             Self::UndefinedChannel => "undefined-channel",
             Self::UnreducedWrite => "unreduced-write",
             Self::ConflictingWrites => "conflicting-writes",
@@ -844,6 +867,8 @@ impl DiagnosticCode {
             Self::NonDominatingSource => "non-dominating-source",
             Self::UnsupportedDetach => "unsupported-detach",
             Self::DetachedInterrupt => "detached-interrupt",
+            Self::FinallyInterrupt => "finally-interrupt",
+            Self::RoutedFinally => "routed-finally",
             Self::DuplicateRoute => "duplicate-route",
             Self::ConflictingSessionKey => "conflicting-session-key",
             Self::MissingCallbackAllowlist => "missing-callback-allowlist",

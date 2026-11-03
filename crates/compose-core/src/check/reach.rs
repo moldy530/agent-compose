@@ -184,6 +184,41 @@ pub(crate) fn reached_by(ir: &Ir, target: &Address) -> Reached {
     found
 }
 
+/// Everything one **node** reaches (grammar 7.7 clauses 1 and 2, asked of a
+/// single node rather than of its whole flow).
+///
+/// What a flow's `finally:` node is held to (grammar 7.9, Decision D159): the
+/// `human` node itself for a `human:` node, what an `agent.*` or a `flow.*` it
+/// names reaches, and what every dispatch target of a `map` reaches — the
+/// relation [`reached_by`] answers for one address, applied to each address the
+/// node's kind key names. A `function:`, `store:`, `exec:`, `http:` or `coder:`
+/// node reaches none of what this relation is about.
+pub(crate) fn reached_by_node(ir: &Ir, holder: &str, node: &Node) -> Reached {
+    let mut found = Reached::default();
+    let merge = |into: &mut Reached, from: Reached| {
+        into.stores.extend(from.stores);
+        into.humans.extend(from.humans);
+        into.placeable.extend(from.placeable);
+    };
+    match &node.kind {
+        NodeKind::Human { .. } => {
+            found.humans.insert(
+                (holder.to_string(), node.id.value.to_string()),
+                node.id.span.clone(),
+            );
+        }
+        NodeKind::Agent { agent } => merge(&mut found, reached_by(ir, &agent.value)),
+        NodeKind::Flow { flow, .. } => merge(&mut found, reached_by(ir, &flow.value)),
+        NodeKind::Map { map } => {
+            for target in targets(&map.dispatch) {
+                merge(&mut found, reached_by(ir, &target.value));
+            }
+        }
+        _ => {}
+    }
+    found
+}
+
 /// The traversal itself: a worklist of flow addresses, each visited once.
 ///
 /// What it collects is order-independent — a set of stores and a map of `human`

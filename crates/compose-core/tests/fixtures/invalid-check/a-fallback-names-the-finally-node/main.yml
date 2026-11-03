@@ -1,0 +1,22 @@
+# rule: no `on_error: { fallback: ... }` names a flow's `finally:` node (grammar 7.9, 9.2, Decision D159)
+# code: routed-finally
+# message: node `work` of `flow.f` falls back to `cleanup`, which is the flow's `finally:` node
+# at: main.yml:16:29
+# label: main.yml:22:12 `finally:` names it here
+# help: a finally node is outside routing: the instance ending is what runs it, once, whatever the outcome — so nothing routes to it, it routes to nothing, and it needs no edge to be reachable (grammar 7.8 clause 4). Delete this, and route the branch to `end` where it is done (grammar 7.9, Decision D159)
+#
+# A fallback schedules its target exactly as an edge does (grammar 7.8), so it
+# is the same mistake an edge into the finally node is.
+version: "0.1"
+flow.f:
+  outputs: {}
+  nodes:
+    work:
+      exec: { command: "true" }
+      on_error: { fallback: cleanup }
+    cleanup:
+      exec: { command: "true" }
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: cleanup

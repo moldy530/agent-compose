@@ -96,6 +96,7 @@ pub fn explanation(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::UnknownRoot => include_str!("codes/unknown-root.md"),
         DiagnosticCode::UnknownField => include_str!("codes/unknown-field.md"),
         DiagnosticCode::TypeMismatch => include_str!("codes/type-mismatch.md"),
+        DiagnosticCode::OutcomeOutsideFinally => include_str!("codes/outcome-outside-finally.md"),
         DiagnosticCode::UndefinedChannel => include_str!("codes/undefined-channel.md"),
         DiagnosticCode::UnreducedWrite => include_str!("codes/unreduced-write.md"),
         DiagnosticCode::ConflictingWrites => include_str!("codes/conflicting-writes.md"),
@@ -149,6 +150,8 @@ pub fn explanation(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::NonDominatingSource => include_str!("codes/non-dominating-source.md"),
         DiagnosticCode::UnsupportedDetach => include_str!("codes/unsupported-detach.md"),
         DiagnosticCode::DetachedInterrupt => include_str!("codes/detached-interrupt.md"),
+        DiagnosticCode::FinallyInterrupt => include_str!("codes/finally-interrupt.md"),
+        DiagnosticCode::RoutedFinally => include_str!("codes/routed-finally.md"),
         DiagnosticCode::DuplicateRoute => include_str!("codes/duplicate-route.md"),
         DiagnosticCode::ConflictingSessionKey => include_str!("codes/conflicting-session-key.md"),
         DiagnosticCode::MissingCallbackAllowlist => {
