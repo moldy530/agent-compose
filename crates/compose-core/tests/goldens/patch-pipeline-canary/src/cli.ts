@@ -1522,9 +1522,13 @@ const LAST_INSTANT = 8.64e15;
  *
  * The exit codes are the project's, read for a store: `0` found or applied;
  * `1` the answer is no — a `get` that found nothing, a condition that did not
- * hold, a value the store's `value_schema` refused, or a backend that failed;
- * `2` the command could not run — a flag, a store address, a sub-verb or a
- * partition the command does not take (PRD resolved q72).
+ * hold, or a backend that failed; `2` the command could not run — a flag, a
+ * store address, a sub-verb or a partition the command does not take, or a
+ * value the store's `value_schema` refuses (PRD resolved q72). A refused value
+ * is usage rather than an answer of no for the reason an `--input` that does
+ * not fit its type is usage to `run` (grammar 13.2): nothing was read or
+ * written, and what is to fix is what was typed — so a supervisor retrying on
+ * `1` never retries a `set` or an `import` that cannot succeed.
  *
  * **Standard output is watched from the first line**, because a pipe's reader
  * may leave before the answer is written (`| head -1`), and a stream that fails
@@ -1569,8 +1573,8 @@ async function storeVerb(argv: readonly string[]): Promise<number> {
     code = await storeSubverb(name, target, operands, options, format);
   } catch (error) {
     if (error instanceof UsageError) throw error;
-    // The answer is no, and the backend said why: a value the schema refused,
-    // a server that is not there, a provider this release does not open.
+    // The answer is no, and the backend said why: a server that is not there,
+    // a provider this release does not open.
     code = failed(format, error instanceof Error ? error.message : String(error));
   }
   const lost = await delivered();
@@ -1731,7 +1735,8 @@ async function storeGet(target: OperatorTarget, key: string, format: Format): Pr
  * The value is held to the store's `value_schema` by the emitted Zod before
  * anything is written, which is the check a store-op node's `value:` meets at
  * `validate` and a synthesized tool's meets at its argument schema: a store
- * holds what its schema admits whoever wrote it.
+ * holds what its schema admits whoever wrote it. A value it refuses is exit
+ * `2`, as a value that is not JSON is: the command line is what is to fix.
  */
 async function storeSet(
   target: OperatorTarget,
@@ -1757,8 +1762,10 @@ async function storeSet(
   };
   const refusal = schemaRefusal(target.store, value);
   if (refusal !== undefined) {
-    throw new Error(
+    return failed(
+      format,
       `\`${target.store.address}\` refused the value for ${JSON.stringify(key)}: ${refusal}. Nothing was written: a value is held to the store's \`value_schema\` before it reaches the store (grammar 11.1)`,
+      2,
     );
   }
   const row = await runOperatorOp(target, "set", params);
@@ -1903,18 +1910,19 @@ interface ImportedLine {
  * `--file`.
  *
  * **Every line is read and held to the schema before any is written**, so a
- * file with a line the store refuses writes nothing and names each such line;
- * a backend that fails part-way leaves the lines before it written and says
- * how many. Each line is one write through the normal write path, so it takes
- * the partition's **next** version — the exported `version` is not restored,
- * because a version is the partition's sequence and a restored one could be a
- * version some key already showed (PRD resolved q68). An `expires_at` still
- * ahead of the store's clock becomes the `ttl` that leaves it there; one
- * already past skips the line, which is counted; a line with none writes a key
- * that does not expire, whatever the store's `default_ttl:` says, so an export
- * and an import of it leave the same keys alive. `--if-absent` writes each
- * line under `if: absent`, so a key the partition already holds is kept and
- * counted rather than overwritten.
+ * file with a line the store refuses writes nothing and names each such line,
+ * exit `2` — nothing was written, and the file is what is to fix, as a `set`'s
+ * refused value is; a backend that fails part-way leaves the lines before it
+ * written, says how many, and is exit `1`. Each line is one write through the
+ * normal write path, so it takes the partition's **next** version — the
+ * exported `version` is not restored, because a version is the partition's
+ * sequence and a restored one could be a version some key already showed (PRD
+ * resolved q68). An `expires_at` still ahead of the store's clock becomes the
+ * `ttl` that leaves it there; one already past skips the line, which is
+ * counted; a line with none writes a key that does not expire, whatever the
+ * store's `default_ttl:` says, so an export and an import of it leave the same
+ * keys alive. `--if-absent` writes each line under `if: absent`, so a key the
+ * partition already holds is kept and counted rather than overwritten.
  */
 async function storeImport(
   target: OperatorTarget,
@@ -1935,13 +1943,10 @@ async function storeImport(
   });
   if (refused.length > 0) {
     const message = `${refused.length === 1 ? "a line" : `${refused.length} lines`} of the import could not be written to \`${target.store.address}\`, so none was`;
-    if (format === "json") {
-      answered({ error: message, lines: refused }, 1);
-    } else {
-      process.stderr.write(`error: ${message}:\n`);
-      for (const { line, error } of refused) process.stderr.write(`  line ${line}: ${error}\n`);
-    }
-    return 1;
+    if (format === "json") return answered({ error: message, lines: refused }, 2);
+    process.stderr.write(`error: ${message}:\n`);
+    for (const { line, error } of refused) process.stderr.write(`  line ${line}: ${error}\n`);
+    return 2;
   }
 
   // The store's own clock, read once and carried forward by this process's
@@ -2281,11 +2286,15 @@ function answered(document: unknown, code: number): number {
   return code;
 }
 
-/** Report a `store` op that failed — a value refused, a backend down — and answer `1`. */
-function failed(format: Format, message: string): number {
-  if (format === "json") return answered({ error: message }, 1);
+/**
+ * Report a `store` op that failed, in the command's format, and answer its
+ * code: `1` for a backend down — the answer is no — and `2` for a value the
+ * store's `value_schema` refused, which is the command line to fix.
+ */
+function failed(format: Format, message: string, code: 1 | 2 = 1): number {
+  if (format === "json") return answered({ error: message }, code);
   process.stderr.write(`error: ${message}\n`);
-  return 1;
+  return code;
 }
 
 /** The store and the partition an op addressed, as a message names them. */

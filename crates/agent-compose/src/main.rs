@@ -175,8 +175,8 @@
 //! | code | meaning |
 //! |---|---|
 //! | `0` | clean: nothing was reported, or a `plan` was produced, or a `store` op found or applied |
-//! | `1` | diagnostics were reported, `build --check` found drift, a `run` produced no answer, a `store` op found nothing, declined its condition, had its value refused or met a failing backend, a `store export` could not write its lines (a full disk, never a reader that left), a `plan`'s spec did not resolve, or a discovery verb found something already there and would not replace it |
-//! | `2` | the command could not run: bad usage, an unreadable entrypoint, an output directory that could not be written, a `visualize --flow` naming no flow, a `store` address, sub-verb or partition flag the composition does not take, a missing environment variable or one carrying a value the command does not take (`AGENT_COMPOSE_INTERACTIVE`, grammar 8.7), an uninstalled dependency set, or no JavaScript runtime to launch |
+//! | `1` | diagnostics were reported, `build --check` found drift, a `run` produced no answer, a `store` op found nothing, declined its condition or met a failing backend, a `store export` could not write its lines (a full disk, never a reader that left), a `plan`'s spec did not resolve, or a discovery verb found something already there and would not replace it |
+//! | `2` | the command could not run: bad usage, an unreadable entrypoint, an output directory that could not be written, a `visualize --flow` naming no flow, a `store` address, sub-verb or partition flag the composition does not take, a `store` value its `value_schema` refuses, a missing environment variable or one carrying a value the command does not take (`AGENT_COMPOSE_INTERACTIVE`, grammar 8.7), an uninstalled dependency set, or no JavaScript runtime to launch |
 //! | `3` | a `run` with nobody to ask stopped at a `human` pause (grammar 8.7, PRD 5.11) |
 //!
 //! `plan` reads the first two differently from every other verb, and the

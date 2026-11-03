@@ -204,9 +204,10 @@ the store's scope names: `--session` for `scope: session`, `--execution` for
 `scope: execution`, neither for `scope: global`. A value is held to the store's
 `value_schema` before it is written. The answer is a table, or one JSON document
 under `--format json`; the exit code is `0` for a key found or a write applied,
-`1` for a key that holds nothing, a condition that declined, a refused value or
-a backend that failed, and `2` for a command line it does not take. **An
-operator's write is not an effect**: it belongs to no execution, carries no
+`1` for a key that holds nothing, a condition that declined or a backend that
+failed, and `2` for a command line it does not take — a value `value_schema`
+refuses among it, since nothing was written and the value is what is to fix.
+**An operator's write is not an effect**: it belongs to no execution, carries no
 idempotency key, and writes no journal row, no ledger row and no trace record,
 so it is recorded nowhere.
 

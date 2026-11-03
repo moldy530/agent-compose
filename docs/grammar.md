@@ -11350,9 +11350,9 @@ line already expired, and under `--if-absent` keeps a key already held. The
 answer is a table, or one JSON document under `--format json` — the op's own
 answer row, or the import's summary, with an export's summary and failure — a
 refused composition's report among them — on stderr so its stdout is only ever
-its lines; exit `0` is found or applied, `1` not found, declined, refused or a
-failing backend, `2` usage (PRD resolved q72), whether or not the reader of
-standard output stayed to read the answer.
+its lines; exit `0` is found or applied, `1` not found, declined or a failing
+backend, `2` usage — a value `value_schema` refuses among it (PRD resolved
+q72) — whether or not the reader of standard output stayed to read the answer.
 
 **Rationale**: a store's contents were reachable only from a flow, so seeing what
 a run left or seeding a store before one meant writing a composition for it, or
@@ -11386,7 +11386,14 @@ at `validate`, a tool's by Zod at its argument schema — and an operator's by t
 same emitted Zod, before the store is reached. `import` checks every line first
 and writes nothing when any is refused, naming each line, because a file is a
 batch an operator expects to land or not; there is no transaction across lines,
-so a backend that fails part-way says which line it stopped at.
+so a backend that fails part-way says which line it stopped at. A refused value
+— a `set`'s, or any line of an `import` — is exit `2`, usage, and not one of the
+ruling's `1`s: it is not a key found missing, a condition that declined or a
+backend that failed, and nothing was read or written, so what is to fix is what
+was typed or the file it named. That is the reading `run` already gives a value
+that does not fit an argument's type (§13.2), and the one this verb gives a
+`set` value that is not JSON; a refusal that exited `1` would send a supervisor
+retrying on `1` to retry a write that can never land.
 
 **Fresh versions, and an expiry carried as a remaining `ttl`.** A version is the
 partition's sequence (D152), so an import that restored exported versions could

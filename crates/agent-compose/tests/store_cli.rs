@@ -32,21 +32,22 @@
 //!    in storage — an `export` → edit → `import` round trip at fresh versions
 //!    with a remaining `expires_at` honoured and an expired line skipped, an
 //!    `export` of more keys than a page holds writing each once, in byte
-//!    order, with a summary that counts them all, a schema-refused import
-//!    line named by number, `--if-absent` seeding without overwriting, the wrong
-//!    scope flags and an unknown address exiting `2`, and the `--format json`
-//!    shapes — [`drive`], once per arm;
+//!    order, with a summary that counts them all, a schema-refused import line
+//!    named by number and a schema-refused `set` value — each exiting `2`, a
+//!    command line to fix rather than an answer of no — `--if-absent` seeding
+//!    without overwriting, the wrong scope flags and an unknown address
+//!    exiting `2`, and the `--format json` shapes — [`drive`], once per arm;
 //!  * a store's `default_ttl:` taken by a `set` with no `--ttl` and not by an
 //!    import line with no `expires_at` — [`drive`] too;
 //!  * a command whose standard output will not take its answer — a pipe whose
 //!    reader has gone, as `| head -1` leaves it, or a full disk — ending all
 //!    the same rather than waiting for ever, with **the op's own exit code**:
 //!    `0` for a `get` that found its key or a `set` that applied, an export
-//!    stopped by a departed reader included, and `1` only where the op's
-//!    answer is no or an export's lines did not land — [`undelivered`], once
-//!    per arm — and a server that is not there exiting `1` from every
-//!    sub-verb, with `{ error }` under `--format json` — [`no_server`], once
-//!    per dialled arm;
+//!    stopped by a departed reader included, `1` only where the op's answer
+//!    is no or an export's lines did not land, and `2` for a value the schema
+//!    refused — [`undelivered`], once per arm — and a server that is not
+//!    there exiting `1` from every sub-verb, with `{ error }` under
+//!    `--format json` — [`no_server`], once per dialled arm;
 //!  * **no effect**: no journal is opened by any of it, no ledger row is left,
 //!    and a flow run afterwards reads what the operator wrote — the end of
 //!    [`drive`];
@@ -1193,7 +1194,11 @@ fn drive(arm: &Arm) {
         "the summary counts every page's lines"
     );
 
-    // A line the schema refuses fails the import, naming it, and writes nothing.
+    // A line the schema refuses fails the import, naming it, and writes
+    // nothing — exit `2`: nothing was read or written and the file is what is
+    // to fix, so it is usage, as a `run --input` that does not fit its type is,
+    // and not one of the ruling's `1`s — a key missing, a condition declined, a
+    // backend down — that a supervisor retrying on `1` would retry for ever.
     let refusing = [
         json!({ "key": "refused/ok", "value": { "text": "fine" } }).to_string(),
         json!({ "key": "refused/bad", "value": { "text": "" } }).to_string(),
@@ -1209,7 +1214,7 @@ fn drive(arm: &Arm) {
             ..Given::default()
         },
     );
-    refused.exits(1);
+    refused.exits(2);
     assert!(
         refused.stderr().contains("line 2:")
             && refused.stderr().contains("text")
@@ -1227,7 +1232,7 @@ fn drive(arm: &Arm) {
             ..Given::default()
         },
     );
-    let report = refused.exits(1).json();
+    let report = refused.exits(2).json();
     assert_eq!(
         report["lines"]
             .as_array()
@@ -1240,10 +1245,27 @@ fn drive(arm: &Arm) {
     project.store("get", &[&notes, "refused/ok"]).exits(1);
     let set_refused = project.store("set", &[&notes, "refused/set", r#"{"text":3}"#]);
     assert!(
-        set_refused.exits(1).stderr().contains("refused the value"),
-        "a set's value is held to the schema too:\n{}",
+        set_refused.exits(2).stderr().contains("refused the value"),
+        "a set's value is held to the schema too, and is usage as a value that is not JSON \
+         is:\n{}",
         set_refused.stderr()
     );
+    assert!(
+        project
+            .store(
+                "set",
+                &[&notes, "refused/set", r#"{"text":3}"#, "--format", "json"]
+            )
+            .exits(2)
+            .json()["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("refused the value")),
+        "…answered as `{{ error }}` under `--format json`, naming the issues"
+    );
+    project
+        .store("set", &[&notes, "refused/set", "{text"])
+        .exits(2);
+    project.store("get", &[&notes, "refused/set"]).exits(1);
 
     // `--if-absent` seeds without overwriting — and `--file` is read from where
     // the command was typed, not from the build directory the child runs in.
@@ -1595,11 +1617,11 @@ fn drive(arm: &Arm) {
 ///
 /// A reader that has gone is never a failure: a `get` that found its key and a
 /// `set` that applied end `0`, a `get` that found nothing and a `set` whose
-/// condition declined end `1`, an answer that was itself a failure is said on
-/// stderr instead, and an `export` stops at the page the pipe refused and ends
-/// `0`, its summary saying where. A standard output that fails under a reader
-/// still there — a full disk — is said on stderr, and for an `export` is the
-/// export failing.
+/// condition declined end `1`, a `set` whose value the schema refused ends
+/// `2`, an answer that was itself a failure is said on stderr instead, and an
+/// `export` stops at the page the pipe refused and ends `0`, its summary
+/// saying where. A standard output that fails under a reader still there — a
+/// full disk — is said on stderr, and for an `export` is the export failing.
 fn undelivered(arm: &Arm) {
     let Some(project) = Project::new(arm) else {
         return;
@@ -1710,7 +1732,7 @@ fn undelivered(arm: &Arm) {
         &[&notes, "cut/refused", r#"{"text":3}"#, "--format", "json"],
     );
     let said: Value =
-        serde_json::from_str(refused.exits(1).stderr().trim()).unwrap_or_else(|error| {
+        serde_json::from_str(refused.exits(2).stderr().trim()).unwrap_or_else(|error| {
             panic!(
                 "the lost failure is one JSON object on stderr ({error}):\n{}",
                 refused.stderr()

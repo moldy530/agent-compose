@@ -266,12 +266,12 @@ agent-compose store import main.yml store.notes --if-absent < notes.jsonl
 | sub-verb | flags | answers |
 |---|---|---|
 | `get <key>` | — | `{ value, found, version }`; exit `1` when the key holds nothing |
-| `set <key> <value>` | `--if absent\|present` or `--if-version <n>`, `--ttl <duration>\|never` | `{ key, applied, version, deduped }`; exit `1` when the condition declined, naming the version the key holds |
+| `set <key> <value>` | `--if absent\|present` or `--if-version <n>`, `--ttl <duration>\|never` | `{ key, applied, version, deduped }`; exit `1` when the condition declined, naming the version the key holds; exit `2` when `value_schema` refuses the value |
 | `delete <key>` | `--if-version <n>` | `{ deleted, applied, version, deduped }`; exit `1` when the condition declined |
 | `list` | `--prefix <p>`, `--limit <n>` (1 to 1000, default 100), `--after <key>`, `--values` | one page, `{ keys, next, entries }`: `next` when more remain, `entries` under `--values` |
 | `count` | `--prefix <p>` | `{ count }` |
 | `export` | `--prefix <p>` | JSON Lines on stdout, one entry per line |
-| `import` | `--if-absent`, `--file <path>` | `{ read, written, skipped, expired, present }` |
+| `import` | `--if-absent`, `--file <path>` | `{ read, written, skipped, expired, present }`; exit `2`, writing nothing, when any line is refused |
 
 **The partition is named by the scope the store declares.** `--session <key>`
 for a `scope: session` store — the session identity itself, which is what a
@@ -290,11 +290,14 @@ nothing will delete, because the run released that partition when it settled.
 
 **A value is JSON**, on the command line or, as `-`, on standard input. A
 `set`'s value and every `import` line are held to the store's `value_schema` by
-the emitted Zod before anything is written; a refused value exits `1` naming the
-issues. `--ttl` is `ttl:`'s spelling — `250ms`, `30s`, `5m`, `24h`, or `never`
-to override a store's `default_ttl:` — and a `set` with none takes the default,
-exactly as a node's would. A key whose time is up is absent to `get`, `list`,
-`count`, `export` and every condition (`agent-compose docs stores`).
+the emitted Zod before anything is written; a refused value exits `2` naming the
+issues — nothing was read or written, and the value is what is to fix, as with a
+`run --input` that does not fit its type — so a supervisor retrying on `1` never
+retries a write that cannot land. `--ttl` is `ttl:`'s spelling — `250ms`, `30s`,
+`5m`, `24h`, or `never` to override a store's `default_ttl:` — and a `set` with
+none takes the default, exactly as a node's would. A key whose time is up is
+absent to `get`, `list`, `count`, `export` and every condition
+(`agent-compose docs stores`).
 
 **`export` and `import` move a partition as JSON Lines.** `export` writes one
 `{"key": …, "value": …, "version": …, "expires_at": …}` per live key, in the
@@ -321,8 +324,9 @@ are its stdout under both formats, so its summary — `{"written": n}` under
 report of a composition the compiler refuses: a failure is never written among
 the lines a redirect is collecting for an import. A failure under
 `--format json` is otherwise `{"error": …}` on stdout, with `lines` naming each
-refused line of an import; a usage error is a sentence on stderr under either
-format, as every verb's is.
+refused line of an import — a refused value is answered so too, though it exits
+`2`, so the issues it names reach a script reading the document; any other usage
+error is a sentence on stderr under either format, as every verb's is.
 
 **A reader that leaves early is not a failure**, here as for every verb (see
 [Exit codes](#exit-codes)). When the reader of a pipe goes before the answer
@@ -415,8 +419,8 @@ dropped would leave you believing something had been installed under `$HOME`.
 | code | meaning |
 |---|---|
 | `0` | clean: nothing was reported, or nothing but **warnings** was, or a `plan` was produced, or a document was printed, or a `store` op found or applied |
-| `1` | **errors** were reported, `build --check` found drift, a `run` produced no answer, a `resume` diverged from its journal, a `store` op found nothing, declined its condition, had a value refused or met a failing backend, a `store export` could not write its lines (a full disk, never a reader that left), a `plan`'s spec did not resolve, or a discovery verb found something already there and would not replace it |
-| `2` | the command could not run: bad usage, an unreadable entrypoint, an unwritable output directory, a missing or malformed environment variable, an uninstalled dependency set, no JavaScript runtime to launch, a `resume` naming an execution the journal does not hold open, or a `store` address, sub-verb or partition flag the composition does not take |
+| `1` | **errors** were reported, `build --check` found drift, a `run` produced no answer, a `resume` diverged from its journal, a `store` op found nothing, declined its condition or met a failing backend, a `store export` could not write its lines (a full disk, never a reader that left), a `plan`'s spec did not resolve, or a discovery verb found something already there and would not replace it |
+| `2` | the command could not run: bad usage, an unreadable entrypoint, an unwritable output directory, a missing or malformed environment variable, an uninstalled dependency set, no JavaScript runtime to launch, a `resume` naming an execution the journal does not hold open, a `store` address, sub-verb or partition flag the composition does not take, or a `store` value its `value_schema` refuses |
 | `3` | a `run` or `resume` with nobody to ask stopped at a `human` pause |
 
 The split between `1` and `2` is *the answer is no* versus *the command could
