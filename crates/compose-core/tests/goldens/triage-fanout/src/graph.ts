@@ -286,6 +286,11 @@ const storeTriageMemory: stores.StoreBinding = {
 };
 
 /**
+ * Every store this composition binds, so an execution's settlement prunes its ledger rows from each (PRD resolved q69).
+ */
+stores.bindsStores([storeDocs, storeTriageMemory]);
+
+/**
  * `tool.dead_letter` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for. This is the parse a `function:` node's binding faces, and it is a `ResultMismatch` that fails the node: the arguments are the composition's, checked field-by-field at compile time, so a value constraint they miss at runtime is the graph's own failure and there is nobody to hand it to. A **model's** arguments are refused one level out, at the entry in the agent's `tools:`, where `runtime.parseToolArguments` raises the `ToolCallRefused` the loop hands back (Decision D119). The tool's **result** is parsed with `runtime.parseResult` on both surfaces: a tool answering off-contract is not a call anybody can rephrase.
  */
 async function toolDeadLetter(args: unknown, context: runtime.RunContext): Promise<unknown> {

@@ -270,23 +270,23 @@ function numberedStoreBind(sql: string): string {
 const POSTGRES_STORE_CLOCK = "FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint";
 
 /**
- * A bounded `DELETE` over the rows a sub-select finds, which is how Postgres
- * spells `DELETE … LIMIT` — it has no other.
+ * A bounded `DELETE` of one partition's expired rows, over the rows a
+ * sub-select finds, which is how Postgres spells `DELETE … LIMIT` — it has no
+ * other.
  *
- * **`FOR UPDATE SKIP LOCKED`**, so a sweep never waits on a row another
- * transaction holds: a write sweeping its own partition is already serialized
- * against every other write to it by the sequence lock, and a store-wide sweep
- * beside them takes the expired rows nobody holds and leaves the rest for the
- * next sweep — which is what makes a sweep unable to be either half of a
- * deadlock with a write. `ctid` is the row's own address, so the outer delete
- * removes exactly the rows the sub-select locked; they cannot move while it
- * holds them. Both read through a partial index over `expires_at`, so neither
- * reads a row that has not expired.
+ * It runs only under the partition's sequence lock — a write's sweep and each
+ * batch of a store-wide one alike (`StoreDialect.sweepPartition`) — so no other
+ * write to the partition is in flight beside it. **`FOR UPDATE SKIP LOCKED`**
+ * all the same, so it never waits on a row something outside that lock holds,
+ * and leaves such a row for the next sweep instead. `ctid` is the row's own
+ * address, so the outer delete removes exactly the rows the sub-select locked;
+ * they cannot move while it holds them. It reads through the partial index over
+ * `(store, scope_key, expires_at)`, so it reads no row that has not expired.
  */
-function postgresSweep(where: string, limit: number): string {
+function postgresSweep(limit: number): string {
   return (
     "DELETE FROM store_entries WHERE ctid = ANY(ARRAY(SELECT ctid FROM store_entries " +
-    `WHERE ${where} AND expires_at <= ? LIMIT ${limit} FOR UPDATE SKIP LOCKED))`
+    `WHERE store = ? AND scope_key = ? AND expires_at <= ? LIMIT ${limit} FOR UPDATE SKIP LOCKED))`
   );
 }
 
@@ -296,8 +296,7 @@ const POSTGRES_STORE_DIALECT: StoreDialect = {
   overwrite: standardOverwrite,
   ignore: standardIgnore,
   clock: POSTGRES_STORE_CLOCK,
-  sweepPartition: (limit) => postgresSweep("store = ? AND scope_key = ?", limit),
-  sweepStore: (limit) => postgresSweep("store = ?", limit),
+  sweepPartition: postgresSweep,
 };
 
 /**

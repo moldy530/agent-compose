@@ -4363,9 +4363,12 @@ Rules (PRD 5.8):
   write to its partition, which removes **at most 100** of that partition's
   expired keys before it reads its own; or the next process to open the store —
   the open of a local store file, a dialled connection's first op on it — which
-  removes **every** expired key of the store, every partition included (on
-  `postgres`, but for a row a write in flight holds at that instant, which that
-  write's own sweep or the next one removes). A `ttl`
+  removes **every** key of the store that had expired by then, every partition
+  included. That removal runs behind the ops, a batch of at most 1000 between
+  two of them, so no op waits for more than one batch; a command waits for the
+  rest before it exits; and on a dialled backend each batch takes its
+  partition's version lock as a write does, so it and a write wait for each
+  other rather than deadlocking. A `ttl`
   adds no field to any output row (Decision
   [D34](#d34-the-store-op-catalog-is-normative-including-derived-output-schemas)):
   an expired key is answered exactly as a key never written is.
@@ -4443,14 +4446,16 @@ Rules (PRD 5.8):
   row is what answers a retry of its effect site, and an execution retries only
   while its journal row is open; every §9.4 key begins `<execution.id>/`, and a
   settled execution never resumes (PRD resolved q65). So when an execution's row
-  closes `completed` or `failed`, the runtime deletes, in every store partition
-  that execution's keyed writes reached, the ledger rows under that prefix — a
-  child execution's under the child's own id, when the child settles (§8.6 rule
-  7). An execution the journal still holds open keeps every row, so a resume
-  still writes nothing twice (PRD resolved q29, q69). A `scope: execution`
-  store's partition, ledger included, already dies with the run (§11.3). A
-  prune that fails is said and changes no outcome: the rows answer nothing
-  again.
+  closes `completed` or `failed` and the detached `agent.*`/`tool.*` deliveries
+  it started have finished — they write, and retry, under its id (§8.6 rule 7) —
+  the runtime deletes the ledger rows under that prefix from every store the
+  composition binds, which reaches every partition the execution wrote from any
+  process, a placement's worker included (§14.1 rule 5); a child execution's
+  rows go under the child's own id, when the child settles. An execution the
+  journal still holds open keeps every row, so a resume still writes nothing
+  twice (PRD resolved q29, q69). A `scope: execution` store's partition, ledger
+  included, already dies with the run (§11.3). A prune that fails is said and
+  changes no outcome: the rows answer nothing again.
 - A store **write** performed inside a `map`-dispatched instance — `kv set`,
   `kv delete`, `kv merge`, `kv append`, `kv incr`, `vector upsert`,
   `vector delete`, `blob put`, `blob delete` — MUST be one of two forms (PRD 5.8,
@@ -10985,10 +10990,12 @@ applies sets again to its own `ttl`, else the default, else to nothing; a write
 that declined changes nothing. An expired key is absent to every read and every
 condition, consumes no version, and leaves storage at the next write to its
 partition (at most 100 rows a write) or the next process to open the store,
-whichever comes first. When an execution's journal row closes `completed` or
-`failed`, the ledger rows under its `<execution.id>/` prefix are deleted in every
-store partition its keyed writes reached (§4.4, §8.8, §11.1, §11.4, §11.5, PRD
-resolved q69).
+whichever comes first — the latter behind that process's ops, a bounded batch at
+a time, never in front of them. When an execution's journal row closes
+`completed` or `failed` and its detached deliveries have finished, the ledger
+rows under its `<execution.id>/` prefix are deleted from every store the
+composition binds, which is every partition its keyed writes reached from any
+process (§4.4, §8.8, §11.1, §11.4, §11.5, PRD resolved q69).
 
 **Rationale**: a store several runs share has two growth problems a `kv` store
 had no answer to. The composition's own keys — a claim, a cache entry, a
@@ -11033,9 +11040,17 @@ backend; making it invisible at that instant needs only the comparison. So
 visibility is exact and storage is lazy: each write sweeps its own partition —
 under the lock it already holds, through an index over the expiry, so it reads
 no live row — bounded at 100 rows so a backlog never stalls a write, and the
-first op a process makes on a store removes the store's whole backlog, so a
-store nobody writes to again still sheds what expired the next time anything
-starts against it.
+first op a process makes on a store starts removing the store's whole backlog,
+so a store nobody writes to again still sheds what expired the next time
+anything starts against it. That sweep runs **behind** the op that started it
+and between the ops after it, one batch of at most 1000 rows at a time, so it
+never stalls an op either: an op waits for at most the batch in progress, and a
+command waits for the rest on its way out rather than in front of its first op.
+On a dialled backend each batch is one partition's, under that partition's
+version-sequence lock taken first, as a write takes it — two `DELETE`s reaching
+one expired row through two indexes lock it in two orders, which a server
+breaks by failing one of them, and the sequence lock is what keeps a second
+one off the partition while either runs.
 
 **The ledger, pruned at settlement.** A ledger row exists to answer a retry of
 its effect site under the at-least-once of
@@ -11044,11 +11059,23 @@ execution can retry only while its journal row is open: a settled execution
 never resumes (PRD resolved q65). Every derived key begins with the execution's
 id, so the rows a settled execution left are exactly one prefix of the ledger,
 and deleting them — after the row closes, never before — leaves the ledger
-proportional to the executions that are open rather than to history. A resume of
-an unsettled execution finds every row it wrote, so it still writes nothing
-twice (PRD resolved q29). The ledger is still the server's on a dialled backend
-— D149's clause stands; this prunes it — and a child execution's rows are its
-own prefix, so they go when the child settles.
+proportional to the executions that are open rather than to history. "After"
+means after everything still writing under that id, too: a detached `agent.*`
+or `tool.*` delivery outlives the run that dispatched it (§8.6 rule 7) and
+retries under the run's id, so the prune waits for those deliveries to finish
+— chained behind them, so the outcome does not. And it is every store the
+composition binds that is pruned, not the ones the settling process wrote: a
+placed node writes a dialled store from its worker (§14.1 rule 5), and the hub
+that settles never sees that write. A `kv` or `vector` store's ledger is keyed
+by the idempotency key alone, so the prefix is one range on a primary key in
+each, and a store the execution never wrote costs a seek that finds nothing; a
+`blob` store's is a directory per partition, which no placement can reach
+([D131](#d131-a-process-local-store-is-refused-where-a-placement-can-open-it)),
+so the execution wrote it only in the partition its identity addresses, and it
+is pruned there. A resume of an unsettled execution finds every row it wrote,
+so it still writes nothing twice (PRD resolved q29). The ledger is still the
+server's on a dialled backend — D149's clause stands; this prunes it — and a
+child execution's rows are its own prefix, so they go when the child settles.
 
 **What it does not touch.** `scope:` is orthogonal
 ([D35](#d35-scope-is-required-on-store-definitions)): an execution-scoped key may

@@ -420,14 +420,20 @@ instant it expires, and leaves storage at whichever comes first: the next write
 to its partition, which deletes **at most 100** of that partition's expired keys
 before it reads its own key; or the next process to open the store — a process's
 first op on a SQLite store file, or a connection's first op on a `postgres` or
-`mysql` store — which deletes **every** expired key of the store, all partitions,
-in batches of 1000. Both read an index over the expiry, so neither reads a key
-that has not expired. On `postgres` a sweep skips a row another write is
-holding at that moment rather than waiting for it, and that write's own sweep
-or the next one takes it; on `mysql` and SQLite it waits for the write, which
-is one op long. `AGENT_COMPOSE_STORE_CLOCK_OFFSET_MS` shifts the clock
-every backend reads expiry by, in whole milliseconds, which is how a test moves
-time past an expiry without waiting for it.
+`mysql` store — which starts deleting **every** key of the store, all
+partitions, that had expired by then. That sweep runs *behind* the op that
+started it and between the ops after it, in batches of at most 1000, so no op
+waits for more than the one batch in progress however large the backlog is; a
+command — `run` or `resume` — waits for the rest on its way out, so the process
+that reached the store has removed its backlog by the time it exits, and a
+`serve` finishes it in the background. Both sweeps
+read an index over the expiry, so neither reads a key that has not expired. On
+`postgres` and `mysql` each batch is one partition's and takes that partition's
+version lock first, exactly as a write does, so a sweep and a write to the same
+partition wait for each other's commit rather than deadlocking.
+`AGENT_COMPOSE_STORE_CLOCK_OFFSET_MS` shifts the clock every backend reads
+expiry by, in whole milliseconds, which is how a test moves time past an expiry
+without waiting for it.
 
 **The lease, as above.** `claim` takes the key only if nobody holds it, for a
 minute; `keep` holds it ten more minutes only if it is still the version this
@@ -439,10 +445,15 @@ a run that fails before it leaves the lease to expire on its own; PRD resolved q
 
 **The idempotency ledger is pruned when an execution settles.** Each keyed
 write leaves a ledger row so a retry of it answers rather than writing twice.
-When the execution that wrote it settles — `completed` or `failed` — its rows go,
-in every store it wrote; a child execution's go when the child settles. An
-execution that has not settled — parked at a `human` pause, or one a crash left
-open — keeps every row, so its resume still writes nothing twice. The ledger
+When the execution that wrote it settles — `completed` or `failed` — its rows go
+from every store the composition binds, so a write a placed node made from its
+worker goes too; a child execution's go when the child settles. A detached
+`agent` or `tool` delivery the execution started is still writing, and
+retrying, under its id, so the rows stay until those deliveries have finished;
+a `run` that exits before they do cuts them off and leaves that execution's
+rows, which nothing will ask for again. An execution that has not
+settled — parked at a `human` pause, stopped by a divergence, or left open by a
+crash — keeps every row, so its resume still writes nothing twice. The ledger
 therefore holds the open executions' rows, not history.
 
 ## Writes inside a `map`

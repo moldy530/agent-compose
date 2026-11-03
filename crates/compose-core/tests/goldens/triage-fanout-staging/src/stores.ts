@@ -231,10 +231,17 @@
 // which inside its own transaction deletes at most [`SWEEP_PER_WRITE`] of that
 // partition's expired rows before it reads its key; or the first op a process
 // makes on the store — the open of a SQLite file, the first op over a dialled
-// connection — which deletes **every** expired row of the store, in batches of
-// [`SWEEP_PER_BATCH`] so no statement holds a lock for long. Both run on an index
-// over the expiry, so neither reads a row that is not expired, and the write's
-// sweep is bounded however large the backlog is.
+// connection — which **starts** a sweep of every row of the store that had
+// expired by then. That sweep runs **behind** the op that started it and
+// between the ops after it, one batch of at most [`SWEEP_PER_BATCH`] rows at a
+// time, so no op waits for more than one batch however large the backlog is;
+// and [`releaseStores`], on a command's way out, waits for it to finish, so a
+// process that reached a store has removed what had expired there by the time
+// it exits. Both sweeps run on an index over the expiry, so neither reads a row
+// that is not expired. On a dialled store each batch is one partition's, taken
+// under that partition's version-sequence lock exactly as a write takes it, so
+// a sweep and a write are serialized rather than able to deadlock
+// ([`RemoteKv`]'s `#sweepStep`).
 //
 // `AGENT_COMPOSE_STORE_CLOCK_OFFSET_MS` shifts the clock every arm reads by a
 // whole number of milliseconds — added to `Date.now()` locally and to the
@@ -252,15 +259,21 @@
 // writing twice, and an execution can retry only while its journal row is open.
 // Every grammar 9.4 key begins `<execution id>/`, and PRD resolved q65 makes a
 // settled execution one that never resumes, so when an execution's row closes
-// `completed` or `failed`, [`pruneLedger`] deletes the rows under that prefix in
-// every store partition the execution's keyed writes reached — a child
-// execution's under the child's own id, when the child settles. An execution
+// `completed` or `failed` — and the detached deliveries it started, which
+// write under its id, have finished — [`pruneLedger`] deletes the rows under
+// that prefix in every store partition the execution could have written: a
+// child execution's under the child's own id, when the child settles. An execution
 // the journal still holds open keeps every row, so its resume writes nothing
 // twice (PRD resolved q29). The ledger therefore grows with the executions that
-// are open rather than with history. Which partitions an execution wrote is
-// noted in this process at each keyed op, outside the journaled seam, so a
-// resumed generation — which replays every op its record holds through
-// [`runStoreOp`] — notes the ones its earlier generations wrote too.
+// are open rather than with history. Which stores to prune is **not** a record
+// this process keeps of the writes it made: a placed node's keyed write is
+// made in a worker, and a resumed generation's replay of a placed node runs
+// there too, so no one process sees every write an execution made. The prune
+// visits every store the composition binds ([`bindsStores`]) instead — which
+// is every store any process of it could have written — and deletes the
+// settled execution's prefix from each; the rows are found by a range on the
+// ledger's primary key, so a store the execution never wrote costs a seek
+// that finds nothing.
 
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -498,8 +511,7 @@ function kvWrite(store: StoreBinding, op: StoreOp): boolean {
 export const STORE_CLOCK_OFFSET = "AGENT_COMPOSE_STORE_CLOCK_OFFSET_MS";
 
 /** What [`STORE_CLOCK_OFFSET`] adds to the clock; `0` where it is unset. */
-function clockOffset(): number {
-  const written = process.env[STORE_CLOCK_OFFSET];
+function clockOffset(written: string | undefined = process.env[STORE_CLOCK_OFFSET]): number {
   if (written === undefined) return 0;
   if (!/^-?[0-9]+$/.test(written.trim())) {
     throw new Error(
@@ -795,22 +807,62 @@ function sweepLocalPartition(database: Database, scopeKey: string, now: number):
 }
 
 /**
- * Remove every expired row of one store file — the open's half of the
- * schedule (PRD resolved q69), run once per process per file.
- *
- * In batches of [`SWEEP_PER_BATCH`], each its own statement and so its own
- * transaction: a backlog is removed without one lock held across all of it,
- * and a writer in another process gets in between two batches.
+ * The store-wide sweeps in flight on every backend, so [`releaseStores`] can
+ * let each finish before the process goes.
  */
-function sweepLocalStore(database: Database, now: number): void {
-  for (;;) {
-    const removed = database.run(
-      "DELETE FROM entries WHERE rowid IN (SELECT rowid FROM entries WHERE " +
-        `expires_at IS NOT NULL AND expires_at <= ? LIMIT ${SWEEP_PER_BATCH})`,
-      [now],
-    );
-    if (removed.changes < SWEEP_PER_BATCH) return;
-  }
+const SWEEPING = new Set<Promise<void>>();
+
+/** Hold one store-wide sweep in [`SWEEPING`] until it ends. */
+function holdSweep(sweeping: Promise<void>): void {
+  SWEEPING.add(sweeping);
+  void sweeping.finally(() => SWEEPING.delete(sweeping));
+}
+
+/**
+ * Start removing every row of one store file that had expired by `now` — the
+ * open's half of the schedule (PRD resolved q69), started once per process per
+ * file.
+ *
+ * **Behind the ops, never in front of them.** In batches of
+ * [`SWEEP_PER_BATCH`], each its own statement and so its own transaction, with
+ * a turn of the event loop before each: the op that opened the file runs
+ * first, and an op arriving while the sweep is under way waits for at most the
+ * one batch in progress — the driver is synchronous, so a batch is one step no
+ * op lands inside, and a write's transaction is one no batch lands inside —
+ * however large the backlog is. A writer in another process gets in between two
+ * batches the same way. [`releaseStores`] waits for the rest, so a command that
+ * reached the store has removed its backlog by the time it exits.
+ *
+ * **Never an op's failure.** Every read and condition already treats an
+ * expired row as absent, so a batch the file refused is said on stderr and the
+ * sweep stops; the next write to each partition, and the next process, take
+ * what it left.
+ */
+function startLocalSweep(database: Database, store: StoreBinding, now: number): void {
+  holdSweep(
+    (async () => {
+      try {
+        for (;;) {
+          await new Promise((resolve) => setTimeout(resolve, 0));
+          const removed = database.run(
+            "DELETE FROM entries WHERE rowid IN (SELECT rowid FROM entries WHERE " +
+              `expires_at IS NOT NULL AND expires_at <= ? LIMIT ${SWEEP_PER_BATCH})`,
+            [now],
+          );
+          if (removed.changes < SWEEP_PER_BATCH) return;
+        }
+      } catch (error) {
+        process.stderr.write(
+          `warning: \`${store.address}\` could not finish removing its expired keys (${error instanceof Error ? error.message : String(error)}); they stay invisible to every read and condition, and a write to each one's partition removes them (PRD resolved q69)\n`,
+        );
+      }
+    })(),
+  );
+}
+
+/** Where a `kv` or `vector` store's file lives — one file per store. */
+function storeFile(store: StoreBinding): string {
+  return path.join(dataRoot(), "stores", `${encodeKey(store.name)}.sqlite`);
 }
 
 /**
@@ -853,7 +905,6 @@ function breakStaleLock(file: string): boolean {
 async function migrated(
   Database: SqliteModule["Database"],
   file: string,
-  now: number | undefined,
 ): Promise<InstanceType<SqliteModule["Database"]>> {
   const deadline = Date.now() + LOCK_WAIT_MS;
   let broke = false;
@@ -867,11 +918,6 @@ async function migrated(
       database.exec(`PRAGMA busy_timeout = ${LOCK_WAIT_MS};`);
       database.exec(SCHEMA);
       migrateStoreFile(database);
-      // The open is this process's first op on the file, which is the second
-      // half of PRD resolved q69's schedule: every key whose time is up leaves
-      // storage now, whatever the writes since have swept. A `vector` file has
-      // no key that expires, so it is given no clock and swept of nothing.
-      if (now !== undefined) sweepLocalStore(database, now);
       return database;
     } catch (error) {
       database.close();
@@ -913,9 +959,16 @@ function open(store: StoreBinding, execution: runtime.ExecutionIdentity): Promis
       migrateStoreFile(opened);
       return opened;
     }
-    const directory = path.join(dataRoot(), "stores");
-    fs.mkdirSync(directory, { recursive: true });
-    return await migrated(Database, path.join(directory, `${encodeKey(store.name)}.sqlite`), now);
+    const file = storeFile(store);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const database = await migrated(Database, file);
+    // The open is this process's first op on the file, which is the second
+    // half of PRD resolved q69's schedule: every key whose time had come by now
+    // leaves storage, whatever the writes since have swept — behind this op
+    // and between the ones after it, never in front of them. A `vector` file
+    // has no key that expires, so it is given no clock and swept of nothing.
+    if (now !== undefined) startLocalSweep(database, store, now);
+    return database;
   })();
   // Registered before the first `await` inside it, so a concurrent caller finds
   // this promise rather than opening a second handle. A failed open is dropped
@@ -1043,84 +1096,112 @@ export function releaseExecution(id: string, parked = false): void {
 // ---------------------------------------------------------------------------
 
 /**
- * Per execution, the store partitions its keyed writes left ledger rows in —
- * what [`pruneLedger`] visits when the execution settles.
+ * Every store the composition binds, by address — what [`pruneLedger`] visits
+ * when an execution settles.
  *
- * Keyed by store address, because a store's partition for one execution is
- * fixed by its scope (grammar 11.3): one execution writes one partition of each
- * store. A `scope: execution` store is not here: its whole partition, ledger
- * included, already dies with the run ([`releaseExecution`]).
+ * Registered by `./graph.ts` as it loads ([`bindsStores`]), so it is the same
+ * set in every process this project runs in — the hub, a placement's worker, a
+ * resumed generation — and none of them has to have seen a write for a store to
+ * be here. That is the point: the process that settles an execution is not
+ * always the process that made its keyed writes (a placed node writes a dialled
+ * store from its worker, grammar 14.1 rule 5, Decision D131, and a resume
+ * replays a placed node there too), so a record of the writes this process made
+ * would miss exactly those.
  */
-const LEDGERS = new Map<string, Map<string, { readonly store: StoreBinding; readonly scopeKey: string }>>();
+const BOUND = new Map<string, StoreBinding>();
 
 /**
- * Note that this execution's keyed write reached a store partition, so its
- * settlement can prune the ledger rows it left there.
- *
- * Called from [`runStoreOp`] **outside** the journaled seam, for [`remember`]'s
- * reason: a resumed generation answers its record's writes out of the journal
- * without entering the backend, and it is still the generation that settles —
- * so the partitions an earlier generation wrote are noted by the replay of the
- * very ops that wrote them, and the prune that follows reaches every one.
+ * Register the stores the composition binds — `./graph.ts`'s one call, made
+ * once as it loads, with every `store.*` binding it declares. See [`BOUND`].
  */
-function noteLedger(store: StoreBinding, execution: string, scopeKey: string): void {
-  if (store.scope === "execution") return;
-  let held = LEDGERS.get(execution);
-  if (held === undefined) {
-    held = new Map();
-    LEDGERS.set(execution, held);
-  }
-  held.set(store.address, { store, scopeKey });
+export function bindsStores(bindings: readonly StoreBinding[]): void {
+  for (const binding of bindings) BOUND.set(binding.address, binding);
 }
 
 /**
- * Delete the idempotency ledger rows an execution left, now that it has settled
- * — or, with `settled: false`, forget the partitions it noted without touching
- * them, because its journal row stays open and a resume will note them again.
+ * The prunes in flight, so [`releaseStores`] lets each finish before it closes
+ * the connection it runs over.
+ */
+const PRUNING = new Set<Promise<void>>();
+
+/**
+ * Delete the idempotency ledger rows a settled execution left, in every store
+ * the composition binds (PRD resolved q69).
  *
  * Every grammar 9.4 key begins `<execution id>/`, so the rows are exactly those
- * under that prefix, in every partition this execution's keyed writes reached:
- * a ledger row is a retry's answer, a settled execution never resumes (PRD
- * resolved q65), and nothing will ask for these again (PRD resolved q69). A
+ * under that prefix: a ledger row is a retry's answer, a settled execution
+ * never resumes (PRD resolved q65), and nothing will ask for these again. A
  * child execution's rows are under the child's own id, and go when the child
  * settles. A row of an execution the journal still holds open is never
  * touched — the prefix is this execution's alone — so a resume still writes
  * nothing twice (PRD resolved q29).
  *
- * Registered with the runtime as this module loads ([`runtime.settlesLedgers`]),
- * which calls it after the execution's row has closed: a crash between the two
- * leaves rows nothing will ask for, which is harmless, where the other order
- * could leave an open execution without the rows its resume depends on.
+ * **Every store, not the ones this process wrote** ([`BOUND`]). A `kv` or
+ * `vector` file's ledger and a dialled store's are keyed by the idempotency
+ * key, with no partition in the key, so each prune is one range on a primary
+ * key wherever the write came from, and a store the execution never wrote costs
+ * a seek that finds nothing. What is skipped is what cannot hold a row of it: a
+ * `scope: execution` store, whose whole partition dies with the run
+ * ([`releaseExecution`]); a store file nothing has created; a `memory` store
+ * this process never opened; a dialled store whose address variable this
+ * process does not hold — the environment partition hands it to every process
+ * that reaches the store, the hub's included (`docs/distributed.md` §9.1), so a
+ * process without it reached nothing there; and a provider this release does
+ * not implement. A `blob` store's ledger is a directory per partition, so it is
+ * pruned in the partition this execution's identity addresses, which is the
+ * one partition of it the execution can have written.
+ *
+ * Called by the runtime ([`runtime.settlesLedgers`]) after the execution's row
+ * has closed **and** the detached deliveries it started have finished: a crash
+ * between the close and this leaves rows nothing will ask for, which is
+ * harmless, where the other order could leave an open execution — or a
+ * delivery still retrying under a settled one's id — without the row that makes
+ * its retry answer instead of writing twice.
  *
  * **Never the execution's failure.** A store that could not be pruned is one
  * whose rows stay, which costs storage and changes no answer; it is said on
  * stderr naming the store, and every other store is still pruned.
  */
-export async function pruneLedger(execution: string, settled = true): Promise<void> {
-  const held = LEDGERS.get(execution);
-  if (held === undefined) return;
-  LEDGERS.delete(execution);
-  if (!settled) return;
-  const prefix = `${execution}/`;
-  for (const { store, scopeKey } of held.values()) {
-    try {
-      if (store.kind === "blob") {
-        pruneBlobLedger(store, scopeKey, prefix);
-      } else if (!opensInProcess(store.backend.provider)) {
-        await (await connectionFor(store)).prune(store.name, scopeKey, prefix);
-      } else {
-        const database = await open(store, { id: execution, session_key: "" });
-        database.run(
-          "DELETE FROM applied WHERE idempotency_key >= ? AND idempotency_key < ?",
-          [prefix, prefixEnd(prefix)],
+export function pruneLedger(execution: runtime.ExecutionIdentity): Promise<void> {
+  const pruning = (async () => {
+    const prefix = `${execution.id}/`;
+    for (const store of BOUND.values()) {
+      if (store.scope === "execution") continue;
+      try {
+        if (store.kind === "blob") {
+          // A session-scoped store an execution with no session key cannot have
+          // written: every op on it fails naming the key ([`partition`]).
+          if (store.scope === "session" && execution.session_key === "") continue;
+          pruneBlobLedger(store, partition(store, execution), prefix);
+          continue;
+        }
+        if (opensInProcess(store.backend.provider)) {
+          const held = DATABASES.get(handleKey(store, execution));
+          if (held === undefined) {
+            if (store.backend.provider === "memory") continue;
+            if (!fs.existsSync(storeFile(store))) continue;
+          }
+          const database = await (held ?? open(store, execution));
+          database.run("DELETE FROM applied WHERE idempotency_key >= ? AND idempotency_key < ?", [
+            prefix,
+            prefixEnd(prefix),
+          ]);
+          continue;
+        }
+        if (!DIALLED_KV.includes(store.backend.provider)) continue;
+        const variable = store.backend.urlEnv;
+        if (variable === undefined || (process.env[variable] ?? "") === "") continue;
+        await (await connectionFor(store)).prune(store.name, prefix);
+      } catch (error) {
+        process.stderr.write(
+          `warning: the ledger rows execution \`${execution.id}\` left in \`${store.address}\` could not be pruned (${error instanceof Error ? error.message : String(error)}); they stay where they are and answer nothing, since a settled execution never resumes (PRD resolved q69)\n`,
         );
       }
-    } catch (error) {
-      process.stderr.write(
-        `warning: the ledger rows execution \`${execution}\` left in \`${store.address}\` could not be pruned (${error instanceof Error ? error.message : String(error)}); they stay where they are and answer nothing, since a settled execution never resumes (PRD resolved q69)\n`,
-      );
     }
-  }
+  })();
+  PRUNING.add(pruning);
+  void pruning.finally(() => PRUNING.delete(pruning));
+  return pruning;
 }
 
 /**
@@ -1233,11 +1314,8 @@ export async function runStoreOp(
   const idempotencyKey = writes(op) ? site.idempotencyKey : undefined;
 
   // What `scope: execution` makes this run the owner of, noted **outside** the
-  // seam below because a replayed op never enters it (see [`remember`]) — and
-  // for the same reason, where a keyed write leaves its ledger row, which this
-  // execution's settlement prunes (see [`noteLedger`]).
+  // seam below because a replayed op never enters it (see [`remember`]).
   remember(store, execution, scopeKey);
-  if (idempotencyKey !== undefined) noteLedger(store, execution.id, scopeKey);
 
   // Both halves of PRD 5.8's replay discipline go through the journal, and this
   // is where "replay consumes history, not the live store" stops being a
@@ -2071,18 +2149,18 @@ interface StoreDialect {
    */
   readonly clock: string;
   /**
-   * A `DELETE` of at most `limit` expired rows of **one** partition — a write's
-   * sweep, run inside its transaction under the partition's sequence lock.
-   * Binds the store, the partition and `now`, in that order.
+   * A `DELETE` of at most `limit` expired rows of **one** partition. Binds the
+   * store, the partition and `now`, in that order.
+   *
+   * Both sweeps are this statement, and both run it inside a transaction that
+   * holds the partition's sequence lock — a write's sweep under the lock its
+   * write already took, and each batch of a store-wide sweep under the lock it
+   * takes first, exactly as a write would ([`RemoteKv`]'s `#sweepStep`). So no
+   * other write to the partition is in flight while it runs, and it cannot be
+   * half of a deadlock with one: whoever holds the sequence row holds nothing
+   * the other is waiting for.
    */
   readonly sweepPartition: (limit: number) => string;
-  /**
-   * A `DELETE` of at most `limit` expired rows of a **whole** store — one batch
-   * of the sweep a connection's first op on the store makes. Binds the store and
-   * `now`. It runs beside other processes' writes, so it must never wait on a
-   * row one of them holds in a way that could make that writer wait on it.
-   */
-  readonly sweepStore: (limit: number) => string;
 }
 
 /** What one server's connection does, and the whole of it. */
@@ -2297,15 +2375,19 @@ class RemoteKv {
   #queue: Promise<unknown> = Promise.resolve();
 
   /**
-   * The stores this connection has swept whole, by name — the open's half of
-   * PRD resolved q69's schedule, made once per store per connection.
+   * The store-wide sweeps this connection has started, by store name — the
+   * open's half of PRD resolved q69's schedule, started once per store per
+   * connection — each the promise of its end.
    *
    * Per connection rather than per process because a connection is what a
    * dialled store's "open" is: a process starting is its first connection, and
    * a connection redialled after a loss sweeps again, which costs a statement
    * that finds nothing.
    */
-  readonly #swept = new Set<string>();
+  readonly #sweeps = new Map<string, Promise<void>>();
+
+  /** Set once [`close`] is asked for, so a sweep queues no batch behind it. */
+  #closing = false;
 
   constructor(driver: StoreDriver) {
     this.#driver = driver;
@@ -2327,40 +2409,72 @@ class RemoteKv {
    * Delete one execution-scoped partition, when its run has ended — its
    * entries, its ledger, and its version sequence, which nothing will address
    * again.
+   *
+   * One transaction, under the partition's sequence lock taken first, as a
+   * write and a sweep batch take it ([`#sweepBatch`]): another process's
+   * store-wide sweep can reach this partition's expired rows at the same
+   * moment, and two `DELETE`s reaching one row through two indexes are the
+   * deadlock that lock exists to rule out. A partition no write ever reached
+   * has no sequence row, and then no sweep has anything of it to take either.
    */
   forget(store: string, scopeKey: string): Promise<unknown> {
     return this.#serial(async () => {
-      for (const table of ["store_entries", "store_applied", "store_sequences"]) {
-        await this.#run(`DELETE FROM ${table} WHERE store = ? AND scope_key = ?`, [
-          store,
-          scopeKey,
-        ]);
+      await this.#run("BEGIN", []);
+      try {
+        await this.#all(
+          "SELECT last FROM store_sequences WHERE store = ? AND scope_key = ? FOR UPDATE",
+          [store, scopeKey],
+        );
+        for (const table of ["store_entries", "store_applied", "store_sequences"]) {
+          await this.#run(`DELETE FROM ${table} WHERE store = ? AND scope_key = ?`, [
+            store,
+            scopeKey,
+          ]);
+        }
+        await this.#run("COMMIT", []);
+      } catch (error) {
+        await this.#run("ROLLBACK", []).catch(() => undefined);
+        throw error;
       }
     });
   }
 
   /**
-   * Delete the ledger rows a settled execution left in one partition: every
-   * idempotency key under `prefix`, which is `<execution id>/` (PRD resolved
-   * q69, [`pruneLedger`]).
+   * Delete the ledger rows a settled execution left in one store, whichever
+   * partitions they are in: every idempotency key under `prefix`, which is
+   * `<execution id>/` (PRD resolved q69, [`pruneLedger`]).
    *
-   * A range on the ledger's primary key, so the server seeks to the run of rows
-   * under the prefix rather than reading the partition's ledger; one statement,
-   * because the rows are this settled execution's alone and nothing else is
-   * writing them.
+   * A range on the ledger's primary key — `(store, idempotency_key)` on both
+   * servers, with no partition in it — so the server seeks to the run of rows
+   * under the prefix rather than reading anything else; one statement, because
+   * the rows are this settled execution's alone and nothing else is writing
+   * them.
    */
-  prune(store: string, scopeKey: string, prefix: string): Promise<unknown> {
+  prune(store: string, prefix: string): Promise<unknown> {
     return this.#serial(async () => {
       await this.#run(
-        "DELETE FROM store_applied WHERE store = ? AND scope_key = ? " +
-          "AND idempotency_key >= ? AND idempotency_key < ?",
-        [store, scopeKey, prefix, prefixEnd(prefix)],
+        "DELETE FROM store_applied WHERE store = ? AND idempotency_key >= ? AND idempotency_key < ?",
+        [store, prefix, prefixEnd(prefix)],
       );
     });
   }
 
+  /**
+   * Wait for every store-wide sweep this connection started to finish —
+   * [`releaseStores`]'s step before [`close`], so a command that reached a
+   * store has removed what had expired there by the time it exits.
+   */
+  async drain(): Promise<void> {
+    for (;;) {
+      const held = [...this.#sweeps.values()];
+      await Promise.all(held);
+      if (held.length === this.#sweeps.size) return;
+    }
+  }
+
   /** Give the connection back. */
   close(): Promise<void> {
+    this.#closing = true;
     return this.#serial(() => this.#driver.close());
   }
 
@@ -2403,10 +2517,10 @@ class RemoteKv {
     idempotencyKey: string | undefined,
     via: StoreSite["via"],
   ): Promise<Applied> {
-    if (!this.#swept.has(store.name)) {
-      this.#swept.add(store.name);
-      await this.#sweepStore(store);
-    }
+    // The first op on a store over this connection starts its store-wide
+    // sweep — **behind** this op, at the tail of the queue it is running on,
+    // never in front of it (see [`#startSweep`]).
+    if (!this.#sweeps.has(store.name)) this.#startSweep(store);
     if (!writes(op)) {
       return { row: await this.#read(store, op, params, scopeKey), deduped: false };
     }
@@ -2422,13 +2536,24 @@ class RemoteKv {
           `\`${store.address}\` could not lock its version sequence for partition ${JSON.stringify(scopeKey)}: the row was created and then not found, so this server is not keeping what this store writes (PRD resolved q68)`,
         );
       }
-      await this.#run(
-        "INSERT INTO store_sequences (store, scope_key, last) VALUES (?, ?, " +
-          '(SELECT COALESCE(MAX(version), 0) FROM store_entries WHERE store = ? AND scope_key = ?)) ' +
-          this.#driver.dialect.ignore("(store, scope_key)", "last = last"),
-        [store.name, scopeKey, store.name, scopeKey],
-      );
+      await this.#createSequence(store, scopeKey);
     }
+  }
+
+  /**
+   * Create a partition's sequence row where it has none — **outside** any
+   * transaction, so a write or a sweep rolled back never takes a row other
+   * writers are queued behind with it — starting past every version the
+   * partition already holds. A concurrent creator's row wins and this one
+   * changes nothing.
+   */
+  async #createSequence(store: StoreBinding, scopeKey: string): Promise<void> {
+    await this.#run(
+      "INSERT INTO store_sequences (store, scope_key, last) VALUES (?, ?, " +
+        '(SELECT COALESCE(MAX(version), 0) FROM store_entries WHERE store = ? AND scope_key = ?)) ' +
+        this.#driver.dialect.ignore("(store, scope_key)", "last = last"),
+      [store.name, scopeKey, store.name, scopeKey],
+    );
   }
 
   /**
@@ -2651,9 +2776,12 @@ class RemoteKv {
     }
   }
 
-  /** The server's clock, shifted by [`STORE_CLOCK_OFFSET`], in epoch milliseconds. */
-  async #now(): Promise<number> {
-    const offset = clockOffset();
+  /**
+   * The server's clock, shifted by [`STORE_CLOCK_OFFSET`], in epoch
+   * milliseconds — by the shift as it reads now, or as a caller read it
+   * earlier and hands in.
+   */
+  async #now(offset: number = clockOffset()): Promise<number> {
     const answered = await this.#all(`SELECT (${this.#driver.dialect.clock}) AS now`, []);
     const now = Number(answered[0]?.["now"]);
     if (!Number.isFinite(now)) {
@@ -2665,35 +2793,132 @@ class RemoteKv {
   }
 
   /**
-   * Remove every expired row of one store — the sweep a connection's first op
-   * on a store makes, which is the second half of PRD resolved q69's schedule.
+   * Start removing every row of one store that had expired by the instant the
+   * op starting it was made — the sweep a connection's first op on a store
+   * starts, which is the second half of PRD resolved q69's schedule.
    *
-   * In batches of [`SWEEP_PER_BATCH`], each one statement and so one short
-   * transaction, until a batch finds fewer than it may take. Each batch skips
-   * or waits only on rows a writer holds as a writer would, never holding one a
-   * writer then needs (`StoreDialect.sweepStore`), so it cannot deadlock a
-   * write.
+   * **Behind the ops, never in front of them.** One batch ([`#sweepStep`]) is
+   * one step of this connection's queue, and the next batch is queued only when
+   * the one before it has finished — at the tail, behind every op that arrived
+   * meanwhile. So the op that started the sweep runs first, and an op arriving
+   * while it is under way waits for at most the one batch in progress, however
+   * large the backlog is. [`releaseStores`] waits for the rest, so a command
+   * that reached the store has removed its backlog by the time it exits; a
+   * connection that is closed or lost first stops between two batches.
    *
-   * **Never the op's failure.** The sweep is housekeeping in front of an op
-   * that does not depend on it — every read and condition already treats an
-   * expired row as absent — so a sweep the server refused is said on stderr
-   * and the op runs; a connection that is really gone fails the op's own
-   * statement next, with the sentence that names it.
+   * It ends when no row of the store had expired by that instant, or when the
+   * same partition has twice in a row yielded nothing to a batch — rows held
+   * by a writer that does not take the sequence lock, which only an earlier
+   * release's writer mid-upgrade is — and the next write to that partition
+   * sweeps those instead. A write only ever moves an expiry past the instant it
+   * was made at, so the rows the sweep is after only ever become fewer.
+   *
+   * **Never an op's failure.** Every read and condition already treats an
+   * expired row as absent, so a batch the server refused is said on stderr and
+   * the sweep stops; a connection that is really gone fails the next op's own
+   * statement, with the sentence that names it.
    */
-  async #sweepStore(store: StoreBinding): Promise<void> {
-    try {
-      const now = await this.#now();
-      for (;;) {
-        const removed = await this.#run(this.#driver.dialect.sweepStore(SWEEP_PER_BATCH), [
-          store.name,
-          now,
-        ]);
-        if (removed < SWEEP_PER_BATCH) return;
-      }
-    } catch (error) {
-      process.stderr.write(
-        `warning: \`${store.address}\` could not remove its expired keys at open (${error instanceof Error ? error.message : String(error)}); they stay invisible to every read and condition, and a write to each one's partition removes them (PRD resolved q69)\n`,
+  #startSweep(store: StoreBinding): void {
+    // The shift as the op starting this reads it — a test moves the clock for
+    // the length of one op — so the sweep judges "expired" by that op's instant.
+    const written = process.env[STORE_CLOCK_OFFSET];
+    let finish = (): void => undefined;
+    const finished = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    this.#sweeps.set(store.name, finished);
+    holdSweep(finished);
+    let now: number | undefined;
+    let stalled: string | undefined;
+    const step = (): void => {
+      this.#serial(async () => {
+        if (this.#closing) return false;
+        now ??= await this.#now(clockOffset(written));
+        const swept = await this.#sweepStep(store, now);
+        if (swept === undefined) return false;
+        if (swept.removed > 0) {
+          stalled = undefined;
+          return true;
+        }
+        if (stalled === swept.scopeKey) return false;
+        stalled = swept.scopeKey;
+        return true;
+      }).then(
+        (more) => (more && !this.#closing ? step() : finish()),
+        (error: unknown) => {
+          process.stderr.write(
+            `warning: \`${store.address}\` could not finish removing its expired keys (${error instanceof Error ? error.message : String(error)}); they stay invisible to every read and condition, and a write to each one's partition removes them (PRD resolved q69)\n`,
+          );
+          finish();
+        },
       );
+    };
+    step();
+  }
+
+  /**
+   * One batch of a store-wide sweep: the partition holding the store's oldest
+   * row expired by `now`, and at most [`SWEEP_PER_BATCH`] of that partition's
+   * expired rows — or `undefined` where no row had expired by `now`.
+   *
+   * **Under the partition's sequence lock, taken first, as a write takes it**
+   * ([`#write`]). That is what makes a sweep unable to deadlock a write on
+   * either server. A store-wide `DELETE` reaching its rows through the
+   * store-wide expiry index would lock them in an order no write shares — on
+   * MySQL it holds each row's clustered record and then needs the entry it has
+   * in the partition's own expiry index, which a write's sweep of that
+   * partition locks the other way round — and the server would break the cycle
+   * by failing one of them, the write as often as not. Here, whichever of a
+   * sweep batch and a write holds the sequence row holds nothing the other is
+   * waiting for, so one simply waits for the other's commit. The partition is
+   * found by a read that locks nothing, through the store-wide expiry index, so
+   * it reads one expired row and no live one.
+   */
+  async #sweepStep(
+    store: StoreBinding,
+    now: number,
+  ): Promise<{ readonly scopeKey: string; readonly removed: number } | undefined> {
+    const oldest = await this.#all(
+      "SELECT scope_key FROM store_entries WHERE store = ? AND expires_at <= ? ORDER BY expires_at LIMIT 1",
+      [store.name, now],
+    );
+    const found = oldest[0]?.["scope_key"];
+    if (found === undefined || found === null) return undefined;
+    const scopeKey = String(found);
+    return { scopeKey, removed: await this.#sweepBatch(store, scopeKey, now) };
+  }
+
+  /**
+   * One partition's batch of [`#sweepStep`], in its own transaction under the
+   * partition's sequence lock.
+   *
+   * A partition holding an expired row always has a sequence row: only a write
+   * of this release sets an expiry, and it does so holding that row. The one
+   * way to find none is a race with [`forget`], which takes the same lock and
+   * deletes the entries in the same transaction as the row — so a batch that
+   * finds none removes nothing, and the next step asks again.
+   */
+  async #sweepBatch(store: StoreBinding, scopeKey: string, now: number): Promise<number> {
+    await this.#run("BEGIN", []);
+    try {
+      const sequence = await this.#all(
+        "SELECT last FROM store_sequences WHERE store = ? AND scope_key = ? FOR UPDATE",
+        [store.name, scopeKey],
+      );
+      if (sequence.length === 0) {
+        await this.#run("ROLLBACK", []);
+        return 0;
+      }
+      const removed = await this.#run(this.#driver.dialect.sweepPartition(SWEEP_PER_BATCH), [
+        store.name,
+        scopeKey,
+        now,
+      ]);
+      await this.#run("COMMIT", []);
+      return removed;
+    } catch (error) {
+      await this.#run("ROLLBACK", []).catch(() => undefined);
+      throw error;
     }
   }
 }
@@ -2708,8 +2933,22 @@ class RemoteKv {
  * Idempotent, and never the caller's failure: a connection that could not be
  * closed is one the server will reap, and the command that asked has already
  * done its work.
+ *
+ * **What is still running over the stores goes first**: a settled execution's
+ * ledger prune ([`pruneLedger`]), and every store-wide sweep this process
+ * started ([`SWEEPING`]) — on SQLite and over each connection alike — so a
+ * command that reached a store has removed what had expired there by the time
+ * it exits (PRD resolved q69's "next process start"). That wait is here, on
+ * the way out, rather than in front of the first op, where it would stall
+ * whatever the command had come to do. Re-read until nothing is left, because a
+ * prune can start while another finishes.
  */
 export async function releaseStores(): Promise<void> {
+  for (;;) {
+    const running = [...PRUNING, ...SWEEPING];
+    if (running.length === 0) break;
+    await Promise.all(running.map((held) => held.catch(() => undefined)));
+  }
   const held = [...DIALLED.values()];
   DIALLED.clear();
   await Promise.all(
@@ -3321,23 +3560,23 @@ function numberedStoreBind(sql: string): string {
 const POSTGRES_STORE_CLOCK = "FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint";
 
 /**
- * A bounded `DELETE` over the rows a sub-select finds, which is how Postgres
- * spells `DELETE … LIMIT` — it has no other.
+ * A bounded `DELETE` of one partition's expired rows, over the rows a
+ * sub-select finds, which is how Postgres spells `DELETE … LIMIT` — it has no
+ * other.
  *
- * **`FOR UPDATE SKIP LOCKED`**, so a sweep never waits on a row another
- * transaction holds: a write sweeping its own partition is already serialized
- * against every other write to it by the sequence lock, and a store-wide sweep
- * beside them takes the expired rows nobody holds and leaves the rest for the
- * next sweep — which is what makes a sweep unable to be either half of a
- * deadlock with a write. `ctid` is the row's own address, so the outer delete
- * removes exactly the rows the sub-select locked; they cannot move while it
- * holds them. Both read through a partial index over `expires_at`, so neither
- * reads a row that has not expired.
+ * It runs only under the partition's sequence lock — a write's sweep and each
+ * batch of a store-wide one alike (`StoreDialect.sweepPartition`) — so no other
+ * write to the partition is in flight beside it. **`FOR UPDATE SKIP LOCKED`**
+ * all the same, so it never waits on a row something outside that lock holds,
+ * and leaves such a row for the next sweep instead. `ctid` is the row's own
+ * address, so the outer delete removes exactly the rows the sub-select locked;
+ * they cannot move while it holds them. It reads through the partial index over
+ * `(store, scope_key, expires_at)`, so it reads no row that has not expired.
  */
-function postgresSweep(where: string, limit: number): string {
+function postgresSweep(limit: number): string {
   return (
     "DELETE FROM store_entries WHERE ctid = ANY(ARRAY(SELECT ctid FROM store_entries " +
-    `WHERE ${where} AND expires_at <= ? LIMIT ${limit} FOR UPDATE SKIP LOCKED))`
+    `WHERE store = ? AND scope_key = ? AND expires_at <= ? LIMIT ${limit} FOR UPDATE SKIP LOCKED))`
   );
 }
 
@@ -3347,8 +3586,7 @@ const POSTGRES_STORE_DIALECT: StoreDialect = {
   overwrite: standardOverwrite,
   ignore: standardIgnore,
   clock: POSTGRES_STORE_CLOCK,
-  sweepPartition: (limit) => postgresSweep("store = ? AND scope_key = ?", limit),
-  sweepStore: (limit) => postgresSweep("store = ?", limit),
+  sweepPartition: postgresSweep,
 };
 
 /**

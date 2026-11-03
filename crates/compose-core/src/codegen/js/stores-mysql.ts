@@ -125,14 +125,17 @@ import type { Connection, ResultSetHeader, RowDataPacket } from "mysql2/promise"
  * ledger's arithmetic again: `store` and an ASCII `scope_key`, 2176 bytes.
  *
  * `expires_at` is the epoch millisecond a key expires at, `NULL` for one that
- * does not (PRD resolved q69), and the two indexes over it are what each sweep
- * reads through: `store_entries_partition_expiry` a write's sweep of its own
- * partition, by the partition's **hash** — the one exact, index-sized handle on
- * a partition this table has, since `store_entries_partition` holds a prefix of
- * `scope_key` and a prefix cannot be followed by a range — and
- * `store_entries_expiry` the store-wide sweep a connection's first op makes.
- * MySQL has no partial index, so a key that never expires has an entry in both
- * under `NULL`, which sorts first and which neither sweep's range reaches.
+ * does not (PRD resolved q69), and the two indexes over it are what the sweeps
+ * read through: `store_entries_partition_expiry` is every `DELETE` of expired
+ * rows — a write's sweep of its own partition, and each batch of a store-wide
+ * one, both under the partition's sequence lock — by the partition's **hash**,
+ * the one exact, index-sized handle on a partition this table has, since
+ * `store_entries_partition` holds a prefix of `scope_key` and a prefix cannot
+ * be followed by a range; and `store_entries_expiry` is the read, locking
+ * nothing, by which a store-wide sweep finds the partition holding the store's
+ * oldest expired row. MySQL has no partial index, so a key that never expires
+ * has an entry in both under `NULL`, which sorts first and which no sweep's
+ * range reaches.
  */
 const MYSQL_STORE_SCHEMA = [
   `CREATE TABLE IF NOT EXISTS store_entries (
@@ -307,19 +310,17 @@ const MYSQL_STORE_DIALECT: StoreDialect = {
   overwrite: duplicateKeyOverwrite,
   ignore: duplicateKeyNoop,
   clock: MYSQL_STORE_CLOCK,
-  // A write's own partition, by its hash — `store_entries_partition_expiry`
-  // (see [`MYSQL_STORE_SCHEMA`]) — under the sequence lock the write already
-  // holds, so no other write to the partition is in flight.
+  // One partition, by its hash — `store_entries_partition_expiry` (see
+  // [`MYSQL_STORE_SCHEMA`]) — and only ever under that partition's sequence
+  // lock, a write's or a store-wide sweep batch's (`StoreDialect`). MySQL takes
+  // no `SKIP LOCKED` on a `DELETE`, and needs none here: the `DELETE` holds
+  // each row's clustered record and then the entries its other indexes have
+  // for it, so two statements reaching one row through two indexes would each
+  // hold what the other waits for — which is why no `DELETE` of expired rows
+  // runs outside the lock that keeps a second one off the partition.
   sweepPartition: (limit) =>
     "DELETE FROM store_entries WHERE store = ? AND scope_hash = UNHEX(SHA2(?, 256)) " +
     `AND expires_at <= ? ORDER BY expires_at LIMIT ${limit}`,
-  // Every partition, by `store_entries_expiry`, oldest expiry first. MySQL takes
-  // no `SKIP LOCKED` on a `DELETE`, so where a write holds an expired row this
-  // waits for that write's commit — a write's few statements — and never the
-  // other way round: it locks in expiry order, and a write's own sweep takes
-  // its partition's expired rows in the same order before anything else.
-  sweepStore: (limit) =>
-    `DELETE FROM store_entries WHERE store = ? AND expires_at <= ? ORDER BY expires_at LIMIT ${limit}`,
 };
 
 /**

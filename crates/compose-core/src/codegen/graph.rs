@@ -633,6 +633,7 @@ const DEFAULT_ROUTE_ON: &[&str] = &["rate_limit", "overloaded", "timeout"];
 /// node reads.
 fn stores(ir: &Ir, names: &Names, imported: &mut Vec<String>) -> String {
     let mut text = String::new();
+    let mut bound: Vec<String> = Vec::new();
     for (address, definition) in &ir.definitions {
         let DefinitionBody::Store(store) = &definition.body else {
             continue;
@@ -641,6 +642,7 @@ fn stores(ir: &Ir, names: &Names, imported: &mut Vec<String>) -> String {
             .split_once('.')
             .map_or(address.as_str(), |(_, rest)| rest);
         let backend = crate::ir::deploy::backend_of(ir, store);
+        bound.push(names.value(address).to_string());
         text.push('\n');
         text.push_str(&names::doc(
             "",
@@ -728,6 +730,23 @@ fn stores(ir: &Ir, names: &Names, imported: &mut Vec<String>) -> String {
         }
         text.push_str("  },\n");
         text.push_str("};\n");
+    }
+    // Every binding, registered with the module whose settlement prunes the
+    // idempotency ledger (PRD resolved q69): the process that settles an
+    // execution is not always the one that made its keyed writes — a placed
+    // node writes from its worker — so the prune visits every store the
+    // composition binds rather than the ones this process happened to reach.
+    if !bound.is_empty() {
+        text.push('\n');
+        text.push_str(&names::doc(
+            "",
+            &[
+                "Every store this composition binds, so an execution's settlement prunes \
+               its ledger rows from each (PRD resolved q69)."
+                    .to_string(),
+            ],
+        ));
+        text.push_str(&format!("stores.bindsStores([{}]);\n", bound.join(", ")));
     }
     text
 }

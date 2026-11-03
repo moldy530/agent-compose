@@ -634,6 +634,11 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "the_write_sweep_removes_at_most_100_rows",
     "an_expired_key_leaves_storage_at_the_next_writes_to_its_partition",
     "an_expired_key_leaves_storage_when_a_process_next_opens_the_store",
+    // …where that open's sweep runs behind the process's first op rather than
+    // in front of it — the op answers with the backlog still stored — and has
+    // removed all of it by the time the process lets go of the store.
+    "a_first_op_answers_before_the_start_sweep_has_finished",
+    "the_start_sweep_has_removed_the_backlog_when_the_process_lets_go",
     "a_malformed_clock_offset_is_refused_by_name",
     // (d) the ledger a settled execution leaves is pruned, through the
     // runtime's own settle: N executions leave a bounded ledger and keep their
@@ -647,6 +652,21 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "a_prune_reaches_only_its_own_executions_prefix",
     "a_childs_ledger_rows_go_when_the_child_settles",
     "a_parents_ledger_rows_go_when_the_parent_settles",
+    // …the two outcomes `settleExecution` leaves open — a parked `human`
+    // pause and a replay divergence — keep every row through the settlement
+    // itself, and the resume of each is answered from them.
+    "a_parked_executions_settlement_keeps_its_ledger_rows",
+    "a_diverged_executions_settlement_keeps_its_ledger_rows",
+    // …what is pruned is every store the composition binds, so a keyed write a
+    // second process made (a placement's worker) goes when the process that
+    // settles prunes, though it never saw the write.
+    "a_keyed_write_another_process_made_is_pruned_at_settlement",
+    // …and a detached delivery still running at settlement writes under the
+    // execution's id: its rows stay until it has finished, so a retry inside
+    // it after the run settled is answered rather than applied twice.
+    "a_detached_delivery_running_at_settlement_keeps_its_ledger_rows",
+    "a_retry_inside_a_detached_delivery_after_settlement_still_dedupes",
+    "a_detached_deliverys_rows_go_once_it_has_finished",
 ];
 
 /// The cases a backend with a **socket** must answer `true`, on top of those.
@@ -690,6 +710,14 @@ const TRUE_WHEN_DIALLED: &[&str] = &[
     // keys are alive — the row holds the server's instant with this process's
     // clock ten days off.
     "expiry_is_computed_by_the_servers_clock",
+    // PRD resolved q69 (c): the two halves of the cleanup schedule — a write's
+    // sweep of its partition and the store-wide sweep a connection's first op
+    // starts — run at once in two processes over one backlog without either
+    // failing as a deadlock, the sweep takes no key a write refreshed, and the
+    // backlog is gone once both processes have let go of the store.
+    "a_store_wide_sweep_and_a_write_never_deadlock",
+    "a_store_wide_sweep_takes_no_key_a_write_refreshed",
+    "a_store_wide_sweep_removes_the_whole_backlog",
 ];
 
 /// **A target that binds both dialled arms gets one module, and it compiles.**
