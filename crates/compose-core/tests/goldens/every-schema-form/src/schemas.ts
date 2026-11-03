@@ -419,6 +419,20 @@ export const flowShapeNodeFetchOutput = z.object({
 }).strict();
 export type FlowShapeNodeFetchOutput = z.infer<typeof flowShapeNodeFetchOutput>;
 
+/**
+ * `flow.shape` node `shift` — what the `batch` of `store.ledger` answers, derived from the op and the store (grammar 11.4, Decision D34).
+ */
+export const flowShapeNodeShiftOutput = z.object({
+  applied: z.boolean(),
+  deduped: z.boolean(),
+  results: z.array(z.object({
+    key: z.string(),
+    version: z.number().int(),
+  }).strict()).max(3),
+  failed: z.number().int(),
+}).strict();
+export type FlowShapeNodeShiftOutput = z.infer<typeof flowShapeNodeShiftOutput>;
+
 /** `store.docs` — the metadata a match carries (grammar 11.1). */
 export const storeDocsMetadataSchema = z.object({
   source: z.string(),

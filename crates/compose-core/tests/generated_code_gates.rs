@@ -3993,6 +3993,41 @@ fn the_local_store_backends_partition_dedupe_and_encode_what_they_are_given() {
 /// WebAssembly module over `node:fs`, and a difference between the two engines
 /// would be a difference in what every store in every emitted project does.
 fn the_local_backends_behaved(answer: &Value) {
+    // PRD resolved q71's `batch` on the two in-process arms — a target's
+    // `provider: memory` binding and a `scope: execution` store — which the
+    // store contract does not drive: one transaction there too. The seed took
+    // version 1, so the batch's two sets take 2 and 3 in entry order; a retry
+    // is answered whole and `deduped`; a condition failing at the last entry
+    // takes the first back, so `c` was never written and `a` kept its value.
+    for arm in ["memory", "execution"] {
+        let batch = &answer[format!("batch_{arm}")];
+        let results = json!([
+            { "key": "a", "version": 2 },
+            { "key": "b", "version": 3 },
+            { "key": "old" },
+        ]);
+        assert_eq!(
+            batch["landed"],
+            json!({ "applied": true, "deduped": false, "results": results }),
+            "the `{arm}` arm's batch lands every entry at consecutive versions"
+        );
+        assert_eq!(
+            batch["retried"],
+            json!({ "applied": true, "deduped": true, "results": results }),
+            "the `{arm}` arm answers a retried batch whole out of its ledger"
+        );
+        assert_eq!(
+            batch["declined"],
+            json!({ "applied": false, "deduped": false, "results": [], "failed": 1 }),
+            "the `{arm}` arm's declined batch names the entry that declined"
+        );
+        assert_eq!(
+            batch["held"],
+            json!(["one", "two", null, null]),
+            "the `{arm}` arm's declined batch applied none of its entries"
+        );
+    }
+
     // The `kv` catalogue of grammar 11.4, row by row — a hit carrying the
     // version its write took from the partition's sequence (PRD resolved q68).
     assert_eq!(

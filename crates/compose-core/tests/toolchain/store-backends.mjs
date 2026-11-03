@@ -247,6 +247,55 @@ const answer = {};
   );
 }
 
+// --- A `batch` in memory: one transaction, on the arms that open no file -----
+
+// PRD resolved q71 on the two in-process arms `store-contract.mjs` does not
+// drive: a target's `provider: memory` binding and a `scope: execution` store,
+// both an in-memory database opened by this process. A batch there is the same
+// transaction it is on a file — a set, a set and a delete land together; a
+// condition failing at its last entry takes the earlier ones back and answers
+// its index; a retry under the same key is answered whole, `deduped`.
+for (const [label, store] of [
+  [
+    "memory",
+    binding("batched", "kv", "global", {
+      backend: { provider: "memory", from: "the `kv` default of the `staging` target" },
+    }),
+  ],
+  ["execution", binding("batched_scratch", "kv", "execution")],
+]) {
+  const run = context(`exec_batch_${label}`);
+  await stores.runStoreOp(store, "set", { key: "old", value: { text: "seed" } }, run, node(`bm/${label}/seed`));
+  const ops = [
+    { op: "set", key: "a", value: { text: "one" } },
+    { op: "set", key: "b", value: { text: "two" } },
+    { op: "delete", key: "old" },
+  ];
+  const landed = await stores.runStoreOp(store, "batch", { ops }, run, node(`bm/${label}/1`));
+  const retried = await stores.runStoreOp(store, "batch", { ops }, run, node(`bm/${label}/1`));
+  const declined = await stores.runStoreOp(
+    store,
+    "batch",
+    {
+      ops: [
+        { op: "set", key: "c", value: { text: "three" } },
+        { op: "set", key: "a", value: { text: "never" }, condition: "absent" },
+      ],
+    },
+    run,
+    node(`bm/${label}/2`),
+  );
+  const held = await Promise.all(
+    ["a", "b", "c", "old"].map((key) => stores.runStoreOp(store, "get", { key }, run, node())),
+  );
+  answer[`batch_${label}`] = {
+    landed,
+    retried,
+    declined,
+    held: held.map((row) => (row.found ? row.value.text : null)),
+  };
+}
+
 // --- `blob`: a directory of files, keyed reversibly --------------------------
 
 {

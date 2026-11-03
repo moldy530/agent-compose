@@ -2768,6 +2768,473 @@ if (provider !== "sqlite") {
   }
 }
 
+// --- A batch: many keys, one transaction, one ledger row (PRD resolved q71) ----
+//
+// A `batch` is one `kv` write's shape with N entries inside its transaction:
+// the partition's sequence locked once, the ledger asked once, each entry a
+// single `set` or `delete` decided against what its key holds, all of them
+// landing or none. Every case below is a promise the ruling makes of **every**
+// arm, so a server whose savepoint, row lock or rollback answered differently
+// from SQLite's is this list failing on that arm.
+
+/** A batch, as a store-op node issues one. */
+const batch = (store, ops, run, key_ = undefined) =>
+  stores.runStoreOp(store, "batch", { ops }, run, node(key_));
+
+/**
+ * The last version a partition's sequence handed out, read out of storage
+ * itself — which is what "no version consumed" is a statement about.
+ */
+async function sequenceLast(store, scopeKey = "global") {
+  const held = await storage(
+    "SELECT last FROM store_sequences WHERE store = ? AND scope_key = ?",
+    [store.name, scopeKey],
+    [store.name, "SELECT last FROM sequences WHERE scope_key = ?", [scopeKey]],
+  );
+  return held[0] === undefined ? undefined : Number(held[0].last);
+}
+
+/** The schema the batch cases hold their `set` entries' values to. */
+const BATCHED = z.object({ n: z.number().int().min(0), hold: z.boolean().optional() }).strict();
+
+{
+  // **A set, a set and a delete land together**, the two sets taking the
+  // partition's next two versions in entry order, and the record the trace
+  // files is one write with no single key and the whole answer.
+  const store = kv("batch_lands", "global", URL_ENV, BATCHED);
+  const run = ctx(execution("batch_lands"));
+  const seeded = await set(store, "old", { n: 0 }, run, `${RUN}/batch_lands/seed`);
+  run.storeRecords.length = 0;
+  const key = `${execution("batch_lands")}/move/0`;
+  const moved = await batch(
+    store,
+    [
+      { op: "set", key: "a", value: { n: 1 } },
+      { op: "set", key: "b", value: { n: 2 } },
+      { op: "delete", key: "old" },
+    ],
+    run,
+    key,
+  );
+  const [a, b, old] = await Promise.all(["a", "b", "old"].map((name) => get(store, name, run)));
+  answer.a_batch_of_set_set_delete_lands_all_three_with_consecutive_versions =
+    moved.applied === true &&
+    moved.deduped === false &&
+    !("failed" in moved) &&
+    same(moved.results, [
+      { key: "a", version: seeded.version + 1 },
+      { key: "b", version: seeded.version + 2 },
+      { key: "old" },
+    ]) &&
+    a.value?.n === 1 &&
+    a.version === seeded.version + 1 &&
+    b.value?.n === 2 &&
+    b.version === seeded.version + 2 &&
+    old.found === false &&
+    (await sequenceLast(store)) === seeded.version + 2;
+  answer.batch_lands = moved;
+  const [record] = run.storeRecords.filter((entry) => entry.op === "batch");
+  answer.a_batch_record_is_one_write_with_no_key_and_its_answer =
+    record !== undefined &&
+    record.effect === "write" &&
+    record.via === "node" &&
+    !("key" in record) &&
+    !("version" in record) &&
+    record.applied === true &&
+    record.idempotencyKey === key &&
+    record.deduped === false &&
+    same(record.answer?.results, moved.results);
+  answer.batch_record = record ?? null;
+
+  // **A retried batch is answered whole out of the ledger**: the same results,
+  // `deduped: true`, and nothing written again — the versions the keys hold
+  // are still the first attempt's, and the sequence has not moved.
+  const retried = await batch(
+    store,
+    [
+      { op: "set", key: "a", value: { n: 1 } },
+      { op: "set", key: "b", value: { n: 2 } },
+      { op: "delete", key: "old" },
+    ],
+    run,
+    key,
+  );
+  answer.a_retried_batch_dedupes_whole =
+    retried.applied === true &&
+    retried.deduped === true &&
+    same(retried.results, moved.results) &&
+    (await get(store, "a", run)).version === seeded.version + 1 &&
+    (await sequenceLast(store)) === seeded.version + 2;
+}
+
+{
+  // **A condition that does not hold at index 2 applies nothing** — not the
+  // two entries before it, which had already been written inside the
+  // transaction — and answers `applied: false` naming the index. No version is
+  // consumed. The decline is an answer, so it is the ledger row, and a retry
+  // of it is handed the decline again even once the condition would hold.
+  const store = kv("batch_declines", "global", URL_ENV, BATCHED);
+  const run = ctx(execution("batch_declines"));
+  const held = await set(store, "held", { n: 9 }, run, `${RUN}/batch_declines/seed`);
+  const key = `${execution("batch_declines")}/claim/0`;
+  const ops = [
+    { op: "set", key: "c", value: { n: 3 } },
+    { op: "set", key: "d", value: { n: 4 } },
+    { op: "set", key: "held", value: { n: 5 }, condition: "absent" },
+  ];
+  const declined = await batch(store, ops, run, key);
+  const [c, d, still] = await Promise.all(["c", "d", "held"].map((name) => get(store, name, run)));
+  answer.a_failed_condition_at_index_2_leaves_indexes_0_and_1_unapplied =
+    declined.applied === false &&
+    declined.deduped === false &&
+    declined.failed === 2 &&
+    same(declined.results, []) &&
+    c.found === false &&
+    d.found === false &&
+    still.value?.n === 9 &&
+    still.version === held.version &&
+    (await sequenceLast(store)) === held.version;
+  answer.batch_declined = declined;
+  // The key the condition was about goes; the condition would hold now.
+  await write(store, "delete", { key: "held" }, run, `${RUN}/batch_declines/clear`);
+  const again = await batch(store, ops, run, key);
+  answer.a_retried_declined_batch_answers_its_decline_deduped =
+    again.applied === false &&
+    again.deduped === true &&
+    again.failed === 2 &&
+    same(again.results, []) &&
+    (await get(store, "c", run)).found === false &&
+    (await get(store, "held", run)).found === false;
+  // …while a batch under a key of its own, against the same state, applies.
+  const fresh = await batch(store, ops, run, `${key}/fresh`);
+  answer.the_same_entries_under_a_fresh_key_apply_once_the_condition_holds =
+    fresh.applied === true && fresh.results.length === 3;
+}
+
+{
+  // **A value the schema refuses fails the batch and changes nothing**: the
+  // entry before it, written inside the transaction, is rolled back, the
+  // entry after it never runs, no version is consumed, and no ledger row is
+  // left, so a retry is refused again rather than answered.
+  const store = kv("batch_refused", "global", URL_ENV, BATCHED);
+  const run = ctx(execution("batch_refused"));
+  const kept = await set(store, "kept", { n: 7 }, run, `${RUN}/batch_refused/seed`);
+  const key = `${execution("batch_refused")}/move/0`;
+  const ops = [
+    { op: "set", key: "e", value: { n: 1 } },
+    { op: "set", key: "f", value: { n: -1 } },
+    { op: "delete", key: "kept" },
+  ];
+  const refused = await refusal(batch(store, ops, run, key));
+  answer.batch_refusal = refused ?? null;
+  answer.a_value_the_schema_refuses_at_index_1_fails_the_node_and_leaves_the_partition_unchanged =
+    refused !== undefined &&
+    refused.includes(`refused the \`batch\` at its entry 1, a \`set\` at key "f"`) &&
+    refused.includes("Nothing was written") &&
+    (await get(store, "e", run)).found === false &&
+    (await get(store, "f", run)).found === false &&
+    (await get(store, "kept", run)).version === kept.version &&
+    (await sequenceLast(store)) === kept.version &&
+    (await ledgerRows(store, key)) === 0 &&
+    (await refusal(batch(store, ops, run, key))) !== undefined;
+}
+
+{
+  // **A duplicate key inside one batch applies in order**: the second entry
+  // naming a key reads what the first left inside the transaction, so an
+  // `if: present` behind a `set` of an absent key holds, and a `set` then a
+  // `delete` of one key leaves it absent.
+  const store = kv("batch_in_order", "global", URL_ENV, BATCHED);
+  const run = ctx(execution("batch_in_order"));
+  const ordered = await batch(
+    store,
+    [
+      { op: "set", key: "k", value: { n: 1 } },
+      { op: "set", key: "k", value: { n: 2 }, condition: "present" },
+      { op: "set", key: "gone", value: { n: 3 } },
+      { op: "delete", key: "gone" },
+    ],
+    run,
+    `${execution("batch_in_order")}/move/0`,
+  );
+  const k = await get(store, "k", run);
+  const first = ordered.results?.[0]?.version;
+  answer.a_duplicate_key_within_a_batch_applies_in_order =
+    ordered.applied === true &&
+    same(ordered.results, [
+      { key: "k", version: first },
+      { key: "k", version: first + 1 },
+      { key: "gone", version: first + 2 },
+      { key: "gone" },
+    ]) &&
+    k.value?.n === 2 &&
+    k.version === first + 1 &&
+    (await get(store, "gone", run)).found === false;
+  // …and a version condition on an entry reads the version an earlier entry
+  // of the same batch took.
+  const cas = await batch(
+    store,
+    [
+      { op: "set", key: "k", value: { n: 4 } },
+      { op: "delete", key: "k", ifVersion: k.version },
+    ],
+    run,
+    `${execution("batch_in_order")}/move/1`,
+  );
+  answer.an_entry_condition_reads_what_the_entries_before_it_left =
+    cas.applied === false && cas.failed === 1 && (await get(store, "k", run)).value?.n === 2;
+}
+
+{
+  // **Each `set` entry's `ttl` and the store's `default_ttl:` apply exactly as
+  // on a single write**: an entry's own `ttl` first, `never` beating the
+  // default, and the default where an entry names none — each entry its own
+  // expiry, from the one instant the batch read its clock.
+  const store = { ...kv("batch_expiry", "global", URL_ENV, BATCHED), defaultTtl: 2 * HOUR };
+  const run = ctx(execution("batch_expiry"));
+  await later(0, () =>
+    batch(
+      store,
+      [
+        { op: "set", key: "short", value: { n: 1 }, ttl: HOUR },
+        { op: "set", key: "defaulted", value: { n: 2 } },
+        { op: "set", key: "kept", value: { n: 3 }, ttl: "never" },
+      ],
+      run,
+      `${execution("batch_expiry")}/move/0`,
+    ),
+  );
+  const at = (offset) =>
+    later(offset, async () =>
+      (await Promise.all(["short", "defaulted", "kept"].map((name) => get(store, name, run)))).map(
+        (row) => row.found,
+      ),
+    );
+  const [early, between, past] = [await at(HOUR - MINUTE), await at(HOUR + MINUTE), await at(2 * HOUR + MINUTE)];
+  answer.each_batch_entrys_ttl_and_the_store_default_apply =
+    same(early, [true, true, true]) && same(between, [false, true, true]) && same(past, [false, false, true]);
+  answer.batch_expiry = { early, between, past };
+}
+
+{
+  // **The bound is the run's too**: a caller that skipped the compiler is
+  // refused by name, before anything is read, rather than applied in part.
+  const store = kv("batch_bound", "global", URL_ENV, BATCHED);
+  const run = ctx(execution("batch_bound"));
+  const many = Array.from({ length: 101 }, (_, index) => ({ op: "delete", key: `k${index}` }));
+  answer.batch_bound_refusal = (await refusal(batch(store, many, run, `${RUN}/batch_bound`))) ?? null;
+  answer.a_batch_of_101_entries_is_refused_by_name =
+    typeof answer.batch_bound_refusal === "string" &&
+    answer.batch_bound_refusal.includes("was handed 101 entries") &&
+    (await refusal(batch(store, [], run, `${RUN}/batch_bound/empty`)))?.includes("was handed 0 entries") === true;
+}
+
+/**
+ * Whether some other transaction holds an uncommitted write of `key` in
+ * `store`'s global partition — asked by trying to write it from a connection of
+ * this file's own, under a short lock timeout, and rolling the attempt back.
+ *
+ * A row another transaction inserted is invisible to every read but a dirty
+ * one, and Postgres has none; an insert of the same key waits on it on both
+ * servers, which is the one question both can be asked alike. A key nobody
+ * holds is inserted and rolled back at once, which is the `false` answer.
+ */
+async function heldUncommitted(store, key) {
+  const probe = await openServer(process.env[URL_ENV]);
+  try {
+    await begin(probe);
+    try {
+      if (provider === "postgres") {
+        await rows(probe, "SET LOCAL lock_timeout = '500ms'");
+        await rows(
+          probe,
+          'INSERT INTO store_entries (store, scope_key, "key", value) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
+          [store.name, "global", key, "{}"],
+        );
+      } else {
+        await rows(probe, "SET SESSION innodb_lock_wait_timeout = 1");
+        await rows(
+          probe,
+          "INSERT IGNORE INTO store_entries (store, scope_key, `key`, value) VALUES (?, ?, ?, ?)",
+          [store.name, "global", key, "{}"],
+        );
+      }
+      return false;
+    } catch (error) {
+      const message = String(error?.message ?? error);
+      return message.includes("lock timeout") || message.includes("Lock wait timeout");
+    } finally {
+      await rollback(probe).catch(() => undefined);
+    }
+  } finally {
+    await probe.end().catch(() => undefined);
+  }
+}
+
+{
+  // **A batch killed between two entry writes leaves none of it** — on every
+  // arm, by killing the writing process outright. `store-batch-crash.mjs` seeds
+  // a key, then runs a batch whose second entry's value holds the schema's
+  // refinement open for ever, after its first entry was written inside the
+  // transaction; this process waits for the marker that says so, proves the
+  // first entry was really written (SQLite's rollback journal is on disk; a
+  // server holds an uncommitted insert of the key), and sends `SIGKILL`. What
+  // is left is the seed and nothing of the batch: no key, no version, no
+  // ledger row — so a retry of the same effect applies, once.
+  //
+  // On SQLite the store is one this process has never opened: the killed
+  // writer's lock directory is still there, and the open below is what breaks
+  // it once `LOCK_WAIT_MS` has passed and rolls the hot journal back, which is
+  // the recovery a real crash gets.
+  const name = `${RUN}_batch_killed`;
+  const store = kv("batch_killed", "global", URL_ENV, BATCHED);
+  const key = `${execution("batch_killed")}/move/0`;
+  const marker = path.join(data, `${RUN}-batch-crash.marker`);
+  const script = path.join(path.dirname(fileURLToPath(import.meta.url)), "store-batch-crash.mjs");
+  try {
+    fs.mkdirSync(data, { recursive: true });
+    const child = spawn(process.execPath, [script, project, provider, data, name, key, marker], {
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let err = "";
+    child.stderr.on("data", (chunk) => (err += chunk));
+    const exited = new Promise((resolve) => child.on("close", (code, signal) => resolve({ code, signal })));
+    const deadline = Date.now() + 30_000;
+    let open = false;
+    while (Date.now() < deadline && child.exitCode === null) {
+      if (fs.existsSync(marker)) {
+        open = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    answer.the_batch_was_mid_transaction_when_it_was_killed = open;
+    let written = false;
+    if (open) {
+      written =
+        provider === "sqlite"
+          ? fs.existsSync(path.join(data, "stores", `${stores.encodeKey(name)}.sqlite-journal`))
+          : await heldUncommitted(store, "first");
+    }
+    answer.the_killed_batch_had_written_its_first_entry = written;
+    child.kill("SIGKILL");
+    const ended = await exited;
+    answer.batch_crash_exit = { ...ended, stderr: err.slice(0, 2000) };
+    const run = ctx(execution("batch_killed"));
+    const [first, second, seeded] = await Promise.all(
+      ["first", "second", "seeded"].map((entry) => get(store, entry, run)),
+    );
+    const left = {
+      first: first.found,
+      second: second.found,
+      seeded,
+      last: await sequenceLast(store),
+      ledger: await ledgerRows(store, key),
+    };
+    answer.batch_crash_left = left;
+    answer.a_batch_killed_mid_transaction_leaves_none_of_it =
+      open &&
+      written &&
+      ended.signal === "SIGKILL" &&
+      left.first === false &&
+      left.second === false &&
+      seeded.value?.n === 0 &&
+      left.last === seeded.version &&
+      left.ledger === 0;
+    const retried = await batch(
+      store,
+      [
+        { op: "set", key: "first", value: { n: 1 } },
+        { op: "set", key: "second", value: { n: 2 } },
+        { op: "delete", key: "seeded" },
+      ],
+      run,
+      key,
+    );
+    const again = await batch(store, [{ op: "delete", key: "first" }], run, key);
+    answer.a_batch_retried_after_its_crash_applies_once =
+      retried.applied === true &&
+      retried.deduped === false &&
+      same(retried.results, [
+        { key: "first", version: seeded.version + 1 },
+        { key: "second", version: seeded.version + 2 },
+        { key: "seeded" },
+      ]) &&
+      again.deduped === true &&
+      same(again.results, retried.results) &&
+      (await get(store, "first", run)).found === true;
+  } catch (error) {
+    answer.batch_crash_error = String(error?.message ?? error);
+  }
+}
+
+if (provider !== "sqlite") {
+  // **…and one whose connection the server ends between two entry writes.**
+  // The dialled arm's own failure, driven the way the redial case below
+  // drives it: a connection of this file's holds an uncommitted insert of the
+  // batch's second key, so the batch — its first entry written inside the
+  // transaction — waits on the server for it, and the server's own `KILL` /
+  // `pg_terminate_backend` ends that session mid-transaction. The op is refused
+  // by name, the server rolls the transaction back, and a retry applies once.
+  const BATCH_URL_ENV = "AGENT_COMPOSE_STORE_URL_BATCH";
+  process.env[BATCH_URL_ENV] = process.env[URL_ENV];
+  const store = kv("batch_ended", "global", BATCH_URL_ENV, BATCHED);
+  const run = ctx(execution("batch_ended"));
+  const key = `${execution("batch_ended")}/move/0`;
+  const ops = [
+    { op: "set", key: "first", value: { n: 1 } },
+    { op: "set", key: "second", value: { n: 2 } },
+    { op: "delete", key: "seeded" },
+  ];
+  const killer = await openServer(process.env[URL_ENV]);
+  let blocked;
+  try {
+    const seeded = await set(store, "seeded", { n: 0 }, run, `${RUN}/batch_ended/seed`);
+    await begin(killer);
+    await holdTheKey(killer, store.name, "second");
+    blocked = batch(store, ops, run, key).then(
+      () => undefined,
+      (error) => String(error?.message ?? error),
+    );
+    const victim = await waitingOn(killer, store.name);
+    answer.the_batch_was_caught_between_two_entries = victim !== undefined;
+    if (victim !== undefined) {
+      answer.the_ended_batch_had_written_its_first_entry = await heldUncommitted(store, "first");
+      await kill(killer, victim);
+      const refused = (await blocked) ?? "";
+      answer.batch_ended_refusal = refused;
+      await rollback(killer).catch(() => undefined);
+      const [first, second, still] = await Promise.all(
+        ["first", "second", "seeded"].map((entry) => get(store, entry, run)),
+      );
+      answer.a_batch_whose_connection_the_server_ends_mid_transaction_leaves_none_of_it =
+        answer.the_ended_batch_had_written_its_first_entry === true &&
+        refused.includes(`lost its connection to the \`${provider}\` store backend`) &&
+        first.found === false &&
+        second.found === false &&
+        still.version === seeded.version &&
+        (await sequenceLast(store)) === seeded.version &&
+        (await ledgerRows(store, key)) === 0;
+      const retried = await batch(store, ops, run, key);
+      answer.a_batch_whose_connection_ended_is_retried_once =
+        retried.applied === true &&
+        retried.deduped === false &&
+        same(retried.results, [
+          { key: "first", version: seeded.version + 1 },
+          { key: "second", version: seeded.version + 2 },
+          { key: "seeded" },
+        ]);
+    }
+  } catch (error) {
+    answer.batch_ended_error = String(error?.message ?? error);
+  } finally {
+    await rollback(killer).catch(() => undefined);
+    if (blocked !== undefined) await blocked;
+    await killer.end().catch(() => undefined);
+  }
+}
+
 // --- Ledger retention (PRD resolved q69) --------------------------------------
 //
 // Driven through the runtime's own lifecycle — `openExecution`, then

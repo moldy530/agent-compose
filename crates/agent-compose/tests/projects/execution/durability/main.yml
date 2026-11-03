@@ -87,6 +87,11 @@
 #     generation answers both reads out of the record, so the count it reports
 #     is the first generation's and the key written while it was down is not
 #     found (PRD resolved q70, q29).
+#   * `flow.moved` — a `batch` that moves an entry from `open/` to `closed/`
+#     ahead of a model call, with `flow.reopened` moving it back between the
+#     generations: a resumed generation answers the batch out of the record and
+#     applies none of it again, so the entry stays where the world left it
+#     (PRD resolved q71, q29).
 #   * `flow.fanned` — a **detached** `map` whose sink calls a *model*, which
 #     `flow.parceled`'s subprocess sink cannot decide. A delivery runs with the
 #     node execution's collectors detached (Decision D94), so its record holds
@@ -145,6 +150,18 @@ state:
     default: nothing yet
   surveyed:
     description: How many entries `flow.surveyed`'s `count` found under `survey/`.
+    type: integer
+    default: -1
+  shifted:
+    description: Whether `flow.moved`'s batch answered `applied`.
+    type: boolean
+    default: false
+  open_count:
+    description: How many entries `flow.peeked` found under the topic's `open/` key.
+    type: integer
+    default: -1
+  closed_count:
+    description: How many entries `flow.peeked` found under the topic's `closed/` key.
     type: integer
     default: -1
 
@@ -1034,6 +1051,92 @@ flow.surveyed:
     - { from: census, to: fetch }
     - { from: fetch, to: ask }
     - { from: ask, to: end }
+
+# PRD resolved q71's `batch` across a resume. `flow.moved` moves the topic's
+# entry from `open/` to `closed/` in one batch — set the new key if it is
+# absent, delete the old — and then calls a model, so a crash during that call
+# leaves the batch behind the frontier, committed. `flow.reopened` moves it back
+# while the execution is down, in a batch of its own. A resume that applied the
+# recorded batch again would find `closed/` absent and move the entry once
+# more; replay answers it out of the record instead (PRD resolved q29), so the
+# entry stays under `open/`, which `flow.peeked` counts.
+flow.reopened:
+  description: Put the topic's entry under `open/` and take it out of `closed/`, in one batch.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    back:
+      store: store.ledger
+      op: batch
+      ops:
+        - { op: set, key: "'open/' + input.topic", value: { entry: "input.topic" } }
+        - { op: delete, key: "'closed/' + input.topic" }
+  edges:
+    - { from: start, to: back }
+    - { from: back, to: end }
+
+flow.moved:
+  description: Move the topic's entry from `open/` to `closed/` in one batch, then call a model.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+  outputs:
+    shifted:
+      type: boolean
+    note:
+      type: string
+  nodes:
+    shift:
+      store: store.ledger
+      op: batch
+      ops:
+        - { op: set, key: "'closed/' + input.topic", if: absent, value: { entry: "input.topic" } }
+        - { op: delete, key: "'open/' + input.topic" }
+      writes:
+        applied: shifted
+    ask:
+      agent: agent.noter
+      input:
+        topic: "input.topic"
+      writes:
+        note: note
+  edges:
+    - { from: start, to: shift }
+    - { from: shift, to: ask }
+    - { from: ask, to: end }
+
+flow.peeked:
+  description: Count the topic's entry under `open/` and under `closed/`.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+  outputs:
+    open_count:
+      type: integer
+    closed_count:
+      type: integer
+  nodes:
+    opened:
+      store: store.ledger
+      op: count
+      prefix: "'open/' + input.topic"
+      writes:
+        count: open_count
+    closed:
+      store: store.ledger
+      op: count
+      prefix: "'closed/' + input.topic"
+      writes:
+        count: closed_count
+  edges:
+    - { from: start, to: opened }
+    - { from: opened, to: closed }
+    - { from: closed, to: end }
 
 triggers:
   gate:

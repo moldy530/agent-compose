@@ -363,6 +363,23 @@ const flowShapeNodeFetchShape: runtime.Shape = {
   }
 };
 
+/** `flow.shape` node `shift` — the `shift.output` root its guards read. */
+const flowShapeNodeShiftShape: runtime.Shape = {
+  "properties": {
+    "applied": "bool",
+    "deduped": "bool",
+    "failed": "int",
+    "results": {
+      "items": {
+        "properties": {
+          "key": "string",
+          "version": "int"
+        }
+      }
+    }
+  }
+};
+
 /**
  * `provider.aws` — a `bedrock` connection (grammar 12.1). Every value is read when a node calls it, never at import: a build carries no credential and `./index.ts` is where their presence is checked (PRD 5.9).
  */
@@ -1694,6 +1711,61 @@ const flowShapeNodeFetch: runtime.NodeDescriptor = {
   }),
   writes: [],
   edges: [
+    { to: "shift" },
+  ],
+};
+
+/** `flow.shape` node `shift` — a `batch` on `store.ledger` (grammar 8.8). */
+const flowShapeNodeShift: runtime.NodeDescriptor = {
+  flow: "flow.shape",
+  node: "shift",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from the built-in, `on_error` from the built-in.
+  policy: {
+    onError: "fail",
+  },
+  shapes: { input: flowShapeShape, state: stateShape, output: flowShapeNodeShiftShape },
+  input: (roots) => ({
+    ops: [
+      {
+        op: "set",
+        key: String(runtime.toJson(runtime.evaluate("input.goal + '/next'", roots))),
+        value: {
+          "owner": runtime.toJson(runtime.evaluate("'shifter'", roots)),
+          "marks": runtime.toJson(runtime.evaluate("[state.latest]", roots)),
+          "hits": runtime.toJson(runtime.evaluate("1", roots)),
+        },
+        condition: "absent",
+        ttl: 600000,
+      },
+      {
+        op: "set",
+        key: String(runtime.toJson(runtime.evaluate("'goal/last'", roots))),
+        value: {
+          "owner": runtime.toJson(runtime.evaluate("'shifter'", roots)),
+          "marks": runtime.toJson(runtime.evaluate("[]", roots)),
+          "hits": runtime.toJson(runtime.evaluate("0", roots)),
+        },
+        ifVersion: Number(runtime.toJson(runtime.evaluate("7", roots))),
+        ttl: "never",
+      },
+      {
+        op: "delete",
+        key: String(runtime.toJson(runtime.evaluate("input.goal", roots))),
+        ifVersion: Number(runtime.toJson(runtime.evaluate("5", roots))),
+      },
+    ],
+  }),
+  run: async (input, context, view) => ({
+    output: await stores.runStoreOp(
+      storeLedger,
+      "batch",
+      input as stores.StoreParams,
+      context,
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "shift")].join("/") },
+    ),
+  }),
+  writes: [],
+  edges: [
     { to: END },
   ],
 };
@@ -1741,6 +1813,9 @@ function flowShape() {
       ends: ["fetch"],
     })
     .addNode("fetch", (state: GraphState) => runtime.runNode(flowShapeNodeFetch, state), {
+      ends: ["shift"],
+    })
+    .addNode("shift", (state: GraphState) => runtime.runNode(flowShapeNodeShift, state), {
       ends: [END],
     })
     .addEdge(START, "shape")
@@ -1758,7 +1833,7 @@ const flowShapeGraph = flowShape();
 const flowShapeBinding: runtime.SubflowBinding = {
   address: "flow.shape",
   outputs: ["draft", "notes"],
-  recursionLimit: 39,
+  recursionLimit: 40,
   stream: (initial, options) =>
     flowShapeGraph.stream(initial, {
       ...options,
@@ -1850,7 +1925,7 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
     inputKinds: { "goal": "string", "goals": "json", },
     outputs: ["draft", "notes"],
     sessionStores: [],
-    recursionLimit: 39,
+    recursionLimit: 40,
     parse: (inputs: unknown) =>
       runtime.parseResult(flowShapeInputs, inputs, "the `inputs:` of `flow.shape`") as Record<string, unknown>,
     stream: (initial, options) =>

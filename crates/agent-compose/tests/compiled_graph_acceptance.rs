@@ -12056,6 +12056,133 @@ fn a_flow_pages_through_a_kv_store_counts_it_and_reads_many_keys_at_once() {
     );
 }
 
+/// A flow moves a record with a `batch` and routes on what it answered (grammar
+/// 11.4, PRD resolved q71).
+///
+/// `flow.move` seeds two open records in one batch, moves one to `closed/` —
+/// set the new key if it is absent, delete the old — and routes on `applied`
+/// into a second move that asks the same of a store where the new key is now
+/// held. That one declines at its first entry and so applies **nothing**: its
+/// own delete, of a key the store does hold, is taken back with it, and the
+/// flow routes on `applied: false` to read the keys. What decides it is that
+/// last page: `closed/<name>` and `open/other`, and not `open/<name>` — the
+/// first batch's two entries both landed and the second's neither did. Then
+/// the trace: each batch is one **write** record, addressing no single key and
+/// carrying no `version`, with the node's idempotency key and the whole answer
+/// — its `results`, or its `failed` (`docs/trace.md` §6).
+#[test]
+fn a_flow_moves_a_record_with_a_batch_and_routes_on_what_it_answered() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(run) = harness::invoke_with(
+        "stores",
+        "flow.move",
+        &json!({ "name": "ticket" }),
+        &harness::environment(&provider),
+    ) else {
+        return;
+    };
+    run.succeeded();
+    let outputs = run.outputs();
+    assert_eq!(outputs["moved"], json!(true), "{outputs}");
+    assert_eq!(
+        outputs["refused_at"],
+        json!(0),
+        "the second move declined at its first entry: {outputs}"
+    );
+    assert_eq!(
+        outputs["move_keys"],
+        json!(["closed/ticket", "open/other"]),
+        "the first batch moved the record whole, and the declined one took its own delete \
+         back with it: {outputs}"
+    );
+
+    let record = |node: &str| -> Value {
+        let records: Vec<Value> = run
+            .entries(node)
+            .into_iter()
+            .filter_map(|entry| entry["stores"].as_array().cloned())
+            .flatten()
+            .collect();
+        assert_eq!(records.len(), 1, "one record per batch: {records:#?}");
+        records[0].clone()
+    };
+    let moved = record("move");
+    let again = record("again");
+    for (record, applied) in [(&moved, true), (&again, false)] {
+        assert_eq!(record["op"], "batch", "{record}");
+        assert_eq!(record["effect"], "write", "{record}");
+        assert_eq!(record["applied"], json!(applied), "{record}");
+        assert_eq!(record["deduped"], json!(false), "{record}");
+        assert!(
+            record["idempotencyKey"]
+                .as_str()
+                .is_some_and(|key| !key.is_empty()),
+            "a batch carries the node's one idempotency key: {record}"
+        );
+        for absent in ["key", "version"] {
+            assert!(
+                record.get(absent).is_none(),
+                "a batch addresses no single key and takes no one version, so it carries no \
+                 `{absent}`: {record}"
+            );
+        }
+    }
+    let results = moved["answer"]["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a batch record carries its answer's results: {moved}"));
+    assert_eq!(results.len(), 2, "{moved}");
+    assert_eq!(results[0]["key"], "closed/ticket", "{moved}");
+    assert!(
+        results[0]["version"].is_u64(),
+        "a `set` entry's result has its version: {moved}"
+    );
+    assert_eq!(
+        results[1],
+        json!({ "key": "open/ticket" }),
+        "a `delete` entry's result has no version: {moved}"
+    );
+    assert_eq!(
+        again["answer"],
+        json!({ "applied": false, "deduped": false, "results": [], "failed": 0 }),
+        "a declined batch's answer names the entry and holds no results: {again}"
+    );
+}
+
+/// D67 admits a `batch` inside a `map`, at a key every instance shares, and
+/// every instance's batch lands whole (grammar 11.4, PRD resolved q71).
+///
+/// `flow.batch_each` dispatches one `flow.batch_one` per item, four at a time,
+/// and each writes its own `item/<item>` and the shared `last` in one batch.
+/// Every batch is one transaction serialized on the partition, so all eight
+/// `item/` keys are there, and `last` holds one instance's record whole.
+#[test]
+fn a_map_of_batches_lands_every_instances_entries() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let items = ["a", "b", "c", "d", "e", "f", "g", "h"];
+    let Some(run) = harness::invoke_with(
+        "stores",
+        "flow.batch_each",
+        &json!({ "items": items }),
+        &harness::environment(&provider),
+    ) else {
+        return;
+    };
+    run.succeeded();
+    let outputs = run.outputs();
+    assert_eq!(
+        outputs["batched"],
+        json!(items.len()),
+        "every instance's batch landed its own key: {outputs}"
+    );
+    let last = outputs["batched_last"]["name"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the shared key holds a record: {outputs}"));
+    assert!(
+        items.contains(&last),
+        "the shared key holds one instance's record whole: {outputs}"
+    );
+}
+
 /// The names a long walk stocks its store with: `k000` up, written in reverse
 /// so the order the pages come back in is the store's rather than the input's.
 fn stock(count: usize) -> Vec<String> {
@@ -20679,6 +20806,170 @@ fn a_resumed_run_answers_a_count_and_a_get_many_out_of_the_record() {
         "a live `count` sees the key the resumed one did not: {}",
         fresh.stderr()
     );
+}
+
+/// A resumed generation answers a `batch` out of the record and applies none of
+/// it again (PRD resolved q71, q29).
+///
+/// `flow.moved` moves the topic's entry from `open/` to `closed/` in one batch
+/// and then calls a model, and the run is killed during that call — so the
+/// batch has committed and is behind the frontier. While the execution is down
+/// `flow.reopened` moves the entry back. A resume that applied the recorded
+/// batch again would find `closed/` absent, its `if: absent` holding, and move
+/// the entry a second time; the record answers it instead, so the resumed run
+/// reports the first generation's `applied: true`, its batch record is that
+/// generation's, and the entry stays under `open/` where the world left it. A
+/// fresh run of the same flow then moves it, which is what makes the stay
+/// evidence: the batch would have applied had it run live.
+#[test]
+fn a_resumed_run_answers_a_batch_out_of_the_record_and_applies_none_of_it_again() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "a moved note" })).after(Duration::from_secs(120)),
+    ));
+
+    let Some((project, built)) = harness::build_under_toolchain("durability", "resume-moved")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the durability fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let environment = harness::environment(&provider);
+    let topic = [("topic", "moving")];
+    let peek = || {
+        let peeked = harness::run_into(
+            &project,
+            "durability",
+            "flow.peeked",
+            &topic,
+            None,
+            &environment,
+        );
+        peeked.succeeded();
+        let outputs = peeked.outputs();
+        (
+            outputs["open_count"].clone(),
+            outputs["closed_count"].clone(),
+        )
+    };
+
+    harness::run_into(
+        &project,
+        "durability",
+        "flow.reopened",
+        &topic,
+        None,
+        &environment,
+    )
+    .succeeded();
+    assert_eq!(
+        peek(),
+        (json!(1), json!(0)),
+        "the entry starts under `open/`"
+    );
+
+    let killed = harness::crash_run(
+        &project,
+        &["run", "flow.moved", "--input", "topic=moving"],
+        &environment,
+        |_| provider.snapshot().requests >= 1,
+    );
+    assert_eq!(
+        peek(),
+        (json!(0), json!(1)),
+        "the killed generation's batch committed before the model call it died in"
+    );
+
+    // The world moves back while the execution is down.
+    harness::run_into(
+        &project,
+        "durability",
+        "flow.reopened",
+        &topic,
+        None,
+        &environment,
+    )
+    .succeeded();
+    assert_eq!(peek(), (json!(1), json!(0)));
+
+    provider.reset();
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "a moved note" })),
+    ));
+    let resumed = harness::resume(
+        &project,
+        "durability",
+        &killed.execution,
+        Some("json"),
+        &environment,
+    );
+    resumed.succeeded();
+    let answered = resumed.outputs();
+    assert_eq!(answered["status"], "completed", "{answered}");
+    assert_eq!(
+        answered["outputs"]["shifted"],
+        json!(true),
+        "the replayed batch answers what the first generation's did: {answered}"
+    );
+    let trace = answered["trace"].as_array().expect("a trace");
+    let record = trace
+        .iter()
+        .find(|entry| entry["node"] == "shift")
+        .and_then(|entry| entry["stores"].as_array())
+        .and_then(|records| records.first().cloned())
+        .unwrap_or_else(|| panic!("the `shift` node's batch is on its entry: {answered}"));
+    assert_eq!(record["op"], "batch", "{record}");
+    assert_eq!(record["effect"], "write", "{record}");
+    assert_eq!(record["applied"], json!(true), "{record}");
+    assert_eq!(
+        record["deduped"],
+        json!(false),
+        "the record is the first generation's, which applied it: {record}"
+    );
+    assert!(record.get("key").is_none(), "{record}");
+    assert_eq!(
+        record["answer"]["results"][0]["key"], "closed/moving",
+        "{record}"
+    );
+    assert_eq!(
+        peek(),
+        (json!(1), json!(0)),
+        "the resumed generation applied none of the batch again: the entry stays where the \
+         run that moved it back left it"
+    );
+    assert_eq!(
+        provider.snapshot().requests,
+        1,
+        "only the killed model call was made again"
+    );
+
+    // A fresh run applies the batch live, which is what the resume did not do.
+    provider.reset();
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "a fresh note" })),
+    ));
+    let fresh = harness::run_into(
+        &project,
+        "durability",
+        "flow.moved",
+        &topic,
+        None,
+        &environment,
+    );
+    fresh.succeeded();
+    assert_eq!(
+        fresh.outputs()["shifted"],
+        json!(true),
+        "{}",
+        fresh.stderr()
+    );
+    assert_eq!(peek(), (json!(0), json!(1)), "a live batch moves the entry");
 }
 
 /// resolved q29's **second** divergence: "a recorded answer [that] fails the

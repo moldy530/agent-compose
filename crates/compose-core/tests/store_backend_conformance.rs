@@ -816,6 +816,36 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "a_replayed_count_answers_out_of_the_record",
     "a_replayed_get_many_answers_out_of_the_record",
     "a_replayed_page_answers_out_of_the_record",
+    // PRD resolved q71: a `batch` is one transaction on every arm — a set, a
+    // set and a delete land together at consecutive versions; a condition
+    // failing at index 2 takes indexes 0 and 1 back and answers `failed: 2`; a
+    // value the schema refuses fails the batch with nothing written and no
+    // version consumed; later entries read what earlier ones left; each
+    // entry's `ttl` and the store's default apply as on one write.
+    "a_batch_of_set_set_delete_lands_all_three_with_consecutive_versions",
+    "a_failed_condition_at_index_2_leaves_indexes_0_and_1_unapplied",
+    "a_value_the_schema_refuses_at_index_1_fails_the_node_and_leaves_the_partition_unchanged",
+    "a_duplicate_key_within_a_batch_applies_in_order",
+    "an_entry_condition_reads_what_the_entries_before_it_left",
+    "each_batch_entrys_ttl_and_the_store_default_apply",
+    "a_batch_of_101_entries_is_refused_by_name",
+    // One idempotency key, one ledger row holding the whole answer: a retried
+    // batch dedupes whole, and so does a retried decline, which is an answer
+    // too — while the same entries under a fresh key apply.
+    "a_retried_batch_dedupes_whole",
+    "a_retried_declined_batch_answers_its_decline_deduped",
+    "the_same_entries_under_a_fresh_key_apply_once_the_condition_holds",
+    // The trace: a batch is one write addressing no single key, its keys and
+    // versions in the answer it carries.
+    "a_batch_record_is_one_write_with_no_key_and_its_answer",
+    // All or nothing under a real crash: the writing process killed with
+    // `SIGKILL` between two entry writes — its first entry provably written
+    // inside the open transaction — leaves the partition as it was, and the
+    // retry of that effect applies, once.
+    "the_batch_was_mid_transaction_when_it_was_killed",
+    "the_killed_batch_had_written_its_first_entry",
+    "a_batch_killed_mid_transaction_leaves_none_of_it",
+    "a_batch_retried_after_its_crash_applies_once",
 ];
 
 /// The order every arm pages a mixed set in: UTF-8 byte order, which Rust's
@@ -942,6 +972,15 @@ const TRUE_WHEN_DIALLED: &[&str] = &[
     "a_store_that_never_answers_delays_no_settlement",
     "a_store_that_never_answers_delays_no_other_stores_prune",
     "a_store_that_never_answers_holds_a_command_for_its_dial_deadline_alone",
+    // PRD resolved q71 on the dialled arms' own failure: a batch whose session
+    // the server ends between two entry writes — caught waiting on a row lock
+    // after its first entry is written, which an uncommitted insert of that
+    // key proves — is refused by name, leaves none of its entries, no version
+    // and no ledger row, and its retry applies once.
+    "the_batch_was_caught_between_two_entries",
+    "the_ended_batch_had_written_its_first_entry",
+    "a_batch_whose_connection_the_server_ends_mid_transaction_leaves_none_of_it",
+    "a_batch_whose_connection_ended_is_retried_once",
     // A server keeps what a run leaves on it, so the run takes every row of its
     // own run-unique stores back off it at the end (the large walk's hundred
     // thousand go first, in that case's own `finally`: `TRUE_EVERYWHERE`).
