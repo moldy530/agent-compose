@@ -883,6 +883,12 @@ const CODEGEN: &[Criterion] = &[
                 "a_settled_run_leaves_no_ledger_rows_in_a_vector_or_a_blob_store",
                 Status::Live,
             ),
+            // …and the cleanup schedule's "next process start": a `run` that
+            // never reaches a store still removes what expired there.
+            (
+                "a_run_sheds_expired_keys_from_a_store_it_never_reaches",
+                Status::Live,
+            ),
         ],
     },
     Criterion {

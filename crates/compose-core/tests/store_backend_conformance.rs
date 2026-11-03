@@ -616,6 +616,12 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "if_present_and_if_version_decline_an_expired_key_with_no_version",
     "if_absent_applies_on_an_expired_key",
     "a_key_set_again_after_expiring_takes_the_next_version",
+    // …and so they do while the expired key is still a row: behind a backlog
+    // of 400 expired fillers, each write's bounded sweep takes a hundred of
+    // them and leaves the key stored, so what each condition reads is an
+    // expired row rather than a missing one.
+    "if_present_and_if_version_decline_an_expired_key_a_sweep_has_not_reached",
+    "if_absent_takes_an_expired_key_a_sweep_has_not_reached",
     // …a write refreshes the expiry to its own `ttl`, else the store's
     // `default_ttl:`, else clears it; `ttl: never` beats a default; and a
     // declined write changes nothing.
@@ -629,11 +635,13 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "merge_append_and_incr_each_take_a_ttl",
     // (c) the cleanup schedule: invisible at once, out of storage at the next
     // write to the partition — at most 100 rows a write — or the next process
-    // to open the store, whichever comes first.
+    // start, whichever comes first: a process whose first op on the store is a
+    // read, and a process start that makes no op on the store at all.
     "an_expired_key_stays_invisible_until_a_write_removes_it",
     "the_write_sweep_removes_at_most_100_rows",
     "an_expired_key_leaves_storage_at_the_next_writes_to_its_partition",
     "an_expired_key_leaves_storage_when_a_process_next_opens_the_store",
+    "an_expired_key_leaves_storage_when_a_process_starts_without_reaching_the_store",
     // …where that open's sweep runs behind the process's first op rather than
     // in front of it — the op answers with the backlog still stored — and has
     // removed all of it by the time the process lets go of the store.
@@ -667,6 +675,13 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "a_detached_delivery_running_at_settlement_keeps_its_ledger_rows",
     "a_retry_inside_a_detached_delivery_after_settlement_still_dedupes",
     "a_detached_deliverys_rows_go_once_it_has_finished",
+    // …unless the command lets go of its stores first, as `agent-compose run`
+    // does without waiting for its deliveries: the exit starts the prune the
+    // delivery was holding back, and the delivery — still running in the
+    // process until it ends — is refused a keyed write from then on rather
+    // than applying one its ledger can no longer answer.
+    "a_command_letting_go_prunes_what_a_running_delivery_held_back",
+    "a_delivery_cut_off_by_its_command_is_refused_a_keyed_write",
 ];
 
 /// The cases a backend with a **socket** must answer `true`, on top of those.
@@ -714,10 +729,20 @@ const TRUE_WHEN_DIALLED: &[&str] = &[
     // sweep of its partition and the store-wide sweep a connection's first op
     // starts — run at once in two processes over one backlog without either
     // failing as a deadlock, the sweep takes no key a write refreshed, and the
-    // backlog is gone once both processes have let go of the store.
+    // backlog is gone once both processes have let go of the store. Each of the
+    // three also holds only where the store-wide sweep really ran during the
+    // writer's run: the backlog carries rows only that sweep can take.
     "a_store_wide_sweep_and_a_write_never_deadlock",
     "a_store_wide_sweep_takes_no_key_a_write_refreshed",
     "a_store_wide_sweep_removes_the_whole_backlog",
+    // PRD resolved q69 (d): a settlement prunes every store the composition
+    // binds, so a bound store whose server accepts a connection and never
+    // answers is one every settlement meets — and it delays neither the
+    // settlement nor any other store's prune, and holds a command's exit for
+    // the dial deadline and no longer.
+    "a_store_that_never_answers_delays_no_settlement",
+    "a_store_that_never_answers_delays_no_other_stores_prune",
+    "a_store_that_never_answers_holds_a_command_for_its_dial_deadline_alone",
 ];
 
 /// **A target that binds both dialled arms gets one module, and it compiles.**

@@ -19,9 +19,16 @@
 // writer, which refreshes each one for two hours — past the sweeper's instant,
 // so no key a write refreshed is one the sweep may take.
 //
+// Each process also says **when** it did what it did, on the wall clock both
+// share, so the parent can tell a race from two processes that merely ran one
+// after the other: the writer the instants of its first and last write, the
+// sweeper the instant its first op started the first sweep and the instant
+// every sweep it started had finished.
+//
 // Usage: bun store-sweep-race.mjs <project> <provider> <data directory> <binding json> <role> <start at, ms> <count>
 //   role = write | sweep
-// Prints one JSON object: how many writes applied, and every error an op raised.
+// Prints one JSON object: how many writes applied, every error an op raised,
+// and `from`/`to`, the wall-clock window of the process's half of the race.
 
 import { pathToFileURL } from "node:url";
 import path from "node:path";
@@ -57,6 +64,7 @@ const answer = { applied: 0 };
 
 await new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(startAt) - Date.now())));
 
+answer.from = Date.now();
 if (role === "write") {
   for (let index = 0; index < Number(count); index += 1) {
     try {
@@ -72,6 +80,7 @@ if (role === "write") {
       errors.push(String(error?.message ?? error));
     }
   }
+  answer.to = Date.now();
 } else {
   // Each binding names a variable of its own for the one server, which is how
   // one process holds several connections — and so starts several sweeps.
@@ -95,5 +104,6 @@ if (role === "write") {
 // Waits out every sweep this process started, which is the half of the race
 // the sweeping process exists for.
 await stores.releaseStores();
+if (role !== "write") answer.to = Date.now();
 answer.errors = errors;
 process.stdout.write(JSON.stringify(answer));

@@ -223,19 +223,24 @@
 // **Removal is lazy, on a stated schedule.** An expired row stays in storage,
 // invisible, until one of two things happens first: a write to its partition,
 // which inside its own transaction deletes at most [`SWEEP_PER_WRITE`] of that
-// partition's expired rows before it reads its key; or the first op a process
-// makes on the store — the open of a SQLite file, the first op over a dialled
-// connection — which **starts** a sweep of every row of the store that had
-// expired by then. That sweep runs **behind** the op that started it and
-// between the ops after it, one batch of at most [`SWEEP_PER_BATCH`] rows at a
-// time, so no op waits for more than one batch however large the backlog is;
-// and [`releaseStores`], on a command's way out, waits for it to finish, so a
-// process that reached a store has removed what had expired there by the time
-// it exits. Both sweeps run on an index over the expiry, so neither reads a row
-// that is not expired. On a dialled store each batch is one partition's, taken
-// under that partition's version-sequence lock exactly as a write takes it, so
-// a sweep and a write are serialized rather than able to deadlock
-// ([`RemoteKv`]'s `#sweepStep`).
+// partition's expired rows before it reads its key; or the next process start,
+// which **starts** a sweep of every row of the store that had expired by then.
+// "Process start" is two things here, and both start the one sweep: the start
+// of a `run`, a `resume` or a `serve` ([`sweepBoundStores`], called by
+// `./cli.ts` and `./serve.ts` before the first execution), which starts it on
+// every `kv` store the composition binds whether or not anything will reach
+// it; and the first op any process makes on a store it has not swept yet — the
+// open of a SQLite file, the first op over a dialled connection — which is
+// how a placement's worker, a library caller and a connection redialled after
+// a loss sweep too. That sweep runs **behind** the ops, between them, one batch
+// of at most [`SWEEP_PER_BATCH`] rows at a time, so no op waits for more than
+// one batch however large the backlog is; and [`releaseStores`], on a
+// command's way out, waits for it to finish, so a command has removed what had
+// expired in every store it swept by the time it exits. Both sweeps run on an
+// index over the expiry, so neither reads a row that is not expired. On a
+// dialled store each batch is one partition's, taken under that partition's
+// version-sequence lock exactly as a write takes it, so a sweep and a write are
+// serialized rather than able to deadlock ([`RemoteKv`]'s `#sweepStep`).
 //
 // `AGENT_COMPOSE_STORE_CLOCK_OFFSET_MS` shifts the clock every arm reads by a
 // whole number of milliseconds — added to `Date.now()` locally and to the
@@ -268,6 +273,18 @@
 // settled execution's prefix from each; the rows are found by a range on the
 // ledger's primary key, so a store the execution never wrote costs a seek
 // that finds nothing.
+//
+// **The prune runs behind the outcome, never in front of it.** It is started
+// once the row has closed and is never awaited by the settlement, so a bound
+// store the execution never reached — one whose server is slow, refusing, or
+// not answering at all — cannot delay or withhold the run's answer: `runFlow`
+// returns when the row has closed. Each store is pruned on its own, so one
+// that does not answer holds up no other, and a dial that has not completed in
+// [`STORE_DIAL_MS`] fails. [`releaseStores`], on a command's way out, waits for
+// every prune in flight — and starts the ones still waiting on detached
+// deliveries, which the exit is about to cut off — so a command's settled
+// executions leave no rows behind; a `serve` lets them finish in the
+// background.
 
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -814,8 +831,9 @@ function holdSweep(sweeping: Promise<void>): void {
 
 /**
  * Start removing every row of one store file that had expired by `now` — the
- * open's half of the schedule (PRD resolved q69), started once per process per
- * file.
+ * process-start half of the schedule (PRD resolved q69), started once per
+ * process per file, by the file's open: the one [`sweepBoundStores`] makes as a
+ * command starts, or the one the process's first op on the file makes.
  *
  * **Behind the ops, never in front of them.** In batches of
  * [`SWEEP_PER_BATCH`], each its own statement and so its own transaction, with
@@ -956,11 +974,12 @@ function open(store: StoreBinding, execution: runtime.ExecutionIdentity): Promis
     const file = storeFile(store);
     fs.mkdirSync(path.dirname(file), { recursive: true });
     const database = await migrated(Database, file);
-    // The open is this process's first op on the file, which is the second
-    // half of PRD resolved q69's schedule: every key whose time had come by now
-    // leaves storage, whatever the writes since have swept — behind this op
-    // and between the ones after it, never in front of them. A `vector` file
-    // has no key that expires, so it is given no clock and swept of nothing.
+    // The open is this process's start on the file — [`sweepBoundStores`]'s,
+    // or its first op's — which is the second half of PRD resolved q69's
+    // schedule: every key whose time had come by now leaves storage, whatever
+    // the writes since have swept — behind the ops and between them, never in
+    // front of them. A `vector` file has no key that expires, so it is given no
+    // clock and swept of nothing.
     if (now !== undefined) startLocalSweep(database, store, now);
     return database;
   })();
@@ -1114,13 +1133,36 @@ export function bindsStores(bindings: readonly StoreBinding[]): void {
 
 /**
  * The prunes in flight, so [`releaseStores`] lets each finish before it closes
- * the connection it runs over.
+ * the connection it runs over, and [`ledgerPrunesSettled`] can wait for them.
  */
 const PRUNING = new Set<Promise<void>>();
 
 /**
+ * The settled executions whose prune is waiting on their detached deliveries,
+ * by execution id — each the identity the prune will be handed.
+ *
+ * Here rather than only in a promise chain so [`releaseStores`] can find them:
+ * a command on its way out cuts those deliveries off, and a prune chained
+ * behind a delivery the exit kills would never run.
+ */
+const DEFERRED = new Map<string, runtime.ExecutionIdentity>();
+
+/**
+ * The settled executions whose prune [`releaseStores`] started **ahead** of
+ * their detached deliveries, which this process is letting go of.
+ *
+ * A keyed write under one of these ids is refused rather than made
+ * ([`refuseUnledgered`]): its ledger has been pruned, so a retry of a write
+ * its first attempt applied would find no row to answer it and apply a second
+ * time. Only a command on its way out adds to it, so it holds the few
+ * executions whose deliveries that exit is cutting off, and nothing else.
+ */
+const CUT_OFF = new Set<string>();
+
+/**
  * Delete the idempotency ledger rows a settled execution left, in every store
- * the composition binds (PRD resolved q69).
+ * the composition binds (PRD resolved q69) — started now, or, where `after` is
+ * given, once it settles.
  *
  * Every grammar 9.4 key begins `<execution id>/`, so the rows are exactly those
  * under that prefix: a ledger row is a retry's answer, a settled execution
@@ -1145,57 +1187,129 @@ const PRUNING = new Set<Promise<void>>();
  * pruned in the partition this execution's identity addresses, which is the
  * one partition of it the execution can have written.
  *
- * Called by the runtime ([`runtime.settlesLedgers`]) after the execution's row
- * has closed **and** the detached deliveries it started have finished: a crash
- * between the close and this leaves rows nothing will ask for, which is
- * harmless, where the other order could leave an open execution — or a
- * delivery still retrying under a settled one's id — without the row that makes
- * its retry answer instead of writing twice.
+ * Called by the runtime ([`runtime.settlesLedgers`]) once the execution's row
+ * has closed, with `after` the end of the detached deliveries it started where
+ * any are still in flight: a crash between the close and the prune leaves rows
+ * nothing will ask for, which is harmless, where the other order could leave an
+ * open execution — or a delivery still retrying under a settled one's id —
+ * without the row that makes its retry answer instead of writing twice.
+ *
+ * **Behind the outcome, and nothing of it awaited.** This returns at once; the
+ * prune is held in [`PRUNING`] (or [`DEFERRED`], while it waits) for
+ * [`releaseStores`] and nothing else. Every bound store is visited, a store the
+ * settling execution never reached included, and one of those can be slow or
+ * not answer at all — so a settlement that waited for its prune would hand the
+ * reachability of every store the composition binds to the outcome of every
+ * run, which is the one thing a prune must not touch. The stores are pruned
+ * independently, so one that does not answer delays no other, and a dial that
+ * has not completed in [`STORE_DIAL_MS`] fails.
  *
  * **Never the execution's failure.** A store that could not be pruned is one
  * whose rows stay, which costs storage and changes no answer; it is said on
  * stderr naming the store, and every other store is still pruned.
  */
-export function pruneLedger(execution: runtime.ExecutionIdentity): Promise<void> {
-  const pruning = (async () => {
-    const prefix = `${execution.id}/`;
-    for (const store of BOUND.values()) {
-      if (store.scope === "execution") continue;
-      try {
-        if (store.kind === "blob") {
-          // A session-scoped store an execution with no session key cannot have
-          // written: every op on it fails naming the key ([`partition`]).
-          if (store.scope === "session" && execution.session_key === "") continue;
-          pruneBlobLedger(store, partition(store, execution), prefix);
-          continue;
-        }
-        if (opensInProcess(store.backend.provider)) {
-          const held = DATABASES.get(handleKey(store, execution));
-          if (held === undefined) {
-            if (store.backend.provider === "memory") continue;
-            if (!fs.existsSync(storeFile(store))) continue;
-          }
-          const database = await (held ?? open(store, execution));
-          database.run("DELETE FROM applied WHERE idempotency_key >= ? AND idempotency_key < ?", [
-            prefix,
-            prefixEnd(prefix),
-          ]);
-          continue;
-        }
-        if (!DIALLED_KV.includes(store.backend.provider)) continue;
-        const variable = store.backend.urlEnv;
-        if (variable === undefined || (process.env[variable] ?? "") === "") continue;
-        await (await connectionFor(store)).prune(store.name, prefix);
-      } catch (error) {
-        process.stderr.write(
-          `warning: the ledger rows execution \`${execution.id}\` left in \`${store.address}\` could not be pruned (${error instanceof Error ? error.message : String(error)}); they stay where they are and answer nothing, since a settled execution never resumes (PRD resolved q69)\n`,
-        );
-      }
-    }
-  })();
+export function pruneLedger(
+  execution: runtime.ExecutionIdentity,
+  after: Promise<void> | undefined,
+): void {
+  if (after === undefined) {
+    startPrune(execution);
+    return;
+  }
+  DEFERRED.set(execution.id, execution);
+  const resume = (): void => {
+    // Gone where [`releaseStores`] has already started it, ahead of the
+    // deliveries its exit cut off.
+    if (DEFERRED.get(execution.id) !== execution) return;
+    DEFERRED.delete(execution.id);
+    startPrune(execution);
+  };
+  void after.then(resume, resume);
+}
+
+/** Start one settled execution's prune, held in [`PRUNING`] until it ends. */
+function startPrune(execution: runtime.ExecutionIdentity): void {
+  const prefix = `${execution.id}/`;
+  const pruning = Promise.all(
+    [...BOUND.values()].map((store) => pruneStore(store, execution, prefix)),
+  ).then(() => undefined);
   PRUNING.add(pruning);
   void pruning.finally(() => PRUNING.delete(pruning));
-  return pruning;
+}
+
+/** One store's half of [`pruneLedger`]: never a rejection, a failure said. */
+async function pruneStore(
+  store: StoreBinding,
+  execution: runtime.ExecutionIdentity,
+  prefix: string,
+): Promise<void> {
+  if (store.scope === "execution") return;
+  try {
+    if (store.kind === "blob") {
+      // A session-scoped store an execution with no session key cannot have
+      // written: every op on it fails naming the key ([`partition`]).
+      if (store.scope === "session" && execution.session_key === "") return;
+      pruneBlobLedger(store, partition(store, execution), prefix);
+      return;
+    }
+    if (opensInProcess(store.backend.provider)) {
+      const held = DATABASES.get(handleKey(store, execution));
+      if (held === undefined) {
+        if (store.backend.provider === "memory") return;
+        if (!fs.existsSync(storeFile(store))) return;
+      }
+      const database = await (held ?? open(store, execution));
+      database.run("DELETE FROM applied WHERE idempotency_key >= ? AND idempotency_key < ?", [
+        prefix,
+        prefixEnd(prefix),
+      ]);
+      return;
+    }
+    if (!DIALLED_KV.includes(store.backend.provider)) return;
+    const variable = store.backend.urlEnv;
+    if (variable === undefined || (process.env[variable] ?? "") === "") return;
+    await (await connectionFor(store)).prune(store.name, prefix);
+  } catch (error) {
+    process.stderr.write(
+      `warning: the ledger rows execution \`${execution.id}\` left in \`${store.address}\` could not be pruned (${error instanceof Error ? error.message : String(error)}); they stay where they are and answer nothing, since a settled execution never resumes (PRD resolved q69)\n`,
+    );
+  }
+}
+
+/**
+ * Wait for every ledger prune this process has started to finish — not the
+ * ones still waiting on detached deliveries ([`DEFERRED`]), which start when
+ * those finish.
+ *
+ * A settlement does not wait for its prune ([`pruneLedger`]), so this is how a
+ * caller that needs to read what one left — a test, or [`releaseStores`] —
+ * waits for it. Re-read until nothing is left, because a prune can start while
+ * another finishes.
+ */
+export async function ledgerPrunesSettled(): Promise<void> {
+  for (;;) {
+    const running = [...PRUNING];
+    if (running.length === 0) return;
+    await Promise.all(running.map((held) => held.catch(() => undefined)));
+  }
+}
+
+/**
+ * Refuse a keyed write under an execution whose ledger [`releaseStores`]
+ * pruned ahead of its detached deliveries ([`CUT_OFF`]).
+ *
+ * The ledger row a retry of the write would be answered from is gone, so made
+ * here the write could apply a second time; refused, it is a delivery failing
+ * on its way out of a process that is ending anyway.
+ */
+function refuseUnledgered(store: StoreBinding, idempotencyKey: string | undefined): void {
+  if (idempotencyKey === undefined || CUT_OFF.size === 0) return;
+  const end = idempotencyKey.indexOf("/");
+  const execution = end < 0 ? idempotencyKey : idempotencyKey.slice(0, end);
+  if (!CUT_OFF.has(execution)) return;
+  throw new Error(
+    `\`${store.address}\` refused a keyed write of execution \`${execution}\`: that execution has settled and this process, on its way out, has already deleted its idempotency ledger (PRD resolved q69), so a write made now could not be told from one its first attempt already applied`,
+  );
 }
 
 /**
@@ -1238,6 +1352,75 @@ function pruneBlobLedger(store: StoreBinding, scopeKey: string, prefix: string):
 }
 
 runtime.settlesLedgers(pruneLedger);
+
+/**
+ * Start the store-wide sweep of every `kv` store the composition binds — the
+ * "next process start" half of PRD resolved q69 (c)'s cleanup schedule — and
+ * return at once.
+ *
+ * Called by `./cli.ts` as a `run` or a `resume` begins its execution, and by
+ * `./serve.ts` once the app is listening: every process the project's command
+ * line starts. **Every** bound store, not the ones the process will reach,
+ * because that is what the schedule promises — a store whose partitions no
+ * write reaches again, a cache nobody reads past its expiry, still sheds what
+ * expired the next time the deployment starts. The first op a process makes on
+ * a store it has not swept starts the same sweep ([`open`], [`RemoteKv`]), so a
+ * store this one reaches before its sweep is under way is swept once, not
+ * twice.
+ *
+ * **Behind everything, in front of nothing.** Each store's sweep is the one an
+ * open starts — one batch at a time between the ops — and a dial it needs is
+ * made here in the background, bounded by [`STORE_DIAL_MS`], so no execution
+ * waits for a store it never reaches; [`releaseStores`] waits for the rest on
+ * a command's way out ([`SWEEPING`]).
+ *
+ * What is skipped is what holds nothing expired to this process: a
+ * `scope: execution` store, whose partitions die with their runs; a `vector`
+ * or `blob` store, whose keys never expire; a `memory` store, which a process
+ * starts empty; a store file nothing has created; and a dialled store whose
+ * address variable this process does not hold, which it could not reach to
+ * sweep (`docs/distributed.md` §9.1). A sweep that cannot run is said on
+ * stderr, naming the store; every read and condition already treats an expired
+ * key as absent, so what it leaves changes no answer.
+ */
+export function sweepBoundStores(): void {
+  for (const store of BOUND.values()) {
+    if (store.kind !== "kv" || store.scope === "execution") continue;
+    const provider = store.backend.provider;
+    if (opensInProcess(provider)) {
+      if (provider === "memory" || !fs.existsSync(storeFile(store))) continue;
+      // The open starts the file's sweep ([`startLocalSweep`]); it is held as
+      // well, so a command letting go before the open has finished still waits
+      // for the sweep the open is about to start.
+      holdSweep(
+        open(store, { id: "", session_key: "" }).then(
+          () => undefined,
+          (error: unknown) => unswept(store, error),
+        ),
+      );
+      continue;
+    }
+    if (!DIALLED_KV.includes(provider)) continue;
+    const variable = store.backend.urlEnv;
+    if (variable === undefined || (process.env[variable] ?? "") === "") continue;
+    holdSweep(
+      (async () => {
+        try {
+          await (await connectionFor(store)).sweep(store);
+        } catch (error) {
+          unswept(store, error);
+        }
+      })(),
+    );
+  }
+}
+
+/** Say that a process-start sweep of one store could not run. */
+function unswept(store: StoreBinding, error: unknown): void {
+  process.stderr.write(
+    `warning: \`${store.address}\` could not be opened to remove the keys that have expired in it (${error instanceof Error ? error.message : String(error)}); they stay invisible to every read and condition, and a write to each one's partition removes them (PRD resolved q69)\n`,
+  );
+}
 
 /**
  * Run `work` inside a transaction, rolling back whatever it did if it throws.
@@ -1322,7 +1505,21 @@ export async function runStoreOp(
     context.effects,
     "store",
     { store: store.address, op, scope: store.scope, partition: scopeKey, via: site.via, params },
-    () => perform(store, op, params, scopeKey, execution, idempotencyKey, site.via, context.signal),
+    async () => {
+      // Live only: a replayed write is answered by the record and reaches no
+      // store, so it has no ledger row to miss.
+      refuseUnledgered(store, idempotencyKey);
+      return await perform(
+        store,
+        op,
+        params,
+        scopeKey,
+        execution,
+        idempotencyKey,
+        site.via,
+        context.signal,
+      );
+    },
     (slot) => inProcessState(store, op, execution, slot),
   );
   // A `kv` write's record carries what it decided — whether it landed, and
@@ -2242,6 +2439,26 @@ const STORE_BACKENDS: Partial<
 > = {};
 
 /**
+ * How long a dial of a store server may take before it fails: ten seconds, on
+ * both arms — each hands it to its driver as that driver's own connect
+ * deadline (`connectionTimeoutMillis`, `connectTimeout`), which ends the socket
+ * rather than abandoning it.
+ *
+ * A bound, because this module dials servers nothing asked it to reach: a
+ * settled execution's ledger prune visits every store the composition binds
+ * ([`pruneLedger`]) and a process's start sweeps every one of them
+ * ([`sweepBoundStores`]), so a server that accepts a connection and never
+ * answers would otherwise hold a command's exit for as long as the socket
+ * lived. Neither waits in front of an outcome; this is what bounds what
+ * [`releaseStores`] waits for. An op's own dial fails the same way, which is
+ * the node's error under its `retry:` rather than a run that never ends.
+ * Ten seconds is `mysql2`'s own default, so the MySQL arm's behaviour is
+ * unchanged and the Postgres arm's is the same; it is long past any server
+ * answering a handshake, a cold-starting one included.
+ */
+const STORE_DIAL_MS = 10_000;
+
+/**
  * Every dialled connection this process holds, by the server it addresses.
  *
  * Keyed on the provider and the **variable name** rather than on the address:
@@ -2322,7 +2539,22 @@ function connectionFor(store: StoreBinding): Promise<RemoteKv> {
   // The **name** goes with the address, because every message an arm raises
   // about this connection has to name the line an operator can change — and the
   // address itself is a credential this module never prints.
-  dialling = (async () => new RemoteKv(await open(address, variable, lost)))();
+  const provider = store.backend.provider;
+  dialling = (async () => {
+    const started = Date.now();
+    try {
+      return new RemoteKv(await open(address, variable, lost));
+    } catch (error) {
+      // A dial the driver gave up on at its deadline says so in the driver's
+      // words — `Connection terminated`, `connect ETIMEDOUT` — which name
+      // neither the deadline nor the store; this sentence names both.
+      if (Date.now() - started < STORE_DIAL_MS) throw error;
+      throw new Error(
+        `the \`${provider}\` store backend at \`\${${variable}}\` did not answer a dial within ${STORE_DIAL_MS / 1000} seconds (${error instanceof Error ? error.message : String(error)})`,
+        { cause: error },
+      );
+    }
+  })();
   // Registered before the first `await` inside it, so a concurrent caller finds
   // this promise rather than dialling a second time. A failed dial is dropped
   // from the cache so the next op tries again instead of inheriting the failure
@@ -2370,8 +2602,9 @@ class RemoteKv {
 
   /**
    * The store-wide sweeps this connection has started, by store name — the
-   * open's half of PRD resolved q69's schedule, started once per store per
-   * connection — each the promise of its end.
+   * process-start half of PRD resolved q69's schedule, started once per store
+   * per connection, by [`sweep`] or by the first op on the store — each the
+   * promise of its end.
    *
    * Per connection rather than per process because a connection is what a
    * dialled store's "open" is: a process starting is its first connection, and
@@ -2385,6 +2618,16 @@ class RemoteKv {
 
   constructor(driver: StoreDriver) {
     this.#driver = driver;
+  }
+
+  /**
+   * Start one store's store-wide sweep over this connection unless it has one
+   * already, and answer the promise of its end — what a process start asks of
+   * every bound store ([`sweepBoundStores`]).
+   */
+  sweep(store: StoreBinding): Promise<void> {
+    if (!this.#sweeps.has(store.name)) this.#startSweep(store);
+    return this.#sweeps.get(store.name) ?? Promise.resolve();
   }
 
   /** Run one op against this server, dedupe included. */
@@ -2928,17 +3171,36 @@ class RemoteKv {
  * closed is one the server will reap, and the command that asked has already
  * done its work.
  *
- * **What is still running over the stores goes first**: a settled execution's
- * ledger prune ([`pruneLedger`]), and every store-wide sweep this process
- * started ([`SWEEPING`]) — on SQLite and over each connection alike — so a
- * command that reached a store has removed what had expired there by the time
- * it exits (PRD resolved q69's "next process start"). That wait is here, on
- * the way out, rather than in front of the first op, where it would stall
- * whatever the command had come to do. Re-read until nothing is left, because a
- * prune can start while another finishes.
+ * **What is still running over the stores goes first**: every settled
+ * execution's ledger prune ([`pruneLedger`]), and every store-wide sweep this
+ * process started ([`SWEEPING`]) — on SQLite and over each connection alike —
+ * so a command's settled executions leave no ledger rows and every store it
+ * swept has lost what had expired there by the time it exits (PRD resolved
+ * q69). That wait is here, on the way out, rather than in front of an outcome
+ * or a first op, where it would stall whatever the command had come to do; a
+ * dial either one needs is bounded by [`STORE_DIAL_MS`], so a server that
+ * does not answer holds the exit for that long and no longer.
+ *
+ * **A prune still waiting on detached deliveries starts now** ([`DEFERRED`]).
+ * `agent-compose run` does not wait for an `agent.*` or `tool.*` delivery its
+ * execution started — the exit cuts it off — so a prune chained behind one
+ * would never run, and every such run would leave its execution's rows for
+ * ever. Once this process is gone no delivery of a settled execution retries
+ * anywhere (PRD resolved q65), so the rows answer nothing; what is left is the
+ * delivery still running *here* until the exit, and a keyed write it makes
+ * under that execution from now on is refused rather than made without its
+ * ledger row ([`CUT_OFF`]).
+ *
+ * Re-read until nothing is left, because a prune can start while another
+ * finishes.
  */
 export async function releaseStores(): Promise<void> {
   for (;;) {
+    for (const [id, execution] of DEFERRED) {
+      DEFERRED.delete(id);
+      CUT_OFF.add(id);
+      startPrune(execution);
+    }
     const running = [...PRUNING, ...SWEEPING];
     if (running.length === 0) break;
     await Promise.all(running.map((held) => held.catch(() => undefined)));

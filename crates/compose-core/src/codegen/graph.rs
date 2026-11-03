@@ -736,13 +736,16 @@ fn stores(ir: &Ir, names: &Names, imported: &mut Vec<String>) -> String {
     // execution is not always the one that made its keyed writes — a placed
     // node writes from its worker — so the prune visits every store the
     // composition binds rather than the ones this process happened to reach.
+    // The same set is what a process start sweeps of expired keys, for the
+    // ruling's "or the next process start".
     if !bound.is_empty() {
         text.push('\n');
         text.push_str(&names::doc(
             "",
             &[
                 "Every store this composition binds, so an execution's settlement prunes \
-               its ledger rows from each (PRD resolved q69)."
+               its ledger rows from each and a process start sweeps each of the keys \
+               that have expired (PRD resolved q69)."
                     .to_string(),
             ],
         ));

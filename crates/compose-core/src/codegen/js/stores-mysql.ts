@@ -633,6 +633,10 @@ async function openMysqlStore(
     uri: url,
     // This side's own probes, the other direction of the socket question.
     enableKeepAlive: true,
+    // The dial's deadline, spelled out although it is `mysql2`'s default: it is
+    // the bound every dial of a store has (`STORE_DIAL_MS`), not a default this
+    // arm happens to inherit.
+    connectTimeout: STORE_DIAL_MS,
     // See the note above: the ledger claim's arithmetic, not a preference. The
     // list form because that is what `mysql2` types the option as, and
     // `mergeFlags` takes an array as written.

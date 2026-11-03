@@ -177,7 +177,7 @@ import {
   watchHumanPauses,
 } from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
-import { dataRoot, releaseStores } from "./stores.ts";
+import { dataRoot, releaseStores, sweepBoundStores } from "./stores.ts";
 import { httpTriggers, manualTriggers } from "./triggers.ts";
 
 /** What a `--format` selects. */
@@ -417,6 +417,12 @@ interface Job {
  * construction rather than by two implementations agreeing.
  */
 async function execute(job: Job): Promise<number> {
+  // A process start, which is half of PRD resolved q69's cleanup schedule: every
+  // `kv` store the composition binds starts shedding the keys that have expired
+  // in it — behind this run's ops, never in front of them, the stores this run
+  // never reaches included — and `runMain`'s `releaseStores` waits for the rest
+  // on the way out (`./stores.ts`).
+  sweepBoundStores();
   // The trace export this run journals, if it journals one. Held in a box rather
   // than returned, because it is written by a hook **inside** the run and read
   // after the run has reported: PRD resolved q50 puts the sink "wherever

@@ -165,6 +165,7 @@ import {
 } from "./delivery.ts";
 import { type CompiledFlow, type FlowRun, flows, runChildFlow, runFlow } from "./graph.ts";
 import { mountWorkerRoutes, placementWaits, watchPlacementWaits } from "./mesh.ts";
+import { sweepBoundStores } from "./stores.ts";
 import {
   deliverHumanAnswer,
   deliveriesOf,
@@ -2141,6 +2142,10 @@ export async function serve(options: ServeOptions = {}): Promise<FastifyInstance
   const bound = typeof address === "object" && address !== null ? address.port : port;
   const shown = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
   process.stdout.write(`${JSON.stringify({ base_url: `http://${shown}:${bound}` })}\n`);
+  // A process start, which is half of PRD resolved q69's cleanup schedule: every
+  // `kv` store the composition binds starts shedding the keys that have expired
+  // in it, in the background and behind every request (`./stores.ts`).
+  sweepBoundStores();
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
     process.on(signal, () => {
       void app.close().then(() => process.exit(0));

@@ -11601,9 +11601,9 @@ function holdDelivery(execution: string, delivery: Promise<void>): void {
  * delivery every time.
  *
  * A run that ended does not wait here; the prune of its idempotency ledger does
- * — it is chained onto this ([`settleExecution`], PRD resolved q69) — because a
- * delivery still running is still writing, and retrying, under the execution's
- * id.
+ * — it is started behind this ([`settleExecution`], PRD resolved q69), and
+ * nothing waits for either but a command on its way out — because a delivery
+ * still running is still writing, and retrying, under the execution's id.
  *
  * Called after the wait board is released, so a delivery holding a pause of its
  * own is already abandoned rather than something this could wait on for ever.
@@ -14468,17 +14468,22 @@ export async function settleExecution(execution: string, error?: unknown): Promi
   // its first attempt applied would find no row to answer it and apply it a
   // second time, and one writing after the prune would leave a row nothing
   // prunes. A run that resumed already waited for them (`runFlow`'s release),
-  // and most runs dispatch none: then the prune is awaited here, and settling
-  // means pruned. Otherwise it is chained onto them rather than awaited, so
-  // nothing they do delays this execution's outcome — and an `agent-compose
-  // run` that exits before they finish cuts them off and leaves this
-  // execution's rows where they are, which nothing will ask for: the process
-  // that could have retried a write is gone, and the execution never resumes.
-  if (!deliveriesInFlight(execution)) {
-    await pruneLedgers(identity);
-    return;
-  }
-  void settleDetached(execution).then(() => pruneLedgers(identity));
+  // and most runs dispatch none; where some are still in flight the prune is
+  // handed the end of them to start behind.
+  //
+  // **Started, never awaited.** The prune visits every store the composition
+  // binds, the ones this execution never reached included, and a settlement
+  // that waited for it would make this run's answer wait on whether every one
+  // of those servers answers — a store a flow never touched, on a host that
+  // accepts a connection and says nothing, would hold `runFlow`, a `run` and
+  // a `serve` sync trigger for as long as the socket lived. So the outcome is
+  // the row's alone: `src/stores.ts` holds the prune, and a command waits for
+  // it on its way out (`releaseStores`), starting then the ones still waiting
+  // on deliveries the exit is about to cut off.
+  pruneLedgers(
+    identity,
+    deliveriesInFlight(execution) ? settleDetached(execution) : undefined,
+  );
 }
 
 /**
@@ -14495,30 +14500,35 @@ const executionSessions = new Map<string, string>();
  * A registration rather than an import because the emitted import graph has
  * one direction: `src/stores.ts` imports this module, and this module imports
  * nothing that imports it. Called once an execution's row has closed
- * `completed` or `failed` and its detached deliveries have finished — every
- * grammar 9.4 key begins with the execution's id, and a settled execution never
- * resumes (PRD resolved q65), so its rows answer nothing again (PRD resolved
- * q69). An execution that does not settle is never handed to it.
+ * `completed` or `failed`, with the end of its detached deliveries where any
+ * are still in flight — every grammar 9.4 key begins with the execution's id,
+ * and a settled execution never resumes (PRD resolved q65), so its rows answer
+ * nothing again (PRD resolved q69). An execution that does not settle is never
+ * handed to it. It returns at once: the prune is the store module's to hold and
+ * its command's to wait for, never the settlement's.
  */
-let ledgerPrune: ((execution: ExecutionIdentity) => Promise<void>) | undefined;
+let ledgerPrune:
+  | ((execution: ExecutionIdentity, after: Promise<void> | undefined) => void)
+  | undefined;
 
 /** Register [`ledgerPrune`]. See there. */
-export function settlesLedgers(prune: (execution: ExecutionIdentity) => Promise<void>): void {
+export function settlesLedgers(
+  prune: (execution: ExecutionIdentity, after: Promise<void> | undefined) => void,
+): void {
   ledgerPrune = prune;
 }
 
 /**
- * Run [`ledgerPrune`], which is **never** the execution's outcome: the row has
- * already closed, and rows that could not be pruned are rows nothing reads. The
- * prune says so per store on its own; this is what stops anything it did not
- * catch from becoming the run's failure — or, chained behind a delivery, an
- * unhandled rejection.
+ * Hand [`ledgerPrune`] a settled execution, which is **never** the execution's
+ * outcome: the row has already closed, and rows that could not be pruned are
+ * rows nothing reads. The prune says so per store on its own; this is what
+ * stops anything it did not catch from becoming the run's failure.
  */
-async function pruneLedgers(execution: ExecutionIdentity): Promise<void> {
+function pruneLedgers(execution: ExecutionIdentity, after: Promise<void> | undefined): void {
   const prune = ledgerPrune;
   if (prune === undefined) return;
   try {
-    await prune(execution);
+    prune(execution, after);
   } catch (failure) {
     process.stderr.write(
       `warning: the store ledger execution \`${execution.id}\` left could not be pruned (${describe(failure)}); its rows stay and answer nothing (PRD resolved q69)\n`,

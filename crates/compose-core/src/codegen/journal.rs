@@ -1774,9 +1774,10 @@ mod tests {
         //  * `releaseExecution` — grammar 11.1's `scope: execution` lifetime,
         //    run by `runFlow` when a run ends. It removes what the run owned;
         //    running it twice removes it twice.
-        //  * `pruneLedger` and `pruneBlobLedger` — the idempotency ledger's
-        //    retention (PRD resolved q69), run by the runtime once an
-        //    execution's journal row has closed `completed` or `failed`. They
+        //  * `pruneStore` and `pruneBlobLedger` — the idempotency ledger's
+        //    retention (PRD resolved q69), one store each of the prune
+        //    `pruneLedger` starts once an execution's journal row has closed
+        //    `completed` or `failed`. They
         //    delete the ledger rows under that settled execution's own
         //    `<execution id>/` prefix, which no replay will ever ask for —
         //    a settled execution never resumes (PRD resolved q65) — so a
@@ -1810,7 +1811,7 @@ mod tests {
         //    that ever escaped one of them fails this test rather than nothing.
         const NOT_AN_EFFECT: [(&str, &str); 15] = [
             ("src/stores.ts", "releaseExecution"),
-            ("src/stores.ts", "pruneLedger"),
+            ("src/stores.ts", "pruneStore"),
             ("src/stores.ts", "pruneBlobLedger"),
             ("src/runtime.ts", "releaseWorkspaces"),
             ("src/delivery.ts", "attemptDelivery"),

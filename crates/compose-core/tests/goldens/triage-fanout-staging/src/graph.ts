@@ -288,7 +288,7 @@ const storeTriageMemory: stores.StoreBinding = {
 };
 
 /**
- * Every store this composition binds, so an execution's settlement prunes its ledger rows from each (PRD resolved q69).
+ * Every store this composition binds, so an execution's settlement prunes its ledger rows from each and a process start sweeps each of the keys that have expired (PRD resolved q69).
  */
 stores.bindsStores([storeDocs, storeTriageMemory]);
 

@@ -422,6 +422,10 @@ async function openPostgresStore(
     // This side's own probes: a process whose store server has gone finds out on
     // the socket rather than on the next op's timeout.
     keepAlive: true,
+    // …and a deadline on the dial itself, which `pg` otherwise waits on for as
+    // long as a server that accepted the socket chooses not to answer
+    // (`STORE_DIAL_MS`).
+    connectionTimeoutMillis: STORE_DIAL_MS,
   });
   const fault: { error?: Error } = {};
   // **Before `connect`**, because `pg` emits `error` on the client whenever it

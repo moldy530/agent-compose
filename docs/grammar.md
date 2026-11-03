@@ -4361,12 +4361,13 @@ Rules (PRD 5.8):
   Removal is lazy, on a stated schedule. An expired key is invisible the
   instant it expires and leaves storage at whichever comes first: the next
   write to its partition, which removes **at most 100** of that partition's
-  expired keys before it reads its own; or the next process to open the store —
-  the open of a local store file, a dialled connection's first op on it — which
-  removes **every** key of the store that had expired by then, every partition
-  included. That removal runs behind the ops, a batch of at most 1000 between
-  two of them, so no op waits for more than one batch; a command waits for the
-  rest before it exits; and on a dialled backend each batch takes its
+  expired keys before it reads its own; or the next process start — every
+  `run`, `resume` and `serve`, on every `kv` store the composition binds whether
+  or not it reaches the store, and any other process at its first op on one —
+  which removes **every** key of the store that had expired by then, every
+  partition included. That removal runs behind the ops, a batch of at most 1000
+  between two of them, so no op waits for more than one batch; a command waits
+  for the rest before it exits; and on a dialled backend each batch takes its
   partition's version lock as a write does, so it and a write wait for each
   other rather than deadlocking. A `ttl`
   adds no field to any output row (Decision
@@ -4454,8 +4455,12 @@ Rules (PRD 5.8):
   rows go under the child's own id, when the child settles. An execution the
   journal still holds open keeps every row, so a resume still writes nothing
   twice (PRD resolved q29, q69). A `scope: execution` store's partition, ledger
-  included, already dies with the run (§11.3). A prune that fails is said and
-  changes no outcome: the rows answer nothing again.
+  included, already dies with the run (§11.3). The prune runs behind the
+  outcome and nothing of the outcome waits for it — each store on its own, a
+  dial bounded at ten seconds — and a command waits for it on its way out,
+  starting then a prune still waiting on deliveries the exit cuts off, whose
+  keyed writes are refused from then on. A prune that fails is said and changes
+  no outcome: the rows answer nothing again.
 - A store **write** performed inside a `map`-dispatched instance — `kv set`,
   `kv delete`, `kv merge`, `kv append`, `kv incr`, `vector upsert`,
   `vector delete`, `blob put`, `blob delete` — MUST be one of two forms (PRD 5.8,
@@ -10989,13 +10994,16 @@ server's on a dialled backend, the process's locally — which every write that
 applies sets again to its own `ttl`, else the default, else to nothing; a write
 that declined changes nothing. An expired key is absent to every read and every
 condition, consumes no version, and leaves storage at the next write to its
-partition (at most 100 rows a write) or the next process to open the store,
-whichever comes first — the latter behind that process's ops, a bounded batch at
-a time, never in front of them. When an execution's journal row closes
-`completed` or `failed` and its detached deliveries have finished, the ledger
-rows under its `<execution.id>/` prefix are deleted from every store the
-composition binds, which is every partition its keyed writes reached from any
-process (§4.4, §8.8, §11.1, §11.4, §11.5, PRD resolved q69).
+partition (at most 100 rows a write) or the next process start, whichever comes
+first — every `run`, `resume` and `serve` starting the sweep of every `kv` store
+the composition binds, any other process its first op on a store, and the
+sweep running behind that process's ops, a bounded batch at a time, never in
+front of them. When an execution's journal row closes `completed` or `failed`
+and its detached deliveries have finished, the ledger rows under its
+`<execution.id>/` prefix are deleted from every store the composition binds,
+which is every partition its keyed writes reached from any process — behind
+the outcome, which never waits for it, and before a command exits (§4.4, §8.8,
+§11.1, §11.4, §11.5, PRD resolved q69).
 
 **Rationale**: a store several runs share has two growth problems a `kv` store
 had no answer to. The composition's own keys — a claim, a cache entry, a
@@ -11039,13 +11047,22 @@ expired key at the instant it expires needs a clock-driven process on every
 backend; making it invisible at that instant needs only the comparison. So
 visibility is exact and storage is lazy: each write sweeps its own partition —
 under the lock it already holds, through an index over the expiry, so it reads
-no live row — bounded at 100 rows so a backlog never stalls a write, and the
-first op a process makes on a store starts removing the store's whole backlog,
-so a store nobody writes to again still sheds what expired the next time
-anything starts against it. That sweep runs **behind** the op that started it
-and between the ops after it, one batch of at most 1000 rows at a time, so it
-never stalls an op either: an op waits for at most the batch in progress, and a
-command waits for the rest on its way out rather than in front of its first op.
+no live row — bounded at 100 rows so a backlog never stalls a write, and a
+process start removes every store's whole backlog, so a store nobody writes to
+again still sheds what expired the next time the deployment starts. "Process
+start" is read as the ruling writes it, not as "the next process to touch the
+store": every `run`, `resume` and `serve` starts the sweep on every `kv` store
+the composition binds, a store none of its executions will reach included,
+because a cache or a session's scratch that nothing reads past its expiry is
+exactly the store that would otherwise keep its expired keys for ever. Any
+other process — a placement's worker, a library caller — and a connection
+dialled again after a loss start the same sweep with their first op on a
+store. The sweep runs **behind** the process's ops and between them, one batch
+of at most 1000 rows at a time, so it never stalls an op either: an op waits
+for at most the batch in progress, and a command waits for the rest on its way
+out rather than in front of its first op; a dial it needs is made in the
+background and bounded, so a bound store whose server does not answer delays
+nothing the process does.
 On a dialled backend each batch is one partition's, under that partition's
 version-sequence lock taken first, as a write takes it — two `DELETE`s reaching
 one expired row through two indexes lock it in two orders, which a server
@@ -11063,7 +11080,18 @@ proportional to the executions that are open rather than to history. "After"
 means after everything still writing under that id, too: a detached `agent.*`
 or `tool.*` delivery outlives the run that dispatched it (§8.6 rule 7) and
 retries under the run's id, so the prune waits for those deliveries to finish
-— chained behind them, so the outcome does not. And it is every store the
+— chained behind them, so the outcome does not. A command does not wait for
+them — `agent-compose run` exits under a delivery still in flight — so it
+starts such a prune on its way out instead: no process retries a settled
+execution's delivery once this one is gone (PRD resolved q65), and the delivery
+still running here until the exit is refused any keyed write from then on, so
+it can never apply one a second time for want of the row. **Nor does the
+outcome wait for the prune itself.** It visits every store the composition
+binds, and one of those can be on a server that is slow or does not answer;
+an outcome that waited would hand every bound store's reachability to every
+run, a store the run never touched included. So the prune runs behind the
+outcome, each store on its own, with a dial bounded at ten seconds, and a
+command waits for it before it exits. And it is every store the
 composition binds that is pruned, not the ones the settling process wrote: a
 placed node writes a dialled store from its worker (§14.1 rule 5), and the hub
 that settles never sees that write. A `kv` or `vector` store's ledger is keyed

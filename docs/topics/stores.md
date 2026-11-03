@@ -418,19 +418,24 @@ no version: a key set again after expiring takes its partition's next one, so an
 **What the code does about storage, exactly.** An expired key is invisible the
 instant it expires, and leaves storage at whichever comes first: the next write
 to its partition, which deletes **at most 100** of that partition's expired keys
-before it reads its own key; or the next process to open the store — a process's
-first op on a SQLite store file, or a connection's first op on a `postgres` or
-`mysql` store — which starts deleting **every** key of the store, all
-partitions, that had expired by then. That sweep runs *behind* the op that
-started it and between the ops after it, in batches of at most 1000, so no op
-waits for more than the one batch in progress however large the backlog is; a
-command — `run` or `resume` — waits for the rest on its way out, so the process
-that reached the store has removed its backlog by the time it exits, and a
-`serve` finishes it in the background. Both sweeps
-read an index over the expiry, so neither reads a key that has not expired. On
-`postgres` and `mysql` each batch is one partition's and takes that partition's
-version lock first, exactly as a write does, so a sweep and a write to the same
-partition wait for each other's commit rather than deadlocking.
+before it reads its own key; or the next process start, which starts deleting
+**every** key of the store, all partitions, that had expired by then. A process
+start is every `run`, `resume` and `serve`: each starts that sweep on every `kv`
+store the composition binds — whether or not anything it does will reach the
+store — skipping only what holds nothing to sweep (a `scope: execution` or
+`memory` store, a SQLite file nothing has created) and a `postgres` or `mysql`
+store whose address variable the process does not hold. Any other process —
+a placement's worker, say — starts it with its first op on a store, and so does
+a connection dialled again after a lost one. The sweep runs *behind* the
+process's ops and between them, in batches of at most 1000, so no op waits for
+more than the one batch in progress however large the backlog is; a command —
+`run` or `resume` — waits for the rest on its way out, so it has removed the
+backlog of every store it swept by the time it exits, and a `serve` finishes it
+in the background. Both sweeps read an index over the expiry, so neither reads
+a key that has not expired. On `postgres` and `mysql` each batch is one
+partition's and takes that partition's version lock first, exactly as a write
+does, so a sweep and a write to the same partition wait for each other's commit
+rather than deadlocking.
 `AGENT_COMPOSE_STORE_CLOCK_OFFSET_MS` shifts the clock every backend reads
 expiry by, in whole milliseconds, which is how a test moves time past an expiry
 without waiting for it.
@@ -447,14 +452,22 @@ a run that fails before it leaves the lease to expire on its own; PRD resolved q
 write leaves a ledger row so a retry of it answers rather than writing twice.
 When the execution that wrote it settles — `completed` or `failed` — its rows go
 from every store the composition binds, so a write a placed node made from its
-worker goes too; a child execution's go when the child settles. A detached
-`agent` or `tool` delivery the execution started is still writing, and
-retrying, under its id, so the rows stay until those deliveries have finished;
-a `run` that exits before they do cuts them off and leaves that execution's
-rows, which nothing will ask for again. An execution that has not
-settled — parked at a `human` pause, stopped by a divergence, or left open by a
-crash — keeps every row, so its resume still writes nothing twice. The ledger
-therefore holds the open executions' rows, not history.
+worker goes too; a child execution's go when the child settles. The prune runs
+*behind* the outcome: a run's answer never waits for it, so a bound store the
+run never reached, on a server that is slow or not answering, delays nothing
+the run reports. Each store is pruned on its own, a dial that has not completed
+in ten seconds fails (said on stderr, naming the store), and a `run` or
+`resume` waits for its prunes on its way out while a `serve` lets them finish in
+the background. A detached `agent` or `tool` delivery the execution started is
+still writing, and retrying, under its id, so the rows stay until those
+deliveries have finished — and a `run`, which exits without waiting for them,
+prunes on its way out regardless: nothing retries a settled execution's
+delivery once that process is gone, and the delivery still running in it until
+the exit is refused any keyed write from then on rather than making one its
+ledger can no longer answer. An execution that has not settled — parked at a
+`human` pause, stopped by a divergence, or left open by a crash — keeps every
+row, so its resume still writes nothing twice. The ledger therefore holds the
+open executions' rows, not history.
 
 ## Writes inside a `map`
 

@@ -12655,6 +12655,119 @@ fn a_settled_run_leaves_no_ledger_rows_in_a_vector_or_a_blob_store() {
     );
 }
 
+/// The composition [`a_run_sheds_expired_keys_from_a_store_it_never_reaches`]
+/// runs: `flow.fill` writes a key with a minute's `ttl` into `store.cache`, and
+/// `flow.elsewhere` stops at a `human` pause and touches no store at all.
+const START_SWEEP: &str = r#"version: "0.1"
+store.cache:
+  kind: kv
+  scope: global
+  value_schema:
+    n: { type: integer }
+
+flow.fill:
+  inputs:
+    key: { type: string }
+  outputs: {}
+  nodes:
+    put:
+      store: store.cache
+      op: set
+      key: "input.key"
+      ttl: 1m
+      value: { n: "1" }
+  edges:
+    - { from: start, to: put }
+    - { from: put, to: end }
+
+flow.elsewhere:
+  inputs: {}
+  outputs: {}
+  nodes:
+    wait:
+      human:
+        input:
+          note: { type: string }
+        output:
+          ok: { type: boolean }
+      input:
+        note: "'nothing here touches a store'"
+  edges:
+    - { from: start, to: wait }
+    - { from: wait, to: end }
+"#;
+
+/// **A `run` removes the keys that have expired in a store it never reaches**
+/// (PRD resolved q69 (c): an expired key leaves storage at the next write to
+/// its partition "or the next process start, whichever comes first").
+///
+/// Two `run`s of `flow.fill` leave two keys in `store.cache` that expire a
+/// minute later. Then `flow.elsewhere` runs — twice, with the store's clock
+/// moved by the emitted module's own offset — and it touches no store: it
+/// stops at a `human` pause nobody is there to answer, so the command exits 3
+/// with the execution still open and nothing settles either, which keeps a
+/// settlement's ledger prune from opening the store file on its way past.
+/// Thirty seconds on, nothing has expired and the start removes nothing; two
+/// minutes on, both keys have, and the start of that `run` removes them from
+/// the file. No write to the partition did it, and no op on the store: there
+/// was none.
+#[test]
+fn a_run_sheds_expired_keys_from_a_store_it_never_reaches() {
+    let scratch = harness::Scratch::new("start-sweep");
+    let entrypoint = scratch.path().join("main.yml");
+    std::fs::write(&entrypoint, START_SWEEP).expect("the scratch spec is writable");
+    let Some(project) = harness::scratch_project("start-sweep") else {
+        return;
+    };
+    let stored = harness::Scratch::new("start-sweep-data");
+    let data = stored.path().to_path_buf();
+    let run = |flow: &str, inputs: &[(&str, &str)], clock: u64| {
+        let environment = vec![
+            (
+                "AGENT_COMPOSE_DATA_DIR".to_string(),
+                data.display().to_string(),
+            ),
+            (STORE_CLOCK.to_string(), clock.to_string()),
+        ];
+        harness::run_target(&project, &entrypoint, "local", flow, inputs, &environment)
+    };
+    let parked = |clock: u64| {
+        let run = run("flow.elsewhere", &[], clock);
+        assert_eq!(
+            run.output.status.code(),
+            Some(3),
+            "`flow.elsewhere` parks at its pause with nobody to answer it: {}",
+            run.stderr()
+        );
+    };
+    let cache = data.join("stores").join("cache.sqlite");
+    let stored_keys =
+        || harness::sqlite_rows(&project, &cache, "SELECT key FROM entries ORDER BY key");
+
+    run("flow.fill", &[("key", "a")], 0).succeeded();
+    run("flow.fill", &[("key", "b")], 0).succeeded();
+    assert_eq!(
+        stored_keys(),
+        json!([{ "key": "a" }, { "key": "b" }]),
+        "the two writes are stored"
+    );
+
+    parked(30_000);
+    assert_eq!(
+        stored_keys(),
+        json!([{ "key": "a" }, { "key": "b" }]),
+        "a start before the expiry removes nothing"
+    );
+
+    parked(120_000);
+    assert_eq!(
+        stored_keys(),
+        json!([]),
+        "the start of a `run` that never reached `store.cache` removed every key that had \
+         expired in it (PRD resolved q69)"
+    );
+}
+
 /// A declared `manual` trigger's `session_key:` remaps the `--session` the CLI
 /// was given, and the run addresses the partition it names (grammar 13.2, 11.3).
 ///
