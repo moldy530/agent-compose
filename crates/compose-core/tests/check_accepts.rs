@@ -1021,6 +1021,106 @@ flow.f:
     );
 }
 
+/// An authored ledger key on every `kv` write that takes one, and one that is
+/// the **same** for every item of a fan-out (PRD resolved q73, Decision D67).
+///
+/// D67's rule reads on `key:`, and a `kv` write inside a `map` is legal whatever
+/// its key is — so the constant `idempotency_key:` below is legal too, and it
+/// means what it says: the items dedupe against each other, and one of them
+/// lands. Every other write here names its business key from the flow's own
+/// input, over the scope `key:` reads.
+#[test]
+fn an_authored_ledger_key_on_every_kv_write_inside_a_fan_out() {
+    accepts(
+        "authored-ledger-keys",
+        r#"
+store.events:
+  kind: kv
+  scope: global
+  default_ttl: 24h
+  value_schema:
+    seen: { type: integer }
+    tags: { type: array, max_items: 10, items: { type: string } }
+state:
+  ids:
+    type: array
+    max_items: 5
+    items: { type: string }
+flow.record:
+  inputs:
+    event_id: { type: string }
+  outputs: {}
+  nodes:
+    once:
+      store: store.events
+      op: set
+      key: "'event/' + input.event_id"
+      value: { seen: "1", tags: "[]" }
+      idempotency_key: "input.event_id"
+    merged:
+      store: store.events
+      op: merge
+      key: "'event/' + input.event_id"
+      fields: { seen: "2" }
+      idempotency_key: "'merge/' + input.event_id"
+    appended:
+      store: store.events
+      op: append
+      key: "'event/' + input.event_id"
+      field: tags
+      value: "'seen'"
+      idempotency_key: "'append/' + input.event_id + '/' + execution.session_key"
+    counted:
+      store: store.events
+      op: incr
+      key: "'event/' + input.event_id"
+      field: seen
+      idempotency_key: "'incr/' + input.event_id"
+    moved:
+      store: store.events
+      op: batch
+      ops:
+        - { op: set, key: "'moved/' + input.event_id", value: { seen: "1", tags: "[]" } }
+        - { op: delete, key: "'event/' + input.event_id" }
+      idempotency_key: "'move/' + input.event_id"
+    dropped:
+      store: store.events
+      op: delete
+      key: "'moved/' + input.event_id"
+      idempotency_key: "'drop/' + input.event_id"
+    shared:
+      store: store.events
+      op: set
+      key: "'summary'"
+      value: { seen: "0", tags: "[]" }
+      idempotency_key: "'the-one-summary'"
+  edges:
+    - { from: start, to: once }
+    - { from: once, to: merged }
+    - { from: merged, to: appended }
+    - { from: appended, to: counted }
+    - { from: counted, to: moved }
+    - { from: moved, to: dropped }
+    - { from: dropped, to: shared }
+    - { from: shared, to: end }
+flow.f:
+  outputs: {}
+  nodes:
+    each:
+      map:
+        over: "state.ids"
+        as: id
+        node: flow.record
+        max_concurrency: 4
+        input:
+          event_id: "id"
+  edges:
+    - { from: start, to: each }
+    - { from: each, to: end }
+"#,
+    );
+}
+
 /// `execution.item_index` derives a key the way the unkeyed-write help says it
 /// does: from inside a string-valued expression. The index itself is an integer
 /// (grammar 4.1) and a `key` is a string (grammar 11.4), so a bare

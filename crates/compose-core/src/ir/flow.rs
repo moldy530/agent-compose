@@ -224,14 +224,16 @@ pub struct Human {
 
 /// The parameters of a store op (grammar 11.4).
 ///
-/// Eleven of the twenty are CEL; `top_k`, `limit`, `content_type`, `field`,
+/// Twelve of the twenty-one are CEL; `top_k`, `limit`, `content_type`, `field`,
 /// `unique`, `include_values`, `if` and `ttl` are literals (grammar 8.8, 11.4),
 /// so a bound — and which field a partial update touches, what it is
 /// conditioned on, how long the key it leaves lives, and whether a page carries
-/// its values — is readable without running the graph. The twentieth, a
+/// its values — is readable without running the graph. The twenty-first, a
 /// `batch`'s `ops`, is a literal list whose entries hold both (PRD resolved
 /// q71): each one's op, condition and `ttl` literals, its key, value and
-/// version CEL, exactly as on the single ops.
+/// version CEL, exactly as on the single ops. The twelfth CEL one is PRD
+/// resolved q73's `idempotency_key`, the business key a `kv` write dedupes on
+/// in place of grammar 9.4's derived one.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct StoreParams {
     /// `key:`
@@ -299,6 +301,10 @@ pub struct StoreParams {
     /// q71).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ops: Option<Spanned<Vec<BatchEntry>>>,
+    /// `idempotency_key:` — a `kv` write's authored ledger key, which replaces
+    /// the one grammar 9.4 derives (PRD resolved q73).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<Spanned<Cel>>,
 }
 
 impl StoreParams {

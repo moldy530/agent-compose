@@ -1,0 +1,18 @@
+# rule: `idempotency_key:` is a `kv` write's, and a `blob` `put` dedupes on the key grammar 9.4 derives (grammar 11.4, PRD resolved q73)
+# code: invalid-value
+# message: `idempotency_key` is not a parameter of the `put` op
+# at: 15:7
+# help: `put` takes `key`, `value`, `content_type`; `idempotency_key:` is the business key a `kv` write dedupes on in place of the derived one, and only `set`, `delete`, `merge`, `append`, `incr`, `batch` take one — a `put` writes a `blob` store, whose writes dedupe on the key grammar 9.4 derives (grammar 11.4, PRD resolved q73)
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    step:
+      store: store.artifacts
+      op: put
+      key: "'report.txt'"
+      value: "'the report'"
+      idempotency_key: "'report'"
+  edges:
+    - { from: start, to: step }
+    - { from: step, to: end }

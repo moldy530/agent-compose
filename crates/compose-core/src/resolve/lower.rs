@@ -526,6 +526,7 @@ fn store_params(source: &ast_flow::StoreOpParams) -> Option<ir::flow::StoreParam
         after: source.after.clone(),
         include_values: source.include_values.clone(),
         keys: source.keys.clone(),
+        idempotency_key: source.idempotency_key.clone(),
         ops: match &source.ops {
             None => None,
             Some(ops) => Some(Spanned::new(

@@ -49,6 +49,20 @@
 //! `value_schema` and total, the version an integer. A `batch` is a `kv` op,
 //! which [`model::kind_takes`] decides like every other row.
 //!
+//! # An authored ledger key (PRD resolved q73)
+//!
+//! `idempotency_key:` is one string expression, over the scope every other
+//! parameter reads, so a retry re-derives the same string. The parser has
+//! already held it to its row — the six `kv` writes — and what is left is the
+//! two halves only the store answers: a `delete` is one op of three kinds, so a
+//! `vector`/`blob` `delete` naming one is refused against its store as
+//! `if_version:` is; and a key two executions share is the whole of what the
+//! parameter is for, which a `scope: execution` store — one partition per
+//! execution, dying with its run — can never have, so it is refused there too.
+//! The map-write rule below reads on `key:` and not on this: an authored key
+//! that is the same for every item of a `map` dedupes the items against each
+//! other, which is what the author wrote (Decision D67).
+//!
 //! # Keying a write inside a fan-out
 //!
 //! A store write performed inside a `map`-dispatched instance must have an
@@ -145,6 +159,47 @@ pub(crate) fn store_node<'a>(
         );
     }
 
+    // PRD resolved q73's authored key: a `kv` write's, replacing the key grammar
+    // 9.4 derives for it. `delete` is the one op of its row another kind takes,
+    // so a `vector`/`blob` `delete` naming one is refused against the store,
+    // as a version is above; and a key two executions share is the whole of
+    // what one is for, which an execution-scoped store's partition — its own
+    // run's, dying with it — never is.
+    if let Some(authored) = &params.idempotency_key {
+        if definition.kind != StoreKind::Kv {
+            ctx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidValue,
+                    authored.span.clone(),
+                    format!(
+                        "`idempotency_key` is not a parameter of a `{}` `{}`: an authored key replaces the derived key of a `kv` write, and `{}` is `kind: {}`",
+                        definition.kind.as_str(),
+                        op.as_str(),
+                        store.value,
+                        definition.kind.as_str()
+                    ),
+                )
+                .with_help(
+                    "a `vector` or `blob` write dedupes on the key grammar 9.4 derives, and only a `kv` store's writes take one of their own: drop `idempotency_key:`, or keep the record in a `kv` store (grammar 11.4, PRD resolved q73)",
+                ),
+            );
+        } else if definition.scope == StoreScope::Execution {
+            ctx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidValue,
+                    authored.span.clone(),
+                    format!(
+                        "{subject} gives its write to `{}` an `idempotency_key`, and `{}` is `scope: execution`: its partition is one execution's and dies with the run, so no second execution ever writes under the key",
+                        store.value, store.value
+                    ),
+                )
+                .with_help(
+                    "an authored key dedupes the executions that write one store under one business key, and the retries of this execution's own write are already deduped by the key grammar 9.4 derives: drop `idempotency_key:`, or declare the store `scope: session` or `scope: global` (grammar 11.3, 11.4, PRD resolved q73)",
+                ),
+            );
+        }
+    }
+
     // A `kv` page's two parameters (PRD resolved q70). `list` is one op of
     // two kinds and the page is `kv`'s: a `blob` `list` keeps its one shape —
     // a prefix and a limit — so naming either there is refused against the
@@ -186,6 +241,9 @@ pub(crate) fn store_node<'a>(
         // Analyzed on any kind, so a mistake inside it is reported beside the
         // refusal above rather than after it is repaired.
         ("after", params.after.as_ref()),
+        // …and so is an authored key, on any kind and any scope: it is a
+        // string, which a retry re-derives (PRD resolved q73).
+        ("idempotency_key", params.idempotency_key.as_ref()),
     ] {
         let Some(expression) = expression else {
             continue;

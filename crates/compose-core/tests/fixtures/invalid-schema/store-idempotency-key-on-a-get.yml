@@ -1,0 +1,15 @@
+# rule: `idempotency_key:` is a parameter of the six `kv` writes, and a `get` reads (grammar 11.4, PRD resolved q73)
+# at: /flow.demo/nodes/load/idempotency_key
+# via: /$defs/storeNode/allOf/15/then/properties/idempotency_key
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    load:
+      store: store.memory
+      op: get
+      key: "execution.session_key"
+      idempotency_key: "execution.id"
+  edges:
+    - { from: start, to: load }
+    - { from: load, to: end }

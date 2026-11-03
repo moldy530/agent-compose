@@ -1,0 +1,16 @@
+# rule: `idempotency_key:` is a `kv` write's, and a `blob` `put` dedupes on the key grammar 9.4 derives (grammar 11.4, PRD resolved q73)
+# at: /flow.demo/nodes/save/idempotency_key
+# via: /$defs/storeNode/allOf/4/then/properties/idempotency_key
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    save:
+      store: store.artifacts
+      op: put
+      key: "'report.txt'"
+      value: "'the report'"
+      idempotency_key: "'report'"
+  edges:
+    - { from: start, to: save }
+    - { from: save, to: end }

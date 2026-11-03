@@ -1,0 +1,18 @@
+# rule: `idempotency_key:` is a `kv` write's, and a `vector` `upsert` dedupes on the key grammar 9.4 derives (grammar 11.4, PRD resolved q73)
+# code: invalid-value
+# message: `idempotency_key` is not a parameter of the `upsert` op
+# at: 15:7
+# help: `upsert` takes `key`, `value`, `metadata`; `idempotency_key:` is the business key a `kv` write dedupes on in place of the derived one, and only `set`, `delete`, `merge`, `append`, `incr`, `batch` take one — an `upsert` writes a `vector` store, whose writes dedupe on the key grammar 9.4 derives (grammar 11.4, PRD resolved q73)
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    step:
+      store: store.docs
+      op: upsert
+      key: "'doc-1'"
+      value: "'the text'"
+      idempotency_key: "'doc-1'"
+  edges:
+    - { from: start, to: step }
+    - { from: step, to: end }

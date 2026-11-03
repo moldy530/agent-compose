@@ -1546,6 +1546,10 @@
           "maxItems": 100,
           "items": { "$ref": "#/$defs/storeBatchEntry" }
         },
+        "idempotency_key": {
+          "description": "kv set/delete/merge/append/incr/batch only: CEL string over input, state and execution - the business key the write dedupes on in place of the key grammar 9.4 derives. Two executions writing one store under one key apply once: the second writes nothing and answers the first's whole answer with `deduped: true`. The ledger holds it as `author/<store>/<key>`, per store rather than per partition; on a store that declares `default_ttl:` the row expires with it, and otherwise it is kept (PRD resolved q73).",
+          "$ref": "#/$defs/cel"
+        },
         "writes": { "description": "Write remap over the op's derived output fields.", "$ref": "#/$defs/writes" },
         "retry": { "$ref": "#/$defs/retry" },
         "timeout": { "description": "Wall-clock bound on this node.", "$ref": "#/$defs/duration" },
@@ -1557,7 +1561,7 @@
         {
           "if": { "properties": { "op": { "enum": ["get", "delete"] } }, "required": ["op"] },
           "then": {
-            "description": "`get`/`delete` address one key; a `delete` may also take `if_version:` (a kv one - a version is a kv key's). Grammar 11.4.",
+            "description": "`get`/`delete` address one key; a `delete` may also take `if_version:` and `idempotency_key:` (kv ones - a version is a kv key's, and an authored key replaces a kv write's derived one). Grammar 11.4, PRD resolved q73.",
             "required": ["key"],
             "properties": {
               "value": false,
@@ -1629,7 +1633,8 @@
               "after": false,
               "include_values": false,
               "keys": false,
-              "ops": false
+              "ops": false,
+              "idempotency_key": false
             }
           }
         },
@@ -1654,7 +1659,8 @@
               "after": false,
               "include_values": false,
               "keys": false,
-              "ops": false
+              "ops": false,
+              "idempotency_key": false
             }
           }
         },
@@ -1679,7 +1685,8 @@
               "if_version": false,
               "ttl": false,
               "keys": false,
-              "ops": false
+              "ops": false,
+              "idempotency_key": false
             }
           }
         },
@@ -1705,7 +1712,8 @@
               "after": false,
               "include_values": false,
               "keys": false,
-              "ops": false
+              "ops": false,
+              "idempotency_key": false
             }
           }
         },
@@ -1822,7 +1830,8 @@
               "after": false,
               "include_values": false,
               "keys": false,
-              "ops": false
+              "ops": false,
+              "idempotency_key": false
             }
           }
         },
@@ -1850,7 +1859,8 @@
               "ttl": false,
               "after": false,
               "include_values": false,
-              "ops": false
+              "ops": false,
+              "idempotency_key": false
             }
           }
         },
@@ -1861,14 +1871,14 @@
         {
           "if": { "properties": { "op": { "const": "get" } }, "required": ["op"] },
           "then": {
-            "description": "`get` reads and is conditioned on nothing.",
-            "properties": { "if_version": false }
+            "description": "`get` reads: it is conditioned on nothing and carries no idempotency key (PRD resolved q73).",
+            "properties": { "if_version": false, "idempotency_key": false }
           }
         },
         {
           "if": { "properties": { "op": { "const": "batch" } }, "required": ["op"] },
           "then": {
-            "description": "`kv batch` takes `ops` alone: each entry carries its own key, value, condition and ttl. Grammar 11.4, PRD resolved q71.",
+            "description": "`kv batch` takes `ops` and an optional `idempotency_key`: each entry carries its own key, value, condition and ttl, and the batch is one write under one key. Grammar 11.4, PRD resolved q71, q73.",
             "required": ["ops"],
             "properties": {
               "key": false,

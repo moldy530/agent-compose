@@ -1,0 +1,24 @@
+# rule: an `idempotency_key:` is one expression whose result is a string — the ledger key a retry re-derives (grammar 11.4, PRD resolved q73)
+# code: type-mismatch
+# message: `idempotency_key` of node `record` must evaluate to a string, found an integer
+# at: main.yml:21:24
+version: "0.1"
+store.events:
+  kind: kv
+  scope: global
+  value_schema:
+    seen: { type: integer }
+flow.f:
+  inputs:
+    event_id: { type: integer }
+  outputs: {}
+  nodes:
+    record:
+      store: store.events
+      op: set
+      key: "'event'"
+      value: { seen: "1" }
+      idempotency_key: "input.event_id"
+  edges:
+    - { from: start, to: record }
+    - { from: record, to: end }
