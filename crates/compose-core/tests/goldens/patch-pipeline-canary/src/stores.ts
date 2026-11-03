@@ -853,7 +853,7 @@ function breakStaleLock(file: string): boolean {
 async function migrated(
   Database: SqliteModule["Database"],
   file: string,
-  now: number,
+  now: number | undefined,
 ): Promise<InstanceType<SqliteModule["Database"]>> {
   const deadline = Date.now() + LOCK_WAIT_MS;
   let broke = false;
@@ -869,8 +869,9 @@ async function migrated(
       migrateStoreFile(database);
       // The open is this process's first op on the file, which is the second
       // half of PRD resolved q69's schedule: every key whose time is up leaves
-      // storage now, whatever the writes since have swept.
-      sweepLocalStore(database, now);
+      // storage now, whatever the writes since have swept. A `vector` file has
+      // no key that expires, so it is given no clock and swept of nothing.
+      if (now !== undefined) sweepLocalStore(database, now);
       return database;
     } catch (error) {
       database.close();
@@ -897,8 +898,9 @@ function open(store: StoreBinding, execution: runtime.ExecutionIdentity): Promis
 
   const opening = (async () => {
     // Read before anything is opened, so a clock offset nobody can read fails
-    // this op by name rather than inside [`migrated`]'s retry loop.
-    const now = localNow();
+    // this op by name rather than inside [`migrated`]'s retry loop — and only
+    // for a `kv` store, the one kind whose keys expire.
+    const now = store.kind === "kv" ? localNow() : undefined;
     const { Database } = await sqlite();
     if (store.scope === "execution" || store.backend.provider === "memory") {
       // Nothing on disk: an execution-scoped store dies with the run, and
@@ -1812,8 +1814,9 @@ function nextLocalVersion(database: Database, scopeKey: string): number {
 
 /**
  * The `vector` rows of grammar 11.4's catalog, and the `kv` `list` — which
- * answers the keys alive at `now`, so an expired key is not listed (PRD
- * resolved q69). A `vector` row never expires: its `expires_at` is `NULL`.
+ * answers the keys alive at `now`, the clock [`localKv`] read for the op, so
+ * an expired key is not listed (PRD resolved q69). A `vector` row never
+ * expires, and no `vector` op reads a clock.
  */
 function tabular(
   store: StoreBinding,
@@ -1822,7 +1825,7 @@ function tabular(
   scopeKey: string,
   database: Database,
   vector: number[] | undefined,
-  now: number = localNow(),
+  now?: number,
 ): Record<string, unknown> {
   switch (op) {
     case "delete": {
@@ -1846,7 +1849,7 @@ function tabular(
         // keys (usually none) for a `prefix:` grammar 11.4 puts no restriction
         // on. Spreading the string iterates code points, which is what SQLite
         // is counting on the other side.
-        [scopeKey, [...prefix].length, prefix, now, limit],
+        [scopeKey, [...prefix].length, prefix, now ?? localNow(), limit],
       ) as Row[];
       return { keys: rows.map((row) => String(row["key"])) };
     }

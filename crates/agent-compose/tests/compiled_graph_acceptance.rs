@@ -12429,8 +12429,11 @@ fn the_published_lease_claims_declines_keeps_and_releases() {
     let scratch = harness::Scratch::new("published-lease");
     let entrypoint = scratch.path().join("main.yml");
     std::fs::write(&entrypoint, published_lease()).expect("the scratch spec is writable");
-    // One data directory for every run, so the six builds share one store.
-    let data = scratch.path().join("data");
+    // One data directory for every run, so the six builds share one store —
+    // a directory of its own rather than one beside the spec, so nothing a run
+    // writes sits in the directory the next build reads its composition from.
+    let stored = harness::Scratch::new("published-lease-data");
+    let data = stored.path().to_path_buf();
 
     let provider = MockProvider::start().expect("a loopback port");
     let mut environment = harness::environment(&provider);

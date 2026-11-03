@@ -4363,7 +4363,9 @@ Rules (PRD 5.8):
   write to its partition, which removes **at most 100** of that partition's
   expired keys before it reads its own; or the next process to open the store —
   the open of a local store file, a dialled connection's first op on it — which
-  removes **every** expired key of the store, every partition included. A `ttl`
+  removes **every** expired key of the store, every partition included (on
+  `postgres`, but for a row a write in flight holds at that instant, which that
+  write's own sweep or the next one removes). A `ttl`
   adds no field to any output row (Decision
   [D34](#d34-the-store-op-catalog-is-normative-including-derived-output-schemas)):
   an expired key is answered exactly as a key never written is.

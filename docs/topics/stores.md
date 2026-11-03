@@ -422,7 +422,10 @@ before it reads its own key; or the next process to open the store — a process
 first op on a SQLite store file, or a connection's first op on a `postgres` or
 `mysql` store — which deletes **every** expired key of the store, all partitions,
 in batches of 1000. Both read an index over the expiry, so neither reads a key
-that has not expired. `AGENT_COMPOSE_STORE_CLOCK_OFFSET_MS` shifts the clock
+that has not expired. On `postgres` a sweep skips a row another write is
+holding at that moment rather than waiting for it, and that write's own sweep
+or the next one takes it; on `mysql` and SQLite it waits for the write, which
+is one op long. `AGENT_COMPOSE_STORE_CLOCK_OFFSET_MS` shifts the clock
 every backend reads expiry by, in whole milliseconds, which is how a test moves
 time past an expiry without waiting for it.
 

@@ -951,15 +951,18 @@ pub fn invoke_entrypoint(
     host: Option<&str>,
 ) -> Option<Invocation> {
     let (project, built) = build_entrypoint(entrypoint, "invoke")?;
-    if let Some(source) = host {
-        std::fs::write(project.join("host-functions.mjs"), source)
-            .expect("the project directory is writable");
-    }
+    // Before the host preamble is written into the project, so a build that
+    // failed is reported with what `build` said rather than as a project
+    // directory that is not there.
     assert!(
         built.status.success(),
         "the composition `{label}` did not build:\n{}",
         String::from_utf8_lossy(&built.stderr)
     );
+    if let Some(source) = host {
+        std::fs::write(project.join("host-functions.mjs"), source)
+            .expect("the project directory is writable");
+    }
 
     let inputs_path = project.join("invoke-inputs.json");
     std::fs::write(
