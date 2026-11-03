@@ -829,6 +829,15 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "an_entry_condition_reads_what_the_entries_before_it_left",
     "each_batch_entrys_ttl_and_the_store_default_apply",
     "a_batch_of_101_entries_is_refused_by_name",
+    // PRD resolved q69 of a batch, which is one write: it sweeps its partition
+    // once — at most 100 expired rows, not none and not 100 per entry — and
+    // every entry's condition reads an expired key as absent behind a backlog
+    // that sweep has not reached, so `if: absent` takes it at the next version
+    // and `if: present` and `if_version:` decline it, consuming none.
+    "a_batch_sweeps_at_most_100_expired_rows_of_its_partition_once",
+    "an_expired_key_leaves_storage_at_the_next_batch_to_its_partition",
+    "a_batch_entrys_condition_declines_an_expired_key_a_sweep_has_not_reached",
+    "a_batch_entry_with_if_absent_takes_an_expired_key_a_sweep_has_not_reached",
     // One idempotency key, one ledger row holding the whole answer: a retried
     // batch dedupes whole, and so does a retried decline, which is an answer
     // too — while the same entries under a fresh key apply.
@@ -846,6 +855,19 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "the_killed_batch_had_written_its_first_entry",
     "a_batch_killed_mid_transaction_leaves_none_of_it",
     "a_batch_retried_after_its_crash_applies_once",
+    // Two processes racing batches over the same six keys in opposite orders
+    // (`store-batch-race.mjs`): the partition's sequence is locked before any
+    // key, so the two wait for each other rather than in a circle — every
+    // batch applies, no version is taken twice and each batch's are one
+    // consecutive run, a reader in a third process never finds two batches'
+    // values among the six, and the six end holding the last batch's. The
+    // same writers then race fresh keys into their own adjacent partitions.
+    "two_processes_racing_batches_really_overlapped",
+    "two_processes_racing_batches_over_shared_keys_in_opposite_orders_all_apply",
+    "two_processes_racing_batches_never_take_one_version",
+    "every_key_two_racing_batches_wrote_holds_the_last_batchs_value",
+    "a_reader_beside_two_racing_batches_never_finds_one_half_landed",
+    "two_processes_racing_batches_into_adjacent_partitions_all_apply",
 ];
 
 /// The order every arm pages a mixed set in: UTF-8 byte order, which Rust's

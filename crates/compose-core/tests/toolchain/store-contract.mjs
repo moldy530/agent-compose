@@ -3017,6 +3017,157 @@ const BATCHED = z.object({ n: z.number().int().min(0), hold: z.boolean().optiona
 }
 
 {
+  // **A batch sweeps its partition once, as one write does** (PRD resolved
+  // q69 (c), D156): an expired key leaves storage at the next write to its
+  // partition, and a batch is one write — so a batch of three entries into a
+  // partition holding 150 expired rows takes 100 of them, not none and not a
+  // hundred per entry, and the next batch takes the other 50. A key that never
+  // expires beside them is every count's one live row until the first batch
+  // deletes it.
+  const store = kv("batch_sweep", "global", URL_ENV, BATCHED);
+  const run = ctx(execution("batch_sweep"));
+  await later(0, async () => {
+    await write(store, "set", { key: "kept", value: { n: 0 } }, run);
+    // Laid down by batches, at most 100 entries each — the bound — and swept
+    // of nothing, since nothing has expired at this instant.
+    for (let start = 0; start < 150; start += 100) {
+      await batch(
+        store,
+        Array.from({ length: Math.min(100, 150 - start) }, (_, offset) => ({
+          op: "set",
+          key: `old-${String(start + offset).padStart(3, "0")}`,
+          value: { n: start + offset },
+          ttl: HOUR,
+        })),
+        run,
+      );
+    }
+  });
+  const seeded = await storedRows(store, "global");
+  const first = await later(HOUR + MINUTE, () =>
+    batch(
+      store,
+      [
+        { op: "set", key: "new-1", value: { n: 1 } },
+        { op: "set", key: "new-2", value: { n: 2 } },
+        { op: "delete", key: "kept" },
+      ],
+      run,
+    ),
+  );
+  const afterFirst = await storedRows(store, "global");
+  const second = await later(HOUR + MINUTE, () => batch(store, [{ op: "set", key: "new-3", value: { n: 3 } }], run));
+  const afterSecond = await storedRows(store, "global");
+  // 150 expired and `kept`; the first batch removes 100 of them, adds two keys
+  // and deletes `kept`; the second removes the other 50 and adds one.
+  answer.a_batch_sweeps_at_most_100_expired_rows_of_its_partition_once =
+    seeded === 151 && first.applied === true && afterFirst === 151 - 100 + 2 - 1;
+  answer.an_expired_key_leaves_storage_at_the_next_batch_to_its_partition =
+    second.applied === true && afterSecond === 3;
+  answer.batch_sweep_trace = { seeded, afterFirst, afterSecond };
+}
+
+{
+  // **…and every entry's condition reads an expired key as absent** (PRD
+  // resolved q69 (b)), behind a backlog the batch's own sweep has not
+  // reached: 500 fillers expire two minutes ahead of `job`, so each batch's
+  // sweep takes a hundred of them and leaves `job` a row — what each entry's
+  // condition reads is an expired row, and every count below says so. A
+  // `set` with `if: present` and one with `if_version:` decline it, as does a
+  // `delete` with `if_version:`, each naming its index and consuming no
+  // version; a `set` with `if: absent` takes it, at the partition's next
+  // version — expiry consumed none.
+  const store = kv("batch_lease", "global", URL_ENV, BATCHED);
+  const run = ctx(execution("batch_lease"));
+  const FILLERS = 500;
+  await later(0, async () => {
+    for (let start = 0; start < FILLERS; start += 100) {
+      await batch(
+        store,
+        Array.from({ length: 100 }, (_, offset) => ({
+          op: "set",
+          key: `f-${String(start + offset).padStart(3, "0")}`,
+          value: { n: start + offset },
+          ttl: HOUR - 2 * MINUTE,
+        })),
+        run,
+      );
+    }
+  });
+  const claim = await later(0, () =>
+    batch(store, [{ op: "set", key: "job", value: { n: 1 }, condition: "absent", ttl: HOUR }], run),
+  );
+  const claimed = claim.results?.[0]?.version;
+  /** Whether `job` is still a row, expired or not, and how many rows the partition holds. */
+  const stored = async () => [
+    Number(
+      (
+        await storage(
+          `SELECT COUNT(*) AS n FROM store_entries WHERE store = ? AND scope_key = ? AND ${provider === "mysql" ? "`key`" : '"key"'} = ?`,
+          [store.name, "global", "job"],
+          [store.name, "SELECT COUNT(*) AS n FROM entries WHERE scope_key = ? AND key = ?", ["global", "job"]],
+        )
+      )[0]?.n,
+    ),
+    await storedRows(store, "global"),
+  ];
+  const expired = (ops) => later(HOUR + MINUTE, () => batch(store, ops, run));
+  const present = await expired([
+    { op: "set", key: "other", value: { n: 2 } },
+    { op: "set", key: "job", value: { n: 2 }, condition: "present" },
+  ]);
+  const afterPresent = await stored();
+  const versioned = await expired([{ op: "set", key: "job", value: { n: 3 }, ifVersion: claimed }]);
+  const afterVersioned = await stored();
+  const deleted = await expired([
+    { op: "set", key: "other", value: { n: 4 } },
+    { op: "delete", key: "job", ifVersion: claimed },
+  ]);
+  const afterDeleted = await stored();
+  const declinedLast = await sequenceLast(store);
+  const retaken = await expired([
+    { op: "set", key: "job", value: { n: 5 }, condition: "absent", ttl: HOUR },
+    { op: "set", key: "other", value: { n: 6 } },
+  ]);
+  const afterRetaken = await stored();
+  // 500 fillers and `job`; each batch's sweep takes a hundred fillers, and
+  // only the last batch, which applied, leaves `other` beside them.
+  answer.a_batch_entrys_condition_declines_an_expired_key_a_sweep_has_not_reached =
+    claim.applied === true &&
+    claimed === FILLERS + 1 &&
+    present.applied === false &&
+    present.failed === 1 &&
+    same(afterPresent, [1, 401]) &&
+    versioned.applied === false &&
+    versioned.failed === 0 &&
+    same(afterVersioned, [1, 301]) &&
+    deleted.applied === false &&
+    deleted.failed === 1 &&
+    same(afterDeleted, [1, 201]) &&
+    declinedLast === claimed;
+  answer.a_batch_entry_with_if_absent_takes_an_expired_key_a_sweep_has_not_reached =
+    retaken.applied === true &&
+    same(retaken.results, [
+      { key: "job", version: claimed + 1 },
+      { key: "other", version: claimed + 2 },
+    ]) &&
+    same(afterRetaken, [1, 102]) &&
+    (await later(HOUR + MINUTE, () => get(store, "job", run))).value?.n === 5;
+  answer.batch_lease_trace = {
+    claim,
+    present,
+    afterPresent,
+    versioned,
+    afterVersioned,
+    deleted,
+    afterDeleted,
+    declinedLast: declinedLast ?? null,
+    retaken,
+    afterRetaken,
+  };
+}
+
+{
   // **The bound is the run's too**: a caller that skipped the compiler is
   // refused by name, before anything is read, rather than applied in part.
   const store = kv("batch_bound", "global", URL_ENV, BATCHED);
@@ -3232,6 +3383,161 @@ if (provider !== "sqlite") {
     await rollback(killer).catch(() => undefined);
     if (blocked !== undefined) await blocked;
     await killer.end().catch(() => undefined);
+  }
+}
+
+{
+  // **Two processes racing batches over the same keys in opposite orders**
+  // (`store-batch-race.mjs`): each batch locks the partition's sequence first
+  // and its keys after, so the second of two waits for the first to commit
+  // before it reads anything — never on a key the first is about to reach for
+  // while holding one it needs — and they apply one after the other. So every
+  // batch of both writers applies with no error (a deadlock the server broke
+  // would be one failing); every version a `set` entry took is the partition's
+  // own, no two alike and each batch's a run of consecutive ones in entry
+  // order, as one batch alone takes them; a reader asking for all six keys at
+  // once, in a third process, never finds two batches' tags among them; and
+  // the six end holding the one batch that committed last, at its versions. A
+  // second store races batches of fresh keys into the two writers' own
+  // adjacent partitions, where a server's gap locks would be the circle.
+  const script = path.join(path.dirname(fileURLToPath(import.meta.url)), "store-batch-race.mjs");
+  const done = path.join(data, `${RUN}-batch-race.done`);
+  const ROUNDS = 100;
+  const KEYS = ["a", "b", "c", "d", "e", "z"];
+  const startAt = Date.now() + 2_500;
+  fs.mkdirSync(data, { recursive: true });
+  const racer = (role) =>
+    new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [script, project, provider, data, RUN, role, String(startAt), done], {
+        env: process.env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let out = "";
+      let err = "";
+      child.stdout.on("data", (chunk) => (out += chunk));
+      child.stderr.on("data", (chunk) => (err += chunk));
+      child.on("error", reject);
+      child.on("close", (code) =>
+        code === 0 ? resolve(JSON.parse(out)) : reject(new Error(`the batch racer ${role} exited ${code}: ${err}`)),
+      );
+    });
+  const reader = racer("reader");
+  // A rejection nothing is listening to yet would end this process.
+  const read = reader.then(
+    (answered) => ({ answered }),
+    (error) => ({ error }),
+  );
+  try {
+    const writers = await Promise.allSettled([racer("forward"), racer("reverse")]);
+    fs.writeFileSync(done, "done");
+    const outcome = await read;
+    for (const settled of writers) if (settled.status === "rejected") throw settled.reason;
+    if (outcome.error !== undefined) throw outcome.error;
+    const [forward, reverse] = writers.map((settled) => settled.value);
+    const sides = { forward, reverse };
+
+    /** Every batch of one phase, tagged with its writer and round. */
+    const batches = (phase) =>
+      Object.entries(sides).flatMap(([role, side]) => side[phase].map((answered, round) => ({ role, round, answered })));
+    const failures = (phase) =>
+      batches(phase).filter(({ answered }) => answered.error !== undefined || answered.applied !== true);
+    /** A batch's `set` versions, in entry order. */
+    const versionsOf = (answered) => (answered.results ?? []).filter((row) => "version" in row).map((row) => row.version);
+    /** Whether a batch's versions are a run of consecutive ones, as one batch takes them. */
+    const consecutive = (versions) => versions.every((version, index) => index === 0 || version === versions[index - 1] + 1);
+    /** Every batch of the phase applied, each one's versions a consecutive run of one per `set` entry. */
+    const applied = (phase) => {
+      const all = batches(phase);
+      return (
+        all.length === 2 * ROUNDS &&
+        failures(phase).length === 0 &&
+        all.every(({ answered }) => versionsOf(answered).length === KEYS.length && consecutive(versionsOf(answered)))
+      );
+    };
+
+    const global_ = batches("global");
+    // A batch that waited on another overlaps it in time; with none
+    // overlapping, the case would have raced nothing.
+    const overlapping = forward.global.filter((mine) =>
+      reverse.global.some((theirs) => mine.started < theirs.ended && theirs.started < mine.ended),
+    ).length;
+    answer.two_processes_racing_batches_really_overlapped = overlapping > 0;
+    answer.two_processes_racing_batches_over_shared_keys_in_opposite_orders_all_apply =
+      global_.length === 2 * ROUNDS && failures("global").length === 0;
+    const versions = global_.flatMap(({ answered }) => versionsOf(answered));
+    answer.two_processes_racing_batches_never_take_one_version =
+      applied("global") && new Set(versions).size === versions.length;
+
+    // The batch that committed last is the one holding the highest versions,
+    // and the six keys hold its tag at the versions it answered.
+    const last = global_.reduce((best, entry) =>
+      Math.max(...versionsOf(entry.answered)) > Math.max(...versionsOf(best.answered)) ? entry : best,
+    );
+    const store = kv("batch_race", "global");
+    const run = ctx(execution("batch_race_read"));
+    const held = await stores.runStoreOp(store, "get_many", { keys: KEYS }, run, node());
+    const lastVersions = Object.fromEntries((last.answered.results ?? []).filter((row) => "version" in row).map((row) => [row.key, row.version]));
+    answer.every_key_two_racing_batches_wrote_holds_the_last_batchs_value =
+      held.entries.every(
+        (entry) =>
+          entry.found === true &&
+          entry.value?.by === last.role &&
+          entry.value?.n === last.round &&
+          entry.version === lastVersions[entry.key],
+      ) && (await sequenceLast(store)) === Math.max(...Object.values(lastVersions));
+
+    /** A read of the six keys that found more than one batch's tag among them, or a key missing. */
+    const torn = (answered) => {
+      if (answered.error !== undefined) return true;
+      const found = answered.entries.filter((entry) => entry.found);
+      if (found.length === 0) return false;
+      if (found.length !== KEYS.length) return true;
+      return new Set(found.map((entry) => `${entry.value?.by}/${entry.value?.n}`)).size !== 1;
+    };
+    const reads = outcome.answered.reads;
+    const tornReads = reads.filter(torn);
+    // A read between the first commit and the last is one the race could have torn.
+    const midRace = reads.filter(
+      (answered) =>
+        answered.error === undefined &&
+        answered.entries.some((entry) => entry.found) &&
+        !answered.entries.every((entry) => entry.value?.by === last.role && entry.value?.n === last.round),
+    ).length;
+    answer.a_reader_beside_two_racing_batches_never_finds_one_half_landed =
+      reads.length > 0 && tornReads.length === 0 && midRace > 0;
+
+    // Fresh keys into the two writers' own adjacent partitions: every batch
+    // applies, and each partition's versions are its own sequence's, 1
+    // upwards with none twice — the two partitions' sequences are two.
+    const partitionVersions = (role) => sides[role].session.flatMap(versionsOf);
+    answer.two_processes_racing_batches_into_adjacent_partitions_all_apply =
+      applied("session") &&
+      ["forward", "reverse"].every((role) =>
+        same(
+          [...partitionVersions(role)].sort((left, right) => left - right),
+          Array.from({ length: ROUNDS * KEYS.length }, (_, index) => index + 1),
+        ),
+      );
+    answer.batch_race_trace = {
+      partitions: Object.fromEntries(
+        ["forward", "reverse"].map((role) => {
+          const versions = [...partitionVersions(role)].sort((left, right) => left - right);
+          return [role, { count: versions.length, first: versions[0] ?? null, last: versions.at(-1) ?? null }];
+        }),
+      ),
+      overlapping,
+      failures: [...failures("global"), ...failures("session")].slice(0, 3),
+      reads: reads.length,
+      midRace,
+      torn: tornReads.slice(0, 3),
+      last: { role: last.role, round: last.round, results: last.answered.results },
+    };
+  } catch (error) {
+    answer.batch_race_error = String(error?.message ?? error);
+  } finally {
+    // A reader still reading when a writer failed stops at the marker.
+    fs.writeFileSync(done, "done");
+    await read;
   }
 }
 
