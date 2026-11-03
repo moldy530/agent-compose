@@ -254,8 +254,16 @@ async function holdTheKey(killer, store, key) {
  * rather than hiding.
  *
  * MySQL is asked by the statement text — `mysql2` interpolates parameters on the
- * client, so the blocked `INSERT` carries this run's unique store name — and
- * Postgres by state, since `pg` binds parameters on the server and its
+ * client, so the blocked statement carries this run's unique store name — of a
+ * session **waiting on a row lock** (`performance_schema.data_lock_waits`), and
+ * not by the text alone: a store's connection runs several statements naming
+ * the store before the one that blocks, as does the store-wide sweep its first
+ * op started, so a poll on the text alone can land on one of those and answer
+ * before the store has written anything — a batch's first entry included,
+ * which a probe then finds free. `information_schema.innodb_trx` would say
+ * `LOCK WAIT` too, but it is a cache refreshed only once nobody has read it for
+ * a tenth of a second, which a poll every 50 ms never allows. Postgres is asked
+ * by state, since `pg` binds parameters on the server and its
  * `pg_stat_activity.query` holds `$1` where the name would be — and by the
  * session waiting on a **lock**, among **client** backends: an autovacuum worker
  * reports `state = 'active'` with `autovacuum: VACUUM … store_entries` as its
@@ -283,8 +291,10 @@ async function waitingOn(killer, store) {
     }
     return await rows(
       killer,
-      "SELECT ID AS id FROM information_schema.processlist WHERE DB = DATABASE() " +
-        "AND ID <> CONNECTION_ID() AND INFO LIKE ?",
+      "SELECT DISTINCT t.PROCESSLIST_ID AS id FROM performance_schema.data_lock_waits w " +
+        "JOIN performance_schema.threads t ON t.THREAD_ID = w.REQUESTING_THREAD_ID " +
+        "WHERE t.PROCESSLIST_DB = DATABASE() AND t.PROCESSLIST_ID <> CONNECTION_ID() " +
+        "AND t.PROCESSLIST_INFO LIKE ?",
       [`%${store}%`],
     );
   };
