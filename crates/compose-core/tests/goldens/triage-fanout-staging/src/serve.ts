@@ -288,6 +288,11 @@ interface Execution {
   outputs?: Record<string, unknown>;
   trace?: readonly runtime.TraceEntry[];
   error?: string;
+  /**
+   * What a `finally:` node of the run raised after its own retries, where one
+   * did — beside a `status` it did not change (grammar 7.9, PRD resolved q76).
+   */
+  finallyError?: string;
   /** Resolves when the run has stopped, however it stopped. */
   settled: Promise<void>;
 }
@@ -1350,12 +1355,15 @@ function recorded(execution: Execution, answer: FlowRun | undefined, error: unkn
     execution.status = "completed";
     execution.outputs = answer.outputs;
     execution.trace = answer.trace;
+    if (answer.finallyError !== undefined) execution.finallyError = answer.finallyError;
     return;
   }
   execution.status = "failed";
   execution.error = message(error);
   const trace = (error as { trace?: readonly runtime.TraceEntry[] }).trace;
   if (trace !== undefined) execution.trace = trace;
+  const finallyError = (error as { finallyError?: string } | null | undefined)?.finallyError;
+  if (finallyError !== undefined) execution.finallyError = finallyError;
 }
 
 /**
@@ -1474,6 +1482,9 @@ function shipping(
         flow: execution.flow,
         status,
         ...(execution.error === undefined ? {} : { error: execution.error }),
+        ...(execution.finallyError === undefined
+          ? {}
+          : { finallyError: execution.finallyError }),
         entries: execution.trace ?? [],
       }),
     )
@@ -2074,6 +2085,7 @@ function report(execution: Execution): Promise<Record<string, unknown>> {
     })),
     ...(execution.outputs === undefined ? {} : { outputs: execution.outputs }),
     ...(execution.error === undefined ? {} : { error: execution.error }),
+    ...(execution.finallyError === undefined ? {} : { finallyError: execution.finallyError }),
     ...(execution.trace === undefined ? {} : { trace: execution.trace }),
   });
 }

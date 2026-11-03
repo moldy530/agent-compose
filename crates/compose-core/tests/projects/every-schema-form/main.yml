@@ -307,9 +307,18 @@ flow.condense:
         command: "true"
         output:
           latest: { type: string }
+    # The flow's `finally:` node (grammar 7.9, PRD resolved q76): a descriptor
+    # the emitted graph carries beside its compiled graph rather than in it,
+    # and the one input scope where `execution.outcome` is a root.
+    note:
+      exec:
+        command: "true"
+      input: { outcome: "execution.outcome" }
+      retry: { max: 1, backoff: 1s }
   edges:
     - { from: start, to: reduce }
     - { from: reduce, to: end }
+  finally: note
 
 # The configured built-in: a shell bounded by a workspace, a per-command
 # deadline, and the environment its children may read — the only binding whose

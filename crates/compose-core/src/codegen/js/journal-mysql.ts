@@ -99,6 +99,7 @@ const MYSQL_SCHEMA = [
   started_at      VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   ended_at        VARCHAR(32),
   error           LONGTEXT,
+  finally_error   LONGTEXT,
   PRIMARY KEY (id),
   KEY executions_by_status (status, started_at)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
@@ -172,6 +173,28 @@ const MYSQL_SCHEMA = [
   admission       LONGTEXT,
   PRIMARY KEY (execution)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
+];
+
+/**
+ * The columns grown on a table that already existed, each probed before it is
+ * added (`docs/durability.md` §11.2).
+ *
+ * `CREATE TABLE IF NOT EXISTS` above leaves a table an earlier build created
+ * exactly as it was, so a column this release added to it is a column that
+ * database does not have — and an `UPDATE` naming it would fail every settle in
+ * it. `finally_error` (PRD resolved q76) is the first: the lifecycle row's record
+ * of what a `finally:` node raised, nullable because no row written before it
+ * had one. MySQL has no `ADD COLUMN IF NOT EXISTS`, so `information_schema` is
+ * asked first, and only the one open that finds the column missing alters the
+ * table; it runs under the writer guard, so there is one such open.
+ */
+const MYSQL_MIGRATIONS: readonly { readonly probe: string; readonly add: string }[] = [
+  {
+    probe:
+      "SELECT COUNT(*) AS held FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() " +
+      "AND TABLE_NAME = 'executions' AND COLUMN_NAME = 'finally_error'",
+    add: "ALTER TABLE executions ADD COLUMN finally_error LONGTEXT NULL AFTER error",
+  },
 ];
 
 /**
@@ -528,6 +551,10 @@ async function openMysql(): Promise<JournalDriver> {
     // holding the journal.
     if (Number(rows[0]?.["taken"] ?? 0) !== 1) throw guardHeld();
     for (const statement of MYSQL_SCHEMA) await connection.query(statement);
+    for (const { probe, add } of MYSQL_MIGRATIONS) {
+      const [held] = await connection.query<RowDataPacket[]>(probe);
+      if (Number(held[0]?.["held"] ?? 0) === 0) await connection.query(add);
+    }
   } catch (error) {
     await connection.end().catch(() => undefined);
     throw error;

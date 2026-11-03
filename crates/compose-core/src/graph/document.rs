@@ -288,6 +288,13 @@ pub struct GraphNode {
     /// A satellite's place in its map: which map dispatched it, and on what.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dispatch: Option<DispatchView>,
+    /// `true` on the node the flow's `finally:` names, and absent on every
+    /// other (grammar 7.9, PRD resolved q76): the node an instance runs once
+    /// when it ends, which no edge reaches and none leaves — so it is drawn
+    /// apart and labelled rather than left to read as a node the validator
+    /// should have refused for being unreachable.
+    #[serde(rename = "finally", skip_serializing_if = "std::ops::Not::not")]
+    pub is_finally: bool,
 }
 
 vocabulary! {

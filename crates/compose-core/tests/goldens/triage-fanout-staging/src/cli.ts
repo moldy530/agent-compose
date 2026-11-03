@@ -26,16 +26,13 @@
 // # Reading and writing a store with no flow
 //
 // `store` is the operator's surface onto one `kv` store (PRD resolved q72):
-// `get`, `set`, `delete`, `list`, `count`, `export` and `import`, and `log` —
-// one key's history (PRD resolved q74) — run against this target's own
-// backend through `./stores.ts`'s operator entry points.
+// `get`, `set`, `delete`, `list`, `count`, `export` and `import`, run against
+// this target's own backend through `./stores.ts`'s operator entry points.
 // The binary carries no database driver (PRD 5.12), which is why the compiler
 // launches this rather than opening a store itself — the same split `run` is.
 // An operator's write is **not an effect**: it belongs to no execution, so it
 // carries no idempotency key and leaves no journal row, no ledger row and no
-// trace record. On a store that declares `history: true` it is recorded in one
-// place, its history row, as actor `cli`; on any other, nowhere. See
-// [`storeVerb`].
+// trace record — it is recorded nowhere. See [`storeVerb`].
 //
 // # What `run` prints
 //
@@ -204,7 +201,7 @@ import {
   runOperatorOp,
   sweepBoundStores,
 } from "./stores.ts";
-import type { HistoryEntry, OperatorTarget, StoreBinding, StoreParams } from "./stores.ts";
+import type { OperatorTarget, StoreBinding, StoreParams } from "./stores.ts";
 import { httpTriggers, manualTriggers } from "./triggers.ts";
 
 /** What a `--format` selects. */
@@ -694,7 +691,18 @@ async function executing(
         : divergence !== undefined
           ? describe(divergence)
           : describe(error);
-    const written = writeTrace(address, execution, status, trace, job.lineage, reason);
+    // What a `finally:` node raised, beside the failure it did not change: the
+    // exit code is the failure's (grammar 7.9).
+    const finallyError = finallyFailure(undefined, error);
+    const written = writeTrace(
+      address,
+      execution,
+      status,
+      trace,
+      job.lineage,
+      reason,
+      finallyError,
+    );
     if (format === "json") {
       // The same record the completed run answers with, `error` where its
       // `outputs` would be — the trace file's path included, because a run that
@@ -706,6 +714,7 @@ async function executing(
             execution_id: execution,
             status,
             error: reason,
+            ...(finallyError === undefined ? {} : { finally_error: finallyError }),
             trace_version: TRACE_VERSION,
             trace,
             ...(written === undefined ? {} : { trace_path: written }),
@@ -723,13 +732,26 @@ async function executing(
           cause = (cause as { cause?: unknown }).cause;
         }
       }
+      sayFinallyFailure(finallyError);
       if (written !== undefined) process.stderr.write(`\ntrace: ${written}\n`);
     }
     return interrupt === undefined ? 1 : 3;
   }
 
   await prompting;
-  const written = writeTrace(address, execution, "completed", produced.trace, job.lineage);
+  // A completed run whose `finally:` node failed is still a completed run: its
+  // outputs are its body's, its exit code `0`, and the failure is one line on
+  // stderr and `finally_error` on the record (grammar 7.9, PRD resolved q76).
+  const finallyError = produced.finallyError;
+  const written = writeTrace(
+    address,
+    execution,
+    "completed",
+    produced.trace,
+    job.lineage,
+    undefined,
+    finallyError,
+  );
   if (format === "json") {
     process.stdout.write(
       `${JSON.stringify(
@@ -738,6 +760,7 @@ async function executing(
           execution_id: execution,
           status: "completed",
           outputs: produced.outputs,
+          ...(finallyError === undefined ? {} : { finally_error: finallyError }),
           trace_version: TRACE_VERSION,
           trace: produced.trace,
           ...(written === undefined ? {} : { trace_path: written }),
@@ -750,6 +773,7 @@ async function executing(
   }
   process.stdout.write(`${JSON.stringify(produced.outputs, null, 2)}\n`);
   process.stderr.write(render(produced.trace));
+  sayFinallyFailure(finallyError);
   if (written !== undefined) process.stderr.write(`\ntrace: ${written}\n`);
   return 0;
 }
@@ -813,6 +837,7 @@ async function journalExport(
   // there to pick up. Bounded like every other ladder on this ledger
   // (`docs/durability.md` §3.7): its end is a sentence on stderr and a trace file
   // that still holds the run.
+  const finallyError = finallyFailure(produced, error);
   await insisting(async () => {
     try {
       record = await shipTrace({
@@ -822,6 +847,7 @@ async function journalExport(
         // lifecycle row closes, and a run holding a pause leaves it open.
         status: produced === undefined ? "failed" : "completed",
         ...(produced === undefined ? { error: describe(error) } : {}),
+        ...(finallyError === undefined ? {} : { finallyError }),
         entries: trace ?? [],
       });
       return true;
@@ -879,6 +905,7 @@ async function owed(job: Job, produced: FlowRun | undefined, error: unknown): Pr
       produced === undefined
         ? (error as { trace?: readonly runtime.TraceEntry[] } | null)?.trace
         : produced.trace;
+    const finallyError = finallyFailure(produced, error);
     await intendDelivery({
       execution: job.execution,
       kind: "callback",
@@ -900,6 +927,7 @@ async function owed(job: Job, produced: FlowRun | undefined, error: unknown): Pr
           trigger: job.trigger ?? "manual",
           status: produced === undefined ? "failed" : "completed",
           ...(produced === undefined ? { error: describe(error) } : { outputs: produced.outputs }),
+          ...(finallyError === undefined ? {} : { finallyError }),
           ...(trace === undefined ? {} : { trace }),
         }),
       ),
@@ -1469,8 +1497,7 @@ interface StoreSubverb {
  * does ([`STORE_PARTITION_OPTIONS`]). The options mirror the op parameters of
  * grammar 11.4 they set: `--if` and `--if-version` are `if:` and
  * `if_version:`, `--ttl` is `ttl:`, and `--after` and `--values` are a `list`'s
- * `after:` and `include_values:` — and `log`'s `--limit` and `--after` are the
- * `history` op's `limit:` and `after:` (PRD resolved q74).
+ * `after:` and `include_values:`.
  */
 const STORE_SUBVERBS: Readonly<Record<string, StoreSubverb>> = {
   get: { operands: ["key"], options: {} },
@@ -1483,7 +1510,6 @@ const STORE_SUBVERBS: Readonly<Record<string, StoreSubverb>> = {
   count: { operands: [], options: { prefix: "single" } },
   export: { operands: [], options: { prefix: "single" } },
   import: { operands: [], options: { "if-absent": "flag", file: "single" } },
-  log: { operands: ["key"], options: { limit: "single", after: "single" } },
 };
 
 /** What every `store` sub-verb takes: the partition, and the format. */
@@ -1523,8 +1549,7 @@ const LAST_INSTANT = 8.64e15;
  * operator entry points, which run the same ops a store-op node runs and
  * bypass exactly the effect machinery: **an operator's write is not an
  * effect** — it belongs to no execution, carries no idempotency key, writes no
- * journal row and no ledger row, and is recorded only in the history of a
- * store that declares `history: true`, as actor `cli` (PRD resolved q74).
+ * journal row and no ledger row, and is recorded nowhere.
  *
  * The exit codes are the project's, read for a store: `0` found or applied;
  * `1` the answer is no — a `get` that found nothing, a condition that did not
@@ -1643,8 +1668,6 @@ async function storeSubverb(
       return await storeExport(target, prefix, format);
     case "import":
       return await storeImport(target, options.single["file"], options.flags.has("if-absent"), format);
-    case "log":
-      return await storeLog(target, operands[0]!, options.single, format);
     default:
       throw new UsageError(
         `\`store ${name}\` is not a sub-verb of \`store\`: it takes ${Object.keys(STORE_SUBVERBS).map((held) => `\`${held}\``).join(", ")}`,
@@ -1792,83 +1815,6 @@ async function storeDelete(
     ...conditionOf(undefined, ifVersion),
   });
   return wrote(target, key, row, format, ["key", "deleted", "applied", "version"]);
-}
-
-/**
- * `store log <store> <key> [--limit <n>] [--after <seq>]` — one page of the
- * key's history, oldest first, on a store whose definition declares
- * `history: true` (PRD resolved q74): the `history` op, read through the same
- * statement a store-op node's runs.
- *
- * A read, so it answers `0` whether the key has a history or none — an empty
- * page is said on stderr, as a `list` of no keys is — and `1` only where the
- * backend failed. A store that keeps no history is a usage error, `2`: nothing
- * it could read is there, and what is to fix is which store the command names.
- * The table shows each row's `seq`, the instant it was written (UTC, by the
- * store's clock), the op, the version the write left, who wrote it — `node` or
- * `tool` with the execution id and instance path, or `cli` — and the value
- * before and after, `—` where the key held nothing on that side; `--format
- * json` answers the page as the op does, `{ entries, next }`. Where more rows
- * remain the `next` cursor is printed, which `--after` takes.
- */
-async function storeLog(
-  target: OperatorTarget,
-  key: string,
-  single: Readonly<Record<string, string>>,
-  format: Format,
-): Promise<number> {
-  if (target.store.history !== true) {
-    throw new UsageError(
-      `\`${target.store.address}\` keeps no history: its definition does not declare \`history: true\`, so no write to it records a row for \`store log\` to read (grammar 11.1, PRD resolved q74)`,
-    );
-  }
-  // The op's own cursor rule (`historyCursor`), held here so a cursor it would
-  // refuse — digits past the largest safe integer among them — is a usage
-  // error, `2`, rather than the op failing as a backend would, `1`.
-  const after = single["after"];
-  if (
-    after !== undefined &&
-    (!/^[0-9]*$/.test(after) || !Number.isSafeInteger(Number(after)))
-  ) {
-    throw new UsageError(
-      `\`--after ${after}\` is not a history cursor: it takes the \`next\` a page of \`store log\` printed — the last \`seq\` of that page, a whole number no larger than ${Number.MAX_SAFE_INTEGER}`,
-    );
-  }
-  const row = await runOperatorOp(target, "history", {
-    key,
-    limit: limitOf(single["limit"], "`log` reads 1 to 1000 history rows at a time"),
-    ...(after === undefined ? {} : { after }),
-  });
-  if (format === "json") return answered(row, 0);
-  const entries = row["entries"] as readonly HistoryEntry[];
-  if (entries.length === 0) {
-    process.stderr.write(
-      `${JSON.stringify(key)} has no history in ${where(target)}${after === undefined ? "" : ` after ${after}`}\n`,
-    );
-    return 0;
-  }
-  const absent = "—";
-  out(
-    table(
-      ["seq", "at", "op", "version", "actor", "old_value", "new_value"],
-      entries.map((entry) => [
-        String(entry.seq),
-        new Date(Math.min(entry.at, LAST_INSTANT)).toISOString(),
-        entry.op,
-        entry.version === undefined ? absent : String(entry.version),
-        [entry.actor.kind, entry.actor.execution, entry.actor.path]
-          .filter((part): part is string => part !== undefined)
-          .join(" "),
-        "old_value" in entry ? compact(entry.old_value) : absent,
-        "new_value" in entry ? compact(entry.new_value) : absent,
-      ]),
-    ),
-  );
-  const next = row["next"];
-  if (typeof next === "string") {
-    out(`next: ${next}  (\`--after ${next}\` reads the page after this one)\n`);
-  }
-  return 0;
 }
 
 /**
@@ -2198,18 +2144,12 @@ function ttlOf(written: string | undefined): Pick<StoreParams, "ttl"> {
   return { ttl: amount * unit };
 }
 
-/**
- * `--limit <n>`, held to a page's 1..1000 (grammar 11.4) — a `list`'s page of
- * keys, or, with `rule` saying so, a `log`'s page of history rows.
- */
-function limitOf(
-  written: string | undefined,
-  rule = `a \`list\` reads 1 to ${STORE_LIST_MAX} keys at a time`,
-): number {
+/** `--limit <n>`, held to a page's 1..1000 (grammar 11.4). */
+function limitOf(written: string | undefined): number {
   if (written === undefined) return STORE_LIST_DEFAULT;
   const limit = /^[0-9]+$/.test(written) ? Number(written) : Number.NaN;
   if (!Number.isInteger(limit) || limit < 1 || limit > STORE_LIST_MAX) {
-    throw new UsageError(`\`--limit ${written}\` is not a page size: ${rule}`);
+    throw new UsageError(`\`--limit ${written}\` is not a page size: a \`list\` reads 1 to ${STORE_LIST_MAX} keys at a time`);
   }
   return limit;
 }
@@ -2663,6 +2603,7 @@ function writeTrace(
   trace: readonly runtime.TraceEntry[],
   lineage: runtime.Lineage | undefined,
   error?: string,
+  finallyError?: string,
 ): string | undefined {
   // A run that failed before it started made no routing decisions, and an empty
   // file named as a trace would be a file a reader opens for nothing.
@@ -2679,6 +2620,7 @@ function writeTrace(
       flow: address,
       status,
       ...(error === undefined ? {} : { error }),
+      ...(finallyError === undefined ? {} : { finallyError }),
       entries: trace,
       ...(lineage === undefined ? {} : { lineage }),
     });
@@ -2689,6 +2631,26 @@ function writeTrace(
     // otherwise succeeded; stdout still carries the answer.
     return undefined;
   }
+}
+
+/**
+ * What a `finally:` node of this run raised after its own retries, where one
+ * did (grammar 7.9, PRD resolved q76) — off the answer for a run that produced
+ * one, and off the failure for a run that did not: `finally_error`, beside an
+ * outcome it did not change.
+ */
+function finallyFailure(produced: FlowRun | undefined, error: unknown): string | undefined {
+  if (produced !== undefined) return produced.finallyError;
+  return (error as { finallyError?: string } | null | undefined)?.finallyError;
+}
+
+/**
+ * The one line a run's report gives a failed `finally:` node, on stderr: the
+ * node and what it raised. Its exit code is the outcome's, which the finally
+ * node does not change (grammar 7.9).
+ */
+function sayFinallyFailure(finallyError: string | undefined): void {
+  if (finallyError !== undefined) process.stderr.write(`finally_error: ${finallyError}\n`);
 }
 
 /** The human report: one line per node, plus what its model and stores did. */

@@ -20,13 +20,19 @@ import { Client } from "pg";
  * `IF NOT EXISTS` throughout, so a second open of a journal this build already
  * created does nothing — which is the whole of what `docs/durability.md` §11.2
  * asks of a physical schema, and all it can ask of this one: a remote journal is
- * created by this release or a later one, so there is no older file whose
- * columns have to be probed for. (The SQLite arm's `PRAGMA table_info` walks
- * exist because there *are* older files.) A column added here in a later release
- * is the case to read §11.2 twice for, exactly as it is there. A **table** added
- * in one is not: `lineage` (PRD resolved q65) arrived after this schema first
- * shipped, and `IF NOT EXISTS` is the whole of its migration into a database an
- * earlier build created.
+ * created by this release or a later one, so there is no file older than this
+ * arm whose columns have to be probed for. (The SQLite arm's `PRAGMA table_info`
+ * walks exist because there *are* older files.) A **table** added since is no
+ * work: `lineage` (PRD resolved q65) arrived after this schema first shipped,
+ * and `IF NOT EXISTS` is the whole of its migration into a database an earlier
+ * build created. A **column** added since is the case §11.2 is read twice for,
+ * and `finally_error` (PRD resolved q76) is the first: a database an earlier
+ * build created holds `executions` without it, and `CREATE TABLE IF NOT EXISTS`
+ * leaves that table as it is. So the `DO` block below probes `pg_attribute` and
+ * adds the column only where it is missing — the probe because `ALTER TABLE …
+ * ADD COLUMN IF NOT EXISTS` takes `ACCESS EXCLUSIVE` before it looks, so as a
+ * bare statement every open would queue behind every reader of the table. This
+ * runs under the writer guard, so one opener does it.
  *
  * **`COLLATE "C"` on every column a statement compares or orders by**, and that
  * is a correctness choice rather than a preference. A journal key is
@@ -53,8 +59,19 @@ CREATE TABLE IF NOT EXISTS executions (
   journal_version INTEGER NOT NULL,
   started_at      TEXT COLLATE "C" NOT NULL,
   ended_at        TEXT,
-  error           TEXT
+  error           TEXT,
+  finally_error   TEXT
 );
+DO $migrate$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_attribute
+    WHERE attrelid = 'executions'::regclass AND attname = 'finally_error' AND NOT attisdropped
+  ) THEN
+    ALTER TABLE executions ADD COLUMN IF NOT EXISTS finally_error TEXT;
+  END IF;
+END
+$migrate$;
 CREATE TABLE IF NOT EXISTS effects (
   execution   TEXT COLLATE "C" NOT NULL,
   "key"       TEXT COLLATE "C" NOT NULL,
