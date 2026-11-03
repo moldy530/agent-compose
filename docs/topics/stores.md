@@ -547,8 +547,10 @@ no version: a key set again after expiring takes its partition's next one, so an
 
 **What the code does about storage, exactly.** An expired key is invisible the
 instant it expires, and leaves storage at whichever comes first: the next write
-to its partition, which deletes **at most 100** of that partition's expired keys
-before it reads its own key; or the next process start, which starts deleting
+to its partition that is not a deduped retry, which deletes **at most 100** of
+that partition's expired keys before it reads its own key (a retry the
+idempotency ledger answers returns that answer before it touches the partition,
+so it deletes nothing); or the next process start, which starts deleting
 **every** key of the store, all partitions, that had expired by then. A process
 start is every `run`, `resume` and `serve`: each starts that sweep on every `kv`
 store the composition binds — whether or not anything it does will reach the
@@ -571,8 +573,10 @@ expiry by, in whole milliseconds, which is how a test moves time past an expiry
 without waiting for it.
 
 **The lease, as above.** `claim` takes the key only if nobody holds it, for a
-minute; `keep` holds it ten more minutes only if it is still the version this
-run took (`state.lease`), and records the version it took in turn; `release`
+minute; `keep` holds it for ten minutes from the moment it writes — its own
+`ttl: 10m`, which replaces what was left of the claim's minute rather than
+adding to it — only if it is still the version this run took (`state.lease`),
+and records the version it took in turn; `release`
 deletes it only if it still holds that version — so a run that lost its lease to
 expiry never deletes the next holder's. The release is an ordinary last node, so
 a run that fails before it leaves the lease to expire on its own; PRD resolved q76's

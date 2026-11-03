@@ -2911,7 +2911,9 @@ class RemoteKv {
    * Per connection rather than per process because a connection is what a
    * dialled store's "open" is: a process starting is its first connection, and
    * a connection redialled after a loss sweeps again, which costs a statement
-   * that finds nothing.
+   * that finds nothing. Each is held in [`SWEEPING`] too, which is what
+   * [`drainStores`] waits on before [`releaseStores`] closes the connection,
+   * so the connection keeps no wait of its own.
    */
   readonly #sweeps = new Map<string, Promise<void>>();
 
@@ -2996,19 +2998,6 @@ class RemoteKv {
         [store, prefix, prefixEnd(prefix)],
       );
     });
-  }
-
-  /**
-   * Wait for every store-wide sweep this connection started to finish —
-   * [`releaseStores`]'s step before [`close`], so a command that reached a
-   * store has removed what had expired there by the time it exits.
-   */
-  async drain(): Promise<void> {
-    for (;;) {
-      const held = [...this.#sweeps.values()];
-      await Promise.all(held);
-      if (held.length === this.#sweeps.size) return;
-    }
   }
 
   /** Give the connection back. */
