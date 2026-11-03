@@ -162,7 +162,15 @@ const list = (store, run, prefix = undefined, limit = 50) =>
  * a connection deliberately being killed.
  */
 async function openKiller() {
-  const address = process.env[KILLED_URL_ENV];
+  return await openServer(process.env[KILLED_URL_ENV]);
+}
+
+/**
+ * A connection of this file's own to `address`, with the pinned driver — the
+ * killer's, and the one the reader and the earlier release's schema below are
+ * spoken over. See [`openKiller`].
+ */
+async function openServer(address) {
   if (provider === "postgres") {
     const pg = await import("pg");
     const Client = pg.Client ?? pg.default.Client;
@@ -315,6 +323,115 @@ const answer = {};
   answer.every_opener_wrote_through_its_own_connection = held.every(
     (row, index) => row.found === true && row.value?.opener === index,
   );
+}
+
+// --- An open beside a reader -------------------------------------------------
+
+if (provider !== "sqlite") {
+  // A dialled store runs its schema on **every** open — every process start,
+  // and every redial after a lost connection — so a statement in it that waits
+  // on a reader is a `serve` that cannot open for as long as a `pg_dump` or an
+  // operator's open transaction lasts, and every other process's store ops
+  // queue behind the open's own lock request meanwhile. Postgres takes
+  // `ACCESS EXCLUSIVE` for an `ALTER TABLE … ADD COLUMN IF NOT EXISTS` before it
+  // looks for the column, which is why the arm probes for the one migration it
+  // has rather than attempting it (`stores-postgres.ts`).
+  //
+  // The reader is the lock a `get` takes, held open: a transaction that has
+  // read every table the schema names. A fresh variable is a fresh connection,
+  // so the `get` beside it is an open and runs the whole schema.
+  const READER_URL_ENV = "AGENT_COMPOSE_STORE_URL_READER";
+  process.env[READER_URL_ENV] = process.env[URL_ENV];
+  const store = kv("beside_a_reader", "global", READER_URL_ENV);
+  const run = ctx(execution("beside_a_reader"));
+  const reader = await openServer(process.env[URL_ENV]);
+  let opening;
+  try {
+    await begin(reader);
+    for (const table of ["store_entries", "store_applied", "store_sequences"]) {
+      await rows(reader, `SELECT COUNT(*) AS held FROM ${table}`);
+    }
+    // Settled into a string the moment the promise exists: a rejection nothing
+    // is listening to yet would end this process.
+    opening = get(store, "anything", run).then(
+      () => "answered",
+      (error) => `refused: ${String(error?.message ?? error)}`,
+    );
+    const waited = await Promise.race([
+      opening,
+      new Promise((resolve) => setTimeout(() => resolve("still waiting after 3 s"), 3_000)),
+    ]);
+    answer.an_open_does_not_wait_on_a_reader = waited === "answered";
+    answer.open_beside_a_reader = waited;
+  } catch (error) {
+    answer.open_beside_a_reader = String(error?.message ?? error);
+  } finally {
+    // Released before the open is awaited, so an open that *is* waiting on the
+    // reader finishes and this runner fails the case rather than hanging.
+    await rollback(reader).catch(() => undefined);
+    if (opening !== undefined) await opening;
+    await reader.end().catch(() => undefined);
+  }
+}
+
+// --- First writes into distinct partitions, at once --------------------------
+
+{
+  // The other half of what a write's isolation level decides, and the half a
+  // case about one key cannot see. A `kv` write locks the key it reads, and
+  // every **first** write of a key — every `if: absent` claim, every append
+  // that starts a list — reads a key that is not there yet. Under InnoDB's
+  // default `REPEATABLE READ` that read takes a gap lock spanning the index
+  // between two existing rows, so two writers in two different partitions
+  // whose keys fall in one gap each hold one and then wait on the other's to
+  // insert: a deadlock the server breaks by failing one of them, between
+  // writes that share nothing. The MySQL arm asserts `READ COMMITTED` on its
+  // session and refuses a session that will not hold it
+  // (`MYSQL_STORE_ISOLATION`), which is what this case is the test of; the
+  // single-partition race above passes under either level.
+  //
+  // Eight connections to one server, each making the first two writes of a
+  // fresh `session` partition per round — a claim and an append — at once
+  // with the seven others. On the local backend the eight are one handle and
+  // the case says what it says about distinct partitions.
+  const PARTITION_URL_ENVS = Array.from({ length: 8 }, (_, index) => `AGENT_COMPOSE_STORE_URL_PART_${index}`);
+  if (provider !== "sqlite") {
+    for (const variable of PARTITION_URL_ENVS) process.env[variable] = process.env[URL_ENV];
+  }
+  const schema = z.object({ owner: z.string().optional(), items: z.array(z.string()).optional() }).strict();
+  const writers = PARTITION_URL_ENVS.map((variable) => kv("partitions", "session", variable, schema));
+  const ROUNDS = 40;
+  const failures = [];
+  let landed = 0;
+  for (let round = 0; round < ROUNDS; round += 1) {
+    const settled = await Promise.allSettled(
+      writers.map(async (store, index) => {
+        const run = ctx(execution(`partition_${round}_${index}`), `partition-${round}-${index}`);
+        const claimed = await stores.runStoreOp(
+          store,
+          "set",
+          { key: "claim", value: { owner: `writer-${index}` }, condition: "absent" },
+          run,
+          node(`pt/${round}/${index}/claim`),
+        );
+        const appended = await stores.runStoreOp(
+          store,
+          "append",
+          { key: "list", field: "items", value: `round-${round}` },
+          run,
+          node(`pt/${round}/${index}/append`),
+        );
+        return claimed.applied === true && appended.applied === true;
+      }),
+    );
+    for (const outcome of settled) {
+      if (outcome.status === "rejected") failures.push(String(outcome.reason?.message ?? outcome.reason));
+      else if (outcome.value) landed += 1;
+    }
+  }
+  answer.concurrent_first_writes_into_distinct_partitions_all_land =
+    failures.length === 0 && landed === ROUNDS * writers.length;
+  answer.partition_failures = { count: failures.length, first: failures.slice(0, 3) };
 }
 
 // --- Round trip: unicode, size, and the types `value_schema` admits ----------
@@ -1229,6 +1346,211 @@ const refusal = async (promise) => {
   answer.a_replayed_write_is_not_applied_again =
     (await get(store, "k", live)).value?.generation === "moved";
   await journal.releaseJournal();
+}
+
+// --- A store an earlier release created --------------------------------------
+
+/**
+ * The schema the release before PRD resolved q68 created, on each backend —
+ * `entries`/`store_entries` with no `version` column and no sequence table —
+ * copied from that release's `src/stores.ts`, `stores-postgres.ts` and
+ * `stores-mysql.ts` rather than derived from this one's, because what is under
+ * test is that this release opens *that* one.
+ */
+const EARLIER_SCHEMA = {
+  sqlite: [
+    `CREATE TABLE entries (
+  scope_key TEXT NOT NULL,
+  key       TEXT NOT NULL,
+  value     TEXT NOT NULL,
+  metadata  TEXT,
+  embedding TEXT,
+  PRIMARY KEY (scope_key, key)
+)`,
+    `CREATE TABLE applied (
+  idempotency_key TEXT PRIMARY KEY,
+  op              TEXT NOT NULL,
+  result          TEXT NOT NULL
+)`,
+  ],
+  postgres: [
+    `CREATE TABLE store_entries (
+  store     TEXT COLLATE "C" NOT NULL,
+  scope_key TEXT COLLATE "C" NOT NULL,
+  "key"     TEXT COLLATE "C" NOT NULL,
+  value     TEXT NOT NULL,
+  PRIMARY KEY (store, scope_key, "key")
+)`,
+    `CREATE TABLE store_applied (
+  store           TEXT COLLATE "C" NOT NULL,
+  scope_key       TEXT COLLATE "C" NOT NULL,
+  idempotency_key TEXT COLLATE "C" NOT NULL,
+  op              TEXT NOT NULL,
+  result          TEXT NOT NULL,
+  PRIMARY KEY (store, idempotency_key)
+)`,
+    "CREATE INDEX store_applied_partition ON store_applied (store, scope_key)",
+  ],
+  mysql: [
+    `CREATE TABLE store_entries (
+  store      VARCHAR(128)  CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  scope_key  VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  \`key\`      VARCHAR(2048) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL,
+  value      LONGTEXT NOT NULL,
+  scope_hash BINARY(32) AS (UNHEX(SHA2(scope_key, 256))) STORED NOT NULL,
+  key_hash   BINARY(32) AS (UNHEX(SHA2(\`key\`, 256))) STORED NOT NULL,
+  PRIMARY KEY (store, scope_hash, key_hash),
+  KEY store_entries_partition (store, scope_key(255), \`key\`(191))
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE store_applied (
+  store           VARCHAR(128)  CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  scope_key       VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  idempotency_key VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  op              VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  result          LONGTEXT NOT NULL,
+  PRIMARY KEY (store, idempotency_key),
+  KEY store_applied_partition (store, scope_key(255))
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
+  ],
+};
+
+{
+  // **A deployment upgrading in place.** PRD resolved q68 gave every `kv` key a
+  // `version`, so a store file or a database the release before it created
+  // has an entries table without the column — and every op of this release
+  // reads it. Each arm brings that table forward at its open (SQLite's
+  // `migrateStoreFile`, the Postgres arm's probed `ALTER`, the MySQL arm's
+  // `MYSQL_STORE_VERSION_COLUMN` with its duplicate-column race), and its rows
+  // take version `0`, which no write of this release hands out. Left
+  // unchecked, a migration that did nothing would pass every case above —
+  // they all run against a schema this release created — and fail every op of
+  // every deployment that upgraded, with `no such column: version`.
+  //
+  // So the earlier schema is laid down by hand, holding one row and the ledger
+  // row its write left — on SQLite the store's own file, on a server a
+  // database of this run's own, since the tables every case above wrote to are
+  // this release's already — and this release then opens it from four
+  // connections at once, which on MySQL is four openers racing the probe and
+  // the `ALTER`.
+  const LEGACY_URL_ENVS = [
+    "AGENT_COMPOSE_STORE_URL_LEGACY",
+    "AGENT_COMPOSE_STORE_URL_LEGACY_B",
+    "AGENT_COMPOSE_STORE_URL_LEGACY_C",
+    "AGENT_COMPOSE_STORE_URL_LEGACY_D",
+  ];
+  const openers = LEGACY_URL_ENVS.map((variable) => kv("legacy", "global", variable));
+  const name = openers[0].name;
+  const LEDGER_KEY = `${execution("legacy")}/write/0`;
+  const row = JSON.stringify({ text: "old" });
+  // What the earlier release's ledger held for a `set`: its whole answer then,
+  // which carried neither `applied` nor `version`.
+  const recorded = JSON.stringify({ key: "old" });
+  const database = `${RUN}_legacy`;
+  let created = false;
+  try {
+    if (provider === "sqlite") {
+      const module = await import("node-sqlite3-wasm");
+      const { Database } = module.default ?? module;
+      const directory = path.join(data, "stores");
+      fs.mkdirSync(directory, { recursive: true });
+      const file = new Database(path.join(directory, `${stores.encodeKey(name)}.sqlite`));
+      try {
+        for (const statement of EARLIER_SCHEMA.sqlite) file.exec(statement);
+        file.run("INSERT INTO entries (scope_key, key, value) VALUES (?, ?, ?)", ["global", "old", row]);
+        file.run("INSERT INTO applied (idempotency_key, op, result) VALUES (?, ?, ?)", [
+          LEDGER_KEY,
+          "set",
+          recorded,
+        ]);
+      } finally {
+        file.close();
+      }
+    } else {
+      const admin = await openServer(process.env[URL_ENV]);
+      try {
+        await rows(admin, `CREATE DATABASE ${database}`);
+        created = true;
+      } finally {
+        await admin.end().catch(() => undefined);
+      }
+      const address = new URL(process.env[URL_ENV]);
+      address.pathname = `/${database}`;
+      for (const variable of LEGACY_URL_ENVS) process.env[variable] = address.href;
+      const seeder = await openServer(address.href);
+      try {
+        for (const statement of EARLIER_SCHEMA[provider]) await rows(seeder, statement);
+        const [entry, ledger] =
+          provider === "postgres"
+            ? [
+                'INSERT INTO store_entries (store, scope_key, "key", value) VALUES ($1, $2, $3, $4)',
+                "INSERT INTO store_applied (store, scope_key, idempotency_key, op, result) VALUES ($1, $2, $3, $4, $5)",
+              ]
+            : [
+                "INSERT INTO store_entries (store, scope_key, `key`, value) VALUES (?, ?, ?, ?)",
+                "INSERT INTO store_applied (store, scope_key, idempotency_key, op, result) VALUES (?, ?, ?, ?, ?)",
+              ];
+        await rows(seeder, entry, [name, "global", "old", row]);
+        await rows(seeder, ledger, [name, "global", LEDGER_KEY, "set", recorded]);
+      } finally {
+        await seeder.end().catch(() => undefined);
+      }
+    }
+
+    const run = ctx(execution("legacy"));
+    const opened = await Promise.allSettled(openers.map((store) => get(store, "old", run)));
+    answer.an_earlier_releases_store_takes_every_opener_at_once = opened.every(
+      (outcome) => outcome.status === "fulfilled",
+    );
+    answer.legacy_opening_errors = opened
+      .filter((outcome) => outcome.status === "rejected")
+      .map((outcome) => String(outcome.reason?.message ?? outcome.reason));
+    const [store, other] = openers;
+    const held = await get(store, "old", run);
+    answer.a_key_an_earlier_release_wrote_answers_version_zero =
+      held.found === true && same(held.value, { text: "old" }) && held.version === 0;
+    // The earlier release's ledger row still answers its write's redelivery,
+    // as a write that applied — every write that release made was
+    // unconditional and landed — and the stored value does not move.
+    const redelivered = await set(store, "old", { text: "REWRITTEN" }, run, LEDGER_KEY);
+    answer.a_write_an_earlier_release_recorded_still_dedupes =
+      redelivered.applied === true &&
+      redelivered.deduped === true &&
+      (await get(other, "old", run)).value?.text === "old";
+    // `if_version: 0` names exactly a key nothing has written since the
+    // upgrade, and the partition's sequence starts past what it holds.
+    const compared = await write(store, "set", { key: "old", value: { text: "new" }, ifVersion: 0 }, run, "lg/1");
+    const next = await set(store, "fresh", { text: "fresh" }, run, "lg/2");
+    answer.if_version_zero_names_a_key_an_earlier_release_wrote =
+      compared.applied === true && compared.version === 1;
+    answer.an_upgraded_partitions_sequence_starts_past_what_it_holds =
+      next.applied === true &&
+      next.version === 2 &&
+      (await get(other, "old", run)).version === 1 &&
+      (await get(other, "fresh", run)).version === 2;
+    answer.legacy_trace = {
+      held: held.version ?? null,
+      compared: compared.version ?? null,
+      next: next.version ?? null,
+    };
+  } catch (error) {
+    answer.legacy_error = String(error?.message ?? error);
+  } finally {
+    // Every connection this run holds is closed before the database goes —
+    // which the case above already does mid-run, so the cases below redial —
+    // and a dialled run's database is its own, so it is dropped rather than
+    // left on a server a developer keeps.
+    await stores.releaseStores();
+    if (created) {
+      const admin = await openServer(process.env[URL_ENV]);
+      await rows(
+        admin,
+        provider === "postgres"
+          ? `DROP DATABASE IF EXISTS ${database} WITH (FORCE)`
+          : `DROP DATABASE IF EXISTS ${database}`,
+      ).catch(() => undefined);
+      await admin.end().catch(() => undefined);
+    }
+  }
 }
 
 // --- A connection the server took away, and the redial that follows ----------

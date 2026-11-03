@@ -30,6 +30,12 @@
 //!    idempotent *concurrently*, which is the case a store has and the journal
 //!    does not: grammar 14.1 rule 5 admits a dialled store from a placement, so
 //!    several first opens against one fresh database is the ordinary start-up;
+//!  * a schema an **earlier release** created, which every op of this one has
+//!    to find brought forward at its open (PRD resolved q68's `version`
+//!    column) — and a DDL that brings it forward by locking out every reader
+//!    of the table on every open, which a server answers and a file does not;
+//!  * a write's isolation level, which decides whether first writes into two
+//!    **distinct** partitions can deadlock on each other's gap locks;
 //!  * a unique index and a conflict-ignore that really make a double-delivered
 //!    write land **once** (grammar 9.4, PRD 5.8) — which is the clause resolved
 //!    q63 moved from the caller's promise to the backend's;
@@ -65,10 +71,12 @@
 //!
 //! The two suites share those servers and never share a row: the journal's
 //! tables are `executions`, `effects`, `deliveries` and `dispatches`, and a
-//! store's are `store_entries` and `store_applied`. Inside those, every case
-//! here keys on a store name minted per run by the runner, so two runs against
-//! one server — CI's and a developer's second `cargo test` — never read each
-//! other's rows either.
+//! store's are `store_entries`, `store_applied` and `store_sequences`. Inside
+//! those, every case here keys on a store name minted per run by the runner, so
+//! two runs against one server — CI's and a developer's second `cargo test` —
+//! never read each other's rows either. The one case that needs tables of its
+//! own — an earlier release's schema, laid down by hand — creates a database
+//! named for the run and drops it when it is done.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -388,16 +396,18 @@ fn every_store_backend_answers_the_same_contract() {
         }
 
         // …and the cases only a backend with a socket has. A local store has no
-        // connection to lose, so these are the dialled arms' own half of the
-        // contract rather than a row of grammar 11.4's catalogue.
+        // connection to lose and no open to redial, so these are the dialled
+        // arms' own half of the contract rather than a row of grammar 11.4's
+        // catalogue.
         if backend.variable.is_some() {
             for case in TRUE_WHEN_DIALLED {
                 assert_eq!(
                     answered.get(*case).and_then(Value::as_bool),
                     Some(true),
                     "the `{provider}` store fails `{case}`, which is what a dialled backend \
-                     promises an operator about a connection its server takes away (PRD \
-                     resolved q63, `storeConnectionLost` in `src/stores.ts`): {answered:#?}"
+                     promises an operator about the connections it opens and the ones its \
+                     server takes away (PRD resolved q63, `storeConnectionLost` in \
+                     `src/stores.ts`): {answered:#?}"
                 );
             }
         }
@@ -562,6 +572,21 @@ const TRUE_EVERYWHERE: &[&str] = &[
     // writes queue behind each other rather than failing (PRD resolved q63,
     // q68).
     "writes_serialize_whatever_isolation_the_server_defaults_to",
+    // …and the half of that level a single key cannot see: first writes into
+    // eight distinct partitions at once, which under InnoDB's default
+    // `REPEATABLE READ` take gap locks across partitions and deadlock writes
+    // that share nothing. The MySQL arm's asserted `READ COMMITTED` is what
+    // this pins.
+    "concurrent_first_writes_into_distinct_partitions_all_land",
+    // A store the release before PRD resolved q68 created — no `version`
+    // column, no sequence table — is brought forward at its open, from four
+    // openers at once: its rows answer version `0`, its ledger still dedupes,
+    // `if_version: 0` names such a key, and the sequence starts past it.
+    "an_earlier_releases_store_takes_every_opener_at_once",
+    "a_key_an_earlier_release_wrote_answers_version_zero",
+    "a_write_an_earlier_release_recorded_still_dedupes",
+    "if_version_zero_names_a_key_an_earlier_release_wrote",
+    "an_upgraded_partitions_sequence_starts_past_what_it_holds",
     // The trace: a write record carries `applied` and `version`, and a tool's
     // carries neither an idempotency key nor `deduped`.
     "a_node_write_record_carries_applied_version_and_its_key",
@@ -597,7 +622,17 @@ const TRUE_EVERYWHERE: &[&str] = &[
 /// so an arm that listened only to the event would leave a dead connection in
 /// the dialled cache and refuse every later op with a raw
 /// `Can't add new command when connection is in closed state`.
+///
+/// The redial is also why the first case here is in this list: a dialled arm
+/// runs its schema at **every** open, so an open that waits on a reader is a
+/// `serve` that cannot come back for as long as a `pg_dump` or an operator's
+/// open transaction lasts — and a local file has neither a server-side lock
+/// queue nor a redial.
 const TRUE_WHEN_DIALLED: &[&str] = &[
+    // The schema an open runs takes no lock a reader holds against it — so no
+    // bare `ALTER TABLE` on every open, which Postgres runs under
+    // `ACCESS EXCLUSIVE` whether or not there is anything to add.
+    "an_open_does_not_wait_on_a_reader",
     // The premise of the two below: the kill really landed on a statement the
     // server could see waiting, rather than on an idle socket.
     "the_store_was_caught_mid_statement",

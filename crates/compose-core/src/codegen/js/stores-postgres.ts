@@ -75,15 +75,32 @@ const POSTGRES_CONCURRENT_CREATOR: readonly string[] = ["23505", "42P07", "42710
  * release created it.
  *
  * `IF NOT EXISTS` throughout, so a second open of a store this build already
- * created does nothing. One migration exists, and it is the `ADD COLUMN IF NOT
- * EXISTS` below: PRD resolved q68 gave every `kv` key a `version`, and a
- * database the previous release created has `store_entries` without it. Its
- * rows take `0`, which no write of this release hands out — a partition's
- * sequence starts past what it holds — so a key answering `version: 0` is one
- * nothing has written since the upgrade. The whole of it is **one transaction
- * holding [`POSTGRES_STORE_SCHEMA_LOCK`]**, because `IF NOT EXISTS` is not
- * atomic against a concurrent creator and a store is opened concurrently by
- * design.
+ * created does nothing. One migration exists, and it is the `DO` block below:
+ * PRD resolved q68 gave every `kv` key a `version`, and a database the previous
+ * release created has `store_entries` without it. Its rows take `0`, which no
+ * write of this release hands out — a partition's sequence starts past what it
+ * holds — so a key answering `version: 0` is one nothing has written since the
+ * upgrade. The whole of it is **one transaction holding
+ * [`POSTGRES_STORE_SCHEMA_LOCK`]**, because `IF NOT EXISTS` is not atomic
+ * against a concurrent creator and a store is opened concurrently by design.
+ *
+ * **The migration is probed rather than attempted**, and the reason is a lock
+ * rather than an error. `ALTER TABLE … ADD COLUMN IF NOT EXISTS` takes
+ * `ACCESS EXCLUSIVE` on `store_entries` *before* it looks for the column, so as
+ * a bare statement it would run on every open — every process start, and every
+ * redial after a lost connection — and every open would queue behind every
+ * transaction touching the table, plain readers and a `pg_dump` included, while
+ * every other process's store ops queued behind the open. The `DO` block reads
+ * `pg_attribute` instead, which locks nothing, and runs the `ALTER` only on the
+ * one open that finds the column missing. `'store_entries'::regclass` resolves
+ * the name through `search_path` exactly as the `ALTER` would, so the table
+ * probed is the table altered; the `IF NOT EXISTS` stays on the `ALTER` for a
+ * creator outside [`POSTGRES_STORE_SCHEMA_LOCK`]. Nothing else here conflicts
+ * with a reader: `CREATE TABLE IF NOT EXISTS` finds the name taken and does
+ * nothing, and `CREATE INDEX IF NOT EXISTS` takes `SHARE` on `store_applied`,
+ * which waits only for an in-flight write to that table. The conformance case
+ * `an_open_does_not_wait_on_a_reader` holds a reader's lock on every table this
+ * creates and opens beside it.
  *
  * **`COLLATE "C"` on every column a statement compares or orders by**, and it is
  * a correctness choice rather than a preference. A `kv` key is the
@@ -127,7 +144,16 @@ CREATE TABLE IF NOT EXISTS store_entries (
   version   BIGINT NOT NULL DEFAULT 0,
   PRIMARY KEY (store, scope_key, "key")
 );
-ALTER TABLE store_entries ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0;
+DO $migrate$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_attribute
+    WHERE attrelid = 'store_entries'::regclass AND attname = 'version' AND NOT attisdropped
+  ) THEN
+    ALTER TABLE store_entries ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0;
+  END IF;
+END
+$migrate$;
 CREATE TABLE IF NOT EXISTS store_applied (
   store           TEXT COLLATE "C" NOT NULL,
   scope_key       TEXT COLLATE "C" NOT NULL,
