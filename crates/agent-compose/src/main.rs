@@ -175,7 +175,7 @@
 //! | code | meaning |
 //! |---|---|
 //! | `0` | clean: nothing was reported, or a `plan` was produced, or a `store` op found or applied |
-//! | `1` | diagnostics were reported, `build --check` found drift, a `run` produced no answer, a `store` op found nothing, declined its condition, had its value refused or met a failing backend, a `plan`'s spec did not resolve, or a discovery verb found something already there and would not replace it |
+//! | `1` | diagnostics were reported, `build --check` found drift, a `run` produced no answer, a `store` op found nothing, declined its condition, had its value refused, met a failing backend or could not write its answer to a standard output that had closed, a `plan`'s spec did not resolve, or a discovery verb found something already there and would not replace it |
 //! | `2` | the command could not run: bad usage, an unreadable entrypoint, an output directory that could not be written, a `visualize --flow` naming no flow, a `store` address, sub-verb or partition flag the composition does not take, a missing environment variable or one carrying a value the command does not take (`AGENT_COMPOSE_INTERACTIVE`, grammar 8.7), an uninstalled dependency set, or no JavaScript runtime to launch |
 //! | `3` | a `run` with nobody to ask stopped at a `human` pause (grammar 8.7, PRD 5.11) |
 //!
@@ -590,7 +590,7 @@ enum Answer {
     #[value(name = "human")]
     Table,
     /// One JSON document on stdout — the op's answer row, or an import's summary (an export's
-    /// lines are its stdout either way, and its summary goes to stderr)
+    /// lines are its stdout either way, and its summary or failure goes to stderr)
     Json,
 }
 

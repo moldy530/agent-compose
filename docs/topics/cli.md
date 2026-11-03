@@ -316,9 +316,19 @@ stderr. `--format json` answers one JSON document on stdout instead: the op's
 own answer row for `get`, `set`, `delete`, `list` and `count` — the row a
 store-op node's output carries — and the summary for `import`. `export`'s lines
 are its stdout under both formats, so its summary — `{"written": n}` under
-`--format json` — goes to stderr. A failure under `--format json` is
-`{"error": …}`, with `lines` naming each refused line of an import; a usage
-error is a sentence on stderr under either format, as every verb's is.
+`--format json` — goes to stderr, and so does its failure, as
+`{"error": …, "written": n}` counting the lines already out: a failure is never
+written among the lines a redirect is collecting for an import. A failure under
+`--format json` is otherwise `{"error": …}` on stdout, with `lines` naming each
+refused line of an import; a usage error is a sentence on stderr under either
+format, as every verb's is.
+
+**A reader that leaves early ends the command.** When standard output closes
+before the answer reaches it — the reader of a pipe gone, as `| head -1` or a
+failed `jq` leaves it — the command says so on stderr (`{"error": …}` under
+`--format json`) and exits `1`: an `export` stops at the page it could not
+write, reading nothing more from the store, and an op that wrote has still
+written — what was lost is the report of it.
 
 **An operator's write is not an effect, and is recorded nowhere.** It belongs to
 no execution, carries no idempotency key — so `deduped` is always `false` — and
@@ -398,7 +408,7 @@ dropped would leave you believing something had been installed under `$HOME`.
 | code | meaning |
 |---|---|
 | `0` | clean: nothing was reported, or nothing but **warnings** was, or a `plan` was produced, or a document was printed, or a `store` op found or applied |
-| `1` | **errors** were reported, `build --check` found drift, a `run` produced no answer, a `resume` diverged from its journal, a `store` op found nothing, declined its condition, had a value refused or met a failing backend, a `plan`'s spec did not resolve, or a discovery verb found something already there and would not replace it |
+| `1` | **errors** were reported, `build --check` found drift, a `run` produced no answer, a `resume` diverged from its journal, a `store` op found nothing, declined its condition, had a value refused, met a failing backend or could not write its answer to a standard output that had closed, a `plan`'s spec did not resolve, or a discovery verb found something already there and would not replace it |
 | `2` | the command could not run: bad usage, an unreadable entrypoint, an unwritable output directory, a missing or malformed environment variable, an uninstalled dependency set, no JavaScript runtime to launch, a `resume` naming an execution the journal does not hold open, or a `store` address, sub-verb or partition flag the composition does not take |
 | `3` | a `run` or `resume` with nobody to ask stopped at a `human` pause |
 

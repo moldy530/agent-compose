@@ -210,6 +210,18 @@ class UsageError extends Error {
 }
 
 /**
+ * Standard output went away before what the `store` verb wrote reached it: the
+ * reader of a pipe closed its end — a `head -1`, a `grep -q`, a `jq` that
+ * failed — or the stream failed some other way.
+ */
+class OutputClosed extends Error {
+  constructor(cause: Error) {
+    super(`standard output closed before the answer reached it (${cause.message})`);
+    this.name = "OutputClosed";
+  }
+}
+
+/**
  * Run the command line, flush what it wrote, and end the process.
  *
  * The exit is explicit rather than left to the event loop draining: a provider
@@ -239,12 +251,28 @@ export async function runMain(argv: readonly string[]): Promise<void> {
   process.exit(code);
 }
 
-/** Wait for what has been written to leave the process. */
+/**
+ * Wait for what has been written to leave the process.
+ *
+ * A stream that has failed or closed is passed over: what it still holds has
+ * nowhere to go — the reader of the pipe is gone — and a write handed to it is
+ * one whose callback a runtime need never call, so waiting on it would keep the
+ * process from ever reaching its exit. For the same reason the wait on a
+ * healthy stream also ends at the stream's `error` or `close`.
+ */
 async function flush(): Promise<void> {
   for (const stream of [process.stdout, process.stderr]) {
+    if (stream.destroyed || stream.errored || !stream.writable) continue;
     if (stream.writableLength === 0) continue;
     await new Promise<void>((resolve) => {
-      stream.write("", () => resolve());
+      const done = (): void => {
+        stream.off("error", done);
+        stream.off("close", done);
+        resolve();
+      };
+      stream.once("error", done);
+      stream.once("close", done);
+      stream.write("", done);
     });
   }
 }
@@ -1455,11 +1483,23 @@ const LAST_INSTANT = 8.64e15;
  *
  * The exit codes are the project's, read for a store: `0` found or applied;
  * `1` the answer is no — a `get` that found nothing, a condition that did not
- * hold, a value the store's `value_schema` refused, or a backend that failed;
- * `2` the command could not run — a flag, a store address, a sub-verb or a
- * partition the command does not take.
+ * hold, a value the store's `value_schema` refused, or a backend that failed —
+ * or an answer that never reached its reader, because standard output closed
+ * first; `2` the command could not run — a flag, a store address, a sub-verb
+ * or a partition the command does not take.
+ *
+ * **Standard output is watched from the first line**, because a pipe's reader
+ * may leave before the answer is written (`| head -1`), and a stream that fails
+ * with nobody listening is an uncaught error: Bun prints it and carries on,
+ * with nothing left to drain the write an `export` waits on, and Node dies of
+ * it. So every write here is one [`put`] — answered once it has left the
+ * process, or with the failure that stopped it — and the command ends `1`
+ * saying so on stderr, which is where a reader that is still there looks. An
+ * `export` stops reading pages at the first refused one; an op that wrote has
+ * still written.
  */
 async function storeVerb(argv: readonly string[]): Promise<number> {
+  watchOutput();
   const [name, ...rest] = argv;
   const known = Object.keys(STORE_SUBVERBS).map((held) => `\`${held}\``).join(", ");
   const subverb = name !== undefined && Object.hasOwn(STORE_SUBVERBS, name) ? STORE_SUBVERBS[name] : undefined;
@@ -1484,63 +1524,81 @@ async function storeVerb(argv: readonly string[]): Promise<number> {
   }
   const format = formatOf(options.single["format"]);
   const target = operatorTarget(address, options.single["session"], options.single["execution"]);
-  const prefix = options.single["prefix"];
-  const prefixed = prefix === undefined ? {} : { prefix };
+  let code: number;
+  let failure: string | undefined;
   try {
-    switch (name) {
-      case "get":
-        return await storeGet(target, operands[0]!, format);
-      case "set":
-        return await storeSet(target, operands[0]!, operands[1]!, options.single, format);
-      case "delete":
-        return await storeDelete(target, operands[0]!, options.single["if-version"], format);
-      case "list": {
-        const after = options.single["after"];
-        const row = await runOperatorOp(target, "list", {
-          ...prefixed,
-          limit: limitOf(options.single["limit"]),
-          ...(after === undefined ? {} : { after }),
-          includeValues: options.flags.has("values"),
-        });
-        if (format === "json") return answered(row, 0);
-        const entries = row["entries"] as readonly { key: string; value: unknown; version: number }[] | undefined;
-        const keys = row["keys"] as readonly string[];
-        if (keys.length === 0) {
-          process.stderr.write(`${where(target)} holds no keys${prefix === undefined ? "" : ` under ${JSON.stringify(prefix)}`}${after === undefined ? "" : ` after ${JSON.stringify(after)}`}\n`);
-          return 0;
-        }
-        process.stdout.write(
-          entries === undefined
-            ? table(["key"], keys.map((key) => [key]))
-            : table(
-                ["key", "version", "value"],
-                entries.map((entry) => [entry.key, String(entry.version), compact(entry.value)]),
-              ),
-        );
-        const next = row["next"];
-        if (typeof next === "string") {
-          process.stdout.write(`next: ${next}  (\`--after ${next}\` reads the page after this one)\n`);
-        }
-        return 0;
-      }
-      case "count": {
-        const row = await runOperatorOp(target, "count", prefixed);
-        if (format === "json") return answered(row, 0);
-        process.stdout.write(table(["count"], [[String(row["count"])]]));
-        return 0;
-      }
-      case "export":
-        return await storeExport(target, prefix, format);
-      case "import":
-        return await storeImport(target, options.single["file"], options.flags.has("if-absent"), format);
-      default:
-        throw new UsageError(`\`${verb}\` is not a sub-verb of \`store\`: it takes ${known}`);
-    }
+    code = await storeSubverb(name, target, operands, options, format);
   } catch (error) {
     if (error instanceof UsageError) throw error;
     // The answer is no, and the backend said why: a value the schema refused,
     // a server that is not there, a provider this release does not open.
-    return failed(format, error instanceof Error ? error.message : String(error));
+    failure = error instanceof Error ? error.message : String(error);
+    code = failed(format, failure);
+  }
+  const lost = await delivered();
+  return lost === undefined ? code : closed(format, new OutputClosed(lost), failure);
+}
+
+/** One `store` sub-verb, run against the target it names, and its exit code. */
+async function storeSubverb(
+  name: string,
+  target: OperatorTarget,
+  operands: readonly string[],
+  options: ReturnType<typeof parse>,
+  format: Format,
+): Promise<number> {
+  const prefix = options.single["prefix"];
+  const prefixed = prefix === undefined ? {} : { prefix };
+  switch (name) {
+    case "get":
+      return await storeGet(target, operands[0]!, format);
+    case "set":
+      return await storeSet(target, operands[0]!, operands[1]!, options.single, format);
+    case "delete":
+      return await storeDelete(target, operands[0]!, options.single["if-version"], format);
+    case "list": {
+      const after = options.single["after"];
+      const row = await runOperatorOp(target, "list", {
+        ...prefixed,
+        limit: limitOf(options.single["limit"]),
+        ...(after === undefined ? {} : { after }),
+        includeValues: options.flags.has("values"),
+      });
+      if (format === "json") return answered(row, 0);
+      const entries = row["entries"] as readonly { key: string; value: unknown; version: number }[] | undefined;
+      const keys = row["keys"] as readonly string[];
+      if (keys.length === 0) {
+        process.stderr.write(`${where(target)} holds no keys${prefix === undefined ? "" : ` under ${JSON.stringify(prefix)}`}${after === undefined ? "" : ` after ${JSON.stringify(after)}`}\n`);
+        return 0;
+      }
+      out(
+        entries === undefined
+          ? table(["key"], keys.map((key) => [key]))
+          : table(
+              ["key", "version", "value"],
+              entries.map((entry) => [entry.key, String(entry.version), compact(entry.value)]),
+            ),
+      );
+      const next = row["next"];
+      if (typeof next === "string") {
+        out(`next: ${next}  (\`--after ${next}\` reads the page after this one)\n`);
+      }
+      return 0;
+    }
+    case "count": {
+      const row = await runOperatorOp(target, "count", prefixed);
+      if (format === "json") return answered(row, 0);
+      out(table(["count"], [[String(row["count"])]]));
+      return 0;
+    }
+    case "export":
+      return await storeExport(target, prefix, format);
+    case "import":
+      return await storeImport(target, options.single["file"], options.flags.has("if-absent"), format);
+    default:
+      throw new UsageError(
+        `\`store ${name}\` is not a sub-verb of \`store\`: it takes ${Object.keys(STORE_SUBVERBS).map((held) => `\`${held}\``).join(", ")}`,
+      );
   }
 }
 
@@ -1623,7 +1681,7 @@ async function storeGet(target: OperatorTarget, key: string, format: Format): Pr
     process.stderr.write(`${JSON.stringify(key)} holds nothing in ${where(target)}\n`);
     return 1;
   }
-  process.stdout.write(table(["key", "version", "value"], [[key, String(row["version"]), compact(row["value"])]]));
+  out(table(["key", "version", "value"], [[key, String(row["version"]), compact(row["value"])]]));
   return 0;
 }
 
@@ -1703,7 +1761,7 @@ function wrote(
     const held = row[column];
     return held === undefined ? "—" : String(held);
   };
-  process.stdout.write(table(columns, [columns.map(cell)]));
+  out(table(columns, [columns.map(cell)]));
   if (!applied) {
     const version = row["version"];
     process.stderr.write(
@@ -1722,8 +1780,15 @@ function wrote(
  * instant and absent for a key that does not expire. A key that has expired
  * is not exported (PRD resolved q69).
  *
- * The lines are the answer under both formats, so the summary goes to stderr:
- * a sentence, or one JSON object.
+ * The lines are the answer under both formats, so everything else goes to
+ * stderr — the summary, and a failure — as a sentence, or as one JSON object:
+ * `{ written }`, or `{ error, written }` naming how many lines had gone out
+ * before it. A failure is never written into the lines, which a caller
+ * redirecting them into a file would otherwise carry into its import.
+ *
+ * Each page waits for standard output to take the one before it, so a slow
+ * reader is never more than a page behind; one that has closed its end stops
+ * the export there, with nothing more read from the store.
  */
 async function storeExport(
   target: OperatorTarget,
@@ -1732,27 +1797,35 @@ async function storeExport(
 ): Promise<number> {
   let after: string | undefined;
   let written = 0;
-  for (;;) {
-    const page = await operatorPage(target, {
-      limit: STORE_EXPORT_PAGE,
-      ...(prefix === undefined ? {} : { prefix }),
-      ...(after === undefined ? {} : { after }),
-    });
-    let lines = "";
-    for (const entry of page.entries) {
-      lines += `${JSON.stringify({
-        key: entry.key,
-        value: entry.value,
-        version: entry.version,
-        ...(entry.expiresAt === null
-          ? {}
-          : { expires_at: new Date(Math.min(entry.expiresAt, LAST_INSTANT)).toISOString() }),
-      })}\n`;
-      written += 1;
+  try {
+    for (;;) {
+      const page = await operatorPage(target, {
+        limit: STORE_EXPORT_PAGE,
+        ...(prefix === undefined ? {} : { prefix }),
+        ...(after === undefined ? {} : { after }),
+      });
+      let lines = "";
+      for (const entry of page.entries) {
+        lines += `${JSON.stringify({
+          key: entry.key,
+          value: entry.value,
+          version: entry.version,
+          ...(entry.expiresAt === null
+            ? {}
+            : { expires_at: new Date(Math.min(entry.expiresAt, LAST_INSTANT)).toISOString() }),
+        })}\n`;
+      }
+      await emit(lines);
+      written += page.entries.length;
+      if (page.next === undefined) break;
+      after = page.next;
     }
-    await emit(lines);
-    if (page.next === undefined) break;
-    after = page.next;
+  } catch (error) {
+    if (error instanceof UsageError) throw error;
+    const reason = error instanceof Error ? error.message : String(error);
+    const message = `${reason}: the export stopped after ${written} ${written === 1 ? "line" : "lines"}, so what was written is not the whole of ${where(target)}`;
+    process.stderr.write(format === "json" ? `${JSON.stringify({ error: message, written })}\n` : `error: ${message}\n`);
+    return 1;
   }
   process.stderr.write(
     format === "json"
@@ -1810,7 +1883,7 @@ async function storeImport(
   if (refused.length > 0) {
     const message = `${refused.length === 1 ? "a line" : `${refused.length} lines`} of the import could not be written to \`${target.store.address}\`, so none was`;
     if (format === "json") {
-      process.stdout.write(`${JSON.stringify({ error: message, lines: refused }, null, 2)}\n`);
+      out(`${JSON.stringify({ error: message, lines: refused }, null, 2)}\n`);
     } else {
       process.stderr.write(`error: ${message}:\n`);
       for (const { line, error } of refused) process.stderr.write(`  line ${line}: ${error}\n`);
@@ -1855,7 +1928,7 @@ async function storeImport(
   }
   const summary = { read, written, skipped: expired + present, expired, present };
   if (format === "json") return answered(summary, 0);
-  process.stdout.write(
+  out(
     table(
       ["read", "written", "skipped", "expired", "present"],
       [[read, written, expired + present, expired, present].map(String)],
@@ -2019,16 +2092,116 @@ function readImportFile(file: string): string {
   }
 }
 
-/** Write `text` to stdout, waiting for the pipe to take it before the next page is read. */
+/**
+ * Write `text` to stdout and wait for it to leave the process before the next
+ * page is read — refused with [`OutputClosed`] where standard output failed
+ * instead.
+ */
 async function emit(text: string): Promise<void> {
   if (text === "") return;
-  if (process.stdout.write(text)) return;
-  await new Promise<void>((resolve) => process.stdout.once("drain", () => resolve()));
+  const failure = await put(text);
+  if (failure !== undefined) throw new OutputClosed(failure);
+}
+
+/**
+ * The first failure standard output has reported since [`watchOutput`] began
+ * listening for one.
+ *
+ * Kept here rather than read off the stream, because the two runtimes do not
+ * keep a failed stream alike: Bun's answers a later `write` with `true` and no
+ * error, and Node's destroys itself.
+ */
+let outputFailure: Error | undefined;
+let watchingOutput = false;
+
+/**
+ * Listen for standard output — and standard error — failing, before the
+ * `store` verb writes anything.
+ *
+ * A stream that fails with no `error` listener is an uncaught error, which
+ * Bun prints with its stack before carrying on and Node dies of. Standard
+ * output's failure is kept, for [`put`] and [`delivered`] to answer with;
+ * standard error's is dropped, since it is the one stream left to say anything
+ * on, and once it has failed there is nobody to say it to.
+ */
+function watchOutput(): void {
+  if (watchingOutput) return;
+  watchingOutput = true;
+  process.stdout.on("error", (error: Error) => {
+    outputFailure ??= error;
+  });
+  process.stderr.on("error", () => undefined);
+}
+
+/** Every write [`out`] has handed standard output and not yet seen settle. */
+const pendingOutput: Promise<Error | undefined>[] = [];
+
+/**
+ * Write `text` to stdout, and settle once it has left the process: with
+ * nothing, or with the failure that stopped it.
+ *
+ * Settled by the write's own callback — which both runtimes call with the
+ * `EPIPE` of a reader that has gone — and also by the stream's `error` and
+ * `close`, so no failure the stream reports another way leaves it waiting. It
+ * never rejects, so a write nobody has awaited yet cannot be an unhandled
+ * rejection.
+ */
+function put(text: string): Promise<Error | undefined> {
+  const stdout = process.stdout;
+  if (outputFailure !== undefined) return Promise.resolve(outputFailure);
+  if (stdout.destroyed || stdout.writableEnded) {
+    return Promise.resolve(new Error("standard output is closed"));
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (failure: Error | undefined): void => {
+      if (settled) return;
+      settled = true;
+      stdout.off("error", onError);
+      stdout.off("close", onClose);
+      if (failure !== undefined) outputFailure ??= failure;
+      resolve(failure);
+    };
+    const onError = (error: Error): void => settle(error);
+    const onClose = (): void => settle(new Error("standard output closed"));
+    stdout.once("error", onError);
+    stdout.once("close", onClose);
+    stdout.write(text, (error) => settle(error ?? undefined));
+  });
+}
+
+/** Write `text` to stdout, for [`delivered`] to wait on before the command answers its exit code. */
+function out(text: string): void {
+  pendingOutput.push(put(text));
+}
+
+/** Wait for everything [`out`] wrote to settle, and answer the first failure, if any. */
+async function delivered(): Promise<Error | undefined> {
+  const settled = await Promise.all(pendingOutput.splice(0));
+  return settled.find((failure) => failure !== undefined);
+}
+
+/**
+ * Report an answer that never reached its reader, and answer `1`.
+ *
+ * On stderr under both formats, since stdout is the stream that failed — the
+ * sentence, or `{ error }` under `--format json`. The op itself ran, so a write
+ * it applied stays applied: what was lost is the report of it — unless the
+ * report was itself a `failure` (an `{ error }` under `--format json`), which
+ * is then said here instead, since this is the only place left to say it.
+ */
+function closed(format: Format, error: OutputClosed, failure?: string): number {
+  const message =
+    failure === undefined
+      ? `${error.message}; the op itself ran, so a write it applied stays applied`
+      : `${failure} — said here because ${error.message}`;
+  process.stderr.write(format === "json" ? `${JSON.stringify({ error: message })}\n` : `error: ${message}\n`);
+  return 1;
 }
 
 /** Answer one JSON document on stdout, and the exit code it goes with. */
 function answered(document: unknown, code: number): number {
-  process.stdout.write(`${JSON.stringify(document, null, 2)}\n`);
+  out(`${JSON.stringify(document, null, 2)}\n`);
   return code;
 }
 

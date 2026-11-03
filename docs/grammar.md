@@ -11348,8 +11348,10 @@ same, checks every line before writing any, writes each at the partition's next
 version, turns a remaining `expires_at` into the `ttl` that keeps it, skips a
 line already expired, and under `--if-absent` keeps a key already held. The
 answer is a table, or one JSON document under `--format json` — the op's own
-answer row, or the import's summary; exit `0` is found or applied, `1` not
-found, declined, refused or a failing backend, `2` usage (PRD resolved q72).
+answer row, or the import's summary, with an export's summary and failure on
+stderr so its stdout is only ever its lines; exit `0` is found or applied, `1`
+not found, declined, refused, a failing backend or an answer standard output
+closed before it could take, `2` usage (PRD resolved q72).
 
 **Rationale**: a store's contents were reachable only from a flow, so seeing what
 a run left or seeding a store before one meant writing a composition for it, or
@@ -11407,6 +11409,16 @@ target dials the server its deploy file binds, with that target's environment
 variables, as `run` does. A wrong partition flag, an address naming no store,
 and an unknown sub-verb are usage errors too, exit `2`, because nothing was read
 or written and a different command line is the fix.
+
+**An answer nobody is left to read is a failure, and ends the command.** An
+operator pipes these commands — `export … | head -1`, `get … | jq` — and a pipe's
+reader may leave before the answer is written. The command watches standard
+output from its first line, so a write the closed pipe refuses ends it `1`,
+said on stderr, rather than as an uncaught error or a wait for a drain that
+cannot come: an `export` stops at the page it could not write and reads nothing
+more, and an op that wrote has still written, since what was lost is the report
+of it. For the same reason an export's failure goes to stderr beside its
+summary, never among the lines a redirect is collecting for an import.
 
 **What this does not change.** No grammar: the command reads a composition and
 adds nothing to what one may say, so no section of this document gains a key and

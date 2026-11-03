@@ -33,7 +33,7 @@ Options:
 
           Possible values:
           - human: A table on stdout, for a person; what went wrong on stderr
-          - json:  One JSON document on stdout — the op's answer row, or an import's summary (an export's lines are its stdout either way, and its summary goes to stderr)
+          - json:  One JSON document on stdout — the op's answer row, or an import's summary (an export's lines are its stdout either way, and its summary or failure goes to stderr)
           
           [default: human]
 
