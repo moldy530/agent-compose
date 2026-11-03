@@ -1,0 +1,14 @@
+# rule: a flow names one `finally:` node, never a list of them (grammar 7.9, Decision D159)
+# code: wrong-type
+# message: expected a string for `finally`, found a sequence
+# at: 14:12
+flow.demo:
+  outputs: {}
+  nodes:
+    work: { exec: { command: "true" } }
+    first: { exec: { command: "true" } }
+    second: { exec: { command: "true" } }
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: [first, second]

@@ -240,6 +240,12 @@ impl Cx<'_, '_> {
                 self.node_id(id, &to.span, &ids, &owner);
             }
         }
+
+        // `finally:` names a node of this flow, and a missing one is refused in
+        // exactly the words an edge naming one is (grammar 7.9, Decision D159).
+        if let Some(finally) = flow.finally.as_ref() {
+            self.node_id(&finally.value, &finally.span, &ids, &owner);
+        }
     }
 
     /// Resolve the addresses one node names.

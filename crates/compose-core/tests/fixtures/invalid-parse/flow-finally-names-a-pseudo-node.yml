@@ -1,0 +1,13 @@
+# rule: a flow's `finally:` names a node, and `end` is a pseudo-node (grammar 2.4, 7.9, Decision D159)
+# code: reserved-name
+# message: `finally` names a node of this flow, and `end` is a pseudo-node
+# at: 13:12
+# help: `start` is a flow's entry and `end` retires a branch; `finally:` names the node an instance runs once when it ends, whatever its outcome (grammar 7.9, Decision D159)
+flow.demo:
+  outputs: {}
+  nodes:
+    work: { exec: { command: "true" } }
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: end

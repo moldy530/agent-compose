@@ -101,12 +101,20 @@ pub(crate) fn flow_def(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> F
         }
     }
 
+    // Read after `nodes:` and `edges:`, which is the order the grammar's key
+    // table lists it in; whether the id names one of those nodes is the
+    // resolver's question (grammar 7.9, Decision D159).
+    let finally = fields
+        .take("finally")
+        .and_then(|node| lexical::finally_target(node, cx));
+
     FlowDef {
         description,
         inputs,
         outputs,
         nodes,
         edges,
+        finally,
     }
 }
 

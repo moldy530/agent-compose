@@ -1,0 +1,13 @@
+# rule: a flow's `finally:` is a node id, which is an identifier (grammar 2.1, 7.9, Decision D159)
+# code: invalid-identifier
+# message: `finally` `Clean-Up` is not a valid identifier
+# at: 13:12
+# help: identifiers are 1-64 characters of lowercase letters, digits, and `_`, starting with a letter
+flow.demo:
+  outputs: {}
+  nodes:
+    work: { exec: { command: "true" } }
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: Clean-Up
