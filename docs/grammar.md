@@ -11326,6 +11326,98 @@ amended.
 
 **Status**: shipped. *PRD 5.8, resolved q29, q63, q68, q70; §8.8, §11.4.*
 
+### D155. An operator reads and writes a `kv` store from the command line, and the write is not an effect
+
+`agent-compose store <sub-verb> <path> <store> [operands]` — `get <key>`,
+`set <key> <value>`, `delete <key>`, `list`, `count`, `export`, `import` — reads
+and writes one `kv` store through the target's own backend with no flow
+written. The compiler validates and builds exactly as `run` does and launches the
+emitted command line's `store` verb, beside `run`, `resume` and `serve`; the
+store is named by its typed address and the partition by the scope it declares —
+`--session <key>` for `scope: session`, `--execution <id>` for
+`scope: execution`, neither for `scope: global` — derived by the function the
+runtime derives it with. A `set` takes `--if absent|present` or
+`--if-version <n>` and `--ttl <duration>|never` (§11.4's `if:`, `if_version:`
+and `ttl:`), a `delete` takes `--if-version`, a `list` pages with `--prefix`,
+`--limit`, `--after` and `--values` (`include_values:`), and a `count` takes
+`--prefix`. A value is JSON, on the command line or as `-` on standard input,
+held to `value_schema` by the emitted Zod before it is written. `export` writes
+JSON Lines of `{ key, value, version, expires_at }` — every live key, in byte
+order, `expires_at` an ISO 8601 UTC instant or absent — and `import` reads the
+same, checks every line before writing any, writes each at the partition's next
+version, turns a remaining `expires_at` into the `ttl` that keeps it, skips a
+line already expired, and under `--if-absent` keeps a key already held. The
+answer is a table, or one JSON document under `--format json` — the op's own
+answer row, or the import's summary; exit `0` is found or applied, `1` not
+found, declined, refused or a failing backend, `2` usage (PRD resolved q72).
+
+**Rationale**: a store's contents were reachable only from a flow, so seeing what
+a run left or seeding a store before one meant writing a composition for it, or
+opening the database by hand and bypassing the schema, the partition encoding
+and the expiry the runtime applies. The ruling's answer is a command line, and
+the toolchain split (PRD 5.12) decides where it lives: the binary carries no
+database driver, so it delegates to the emitted project — as `run` and `serve`
+already do — and the emitted project opens the store with the very binding,
+arm, partition derivation and liveness filter a flow of that build uses. That is
+the whole of the correctness argument: an operator and a flow cannot disagree
+about which row a key is, because there is one function deciding it.
+
+**Not an effect, and recorded nowhere.** An operator's op belongs to no
+execution, so it reaches the store through operator entry points that call the
+same op implementation a store-op node's does and bypass exactly what makes the
+node's an effect: no journal row (it is not inside the journaled seam, and
+nothing replays it), no trace record, no idempotency key — so a write is never
+deduped and leaves no ledger row, and `deduped` answers `false` — and no
+execution owning a partition. The ruling names this posture and its limit: a
+store keeping per-key history records such a write as actor `cli` (PRD resolved
+q74), and until that ships it is recorded nowhere, which the `cli` topic says.
+The alternative — minting an execution per command so the write had somewhere to
+be journaled — is what "belongs to no execution" rules out, and it would have
+been worse on its own terms: an execution is something that runs a flow and
+settles, and one that existed only to carry an operator's `set` would be a
+record of a run nobody made.
+
+**Validation is the store's, wherever the write comes from.** `value_schema` is
+checked on write only (§11.4, PRD resolved q68): a node's `value:` by CEL typing
+at `validate`, a tool's by Zod at its argument schema — and an operator's by the
+same emitted Zod, before the store is reached. `import` checks every line first
+and writes nothing when any is refused, naming each line, because a file is a
+batch an operator expects to land or not; there is no transaction across lines,
+so a backend that fails part-way says which line it stopped at.
+
+**Fresh versions, and an expiry carried as a remaining `ttl`.** A version is the
+partition's sequence (D152), so an import that restored exported versions could
+hand out one some key already showed — the ABA hazard the sequence exists to
+close — and each line is instead a write through the normal path, taking the
+next. An expiry is an absolute instant by the store's clock (D153), so the
+import reads that clock once and carries it forward by its own monotonic one, and
+a line's `ttl` is what remains of its `expires_at` at the moment its write is
+made; a line with none is a key that does not expire, whatever the store's
+`default_ttl:`, so an export and its import leave the same keys alive.
+
+**What cannot be reached is refused by name.** The command is a `kv` surface, so a
+`vector` or `blob` store is a usage error; and a store whose rows live only in
+the memory of the process running each execution — every `scope: execution`
+store on a backend that process opens itself, which under `--target local`
+(D87) is every one, and any store bound to `provider: memory` — is refused
+rather than answered out of an empty database, since the command is another
+process. Under `--target local` the command opens the SQLite files under the
+build directory, which is where every `run` of that build keeps them; a named
+target dials the server its deploy file binds, with that target's environment
+variables, as `run` does. A wrong partition flag, an address naming no store,
+and an unknown sub-verb are usage errors too, exit `2`, because nothing was read
+or written and a different command line is the fix.
+
+**What this does not change.** No grammar: the command reads a composition and
+adds nothing to what one may say, so no section of this document gains a key and
+no static check changes. The agent tool surface (§11.5) is untouched. q74's
+`log` sub-verb and q71's `batch` are not part of it. The process-start sweep
+(D153) is the one each op's own store already starts at its first op; the command
+starts no sweep of the stores it does not address. Decisions D87, D152, D153 and
+D154 are what it is built on, and none is amended.
+
+**Status**: shipped. *PRD 5.12, resolved q23, q68, q69, q70, q72, q74; §11.1, §11.3, §11.4.*
+
 ## Appendix B — Editor integration
 
 [`schemas/agent-compose.schema.json`](../schemas/agent-compose.schema.json) is a

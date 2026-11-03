@@ -193,25 +193,57 @@ fn verbs() -> BTreeSet<String> {
 /// [`the_help_lists_the_verbs_that_act_before_the_verbs_that_teach`] is what
 /// holds the two together.
 fn listed_verbs() -> Vec<String> {
+    let listed = commands_of(&[]);
+    assert!(!listed.is_empty(), "the help lists commands");
+    listed
+}
+
+/// The commands one help page lists under `Commands:`, in the order it lists
+/// them — the binary's own verbs for `--help`, and a verb's **sub-verbs** for
+/// `<verb> --help`, which is empty for every verb that has none.
+///
+/// `agent-compose store` is the verb that has them (PRD resolved q72): its
+/// usage line is `store <COMMAND>`, so a bind that stopped at the verb would
+/// accept `agent-compose store frob main.yml` — a real verb, one word, and a
+/// command clap refuses. Reading the sub-verbs off the same help the verbs are
+/// read off keeps them one inventory rather than a list in this file.
+fn commands_of(verb: &[&str]) -> Vec<String> {
     let output: Output = Command::cargo_bin("agent-compose")
         .expect("the binary under test is built")
+        .args(verb)
         .arg("--help")
         .output()
         .expect("the command runs");
     let text = String::from_utf8(output.stdout).expect("help is UTF-8");
-    let commands = text
-        .split("Commands:\n")
-        .nth(1)
-        .expect("the help lists commands")
+    let Some(commands) = text.split("Commands:\n").nth(1) else {
+        return Vec::new();
+    };
+    commands
         .split("\n\n")
         .next()
-        .expect("the command list ends");
-    commands
+        .expect("the command list ends")
         .lines()
         .filter_map(|line| line.split_whitespace().next())
         .filter(|verb| *verb != "help")
         .map(str::to_string)
         .collect()
+}
+
+/// Every verb that has sub-verbs, with them — read off each verb's own help.
+fn sub_verbs() -> BTreeMap<String, Vec<String>> {
+    let found: BTreeMap<String, Vec<String>> = verbs()
+        .into_iter()
+        .map(|verb| {
+            let listed = commands_of(&[verb.as_str()]);
+            (verb, listed)
+        })
+        .filter(|(_, listed)| !listed.is_empty())
+        .collect();
+    assert!(
+        found.get("store").is_some_and(|listed| listed.len() >= 7),
+        "the help parser still finds `store`'s sub-verbs, found {found:?}"
+    );
+    found
 }
 
 /// The argument slots clap **requires** of one verb, in the two kinds it has.
@@ -247,17 +279,23 @@ impl Required {
 /// second inventory is a second thing to keep in step, and adding a required
 /// argument to a shipped verb is exactly the change that would make the
 /// documents wrong without touching them.
-fn required_arguments(verb: &str) -> Required {
+fn required_arguments(command: &[&str]) -> Required {
     let output: Output = Command::cargo_bin("agent-compose")
         .expect("the binary under test is built")
-        .args([verb, "--help"])
+        .args(command)
+        .arg("--help")
         .output()
         .expect("the command runs");
     let text = String::from_utf8(output.stdout).expect("help is UTF-8");
     let usage = text
         .lines()
         .find(|line| line.starts_with("Usage:"))
-        .unwrap_or_else(|| panic!("`agent-compose {verb} --help` prints a usage line"));
+        .unwrap_or_else(|| {
+            panic!(
+                "`agent-compose {} --help` prints a usage line",
+                command.join(" ")
+            )
+        });
     let words: Vec<&str> = usage.split_whitespace().collect();
     let mut required = Required {
         positionals: 0,
@@ -823,6 +861,16 @@ fn the_cli_topic_names_every_verb() {
             "the `cli` topic does not name `agent-compose {verb}`"
         );
     }
+    // …and every sub-verb, as a command written out: a reader told that
+    // `store` has an `import` has not been told how to type one.
+    for (verb, listed) in sub_verbs() {
+        for sub_verb in listed {
+            assert!(
+                names_command(topic.body, &format!("{verb} {sub_verb}")),
+                "the `cli` topic does not name `agent-compose {verb} {sub_verb}`"
+            );
+        }
+    }
 }
 
 /// Whether `document` names `agent-compose <verb>` **as that verb**.
@@ -889,6 +937,7 @@ fn the_help_lists_the_verbs_that_act_before_the_verbs_that_teach() {
         "resume",
         "run",
         "serve",
+        "store",
         "worker",
     ];
     const TEACH: &[&str] = &["docs", "explain", "init", "schema", "skill"];
@@ -945,6 +994,7 @@ fn the_help_lists_the_verbs_that_act_before_the_verbs_that_teach() {
 #[test]
 fn the_documents_name_only_verbs_the_binary_has() {
     let verbs = verbs();
+    let sub_verbs = sub_verbs();
     for (document, text) in embedded_documents() {
         for words in invocations(&text) {
             let Some(verb) = words.first() else { continue };
@@ -955,6 +1005,20 @@ fn the_documents_name_only_verbs_the_binary_has() {
                 verbs.contains(verb),
                 "{document} tells a reader to run `agent-compose {verb}`, which is not a verb \
                  this binary has: {verbs:?}"
+            );
+            // A verb with sub-verbs is half a command until the next word names
+            // one — `agent-compose store frob` is a usage error however real
+            // `store` is. A placeholder there (`<sub-verb>`) names none.
+            let (Some(listed), Some(sub_verb)) = (sub_verbs.get(verb), words.get(1)) else {
+                continue;
+            };
+            if !is_a_name(sub_verb) {
+                continue;
+            }
+            assert!(
+                listed.contains(sub_verb),
+                "{document} tells a reader to run `agent-compose {verb} {sub_verb}`, and `{verb}` \
+                 has no sub-verb `{sub_verb}`: {listed:?}"
             );
         }
     }
@@ -981,20 +1045,40 @@ fn the_documents_name_only_verbs_the_binary_has() {
 /// let `agent-compose serve --port 8080` pass on the strength of the `8080`.
 #[test]
 fn every_command_the_documents_tell_a_reader_to_run_carries_its_arguments() {
-    let arity: BTreeMap<String, Required> = verbs()
-        .into_iter()
-        .map(|verb| {
-            let required = required_arguments(&verb);
-            (verb, required)
-        })
-        .collect();
+    let sub_verbs = sub_verbs();
+    // Keyed by the command a document writes: the verb, or — for a verb with
+    // sub-verbs — the verb and its sub-verb, whose own usage line says what
+    // *it* requires (`store get <PATH> <STORE> <KEY>`), where the verb's says
+    // only that a sub-verb comes next.
+    let mut arity: BTreeMap<String, Required> = BTreeMap::new();
+    for verb in verbs() {
+        for sub_verb in sub_verbs.get(&verb).into_iter().flatten() {
+            arity.insert(
+                format!("{verb} {sub_verb}"),
+                required_arguments(&[verb.as_str(), sub_verb.as_str()]),
+            );
+        }
+        let required = required_arguments(&[verb.as_str()]);
+        arity.insert(verb, required);
+    }
     let mut demanding = 0;
     for (document, text) in embedded_documents() {
-        for words in invocations(&outside_tables(&text)) {
-            let Some(verb) = words.first() else { continue };
+        for written in invocations(&outside_tables(&text)) {
+            let Some(verb) = written.first() else {
+                continue;
+            };
             if !is_a_name(verb) {
                 continue;
             }
+            // A sub-verb is read as part of the command, so its arguments are
+            // counted from the word after it.
+            let (command, words) = match written.get(1) {
+                Some(sub_verb) if sub_verbs.contains_key(verb) && is_a_name(sub_verb) => {
+                    (format!("{verb} {sub_verb}"), &written[1..])
+                }
+                _ => (verb.clone(), &written[..]),
+            };
+            let verb = &command;
             // A verb this binary does not have is the sibling test's failure,
             // reported there rather than as a confusing arity one here.
             let Some(required) = arity.get(verb) else {
@@ -1004,7 +1088,7 @@ fn every_command_the_documents_tell_a_reader_to_run_carries_its_arguments() {
                 continue;
             }
             demanding += 1;
-            let supplied = supplied_arguments(&words);
+            let supplied = supplied_arguments(words);
             let unmet: Vec<&str> = required
                 .options
                 .iter()
@@ -1017,7 +1101,7 @@ fn every_command_the_documents_tell_a_reader_to_run_carries_its_arguments() {
                  this names none of {unmet:?}. Name them — a placeholder counts as the value — or, \
                  if the sentence is about the verb rather than a command to run, write the verb \
                  alone without the program name",
-                words.join(" "),
+                written.join(" "),
                 required.options.join(", ")
             );
             assert!(
@@ -1026,7 +1110,7 @@ fn every_command_the_documents_tell_a_reader_to_run_carries_its_arguments() {
                  argument(s) and this names {}. Name them — a placeholder counts — or, if the \
                  sentence is about the verb rather than a command to run, write the verb alone \
                  without the program name",
-                words.join(" "),
+                written.join(" "),
                 required.positionals,
                 supplied.positionals
             );
@@ -1086,11 +1170,49 @@ fn the_argument_reader_does_not_take_a_flags_value_for_a_positional() {
     assert!(read("skill --agent=claude").flags.contains("--agent"));
 
     // And the two verbs this pair is really about, against clap's own answer.
-    let serve = required_arguments("serve");
+    let serve = required_arguments(&["serve"]);
     assert_eq!((serve.positionals, serve.options.len()), (1, 0));
-    let worker = required_arguments("worker");
+    let worker = required_arguments(&["worker"]);
     assert_eq!(worker.positionals, 0);
     assert_eq!(worker.options, vec!["--hub", "--token-env"]);
+}
+
+/// …and a sub-verb is read as part of the command it belongs to.
+///
+/// `agent-compose store`'s own usage line requires one thing — a sub-verb — so
+/// against the verb alone `agent-compose store get main.yml` would pass with
+/// two words to spare and still exit `2` for want of the store and the key. The
+/// bind reads the sub-verb's usage line instead, and counts from the word after
+/// the sub-verb; this pins both halves against clap's own answer.
+#[test]
+fn a_sub_verbs_arguments_are_counted_after_the_sub_verb() {
+    let store = required_arguments(&["store"]);
+    assert_eq!((store.positionals, store.options.len()), (1, 0));
+    let get = required_arguments(&["store", "get"]);
+    assert_eq!((get.positionals, get.options.len()), (3, 0));
+    let set = required_arguments(&["store", "set"]);
+    assert_eq!((set.positionals, set.options.len()), (4, 0));
+    let import = required_arguments(&["store", "import"]);
+    assert_eq!((import.positionals, import.options.len()), (2, 0));
+
+    let written: Vec<String> = "store get main.yml store.notes"
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        supplied_arguments(&written[1..]).positionals,
+        2,
+        "the sub-verb itself is not one of the arguments it takes"
+    );
+    assert_eq!(
+        sub_verbs().get("store").map(Vec::as_slice),
+        Some(
+            ["get", "set", "delete", "list", "count", "export", "import"]
+                .map(str::to_string)
+                .as_slice()
+        ),
+        "`store --help` lists the sub-verbs in the order the `cli` topic's table does"
+    );
 }
 
 /// (c) …and every topic the documents point at is one the curriculum has.
@@ -1144,6 +1266,7 @@ fn the_documents_name_only_topics_the_curriculum_has() {
 #[test]
 fn the_sources_name_only_verbs_and_topics_that_exist() {
     let verbs = verbs();
+    let sub_verbs = sub_verbs();
     let topics: BTreeSet<&str> = docs::topics::names().into_iter().collect();
     let mut found = Vec::new();
     for crate_name in ["agent-compose", "compose-core"] {
@@ -1167,6 +1290,15 @@ fn the_sources_name_only_verbs_and_topics_that_exist() {
             verbs.contains(verb),
             "{file} names `agent-compose {verb}`, which is not a verb this binary has: {verbs:?}"
         );
+        if let (Some(listed), Some(sub_verb)) = (sub_verbs.get(verb), words.get(1))
+            && is_a_name(sub_verb)
+        {
+            assert!(
+                listed.contains(sub_verb),
+                "{file} names `agent-compose {verb} {sub_verb}`, and `{verb}` has no sub-verb \
+                 `{sub_verb}`: {listed:?}"
+            );
+        }
         if verb != "docs" {
             continue;
         }
@@ -1397,6 +1529,15 @@ fn the_skill_names_every_verb() {
             section.contains(&format!("`{verb}`")) || section.contains(&format!("`{verb} ")),
             "the skill's verb table does not name `{verb}`"
         );
+    }
+    // …and a verb's sub-verbs, which are the part of it an agent types.
+    for (verb, listed) in sub_verbs() {
+        for sub_verb in listed {
+            assert!(
+                section.contains(&format!("`{sub_verb}`")),
+                "the skill's verb table does not name `{verb}`'s sub-verb `{sub_verb}`"
+            );
+        }
     }
 }
 

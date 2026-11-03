@@ -1,6 +1,6 @@
 //! `agent-compose` — the compiler's command line.
 //!
-//! The verbs fall into two groups. Eight act on a composition; the rest teach
+//! The verbs fall into two groups. Nine act on a composition; the rest teach
 //! the reader about compositions in general and are described at the bottom of
 //! this header. The first is the product's core loop (PRD §7 M0):
 //!
@@ -84,7 +84,23 @@
 //! reference has a value (PRD §9.15) and the pinned dependency set is installed
 //! where the project can resolve it.
 //!
-//! The eighth takes no spec at all, and is the other half of a distributed
+//! The eighth reads and writes one `kv` store through the target's own backend,
+//! with no flow written (PRD resolved q72):
+//!
+//! ```text
+//! agent-compose store <get|set|delete|list|count|export|import> <path> <store> [operands]
+//!                     [--session <key> | --execution <id>] [--target <name>]
+//!                     [--out <dir>] [--format human|json]
+//! ```
+//!
+//! It is invocation too, and for the reason the three above are: this binary
+//! carries no database driver (PRD 5.12), so it builds the project exactly as
+//! `run` does and launches the emitted command line's own `store` verb, which
+//! opens the store the way a flow of that build would. What an operator writes
+//! there is **not an effect** — no execution, no idempotency key, no journal
+//! row — and the `cli` topic says it is recorded nowhere. See [`store`].
+//!
+//! The ninth takes no spec at all, and is the other half of a distributed
 //! deployment (`docs/distributed.md`, PRD 5.10):
 //!
 //! ```text
@@ -158,9 +174,9 @@
 //!
 //! | code | meaning |
 //! |---|---|
-//! | `0` | clean: nothing was reported, or a `plan` was produced |
-//! | `1` | diagnostics were reported, `build --check` found drift, a `run` produced no answer, a `plan`'s spec did not resolve, or a discovery verb found something already there and would not replace it |
-//! | `2` | the command could not run: bad usage, an unreadable entrypoint, an output directory that could not be written, a `visualize --flow` naming no flow, a missing environment variable or one carrying a value the command does not take (`AGENT_COMPOSE_INTERACTIVE`, grammar 8.7), an uninstalled dependency set, or no JavaScript runtime to launch |
+//! | `0` | clean: nothing was reported, or a `plan` was produced, or a `store` op found or applied |
+//! | `1` | diagnostics were reported, `build --check` found drift, a `run` produced no answer, a `store` op found nothing, declined its condition, had its value refused or met a failing backend, a `plan`'s spec did not resolve, or a discovery verb found something already there and would not replace it |
+//! | `2` | the command could not run: bad usage, an unreadable entrypoint, an output directory that could not be written, a `visualize --flow` naming no flow, a `store` address, sub-verb or partition flag the composition does not take, a missing environment variable or one carrying a value the command does not take (`AGENT_COMPOSE_INTERACTIVE`, grammar 8.7), an uninstalled dependency set, or no JavaScript runtime to launch |
 //! | `3` | a `run` with nobody to ask stopped at a `human` pause (grammar 8.7, PRD 5.11) |
 //!
 //! `plan` reads the first two differently from every other verb, and the
@@ -379,6 +395,12 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
     },
+    /// Read and write one `kv` store through the target's own backend, with no flow (validates,
+    /// builds, then launches)
+    Store {
+        #[command(subcommand)]
+        operation: StoreOperation,
+    },
     /// Execute the nodes a hub has placed on the names this process claims
     Worker {
         /// The hub's base URL, as the deployment publishes it
@@ -428,6 +450,157 @@ enum Command {
         #[arg(long)]
         global: bool,
     },
+}
+
+/// What `agent-compose store` does to the store it names (PRD resolved q72).
+///
+/// One sub-verb per op the command line mirrors, each taking the store and the
+/// partition the same way ([`StoreTarget`]) and the op's own parameters as
+/// flags spelled after grammar 11.4's: `--if` and `--if-version` are `if:` and
+/// `if_version:`, `--ttl` is `ttl:`, `--after` and `--values` are a `list`'s
+/// `after:` and `include_values:`. Nothing about a store is checked here beyond
+/// the shape of the arguments — which store an address names, which partition
+/// its scope wants, and whether a value fits its `value_schema` are the emitted
+/// command line's to decide, because that is where the composition and the
+/// emitted Zod are, and an ejected project's operator meets the same refusals.
+#[derive(Subcommand)]
+enum StoreOperation {
+    /// Read one key: the value it holds and its version (exit 1 when it holds nothing)
+    Get {
+        #[command(flatten)]
+        target: StoreTarget,
+        /// The key to read
+        #[arg(value_name = "KEY")]
+        key: String,
+    },
+    /// Write one key, held to the store's `value_schema` first (exit 1 when a condition declines)
+    Set {
+        #[command(flatten)]
+        target: StoreTarget,
+        /// The key to write
+        #[arg(value_name = "KEY")]
+        key: String,
+        /// The value, as JSON — or `-` to read it from standard input
+        #[arg(value_name = "VALUE")]
+        value: String,
+        /// Write only where the key holds nothing, or only where it holds something
+        #[arg(long = "if", value_enum, value_name = "CONDITION")]
+        condition: Option<Condition>,
+        /// Write only where the key holds this version
+        #[arg(long, value_name = "VERSION", conflicts_with = "condition")]
+        if_version: Option<u64>,
+        /// How long the key lives: a duration (`250ms`, `30s`, `5m`, `24h`), or `never`
+        #[arg(long, value_name = "TTL")]
+        ttl: Option<String>,
+    },
+    /// Delete one key (exit 1 when `--if-version` declines)
+    Delete {
+        #[command(flatten)]
+        target: StoreTarget,
+        /// The key to delete
+        #[arg(value_name = "KEY")]
+        key: String,
+        /// Delete only where the key holds this version
+        #[arg(long, value_name = "VERSION")]
+        if_version: Option<u64>,
+    },
+    /// List one page of keys, in byte order
+    List {
+        #[command(flatten)]
+        target: StoreTarget,
+        /// Only the keys that begin with this
+        #[arg(long, value_name = "PREFIX")]
+        prefix: Option<String>,
+        /// How many keys one page holds, 1 to 1000 [default: 100]
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..=1000))]
+        limit: Option<u16>,
+        /// Start after this key — the `next` the page before answered
+        #[arg(long, value_name = "KEY")]
+        after: Option<String>,
+        /// Show each key's value and version too
+        #[arg(long)]
+        values: bool,
+    },
+    /// Count the keys the partition holds
+    Count {
+        #[command(flatten)]
+        target: StoreTarget,
+        /// Only the keys that begin with this
+        #[arg(long, value_name = "PREFIX")]
+        prefix: Option<String>,
+    },
+    /// Write every live entry as JSON Lines on stdout: `{ key, value, version, expires_at }`
+    Export {
+        #[command(flatten)]
+        target: StoreTarget,
+        /// Only the keys that begin with this
+        #[arg(long, value_name = "PREFIX")]
+        prefix: Option<String>,
+    },
+    /// Write the entries of an export, read from standard input or `--file`, at fresh versions
+    Import {
+        #[command(flatten)]
+        target: StoreTarget,
+        /// Keep a key the partition already holds rather than overwriting it
+        #[arg(long)]
+        if_absent: bool,
+        /// Read the entries from this file rather than from standard input
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+    },
+}
+
+/// The store a `store` sub-verb names, the partition it addresses, and the
+/// build it reaches it through — what every sub-verb takes, flattened into each.
+#[derive(clap::Args)]
+struct StoreTarget {
+    /// Path to the spec entrypoint (conventionally `main.yml`)
+    path: PathBuf,
+    /// The store, as a typed address (`store.<name>`)
+    #[arg(value_name = "STORE")]
+    store: String,
+    /// The session whose partition to address, for a `scope: session` store
+    #[arg(long, value_name = "KEY", conflicts_with = "execution")]
+    session: Option<String>,
+    /// The execution whose partition to address, for a `scope: execution` store
+    #[arg(long, value_name = "ID")]
+    execution: Option<String>,
+    /// Deploy target whose backend the store is opened on
+    #[arg(long, value_name = "NAME", default_value = DEFAULT_TARGET)]
+    target: String,
+    /// Where to write the generated project [default: <project>/build/<target>]
+    #[arg(long, value_name = "DIR")]
+    out: Option<PathBuf>,
+    /// How the store answers, and how a refused composition is reported
+    #[arg(long, value_enum, default_value_t = Answer::Table)]
+    format: Answer,
+}
+
+/// How `agent-compose store` answers.
+///
+/// The [`Format`] vocabulary — `human` and `json`, which is what an operator
+/// types for every other verb — with the two lines saying where *this* verb's
+/// answer goes, which [`Format`]'s do not: a person's answer here is a table
+/// on stdout rather than a report on stderr, because the table **is** the
+/// answer. A composition refused before anything was launched is reported as
+/// [`Format`] says, through the same renderer as `run`'s.
+#[derive(Clone, Copy, ValueEnum)]
+enum Answer {
+    /// A table on stdout, for a person; what went wrong on stderr.
+    #[value(name = "human")]
+    Table,
+    /// One JSON document on stdout — the op's answer row, or an import's summary (an export's
+    /// lines are its stdout either way, and its summary goes to stderr)
+    Json,
+}
+
+/// The literal condition `store set --if` takes (grammar 11.4).
+#[derive(Clone, Copy, ValueEnum)]
+enum Condition {
+    /// Only where the key holds nothing — a key that has expired included
+    Absent,
+    /// Only where the key holds something
+    Present,
 }
 
 /// How a report is written.
@@ -574,6 +747,7 @@ fn main() -> ExitCode {
             ];
             launch(&path, "serve", &target, &out, format, &arguments)
         }
+        Command::Store { operation } => store(operation),
         Command::Docs { topic } => docs(topic.as_deref()),
         Command::Explain { code } => explain(&code),
         Command::Schema => emit_text(compose_core::docs::SCHEMA),
@@ -582,8 +756,148 @@ fn main() -> ExitCode {
     }
 }
 
-/// `agent-compose run`, `agent-compose resume` and `agent-compose serve`: build,
-/// then start.
+/// `agent-compose store <sub-verb>`: build, then launch the emitted command
+/// line's `store` verb with the same sub-verb (PRD resolved q72).
+///
+/// The compiler carries no database driver (PRD 5.12), so it does for a store
+/// exactly what it does for a flow: [`launch`] validates, builds into the
+/// directory `build` would, checks the environment and the dependency set, and
+/// hands the child the arguments — whose exit code is this command's. Every
+/// option goes ahead of the operands and the operands after a bare `--`, so a
+/// key that begins with `--` reaches the child as a key; and `--file` is made
+/// absolute first, because the child runs in the build directory rather than
+/// where the command was typed.
+fn store(operation: StoreOperation) -> ExitCode {
+    let mut options: Vec<String> = Vec::new();
+    let flag = |options: &mut Vec<String>, name: &str, value: Option<String>| {
+        if let Some(value) = value {
+            options.push(format!("--{name}"));
+            options.push(value);
+        }
+    };
+    let (sub_verb, target, operands) = match operation {
+        StoreOperation::Get { target, key } => ("get", target, vec![key]),
+        StoreOperation::Set {
+            target,
+            key,
+            value,
+            condition,
+            if_version,
+            ttl,
+        } => {
+            flag(
+                &mut options,
+                "if",
+                condition.map(|held| {
+                    match held {
+                        Condition::Absent => "absent",
+                        Condition::Present => "present",
+                    }
+                    .to_string()
+                }),
+            );
+            flag(
+                &mut options,
+                "if-version",
+                if_version.map(|held| held.to_string()),
+            );
+            flag(&mut options, "ttl", ttl);
+            ("set", target, vec![key, value])
+        }
+        StoreOperation::Delete {
+            target,
+            key,
+            if_version,
+        } => {
+            flag(
+                &mut options,
+                "if-version",
+                if_version.map(|held| held.to_string()),
+            );
+            ("delete", target, vec![key])
+        }
+        StoreOperation::List {
+            target,
+            prefix,
+            limit,
+            after,
+            values,
+        } => {
+            flag(&mut options, "prefix", prefix);
+            flag(&mut options, "limit", limit.map(|held| held.to_string()));
+            flag(&mut options, "after", after);
+            if values {
+                options.push("--values".to_string());
+            }
+            ("list", target, Vec::new())
+        }
+        StoreOperation::Count { target, prefix } => {
+            flag(&mut options, "prefix", prefix);
+            ("count", target, Vec::new())
+        }
+        StoreOperation::Export { target, prefix } => {
+            flag(&mut options, "prefix", prefix);
+            ("export", target, Vec::new())
+        }
+        StoreOperation::Import {
+            target,
+            if_absent,
+            file,
+        } => {
+            if if_absent {
+                options.push("--if-absent".to_string());
+            }
+            flag(
+                &mut options,
+                "file",
+                file.map(|held| {
+                    std::path::absolute(&held)
+                        .unwrap_or(held)
+                        .to_string_lossy()
+                        .into_owned()
+                }),
+            );
+            ("import", target, Vec::new())
+        }
+    };
+    let StoreTarget {
+        path,
+        store,
+        session,
+        execution,
+        target,
+        out,
+        format,
+    } = target;
+    let out = out.unwrap_or_else(|| build::default_out(&path, &target));
+    let mut arguments = vec!["store".to_string(), sub_verb.to_string()];
+    for (name, value) in [("session", session), ("execution", execution)] {
+        if let Some(value) = value {
+            arguments.push(format!("--{name}"));
+            arguments.push(value);
+        }
+    }
+    arguments.extend(options);
+    let format = match format {
+        Answer::Table => Format::Human,
+        Answer::Json => Format::Json,
+    };
+    arguments.push("--format".to_string());
+    arguments.push(
+        match format {
+            Format::Human => "human",
+            Format::Json => "json",
+        }
+        .to_string(),
+    );
+    arguments.push("--".to_string());
+    arguments.push(store);
+    arguments.extend(operands);
+    launch(&path, "store", &target, &out, format, &arguments)
+}
+
+/// `agent-compose run`, `agent-compose resume`, `agent-compose serve` and
+/// `agent-compose store`: build, then start.
 ///
 /// The build half is [`build_project`]'s, run in the same order and refusing on
 /// the same report — a composition the compiler has something to say about is
