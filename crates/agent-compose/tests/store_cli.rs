@@ -27,9 +27,12 @@
 //!  * a `set` → `get` round trip with its version, a conditional `set` declining
 //!    with exit `1` and naming the version the key holds, a `delete` under
 //!    `--if-version`, `list` paging with `--prefix`/`--limit`/`--after`, a
-//!    `count` that agrees, a `--ttl` that reads absent past its expiry, an
-//!    `export` → edit → `import` round trip at fresh versions with a remaining
-//!    `expires_at` honoured and an expired line skipped, a schema-refused import
+//!    `count` that agrees, a `--ttl` that reads absent past its expiry — to a
+//!    `get`, a `count`, a `list` and an `export` each, while the key is still
+//!    in storage — an `export` → edit → `import` round trip at fresh versions
+//!    with a remaining `expires_at` honoured and an expired line skipped, an
+//!    `export` of more keys than a page holds writing each once, in byte
+//!    order, with a summary that counts them all, a schema-refused import
 //!    line named by number, `--if-absent` seeding without overwriting, the wrong
 //!    scope flags and an unknown address exiting `2`, and the `--format json`
 //!    shapes — [`drive`], once per arm;
@@ -706,6 +709,14 @@ const HOUR: i64 = 3_600_000;
 /// beside it.
 const CLOCK_SLACK: i64 = 2_000;
 
+/// How many entries one page of an `export` reads — the emitted `cli.ts`'s
+/// `STORE_EXPORT_PAGE`.
+const EXPORT_PAGE: usize = 1000;
+
+/// How many keys the multi-page export is driven over: two full pages and a
+/// part of a third, so the walk crosses two cursors and ends on a short page.
+const BULK_KEYS: usize = 2 * EXPORT_PAGE + 345;
+
 /// Now, in epoch milliseconds.
 fn now_millis() -> i64 {
     i64::try_from(
@@ -946,59 +957,74 @@ fn drive(arm: &Arm) {
         json!({ "count": 4 })
     );
 
-    // A `--ttl`, and the key absent to every read once the clock is past it.
-    // The command's first op on the store starts the process-start sweep at
-    // that op's clock (PRD resolved q69), so a key read past its expiry is a
-    // key removed too — which is why the export below writes a lease of its own.
-    project
-        .store(
-            "set",
-            &[&notes, "brief", r#"{"text":"held"}"#, "--ttl", "1h"],
-        )
-        .exits(0);
+    // A `--ttl`, and the key absent to every read once the clock is past it
+    // (PRD resolved q69, q72).
+    //
+    // A command's first op on the store starts the process-start sweep at that
+    // op's clock — **behind** the op — so the op itself reads a store that
+    // still holds the expired key, and only the read's own liveness filter
+    // keeps the key out of its answer. The sweep removes it afterwards, so a
+    // read in a later command would prove the sweep and not the filter: each
+    // read below is handed an expired key of its own, written just before it,
+    // and is the first op of a command whose clock is past that key's expiry.
+    let past = || Given {
+        environment: &[(CLOCK_OFFSET, "7200000")],
+        ..Given::default()
+    };
+    let brief = || {
+        project
+            .store(
+                "set",
+                &[&notes, "brief", r#"{"text":"held"}"#, "--ttl", "1h"],
+            )
+            .exits(0);
+    };
+    brief();
     project.store("get", &[&notes, "brief"]).exits(0);
     project
-        .store_with(
-            "get",
-            &[&notes, "brief"],
-            Given {
-                environment: &[(CLOCK_OFFSET, "7200000")],
-                ..Given::default()
-            },
-        )
+        .store_with("get", &[&notes, "brief"], past())
         .exits(1);
-    let counted = project.store_with(
-        "count",
-        &[&notes, "--format", "json"],
-        Given {
-            environment: &[(CLOCK_OFFSET, "7200000")],
-            ..Given::default()
-        },
+    brief();
+    assert_eq!(
+        project
+            .store_with("count", &[&notes, "--format", "json"], past())
+            .exits(0)
+            .json(),
+        json!({ "count": 4 }),
+        "an expired key is not counted"
     );
-    assert_eq!(counted.exits(0).json(), json!({ "count": 4 }));
-    let listed = project.store_with(
-        "list",
-        &[&notes, "--format", "json"],
-        Given {
-            environment: &[(CLOCK_OFFSET, "7200000")],
-            ..Given::default()
-        },
-    );
+    brief();
     assert!(
-        !listed.exits(0).json()["keys"]
+        !project
+            .store_with("list", &[&notes, "--format", "json"], past())
+            .exits(0)
+            .json()["keys"]
             .as_array()
             .expect("a page has keys")
             .contains(&json!("brief")),
         "an expired key is not listed"
     );
-    assert!(
-        project
-            .store("export", &[&notes])
+    brief();
+    let unexported = project.store_with("export", &[&notes, "--format", "json"], past());
+    assert_eq!(
+        unexported
             .exits(0)
             .lines()
             .iter()
-            .all(|line| line["key"] != "brief"),
-        "…nor exported"
+            .map(|line| line["key"].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            json!("other/x"),
+            json!("page/a"),
+            json!("page/b"),
+            json!("page/c")
+        ],
+        "…nor exported, though the store still held it when the export read its page"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(unexported.stderr().trim()).expect("the summary is JSON"),
+        json!({ "written": 4 }),
+        "…nor counted in the export's summary"
     );
 
     // Export, edit, import: fresh versions, the remaining `expires_at` kept,
@@ -1095,6 +1121,76 @@ fn drive(arm: &Arm) {
     assert!(
         after["page/a"].get("expires_at").is_none(),
         "a line with no `expires_at` imports a key that does not expire"
+    );
+
+    // An export longer than one page: it follows each page's cursor to the
+    // last, so every key is written exactly once, in byte order, and the
+    // summary counts them all. The keys are numbered without padding, so their
+    // byte order is not the order they were written in, and a page boundary
+    // falls between keys that order differently as numbers.
+    let bulk: Vec<String> = (0..BULK_KEYS).map(|n| format!("bulk/{n}")).collect();
+    std::fs::write(
+        project.source.path().join("bulk.jsonl"),
+        bulk.iter()
+            .map(|key| format!("{}\n", json!({ "key": key, "value": { "text": key } })))
+            .collect::<String>(),
+    )
+    .expect("the scratch area is writable");
+    assert_eq!(
+        project
+            .store_with(
+                "import",
+                &[&notes, "--file", "bulk.jsonl", "--format", "json"],
+                Given {
+                    directory: Some(project.source.path()),
+                    ..Given::default()
+                },
+            )
+            .exits(0)
+            .json(),
+        json!({ "read": BULK_KEYS, "written": BULK_KEYS, "skipped": 0, "expired": 0, "present": 0 })
+    );
+    let paged = project.store("export", &[&notes, "--prefix", "bulk/", "--format", "json"]);
+    let paged_lines = paged.exits(0).lines();
+    let mut in_byte_order = bulk.clone();
+    in_byte_order.sort_unstable();
+    assert_ne!(
+        in_byte_order, bulk,
+        "the keys' byte order is not their numbering"
+    );
+    let exported_keys: Vec<&str> = paged_lines
+        .iter()
+        .map(|line| line["key"].as_str().expect("a line has a key"))
+        .collect();
+    assert_eq!(
+        exported_keys.len(),
+        BULK_KEYS,
+        "an export of {BULK_KEYS} keys — more than {EXPORT_PAGE} to a page — writes a line for \
+         every one"
+    );
+    if let Some(at) = exported_keys
+        .iter()
+        .zip(&in_byte_order)
+        .position(|(held, key)| held != key)
+    {
+        panic!(
+            "an export longer than a page writes each key exactly once, in byte order: line {} \
+             is `{}` where `{}` belongs",
+            at + 1,
+            exported_keys[at],
+            in_byte_order[at]
+        );
+    }
+    for line in &paged_lines {
+        assert_eq!(
+            line["value"]["text"], line["key"],
+            "each line carries its own key's value, across the pages: {line}"
+        );
+    }
+    assert_eq!(
+        serde_json::from_str::<Value>(paged.stderr().trim()).expect("the summary is JSON"),
+        json!({ "written": BULK_KEYS }),
+        "the summary counts every page's lines"
     );
 
     // A line the schema refuses fails the import, naming it, and writes nothing.
@@ -1418,7 +1514,9 @@ fn drive(arm: &Arm) {
         rows.iter().any(|row| row.to_string().contains("seed/a")),
         "the run journaled its own reads: {effects}"
     );
-    for operator_only in ["page/", "lease", "brief", "other/x", "refused/", "seed/b"] {
+    for operator_only in [
+        "page/", "lease", "brief", "other/x", "bulk/", "refused/", "seed/b",
+    ] {
         assert!(
             !rows
                 .iter()
