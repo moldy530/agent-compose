@@ -723,8 +723,8 @@ Writes are at-least-once with idempotency keys."
 | `answer` | any | `"read"`, and a `"write"` whose `op` is `batch` | What the read answered — the history a replay consumes. On **every** read record: a read that found nothing still answered, and grammar §11.4's own output row is what it answered with — a `get` that missed carries `{ found: false }` and no `value` (Decision D110), which is an answer and not an absence; a `kv` page carries its `keys`, its `next` where more remain and its `entries` where its node asked for them, a `count` its `count`, and a `get_many` one entry per key it was asked for. Its shape is the store's (grammar §11.4), not this format's. On a `batch` — the one write that carries it — it is what the batch answered, `{ applied, deduped, results, failed }`: `results` one `{ key, version }` per entry in the order they applied (no `version` on a `delete` entry's, and none at all where the batch declined, which names the entry in `failed`). A batch's keys and versions are there because it has no one `key` or `version` to put in those two fields (PRD resolved q71). |
 | `applied` | boolean | `"write"` on a `kv` store | Whether the write's condition held and it landed (grammar §11.4, PRD resolved q68). A write with no `if:`/`if_version:` is `true` whenever it ran; `false` is a condition that did not hold — an answer the node routed on, never a failure — and nothing was written. On **both** surfaces, because it is what the write decided rather than a property of how it was delivered. On a deduplicated record it is the first attempt's (`deduped` below). |
 | `version` | integer | `"write"` on a `kv` store whose answer carries one | The version the key holds after the write: the one it took from its partition's version sequence where it applied, the one it still holds where it declined (grammar §11.4). Absent on a `delete` that applied, which leaves the key holding nothing, and on a write that declined against a key holding nothing; a `delete` that declined carries the version the key still holds, like every other declined write. Absent on every `batch`, whose entries each took or left their own — they are in its `answer`. Like `applied`, on both surfaces. |
-| `idempotencyKey` | string | `"write"` **via `"node"`** | The key the write carried (grammar §9.4). See §8, and the paragraph below for the surface that carries none. |
-| `deduped` | boolean | `"write"` **via `"node"`** | Whether the backend had already applied that key — the difference between "this run wrote it" and "an earlier attempt of this same effect did". |
+| `idempotencyKey` | string | `"write"` **via `"node"`** | The key the write carried, **as carried**: grammar §9.4's derived key — the execution id and the node's instance path — or, on a node that wrote `idempotency_key:`, the authored ledger key `author/<store>/<key>` (grammar §11.4, PRD resolved q73), `<store>` the store's declared name and `<key>` the string the node evaluated, which names no instance. See §8 for telling the two apart, and the paragraph below for the surface that carries none. |
+| `deduped` | boolean | `"write"` **via `"node"`** | Whether the backend had already applied that key — the difference between "this run wrote it" and "an earlier attempt of this same effect did". Under an authored key the earlier write may be **another execution's** — the same business event delivered twice — and the record's `applied` and `version` are then that write's, which is what this one was answered with. |
 
 **A write through a synthesized store tool carries neither.** The two fields go
 together, and they are a property of the store-op **node** catalog rather than of
@@ -1108,7 +1108,16 @@ the root's.
 
 **Instance paths surface in exactly three fields**, and in none of them alone:
 each is an idempotency key, of which the path is the **remainder** after the
-execution id. Two are keys a delivery really carried —
+execution id — with one exception, on one field. A store write whose node
+**authored** its key (grammar §11.4, PRD resolved q73) carries
+`author/<store>/<key>` in `StoreRecord.idempotencyKey`, and that key has no
+instance path at all: it names a business event of one store rather than an
+effect site of one execution. A reader tells the two apart by the **first
+segment**: an authored key's is `author`, which no execution id is — every id
+the runtime mints is `exec_` and a UUID, and the one boundary that takes a
+caller's id refuses one whose first segment is `author` — so a key beginning
+`author/` is authored, and every other key is the execution id and a path. Two
+are keys a delivery really carried —
 `DispatchRecord.idempotencyKey`, on every dispatch record under either carrier,
 and `StoreRecord.idempotencyKey`, which a store-op **node**'s write carries and a
 write through a synthesized store tool does not (§6). The third is a **link**
@@ -1137,7 +1146,9 @@ Grammar §9.4 is normative for the derivation; this document only fixes where it
 appears. Two properties are what make it worth reading out of a trace: distinct
 effects get distinct keys, and a repeated attempt at one effect reuses its key —
 so `deduped: true` on a store write means an earlier attempt of *this* effect had
-already been applied, rather than some other write colliding.
+already been applied, rather than some other write colliding. On a write whose
+key is authored it means an earlier write of the **same business key** — in this
+execution or another — had been, which is the identity its author named.
 
 **The key has more readers, at the head of an envelope rather than inside one**
 (PRD resolved q64, q65). A detached `flow.*` dispatch starts a child execution,
@@ -1374,6 +1385,28 @@ cannot index by key, which is what it is. The ruling calls a batch one write
 and says nothing of the trace; its record's shape — a write with no key — is
 that statement read into §6, and §10.3's test finds nothing to bump, so
 `trace_version` stays `6`.
+
+**PRD resolved q73 is a release of the first kind, and the one closest to §10.3's
+own words.** A store-op node may now write `idempotency_key:`, and its write
+record then carries `author/<store>/<key>` in `idempotencyKey` (§6) — a value
+that is not an execution id and an instance path. §10.3 bumps for "changing the
+derivation of an idempotency key, or where instance paths appear", and the
+question is whether that is what happened. It is not, read by the same test
+q71's paragraph applies: **no record a reader of version `6` could have met
+changes.** Every write without the parameter derives exactly the key it did,
+and carries it in exactly the field it did, so the derivation is unchanged
+wherever it was ever used; the new value appears only on the records of nodes
+that write a parameter that did not exist, and so in no trace a version-`6`
+reader was handed; and where instance paths appear — §8's three fields — is
+unchanged too, since the authored key replaces a path only on those new
+records, and announces itself by a first segment no path can begin with. A
+reader that strips the `execution_id` off every `StoreRecord.idempotencyKey` to
+read a path meets an authored key only in a trace of a composition written
+against this release, and tells it by its `author/` prefix (§8). The field's
+type, presence and meaning — the key the write carried, as carried — are as
+they were, and `deduped` keeps its meaning with a wider reach. No field is added
+to the record, so `trace_version` stays `6`; the OTLP mapping gains one
+attribute for the key that is not a path (§12.5), which is an addition.
 
 ### 10.3 What requires a version bump
 
@@ -2075,7 +2108,7 @@ or a row promising one nothing sets.
 | `agentcompose.trace_version` | root | `TRACE_VERSION` — how a reader on a collector pins the format (§1) |
 | `agentcompose.detached`, `agentcompose.parent_execution`, `agentcompose.idempotency_key` | root of a child execution's export | the envelope's lineage head — `detached` as a boolean, `parent_execution` and `idempotency_key` as strings (§2). How a collector tells a child execution from one a trigger started, and the pair it joins the child to its parent's stub record on (§1.4); on the root of no other export |
 | `agentcompose.error` | root, entry, dispatch, tool-call event | that record's `error` |
-| `agentcompose.instance_path` | entry, dispatch, store event, tool-call event, link | §8's path — an entry's derived, a dispatch's read off its `idempotencyKey` |
+| `agentcompose.instance_path` | entry, dispatch, store event, tool-call event, link | §8's path — an entry's derived, a dispatch's read off its `idempotencyKey`, a store event's off a derived key; a store event whose key is authored carries none (PRD resolved q73) |
 | `agentcompose.node`, `agentcompose.step`, `agentcompose.traversal`, `agentcompose.outcome`, `agentcompose.attempts` | entry | the entry's own fields |
 | `agentcompose.writes` | entry | the entry's `writes`, as a string array |
 | `agentcompose.fallback` | entry | the entry's `fallback` |
@@ -2093,6 +2126,7 @@ or a row promising one nothing sets.
 | `agentcompose.harness.turns`, `agentcompose.harness.input_tokens`, `agentcompose.harness.output_tokens`, `agentcompose.harness.cost_usd` | harness run | the run's cost rollup (§7.6.4). The token attributes are present only where that harness reports tokens and the money one only where it estimates a cost, which is the rollup's own presence rule read onto the span |
 | `agentcompose.harness.turn`, `agentcompose.harness.input_tokens`, `agentcompose.harness.cached_input_tokens`, `agentcompose.harness.output_tokens`, `agentcompose.harness.reasoning_tokens` | turn event | the turn's ordinal, and whatever usage that harness reported for it (§7.6.2) |
 | `agentcompose.store`, `agentcompose.store.op`, `agentcompose.store.effect`, `agentcompose.store.via`, `agentcompose.store.scope`, `agentcompose.store.key`, `agentcompose.store.applied`, `agentcompose.store.version`, `agentcompose.store.deduped` | store event | the store record's own fields — `applied` as a boolean and `version` as an integer, each where the record carries it |
+| `agentcompose.store.idempotency_key` | store event | the record's `idempotencyKey` where it is **authored** — `author/<store>/<key>` (§6, PRD resolved q73) — which names no instance and so is not reported as an `agentcompose.instance_path`; absent where the key is derived |
 | `agentcompose.human.expires_at`, `agentcompose.human.settled` | the two pause events | the pause's budget and how it ended |
 
 **What is deliberately not exported.** §11's exclusions hold automatically —

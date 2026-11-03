@@ -261,6 +261,19 @@ store.ledger:
       items: { type: string }
     hits:  { type: integer }
 
+# PRD resolved q73's authored ledger key, which an execution-scoped store does
+# not take: a `scope: global` store whose `default_ttl:` an authored ledger row
+# expires with, written by `flow.shape`'s `record` and `close` under business
+# keys — so the emitted site carries `stores.authoredKey(...)` rather than an
+# instance path, and the input phase evaluates the key beside the rest.
+store.events:
+  kind: kv
+  scope: global
+  description: One record per business event.
+  default_ttl: 24h
+  value_schema:
+    seen: { type: integer }
+
 store.docs:
   kind: vector
   scope: global
@@ -528,6 +541,22 @@ flow.shape:
             marks: "[]"
             hits: "0"
         - { op: delete, key: "input.goal", if_version: "5" }
+    # PRD resolved q73: a single write and a batch, each under the business key
+    # its author named rather than the one its instance path derives.
+    record:
+      store: store.events
+      op: set
+      key: "'event/' + input.goal"
+      value:
+        seen: "1"
+      idempotency_key: "input.goal"
+    close:
+      store: store.events
+      op: batch
+      ops:
+        - { op: set, key: "'closed/' + input.goal", value: { seen: "2" } }
+        - { op: delete, key: "'event/' + input.goal" }
+      idempotency_key: "'close/' + input.goal"
   edges:
     - { from: start, to: shape }
     - { from: shape, to: ask }
@@ -544,7 +573,9 @@ flow.shape:
     - { from: page, to: tally }
     - { from: tally, to: fetch }
     - { from: fetch, to: shift }
-    - { from: shift, to: end }
+    - { from: shift, to: record }
+    - { from: record, to: close }
+    - { from: close, to: end }
 
 # The trigger surface of grammar 13.3, in the two spellings that make its
 # emitted table more than a type declaration.

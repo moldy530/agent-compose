@@ -638,9 +638,7 @@ fn stores(ir: &Ir, names: &Names, imported: &mut Vec<String>) -> String {
         let DefinitionBody::Store(store) = &definition.body else {
             continue;
         };
-        let local = address
-            .split_once('.')
-            .map_or(address.as_str(), |(_, rest)| rest);
+        let local = store_name(address);
         let backend = crate::ir::deploy::backend_of(ir, store);
         bound.push(names.value(address).to_string());
         text.push('\n');
@@ -2019,6 +2017,12 @@ fn store_params(op: crate::ast::flow::StoreOp, params: &crate::ir::flow::StorePa
         ("query", params.query.as_ref()),
         ("prefix", params.prefix.as_ref()),
         ("after", params.after.as_ref()),
+        // PRD resolved q73's business key, evaluated in this same input phase
+        // as every other parameter — so a key that cannot be evaluated fails
+        // the execution before anything is written, and a retry of the node
+        // re-derives the same string. The site's ledger key is built from it
+        // in `run` (see [`activity`]'s store arm).
+        ("idempotencyKey", params.idempotency_key.as_ref()),
     ] {
         let Some(expression) = expression else {
             continue;
@@ -2190,6 +2194,13 @@ fn store_params(op: crate::ast::flow::StoreOp, params: &crate::ir::flow::StorePa
     }
     text.push_str("  }),\n");
     text
+}
+
+/// A store's declared name — its address without the `store.` namespace — which
+/// is what `StoreBinding.name` carries ([`stores`]) and what an authored ledger
+/// key is namespaced under (PRD resolved q73).
+fn store_name(address: &str) -> &str {
+    address.split_once('.').map_or(address, |(_, rest)| rest)
 }
 
 /// A `ttl:` as `src/stores.ts` takes it: the milliseconds a key lives, or
@@ -2558,16 +2569,36 @@ fn activity(
         // field grammar 11.4 marks optional — `value` on a `get` that missed —
         // is required in it, so a parse would refuse exactly the answer
         // Decision D110 says a miss gives.
-        NodeKind::Store { store, op, .. } => format!(
-            "  run: async (input, context, view) => ({{\n    \
-             output: await stores.runStoreOp(\n      {},\n      {},\n      \
-             input as stores.StoreParams,\n      context,\n      \
-             {{ via: \"node\", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, {})].join(\"/\") }},\n    \
-             ),\n  }}),\n",
-            names.value(&store.value.to_string()),
-            names::string(op.as_str()),
-            names::string(id)
-        ),
+        // The site's ledger key is one of two, and which is decided here, in
+        // one file: grammar 9.4's derived key — the execution id and the
+        // node's flattened instance path — or, on a node that wrote
+        // `idempotency_key:`, the authored one, `author/<store>/<key>` (PRD
+        // resolved q73). `<store>` is the store's declared name, the one
+        // `StoreBinding.name` carries and a dialled ledger's `store` column
+        // holds, so it is one rule on every arm; the key is the string the
+        // input phase evaluated. `view` is unread on that arm, which is the
+        // point: an authored key names no instance.
+        NodeKind::Store { store, op, params } => {
+            let site = match &params.idempotency_key {
+                None => format!(
+                    "{{ via: \"node\", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, {})].join(\"/\") }}",
+                    names::string(id)
+                ),
+                Some(_) => format!(
+                    "{{ via: \"node\", idempotencyKey: stores.authoredKey({}, (input as stores.StoreParams).idempotencyKey) }}",
+                    names::string(store_name(&store.value.to_string()))
+                ),
+            };
+            format!(
+                "  run: async (input, context, view) => ({{\n    \
+                 output: await stores.runStoreOp(\n      {},\n      {},\n      \
+                 input as stores.StoreParams,\n      context,\n      \
+                 {site},\n    \
+                 ),\n  }}),\n",
+                names.value(&store.value.to_string()),
+                names::string(op.as_str()),
+            )
+        }
     }
 }
 

@@ -83,7 +83,10 @@ const POSTGRES_CONCURRENT_CREATOR: readonly string[] = ["23505", "42P07", "42710
  * upgrade. PRD resolved q69 gave every key an `expires_at`, `NULL` on every row
  * an earlier release wrote, which is a key that never expires; and the two
  * partial indexes an expiry is found through, which a key that never expires
- * costs nothing in. The whole of it is **one transaction holding
+ * costs nothing in. PRD resolved q73 gave the ledger one too — an authored
+ * row's, under a store's `default_ttl:` — `NULL` on every row an earlier
+ * release claimed, each a derived one, which never expires; and the partial
+ * index the ledger's sweeps read through. The whole of it is **one transaction holding
  * [`POSTGRES_STORE_SCHEMA_LOCK`]**, because `IF NOT EXISTS` is not atomic
  * against a concurrent creator and a store is opened concurrently by design.
  *
@@ -129,7 +132,9 @@ const POSTGRES_CONCURRENT_CREATOR: readonly string[] = ["23505", "42P07", "42710
  * `ON CONFLICT DO NOTHING` changes no row, and `RemoteKv` reads the answer the
  * first attempt gave instead of applying the effect again. `scope_key` is on the
  * row rather than in the key so that an execution-scoped partition can be
- * deleted whole when its run ends.
+ * deleted whole when its run ends — and so that an authored key (PRD resolved
+ * q73), which is a store's rather than a partition's, is one row whichever
+ * partition wrote it.
  *
  * `store_sequences` holds each partition's version sequence — the last version
  * it handed out — and its row is also the lock every write to the partition
@@ -178,9 +183,24 @@ CREATE TABLE IF NOT EXISTS store_applied (
   idempotency_key TEXT COLLATE "C" NOT NULL,
   op              TEXT NOT NULL,
   result          TEXT NOT NULL,
+  expires_at      BIGINT,
   PRIMARY KEY (store, idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS store_applied_partition ON store_applied (store, scope_key);
+DO $migrate_ledger$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_attribute
+    WHERE attrelid = 'store_applied'::regclass AND attname = 'expires_at' AND NOT attisdropped
+  ) THEN
+    ALTER TABLE store_applied ADD COLUMN IF NOT EXISTS expires_at BIGINT;
+  END IF;
+  IF to_regclass('store_applied_expiry') IS NULL THEN
+    CREATE INDEX IF NOT EXISTS store_applied_expiry
+      ON store_applied (store, expires_at) WHERE expires_at IS NOT NULL;
+  END IF;
+END
+$migrate_ledger$;
 CREATE TABLE IF NOT EXISTS store_sequences (
   store     TEXT COLLATE "C" NOT NULL,
   scope_key TEXT COLLATE "C" NOT NULL,
@@ -290,6 +310,22 @@ function postgresSweep(limit: number): string {
   );
 }
 
+/**
+ * …and the same bounded `DELETE` over one store's ledger: its expired rows,
+ * which are authored ones all (PRD resolved q73), through the partial index over
+ * `(store, expires_at)`.
+ *
+ * Run only under the store's authored lock (`StoreDialect.sweepLedger`), and
+ * `FOR UPDATE SKIP LOCKED` for [`postgresSweep`]'s reason: it never waits on a
+ * row something outside that lock holds.
+ */
+function postgresLedgerSweep(limit: number): string {
+  return (
+    "DELETE FROM store_applied WHERE ctid = ANY(ARRAY(SELECT ctid FROM store_applied " +
+    `WHERE store = ? AND expires_at <= ? LIMIT ${limit} FOR UPDATE SKIP LOCKED))`
+  );
+}
+
 /** Postgres speaks the standard upsert in both of its forms. */
 const POSTGRES_STORE_DIALECT: StoreDialect = {
   bind: numberedStoreBind,
@@ -297,6 +333,10 @@ const POSTGRES_STORE_DIALECT: StoreDialect = {
   ignore: standardIgnore,
   clock: POSTGRES_STORE_CLOCK,
   sweepPartition: postgresSweep,
+  sweepLedger: postgresLedgerSweep,
+  // A `TEXT COLLATE "C"` column holds any string a key is, so every key is
+  // spelled as it is.
+  ledgerKey: (idempotencyKey) => idempotencyKey,
 };
 
 /**

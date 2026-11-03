@@ -12149,6 +12149,98 @@ fn a_flow_moves_a_record_with_a_batch_and_routes_on_what_it_answered() {
     );
 }
 
+/// A webhook handler run twice with one business event writes the event once,
+/// and the second **execution** routes on `deduped` (grammar 11.4, PRD resolved
+/// q73).
+///
+/// `flow.webhook` writes `event/<id>` under `idempotency_key: "input.event_id"`
+/// and routes on `deduped`. Two runs into one project are two executions over
+/// one `scope: global` store, the second with another payload: the first lands
+/// and takes the fresh branch; the second is answered with the first's whole
+/// row — `deduped: true`, the first's `version` — writes nothing, and takes the
+/// other branch, where the key still holds the first payload. Both trace records
+/// carry the ledger key as the write carried it, `author/events/<id>`, which
+/// names no instance; a third run with another event id is another write.
+#[test]
+fn a_webhook_run_twice_with_one_business_key_writes_once_and_routes_on_deduped() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(project) = harness::scratch_project("authored-key") else {
+        return;
+    };
+    let environment = harness::environment(&provider);
+    let deliver = |event: &str, payload: &str| {
+        let run = harness::run_into(
+            &project,
+            "stores",
+            "flow.webhook",
+            &[("event_id", event), ("payload", payload)],
+            None,
+            &environment,
+        );
+        run.succeeded();
+        run
+    };
+    let record_of = |run: &harness::Run| -> Value {
+        let records: Vec<Value> = run
+            .entries("record")
+            .into_iter()
+            .filter_map(|entry| entry["stores"].as_array().cloned())
+            .flatten()
+            .collect();
+        assert_eq!(records.len(), 1, "one write record: {records:#?}");
+        records[0].clone()
+    };
+
+    let first = deliver("evt-1", "the first delivery");
+    let second = deliver("evt-1", "a redelivery");
+    let (once, twice) = (first.outputs(), second.outputs());
+    assert_eq!(once["webhook_duplicate"], json!(false), "{once}");
+    assert_eq!(twice["webhook_duplicate"], json!(true), "{twice}");
+    assert!(once["webhook_version"].is_u64(), "{once}");
+    assert_eq!(
+        twice["webhook_version"], once["webhook_version"],
+        "the second execution is answered with the first's version"
+    );
+    assert_eq!(
+        twice["webhook_record"],
+        json!({ "payload": "the first delivery" }),
+        "the store holds the one write the first execution made: {twice}"
+    );
+    assert!(
+        !first.entries("fresh").is_empty() && first.entries("repeated").is_empty(),
+        "the first arrival takes the fresh branch"
+    );
+    assert!(
+        second.entries("fresh").is_empty() && !second.entries("repeated").is_empty(),
+        "the second arrival routes on `deduped` to the other branch"
+    );
+    for (run, deduped) in [(&first, false), (&second, true)] {
+        let record = record_of(run);
+        assert_eq!(record["op"], "set", "{record}");
+        assert_eq!(record["effect"], "write", "{record}");
+        assert_eq!(
+            record["idempotencyKey"],
+            json!("author/events/evt-1"),
+            "the record carries the authored ledger key as the write carried it: {record}"
+        );
+        assert_eq!(record["deduped"], json!(deduped), "{record}");
+        assert_eq!(record["applied"], json!(true), "{record}");
+    }
+
+    let other = deliver("evt-2", "another event");
+    let elsewhere = other.outputs();
+    assert_eq!(elsewhere["webhook_duplicate"], json!(false), "{elsewhere}");
+    assert_eq!(
+        elsewhere["webhook_record"],
+        json!({ "payload": "another event" }),
+        "{elsewhere}"
+    );
+    assert_eq!(
+        record_of(&other)["idempotencyKey"],
+        json!("author/events/evt-2")
+    );
+}
+
 /// D67 admits a `batch` inside a `map`, at a key every instance shares, and
 /// every instance's batch lands whole (grammar 11.4, PRD resolved q71).
 ///
@@ -20842,6 +20934,108 @@ fn a_resumed_run_answers_a_count_and_a_get_many_out_of_the_record() {
         json!(2),
         "a live `count` sees the key the resumed one did not: {}",
         fresh.stderr()
+    );
+}
+
+/// A resumed generation answers a write under an authored key out of the
+/// record, and reaches no live store for it (PRD resolved q73, q29).
+///
+/// `flow.recorded` writes `event/<id>` under `idempotency_key: "input.event_id"`
+/// and then calls a model, and the run is killed during that call — so the
+/// write has committed and is behind the frontier. While the execution is down
+/// a second execution writes the same business key and is answered as a
+/// duplicate: the ledger holds the row, so a live write here would answer
+/// `deduped: true` too. The resumed generation answers `deduped: false` — the
+/// first generation's own answer, out of the journal — and its record carries
+/// the authored ledger key as the first generation carried it.
+#[test]
+fn a_resumed_run_answers_a_write_under_an_authored_key_out_of_the_record() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "a recorded note" })).after(Duration::from_secs(120)),
+    ));
+
+    let Some((project, built)) = harness::build_under_toolchain("durability", "resume-recorded")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the durability fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let environment = harness::environment(&provider);
+
+    let killed = harness::crash_run(
+        &project,
+        &["run", "flow.recorded", "--input", "event_id=evt-9"],
+        &environment,
+        |_| provider.snapshot().requests >= 1,
+    );
+
+    // A second execution of the same business event, while the first is down.
+    provider.reset();
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "a second note" })),
+    ));
+    let duplicate = harness::run_into(
+        &project,
+        "durability",
+        "flow.recorded",
+        &[("event_id", "evt-9")],
+        None,
+        &environment,
+    );
+    duplicate.succeeded();
+    assert_eq!(
+        duplicate.outputs()["recorded_duplicate"],
+        json!(true),
+        "the first generation's write committed before the model call it died in, so a \
+         second execution is answered as its duplicate"
+    );
+
+    provider.reset();
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "a recorded note" })),
+    ));
+    let resumed = harness::resume(
+        &project,
+        "durability",
+        &killed.execution,
+        Some("json"),
+        &environment,
+    );
+    resumed.succeeded();
+    let answered = resumed.outputs();
+    assert_eq!(answered["status"], "completed", "{answered}");
+    assert_eq!(
+        answered["outputs"]["recorded_duplicate"],
+        json!(false),
+        "the replayed write answers what the first generation's did, out of the record — a \
+         live one would have met the ledger row and answered `deduped: true`: {answered}"
+    );
+    let trace = answered["trace"].as_array().expect("a trace");
+    let record = trace
+        .iter()
+        .find(|entry| entry["node"] == "record")
+        .and_then(|entry| entry["stores"].as_array())
+        .and_then(|records| records.first().cloned())
+        .unwrap_or_else(|| panic!("the `record` node's write is on its entry: {answered}"));
+    assert_eq!(record["op"], "set", "{record}");
+    assert_eq!(record["applied"], json!(true), "{record}");
+    assert_eq!(record["deduped"], json!(false), "{record}");
+    assert_eq!(
+        record["idempotencyKey"],
+        json!("author/ledger/evt-9"),
+        "{record}"
+    );
+    assert_eq!(
+        provider.snapshot().requests,
+        1,
+        "only the killed model call was made again"
     );
 }
 

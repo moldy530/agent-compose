@@ -1,0 +1,364 @@
+{
+  "name": "an-authored-store-key",
+  "about": "A store write under an authored ledger key (PRD resolved q73) beside one under a derived key. The derived key is §8's instance path and is reported as `agentcompose.instance_path`; the authored one, `author/<store>/<key>`, names no instance, so the store event carries it as `agentcompose.store.idempotency_key` and carries no instance path at all. The second execution's write under the business key was answered with the first's row: `applied` and `version` are the first's, and `deduped` is true.",
+  "context": {
+    "target": "staging",
+    "artifact": "sha256:00000000000000000000000000000000000000000000000000000000000000a7",
+    "compiler": "0.0.0-dev",
+    "startedAt": "2026-11-02T09:00:00.000Z",
+    "endedAt": "2026-11-02T09:00:01.000Z"
+  },
+  "document": {
+    "trace_version": 6,
+    "flow": "flow.webhook",
+    "execution_id": "exec_second_delivery",
+    "status": "completed",
+    "entries": [
+      {
+        "step": 1,
+        "flow": "flow.webhook",
+        "node": "record",
+        "traversal": 0,
+        "outcome": "completed",
+        "attempts": 1,
+        "writes": [
+          "webhook_duplicate",
+          "webhook_version"
+        ],
+        "stores": [
+          {
+            "store": "store.events",
+            "op": "set",
+            "effect": "write",
+            "via": "node",
+            "scope": "global",
+            "key": "event/evt-1",
+            "applied": true,
+            "version": 4,
+            "idempotencyKey": "author/events/evt-1",
+            "deduped": true
+          },
+          {
+            "store": "store.events",
+            "op": "incr",
+            "effect": "write",
+            "via": "node",
+            "scope": "global",
+            "key": "arrivals",
+            "applied": true,
+            "version": 5,
+            "idempotencyKey": "exec_second_delivery/record/0",
+            "deduped": false
+          }
+        ]
+      }
+    ]
+  },
+  "expected": {
+    "resourceSpans": [
+      {
+        "resource": {
+          "attributes": [
+            {
+              "key": "service.name",
+              "value": {
+                "stringValue": "flow.webhook"
+              }
+            },
+            {
+              "key": "service.namespace",
+              "value": {
+                "stringValue": "staging"
+              }
+            },
+            {
+              "key": "service.version",
+              "value": {
+                "stringValue": "sha256:00000000000000000000000000000000000000000000000000000000000000a7"
+              }
+            },
+            {
+              "key": "deployment.environment.name",
+              "value": {
+                "stringValue": "staging"
+              }
+            },
+            {
+              "key": "telemetry.sdk.name",
+              "value": {
+                "stringValue": "agent-compose"
+              }
+            },
+            {
+              "key": "telemetry.sdk.language",
+              "value": {
+                "stringValue": "nodejs"
+              }
+            },
+            {
+              "key": "telemetry.sdk.version",
+              "value": {
+                "stringValue": "0.0.0-dev"
+              }
+            }
+          ]
+        },
+        "scopeSpans": [
+          {
+            "scope": {
+              "name": "agent-compose",
+              "version": "0.0.0-dev"
+            },
+            "spans": [
+              {
+                "traceId": "b826ea0dabd1ba346b6cefa34f621c53",
+                "spanId": "7ba3eeca5cbbd87b",
+                "name": "flow.webhook",
+                "kind": 1,
+                "startTimeUnixNano": "1793610000000000000",
+                "endTimeUnixNano": "1793610001000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.execution.id",
+                    "value": {
+                      "stringValue": "exec_second_delivery"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.webhook"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.status",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.trace_version",
+                    "value": {
+                      "intValue": "6"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "b826ea0dabd1ba346b6cefa34f621c53",
+                "spanId": "08c606747494c793",
+                "parentSpanId": "7ba3eeca5cbbd87b",
+                "name": "record",
+                "kind": 1,
+                "startTimeUnixNano": "1793610000000000000",
+                "endTimeUnixNano": "1793610001000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_second_delivery/record/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.webhook"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "record"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "webhook_duplicate"
+                          },
+                          {
+                            "stringValue": "webhook_version"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [
+                  {
+                    "timeUnixNano": "1793610000000000000",
+                    "name": "store",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.store",
+                        "value": {
+                          "stringValue": "store.events"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.op",
+                        "value": {
+                          "stringValue": "set"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.effect",
+                        "value": {
+                          "stringValue": "write"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.via",
+                        "value": {
+                          "stringValue": "node"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.scope",
+                        "value": {
+                          "stringValue": "global"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.key",
+                        "value": {
+                          "stringValue": "event/evt-1"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.applied",
+                        "value": {
+                          "boolValue": true
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.version",
+                        "value": {
+                          "intValue": "4"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.idempotency_key",
+                        "value": {
+                          "stringValue": "author/events/evt-1"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.deduped",
+                        "value": {
+                          "boolValue": true
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "timeUnixNano": "1793610000000000000",
+                    "name": "store",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.store",
+                        "value": {
+                          "stringValue": "store.events"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.op",
+                        "value": {
+                          "stringValue": "incr"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.effect",
+                        "value": {
+                          "stringValue": "write"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.via",
+                        "value": {
+                          "stringValue": "node"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.scope",
+                        "value": {
+                          "stringValue": "global"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.key",
+                        "value": {
+                          "stringValue": "arrivals"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.applied",
+                        "value": {
+                          "boolValue": true
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.version",
+                        "value": {
+                          "intValue": "5"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.instance_path",
+                        "value": {
+                          "stringValue": "exec_second_delivery/record/0"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.deduped",
+                        "value": {
+                          "boolValue": false
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

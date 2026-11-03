@@ -631,6 +631,11 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "a_write_an_earlier_release_recorded_still_dedupes",
     "if_version_zero_names_a_key_an_earlier_release_wrote",
     "an_upgraded_partitions_sequence_starts_past_what_it_holds",
+    // …and the ledger a release before PRD resolved q73 created, brought
+    // forward the same way: an `expires_at` on every arm, `NULL` on every row
+    // it held, and an authored write that dedupes over it.
+    "a_store_from_before_authored_keys_takes_every_opener_at_once",
+    "a_ledger_from_before_authored_keys_is_migrated_on_open",
     // The trace: a write record carries `applied` and `version`, and a tool's
     // carries neither an idempotency key nor `deduped`.
     "a_node_write_record_carries_applied_version_and_its_key",
@@ -747,6 +752,9 @@ const TRUE_EVERYWHERE: &[&str] = &[
     // than applying one its ledger can no longer answer.
     "a_command_letting_go_prunes_what_a_running_delivery_held_back",
     "a_delivery_cut_off_by_its_command_is_refused_a_keyed_write",
+    // …but not a write under an authored key, whose row no prune removes
+    // (PRD resolved q73).
+    "a_delivery_cut_off_by_its_command_still_makes_an_authored_write",
     // …and so does a `serve` when it is stopped, the one exit it has: nothing
     // comes back for a settled execution afterwards, so the stop starts the
     // prune and refuses the delivery's keyed write the same way — while
@@ -880,6 +888,37 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "every_key_two_racing_batches_wrote_holds_the_last_batchs_value",
     "a_reader_beside_two_racing_batches_never_finds_one_half_landed",
     "two_processes_racing_batches_into_adjacent_partitions_all_apply",
+    // PRD resolved q73: an authored idempotency key — `author/<store>/<key>`,
+    // a business key two executions share. The second execution's write is
+    // answered with the first's whole row and writes nothing; the namespace
+    // carries the store, and is disjoint from every derived key; it is a
+    // store's and not a partition's; two processes racing one key apply it
+    // once; the settlement prune never takes it; it lives as long as the
+    // store's `default_ttl:`, and for good without one; a batch dedupes whole;
+    // and what it refuses is refused by name.
+    "a_second_execution_under_an_authored_key_is_answered_with_the_firsts_row",
+    "an_authored_key_holds_the_first_executions_value_and_version",
+    "a_retry_under_an_authored_key_dedupes_the_same_way",
+    "an_authored_write_record_carries_the_ledger_key_as_carried",
+    "two_different_authored_keys_both_apply",
+    "the_same_authored_key_on_two_stores_applies_on_both",
+    "a_derived_and_an_authored_write_are_independent_ledger_rows",
+    "an_authored_key_another_op_took_fails_naming_both",
+    "an_authored_key_past_ascii_applies_and_dedupes",
+    "two_session_partitions_sharing_an_authored_key_dedupe_against_each_other",
+    "two_partitions_racing_one_authored_key_apply_it_once",
+    "two_processes_writing_one_authored_key_apply_it_once",
+    "two_processes_in_two_partitions_writing_one_authored_key_apply_it_once",
+    "a_settled_executions_prune_takes_its_derived_rows_and_leaves_its_authored_one",
+    "an_authored_key_answers_within_the_stores_default_ttl",
+    "an_authored_key_past_the_stores_default_ttl_applies_again",
+    "an_expired_authored_row_leaves_storage_at_the_next_authored_write",
+    "an_expired_authored_row_leaves_storage_when_a_process_next_starts",
+    "an_authored_row_on_a_store_without_default_ttl_answers_after_any_wait",
+    "a_batch_under_an_authored_key_dedupes_whole",
+    "an_authored_key_on_an_execution_scoped_store_is_refused",
+    "an_execution_id_in_the_authored_namespace_is_refused_by_the_store_and_the_journal",
+    "every_derived_child_execution_id_is_outside_the_authored_namespace",
 ];
 
 /// The order every arm pages a mixed set in: UTF-8 byte order, which Rust's

@@ -117,7 +117,17 @@ import type { Connection, ResultSetHeader, RowDataPacket } from "mysql2/promise"
  * without help: an idempotency key is `<execution id>/<instance path>` (PRD
  * 5.8), every frame of which this compiler composes out of identifiers and
  * decimals, so 2048 ASCII bytes beside `store`'s 128 is 2176 and inside the
- * limit.
+ * limit. An **authored** key (PRD resolved q73) is `author/<store>/` and a
+ * string the composition evaluated — any string, emoji included — so the column
+ * cannot hold it as written; it stays `ascii` and 2048 long, and every key is
+ * bound to it as [`mysqlLedgerKey`] spells it: ASCII as it is, every other byte
+ * and `%` percent-encoded. A spelled key past 2048 bytes is refused by the
+ * server under `STRICT_TRANS_TABLES` — failing the write, never folding two keys
+ * into one row — which `docs/topics/stores.md` states as this arm's bound on
+ * one. Its `expires_at` is an authored row's under a store's
+ * `default_ttl:`, `NULL` on every other, and `store_applied_expiry` is what the
+ * ledger's sweeps read through, under the same `NULL`-sorts-first reasoning as
+ * the entries' below.
  *
  * `store_sequences` holds each partition's version sequence (PRD resolved q68)
  * — the last version it handed out — and its row is also the lock every write
@@ -158,8 +168,10 @@ const MYSQL_STORE_SCHEMA = [
   idempotency_key VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   op              VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   result          LONGTEXT NOT NULL,
+  expires_at      BIGINT NULL,
   PRIMARY KEY (store, idempotency_key),
-  KEY store_applied_partition (store, scope_key(255))
+  KEY store_applied_partition (store, scope_key(255)),
+  KEY store_applied_expiry (store, expires_at)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
   `CREATE TABLE IF NOT EXISTS store_sequences (
   store      VARCHAR(128)  CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
@@ -172,7 +184,9 @@ const MYSQL_STORE_SCHEMA = [
 /**
  * The migrations, in the order they apply, on a `store_entries` an earlier
  * release created: the `version` column PRD resolved q68 gave every `kv` key,
- * then the `expires_at` column and the two indexes PRD resolved q69 did.
+ * then the `expires_at` column and the two indexes PRD resolved q69 did — and,
+ * on a `store_applied` from before PRD resolved q73, the ledger's own
+ * `expires_at` and its index, `NULL` on every row such a release claimed.
  *
  * Each is probed rather than attempted, because MySQL has no `ADD COLUMN IF NOT
  * EXISTS` and no `ADD INDEX IF NOT EXISTS`; and a concurrent opener that added
@@ -206,6 +220,18 @@ const MYSQL_STORE_MIGRATIONS: readonly { readonly probe: string; readonly add: s
       "SELECT COUNT(*) AS held FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() " +
       "AND TABLE_NAME = 'store_entries' AND INDEX_NAME = 'store_entries_expiry'",
     add: "ALTER TABLE store_entries ADD KEY store_entries_expiry (store, expires_at)",
+  },
+  {
+    probe:
+      "SELECT COUNT(*) AS held FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() " +
+      "AND TABLE_NAME = 'store_applied' AND COLUMN_NAME = 'expires_at'",
+    add: "ALTER TABLE store_applied ADD COLUMN expires_at BIGINT NULL AFTER result",
+  },
+  {
+    probe:
+      "SELECT COUNT(*) AS held FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() " +
+      "AND TABLE_NAME = 'store_applied' AND INDEX_NAME = 'store_applied_expiry'",
+    add: "ALTER TABLE store_applied ADD KEY store_applied_expiry (store, expires_at)",
   },
 ];
 
@@ -304,6 +330,30 @@ const MYSQL_STORE_CLOCK = "CAST(FLOOR(UNIX_TIMESTAMP(NOW(3)) * 1000) AS SIGNED)"
  */
 const MYSQL_STORE_TIME_ZONE = "SET SESSION time_zone = '+00:00'";
 
+/**
+ * An idempotency key as `store_applied.idempotency_key` — `ascii`, so that the
+ * primary key over it stays inside the index budget ([`MYSQL_STORE_SCHEMA`]) —
+ * holds it (PRD resolved q73): every byte of the key's UTF-8 that is ASCII and
+ * not `%` as itself, and every other byte as `%` and two upper-case hex digits.
+ *
+ * Reversible, so two keys are never one row; and the identity on every key
+ * that is ASCII and holds no `%`, which every derived key is — an execution id
+ * this runtime mints and a path of identifiers and decimals — so a row an
+ * earlier release claimed is found by the same string, and a prefix spells as
+ * a prefix, which is what the settlement prune's range is over. An authored
+ * key is the one that can hold anything, and it is what this exists for.
+ */
+function mysqlLedgerKey(idempotencyKey: string): string {
+  let spelled = "";
+  for (const byte of new TextEncoder().encode(idempotencyKey)) {
+    spelled +=
+      byte < 0x80 && byte !== 0x25
+        ? String.fromCharCode(byte)
+        : `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+  }
+  return spelled;
+}
+
 /** MySQL takes `?` as written. */
 const MYSQL_STORE_DIALECT: StoreDialect = {
   bind: positionalBind,
@@ -321,6 +371,13 @@ const MYSQL_STORE_DIALECT: StoreDialect = {
   sweepPartition: (limit) =>
     "DELETE FROM store_entries WHERE store = ? AND scope_hash = UNHEX(SHA2(?, 256)) " +
     `AND expires_at <= ? ORDER BY expires_at LIMIT ${limit}`,
+  // One store's ledger, through `store_applied_expiry`, and only ever under the
+  // store's authored lock (`StoreDialect.sweepLedger`, PRD resolved q73) — the
+  // one lock every statement touching an authored row takes, so no second
+  // `DELETE` reaches these rows through another index while it runs.
+  sweepLedger: (limit) =>
+    `DELETE FROM store_applied WHERE store = ? AND expires_at <= ? ORDER BY expires_at LIMIT ${limit}`,
+  ledgerKey: mysqlLedgerKey,
 };
 
 /**
