@@ -1,0 +1,18 @@
+# rule: a `batch` entry's `op:` is the literal `set` or `delete`, never CEL (grammar 11.4, PRD resolved q71)
+# code: unknown-variant
+# message: the `op` of `ops[1]` of node `move` is `state.kind`, and a batch entry is a `set` or a `delete`
+# at: 15:17
+# help: an entry's `op:` is the literal `set` or `delete`, never an expression — which write each entry is has to be readable without running the graph — and the partial updates are nodes of their own, since each reads the value it changes (grammar 11.4, PRD resolved q71)
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    move:
+      store: store.memory
+      op: batch
+      ops:
+        - { op: set, key: "'new'", value: { body: "'x'" } }
+        - { op: "state.kind", key: "'old'" }
+  edges:
+    - { from: start, to: move }
+    - { from: move, to: end }

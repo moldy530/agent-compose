@@ -37,6 +37,18 @@
 //! `get_many`'s `keys:` is a list-of-strings expression whose **length** is a
 //! run-time fact, so the most one reads is the runtime's to enforce.
 //!
+//! # A batch (PRD resolved q71)
+//!
+//! A `batch`'s `ops:` is a literal list, and the parser has already held it to
+//! its bounds and each entry to its **row** — the single op of its name's: a
+//! `set` entry takes a `key` and a `value` and may carry one condition and a
+//! `ttl`, a `delete` entry takes a `key` and may carry `if_version:` alone —
+//! because both are decidable in one file, and the published schema encodes
+//! them too. What is left is what its expressions hold, which is exactly the
+//! single op's: the key a string, the value a field map checked against
+//! `value_schema` and total, the version an integer. A `batch` is a `kv` op,
+//! which [`model::kind_takes`] decides like every other row.
+//!
 //! # Keying a write inside a fan-out
 //!
 //! A store write performed inside a `map`-dispatched instance must have an
@@ -58,12 +70,13 @@
 
 use crate::ast::common::{Address, Ident};
 use crate::ast::definition::{StoreKind, StoreScope};
+use crate::ast::flow::BatchOp;
 use crate::ast::flow::StoreOp;
 use crate::ast::schema::ScalarKind;
 use crate::cel::ty::Type;
 use crate::diag::{Diagnostic, DiagnosticCode, Spanned};
 use crate::ir::binding::Bindings;
-use crate::ir::flow::{Node, NodeKind, StoreParams, StoreValue};
+use crate::ir::flow::{BatchEntry, Node, NodeKind, StoreParams, StoreValue};
 use crate::ir::schema::{FieldMap, TypeForm};
 use crate::ir::trigger::TriggerKind;
 
@@ -187,6 +200,24 @@ pub(crate) fn store_node<'a>(
         );
     }
 
+    // A `batch`'s entries, each held to the row of the single op it is and
+    // its expressions typed as that op's are (PRD resolved q71).
+    for (index, entry) in params
+        .ops
+        .iter()
+        .flat_map(|ops| ops.value.iter())
+        .enumerate()
+    {
+        batch_entry(
+            ctx,
+            &scope,
+            &format!("`ops[{index}]` of {subject}"),
+            store,
+            definition.value_schema.as_ref(),
+            entry,
+        );
+    }
+
     // A `get_many`'s keys are one expression, and its result is a list of
     // strings. How many it holds is not static — a CEL list's length is a run
     // time fact — so the most one reads (`GET_MANY_MAX_KEYS`) is enforced
@@ -298,6 +329,63 @@ pub(crate) fn store_node<'a>(
                 }
             }
         }
+    }
+}
+
+/// One `batch` entry's expressions, typed as the single op's are (grammar
+/// 11.4, PRD resolved q71): the key a string, a `set` entry's value a field
+/// map checked against `V` and total, the version an integer.
+///
+/// The entry's **row** — which keys its op admits — is the parser's, decided in
+/// one file as a single op's row is, so every entry that reaches here carries
+/// exactly the keys its op takes.
+fn batch_entry(
+    ctx: &mut Ctx,
+    scope: &crate::cel::Scope,
+    subject: &str,
+    store: &Spanned<Address>,
+    value_schema: Option<&FieldMap>,
+    entry: &BatchEntry,
+) {
+    if let Some(key) = &entry.key {
+        let analysis = expr::analyze(ctx, key, scope);
+        expr::expect(
+            ctx,
+            key,
+            &analysis,
+            &Type::String,
+            &format!("`key` of {subject}"),
+        );
+    }
+    if let Some(value) = &entry.value {
+        match value_schema {
+            // A `set` entry's value is a `set`'s: total, field by field, against
+            // `V`.
+            Some(schema) if entry.op.value == BatchOp::Set => schema_bindings(
+                ctx,
+                value,
+                scope,
+                schema,
+                &format!("`value` of {subject}"),
+                &store.value.to_string(),
+                true,
+            ),
+            _ => {
+                for binding in &value.entries {
+                    expr::analyze(ctx, &binding.value, scope);
+                }
+            }
+        }
+    }
+    if let Some(version) = &entry.if_version {
+        let analysis = expr::analyze(ctx, version, scope);
+        expr::expect(
+            ctx,
+            version,
+            &analysis,
+            &Type::Int,
+            &format!("`if_version` of {subject}"),
+        );
     }
 }
 
@@ -559,6 +647,13 @@ pub(crate) fn check_map_writes(ctx: &mut Ctx) {
             let Some(definition) = ctx.store(&store.value) else {
                 continue;
             };
+            // An op its store's kind does not take is already refused against
+            // the store (`store_node`): a `batch` on a `vector` store has no
+            // key to derive, and a second error about it would be about a row
+            // that does not exist.
+            if !model::kind_takes(definition.kind, *op) {
+                continue;
+            }
             // A `kv` write addresses a slot the author named, so concurrent
             // instances sharing a key are many writers on one record: a `set`
             // is a declared overwrite — the store-side counterpart of `reduce:

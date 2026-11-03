@@ -1400,6 +1400,9 @@ fn store_tool_description(
         // decided. The match is total, so they are worded like the rest.
         crate::ast::flow::StoreOp::Count => "Count the keys under a prefix in",
         crate::ast::flow::StoreOp::GetMany => "Read several stored values by key from",
+        // Nor this one, at any level (PRD resolved q71): a `batch` is a node's
+        // alone.
+        crate::ast::flow::StoreOp::Batch => "Write or delete several keys at once in",
     };
     match &store.description {
         Some(description) => format!("{what} `{address}`. {}", description.value.trim()),
@@ -2133,14 +2136,69 @@ fn store_params(op: crate::ast::flow::StoreOp, params: &crate::ir::flow::StorePa
     // milliseconds a key the write leaves lives, or `"never"`, which clears an
     // expiry the store's `default_ttl:` would otherwise set.
     if let Some(ttl) = &params.ttl {
-        let ttl = match &ttl.value {
-            crate::ast::flow::StoreTtl::Never => names::string("never"),
-            crate::ast::flow::StoreTtl::After(duration) => ttl_millis(duration).to_string(),
-        };
-        text.push_str(&format!("    ttl: {ttl},\n"));
+        text.push_str(&format!("    ttl: {},\n", ttl_literal(&ttl.value)));
+    }
+    // A `batch`'s entries (PRD resolved q71), one object each in the order
+    // they apply, every field spelled exactly as the single op's above: the
+    // op, the condition and the `ttl` literals, the key, the value and the
+    // version evaluated in this same input phase — so an entry whose
+    // expression cannot be evaluated fails the execution before anything is
+    // written, as a single write's does.
+    if let Some(ops) = &params.ops {
+        text.push_str("    ops: [\n");
+        for entry in &ops.value {
+            text.push_str("      {\n");
+            text.push_str(&format!(
+                "        op: {},\n",
+                names::string(entry.op.value.as_str())
+            ));
+            if let Some(key) = &entry.key {
+                text.push_str(&format!(
+                    "        key: String(runtime.toJson(runtime.evaluate({}, roots))),\n",
+                    names::string(key.value.as_str())
+                ));
+            }
+            if let Some(value) = &entry.value {
+                text.push_str("        value: {\n");
+                for binding in &value.entries {
+                    text.push_str(&format!(
+                        "          {}: runtime.toJson(runtime.evaluate({}, roots)),\n",
+                        names::string(&binding.name.value),
+                        names::string(binding.value.value.as_str())
+                    ));
+                }
+                text.push_str("        },\n");
+            }
+            if let Some(condition) = &entry.condition {
+                text.push_str(&format!(
+                    "        condition: {},\n",
+                    names::string(condition.value.as_str())
+                ));
+            }
+            if let Some(version) = &entry.if_version {
+                text.push_str(&format!(
+                    "        ifVersion: Number(runtime.toJson(runtime.evaluate({}, roots))),\n",
+                    names::string(version.value.as_str())
+                ));
+            }
+            if let Some(ttl) = &entry.ttl {
+                text.push_str(&format!("        ttl: {},\n", ttl_literal(&ttl.value)));
+            }
+            text.push_str("      },\n");
+        }
+        text.push_str("    ],\n");
     }
     text.push_str("  }),\n");
     text
+}
+
+/// A `ttl:` as `src/stores.ts` takes it: the milliseconds a key lives, or
+/// `"never"` (PRD resolved q69).
+fn ttl_literal(ttl: &crate::ast::flow::StoreTtl) -> String {
+    match ttl {
+        crate::ast::flow::StoreTtl::Never => names::string("never"),
+        crate::ast::flow::StoreTtl::After(duration) => ttl_millis(duration).to_string(),
+    }
 }
 
 /// A grammar 4.4 duration as the milliseconds a store's expiry adds to its

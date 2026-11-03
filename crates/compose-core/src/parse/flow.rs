@@ -4,10 +4,10 @@ use crate::ast::binding::NodeInput;
 use crate::ast::common::Namespace;
 use crate::ast::definition::Settings;
 use crate::ast::flow::{
-    CoderBlock, CoderWorkspace, Edge, FlowContext, FlowDef, FlowNode, Harness, HumanBlock,
-    ItemError, MapBlock, MapDispatch, MapRoute, NODE_KIND_KEYS, Node as FlowNodeAst, NodeKind,
-    PermissionMode, StoreCondition, StoreNode, StoreOp, StoreOpParams, StoreTtl, StoreValue,
-    WorkspaceAccess,
+    BATCH_MAX_ENTRIES, BatchEntry, BatchOp, CoderBlock, CoderWorkspace, Edge, FlowContext, FlowDef,
+    FlowNode, Harness, HumanBlock, ItemError, MapBlock, MapDispatch, MapRoute, NODE_KIND_KEYS,
+    Node as FlowNodeAst, NodeKind, PermissionMode, StoreCondition, StoreNode, StoreOp,
+    StoreOpParams, StoreTtl, StoreValue, WorkspaceAccess,
 };
 use crate::ast::policy::PolicyBlock;
 use crate::ast::schema::Surface;
@@ -625,6 +625,7 @@ const STORE_OPS: &[(&str, StoreOp)] = &[
     ("incr", StoreOp::Incr),
     ("count", StoreOp::Count),
     ("get_many", StoreOp::GetMany),
+    ("batch", StoreOp::Batch),
 ];
 
 /// The two literal conditions a `kv` write's `if:` takes (grammar 11.4, PRD
@@ -785,6 +786,7 @@ const STORE_PARAMS: &[&str] = &[
     "after",
     "include_values",
     "keys",
+    "ops",
 ];
 
 /// The `kv` writes that take a `ttl:` (grammar 11.4, PRD resolved q69), named
@@ -879,16 +881,28 @@ fn store_params(
                 ),
             )
             .with_label(op.span.clone(), "the op is declared here")
-            .with_help(format!(
-                "`{}` takes {}{}",
-                op.value.as_str(),
-                list(&legal),
-                if *name == "ttl" {
-                    ttl_help(op.value)
+            .with_help(if op.value == StoreOp::Batch {
+                // Every parameter a write takes is an entry's on a `batch`, so
+                // the one that was written at the node is named where it goes.
+                if BATCH_ENTRY_KEYS.contains(name) {
+                    format!(
+                        "`batch` takes `ops` alone: each entry carries its own `key`, `value`, `if`, `if_version` and `ttl`, so write `{name}:` inside the entries it belongs to (grammar 11.4, PRD resolved q71)"
+                    )
                 } else {
-                    String::new()
+                    "`batch` takes `ops` alone, a list of `set` and `delete` entries (grammar 11.4, PRD resolved q71)".to_string()
                 }
-            )),
+            } else {
+                format!(
+                    "`{}` takes {}{}",
+                    op.value.as_str(),
+                    list(&legal),
+                    if *name == "ttl" {
+                        ttl_help(op.value)
+                    } else {
+                        String::new()
+                    }
+                )
+            }),
         );
     }
 
@@ -980,6 +994,12 @@ fn store_params(
     params.keys =
         store_param(fields, &legal, "keys").and_then(|node| lexical::cel(node, "`keys`", cx));
 
+    // PRD resolved q71's one parameter: a literal list of entries. The list's
+    // bounds and each entry's shape are decided here, in one file; what an
+    // entry of each op may carry, and what its expressions hold, is the
+    // validator's — exactly where a single `set` or `delete` has it decided.
+    params.ops = store_param(fields, &legal, "ops").and_then(|node| batch_ops(node, subject, cx));
+
     // One condition per write. Both are legal in the row, so the row's own
     // check above admits them; together they would be two answers to one
     // question — and `if: absent` beside a version is a write that can never
@@ -1002,6 +1022,245 @@ fn store_params(
     }
 
     params
+}
+
+/// Every key one `batch` entry may carry (grammar 11.4, PRD resolved q71): the
+/// op, and the five a single `set` or `delete` takes between them.
+const BATCH_ENTRY_KEYS: &[&str] = &["op", "key", "value", "if", "if_version", "ttl"];
+
+/// The two ops a `batch` entry takes.
+const BATCH_OPS: &[(&str, BatchOp)] = &[("set", BatchOp::Set), ("delete", BatchOp::Delete)];
+
+/// A `batch`'s `ops:` — a literal list of one to [`BATCH_MAX_ENTRIES`] entries
+/// (grammar 11.4, PRD resolved q71).
+///
+/// The **first list-valued parameter** of the catalogue, and a literal one: the
+/// list is written out in the node, so how many entries it holds and which op
+/// each is are readable without running the graph, and its bounds are decided
+/// here rather than at run time as a `get_many`'s are. Every entry is read even
+/// when the list is out of bounds, so a mistake inside one is reported beside
+/// the bound rather than after it is repaired.
+fn batch_ops(node: &Node, subject: &str, cx: &mut Cx) -> Option<Spanned<Vec<BatchEntry>>> {
+    let Some(items) = node.as_sequence() else {
+        cx.wrong_type(
+            node,
+            &format!("`ops` of {subject}"),
+            "a list of `set` and `delete` entries",
+        );
+        return None;
+    };
+    if items.is_empty() || items.len() > BATCH_MAX_ENTRIES {
+        let held = match items.len() {
+            0 => "is empty".to_string(),
+            count => format!("holds {count} entries"),
+        };
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::ValueOutOfRange,
+                node.span.clone(),
+                format!(
+                    "`ops` of {subject} {held}, and a `batch` applies 1 to {BATCH_MAX_ENTRIES}"
+                ),
+            )
+            .with_help(if items.is_empty() {
+                "a batch applies its entries in one transaction under one ledger row, so one with none would be a write of nothing: write its entries, or drop the node (grammar 11.4, PRD resolved q71)".to_string()
+            } else {
+                format!(
+                    "one batch is at most {BATCH_MAX_ENTRIES} entries — one transaction and one ledger row; split the writes across two `batch` nodes, each of which lands all of its entries or none (grammar 11.4, PRD resolved q71)"
+                )
+            }),
+        );
+    }
+    let mut entries = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let entry_subject = format!("`ops[{index}]` of {subject}");
+        let Some(mapping) = expect_mapping(item, &entry_subject, cx) else {
+            continue;
+        };
+        entries.push(batch_entry(
+            Fields::new(mapping, item.span.clone(), entry_subject.clone()),
+            &entry_subject,
+            cx,
+        ));
+    }
+    Some(Spanned::new(entries, node.span.clone()))
+}
+
+/// One `batch` entry: its op a literal of two, and its **row** that op's.
+///
+/// Every key is read exactly as the single op of that name reads it, and which
+/// of them an entry carries is decided here, in one file, as the parameter row
+/// of a single `set` or `delete` is above: a `set` entry takes a `key` and a
+/// `value` and may carry one condition and a `ttl`; a `delete` entry takes a
+/// `key` and may carry `if_version:` alone. The published schema encodes the
+/// same rows, and a file it refuses is one the parser refuses (Appendix B). A
+/// key its op does not take is refused by name and left out of the entry, so
+/// the validator reads an entry whose row is already exact.
+fn batch_entry(mut fields: Fields<'_>, subject: &str, cx: &mut Cx) -> BatchEntry {
+    fields.note_known(BATCH_ENTRY_KEYS);
+    let span = fields.span.clone();
+    let op = match fields.take("op") {
+        Some(node) => batch_entry_op(node, subject, cx),
+        None => {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::MissingKey,
+                    span.clone(),
+                    format!("missing required key `op` in {subject}: a batch entry is a `set` or a `delete`"),
+                )
+                .with_help(
+                    "name the entry's op — `op: set` with a `key` and a `value`, or `op: delete` with a `key` (grammar 11.4, PRD resolved q71)",
+                ),
+            );
+            None
+        }
+    };
+
+    // The keys a `delete` entry does not take, each refused with the reason
+    // the single `delete` row gives it.
+    if let Some(op) = op.as_ref().filter(|op| op.value == BatchOp::Delete) {
+        for (name, why) in [
+            (
+                "value",
+                "a `delete` entry takes `key` and `if_version`; to write a value at the key, make the entry `op: set` (grammar 11.4, PRD resolved q71)",
+            ),
+            (
+                "if",
+                "an absent key has nothing to delete, so `if: absent` would never apply and `if: present` is the unconditional delete; condition the entry on the version it must hold with `if_version:` (grammar 11.4, PRD resolved q68)",
+            ),
+            (
+                "ttl",
+                "a `ttl:` is how long the key a write leaves lives, and a `delete` leaves none; give the `ttl:` to a `set` entry (grammar 11.4, PRD resolved q69)",
+            ),
+        ] {
+            let Some(entry) = fields.take_entry(name) else {
+                continue;
+            };
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidValue,
+                    entry.key.span.clone(),
+                    format!(
+                        "`{name}` is not a parameter of a `delete` entry: {subject} removes its key"
+                    ),
+                )
+                .with_label(op.span.clone(), "the entry's op is declared here")
+                .with_help(why.to_string()),
+            );
+        }
+    }
+
+    let key = fields
+        .take("key")
+        .and_then(|node| lexical::cel(node, "`key`", cx));
+    let value = fields
+        .take("value")
+        .and_then(|node| binding::bindings(node, "`value`", NameForm::Identifier, cx));
+    let condition = fields
+        .take("if")
+        .and_then(|node| lexical::keyword(node, "`if`", STORE_CONDITIONS, cx));
+    let if_version = fields
+        .take("if_version")
+        .and_then(|node| lexical::cel(node, "`if_version`", cx));
+    let ttl = fields.take("ttl").and_then(|node| store_ttl(node, cx));
+
+    if let Some(op) = &op {
+        // A missing key is reported against the entry, and only when it is
+        // missing rather than illegible — an illegible one already said why.
+        if !fields.contains("key") {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::MissingKey,
+                    span.clone(),
+                    format!(
+                        "missing required key `key` in {subject}: a `{}` entry addresses one key",
+                        op.value.as_str()
+                    ),
+                )
+                .with_label(op.span.clone(), "the entry's op is declared here")
+                .with_help(format!(
+                    "a `{}` entry takes {}, as a single `{}` does (grammar 11.4, PRD resolved q71)",
+                    op.value.as_str(),
+                    match op.value {
+                        BatchOp::Set => "`key`, `value`, one of `if` and `if_version`, and `ttl`",
+                        BatchOp::Delete => "`key` and `if_version`",
+                    },
+                    op.value.as_str()
+                )),
+            );
+        }
+        if op.value == BatchOp::Set && !fields.contains("value") {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::MissingKey,
+                    span.clone(),
+                    format!("missing required key `value` in {subject}: a `set` entry writes the whole value at its key"),
+                )
+                .with_label(op.span.clone(), "the entry's op is declared here")
+                .with_help(
+                    "give the entry a `value:` — a field map of CEL matching the store's `value_schema`, exactly as a `set` takes one — or make it `op: delete` to remove the key (grammar 11.4, PRD resolved q71)",
+                ),
+            );
+        }
+    }
+    // One condition per entry, exactly as per write (PRD resolved q68).
+    if let (Some(condition), Some(version)) = (condition.as_ref(), if_version.as_ref()) {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::ConflictingKeys,
+                version.span.clone(),
+                format!("{subject} declares both `if:` and `if_version:`, and a write takes one condition"),
+            )
+            .with_label(condition.span.clone(), "the other condition is declared here")
+            .with_help(
+                "`if:` asks whether the key holds a value and `if_version:` which version it holds, and only a key holding a value holds a version — so `if_version:` alone already asks `if: present` as well, and beside `if: absent` it could never apply: keep one (grammar 11.4)",
+            ),
+        );
+    }
+    fields.finish(cx);
+    BatchEntry {
+        op,
+        key,
+        value,
+        condition,
+        if_version,
+        ttl,
+        span,
+    }
+}
+
+/// A `batch` entry's `op:` — the literal `set` or `delete`.
+///
+/// Its own refusal rather than [`lexical::keyword`]'s, because the likeliest
+/// mistakes are not misspellings: another op of the catalogue, which a batch
+/// does not take, or an expression, which this position never is.
+fn batch_entry_op(node: &Node, subject: &str, cx: &mut Cx) -> Option<Spanned<BatchOp>> {
+    if let Yaml::String(text) = &node.value
+        && let Some((_, op)) = BATCH_OPS.iter().find(|(name, _)| name == text)
+    {
+        return Some(Spanned::new(*op, node.span.clone()));
+    }
+    let found = match &node.value {
+        Yaml::String(text) => format!("`{text}`"),
+        _ => node.description().to_string(),
+    };
+    let names: Vec<&str> = BATCH_OPS.iter().map(|(name, _)| *name).collect();
+    let suggestion = match &node.value {
+        Yaml::String(text) => crate::parse::reader::suggest(text, &names),
+        _ => None,
+    };
+    cx.push(
+        Diagnostic::error(
+            DiagnosticCode::UnknownVariant,
+            node.span.clone(),
+            format!("the `op` of {subject} is {found}, and a batch entry is a `set` or a `delete`"),
+        )
+        .with_help(match suggestion {
+            Some(name) => format!("did you mean `{name}`?"),
+            None => "an entry's `op:` is the literal `set` or `delete`, never an expression — which write each entry is has to be readable without running the graph — and the partial updates are nodes of their own, since each reads the value it changes (grammar 11.4, PRD resolved q71)".to_string(),
+        }),
+    );
+    None
 }
 
 /// The value under one store-op parameter, unless the op's row does not admit

@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use crate::ast::common::{Ident, Literal};
 use crate::ast::definition::{AgentAccess, Builtin, StoreKind};
-use crate::ast::flow::{GET_MANY_MAX_KEYS, StoreOp};
+use crate::ast::flow::{BATCH_MAX_ENTRIES, GET_MANY_MAX_KEYS, StoreOp};
 use crate::ast::schema::{Number, ScalarKind, Surface};
 use crate::cel::ty::{ObjectShape, Origin, Property, Type, UnionShape, UnionVariant};
 use crate::diag::{Span, Spanned};
@@ -774,17 +774,18 @@ pub(crate) fn http_default_output(span: &Span) -> FieldMap {
 /// the `top_k` and `limit` the node declares, which is the only bound either
 /// result has and is what lets one be written to a bounded channel at all
 /// (grammar 3.5); a `get_many`'s `entries` by [`GET_MANY_MAX_KEYS`], the most
-/// one reads; and whether a `kv` `list` answers `entries` at all by the
+/// one reads; a `batch`'s `results` by its entry count, one each; and whether a `kv` `list` answers `entries` at all by the
 /// `include_values` literal the node declares (Decision D154) — the same
 /// presence-by-literal Decision D114 gives a match's `metadata`, decided by the
 /// node here rather than by the store.
 ///
-/// The catalog marks five fields optional — `value` on a `kv`/`blob` `get`,
+/// The catalog marks seven fields optional — `value` on a `kv`/`blob` `get`,
 /// absent on a miss; `version` on every `kv` row that carries one, absent where
 /// the key holds nothing; `value` on a partial update, absent where its
-/// condition did not hold; a `list`'s `next`, absent on the last page; and a
-/// `get_many` entry's `value` and `version`, absent where `found` is `false` —
-/// and that is a runtime fact with no static consequence (Decision D110: the
+/// condition did not hold; a `list`'s `next`, absent on the last page; a
+/// `get_many` entry's `value` and `version`, absent where `found` is `false`;
+/// and a `batch`'s `failed`, absent where it applied, and its results'
+/// `version`, absent on a `delete` entry — and that is a runtime fact with no static consequence (Decision D110: the
 /// read fails, the write does not happen), so the synthesized map carries every
 /// field alike. A store row is never parsed against it (`codegen::graph`), so
 /// nothing refuses the answer that leaves one out.
@@ -908,6 +909,28 @@ pub(crate) fn store_output(
             )],
             span,
         ),
+        // A batch answers once for all of its entries (PRD resolved q71):
+        // whether they landed, whether the ledger handed the answer back, one
+        // `{ key, version }` per entry in the order they applied — `version`
+        // absent on a `delete` entry, whose key then holds nothing — and the
+        // index of the entry whose condition did not hold, present exactly
+        // when `applied` is `false`, which is also when `results` is empty.
+        (StoreKind::Kv, StoreOp::Batch) => field_map(
+            vec![
+                ("applied", boolean()),
+                ("deduped", boolean()),
+                (
+                    "results",
+                    array_node(
+                        object_node(vec![("key", string()), ("version", version())], span),
+                        bound.or(i64::try_from(BATCH_MAX_ENTRIES).ok()),
+                        span,
+                    ),
+                ),
+                ("failed", scalar_node(ScalarKind::Integer, span)),
+            ],
+            span,
+        ),
         (_, StoreOp::List) => field_map(vec![("keys", array_node(string(), bound, span))], span),
         (StoreKind::Vector, StoreOp::Search) => {
             let mut properties = vec![
@@ -995,6 +1018,10 @@ pub(crate) fn numeric_fields(value_schema: Option<&FieldMap>) -> Vec<&Field> {
 /// offers `<name>_append` — whose `item` then has no field to name, so every
 /// call is refused back to the model ([`store_tool_input`]) — and one with no
 /// numeric field still offers `<name>_incr`.
+///
+/// No level offers a `batch` (PRD resolved q71): the ruling withholds it from
+/// agents at every access level, so it is a store-op node's alone, and the
+/// unit tests below pin that no row here ever names it.
 ///
 /// `full` is a `kv` level alone: the ruling defines it by `kv`'s tools, and the
 /// parser refuses it on a `vector` or `blob` store (`parse::definition`), so no
@@ -1869,6 +1896,110 @@ mod tests {
         assert_eq!(
             StoreOp::List.optional_parameters(),
             &["prefix", "after", "include_values"]
+        );
+    }
+
+    /// A `batch` is offered to no agent, at any access level and on any kind
+    /// (PRD resolved q71): it is a store-op node's alone. Every level's set is
+    /// otherwise the one it was, so a `batch` arriving in one would be this
+    /// test failing rather than a model quietly handed a hundred writes.
+    #[test]
+    fn a_batch_is_offered_to_no_agent_at_any_access_level() {
+        for kind in StoreKind::ALL {
+            for access in [AgentAccess::Read, AgentAccess::ReadWrite, AgentAccess::Full] {
+                assert!(
+                    !store_tools(*kind, access).contains(&StoreOp::Batch),
+                    "`{}` at {access:?} synthesizes a `batch` tool",
+                    kind.as_str()
+                );
+            }
+        }
+        assert_eq!(
+            store_tools(StoreKind::Kv, AgentAccess::Full),
+            [
+                StoreOp::Get,
+                StoreOp::Set,
+                StoreOp::Merge,
+                StoreOp::Append,
+                StoreOp::Incr,
+                StoreOp::Delete
+            ],
+            "`full` keeps the six tools it grants"
+        );
+    }
+
+    /// A `batch` is a `kv` op and a write — one effect carrying the node's
+    /// one idempotency key — whose row is `ops:` alone (PRD resolved q71).
+    #[test]
+    fn a_batch_is_a_kv_write_that_takes_ops_alone() {
+        assert!(kind_takes(StoreKind::Kv, StoreOp::Batch));
+        assert!(!kind_takes(StoreKind::Vector, StoreOp::Batch));
+        assert!(!kind_takes(StoreKind::Blob, StoreOp::Batch));
+        assert!(StoreOp::Batch.writes());
+        assert_eq!(StoreOp::Batch.required_parameters(), &["ops"]);
+        assert_eq!(StoreOp::Batch.optional_parameters(), &[] as &[&str]);
+        assert_eq!(StoreOp::Batch.as_str(), "batch");
+        assert!(StoreOp::ALL.contains(&StoreOp::Batch));
+    }
+
+    /// A `batch`'s derived row: `applied`, `deduped`, one `{ key, version }`
+    /// per entry bounded by the node's entry count, and `failed` — every field
+    /// carried, the two the ruling marks optional (`failed`, a result's
+    /// `version`) included, under D110's posture: a store row is never parsed
+    /// against it.
+    #[test]
+    fn a_batch_derives_applied_deduped_results_and_failed() {
+        let value = field_map(
+            vec![("body", scalar_node(ScalarKind::String, &span()))],
+            &span(),
+        );
+        let derive = |bound| {
+            store_output(
+                StoreKind::Kv,
+                StoreOp::Batch,
+                Some(&value),
+                None,
+                bound,
+                false,
+                &span(),
+            )
+        };
+        let row = derive(Some(3));
+        assert_eq!(names(&row), ["applied", "deduped", "results", "failed"]);
+        assert_eq!(
+            items(&row, "results"),
+            (vec!["key".into(), "version".into()], Some(3)),
+            "one result per entry, bounded by the entries the node writes"
+        );
+        let kind_of = |name: &str| {
+            row.fields
+                .iter()
+                .find(|field| field.name.value.as_str() == name)
+                .map(|field| match &field.ty.form {
+                    TypeForm::Scalar(scalar) => Some(scalar.kind),
+                    _ => None,
+                })
+        };
+        assert_eq!(kind_of("applied"), Some(Some(ScalarKind::Boolean)));
+        assert_eq!(kind_of("deduped"), Some(Some(ScalarKind::Boolean)));
+        assert_eq!(kind_of("failed"), Some(Some(ScalarKind::Integer)));
+        assert_eq!(
+            items(&derive(None), "results").1,
+            i64::try_from(BATCH_MAX_ENTRIES).ok(),
+            "with no entry count to read, the bound is the most one batch holds"
+        );
+        assert!(
+            names(&store_output(
+                StoreKind::Blob,
+                StoreOp::Batch,
+                None,
+                None,
+                Some(3),
+                false,
+                &span()
+            ))
+            .is_empty(),
+            "a `blob` store takes no batch, so there is no row to derive"
         );
     }
 

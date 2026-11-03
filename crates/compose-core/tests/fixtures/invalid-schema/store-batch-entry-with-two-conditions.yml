@@ -1,0 +1,15 @@
+# rule: a `batch` entry takes one condition, `if:` or `if_version:` (grammar 11.4, PRD resolved q71)
+# at: /flow.work/nodes/write/ops/0
+# via: /$defs/storeBatchEntry/allOf/2/not
+flow.work:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    write:
+      store: store.notes
+      op: batch
+      ops:
+        - { op: set, key: "'new'", value: { title: "'x'" }, if: absent, if_version: "3" }
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: end }

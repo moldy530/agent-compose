@@ -1,0 +1,16 @@
+# rule: a `set` entry of a `batch` writes the whole value at its key (grammar 11.4, PRD resolved q71)
+# at: /flow.work/nodes/write/ops/0
+# via: /$defs/storeBatchEntry/allOf/0/then/required
+flow.work:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    write:
+      store: store.notes
+      op: batch
+      ops:
+        - { op: set, key: "'new'" }
+        - { op: delete, key: "'old'" }
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: end }

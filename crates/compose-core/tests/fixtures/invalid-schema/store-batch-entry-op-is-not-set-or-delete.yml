@@ -1,0 +1,15 @@
+# rule: a `batch` entry's `op:` is the literal `set` or `delete` (grammar 11.4, PRD resolved q71)
+# at: /flow.work/nodes/write/ops/0/op
+# via: /$defs/storeBatchEntry/properties/op/enum
+flow.work:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    write:
+      store: store.notes
+      op: batch
+      ops:
+        - { op: merge, key: "'new'", value: { title: "'x'" } }
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: end }

@@ -455,7 +455,7 @@ impl<'a> Ctx<'a> {
                     *op,
                     definition.value_schema.as_ref(),
                     definition.metadata_schema.as_ref(),
-                    params.top_k.or(params.limit),
+                    params.bound(),
                     params
                         .include_values
                         .as_ref()

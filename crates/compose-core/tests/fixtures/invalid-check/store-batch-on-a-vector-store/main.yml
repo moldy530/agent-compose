@@ -1,0 +1,24 @@
+# rule: a `batch` is a `kv` op, and a `vector` store takes none (grammar 11.4, PRD resolved q71)
+# code: invalid-value
+# message: node `move` asks `store.docs` for a `batch`, which a `vector` store does not take
+# at: main.yml:18:14
+# help: a `vector` store takes `search`, `upsert`, `delete` (grammar 11.4)
+version: "0.1"
+store.docs:
+  kind: vector
+  scope: global
+  embed: { model: text-embedding-3-small, provider: provider.openai }
+provider.openai:
+  kind: openai
+  api_key: "${OPENAI_API_KEY}"
+flow.f:
+  outputs: {}
+  nodes:
+    move:
+      store: store.docs
+      op: batch
+      ops:
+        - { op: delete, key: "'doc/old'" }
+  edges:
+    - { from: start, to: move }
+    - { from: move, to: end }

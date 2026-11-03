@@ -1,0 +1,24 @@
+# rule: a `batch` `set` entry writes the whole value at its key, so it supplies every field `V` declares without a default (grammar 11.4, PRD resolved q71)
+# code: missing-key
+# message: `value` of `ops[0]` of node `move` does not supply `title`
+# at: main.yml:21:43
+# label: main.yml:12:5 the store declares it here
+# help: a `kv set` writes the whole value at its key, so it supplies every field of the store's `value_schema` (grammar 11.4)
+version: "0.1"
+store.notes:
+  kind: kv
+  scope: global
+  value_schema:
+    title: { type: string }
+    body: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    move:
+      store: store.notes
+      op: batch
+      ops:
+        - { op: set, key: "'new'", value: { body: "'x'" } }
+  edges:
+    - { from: start, to: move }
+    - { from: move, to: end }

@@ -469,6 +469,9 @@ pub enum StoreOp {
     /// `kv`: read up to [`GET_MANY_MAX_KEYS`] keys in one op, answered in the
     /// order they were asked for (PRD resolved q70).
     GetMany,
+    /// `kv`: apply a literal list of `set` and `delete` entries to one store in
+    /// one transaction — all of them or none (PRD resolved q71).
+    Batch,
 }
 
 /// The most keys one `kv` `get_many` reads (grammar 11.4, PRD resolved q70).
@@ -479,10 +482,18 @@ pub enum StoreOp {
 /// result be written to a bounded channel at all (grammar 3.5).
 pub const GET_MANY_MAX_KEYS: i64 = 1000;
 
+/// The most entries one `kv` `batch` applies (grammar 11.4, PRD resolved q71).
+///
+/// The list is a literal in the node, so unlike a `get_many`'s keys its length
+/// is decided in one file: a longer one — and an empty one — is refused at
+/// parse, and the published schema bounds it too. It is also the static bound
+/// of the `results` a batch answers, one per entry.
+pub const BATCH_MAX_ENTRIES: usize = 100;
+
 impl StoreOp {
     /// Every op: grammar 11.4's original seven in the order its table first
     /// listed them, then the three partial updates PRD resolved q68 added, then
-    /// the two reads PRD resolved q70 added.
+    /// the two reads PRD resolved q70 added, then q71's `batch`.
     pub const ALL: &'static [Self] = &[
         Self::Get,
         Self::Set,
@@ -496,6 +507,7 @@ impl StoreOp {
         Self::Incr,
         Self::Count,
         Self::GetMany,
+        Self::Batch,
     ];
 
     /// The keyword that names this op.
@@ -514,12 +526,16 @@ impl StoreOp {
             Self::Incr => "incr",
             Self::Count => "count",
             Self::GetMany => "get_many",
+            Self::Batch => "batch",
         }
     }
 
     /// Whether this op writes — the ops an idempotency key and a dedupe apply
     /// to (grammar 9.4, 11.4). `count` and `get_many` are reads, recorded and
     /// replayed like `get` and `list` and carrying no key (PRD resolved q70).
+    /// A `batch` is a write — **one** effect, carrying the node's one key, its
+    /// whole answer one ledger row however many entries it holds (PRD resolved
+    /// q71).
     #[must_use]
     pub const fn writes(self) -> bool {
         matches!(
@@ -531,6 +547,7 @@ impl StoreOp {
                 | Self::Merge
                 | Self::Append
                 | Self::Incr
+                | Self::Batch
         )
     }
 
@@ -548,6 +565,7 @@ impl StoreOp {
             Self::Incr => &["key", "field"],
             Self::Count => &[],
             Self::GetMany => &["keys"],
+            Self::Batch => &["ops"],
         }
     }
 
@@ -570,10 +588,14 @@ impl StoreOp {
     /// and `include_values:` are a `kv` page's, and `list` is one op of two
     /// kinds, so a `blob` `list` naming either is refused against its store by
     /// the validator too.
+    ///
+    /// A `batch` takes `ops:` and nothing else (PRD resolved q71): each entry
+    /// carries its own key, value, condition and `ttl`, so a node-level one
+    /// would be a second answer to a question every entry already answers.
     #[must_use]
     pub const fn optional_parameters(self) -> &'static [&'static str] {
         match self {
-            Self::Get => &[],
+            Self::Get | Self::Batch => &[],
             Self::Delete => &["if_version"],
             Self::Set | Self::Merge => &["if", "if_version", "ttl"],
             Self::Append => &["unique", "if", "if_version", "ttl"],
@@ -632,6 +654,69 @@ impl StoreTtl {
             Self::After(duration) => duration.as_str(),
         }
     }
+}
+
+/// The op one entry of a `kv` `batch` is (grammar 11.4, PRD resolved q71).
+///
+/// A literal, never CEL, and one of exactly two: the ruling's list is of `set`
+/// and `delete` entries, the two writes whose answer is a version and nothing
+/// the stored value has to be read to compute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchOp {
+    /// Write one key's whole value.
+    Set,
+    /// Remove one key.
+    Delete,
+}
+
+impl BatchOp {
+    /// The two, in the order the ruling names them.
+    pub const ALL: &'static [Self] = &[Self::Set, Self::Delete];
+
+    /// The keyword that names this entry's op.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Set => "set",
+            Self::Delete => "delete",
+        }
+    }
+
+    /// The single op this entry is one of — whose parameter row, conditions and
+    /// answer the entry has (grammar 11.4).
+    #[must_use]
+    pub const fn store_op(self) -> StoreOp {
+        match self {
+            Self::Set => StoreOp::Set,
+            Self::Delete => StoreOp::Delete,
+        }
+    }
+}
+
+/// One entry of a `kv` `batch`'s `ops:` (grammar 11.4, PRD resolved q71).
+///
+/// Every field but the op is what the single op of that name takes, spelled
+/// the same way: `key` and `if_version` are CEL, `value` a field map of CEL
+/// matching `V`, `if` and `ttl` literals. Which of them an entry may carry is
+/// its op's row — a `delete` takes no `value`, `if:` or `ttl`, a `set` takes a
+/// `value` — and that is the validator's to decide against the entry, so every
+/// one is held here as written.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchEntry {
+    /// `op:` — `set` or `delete`; absent where it was missing or illegible.
+    pub op: Option<Spanned<BatchOp>>,
+    /// `key:`
+    pub key: Option<Spanned<Cel>>,
+    /// `value:` — a `set` entry's field map.
+    pub value: Option<Bindings>,
+    /// `if:` — `absent` or `present`.
+    pub condition: Option<Spanned<StoreCondition>>,
+    /// `if_version:` — the version the key must hold.
+    pub if_version: Option<Spanned<Cel>>,
+    /// `ttl:` — how long the key a `set` entry leaves lives.
+    pub ttl: Option<Spanned<StoreTtl>>,
+    /// The entry's own span.
+    pub span: Span,
 }
 
 /// The `value:` of a store op: a field map for `kv set`, a single expression
@@ -701,6 +786,9 @@ pub struct StoreOpParams {
     pub include_values: Option<Spanned<bool>>,
     /// `keys:` — the list of keys a `get_many` reads.
     pub keys: Option<Spanned<Cel>>,
+    /// `ops:` — a `batch`'s literal list of entries, in the order they apply
+    /// (PRD resolved q71).
+    pub ops: Option<Spanned<Vec<BatchEntry>>>,
 }
 
 /// Per-item error strategy on a `map` node (grammar 8.6 rule 10,

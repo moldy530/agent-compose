@@ -1,0 +1,15 @@
+# rule: a `batch`'s `ops:` is a literal list of entries, never one expression (grammar 11.4, PRD resolved q71)
+# code: wrong-type
+# message: expected a list of `set` and `delete` entries for `ops` of node `move`, found a string
+# at: 12:12
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    move:
+      store: store.memory
+      op: batch
+      ops: "state.writes"
+  edges:
+    - { from: start, to: move }
+    - { from: move, to: end }

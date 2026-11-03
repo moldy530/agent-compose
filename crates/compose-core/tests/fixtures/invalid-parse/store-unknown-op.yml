@@ -2,7 +2,7 @@
 # code: unknown-variant
 # message: `fetch` is not a valid store `op`
 # at: 12:11
-# help: store `op` takes one of `get`, `set`, `delete`, `list`, `search`, `upsert`, `put`, `merge`, `append`, `incr`, `count`, `get_many`
+# help: store `op` takes one of `get`, `set`, `delete`, `list`, `search`, `upsert`, `put`, `merge`, `append`, `incr`, `count`, `get_many`, `batch`
 flow.demo:
   outputs:
     draft: { type: string }

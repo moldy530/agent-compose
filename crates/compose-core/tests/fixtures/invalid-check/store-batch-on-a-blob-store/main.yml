@@ -1,0 +1,20 @@
+# rule: a `batch` is a `kv` op, decided against the definition the node names (grammar 11.4, PRD resolved q71)
+# code: invalid-value
+# message: node `move` asks `store.artifacts` for a `batch`, which a `blob` store does not take
+# at: main.yml:14:14
+# help: a `blob` store takes `put`, `get`, `delete`, `list` (grammar 11.4)
+version: "0.1"
+store.artifacts:
+  kind: blob
+  scope: global
+flow.f:
+  outputs: {}
+  nodes:
+    move:
+      store: store.artifacts
+      op: batch
+      ops:
+        - { op: delete, key: "'reports/old'" }
+  edges:
+    - { from: start, to: move }
+    - { from: move, to: end }

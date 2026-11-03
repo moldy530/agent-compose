@@ -1,0 +1,16 @@
+# rule: a `batch` takes `ops` alone; each entry carries its own key (grammar 11.4, PRD resolved q71)
+# at: /flow.work/nodes/write/key
+# via: /$defs/storeNode/allOf/16/then/properties/key
+flow.work:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    write:
+      store: store.notes
+      op: batch
+      key: "'new'"
+      ops:
+        - { op: delete, key: "'old'" }
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: end }

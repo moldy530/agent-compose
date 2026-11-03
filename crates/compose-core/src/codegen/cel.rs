@@ -431,6 +431,31 @@ fn node_kind<'ir>(kind: &'ir NodeKind, site: &str, found: &mut Vec<Expression<'i
                 &format!("{site}'s `fields:`"),
                 found,
             );
+            // A `batch`'s entries hold CEL exactly as the single ops do, each
+            // named by its index (PRD resolved q71).
+            for (index, entry) in params
+                .ops
+                .iter()
+                .flat_map(|ops| ops.value.iter())
+                .enumerate()
+            {
+                for (expression, key) in [
+                    (entry.key.as_ref(), "key"),
+                    (entry.if_version.as_ref(), "if_version"),
+                ] {
+                    if let Some(source) = expression {
+                        found.push(Expression {
+                            source,
+                            site: format!("{site}'s `ops[{index}].{key}:`"),
+                        });
+                    }
+                }
+                bindings(
+                    entry.value.as_ref(),
+                    &format!("{site}'s `ops[{index}].value:`"),
+                    found,
+                );
+            }
         }
     }
 }
@@ -510,7 +535,7 @@ mod tests {
     /// Not the ones somebody remembered: the composition below writes an
     /// expression at each position the IR carries one — both `input:` forms, an
     /// inline `http:` body, a `tool.*`'s own `http:` query, the six CEL store
-    /// parameters across four ops, both `map` dispatch forms including a
+    /// parameters across four ops, a `batch` entry's key, value and version, both `map` dispatch forms including a
     /// `default:` route, an edge guard, and all three trigger kinds that carry
     /// expressions — and the assertion is the whole set. A surface the walk
     /// stopped reading is a missing row here rather than a target check quietly
@@ -538,6 +563,10 @@ mod tests {
         r"`flow.surfaces` node `listing`'s `after:` = state.note + '/'",
         r"`flow.surfaces` node `listing`'s `prefix:` = state.note",
         r"`flow.surfaces` node `many`'s `keys:` = [state.note]",
+        r"`flow.surfaces` node `moved`'s `ops[0].key:` = state.note + '/new'",
+        r"`flow.surfaces` node `moved`'s `ops[0].value:` `body` = state.note",
+        r"`flow.surfaces` node `moved`'s `ops[1].if_version:` = 1",
+        r"`flow.surfaces` node `moved`'s `ops[1].key:` = state.note",
         r"`flow.surfaces` node `named`'s `input:` `q` = state.note",
         r"`flow.surfaces` node `plan`'s `input:` `text` = input.goal",
         r"`flow.surfaces` node `routed`'s `map` route `default` `input:` `text` = finding.kind",
@@ -711,6 +740,13 @@ flow.surfaces:
       op: get_many
       keys: "[state.note]"
 
+    moved:
+      store: store.notes
+      op: batch
+      ops:
+        - { op: set, key: "state.note + '/new'", value: { body: "state.note" } }
+        - { op: delete, key: "state.note", if_version: "1" }
+
     fan:
       map:
         over: "plan.output.items"
@@ -763,7 +799,8 @@ flow.surfaces:
     - { from: save, to: find }
     - { from: find, to: keep }
     - { from: keep, to: many }
-    - { from: many, to: listing }
+    - { from: many, to: moved }
+    - { from: moved, to: listing }
     - { from: listing, to: sub, when: "state.note != ''" }
     - { from: listing, to: end, else: true }
     - { from: sub, to: end }

@@ -256,12 +256,13 @@ impl StoreKind {
     }
 
     /// The ops this kind serves (grammar 11.4) — on `kv`, PRD resolved q68's
-    /// three partial updates and q70's two reads among them.
+    /// three partial updates, q70's two reads and q71's `batch` among them.
     #[must_use]
     pub const fn operations(self) -> &'static [&'static str] {
         match self {
             Self::Kv => &[
                 "get", "set", "delete", "list", "merge", "append", "incr", "count", "get_many",
+                "batch",
             ],
             Self::Vector => &["search", "upsert", "delete"],
             Self::Blob => &["put", "get", "delete", "list"],
