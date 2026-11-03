@@ -180,7 +180,11 @@ instance path it would have had with no refusal ahead of it.
 
 Dispatch records and store records carry `idempotencyKey`, which is the one
 place the flattened instance path of a nested fan-out can be read back at all —
-`execution.item_index` exposes only the innermost index.
+`execution.item_index` exposes only the innermost index. A store write whose
+node wrote `idempotency_key:` carries its authored ledger key there instead,
+`author/<store>/<key>`, which is no instance path: a key beginning `author/` is
+authored, since no execution id is `author`, and every other is the execution
+id and a path.
 
 ## Stability
 

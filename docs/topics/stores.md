@@ -154,6 +154,13 @@ same 2048 characters are 2040 of an ASCII session key but only 226 of a CJK one,
 each of whose characters is three bytes and therefore nine encoded characters. A
 `postgres` store holds about 2704 bytes across the store name, the partition —
 encoded the same way — and the key together. A `sqlite` store bounds neither.
+An authored `idempotency_key:` (see *Deduping on a business key*) is bounded the
+same way on its ledger row, which holds `author/<store>/<key>`: a `mysql` store
+holds 2048 bytes of it with every byte outside ASCII, and every `%`,
+percent-encoded — so about 2000 characters of an ASCII key and a ninth of that of
+a CJK one — a `postgres` store about 2704 bytes of it beside the store name, and
+a `sqlite` store any length. Past the bound the write fails, naming the server's
+refusal; it never folds two keys into one row.
 A `mysql` store also has a version floor — **MySQL 8.0.19 or newer**, the release
 whose upsert spelling and key collation it is written for — and a server below it
 is refused when the store is opened, naming the version that server reported
@@ -447,7 +454,10 @@ partial update also answers the whole `value` it left. A `batch` (below) answers
 entry's version is in its `results`, and a guard or a `writes:` on a batch reads
 those. A retried write — the same idempotency key, the same attempt — is
 answered with its first attempt's whole answer and `deduped: true`, so a retried
-claim that won answers `applied: true` again rather than losing to itself.
+claim that won answers `applied: true` again rather than losing to itself. A
+write under an **authored** key is answered the same way when the same key
+comes from **another execution** — which is how a graph learns that a business
+event already landed (see "Deduping on a business key", below).
 
 **Schema evolution.** `value_schema` is checked on write: by CEL typing at
 `validate` for a node, by the emitted Zod at run time for a tool's arguments. A
@@ -710,7 +720,125 @@ the ledger was pruned at all. A `serve` asks the same question again when a
 prune it held back for a detached delivery starts, since that delivery may
 have handed a node out in the meantime. The ledger therefore holds the open
 executions' rows, and those of the executions a worker may still be writing
-for, not history.
+for, not history. A row under an **authored** key is the exception, and on
+purpose: it belongs to no execution, so no settlement prunes it — its retention
+is its store's, below.
+
+## Deduping on a business key
+
+The idempotency key a write carries is derived from the execution and the node,
+so a retry inside one run dedupes — but a **second run** of the same event
+derives a different key, and writes again. That is the duplicate a deployment
+actually meets: a webhook its sender delivered twice, a queue that redelivered.
+`idempotency_key:` on a `kv` write names the key the write dedupes on instead —
+a business key the event carries — and two executions writing under one key
+apply **once**:
+
+```yaml spec
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.m:
+  provider: provider.p
+  id: claude-sonnet-4-5
+
+store.events:
+  kind: kv
+  scope: global
+  default_ttl: 720h
+  value_schema:
+    kind:    { type: string }
+    payload: { type: string }
+
+agent.handler:
+  model: model.m
+  prompt: Act on the event you are given.
+  output:
+    done: { type: boolean }
+
+flow.on_event:
+  inputs:
+    event_id: { type: string, min_length: 1 }
+    kind:     { type: string }
+    payload:  { type: string }
+  outputs: {}
+  nodes:
+    record:           # land the event once, however often it is delivered
+      store: store.events
+      op: set
+      key: "'event/' + input.event_id"
+      value:
+        kind: "input.kind"
+        payload: "input.payload"
+      idempotency_key: "input.event_id"
+    handle:           # only the first delivery gets here
+      agent: agent.handler
+      input: "input.payload"
+  edges:
+    - { from: start, to: record }
+    - { from: record, to: handle, when: "!record.output.deduped" }
+    - { from: record, to: end, else: true }
+    - { from: handle, to: end }
+
+triggers:
+  webhook:
+    type: http
+    flow: flow.on_event
+    path: /events
+    method: POST
+    input:
+      event_id: "payload.body.id"
+      kind: "payload.body.kind"
+      payload: "payload.body.data"
+    respond: async
+```
+
+**The second execution is answered with the first's answer.** The first
+delivery's `record` writes `event/<id>` and its whole answer becomes the ledger
+row. The second delivery is another execution, and its `record` writes
+**nothing**: it is answered with that row — `applied` and the `version` the
+first write took — and `deduped: true`, so it routes to `end` and `handle` runs
+once. The key holds the first delivery's value at the first delivery's version.
+A retry of either execution re-derives the same string and is answered the same
+way, and a resumed run answers its write out of its record, as every write is.
+
+**Which writes take one.** `set`, `delete`, `merge`, `append`, `incr` and
+`batch` — the six `kv` writes; a batch is one write, so its key is the node's,
+beside `ops:`, and no entry's. A read has no write to dedupe, and a `vector`
+`upsert`/`delete` or a `blob` `put`/`delete` keeps the derived key: each is
+refused by name. The expression is CEL over `input`, `state` and `execution`
+and must be a string. No synthesized tool and no operator `store` command carries
+one.
+
+**The namespace.** The ledger holds the key as `author/<store>/<key>` —
+`author/events/<id>` above — apart from every derived key, which begins with an
+execution id; no execution id is `author` or begins `author/`, so the two kinds
+never collide. The trace record carries it exactly so, as its `idempotencyKey`.
+
+**Per store, not per partition.** The namespace names the store: the same key on
+two stores is two writes. Every partition of one store shares it, so two
+sessions of a `scope: session` store writing one key are one write, and the
+second session's partition is not written. A `scope: execution` store's
+partition is one run's and dies with it — no second execution ever reaches it —
+so `idempotency_key:` there is refused.
+
+**One key, one write.** Two nodes may name one key, and the answer the second
+is handed is the first write's. If the two are different ops — a `set` and a
+`delete` under one key — the second fails naming both, rather than taking an
+answer its own output does not describe: give them distinct keys.
+
+**Retention follows the store, and this is the trade.** A derived ledger row
+goes when its execution settles. An authored row belongs to no execution, so it
+lives as long as the store's **`default_ttl:`** — 30 days above — and on a store
+that declares none, **for ever**: the ledger then grows by one row per business
+key, never shrinking, and that is exactly what makes an event land once however
+late its duplicate arrives. With a default, a duplicate arriving after it has
+run out is a first write again — it applies, and its answer takes the row's
+place. Expired ledger rows leave storage the way expired keys do: a write under
+an authored key removes at most 100 of the store's, and the next process start
+the rest. The default is the **store's**: a write's own `ttl:` sets how long
+its key lives, not how long its business key is remembered.
 
 ## Writes inside a `map`
 
@@ -747,7 +875,11 @@ all, whatever keys their entries share. A `blob` or `vector` write has no such
 story: it is bulk content at a document id.
 
 Store writes are at-least-once and carry an idempotency key derived from the
-execution id and the store node's flattened instance path.
+execution id and the store node's flattened instance path — or, on a `kv` write
+that names `idempotency_key:`, the authored key above in its place. The rule on
+this page reads on `key:`, not on `idempotency_key:`: an authored key that is
+the same for every item of a `map` dedupes the items against each other — one
+lands, and the rest are answered with its row — which is what the author wrote.
 
 ## Agent-attached stores
 
