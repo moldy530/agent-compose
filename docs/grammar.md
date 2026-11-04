@@ -2415,7 +2415,11 @@ when it ends. A detached delivery to an `agent.*` or a `tool.*` is not the
 body's either: the `map` resolved it at dispatch (§8.6 rule 7), so the end of
 the instance that issued it stops nothing the delivery does, waits for none of
 it and refuses none of it — an instance the delivery's model begins from its
-`tools:` runs, and ends, on its own.
+`tools:` runs, and ends, on its own. One that ends after the run that issued
+the delivery has closed the execution's record — settled, or parked — ends past
+that record: its finally node runs, but its boundary is journaled nowhere, and a
+failure it raises is not the execution's `finally_error`. The process says it on
+stderr instead, naming the execution, the node and the error.
 
 **What is not an end.** A `human` pause that parks the run (exit `3`,
 `status: "interrupted"`) is not one: the finally node does not run, and the
