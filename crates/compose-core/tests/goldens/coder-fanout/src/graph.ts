@@ -170,6 +170,7 @@ const flowBatchNodeWorkMap: runtime.MapDescriptor = {
           execution: site.execution,
           path: site.path,
           signal: context.signal,
+          bodyEnded: context.bodyEnded,
         }),
       writes: [
         { field: "summary", channel: "summaries", reduce: "append" },

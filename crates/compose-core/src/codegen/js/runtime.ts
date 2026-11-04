@@ -882,6 +882,24 @@ export interface RunContext {
    * subtracts `Date.now()` in the same expression ([`requestBudget`]).
    */
   readonly deadline?: number;
+  /**
+   * The end of the body this node execution is a task of
+   * ([`RunChannel.bodyEnded`], grammar 7.9) — never aborted while that body is
+   * still running, because LangGraph has not let go of the task by then.
+   *
+   * [`signal`]'s other half, and deliberately not part of it: `signal` stops
+   * the work a node is doing, and a sibling's failure stops no activity that
+   * is already running (grammar 7.6.3). What this stops is what the node would
+   * **begin** next — another `retry:` attempt ([`runActivity`]), a `map` item
+   * still queued for a permit or due another `on_item_error` attempt
+   * ([`runMap`]), an instance of any flow ([`Instantiation.bodyEnded`]) —
+   * because the body that would have read the result is over.
+   *
+   * Absent on a detached `map` delivery's context, which is off the instance
+   * the way it is off [`signal`]'s clock (grammar 8.6 rule 7, D94), and on a
+   * placed node's worker, whose body is the hub's.
+   */
+  readonly bodyEnded?: AbortSignal;
   /** How this attempt is addressed, for a message. */
   readonly node: string;
   /**
@@ -1062,21 +1080,50 @@ function abortReason(signal: AbortSignal): Error {
   return signal.reason instanceof Error ? signal.reason : new Error("aborted");
 }
 
-const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
+/**
+ * Whether `signal` is there and has aborted.
+ *
+ * A call rather than an inline `signal?.aborted === true`, because the inline
+ * form is narrowed by the compiler: a ladder that checked it before an `await`
+ * would be told the same check after it can never be true, which is exactly
+ * when it can.
+ */
+function isAborted(signal: AbortSignal | undefined): boolean {
+  return signal?.aborted === true;
+}
+
+/**
+ * Wait `ms`, or reject with the reason of whichever of `signal` and `also`
+ * aborts first.
+ *
+ * `also` is a ladder's [`RunContext.bodyEnded`]: a backoff is the wait before
+ * an attempt **begins**, so the end of the body the node belongs to ends it as
+ * surely as the node's own deadline does.
+ */
+const sleep = (ms: number, signal: AbortSignal, also?: AbortSignal): Promise<void> =>
   new Promise((resolve, reject) => {
-    if (signal.aborted) {
-      reject(abortReason(signal));
+    const first = (): AbortSignal | undefined =>
+      signal.aborted ? signal : also?.aborted === true ? also : undefined;
+    const already = first();
+    if (already !== undefined) {
+      reject(abortReason(already));
       return;
     }
-    const timer = setTimeout(() => {
+    const detach = (): void => {
       signal.removeEventListener("abort", onAbort);
+      also?.removeEventListener("abort", onAbort);
+    };
+    const timer = setTimeout(() => {
+      detach();
       resolve();
     }, ms);
-    const onAbort = () => {
+    const onAbort = (): void => {
       clearTimeout(timer);
-      reject(abortReason(signal));
+      detach();
+      reject(abortReason(first() ?? signal));
     };
     signal.addEventListener("abort", onAbort, { once: true });
+    also?.addEventListener("abort", onAbort, { once: true });
   });
 
 /**
@@ -1157,6 +1204,20 @@ export function backoffFor(policy: RetryPolicy, attempt: number): number {
  * The same wait runs between two attempts, so one attempt's finally node never
  * runs beside the next attempt.
  *
+ * # No attempt begins once the body has ended
+ *
+ * `bodyEnded` is the end of the body this node is a task of
+ * ([`RunChannel.bodyEnded`]), handed to the activity as
+ * [`RunContext.bodyEnded`]. It aborts while the node is still running only
+ * where LangGraph has let go of it — a sibling's failure ended its superstep,
+ * or its instance was stopped — and then nothing is left to read what the node
+ * answers. The attempt in flight runs on, as one a deadline abandoned does; but
+ * no further attempt begins, and a backoff it is sleeping out ends at once,
+ * because a second attempt would be new work inside an instance that has ended
+ * (grammar 7.9) — for a `flow:` node, a whole new instance of it. The node
+ * leaves on the end's own [`InstanceStopped`], which every ladder and policy
+ * above it lets through ([`stoppedOf`]).
+ *
  * # The budget does not run while a human is thinking
  *
  * Decision D102 withholds `timeout` from a `human` node at every level of
@@ -1199,6 +1260,7 @@ export async function runActivity<T>(
   innerTraces?: TraceEntry[],
   toolDispatches?: DispatchRecord[],
   harnessRuns?: HarnessRecord[],
+  bodyEnded?: AbortSignal,
 ): Promise<{ value: T; attempts: number }> {
   const attempts = 1 + (policy.retry?.max ?? 0);
   const controller = new AbortController();
@@ -1277,6 +1339,8 @@ export async function runActivity<T>(
     let last: unknown;
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       if (expired) break;
+      // See *No attempt begins once the body has ended*.
+      if (isAborted(bodyEnded)) throw abortReason(bodyEnded!);
       made = attempt;
       // This attempt's activity, and what it went on to settle with after the
       // deadline had answered for it — read once the instances under this site
@@ -1295,6 +1359,7 @@ export async function runActivity<T>(
             return deadline();
           },
           node,
+          ...(bodyEnded === undefined ? {} : { bodyEnded }),
           ...(storeRecords === undefined ? {} : { storeRecords }),
           ...(modelCalls === undefined ? {} : { modelCalls }),
           ...(harnessRuns === undefined ? {} : { harnessRuns }),
@@ -1428,8 +1493,12 @@ export async function runActivity<T>(
         if (instancesOpenUnder(execution.id, site)) await instancesEnded(execution.id, site);
         const delay = backoffFor(policy.retry!, attempt);
         try {
-          await sleep(delay, controller.signal);
-        } catch {
+          await sleep(delay, controller.signal, bodyEnded);
+        } catch (stopped) {
+          // The body's end, rather than the deadline: no attempt follows, and
+          // the node leaves on the end itself (see *No attempt begins once the
+          // body has ended*).
+          if (!expired && isAborted(bodyEnded)) throw stopped;
           break;
         }
       }
@@ -5359,6 +5428,10 @@ export async function callSubflowTool(
       // The calling node's deadline, inside the boundary — a `flow:` node's
       // reason exactly (grammar 9.2, and see [`Instantiation.signal`]).
       signal: context.signal,
+      // …and the end of the body it belongs to: a model that asks for a tool
+      // after that body has ended is a task LangGraph let go of, and begins no
+      // instance ([`Instantiation.bodyEnded`]).
+      bodyEnded: context.bodyEnded,
       ...(site.policy === undefined ? {} : { policy: site.policy }),
     });
     filed({
@@ -10275,6 +10348,32 @@ export interface RunChannel {
   /** Level 1 of grammar 9.3, if a `flow:` node instantiated this instance. */
   readonly policy?: InstancePolicy;
   readonly trace: readonly TraceEntry[];
+  /**
+   * Aborted the moment this instance's **body** has ended — its graph has
+   * stopped, whichever way — with an [`InstanceStopped`] naming its flow; and
+   * absent where nothing ran the graph through [`quiesce`] (grammar 7.9).
+   *
+   * One signal per instance **generation**, which is the whole point of it: the
+   * instance path does not say which generation a task belongs to, because a
+   * `flow:` node's `retry:` and a `map` item's `on_item_error` retry re-run the
+   * same path. What reads it is a task of this body that LangGraph has let go
+   * of — a sibling's failure ended the superstep it was in, or the instance's
+   * own stop was pulled — and that is still running: a `map` with items queued
+   * for a permit, a `retry:` ladder sleeping out its backoff, an agent whose
+   * model asks for a `flow.*` tool. None of them may begin anything once the
+   * body is over (grammar 7.9: nothing new begins inside an instance that is
+   * ending), and none of them has anything else to learn that from: the
+   * instance's own stop is the instantiating node's clock, and the task's own
+   * clock is its node's. [`runActivity`] hands it on as
+   * [`RunContext.bodyEnded`], and [`runSubflow`] refuses through it
+   * ([`Instantiation.bodyEnded`]).
+   *
+   * It never **stops** anything — an activity in flight runs on, exactly as one
+   * a deadline abandoned does (see [`Instantiation.signal`]) — it only refuses
+   * what would begin. And an instance's `finally:` node is not a task of its
+   * body: it runs under a signal of its own ([`endInstance`]).
+   */
+  readonly bodyEnded?: AbortSignal;
 }
 
 /** The empty run channel a flow instance starts at. */
@@ -10301,14 +10400,16 @@ export function emptyRun(): RunChannel {
  * `(step, node)` — the canonical write order of grammar 7.6.4, read for the one
  * channel whose order is otherwise the scheduler's.
  *
- * `path` and `policy` are the instance's own identity rather than anything a
- * node contributes: they are set once, in the state a flow instance is started
- * from, and a partial update that carries neither leaves them alone.
+ * `path`, `policy` and `bodyEnded` are the instance's own identity rather than
+ * anything a node contributes: they are set once, in the state a flow instance
+ * is started from, and a partial update that carries none of them leaves them
+ * alone.
  */
 export function mergeRun(left: RunChannel, right: Partial<RunChannel>): RunChannel {
   const trace = [...left.trace, ...(right.trace ?? [])];
   trace.sort((a, b) => a.step - b.step || (a.node < b.node ? -1 : a.node > b.node ? 1 : 0));
   const policy = right.policy ?? left.policy;
+  const bodyEnded = right.bodyEnded ?? left.bodyEnded;
   return {
     step: Math.max(left.step, right.step ?? 0),
     input: right.input ?? left.input,
@@ -10322,6 +10423,7 @@ export function mergeRun(left: RunChannel, right: Partial<RunChannel>): RunChann
     path: right.path ?? left.path,
     ...(policy === undefined ? {} : { policy }),
     trace,
+    ...(bodyEnded === undefined ? {} : { bodyEnded }),
   };
 }
 
@@ -10483,6 +10585,8 @@ export function applyWrite(previous: unknown, value: unknown, reduce: Reduce): u
  * is [`Instantiation.signal`].
  */
 export interface Quiescible<S> {
+  /** Its typed address (grammar 2.2): what [`RunChannel.bodyEnded`] names. */
+  readonly address: string;
   stream(
     initial: Record<string, unknown>,
     options: { recursionLimit: number; signal?: AbortSignal },
@@ -10503,6 +10607,14 @@ export interface Quiescible<S> {
  * `signal` is the caller's deadline, when the caller has one: a `flow:` node and
  * a joined `map` dispatch each run their instance inside a node budget, and a
  * top-level run has no clock above it to pass. See [`Instantiation.signal`].
+ *
+ * **The body's end is announced here**, because this is where it happens: the
+ * instance is seeded with a [`RunChannel.bodyEnded`] of its own, and that signal
+ * aborts the moment the stream has finished — whichever way, before the caller
+ * runs anything at the instance's end. LangGraph lets go of a superstep's other
+ * tasks when one of them fails, and the stream also ends when the instance's
+ * stop is pulled; every task it let go of reads this to begin nothing more
+ * (grammar 7.9).
  */
 export async function quiesce<S extends { $run: RunChannel }>(
   graph: Quiescible<S>,
@@ -10510,17 +10622,25 @@ export async function quiesce<S extends { $run: RunChannel }>(
   recursionLimit: number,
   signal?: AbortSignal,
 ): Promise<{ state?: S; error?: unknown }> {
+  const body = new AbortController();
+  const seeded: Record<string, unknown> = {
+    ...initial,
+    $run: { ...(initial["$run"] as Partial<RunChannel> | undefined), bodyEnded: body.signal },
+  };
   let state: S | undefined;
   try {
-    const supersteps = await graph.stream(initial, { recursionLimit, signal });
+    const supersteps = await graph.stream(seeded, { recursionLimit, signal });
     for await (const superstep of supersteps) {
       // An interrupt is announced as a chunk of its own rather than as a state,
       // and reading it as one would lose the run's.
       if (!isInterrupted(superstep)) state = superstep;
     }
   } catch (error) {
-    return { state, error: restateCeiling(recursionLimit, error) };
+    const restated = restateCeiling(recursionLimit, error);
+    body.abort(new InstanceStopped(graph.address, restated));
+    return { state, error: restated };
   }
+  body.abort(new InstanceStopped(graph.address, undefined));
   return { state };
 }
 
@@ -10616,6 +10736,19 @@ export interface Instantiation {
    * (Decision D118).
    */
   readonly signal?: AbortSignal;
+  /**
+   * The end of the body the instantiating node belongs to — its
+   * [`RunContext.bodyEnded`], passed beside its clock (grammar 7.9).
+   *
+   * Aborted, it means the node asking is a task of an instance whose body is
+   * already over, which LangGraph let go of and which is still running: the
+   * instance is refused, not begun, because nothing new begins inside an
+   * instance that has ended. It is the one way to tell such a task from a
+   * fresh generation's, because both name the same instance path. Absent is a
+   * body that never ends here — a detached delivery, which is off the
+   * instance (grammar 8.6 rule 7), or a caller outside [`quiesce`].
+   */
+  readonly bodyEnded?: AbortSignal;
   /** Level 1 of grammar 9.3 for every node inside it. */
   readonly policy?: InstancePolicy;
   /**
@@ -10664,11 +10797,22 @@ export async function runSubflow(
       abortReason(instance.signal),
     );
   }
-  // **Nor is one inside an instance that is ending.** What asks for one there
-  // is a task of that instance LangGraph has already let go of — a `flow:`
-  // node's next `retry:` attempt, a `map`'s next queued item, a flow-as-tool
-  // call — running on after a sibling's failure ended the instance it belongs
-  // to (see [`endInstancesInside`]).
+  // **Nor is one inside an instance that has ended, or is ending.** What asks
+  // for one there is a task of that instance LangGraph has already let go of —
+  // a `flow:` node's next `retry:` attempt, a `map`'s next queued item, a
+  // flow-as-tool call — running on after a sibling's failure ended the
+  // instance it belongs to. Its own body's end says so for as long as the task
+  // runs ([`RunChannel.bodyEnded`]); the table of ends under way says so of
+  // every instance inside one that is ending, from the moment that end begins
+  // until its finally node has run ([`endInstancesInside`]).
+  if (isAborted(instance.bodyEnded)) {
+    throw new SubflowFailure(
+      binding.address,
+      "was not started",
+      [],
+      abortReason(instance.bodyEnded!),
+    );
+  }
   const execution = instance.execution.id;
   const path = instance.path.join("/");
   const stopping = endingAround(execution, path);
@@ -10899,6 +11043,11 @@ function instancesOpenUnder(execution: string, site: string): boolean {
  * stops it, and this is what its own `finally:` node then reads as
  * `execution.error`, beside an `execution.outcome` of `failed` — the same
  * outcome an instance its node's deadline stopped ends on.
+ *
+ * It is also the reason a body's end is announced with
+ * ([`RunChannel.bodyEnded`]), and so what a let-go task of that body leaves on
+ * when it is refused the next thing it would begin: an instance, an attempt, a
+ * `map` item.
  */
 export class InstanceStopped extends Error {
   /** The flow whose instance ended around it. */
@@ -10942,7 +11091,9 @@ function stoppedBy(signal: AbortSignal, error: unknown): unknown {
 /**
  * The [`InstanceStopped`] on this error's `cause` chain, if it came out of one:
  * the failure of an instance the end around it stopped, or of one that end
- * would not let begin ([`endingAround`]).
+ * would not let begin ([`endingAround`]) — or a ladder that ended because the
+ * body it belongs to had ([`RunChannel.bodyEnded`]), and the refusal of what it
+ * would have begun.
  *
  * Read beside [`abandonedOf`] by the ladders and policies an abandonment passes
  * through untouched, and for its reason: what reaches them is a task inside the
@@ -10964,6 +11115,13 @@ function stoppedOf(error: unknown): InstanceStopped | undefined {
  * The instances that are ending, by execution: each one's instance path, the
  * site of its own `finally:` node, and why it is ending — what [`runSubflow`]
  * refuses to begin an instance inside, through [`endingAround`].
+ *
+ * Held from the start of an end to the end of its finally node, and keyed by
+ * path, which every generation of an instance shares — so it is what refuses
+ * the tasks of instances **inside** one that is ending, whose own bodies may
+ * not have stopped yet. The ending instance's own let-go tasks are refused for
+ * longer, by its body's own end ([`RunChannel.bodyEnded`]), which outlasts the
+ * release.
  */
 const endingInstances = new Map<string, Set<EndingInstance>>();
 
@@ -11055,6 +11213,16 @@ function underClosingFinally(
  * release, nothing new may begin inside the ending instance ([`endingAround`])
  * — a let-go `flow:` node's next `retry:` attempt, a `map`'s next item — except
  * under one of those finally nodes, or its own.
+ *
+ * The release lets a **new generation** begin at the ending instance's own path
+ * — the next attempt of the node that ran it — and inside it. It does not let
+ * the ended generation's let-go tasks begin anything: those still run after
+ * the release — a `map` with items queued for a permit, a ladder sleeping out a
+ * backoff — and are refused by their own body's end, which aborted before this
+ * was called and stays aborted for as long as they run
+ * ([`RunChannel.bodyEnded`]). The table covers what that signal cannot: the
+ * tasks of an instance running **inside** the ending one, between this end
+ * beginning and that instance's own body stopping.
  *
  * Nothing at all where `ending` is `undefined` — a pause the run parks at, or a
  * divergence, neither of which is an end — and nothing to wait for where no
@@ -11428,6 +11596,12 @@ export async function endInstance(
     ...(harnessRuns.length === 0 ? {} : { harness: [...harnessRuns] }),
   });
 
+  // Its own end, not the body's: the body's has already come — it is why this
+  // node is running — and what this node begins (the instances a `flow:` node,
+  // a `map` or a `flow.*` tool of it starts, its own `retry:` attempts) is how
+  // the instance ends rather than new work inside one that has (grammar 7.9).
+  // Aborted once the node has settled, so nothing it let go of begins after.
+  const own = new AbortController();
   let attempts = 0;
   try {
     // Inside the `try`, unlike a body node's: an input that cannot be built is
@@ -11448,6 +11622,7 @@ export async function endInstance(
       innerTraces,
       toolDispatched,
       harnessRuns,
+      own.signal,
     );
     attempts = answer.attempts;
     const update: Record<string, unknown> = {};
@@ -11517,6 +11692,8 @@ export async function endInstance(
       error: describe(error),
     };
     return { entry, state, ending: held };
+  } finally {
+    own.abort(new InstanceStopped(descriptor.flow, undefined));
   }
 }
 
@@ -12224,6 +12401,10 @@ export async function runMap(
         ...scoped,
         signal: new AbortController().signal,
         deadline: undefined,
+        // …and off the instance's end, for the same reason: the delivery was
+        // issued when its record was written, and the instance ending around
+        // it neither withdraws it nor refuses what it goes on to do.
+        bodyEnded: undefined,
         storeRecords: undefined,
         modelCalls: undefined,
         toolDispatches: undefined,
@@ -12356,7 +12537,13 @@ export async function runMap(
           // target, no instance: nothing that never began has an end to run a
           // `finally:` node at (grammar 7.9). The permits it just took go
           // straight back, in the `finally` below.
-          if (scoped.signal.aborted) return;
+          //
+          // Nor is one still queued when the body this map node belongs to
+          // ended — a sibling's failure, or the instance's own stop — for the
+          // same reason one step further out: LangGraph has let go of the map
+          // node, nothing will read its fan-out, and nothing new begins inside
+          // an instance that has ended ([`RunContext.bodyEnded`]).
+          if (scoped.signal.aborted || isAborted(scoped.bodyEnded)) return;
           const answer = await attemptItem(map, instance, scoped);
           attempts = answer.attempts;
           landed.push({
@@ -13237,6 +13424,11 @@ async function attemptItem(
   const busy = working(context.execution.id, instance.site.path.join("/"));
   try {
     for (let attempt = 1; attempt <= allowed; attempt += 1) {
+      // No attempt begins once the body the map node belongs to has ended —
+      // the backoff below ends on it too ([`RunContext.bodyEnded`]).
+      if (isAborted(context.bodyEnded)) {
+        throw new ItemAttempts(made, abortReason(context.bodyEnded!));
+      }
       made = attempt;
       try {
         return {
@@ -13273,8 +13465,15 @@ async function attemptItem(
         // `finally` does for every instance this fan-out dispatched.
         abandonPausesUnder(context.execution.id, instance.site.path.join("/"));
         try {
-          await sleep(backoffFor(retry!, attempt), context.signal);
-        } catch {
+          await sleep(backoffFor(retry!, attempt), context.signal, context.bodyEnded);
+        } catch (stopped) {
+          // The end of the body the map node belongs to, rather than its
+          // deadline: the next attempt would be new work inside an instance
+          // that has ended, so the item leaves on that end, which the fan-out
+          // and the node's own ladder let through ([`stoppedOf`]).
+          if (!context.signal.aborted && isAborted(context.bodyEnded)) {
+            throw new ItemAttempts(made, stopped);
+          }
           break;
         }
       }
@@ -16292,6 +16491,7 @@ export async function runNode(
       innerTraces,
       toolDispatched,
       harnessRuns,
+      run.bodyEnded,
     );
     attempts = answer.attempts;
     output = answer.value.output;

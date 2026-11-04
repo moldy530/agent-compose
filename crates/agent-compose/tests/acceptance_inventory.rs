@@ -873,6 +873,13 @@ const CODEGEN: &[Criterion] = &[
                 "a_finally_node_already_running_when_the_instance_around_it_ends_is_waited_for",
                 Status::Live,
             ),
+            // And nothing begins inside an instance that has ended, after its
+            // end is over too: a queued `map` item, a `retry:` attempt and a
+            // `flow.*` tool call its let-go siblings would make are refused.
+            (
+                "an_ended_instance_whose_end_is_over_still_begins_nothing_inside_it",
+                Status::Live,
+            ),
         ],
     },
     Criterion {

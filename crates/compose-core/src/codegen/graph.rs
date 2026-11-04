@@ -2530,6 +2530,11 @@ fn activity(
             // aborted runs to quiescence after the node has already failed
             // (grammar 9.2, and see `runtime.runSubflow`).
             text.push_str("      signal: context.signal,\n");
+            // And the end of the body this node is a task of: a `retry:`
+            // attempt LangGraph's let-go task would make after that body has
+            // ended begins no instance (grammar 7.9, and see
+            // `runtime.RunChannel.bodyEnded`).
+            text.push_str("      bodyEnded: context.bodyEnded,\n");
             // Grammar 9.3 level 1, with D79's outermost-wins: what already
             // reached this instance beats what this site declares, per field.
             text.push_str(&format!(
@@ -3431,15 +3436,18 @@ fn dispatch_run(
             //
             // The dispatch's clock does cross: `context.signal` is the map
             // node's, so its `timeout:` ends the instance rather than only the
-            // wait for it (`runtime.runSubflow`). A detached dispatch never
-            // reaches here — see the arm above.
+            // wait for it (`runtime.runSubflow`). So does the end of the body
+            // the map node belongs to, so an item begun after that body has
+            // ended is refused (grammar 7.9). A detached dispatch never reaches
+            // here — see the arm above.
             format!(
                 "{indent}run: async (input, context, site) =>\n{indent}  \
                  runtime.runSubflow({binding}, {{\n{indent}    \
                  inputs: input as Record<string, unknown>,\n{indent}    \
                  execution: site.execution,\n{indent}    \
                  path: site.path,\n{indent}    \
-                 signal: context.signal,\n{indent}  \
+                 signal: context.signal,\n{indent}    \
+                 bodyEnded: context.bodyEnded,\n{indent}  \
                  }}),\n"
             )
         }
