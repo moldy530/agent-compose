@@ -261,7 +261,7 @@ runs, so a completed run stays completed — same outputs, exit code `0` — eve
 when its finally node fails. Its own `retry:` and `timeout:` apply, through the
 whole policy chain; `on_error:` does not, at any level — once its retries are
 spent, its failure is `finally_error` on the execution's record (the journal row
-and the trace envelope), and `agent-compose run` prints it on one stderr line.
+and the trace envelope), and a `run` prints it on one stderr line.
 
 **A restart runs it once.** The end of the instance is journaled before the
 finally node starts, and its own effects are journaled like any node's: a
