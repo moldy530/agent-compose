@@ -1503,6 +1503,168 @@ fn a_hub_restarted_over_a_dispatch_a_worker_is_running_is_met_with_a_re_join() {
     );
 }
 
+/// The fixture with `flow.retried`'s `retry:` written as `retry`, served under
+/// its mesh target — for a case that needs the second attempt to wait a known
+/// time rather than the fixture's millisecond.
+fn retried_under(purpose: &str, retry: &str) -> Option<Mesh> {
+    let deploy = std::fs::read_to_string(
+        harness::fixture(FIXTURE)
+            .parent()
+            .expect("a fixture directory")
+            .join("deploy")
+            .join(format!("{TARGET}.yml")),
+    )
+    .expect("the fixture's mesh target is readable");
+    let (composition, entrypoint) = harness::staged_with_deploy(purpose, FIXTURE, TARGET, &deploy);
+    let main = std::fs::read_to_string(&entrypoint).expect("the staged composition is readable");
+    let at = main
+        .find("\nflow.retried:\n")
+        .expect("the fixture declares `flow.retried`");
+    let (head, tail) = main.split_at(at);
+    // The first `retry:` after the flow's own line is its `sign`'s: the flow
+    // declares one node.
+    const WRITTEN: &str = "retry: { max: 2, backoff: 1ms }";
+    assert!(
+        tail.contains(WRITTEN),
+        "`flow.retried` no longer says `{WRITTEN}`"
+    );
+    std::fs::write(
+        &entrypoint,
+        format!("{head}{}", tail.replacen(WRITTEN, retry, 1)),
+    )
+    .expect("the staged composition is writable");
+    Mesh::start_from(purpose, entrypoint, Some(composition))
+}
+
+/// **What a worker's stop cuts off is never journaled, and the retry makes it**
+/// (`docs/distributed.md` §3.2, §5, §7.3; `docs/durability.md` §6.1; PRD
+/// resolved q75, q79).
+///
+/// `flow.retried` once more, with its second attempt six seconds after the
+/// first and no jitter — so the order below is the same every run. The first
+/// attempt's loop call answers and is journaled; its pinned-output call is held
+/// for thirty seconds, and the process behind the hub is replaced while it is
+/// in flight. The worker meets `410`, joins again, and stops the runner it was
+/// running under the ended session (§5) by the stop the `stop` list uses —
+/// which aborts that call. The stop is the hub having stopped waiting, not the
+/// provider failing the call, so the runner records nothing for it; recorded,
+/// the failure would have been posted home under the new session (§3.3) and
+/// handed to the retry six seconds later as its history (§7.3), and **every**
+/// attempt would have replayed it — the execution failing on a
+/// `DispatchStopped` nobody asked for.
+///
+/// So the run completes with the third script's answer, which only a call the
+/// retry made live could have fetched; the provider was asked three times —
+/// the loop call once, never again, and the cut-off call twice; the journal's
+/// record at that call's key is the retry's answer; and no record anywhere in
+/// the execution carries the stop. The runner is gone long before its held call
+/// would have answered, which is what says the stop really met it in flight.
+#[test]
+fn a_model_call_a_workers_stop_cut_off_is_not_journaled_and_the_retry_makes_it() {
+    let Some(mut mesh) = retried_under(
+        "mesh-stop-unrecorded",
+        "retry: { max: 2, backoff: 6s, jitter: false }",
+    ) else {
+        return;
+    };
+    /// What the retry's live call answers, and nothing else does.
+    const SIGNED: &str = "signed-by-the-retry-the-stop-left-to-ask";
+    /// How long the first attempt's pinned-output call is held.
+    const HELD: Duration = Duration::from_secs(30);
+    mesh.provider.enqueue_all([
+        Script::new(SONNET, Outcome::text("thinking about it")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "signature": "answered after the stop" })).after(HELD),
+        ),
+        Script::new(SONNET, Outcome::structured(json!({ "signature": SIGNED }))),
+    ]);
+    let mut worker = mesh.worker("stop-unrecorded");
+    let execution = mesh.start_execution("/retried-releases", &json!({ "path": "release.dmg" }));
+
+    // The worker is **inside** the held call: the loop call is committed on
+    // the hub, the dispatch is held, and the provider has the second request.
+    until(
+        "the first attempt's loop call reached the hub's journal",
+        || worker.transcript(),
+        || harness::journal_holds(&mesh.project, &["sign/0#model/0"]),
+    );
+    mesh.until(&execution, "was taken by the worker", |report| {
+        report["placement_waits"][0]["status"] == "dispatched"
+    });
+    until(
+        "the first attempt's pinned-output call reached the provider",
+        || worker.transcript(),
+        || mesh.provider.requests().len() == 2,
+    );
+    let in_flight = Instant::now();
+    let runner = worker
+        .runners()
+        .and_then(|running| running.first().copied());
+
+    mesh.restart();
+
+    // The stop met the call in flight: the runner is gone well before the
+    // provider would have answered it.
+    if let Some(runner) = runner {
+        assert!(
+            gone_within(
+                runner,
+                (HELD - Duration::from_secs(5)).saturating_sub(in_flight.elapsed())
+            ),
+            "the runner the ended session left was not stopped in the middle of its call: {}",
+            worker.transcript()
+        );
+    }
+
+    let outputs = mesh.completed(&execution);
+    assert_eq!(
+        outputs["signature"],
+        SIGNED,
+        "the retry did not make the call the stop cut off; it said:\n{}",
+        worker.transcript()
+    );
+    let made = mesh.provider.requests();
+    assert_eq!(
+        made.len(),
+        3,
+        "the retry re-issued the recorded loop call, or never made the one the stop cut off: \
+         {made:#?}"
+    );
+
+    let rows = harness::journal_rows(
+        &mesh.project,
+        &format!(
+            "SELECT \"key\" AS k, outcome, payload FROM effects \
+             WHERE execution = '{execution}' ORDER BY \"key\""
+        ),
+    );
+    let rows = rows.as_array().expect("rows");
+    let stopped: Vec<&Value> = rows
+        .iter()
+        .filter(|row| {
+            row["payload"]
+                .as_str()
+                .is_some_and(|payload| payload.contains("DispatchStopped"))
+        })
+        .collect();
+    assert!(
+        stopped.is_empty(),
+        "an effect the worker's stop aborted was journaled as the world's answer: {stopped:#?}"
+    );
+    let cut_off = rows
+        .iter()
+        .find(|row| row["k"] == "sign/0#model/1")
+        .unwrap_or_else(|| panic!("the call the stop cut off has no record at all: {rows:#?}"));
+    assert!(
+        cut_off["payload"]
+            .as_str()
+            .is_some_and(|payload| payload.contains(SIGNED) && payload.contains("\"ok\":true")),
+        "the record at the cut-off call's key is not the retry's answer: {cut_off:#}"
+    );
+    assert!(worker.running(), "{}", worker.transcript());
+}
+
 // ---------------------------------------------------------------------------
 // 6. The refusal matrix, from the worker's side
 // ---------------------------------------------------------------------------
@@ -2761,7 +2923,8 @@ fn one_worker_whose_placement_says_max_running_three_runs_three_at_once() {
 /// its next poll, the worker stops the runner and posts the cancelled ending,
 /// and the row settles `cancelled` within ten seconds, with the node's entry
 /// `cancelled` and no `error`. No retry ran — the provider was asked twice,
-/// never a third time — and the worker is still serving.
+/// never a third time — the held call the cancel aborted wrote no record
+/// (`docs/durability.md` §6.1), and the worker is still serving.
 ///
 /// And the worker is what stopped it: the hub settles the node — and so the
 /// execution — only once the worker's `status: "cancelled"` result is home,
@@ -2836,6 +2999,21 @@ fn a_cancel_stops_a_placed_node_on_its_worker_and_settles_the_execution_cancelle
         mesh.provider.requests().len(),
         2,
         "a cancelled placed node was retried"
+    );
+    // The call the cancel aborted wrote no record (`docs/durability.md` §6.1):
+    // the runner's effects are posted ahead of its result, which settled the
+    // row above, so a record it had kept would be in the journal by now.
+    let aborted = harness::journal_rows(
+        &mesh.project,
+        &format!(
+            "SELECT \"key\" AS k, payload FROM effects \
+             WHERE execution = '{execution}' AND \"key\" = 'sign/0#model/1'"
+        ),
+    );
+    assert_eq!(
+        aborted,
+        json!([]),
+        "the model call the cancel aborted was journaled as an answer"
     );
     assert!(
         worker.running(),

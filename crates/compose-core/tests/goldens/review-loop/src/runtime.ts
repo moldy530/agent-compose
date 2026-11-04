@@ -94,6 +94,7 @@ import {
   ExecutionCancelled,
   JOURNAL_VERSION,
   ReplayDivergence,
+  asStopped,
   cancelAtFrontier,
   cancellationOf,
   closeSession,
@@ -111,6 +112,7 @@ import {
   recorderFor,
   refuseRecorded,
   replayedFailure,
+  stoppedInFlight,
 } from "./journal.ts";
 import type {
   CallbackIntent,
@@ -2884,6 +2886,14 @@ export async function callModel(
     } satisfies JournaledCall)) as Extract<JournaledCall, { ok: true }>;
     return { answer: kept.answer, served: result.served };
   } catch (error) {
+    // A call **stopped** in flight is not one the world answered, and is not
+    // kept at all: a cancel's, which the generation that completes a cancel a
+    // restart interrupted would otherwise replay as a failure, and a worker's
+    // stop's, which the attempt after it would ([`stoppedUnder`]). Unrecorded,
+    // the call is the frontier, as [`journaled`] leaves every other effect such
+    // a stop reaches — so the value-keeping below, which bypasses that seam, has
+    // to ask the same question it asks.
+    if (stoppedUnder(recorder.execution, site.signal, error)) throw error;
     // Kept as a **value** rather than through the slot's error path, because a
     // spent ladder is more than its message: the records it filed are what a
     // reader of the failed node's entry reads, and they have to survive into
@@ -2921,6 +2931,24 @@ type JournaledCall =
       readonly error: { readonly name: string; readonly message: string };
       readonly calls: ModelCall[];
     };
+
+/**
+ * Whether an effect that failed while running under `signal` was **stopped**
+ * in flight rather than answered — by its execution's cancel or by a worker's
+ * stop — and so must not be recorded (`./journal.ts`'s [`stoppedInFlight`]).
+ *
+ * Asked by the two effect sites that keep a failure as a **value**, past the
+ * check [`journaled`] makes on its error path: a model call ([`callModel`])
+ * and a harness run ([`runCoder`]). What they threw is asked first; and the
+ * signal they ran under is asked too, because what a stop leaves behind is
+ * not always on the failure's chain — an SDK may report the abort as a
+ * failure of its own wording, with no `cause` — while the signal it aborted
+ * carries the stop's reason whatever the SDK made of it.
+ */
+function stoppedUnder(execution: string, signal: AbortSignal, error: unknown): boolean {
+  if (stoppedInFlight(execution, error)) return true;
+  return signal.aborted && stoppedInFlight(execution, signal.reason);
+}
 
 /** An error's class name, as `describe` reads it. */
 function nameOf(error: unknown): string {
@@ -9904,6 +9932,16 @@ export async function runCoder(
         // and `docs/trace.md` §7.6's "one record per attempt" would hold on the
         // generation that ran and not on the one that resumed.
         if (!(error instanceof HarnessRunFailed)) throw error;
+        // …save a run **stopped** in flight, by the execution's cancel or a
+        // worker's stop, which is not a failure the world answered and is kept
+        // off the record ([`stoppedUnder`]): thrown on through the seam marked
+        // as stopped, which it lets through unrecorded whatever the SDK put on
+        // the failure's chain. Its record is filed here, since the path below
+        // that files a failed run's is not reached.
+        if (stoppedUnder(view.run.execution.id, context.signal, error)) {
+          context.harnessRuns?.push(error.record);
+          throw asStopped(error);
+        }
         live = error;
         return { ok: false, detail: error.detail, record: error.record, stream };
       }

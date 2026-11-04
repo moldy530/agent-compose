@@ -561,6 +561,16 @@ Carries the session. Long-polls for up to one hold (§2).
   ended on — the failure the stop raised in it, or an ending it reached first —
   which the hub answers `409` (§3.4); what the result is for is the slot the
   dispatch holds until it arrives (§2), and the `finally_error` it carries.
+  **What the stop aborts in flight is never recorded** — a model call whose
+  request it aborted, a command it killed part-way, a harness run it ended —
+  as nothing a cancel aborts is (`docs/durability.md` §6.1). The stop is the
+  hub having stopped waiting, not the world failing the effect; the records a
+  stopped runner writes are still posted and appended (§3.3), and the attempt
+  the hub opens next is handed them as its history (§7.3), so a stop recorded
+  as an effect's failure would be replayed as the world's by every attempt
+  that follows — an execution a hub restart orphaned (§5) would fail on a stop
+  nobody asked for. Unrecorded, the effect is the next attempt's frontier, and
+  that attempt performs it.
 
   **The `stop` list is the implementation's reading, and is provisional.** PRD
   resolved q75's ruling b gives the poll response "a `cancel` list", and no
@@ -1635,7 +1645,10 @@ journal of its own — which is the two-journal shape §1 rejects.
 A worker that disconnects mid-node fails that **attempt**, under the node's
 `retry:`/`on_error:` chain like any execution failure. The effects it had already
 streamed home are in the journal, so the retry replays them rather than
-re-issuing them: a model call already paid for is not paid for twice.
+re-issuing them: a model call already paid for is not paid for twice. An
+effect the worker's **stop** cut off — the runner a `410` orphaned, stopped
+as §3.2's `stop` list stops one — is not among them: it never answered, so
+it was never recorded, and the retry performs it live.
 
 **What detects the disconnect is the liveness window of §2, and the hub is the
 side that declares it** — §6.3 states that rule and this section is its

@@ -1572,7 +1572,11 @@ model call whose request was aborted, a command killed part-way — writes no
 record. Recorded, it would be replayed as the world's answer by the generation
 that completes a cancel a restart interrupted, and absorbed by policies a cancel
 is never routed through; unrecorded, it is simply the frontier, where that
-generation fires the cancel again.
+generation fires the cancel again. So is an effect a worker's **stop** aborts
+in a node runner (`docs/distributed.md` §3.2) — the hub having stopped
+waiting for the dispatch, never the world's answer — which the attempt after
+it would otherwise be handed as its history and replay as a failure
+(`docs/distributed.md` §7.3).
 
 ### 6.2 `run` journals; `resume` replays
 
