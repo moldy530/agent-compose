@@ -80,6 +80,16 @@
 #     the failure. The subflow's end is over the moment its one running
 #     instance has ended, and its node is skipped while those siblings are
 #     still running; none of them begins anything afterwards.
+#   * `flow.stranded_work` — the same, against siblings that begin no instance
+#     at all: an `exec:` node sleeping out a `retry:` backoff, a `map` of a
+#     `tool.*` with items queued for its permit, and a `map` of a failing
+#     `tool.*` whose items are due another `on_item_error` attempt. None of them
+#     begins anything once the subflow's body has ended either.
+#   * `flow.delivered` — a **detached** `map` delivery to an agent whose model
+#     calls `flow.slow_toolish`, outlasting the body that issued it. The
+#     delivery is off the instance (grammar §8.6 rule 7): the flow's end stops
+#     nothing it began, waits for none of it, and refuses none of it — not the
+#     tool call made while the flow's own finally node is still running.
 #   * `flow.redone` — a body node whose `timeout:` ends its `retry:` ladder in
 #     one generation, and whose replay in the next completes: the attempt the
 #     deadline never let it make is made then. Its finally node marks the run
@@ -1229,6 +1239,212 @@ flow.redoing:
         outcome: "input.outcome"
         error: "input.error"
         mark: "input.mark"
+    linger:
+      exec:
+        command: "${OPS_BIN}/sleep"
+        args: ["3"]
+  edges:
+    - { from: start, to: mark_it }
+    - { from: mark_it, to: linger }
+    - { from: linger, to: end }
+
+flow.stranded_work:
+  description: A flow whose subflow ends while siblings in it that begin no instance still have something to begin.
+  inputs:
+    names:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs: {}
+  nodes:
+    mid:
+      flow: flow.stranding_work
+      input:
+        names: "input.names"
+      on_error: skip
+    # Longer than every backoff below and than the queued items would take, so
+    # whatever the ended subflow went on to begin would begin while this run is
+    # still going.
+    after:
+      exec:
+        command: "${OPS_BIN}/sleep"
+        args: ["4"]
+    stranded_work_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "'outer:' + execution.outcome"
+  edges:
+    - { from: start, to: mid }
+    - { from: mid, to: after }
+    - { from: after, to: end }
+  finally: stranded_work_end
+
+# Each sibling of `doomed` logs a line to `$TALLY_LOG` per thing it begins, so
+# what it began after the body ended is a line the test can count.
+flow.stranding_work:
+  description: A body node that fails beside a retry ladder, a fan-out with items queued and a fan-out whose items are due another attempt, none of which begins an instance.
+  inputs:
+    names:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs: {}
+  nodes:
+    # Half a second: `flaky` and every item of `retried` have failed once and
+    # are sleeping out a two-second backoff, and `queued`'s first item has half
+    # a second still to run, its others waiting for the one permit.
+    doomed:
+      exec:
+        command: "${OPS_BIN}/sh"
+        args: ["-c", "sleep 0.5; exit 1"]
+    flaky:
+      exec:
+        command: "${OPS_BIN}/sh"
+        args: ["-c", "printf 'flaky\\n' >> \"$TALLY_LOG\"; exit 1"]
+      retry: { max: 1, backoff: 2s, jitter: false }
+    queued:
+      map:
+        over: input.names
+        as: name
+        node: tool.logged_item
+        max_concurrency: 1
+        input:
+          name: "name"
+    retried:
+      map:
+        over: input.names
+        as: name
+        node: tool.refused_item
+        max_concurrency: 4
+        input:
+          name: "name"
+        on_item_error:
+          retry: { max: 1, backoff: 2s, jitter: false }
+  edges:
+    - { from: start, to: doomed }
+    - { from: start, to: flaky }
+    - { from: start, to: queued }
+    - { from: start, to: retried }
+    - { from: doomed, to: end }
+    - { from: flaky, to: end }
+    - { from: queued, to: end }
+    - { from: retried, to: end }
+
+tool.logged_item:
+  description: Logs the item it is given, then takes a second.
+  input:
+    name: { type: string }
+  output:
+    done: { type: string }
+  exec:
+    command: "${OPS_BIN}/sh"
+    args: ["-c", "printf 'item:%s\\n' \"$NAME\" >> \"$TALLY_LOG\"; sleep 1; echo done"]
+
+tool.refused_item:
+  description: Logs the attempt it is making at the item it is given, then fails.
+  input:
+    name: { type: string }
+  output:
+    done: { type: string }
+  exec:
+    command: "${OPS_BIN}/sh"
+    args: ["-c", "printf 'retried:%s\\n' \"$NAME\" >> \"$TALLY_LOG\"; exit 1"]
+
+# The agent `flow.delivered`'s detached delivery reaches: its one tool is a
+# flow that outlasts the body that issued the delivery.
+agent.slow_closer:
+  description: Calls its one tool, then writes a short note.
+  model: model.smart
+  prompt: |
+    Call your tool once, then write one short note about the topic you are given.
+  tools: [flow.slow_toolish]
+  input:
+    topic:
+      description: What to write a note about.
+      type: string
+  # Not `note`, which is a channel: a detached dispatch writes no state
+  # (grammar §8.6 rule 7), so its output names none.
+  output:
+    remark:
+      description: The note.
+      type: string
+
+flow.slow_toolish:
+  description: The flow a detached delivery's model calls as a tool, which takes a second and a half and records how it ended under the mark it is called with.
+  inputs:
+    mark:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    slow_tool_work:
+      exec:
+        command: "${OPS_BIN}/sleep"
+        args: ["1.5"]
+    slow_tool_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "input.mark + ':' + execution.outcome"
+  edges:
+    - { from: start, to: slow_tool_work }
+    - { from: slow_tool_work, to: end }
+  finally: slow_tool_end
+
+flow.delivered:
+  description: A detached delivery to an agent whose tool calls outlast the body that issued it, and a finally node that marks and then lingers.
+  inputs:
+    topics:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs: {}
+  nodes:
+    # One permit, so the second delivery starts only once the first has
+    # answered — inside this flow's finally node, which is still lingering.
+    notify:
+      map:
+        over: input.topics
+        as: topic
+        node: agent.slow_closer
+        max_concurrency: 1
+        detach: true
+        input:
+          topic: "topic"
+    # Long enough for the first delivery's model to have asked for its tool,
+    # and short of the tool's second and a half: the body ends while the
+    # tool's instance is running.
+    wait:
+      exec:
+        command: "${OPS_BIN}/sleep"
+        args: ["1"]
+    delivered_end:
+      flow: flow.marked_lingering
+      input:
+        mark: "'outer:' + execution.outcome"
+  edges:
+    - { from: start, to: notify }
+    - { from: notify, to: wait }
+    - { from: wait, to: end }
+  finally: delivered_end
+
+flow.marked_lingering:
+  description: What `flow.delivered` does once it has ended — the mark it is given, then a pause.
+  inputs:
+    mark:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    mark_it:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "input.mark"
     linger:
       exec:
         command: "${OPS_BIN}/sleep"
