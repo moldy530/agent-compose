@@ -772,14 +772,28 @@ flow.on_event:
         kind: "input.kind"
         payload: "input.payload"
       idempotency_key: "input.event_id"
-    handle:           # only the first delivery gets here
+    handled:          # the write landed already: was the event acted on?
+      store: store.events
+      op: get
+      key: "'handled/' + input.event_id"
+    handle:
       agent: agent.handler
       input: "input.payload"
+    mark:             # after acting, never before
+      store: store.events
+      op: set
+      key: "'handled/' + input.event_id"
+      value:
+        kind: "'handled'"
+        payload: "input.event_id"
   edges:
     - { from: start, to: record }
     - { from: record, to: handle, when: "!record.output.deduped" }
-    - { from: record, to: end, else: true }
-    - { from: handle, to: end }
+    - { from: record, to: handled, else: true }
+    - { from: handled, to: handle, when: "!handled.output.found" }
+    - { from: handled, to: end, else: true }
+    - { from: handle, to: mark }
+    - { from: mark, to: end }
 
 triggers:
   webhook:
@@ -796,12 +810,31 @@ triggers:
 
 **The second execution is answered with the first's answer.** The first
 delivery's `record` writes `event/<id>` and its whole answer becomes the ledger
-row. The second delivery is another execution, and its `record` writes
-**nothing**: it is answered with that row — `applied` and the `version` the
-first write took — and `deduped: true`, so it routes to `end` and `handle` runs
-once. The key holds the first delivery's value at the first delivery's version.
-A retry of either execution re-derives the same string and is answered the same
-way, and a resumed run answers its write out of its record, as every write is.
+row; it is not `deduped`, so the run goes on to `handle`, and `mark` then
+records that the event was acted on. The second delivery is another execution,
+and its `record` writes **nothing**: it is answered with that row — `applied`
+and the `version` the first write took — and `deduped: true`, so it reads
+`handled/<id>`, finds it, and routes to `end`. The key holds the first
+delivery's value at the first delivery's version. A retry of either execution
+re-derives the same string and is answered the same way, and a resumed run
+answers its write out of its record, as every write is.
+
+**`deduped` says the write landed already, not that another delivery made
+it.** On an authored key it means a write under the same business key landed,
+in this execution or another (`docs/trace.md` §8) — and the first delivery can
+be answered `deduped: true` itself. Its `record` commits on the store; then its
+process dies before the journal records the answer, or a dialled store's
+connection drops after the `COMMIT` and the node's `retry:` runs it again.
+Either way `record` runs live a second time under the same key, and the ledger
+hands back the first delivery's own row, `deduped: true`. A graph gated on
+`deduped` alone would send that run to `end`, and every redelivery after it, so
+no delivery would ever reach `handle`. That is the window the `handled/` marker
+closes: only a run that has acted writes it, so the run caught in the window
+finds none and acts. The price is the other direction — a redelivery that
+arrives while the first delivery is still acting finds no marker either, and
+acts too — so `handle` runs **at least once** per event, and more than once
+only for a duplicate that overlaps it. Where acting twice costs something, make
+the action itself idempotent on the event id as well.
 
 **Which writes take one.** `set`, `delete`, `merge`, `append`, `incr` and
 `batch` — the six `kv` writes; a batch is one write, so its key is the node's,
