@@ -1203,7 +1203,9 @@ export function backoffFor(policy: RetryPolicy, attempt: number): number {
  * resolved q76) is a statement about **this** way out as much as any other. So
  * when the deadline wins the race the node does not settle at once: it waits
  * until every instance at or under its own site has ended ([`instancesEnded`]),
- * and only then fails with the [`NodeTimeout`]. The wait is the instances'
+ * and only then fails with the [`NodeTimeout`] — every instance save a
+ * detached delivery's, which the node resolved at dispatch and no deadline of
+ * its waits for (grammar 8.6 rule 7, [`offInstance`]). The wait is the instances'
  * finally nodes and nothing else — the instance's own supersteps stop when the
  * signal aborts, and an instance a node had not yet begun is never begun
  * ([`runSubflow`]) — so it is bounded by those nodes' own grammar 9.3 budgets.
@@ -10821,7 +10823,10 @@ export async function runSubflow(
   }
   const execution = instance.execution.id;
   const path = instance.path.join("/");
-  const stopping = endingAround(execution, path);
+  // The detached delivery it is begun under, if any: the work of that delivery
+  // is nobody's outside it (see [`openInstances`]).
+  const detached = deliveryAround(execution, path);
+  const stopping = endingAround(execution, path, detached);
   if (stopping !== undefined) {
     throw new SubflowFailure(binding.address, "was not started", [], stopping);
   }
@@ -10834,7 +10839,7 @@ export async function runSubflow(
   const ended = runInstance(binding, instance, stop.signal).finally(() =>
     clock?.removeEventListener("abort", follow),
   );
-  instanceBegun(execution, path, ended, stop);
+  instanceBegun(execution, path, ended, stop, detached);
   return ended;
 }
 
@@ -10990,6 +10995,21 @@ async function runInstance(
  * stop, what [`endInstancesInside`] pulls. A detached dispatch's child
  * execution is not here: it is an execution of its own (PRD resolved q65), on no
  * node's clock.
+ *
+ * **A detached `agent.*` delivery's instances are here, and are nobody's
+ * outside it.** Its sink runs under this execution's id, and so does every
+ * instance its model begins from its `tools:` — at a path under the delivery's
+ * own, and so under the `map` node that issued it and every instance around
+ * that node. By the prefix alone each would be inside all of them; but the
+ * delivery was resolved when its record was written, and "nothing it does can
+ * delay the enclosing flow instance" (grammar 8.6 rule 7, Decision D94) is a
+ * statement about every end around it: none of them stops one of these
+ * instances, waits for it, or refuses it a beginning, and neither does the
+ * `map` node's deadline or its `retry:` ladder. So each instance carries the
+ * innermost delivery it was begun under ([`OpenInstance.detached`]), and an end
+ * or a node at or around that delivery leaves it alone ([`offInstance`]). What
+ * it does inside the delivery is its own: the instances *it* begins are inside
+ * it like any others, and its own end stops and waits for them.
  */
 const openInstances = new Map<string, Map<Promise<unknown>, OpenInstance>>();
 
@@ -10999,6 +11019,13 @@ interface OpenInstance {
   readonly path: string;
   /** What its supersteps run under: pulled to stop it ([`endInstancesInside`]). */
   readonly stop: AbortController;
+  /**
+   * The innermost **detached** delivery it runs under — the instance path that
+   * delivery's sink runs at ([`detaching`]) — or absent for one that runs under
+   * none. Read when it begins ([`deliveryAround`]) and kept, so that what the
+   * instance is part of does not depend on when it is asked.
+   */
+  readonly detached?: string;
 }
 
 /** Put one instance on the books until `ending` settles. */
@@ -11007,6 +11034,7 @@ function instanceBegun(
   path: string,
   ending: Promise<unknown>,
   stop: AbortController,
+  detached: string | undefined,
 ): void {
   let open = openInstances.get(execution);
   if (open === undefined) {
@@ -11014,7 +11042,7 @@ function instanceBegun(
     openInstances.set(execution, open);
   }
   const held = open;
-  held.set(ending, { path, stop });
+  held.set(ending, { path, stop, ...(detached === undefined ? {} : { detached }) });
   const ended = (): void => {
     held.delete(ending);
     if (held.size === 0 && openInstances.get(execution) === held) openInstances.delete(execution);
@@ -11030,10 +11058,50 @@ function instanceBegun(
 function instancesOpenUnder(execution: string, site: string): boolean {
   const open = openInstances.get(execution);
   if (open === undefined) return false;
-  for (const { path } of open.values()) {
-    if (under(path, site)) return true;
+  for (const one of open.values()) {
+    if (under(one.path, site) && !offInstance(one.detached, site)) return true;
   }
   return false;
+}
+
+/**
+ * The innermost **detached** delivery `path` lies under in `execution` — the
+ * instance path its sink runs at — or `undefined` where it lies under none
+ * (grammar 8.6 rule 7, and see [`openInstances`]).
+ *
+ * Read off the marks [`runMap`] puts down for as long as each delivery runs
+ * ([`detaching`]), which cover every instance that matters here: an
+ * instance is begun by its delivery's sink while the sink is running, and an
+ * `agent.*` sink answers only once every `flow.*` tool call it made has — its
+ * loop awaits each call, and a call answers only after its instance's
+ * `finally:` node has run. Innermost because deliveries nest: an instance a
+ * delivery began may run a `map` that detaches one of its own.
+ */
+function deliveryAround(execution: string, path: string): string | undefined {
+  const sites = detachedSites.get(execution);
+  if (sites === undefined) return undefined;
+  let innermost: string | undefined;
+  for (const root of sites.keys()) {
+    if (!under(path, root)) continue;
+    if (innermost === undefined || root.length > innermost.length) innermost = root;
+  }
+  return innermost;
+}
+
+/**
+ * Whether an instance whose innermost detached delivery is `detached`
+ * ([`OpenInstance.detached`]) is that delivery's work rather than `around`'s:
+ * the delivery lies at or inside `around` (grammar 8.6 rule 7, Decision D94).
+ *
+ * `around` is an instance that is ending, or the site of a node waiting out
+ * the instances it began. Neither stops, waits for or refuses the work of a
+ * delivery issued inside it: the `map` that issued it resolved it at dispatch.
+ * An instance its sink began is still around the instances *it* begins — the
+ * delivery is around both, not between them — so its own end stops and waits
+ * for them as any end does.
+ */
+function offInstance(detached: string | undefined, around: string): boolean {
+  return detached !== undefined && under(detached, around);
 }
 
 /**
@@ -11152,12 +11220,23 @@ interface EndingInstance {
  * ends, and its `flow:` node, `map` or `flow.*` tool begins instances of its
  * own to do it (grammar 7.9: the stopped instance runs its own finally node
  * before the instance around it runs its).
+ *
+ * Nor inside an end it is off: `detached` is the innermost detached delivery
+ * the new instance is begun under ([`deliveryAround`]), and an end at or
+ * around that delivery refuses none of its work ([`offInstance`]) — the
+ * delivery's `agent.*` sink calls its `flow.*` tools whatever became of the
+ * instance that issued it (grammar 8.6 rule 7).
  */
-function endingAround(execution: string, path: string): InstanceStopped | undefined {
+function endingAround(
+  execution: string,
+  path: string,
+  detached: string | undefined,
+): InstanceStopped | undefined {
   const ending = endingInstances.get(execution);
   if (ending === undefined) return undefined;
   for (const one of ending) {
     if (path === one.path || !under(path, one.path)) continue;
+    if (offInstance(detached, one.path)) continue;
     if (underClosingFinally(ending, one.path, path)) continue;
     return one.reason;
   }
@@ -11215,7 +11294,12 @@ function underClosingFinally(
  * — and is running its finally node, and every instance that finally node has
  * begun ([`underClosingFinally`]). Pulling their stops would cut short the very
  * cleanup this wait is for, so they are waited for, bounded by their finally
- * nodes' own §9.3 budgets, exactly as a deadline's stop leaves them. Until the
+ * nodes' own §9.3 budgets, exactly as a deadline's stop leaves them. Nor is the
+ * work of a **detached** delivery issued inside it — the instances an
+ * `agent.*` sink's model begins from its `tools:` — which this end neither
+ * stops nor waits for, because the delivery was resolved at dispatch and
+ * nothing it does can delay the instance that issued it (grammar 8.6 rule 7,
+ * [`offInstance`]). Until the
  * release, nothing new may begin inside the ending instance ([`endingAround`])
  * — a let-go `flow:` node's next `retry:` attempt, a `map`'s next item — except
  * under one of those finally nodes, or its own.
@@ -11266,7 +11350,10 @@ export async function endInstancesInside(
       endingInstances.delete(execution);
     }
   };
-  const inside = (open: OpenInstance): boolean => open.path !== path && under(open.path, path);
+  // Strictly inside, and not the work of a detached delivery issued inside it,
+  // which no end around the delivery stops or waits for ([`offInstance`]).
+  const inside = (open: OpenInstance): boolean =>
+    open.path !== path && under(open.path, path) && !offInstance(open.detached, path);
   // An end already under way inside this one, read afresh on every round
   // because ends begin while this one waits: an instance this round stops ends
   // its body, and its finally node then begins instances the next round must
@@ -11304,7 +11391,9 @@ export async function endInstancesInside(
  * flow-as-tool call's are under it, and so is every instance nested in any of
  * them. Asked again after each wait, because an instance that was running when
  * the wait began may begin another before it ends; nothing new can begin under
- * a node whose clock has run out, which [`runSubflow`] refuses.
+ * a node whose clock has run out, which [`runSubflow`] refuses. Save the work of
+ * a detached delivery the node issued, which it never waits for
+ * ([`offInstance`]).
  *
  * Callers ask [`instancesOpenUnder`] first, because an `await` here costs a
  * turn even where nothing is open.
@@ -11314,7 +11403,7 @@ async function instancesEnded(execution: string, site: string): Promise<void> {
     const open = openInstances.get(execution);
     if (open === undefined) return;
     const running = [...open]
-      .filter(([, one]) => under(one.path, site))
+      .filter(([, one]) => under(one.path, site) && !offInstance(one.detached, site))
       .map(([ending]) => ending);
     if (running.length === 0) return;
     await Promise.allSettled(running);
@@ -12409,7 +12498,9 @@ export async function runMap(
         deadline: undefined,
         // …and off the instance's end, for the same reason: the delivery was
         // issued when its record was written, and the instance ending around
-        // it neither withdraws it nor refuses what it goes on to do.
+        // it neither withdraws it nor refuses what it goes on to do. The
+        // instances its model begins from its `tools:` are off that end too:
+        // the mark below is what says so ([`deliveryAround`], [`offInstance`]).
         bodyEnded: undefined,
         storeRecords: undefined,
         modelCalls: undefined,
@@ -14259,6 +14350,10 @@ const quietWatchers = new Map<string, Set<() => void>>();
  * Counted for [`working`]'s reason and one of its own: a node `retry:` that
  * re-executes a `map` issues the next attempt's deliveries at the very paths the
  * failed attempt's are still being delivered at, and nothing cancels those.
+ *
+ * Read for one more reason, by [`deliveryAround`]: an instance a delivery's
+ * model begins is that delivery's work, and no end of an instance around it
+ * stops, waits for or refuses it (see [`openInstances`]).
  */
 const detachedSites = new Map<string, Map<string, number>>();
 
