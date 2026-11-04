@@ -65,6 +65,13 @@
 #     journaled from there over `/workers/effects`, and what its finally node
 #     raised comes home on the dispatch's result as `finally_error`
 #     (`docs/distributed.md` §3.3, §3.4).
+#   * `flow.closed` is a cancel reaching that shape (PRD resolved q75, grammar
+#     §7.9, `docs/distributed.md` §3.2): a placed agent attaching a `flow.*`
+#     whose body runs for ten minutes and whose `finally:` node takes eight
+#     seconds and then fails. A cancel during the body ends the attached
+#     instance, which starts its finally node on the worker — and that node runs
+#     whole, past the worker's five-second grace, so the failure it ends on comes
+#     home on the cancelled result as the execution's `finally_error`.
 #
 # `agent.signer` attaches `tool.sign` and both are members of `mac`, which is
 # grammar §14.1 rule 4's second row: the same answer written twice. `tool.sign`'s
@@ -241,6 +248,16 @@ triggers:
     type: http
     flow: flow.tidied
     path: /tidyings
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
+  # A cancel reaching a finally node on a worker — see `flow.closed`.
+  on_closed:
+    type: http
+    flow: flow.closed
+    path: /closings
     method: POST
     input:
       path: "payload.body.path"
@@ -445,6 +462,46 @@ flow.tidying:
     - { from: look, to: end }
   finally: tidy_up
 
+# Placed, and what it attaches is a flow whose body a cancel stops and whose
+# finally node it cannot — see `flow.closed`.
+agent.closer:
+  description: Look a release over at length, and close up after it, on the machine that holds it.
+  model: model.smart
+  prompt: |
+    Look the path you are given over, and report what you found.
+  tools: [flow.closing]
+  input:
+    path:
+      type: string
+  output:
+    signature:
+      type: string
+      min_length: 1
+
+# Attached, never triggered: a body that outlasts any test, and a finally node
+# that outlasts the worker's cancel grace and then fails, so whether it ran to
+# its end is a `finally_error` the hub can read.
+flow.closing:
+  description: Look one release over at length, and close up after it slowly — which never works.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    look_long:
+      exec:
+        command: "${OPS_BIN}/sleep"
+        args: ["600"]
+    close_up:
+      exec:
+        command: "${OPS_BIN}/sh"
+        args: ["-c", "sleep 8; exit 3"]
+  edges:
+    - { from: start, to: look_long }
+    - { from: look_long, to: end }
+  finally: close_up
+
 # Attached rather than triggered, and never reached any other way here: what it
 # is for is being **inside** a placed agent's tool loop.
 flow.escalation:
@@ -632,6 +689,30 @@ flow.tidied:
   edges:
     - { from: start, to: tidy }
     - { from: tidy, to: end }
+
+# A cancel reaching an attached flow's finally node on a worker: `close` is
+# placed, its model calls `flow.closing`, and a cancel during that instance's
+# body starts its finally node there — which runs whole, past the worker's
+# grace, and fails (grammar §7.9, PRD resolved q75).
+flow.closed:
+  description: A placed agent whose attached flow's slow finally node a cancel starts on the worker.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+  nodes:
+    close:
+      agent: agent.closer
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+  edges:
+    - { from: start, to: close }
+    - { from: close, to: end }
 
 flow.release:
   description: Sign a release on a worker, and notarize it on the hub.

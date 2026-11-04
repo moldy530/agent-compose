@@ -526,6 +526,13 @@ impl Drop for Worker {
 /// The child processes of `parent` running `worker-node`, off `/proc`.
 #[cfg(target_os = "linux")]
 fn runners_of(parent: u32) -> Option<Vec<i32>> {
+    children_running(parent, "worker-node")
+}
+
+/// The child processes of `parent` whose command line holds `needle`, off
+/// `/proc`.
+#[cfg(target_os = "linux")]
+fn children_running(parent: u32, needle: &str) -> Option<Vec<i32>> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir("/proc").ok()?.flatten() {
         let Some(pid) = entry
@@ -552,7 +559,7 @@ fn runners_of(parent: u32) -> Option<Vec<i32>> {
         // A zombie's command line is empty, so a runner that has exited and
         // not yet been reaped is not counted as running.
         let command = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
-        if String::from_utf8_lossy(&command).contains("worker-node") {
+        if String::from_utf8_lossy(&command).contains(needle) {
             found.push(pid);
         }
     }
@@ -561,6 +568,11 @@ fn runners_of(parent: u32) -> Option<Vec<i32>> {
 
 #[cfg(not(target_os = "linux"))]
 fn runners_of(_parent: u32) -> Option<Vec<i32>> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn children_running(_parent: u32, _needle: &str) -> Option<Vec<i32>> {
     None
 }
 
@@ -2955,5 +2967,291 @@ fn a_restart_while_a_worker_holds_a_cancelled_dispatch_completes_the_cancel() {
             .is_some_and(|detail| detail.contains("was cancelled")),
         "the held dispatch was ended as an orphan rather than as the cancel's: {rows:#?}"
     );
+    assert!(worker.running(), "{}", worker.transcript());
+}
+
+/// What the resume route answers for an execution somebody cancelled
+/// (`src/serve.ts`'s `CANCELLED_RESUME`, PRD resolved q75 ruling e).
+const CANCELLED_RESUME: &str = "this execution was cancelled, so nothing is waiting for an \
+                                answer: a cancelled execution is ended for good and is never \
+                                resumed";
+
+/// Assert that a cancelled execution holds no wait any more, that its placed
+/// node's entry says `cancelled`, and that an answer to the wait it held is
+/// refused naming the status.
+fn assert_released_and_refused(mesh: &Mesh, execution: &str, wait: &str, report: &Value) {
+    assert!(report.get("error").is_none(), "{report:#}");
+    assert!(
+        report["interrupts"].as_array().is_none_or(Vec::is_empty),
+        "a cancelled execution still publishes the question it was waiting on: {report:#}"
+    );
+    assert!(
+        report["placement_waits"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "a cancelled execution still holds a placement wait: {report:#}"
+    );
+    let escalate = report["trace"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["node"] == "escalate")
+        .unwrap_or_else(|| panic!("the placed node has an entry: {report:#}"));
+    assert_eq!(escalate["outcome"], "cancelled", "{escalate:#}");
+    assert!(escalate.get("error").is_none(), "{escalate:#}");
+    let refused = mesh.resume(execution, wait, &json!({ "decision": "approve" }));
+    assert_eq!(refused.status, 409, "{}", body_of(&refused));
+    assert_eq!(
+        refused.json(),
+        json!({
+            "execution_id": execution,
+            "status": "cancelled",
+            "error": CANCELLED_RESUME,
+        }),
+        "the answer to a released wait was not refused naming the cancel"
+    );
+}
+
+/// **A cancel releases a pause a placed agent brought home** (PRD resolved q75
+/// ruling e: "human and placement waits are released"; Decision D160,
+/// `docs/distributed.md` §3.4).
+///
+/// `flow.escalated`'s placed agent reaches `flow.escalation`'s `ask` on the
+/// worker; the dispatch settles paused and the question is planted on the
+/// hub's board. A cancel while it waits answers `202`, abandons the wait — the
+/// report publishes no question, the placed node's entry is `cancelled` — and
+/// settles the row `cancelled` inside the field report's ten seconds, after
+/// which the answer the question was waiting for is refused naming the status.
+/// The node is not redispatched: one dispatch row, one model call.
+#[test]
+fn a_cancel_releases_a_pause_a_placed_agent_brought_home_and_settles_cancelled() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider.enqueue_all(escalating("never decided"));
+    let mut worker = mesh.worker("cancel-at-a-remote-pause");
+    let execution = mesh.start_execution("/escalations", &json!({ "path": "release.dmg" }));
+    let wait = mesh.paused(&execution);
+    let id = wait["wait_id"].as_str().expect("the wait names itself");
+
+    let asked = Instant::now();
+    let cancelled = mesh.send(Request::post(format!("/executions/{execution}/cancel")));
+    assert_eq!(cancelled.status, 202, "{}", body_of(&cancelled));
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] != "interrupted" && report["status"] != "running"
+    });
+    assert_eq!(
+        report["status"], "cancelled",
+        "a cancel of an execution parked at a worker's question did not end it cancelled: \
+         {report:#}"
+    );
+    assert!(
+        asked.elapsed() < Duration::from_secs(10),
+        "the cancel took {:?} to settle an execution parked at a pause",
+        asked.elapsed()
+    );
+    assert_released_and_refused(&mesh, &execution, id, &report);
+    let rows = mesh.dispatch_rows(&execution);
+    assert_eq!(
+        rows.len(),
+        1,
+        "the cancelled node was dispatched again: {rows:#?}"
+    );
+    assert_eq!(
+        mesh.provider.requests().len(),
+        1,
+        "a cancelled node made a model call past its pause"
+    );
+    assert!(worker.running(), "{}", worker.transcript());
+}
+
+/// **A hub restarted mid-cancel while a placed agent's pause waits completes
+/// the cancel** (PRD resolved q75 ruling e, `docs/durability.md` §6.1).
+///
+/// The journal is left as a `SIGKILL` right after the cancel route recorded its
+/// request would leave it: the request on the `cancellations` table, the
+/// dispatch settled paused with no answer recorded — an abandoned remote pause
+/// writes nothing. The recovered replay reaches the placed node and finds the
+/// unanswered pause, which is a frontier exactly as a local wait's claim is:
+/// the cancel fires there instead of the question going back on the board, so
+/// the row settles `cancelled` with no wait published and the answer is
+/// refused naming the status. Re-planted instead, the wait would refuse every
+/// answer as "being cancelled" while nothing ever ended it.
+#[test]
+fn a_hub_restarted_mid_cancel_at_a_placed_pause_completes_the_cancel() {
+    let Some(mut mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider.enqueue_all(escalating("never decided"));
+    let mut asked = mesh.worker("restart-mid-cancel-at-a-pause");
+    let execution = mesh.start_execution("/escalations", &json!({ "path": "release.dmg" }));
+    let wait = mesh.paused(&execution);
+    let id = wait["wait_id"]
+        .as_str()
+        .expect("the wait names itself")
+        .to_string();
+    asked.kill();
+
+    mesh.restart_after(|project| {
+        let wrote = harness::journal_sql(
+            project,
+            &format!(
+                "INSERT INTO cancellations (execution, requested_at) \
+                 VALUES ('{execution}', '2026-11-04T00:00:00.000Z');"
+            ),
+        );
+        assert!(
+            wrote.status.success(),
+            "{}",
+            String::from_utf8_lossy(&wrote.stderr)
+        );
+    });
+
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] == "cancelled" || report["status"] == "failed"
+    });
+    assert_eq!(
+        report["status"], "cancelled",
+        "the recovered execution did not complete its cancel: {report:#}"
+    );
+    assert_released_and_refused(&mesh, &execution, &id, &report);
+    let rows = mesh.dispatch_rows(&execution);
+    assert_eq!(
+        rows.len(),
+        1,
+        "the recovery dispatched the cancelled node again: {rows:#?}"
+    );
+    assert_eq!(rows[0]["status"], "settled", "{rows:#?}");
+    let human = harness::journal_rows(
+        &mesh.project,
+        "SELECT key FROM effects WHERE kind = 'human'",
+    );
+    assert_eq!(
+        human,
+        json!([]),
+        "the released pause was journaled as answered: {human:#}"
+    );
+    assert_eq!(
+        mesh.provider.requests().len(),
+        1,
+        "the recovery made a model call past the cancelled pause"
+    );
+}
+
+/// The one call `agent.closer` makes on the worker: the attached flow, whose
+/// body outlasts every test — so nothing past it is scripted.
+fn closing() -> Vec<Script> {
+    vec![Script::new(
+        SONNET,
+        Outcome::tool_calls(vec![ToolCall::new(
+            "closing",
+            json!({ "path": "release.dmg" }),
+        )]),
+    )]
+}
+
+/// **A cancel on a worker lets the finally node it started run whole** (grammar
+/// §7.9: "a cancel stops none of it, and nothing it begins"; PRD resolved q75,
+/// Decision D160, `docs/distributed.md` §3.2).
+///
+/// `flow.closed`'s placed agent attaches `flow.closing`, whose body is a
+/// ten-minute command and whose finally node takes eight seconds and then
+/// fails. The cancel lands while the body runs: the worker sends the runner
+/// `SIGTERM`, the runner cancels, the attached instance ends and starts its
+/// finally node — and the worker's five-second grace does **not** kill it,
+/// because the runner reports finally work under way. So past the grace the
+/// runner is still alive and the dispatch still held; and when the row settles,
+/// by the worker's cancelled result, that result carries the failure the
+/// finally node ended on after its eight seconds — work a kill at five would
+/// have cut off, leaving a result with no `finally_error` at all.
+#[test]
+fn a_cancel_on_a_worker_lets_the_finally_node_it_started_run_whole() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider.enqueue_all(closing());
+    let mut worker = mesh.worker("cancel-runs-finally-whole");
+    let execution = mesh.start_execution("/closings", &json!({ "path": "release.dmg" }));
+    until(
+        "the placed agent's model call reached the hub's journal",
+        || worker.transcript(),
+        || harness::journal_holds(&mesh.project, &["close/0#model/0"]),
+    );
+    // The attached flow's body is running once the runner has a `sleep` of its
+    // own; off Linux, where there is no `/proc` to ask, it is given a moment.
+    let runner = worker.runners().map(|_| {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let held = worker.runners().unwrap_or_default();
+            if let Some(runner) = held.first().copied() {
+                let body = u32::try_from(runner)
+                    .ok()
+                    .and_then(|runner| children_running(runner, "sleep"))
+                    .unwrap_or_default();
+                if !body.is_empty() {
+                    break runner;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the attached flow's body never started on the worker: {}",
+                worker.transcript()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    if runner.is_none() {
+        std::thread::sleep(Duration::from_secs(2));
+    }
+
+    let asked = Instant::now();
+    let cancelled = mesh.send(Request::post(format!("/executions/{execution}/cancel")));
+    assert_eq!(cancelled.status, 202, "{}", body_of(&cancelled));
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] != "running" && report["status"] != "interrupted"
+    });
+    assert_eq!(report["status"], "cancelled", "{report:#}");
+
+    // Past the worker's grace, and inside the finally node's eight seconds.
+    std::thread::sleep(Duration::from_millis(6_500).saturating_sub(asked.elapsed()));
+    let rows = mesh.dispatch_rows(&execution);
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["status"].clone())
+            .collect::<Vec<_>>(),
+        [json!("dispatched")],
+        "the dispatch settled inside the finally node's eight seconds, so the runner did not \
+         run it whole: {rows:#?}\n{}",
+        worker.transcript()
+    );
+    if let Some(runner) = runner {
+        assert!(
+            !gone_within(runner, Duration::ZERO),
+            "the worker killed the runner at its grace while a finally node was running in it: \
+             {}",
+            worker.transcript()
+        );
+    }
+
+    let rows = mesh.settled_cancelled(&execution, 1, Duration::from_secs(30));
+    assert!(
+        asked.elapsed() >= Duration::from_secs(8),
+        "the row settled {:?} after the cancel, before the finally node's eight seconds",
+        asked.elapsed()
+    );
+    let payload = rows[0]["payload"].as_str().unwrap_or_default();
+    assert!(
+        payload.contains("flow.closing node `close_up` failed: ") && payload.contains("exited 3"),
+        "the cancelled result does not carry the failure the finally node ended on, so it did \
+         not run to its end: {rows:#?}\n{}",
+        worker.transcript()
+    );
+    if let Some(runner) = runner {
+        assert!(
+            gone_within(runner, Duration::from_secs(10)),
+            "the runner outlived the result it posted: {}",
+            worker.transcript()
+        );
+    }
     assert!(worker.running(), "{}", worker.transcript());
 }

@@ -438,7 +438,9 @@ running, so a placement's `max_running:` (how many of its dispatches one worker
 may hold — `1` unless the deploy file says otherwise) is how many nodes this
 machine runs side by side. A dispatch the hub names in a poll's `cancel` list is
 stopped — its runner is sent `SIGTERM`, and its whole process group `SIGKILL`
-five seconds later if it is still running — and reported `cancelled`.
+five seconds later if it is still running, a grace held for as long as the
+runner reports a `finally:` node running, since that node runs whole — and
+reported `cancelled`.
 
 It runs until it is stopped, or until a join is **refused** — a credential that
 does not verify, a release that does not match this hub's, a claim naming no

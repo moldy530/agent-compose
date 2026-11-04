@@ -16,9 +16,16 @@
 //!   `cancelled`, and the settle webhook says so; a second cancel is `202`, a
 //!   cancel after the end is `409`, and an unknown id is `404` —
 //!   [`a_cancel_stops_a_running_command_and_settles_the_execution_cancelled`];
-//! * the cascade over a lineage, and a child cancelled alone —
-//!   [`a_cancel_of_a_parent_cascades_to_the_child_it_started`] and
+//! * the cascade over a lineage, through a child that has already completed,
+//!   and a child cancelled alone —
+//!   [`a_cancel_of_a_parent_cascades_to_the_child_it_started`],
+//!   [`a_cancel_of_a_root_reaches_a_grandchild_its_completed_child_started`] and
 //!   [`a_child_cancelled_alone_leaves_its_parent_running_to_its_own_end`];
+//! * a `human` wait released, live and across a restart —
+//!   [`a_cancel_releases_a_human_pause_and_settles_the_execution_cancelled`] and
+//!   [`a_restart_in_the_middle_of_a_cancel_at_a_human_pause_completes_it`] (the
+//!   cancel route's auth is pinned beside the status and resume routes', in
+//!   `compiled_graph_acceptance.rs`);
 //! * `resume` refuses a cancelled execution, at the route and at the command
 //!   line, naming the status —
 //!   [`a_cancelled_execution_is_refused_by_resume_at_the_route_and_the_command_line`];
@@ -813,6 +820,271 @@ fn a_restart_between_a_parents_cancel_and_its_childs_cancels_both() {
         ended(&log),
         ["cancelled|none", "cancelled|none"],
         "both finally nodes ran once, at `cancelled`"
+    );
+}
+
+/// The status of every lifecycle row of `flow`, read off the journal.
+fn statuses_of(project: &Path, flow: &str) -> Vec<String> {
+    harness::journal_rows(
+        project,
+        &format!("SELECT status FROM executions WHERE flow = '{flow}'"),
+    )
+    .as_array()
+    .into_iter()
+    .flatten()
+    .filter_map(|row| row["status"].as_str().map(str::to_string))
+    .collect()
+}
+
+/// Wait until every lifecycle row of `flow` reads `status`, within `budget`.
+fn rows_reach(project: &Path, flow: &str, status: &str, budget: Duration) {
+    let deadline = Instant::now() + budget;
+    loop {
+        let held = statuses_of(project, flow);
+        if !held.is_empty() && held.iter().all(|one| one == status) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the `{flow}` rows did not reach `{status}` within {budget:?}: {held:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// **A cancel of a root reaches a grandchild its completed child started**
+/// (PRD resolved q75 ruling c: "every open child execution in its lineage,
+/// recursively"; Decision D160, D94).
+///
+/// `flow.grandparent` detaches one `flow.relay`, which detaches one ten-minute
+/// `flow.long` and **ends at once** — a detached dispatch resolves when it is
+/// issued — while the grandparent runs a ten-minute command of its own. So when
+/// the cancel comes the lineage is root (open) → relay (`completed`) →
+/// grandchild (open). The cascade walks through the settled relay: both
+/// commands stop, the grandchild's row settles `cancelled`, the relay's stays
+/// `completed`, and both finally nodes ran once at `cancelled`.
+#[test]
+fn a_cancel_of_a_root_reaches_a_grandchild_its_completed_child_started() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("cancel-grandchild");
+    let (environment, log) = environment(&provider, &scratch);
+    let Some(project) = harness::scratch_project("cancel-grandchild") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, FIXTURE, &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let root = started(
+        &app,
+        "/grandparent",
+        &json!({ "relays": [{ "lingers": [600] }], "linger": 600 }),
+    );
+    let running = pids(&log, 2);
+    rows_reach(&project, "flow.relay", "completed", SETTLE);
+    assert_eq!(
+        statuses_of(&project, "flow.long"),
+        ["open"],
+        "the grandchild is running when the cancel comes"
+    );
+
+    let (status, body) = cancel(&app, &root);
+    assert_eq!(status, 202, "{body:#}");
+    reaches(&app, &root, "cancelled", SETTLE);
+    rows_reach(&project, "flow.long", "cancelled", SETTLE);
+    assert_eq!(
+        statuses_of(&project, "flow.relay"),
+        ["completed"],
+        "the settled child between them keeps its own outcome"
+    );
+    for pid in &running {
+        assert!(
+            !alive(*pid),
+            "process {pid} outlived a cancel of the root its execution descends from"
+        );
+    }
+    let deadline = Instant::now() + SETTLE;
+    while ended(&log).len() < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        ended(&log),
+        ["cancelled|none", "cancelled|none"],
+        "the grandchild's finally node and the root's both ran once, at `cancelled`"
+    );
+}
+
+/// What the resume route answers for an execution somebody cancelled
+/// (`src/serve.ts`'s `CANCELLED_RESUME`).
+const CANCELLED_RESUME: &str = "this execution was cancelled, so nothing is waiting for an \
+                                answer: a cancelled execution is ended for good and is never \
+                                resumed";
+
+/// Wait until `execution` is parked at its pause, and answer the pause's
+/// `resume_url`.
+fn parked_at(app: &Client, execution: &str) -> String {
+    let report = reaches(app, execution, "interrupted", Duration::from_secs(30));
+    report["interrupts"][0]["resume_url"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the pause publishes a resume url: {report:#}"))
+        .to_string()
+}
+
+/// Assert that a cancelled report publishes no wait, and that an answer sent to
+/// the wait it held is refused naming the status.
+fn released_and_refused(app: &Client, execution: &str, resume_url: &str, report: &Value) {
+    assert!(report.get("error").is_none(), "{report:#}");
+    assert!(
+        report["interrupts"].as_array().is_none_or(Vec::is_empty),
+        "a cancelled execution still publishes the question it was waiting on: {report:#}"
+    );
+    let refused = app
+        .send(Request::post(resume_url).json(&json!({ "decision": "approve" })))
+        .expect("the resume route answers");
+    assert_eq!(refused.status, 409, "{}", refused.text());
+    assert_eq!(
+        refused.json(),
+        json!({
+            "execution_id": execution,
+            "status": "cancelled",
+            "error": CANCELLED_RESUME,
+        })
+    );
+}
+
+/// What the resume route answers while an accepted cancel is still settling
+/// (`src/serve.ts`'s `CANCELLING_RESUME`).
+const CANCELLING_RESUME: &str = "this execution is being cancelled, so every wait it held has \
+                                 been released and nothing is waiting for an answer";
+
+/// **A cancel releases a `human` pause** (PRD resolved q75 ruling e: "human and
+/// placement waits are released"; Decision D160's *Waits*).
+///
+/// `flow.asking` parks at a question with no `timeout:`, so nothing but the
+/// cancel can end it, and its finally node takes four seconds — the window in
+/// which the cancel is accepted and the row not yet settled. The release is
+/// asserted **inside** that window, where a wait still on the board would be
+/// published: right after the `202` the report holds no question and an answer
+/// is refused as one to an execution being cancelled. Then the row settles
+/// `cancelled` inside the field report's ten seconds: the paused node's entry
+/// is `cancelled`, the finally node ran once at `cancelled`, and the answer is
+/// refused naming the status.
+#[test]
+fn a_cancel_releases_a_human_pause_and_settles_the_execution_cancelled() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("cancel-at-a-pause");
+    let (environment, log) = environment(&provider, &scratch);
+    let Some(project) = harness::scratch_project("cancel-at-a-pause") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, FIXTURE, &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let execution = started(&app, "/asking", &json!({ "path": "release.dmg" }));
+    let resume_url = parked_at(&app, &execution);
+    let asked = Instant::now();
+    let (status, body) = cancel(&app, &execution);
+    assert_eq!(status, 202, "{body:#}");
+
+    // Inside the finally node's four seconds: the cancel is accepted and the
+    // row is not settled, and the wait is already gone.
+    let cancelling: Value = app
+        .get(&format!("/executions/{execution}"))
+        .expect("the status route answers")
+        .json();
+    assert!(
+        ended(&log).is_empty(),
+        "the slow finally node had already recorded, so this is not the cancelling window"
+    );
+    assert_ne!(cancelling["status"], "cancelled", "{cancelling:#}");
+    assert!(
+        cancelling["interrupts"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "an execution being cancelled still publishes the question it released: {cancelling:#}"
+    );
+    let early = app
+        .send(Request::post(&resume_url).json(&json!({ "decision": "approve" })))
+        .expect("the resume route answers");
+    assert_eq!(early.status, 409, "{}", early.text());
+    assert_eq!(early.json()["cancelling"], true, "{}", early.text());
+    assert_eq!(early.json()["error"], CANCELLING_RESUME, "{}", early.text());
+
+    let report = reaches(&app, &execution, "cancelled", SETTLE);
+    assert!(
+        asked.elapsed() < SETTLE,
+        "the cancel took {:?} to settle an execution parked at a pause",
+        asked.elapsed()
+    );
+    released_and_refused(&app, &execution, &resume_url, &report);
+    let ask = report["trace"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["node"] == "ask")
+        .unwrap_or_else(|| panic!("the paused node has an entry: {report:#}"));
+    assert_eq!(ask["outcome"], "cancelled", "{ask:#}");
+    assert!(ask.get("error").is_none(), "{ask:#}");
+    assert_eq!(
+        ended(&log),
+        ["cancelled|none"],
+        "the finally node ran once, reading `cancelled` and no `execution.error`"
+    );
+}
+
+/// **A restart in the middle of a cancel at a `human` pause completes it**
+/// (PRD resolved q75 ruling e, `docs/durability.md` §6.1).
+///
+/// The journal is left as a crash right after the cancel route recorded its
+/// request would leave it: the request on the `cancellations` table, the pause
+/// unanswered — an abandoned pause writes nothing. The recovered replay reaches
+/// the pause's claim, the first effect the record does not hold, and the
+/// cancel fires there instead of the wait being planted again: the row settles
+/// `cancelled`, no question is published, and the finally node runs once.
+#[test]
+fn a_restart_in_the_middle_of_a_cancel_at_a_human_pause_completes_it() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("cancel-restart-pause");
+    let (environment, log) = environment(&provider, &scratch);
+    let Some(project) = harness::scratch_project("cancel-restart-pause") else {
+        return;
+    };
+    let (execution, resume_url) = {
+        let Some(mut served) = harness::serve_into(&project, FIXTURE, &environment) else {
+            return;
+        };
+        let app = Client::new(&served.base_url).expect("a client for the generated app");
+        let execution = started(&app, "/asking", &json!({ "path": "release.dmg" }));
+        let resume_url = parked_at(&app, &execution);
+        served.stop();
+        (execution, resume_url)
+    };
+    let wrote = harness::journal_sql(
+        &project,
+        &format!(
+            "INSERT INTO cancellations (execution, requested_at) \
+             VALUES ('{execution}', '2026-11-04T00:00:00.000Z');"
+        ),
+    );
+    assert!(
+        wrote.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wrote.stderr)
+    );
+
+    let Some(recovered) = harness::serve_into(&project, FIXTURE, &environment) else {
+        return;
+    };
+    let app = Client::new(&recovered.base_url).expect("a client for the recovered app");
+    let report = reaches(&app, &execution, "cancelled", Duration::from_secs(30));
+    released_and_refused(&app, &execution, &resume_url, &report);
+    assert_eq!(
+        ended(&log),
+        ["cancelled|none"],
+        "the finally node ran once, at `cancelled`"
     );
 }
 

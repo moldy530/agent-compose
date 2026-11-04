@@ -1550,19 +1550,26 @@ still unsettled is a frontier too, and the cancel withdraws it or tells the
 worker holding it (`docs/distributed.md` §3.2); so is a dispatch row a worker
 settled with the cancelled ending (`ExecutionCancelled`, `docs/distributed.md`
 §3.4), which the replay reads back as the cancel it was, and one the cancel
-withdrew. A dispatch a worker held when the process died is not superseded as
-an orphan at the next start, as every other such row is (`docs/distributed.md`
-§5): read as one, the node's attempt would fail under its `retry:` and
-`on_error:` — the chain a cancel is never routed through — and the execution
-would end `failed`. It is left `dispatched` for the replay, which ends it as
-the cancel's. And a body whose whole record replays to its end had ended before
-the cancel could reach it, and settles as it ended — the cancel changes no
-outcome it arrives after.
+withdrew. So is a **pause nobody answered**: a local one at its claim, and one
+a worker sent home that the replay finds on a dispatch row settled paused with
+no answer recorded — an abandoned pause writes nothing — where the cancel fires
+instead of the wait being planted on the board again. Planted, it would be a
+wait every answer is refused at and nothing ever ends. A dispatch a worker held
+when the process died is not superseded as an orphan at the next start, as
+every other such row is (`docs/distributed.md` §5): read as one, the node's
+attempt would fail under its `retry:` and `on_error:` — the chain a cancel is
+never routed through — and the execution would end `failed`. It is left
+`dispatched` for the replay, which ends it as the cancel's. And a body whose
+whole record replays to its end had ended before the cancel could reach it, and
+settles as it ended — the cancel changes no outcome it arrives after.
 
 **The cascade is walked again.** The cancel route records the parent's request
-and then walks its open children, and a process can die between the two. So
+and then walks its open descendants, and a process can die between the two. So
 the generation that recovers a row carrying `cancelRequestedAt` cancels that
-row's open children — each one's request recorded, recursively — before its
+row's open descendants — its open children, and an open execution a settled
+child started, whose nearest open ancestor is this row (a detached dispatch
+resolves when it is issued, so a child often completes before the grandchild
+it started does) — each one's request recorded, recursively — before its
 replay re-issues any dispatch: a child it reaches again resumes carrying its
 own request and completes its cancel at its own frontier, rather than running
 on as if nothing had asked it to stop.

@@ -9,6 +9,8 @@
 //! stdin   the dispatch, verbatim as `/workers/poll` answered it
 //! stdout  {"type":"effect", …}  → batched and POSTed to /workers/effects
 //!         {"type":"result",  …} → POSTed to /workers/result
+//!         {"type":"finally", "running": …} → read here, never sent: whether
+//!                                  a `finally:` node is running in the runner
 //! stderr  inherited by this process's own, so a node's diagnostics are the
 //!         worker's diagnostics
 //! ```
@@ -86,7 +88,18 @@ use super::{Sessions, Stop, note};
 /// one that does not: a host function that never reads its signal, or a child
 /// that ignores `SIGTERM`. Inside the ten seconds PRD resolved q75 sets as the
 /// bar, with room for the poll that carried the cancel.
+///
+/// **Not while a `finally:` node is running in the runner**, which the runner
+/// reports on its stdout. A cancel ends the instances it reaches, and an
+/// instance that ends runs its finally node *whole* — "a cancel stops none of
+/// it, and nothing it begins" (grammar §7.9, Decision D160) — under that node's
+/// own `timeout:`. So the grace is held for as long as one runs, and runs again
+/// from the moment the last of them settles.
 pub(crate) const CANCEL_GRACE: Duration = Duration::from_secs(5);
+
+/// How often a held grace looks again at whether the runner's finally work has
+/// ended.
+const FINALLY_POLL: Duration = Duration::from_millis(50);
 
 /// One dispatch this worker is running, as a cancel reaches it.
 #[derive(Default)]
@@ -95,6 +108,9 @@ struct Handle {
     pid: AtomicU32,
     /// Whether the hub has cancelled this dispatch.
     cancelled: AtomicBool,
+    /// Whether the runner says a `finally:` node is running in it — the work a
+    /// cancel's grace does not cut off ([`CANCEL_GRACE`]).
+    finally: AtomicBool,
 }
 
 /// The dispatches this worker is running, by `dispatch_id` — shared between the
@@ -131,8 +147,10 @@ impl Running {
 
     /// Act on the hub's cancel of `id` (§3.2): mark it, send its runner
     /// `SIGTERM`, and kill its process group if it is still running after
-    /// [`CANCEL_GRACE`]. A dispatch this worker does not hold — already settled,
-    /// or never handed over — is nothing to stop.
+    /// [`CANCEL_GRACE`] — a grace held while the runner reports a `finally:`
+    /// node running, and given again once it reports none. A dispatch this
+    /// worker does not hold — already settled, or never handed over — is
+    /// nothing to stop.
     pub(crate) fn cancel(&self, id: &str) {
         let Some(handle) = self
             .0
@@ -154,8 +172,17 @@ impl Running {
         let id = id.to_string();
         std::thread::spawn(move || {
             std::thread::sleep(CANCEL_GRACE);
-            if running.holds(&id) {
-                kill_group(handle.pid.load(Ordering::SeqCst));
+            while running.holds(&id) {
+                if !handle.finally.load(Ordering::SeqCst) {
+                    kill_group(handle.pid.load(Ordering::SeqCst));
+                    return;
+                }
+                // A finally node is how the instance the cancel ended ends, and
+                // runs whole: the grace starts over once it has settled.
+                while running.holds(&id) && handle.finally.load(Ordering::SeqCst) {
+                    std::thread::sleep(FINALLY_POLL);
+                }
+                std::thread::sleep(CANCEL_GRACE);
             }
         });
     }
@@ -260,15 +287,25 @@ fn execute_held(
     };
     // **A dispatch the hub cancelled is settled `cancelled`** (§3.4, PRD
     // resolved q75), whatever its runner managed to say on its way out: the
-    // result is the worker's statement that it stopped the work.
-    let cancelled = || {
-        json!({
+    // result is the worker's statement that it stopped the work. What a
+    // `finally:` node that ran in the runner raised travels beside it — a cancel
+    // is what starts most of them, and §3.4 carries `finally_error` on every
+    // ending.
+    let cancelled = |said: Option<&Value>| {
+        let mut body = json!({
             "dispatch_id": id,
             "status": "cancelled",
-        })
+        });
+        if let Some(finally_error) = said
+            .and_then(|said| said.get("finally_error"))
+            .filter(|held| held.is_string())
+        {
+            body["finally_error"] = finally_error.clone();
+        }
+        body
     };
     if handle.cancelled.load(Ordering::SeqCst) {
-        return settle(&mut sender, &cancelled());
+        return settle(&mut sender, &cancelled(None));
     }
 
     let child = spawn(bun, tree, runner, dispatch);
@@ -343,6 +380,12 @@ fn execute_held(
                 }
                 result = Some(body);
             }
+            // The runner's account of its finally work, for a cancel's grace
+            // ([`CANCEL_GRACE`]); the hub is never sent it.
+            Some("finally") => {
+                let running = said.get("running").and_then(Value::as_bool) == Some(true);
+                handle.finally.store(running, Ordering::SeqCst);
+            }
             _ => {
                 unreadable = Some(format!(
                     "the node runner wrote a line this worker does not understand: {line}"
@@ -365,7 +408,7 @@ fn execute_held(
     }
 
     if handle.cancelled.load(Ordering::SeqCst) {
-        return settle(&mut sender, &cancelled());
+        return settle(&mut sender, &cancelled(result.as_ref()));
     }
     let settling = match (result, unreadable, rejected) {
         // The refusal first, and ahead of a result the runner may already have

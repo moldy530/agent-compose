@@ -47,7 +47,8 @@
 //
 // # The stdout contract
 //
-// One JSON object per line, and two kinds:
+// One JSON object per line, and two kinds that carry the dispatch — and a
+// third the worker reads for itself (see *Finally work is reported*):
 //
 // ```json
 // {"type":"effect","effect":{"key":"sign/0#model/0","…":"…"}}
@@ -112,6 +113,24 @@
 // result line says `status: "cancelled"`. The worker posts that result, and
 // kills what is left of this process's group if it has not exited in time.
 //
+// # Finally work is reported
+//
+// A `finally:` node runs whole whatever a cancel does (grammar 7.9, Decision
+// D160) — and a cancel is what *starts* most of them, by ending the instance
+// that declared one. So the worker's grace must not run while one is running
+// here, and this process says when it is, on a line of its own:
+//
+// ```json
+// {"type":"finally","running":true}
+// {"type":"finally","running":false}
+// ```
+//
+// `true` when the first finally node of the process begins and `false` when the
+// last settles; the worker's grace runs from the `false` (`docs/distributed.md`
+// §3.2). The lines are the worker's alone and are never posted to the hub, and
+// one may follow the result line — a detached delivery a finally node issued
+// runs on after the node it belongs to has answered.
+//
 // # What this module is not
 //
 // * **Not a scheduler.** It runs one node and exits. Which node, and when, is
@@ -145,10 +164,11 @@ import { type PlacedAnswer, executeLocally } from "./mesh.ts";
 import type * as runtime from "./runtime.ts";
 import {
   cancelFired,
+  cancelOnTerminate,
   dispatchPausesHome,
   executionCancelSignal,
   finallyErrorOf,
-  fireCancel,
+  onFinallyWork,
   refuseChildExecutions,
   releaseWorkspaces,
   remotePauseOf,
@@ -654,10 +674,15 @@ async function main(): Promise<void> {
   // The execution's one controller, which every node this process runs chains
   // to (`runtime.runActivity`) and the placed node's own context reads; a
   // `SIGTERM` from the worker is the hub's cancel arriving (see *A cancel
-  // arrives as `SIGTERM`*).
+  // arrives as `SIGTERM`*), and nothing else — so the runtime's stop sweep
+  // leaves it to the cancel (`runtime.cancelOnTerminate`).
   const cancel = executionCancelSignal(dispatch.execution_id);
-  process.on("SIGTERM", () => {
-    fireCancel(dispatch.execution_id);
+  cancelOnTerminate(dispatch.execution_id);
+  // …and the worker is told whenever finally work starts and stops here, so a
+  // cancel's grace does not cut off a `finally:` node that runs whole (see
+  // *Finally work is reported*).
+  onFinallyWork((running) => {
+    writing = writing.then(() => say({ type: "finally", running }));
   });
 
   let line: Record<string, unknown>;
