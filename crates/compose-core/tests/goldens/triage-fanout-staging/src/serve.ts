@@ -17,6 +17,7 @@
 // | start | the trigger's own `path:`, at its own `method:` | validates the payload, starts an execution, and answers per `respond:` |
 // | status | `GET /executions/:id` | the execution's state, its outputs once it has them, and any pause it is holding |
 // | resume | `POST /executions/:id/resume` | delivers a human's answer to an interrupted execution |
+// | cancel | `POST /executions/:id/cancel` | cancels an open execution, and every open child execution in its lineage |
 //
 // It is byte-identical in every project this compiler release builds, like
 // `./runtime.ts`: what differs between two projects is `./triggers.ts`.
@@ -120,14 +121,28 @@
 // then compare equal to the one every anonymous caller sends (see
 // [`blankCredentials`]).
 //
-// The subtle clause is that `auth:` covers **three** routes rather than one.
-// `resume` injects data into a parked run and `status` publishes what a run is
-// holding, and both are per execution rather than per trigger — so each enforces
-// the auth of **the trigger that started that execution**, which the journal's
-// lifecycle row records (`docs/durability.md` §3.5). An execution a no-auth
+// The subtle clause is that `auth:` covers **four** routes rather than one.
+// `resume` injects data into a parked run, `status` publishes what a run is
+// holding and `cancel` stops one, and all three are per execution rather than
+// per trigger — so each enforces the auth of **the trigger that started that
+// execution**, which the journal's lifecycle row records (`docs/durability.md`
+// §3.5). An execution a no-auth
 // trigger began keeps open routes; one an authenticated trigger began never
 // answers an unauthenticated poll, in this process or in the one that recovers
 // it after a restart.
+//
+// # Cancel (PRD resolved q75, Decision D160)
+//
+// `POST /executions/:id/cancel` stops an open execution: the request is recorded
+// on the journal first, then the execution's one abort controller fires — every
+// running node's signal with it, model calls, spawned commands, harness runs and
+// placed dispatches alike — and every open child execution in its lineage is
+// cancelled the same way (`runtime.cancelExecution`). Its waits are released,
+// each ending instance runs its `finally:` node at outcome `cancelled`, and the
+// row settles `cancelled`: the status route says so, the settle webhook carries
+// it, and the trace ships. `202` for an execution still open — a second cancel
+// of one already cancelling included, since the request stands either way — and
+// `409` for one that has completed, failed or been cancelled.
 //
 // # Lifecycle webhooks (grammar 13.3, PRD resolved q34, q35)
 //
@@ -173,8 +188,10 @@ import { type CompiledFlow, type FlowRun, flows, runChildFlow, runFlow } from ".
 import { mountWorkerRoutes, placementWaits, watchPlacementWaits } from "./mesh.ts";
 import { drainStores, sweepBoundStores } from "./stores.ts";
 import {
+  cancelExecution,
   deliverHumanAnswer,
   deliveriesOf,
+  endedByCancel,
   executionReport,
   exhaustRecordedDelivery,
   hostChildren,
@@ -195,7 +212,7 @@ import type * as runtime from "./runtime.ts";
 import { type HttpTrigger, httpTriggers } from "./triggers.ts";
 
 /** What an execution this process started is doing (PRD 5.11). */
-export type ExecutionStatus = "running" | "completed" | "failed" | "interrupted";
+export type ExecutionStatus = "running" | "completed" | "failed" | "interrupted" | "cancelled";
 
 /** One execution, tracked in this process for as long as the process lives. */
 interface Execution {
@@ -234,6 +251,12 @@ interface Execution {
    * answer arrived early is [`stillReplayingTo`], off the pause it named.
    */
   recovering: boolean;
+  /**
+   * Whether a cancel of this execution has been accepted here and the run has
+   * not settled yet (PRD resolved q75) — what lets the resume route say why
+   * nothing is waiting rather than which pause is not.
+   */
+  cancelling: boolean;
   /**
    * Whether this execution has held a pause since this process picked it up.
    *
@@ -440,11 +463,28 @@ export function createApp(): FastifyInstance {
     // refused (grammar 13.3, PRD resolved q32).
     const refusal = guarded(execution, request);
     if (refusal !== undefined) return refuse(reply, execution.trigger, refusal);
+    if (execution.status === "cancelled") {
+      return reply.code(409).send({
+        execution_id: id,
+        status: execution.status,
+        error: CANCELLED_RESUME,
+      });
+    }
     if (execution.status !== "running") {
       return reply.code(409).send({
         execution_id: id,
         status: execution.status,
         error: `this execution has already ${execution.status}, so nothing is waiting for an answer`,
+      });
+    }
+    // A cancel accepted and not yet settled has released every wait this
+    // execution held, so an answer arriving now has nothing to settle.
+    if (execution.cancelling) {
+      return reply.code(409).send({
+        execution_id: id,
+        status: statusOf(execution),
+        cancelling: true,
+        error: CANCELLING_RESUME,
       });
     }
     // Fastify's default query parser answers a **repeated** key with an array,
@@ -521,8 +561,50 @@ export function createApp(): FastifyInstance {
     });
   });
 
+  app.post("/executions/:id/cancel", async (request, reply) => {
+    const id = (request.params as { id: string }).id;
+    const execution = executions.get(id);
+    // The order the resume route keeps, for its reasons: an id this process
+    // does not know is a different mistake from a cancel the caller may not
+    // make, and the guard comes before anything about the execution is said
+    // (grammar 13.3, PRD resolved q32).
+    if (execution === undefined) return unknownExecution(reply, id);
+    const refusal = guarded(execution, request);
+    if (refusal !== undefined) return refuse(reply, execution.trigger, refusal);
+    if (execution.status !== "running") {
+      return reply.code(409).send({
+        execution_id: id,
+        status: execution.status,
+        error: `this execution has already ${execution.status === "cancelled" ? "been cancelled" : execution.status}, so there is nothing to cancel`,
+      });
+    }
+    // **Recorded before it is acted on**, and awaited, which is what makes the
+    // `202` a statement about the journal: a process that dies between this
+    // line and the reply has already written the request, and the start that
+    // recovers the execution completes the cancel rather than resuming it
+    // (`runtime.cancelExecution`, `docs/durability.md` §6.1). A second cancel
+    // of an execution already cancelling is the same request again, and
+    // answered the same way.
+    execution.cancelling = true;
+    await cancelExecution(id);
+    return reply.code(202).send({
+      execution_id: id,
+      status: statusOf(execution),
+      cancelling: true,
+      status_url: `/executions/${id}`,
+    });
+  });
+
   return app;
 }
+
+/** What the resume route answers for an execution somebody cancelled (PRD resolved q75). */
+const CANCELLED_RESUME =
+  "this execution was cancelled, so nothing is waiting for an answer: a cancelled execution is ended for good and is never resumed";
+
+/** …and for one whose cancel is accepted and still settling. */
+const CANCELLING_RESUME =
+  "this execution is being cancelled, so every wait it held has been released and nothing is waiting for an answer";
 
 // ---------------------------------------------------------------------------
 // Verifying a caller (grammar 13.3, PRD resolved q32)
@@ -1099,6 +1181,9 @@ function resumeInto(
     // window and [`stillReplayingTo`] for what it decides.
     recovering: true,
     parked: false,
+    // A recovered row whose cancel a dead process had accepted is one the
+    // replay completes (`runtime.completeCancel`), and it says so here too.
+    cancelling: row.cancelRequestedAt !== undefined,
     // The webhook the caller who started this execution is still waiting for.
     // It is on the lifecycle row because *this* process is the one that will
     // finish the run, and the request that named the URL reached the one that
@@ -1180,6 +1265,7 @@ function trackChild(
     // recovered execution is; it holds no pause for the window to be about.
     recovering: child.resume,
     parked: false,
+    cancelling: false,
     reported: new Set<string>(),
     deliveries: Promise.resolve(),
     announced: false,
@@ -1221,6 +1307,7 @@ function register(
     // read, and it is never asked about an execution that is not recovering.
     recovering: false,
     parked: false,
+    cancelling: false,
     ...(callback === undefined ? {} : { callback }),
     // Nothing has been announced about an execution that is one line old.
     reported: new Set<string>(),
@@ -1358,8 +1445,14 @@ function recorded(execution: Execution, answer: FlowRun | undefined, error: unkn
     if (answer.finallyError !== undefined) execution.finallyError = answer.finallyError;
     return;
   }
-  execution.status = "failed";
-  execution.error = message(error);
+  // A run somebody cancelled is `cancelled`, with no `error`: nothing went
+  // wrong with it (PRD resolved q75, Decision D160).
+  if (endedByCancel(error)) {
+    execution.status = "cancelled";
+  } else {
+    execution.status = "failed";
+    execution.error = message(error);
+  }
   const trace = (error as { trace?: readonly runtime.TraceEntry[] }).trace;
   if (trace !== undefined) execution.trace = trace;
   const finallyError = (error as { finallyError?: string } | null | undefined)?.finallyError;
@@ -1435,21 +1528,22 @@ async function closed(
     // stderr and a status route that still holds the answer.
     await insisting(() => deliver(execution, "settled", []));
   }
-  await insisting(() =>
-    // Reached whether or not the webhook was journaled a moment ago, and that is
-    // this hook's second half rather than its continuation: the export is owed by
-    // **every** settled execution (grammar §14.5), including one whose webhook a
-    // dead generation already put down. [`shipping`] is a no-op under a target
-    // that declares no sink and idempotent under one that does, so arriving here
-    // twice across generations costs a journal read.
-    //
-    // The outcome is derived from what the run answered rather than read back
-    // off the execution, for the reason [`recorded`] derives it there: the two
-    // must agree, and one derivation cannot disagree with itself. The third
-    // envelope status is unreachable here — a run holding a pause leaves its row
-    // open and never reaches this hook (`./graph.ts`'s `closing`).
-    shipping(execution, produced === undefined ? "failed" : "completed"),
-  );
+  // Reached whether or not the webhook was journaled a moment ago, and that is
+  // this hook's second half rather than its continuation: the export is owed by
+  // **every** settled execution (grammar §14.5), including one whose webhook a
+  // dead generation already put down. [`shipping`] is a no-op under a target
+  // that declares no sink and idempotent under one that does, so arriving here
+  // twice across generations costs a journal read.
+  //
+  // The outcome is derived from what the run answered rather than read back off
+  // the execution, for the reason [`recorded`] derives it there: the two must
+  // agree, and one derivation cannot disagree with itself. A cancelled run is
+  // one that settled (PRD resolved q75); the envelope status a run holding a
+  // pause carries is unreachable here — its row stays open and never reaches
+  // this hook (`./graph.ts`'s `closing`).
+  const outcome =
+    produced !== undefined ? "completed" : endedByCancel(error) ? "cancelled" : "failed";
+  await insisting(() => shipping(execution, outcome));
 }
 
 /**
@@ -1472,7 +1566,7 @@ async function closed(
  */
 function shipping(
   execution: Execution,
-  status: "completed" | "failed",
+  status: "completed" | "failed" | "cancelled",
 ): Promise<boolean> {
   if (!sinkConfigured()) return Promise.resolve(true);
   const journaled = execution.deliveries

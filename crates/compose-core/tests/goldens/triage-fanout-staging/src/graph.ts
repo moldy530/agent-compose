@@ -644,13 +644,12 @@ const agentTriage: runtime.AgentBinding = {
         ],
         "type": "object"
       },
-      invoke: async (args, context, site) =>
+      invoke: async (args, context) =>
         stores.runStoreTool(
           storeDocs,
           "search",
           runtime.parseToolArguments(storeDocsToolSearchInput, args, "the arguments `docs_search` was called with") as Record<string, unknown>,
           context,
-          site,
         ),
     },
   ],
@@ -1203,7 +1202,7 @@ const flowTriageNodeRemember: runtime.NodeDescriptor = {
       "set",
       input as stores.StoreParams,
       context,
-      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "remember")].join("/"), path: runtime.instancePath(view, "remember").join("/") },
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "remember")].join("/") },
     ),
   }),
   writes: [],
@@ -1995,6 +1994,8 @@ async function quiesceFlow(
   // and its own finally node run (`runtime.endInstancesInside`).
   if (options.resume === true) await runtime.settleDetached(executionId);
   const ending = runtime.instanceEnding(executionId, ended);
+  // A run somebody cancelled says so (PRD resolved q75, Decision D160).
+  if (ending?.outcome === "cancelled") what = "was cancelled";
   let closing: runtime.FinallyRun | undefined;
   try {
     const inside = await runtime.endInstancesInside(

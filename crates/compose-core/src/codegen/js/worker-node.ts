@@ -100,6 +100,18 @@
 // attempt's effects are the retry's history, so "a model call already paid for is
 // not paid for twice" (§7.3) is the same mechanism as a resumed execution's.
 //
+// # A cancel arrives as `SIGTERM` (§3.2, PRD resolved q75)
+//
+// The hub's poll answer names a dispatch in its `cancel` list when the
+// execution it belongs to was cancelled, and the worker holding it stops this
+// process by sending it `SIGTERM`. That fires the execution's cancel **here**,
+// through the same controller a hub-side cancel pulls (`runtime.fireCancel`):
+// every signal the placed node's activities read aborts — a model call's
+// `fetch`, a spawned command, a harness run, an attached flow's instances — so
+// what this process started stops by the path a deadline stops it by, and the
+// result line says `status: "cancelled"`. The worker posts that result, and
+// kills what is left of this process's group if it has not exited in time.
+//
 // # What this module is not
 //
 // * **Not a scheduler.** It runs one node and exits. Which node, and when, is
@@ -132,8 +144,11 @@ import {
 import { type PlacedAnswer, executeLocally } from "./mesh.ts";
 import type * as runtime from "./runtime.ts";
 import {
+  cancelFired,
   dispatchPausesHome,
+  executionCancelSignal,
   finallyErrorOf,
+  fireCancel,
   refuseChildExecutions,
   releaseWorkspaces,
   remotePauseOf,
@@ -238,6 +253,10 @@ class DispatchJournal implements Journal {
     _finallyError?: string,
   ): Promise<void> {
     throw new WorkerJournalReach("close an execution");
+  }
+
+  requestCancel(_id: string): Promise<void> {
+    throw new WorkerJournalReach("record a cancel request");
   }
 
   execution(_id: string): Promise<ExecutionRow | undefined> {
@@ -632,6 +651,14 @@ async function main(): Promise<void> {
   // tool loop — through an attached `flow.*`, which grammar §14.1 rule 4 runs in
   // the attaching agent's placement.
   dispatchPausesHome();
+  // The execution's one controller, which every node this process runs chains
+  // to (`runtime.runActivity`) and the placed node's own context reads; a
+  // `SIGTERM` from the worker is the hub's cancel arriving (see *A cancel
+  // arrives as `SIGTERM`*).
+  const cancel = executionCancelSignal(dispatch.execution_id);
+  process.on("SIGTERM", () => {
+    fireCancel(dispatch.execution_id);
+  });
 
   let line: Record<string, unknown>;
   try {
@@ -651,6 +678,7 @@ async function main(): Promise<void> {
       ...(dispatch.policy === undefined
         ? {}
         : { policy: dispatch.policy as runtime.InstancePolicy }),
+      signal: cancel,
     });
     line = {
       type: "result",
@@ -669,9 +697,12 @@ async function main(): Promise<void> {
     // ([`pausedOnAHuman`]).
     const paused = pausedOnAHuman(error);
     line =
-      paused === undefined
-        ? { type: "result", error: named(error) }
-        : { type: "result", paused };
+      // The hub's cancel, which this process stopped on: §3.4's fourth ending.
+      cancelFired(dispatch.execution_id)
+        ? { type: "result", status: "cancelled" }
+        : paused === undefined
+          ? { type: "result", error: named(error) }
+          : { type: "result", paused };
   }
   // A `finally:` node that ran here and failed after its retries — a flow-as-tool
   // instance's, which grammar 14.1 rule 4 runs in this placed agent's process —

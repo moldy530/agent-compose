@@ -23,7 +23,8 @@ import { Client } from "pg";
  * every column grown since its first release, because files that old exist.) A
  * **table** added since is no work: `lineage` (PRD resolved q65) arrived after
  * this schema first shipped, and `IF NOT EXISTS` is the whole of its migration
- * into a database an earlier build created. A **column** added since is the case §11.2 is read twice for,
+ * into a database an earlier build created — and so is `cancellations` (PRD
+ * resolved q75), which holds a cancel that was requested. A **column** added since is the case §11.2 is read twice for,
  * and `finally_error` (PRD resolved q76) is the first: a database an earlier
  * build created holds `executions` without it, and `CREATE TABLE IF NOT EXISTS`
  * leaves that table as it is. So the `DO` block below probes `pg_attribute` and
@@ -127,6 +128,10 @@ CREATE TABLE IF NOT EXISTS lineage (
   idempotency_key TEXT COLLATE "C" NOT NULL,
   item_index      INTEGER,
   admission       TEXT
+);
+CREATE TABLE IF NOT EXISTS cancellations (
+  execution    TEXT COLLATE "C" PRIMARY KEY,
+  requested_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS effects_of_execution ON effects (execution);
 CREATE INDEX IF NOT EXISTS executions_by_status ON executions (status, started_at);

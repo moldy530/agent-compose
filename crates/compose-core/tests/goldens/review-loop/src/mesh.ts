@@ -28,8 +28,10 @@
 //
 // Work queues to a **placement**, never to a worker (§2, §6.3). A placed node
 // calls [`dispatchPlaced`], which puts a row on the journal's dispatch board and
-// waits; a worker claiming that placement long-polls, is handed at most one
-// unsettled dispatch, streams its effects home, and posts a result. Everything
+// waits; a worker claiming that placement long-polls, is handed work while the
+// unsettled dispatches it holds for that placement number fewer than the
+// placement's `max_running:` (least-loaded session first), streams its effects
+// home, and posts a result. Everything
 // durable is the journal's — §8 rule 3 forbids dispatch state anywhere else — and
 // everything in memory here is either advisory (the session table, §5) or a
 // promise this process is holding for a node it is running.
@@ -45,11 +47,12 @@
 //
 // * **No heartbeat route.** A poll is the liveness signal and §3.2 says there
 //   MUST NOT be a second one.
-// * **No capacity knob.** A session holds exactly one unsettled dispatch. §13
-//   files raising that as a question for the PRD rather than a hub's setting, so
-//   there is no field, no option and no environment variable for it here; the
-//   wire reserves an OPTIONAL join field for whatever the answer turns out to be
-//   and this hub neither sends nor reads one.
+// * **No capacity knob of the hub's own.** How many unsettled dispatches one
+//   session may hold is the placement's `max_running:` (grammar §14.1, PRD
+//   resolved q79, Decision D161), read out of `./deployment.ts` — a deploy-layer
+//   key, never an option or an environment variable of this process. Before
+//   q79 a session held exactly one, and the "no capacity knob" decision that
+//   said so is retired (`docs/distributed.md` §13).
 // * **No containment.** §13's second open row; a worker runs the artifact with
 //   its own privileges, and nothing here says otherwise.
 // * **No worker-to-worker anything.** Every edge goes through this process.
@@ -72,11 +75,15 @@ import {
   type Journal,
   type JournalOutcome,
   type JournalRecord,
+  ExecutionCancelled,
+  cancellationOf,
   effectKey,
+  frontierRefusal,
   openJournal,
   replayedFailure,
 } from "./journal.ts";
 import {
+  fireCancel,
   handsOutPlacedNodes,
   holdFinallyError,
   holdRemotePause,
@@ -102,8 +109,15 @@ import type * as runtime from "./runtime.ts";
  * answered with no output rather than as a wait for a person — §10.3's "a change
  * that would make a peer of the previous version behave **wrongly** rather than
  * be refused", exactly. §10 records the bump and why it costs nothing.
+ *
+ * **`3` since PRD resolved q75 and q79, one bump for both**: a poll answer
+ * carries a `cancel` list and a result may say `status: "cancelled"` (§3.2,
+ * §3.4), and a session holding work may be handed more while it is below its
+ * placement's `max_running:` (§2). A worker of version `2` would ignore the
+ * list and run on a dispatch nobody wants, and would queue a second dispatch
+ * behind the first rather than run it — so it is refused at join instead.
  */
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 /**
  * The runtime a worker executes this artifact under, as §4.1 compares it: a
@@ -240,6 +254,12 @@ interface Session {
   readonly dispatchable: boolean;
   /** When this session last made a request — what the window is measured from. */
   seen: number;
+  /**
+   * The dispatches this session holds that the hub has **cancelled** and not
+   * yet told it about (PRD resolved q75): the next poll answers them as its
+   * `cancel` list (§3.2), and a held poll is answered at once to carry them.
+   */
+  readonly cancels: Set<string>;
 }
 
 /** Every session this process has issued and not forgotten. */
@@ -247,6 +267,25 @@ const sessions = new Map<string, Session>();
 
 /** Whoever is waiting for a poll to have something to answer with. */
 const pollers = new Set<() => void>();
+
+/**
+ * The sessions holding a poll right now, each with the instant its poll
+ * arrived — what §2's **least-loaded** rule chooses among (PRD resolved q79,
+ * Decision D161): a parked dispatch goes to the session, of those polling and
+ * below the placement's cap, holding the fewest unsettled dispatches of that
+ * placement, and between two holding as many, to the one whose poll has waited
+ * longest.
+ */
+const polling = new Map<string, number>();
+
+/**
+ * The dispatches the hub has cancelled and is waiting on the worker for (PRD
+ * resolved q75): no node is awaiting them any more, but the worker is still
+ * stopping the process running each, so each still counts against its session's
+ * capacity until the worker's `status: "cancelled"` result settles it (§3.4) —
+ * or the session ends and the sweep supersedes it (§6.3).
+ */
+const cancelling = new Set<string>();
 
 /**
  * How many times the board has moved in this process.
@@ -511,6 +550,9 @@ export class PlacementUnreachable extends Error {
   }
 }
 
+/** The name of a settled dispatch's outcome when its execution was cancelled (§3.4). */
+const CANCELLED = "ExecutionCancelled";
+
 /** The hub gave up on the session holding a dispatch, and the attempt fails (§6.3). */
 export class DispatchSuperseded extends Error {
   constructor(node: string, placement: string, detail: string) {
@@ -599,6 +641,13 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
     // one effect this module owns.
     if (row.status === "settled") {
       if (row.outcome !== undefined) finallyOf(options.execution, row.outcome);
+      // A dispatch its execution's cancel ended (§3.4's `status: "cancelled"`):
+      // the generation replaying it is completing that cancel, and this is
+      // where it reaches it (PRD resolved q75, `docs/durability.md` §6.1).
+      if (row.outcome?.kind === "error" && row.outcome.name === CANCELLED) {
+        fireCancel(options.execution);
+        throw replayedFailure(row.outcome);
+      }
       const ending = endingOf(row);
       if (ending.kind === "answer") return absorb(options, ending.answer);
       // **A pause a dead hub was holding**, re-derived rather than remembered
@@ -633,6 +682,15 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
     if (row.status === "dispatched" && !sessions.has(row.session ?? "")) {
       await journal.supersedeDispatch(row.id, ORPHANED);
       throw new DispatchSuperseded(options.node, options.placement, ORPHANED);
+    }
+    // A dispatch still open in an execution whose cancel a dead process had
+    // accepted is a **frontier** the record cannot replay past: the cancel is
+    // completed here instead of the wait being held (PRD resolved q75). The
+    // abort it fires withdraws the row below, through the node's own signal.
+    const refusal = frontierRefusal(options.execution, site);
+    if (refusal !== undefined) {
+      await journal.supersedeDispatch(row.id, CANCELLED_DETAIL);
+      throw refusal;
     }
     rows.set(row.id, row);
 
@@ -670,6 +728,34 @@ function awaited(
       },
     };
     const abort = (): void => {
+      // **A cancel** (PRD resolved q75, Decision D160) ends the dispatch the way
+      // the protocol says a cancel does (§3.2): a row still parked is withdrawn
+      // — no worker has it — and one a session holds stays dispatched, counting
+      // against that session's capacity, while the worker is told on its next
+      // poll and stops the process running it; its `status: "cancelled"` result
+      // is what settles the row (§3.4). The node stops waiting either way.
+      if (cancellationOf(options.signal?.reason) !== undefined) {
+        const current = rows.get(row.id) ?? row;
+        const holder = current.status === "dispatched" ? current.session : undefined;
+        held.settle({
+          kind: "error",
+          name: CANCELLED,
+          message: new ExecutionCancelled(options.execution).message,
+        });
+        if (holder === undefined) {
+          rows.delete(row.id);
+          void journal.supersedeDispatch(row.id, CANCELLED_DETAIL).catch((error: unknown) => {
+            process.stderr.write(
+              `could not withdraw \`${row.id}\`: ${error instanceof Error ? error.message : String(error)}\n`,
+            );
+          });
+        } else {
+          cancelling.add(row.id);
+          sessions.get(holder)?.cancels.add(row.id);
+        }
+        stirPolls();
+        return;
+      }
       // The node's own deadline ran out (§6.5: the chain runs from dispatch, so
       // queueing is inside the budget). The hub is done with the dispatch, so
       // the row is ended rather than left for a worker to take work nothing
@@ -822,6 +908,9 @@ function absorb(options: DispatchOptions, answer: PlacedAnswer): PlacedAnswer {
 /** Why a dispatch a replaced process was holding is over. See [`supersedeOrphans`]. */
 const ORPHANED =
   "the hub process holding this dispatch was replaced, so the session it was issued to ended (docs/distributed.md §5)";
+
+/** Why a dispatch its execution's cancel withdrew is over (§3.2, PRD resolved q75). */
+const CANCELLED_DETAIL = "the execution this dispatch belonged to was cancelled (docs/distributed.md §3.2)";
 
 /**
  * Hold what a settled dispatch says a `finally:` node raised on the worker as
@@ -1414,6 +1503,7 @@ async function join(request: FastifyRequest, reply: FastifyReply): Promise<unkno
     // A provisioning join is answered normally and dispatched nothing (§3.1).
     dispatchable: current,
     seen: Date.now(),
+    cancels: new Set(),
   };
   sessions.set(session.id, session);
   // §6.2's wake: a join that may be dispatched to is what a parked placement
@@ -1535,6 +1625,9 @@ async function poll(
   const away = (): boolean => hungUp || reply.raw.socket?.destroyed === true;
   request.raw.once("aborted", hangUp);
   reply.raw.once("close", hangUp);
+  // On the books of polling sessions for the whole hold, with the instant it
+  // arrived: [`taken`]'s least-loaded rule chooses among these (§2).
+  polling.set(session.id, Date.now());
   try {
     const deadline = Date.now() + holdMs;
     for (;;) {
@@ -1547,6 +1640,17 @@ async function poll(
       // subscribed: see [`boardMoved`].
       const seen = boardMoved;
       const dispatch = await taken(session);
+      // **The cancel list** (§3.2, PRD resolved q75): every dispatch this
+      // session holds that the hub has cancelled since it last told it, on
+      // every `200` — and a reason to answer at once, with or without work.
+      // Taken off the session only once the answer is about to be written: a
+      // worker that hung up is told on the poll it makes next.
+      if (dispatch === undefined && session.cancels.size > 0) {
+        if (away()) return reply.code(204).send();
+        const cancel = [...session.cancels];
+        session.cancels.clear();
+        return reply.code(200).send({ cancel });
+      }
       if (dispatch !== undefined) {
         // **Checked again, because the claim is not free of time.** The latch at
         // the top of the loop was read before the board was; opening the journal
@@ -1563,13 +1667,16 @@ async function poll(
           await released(String(dispatch["dispatch_id"]), session.id);
           return reply.code(204).send();
         }
-        return reply.code(200).send(dispatch);
+        const cancel = [...session.cancels];
+        session.cancels.clear();
+        return reply.code(200).send({ ...dispatch, cancel });
       }
       const left = deadline - Date.now();
       if (left <= 0) return reply.code(204).send();
       await held(Math.min(left, holdMs), seen, holds);
     }
   } finally {
+    polling.delete(session.id);
     // Off with the handler: `close` fires on an ordinary answer too, once the
     // response has been written, and a listener left behind would be one per
     // poll on a connection the runtime warns about at ten.
@@ -1581,18 +1688,23 @@ async function poll(
 /**
  * The dispatch this session may be handed, if the board has one.
  *
- * Three rules of §2 and §6.2 in one function, and the order is each of them:
- * a session that has not settled its dispatch is answered nothing however deep
- * the queue; a provisioning session is answered nothing at all; and what is left
- * is scanned **in park order**, over the placements this session claims.
+ * The rules of §2 and §6.2 in one function, and the order is each of them: a
+ * provisioning session is answered nothing at all; what is left is scanned
+ * **in park order**, over the placements this session claims; a placement this
+ * session already holds `max_running:` unsettled dispatches of offers it
+ * nothing however deep its queue (PRD resolved q79, Decision D161); and a
+ * dispatch is handed to the **least-loaded** session polling for it — fewest
+ * unsettled dispatches of that placement, the oldest poll between equals — so
+ * this session takes it only where it is that session ([`leastLoaded`]).
  */
 async function taken(session: Session): Promise<Record<string, unknown> | undefined> {
   if (!session.dispatchable) return undefined;
-  if (holding(session.id)) return undefined;
   const journal = await openJournal();
   for (const row of await journal.unsettledDispatches()) {
     if (row.status !== "parked") continue;
     if (!session.claims.includes(row.placement)) continue;
+    if (heldFor(session.id, row.placement) >= capacityOf(row.placement)) continue;
+    if (leastLoaded(row.placement) !== session.id) continue;
     // A row this process is not awaiting is one whose node is not running here
     // — a predecessor's, on an execution nothing has replayed yet. Left alone:
     // handing it out would dispatch work no node is waiting for the answer to.
@@ -1662,22 +1774,62 @@ async function released(id: string, session: string): Promise<void> {
 }
 
 /**
- * Whether this session is holding a dispatch it has not settled (§2).
+ * How many unsettled dispatches of `placement` this session holds (§2, PRD
+ * resolved q79) — a dispatch a node is waiting on, or one the hub cancelled
+ * whose process the worker is still stopping ([`cancelling`]).
  *
- * Read against the rows this process has handed out rather than against a
- * counter, so a restart re-derives it from what it re-attaches to rather than
- * from something it remembered. What it is **not** written against is a worker
- * that keeps two polls in flight: §2 requires "exactly one poll in flight from
- * the moment it joins", and a session that breaks that could interleave two
- * checks around one claim. That is a worker in breach of the wire rather than a
- * race this hub arbitrates, and the cost is bounded — the second dispatch is a
- * real dispatch, journaled, and settled or superseded like any other.
+ * Read against the rows this process has handed out — the journal's dispatch
+ * rows, as this process caches them (PRD resolved q44: capacity is per session,
+ * held in the dispatch rows) — rather than against a counter, so a restart
+ * re-derives it from what it re-attaches to rather than from something it
+ * remembered. What it is **not** written against is a worker that keeps two
+ * polls in flight: §2 requires "exactly one poll in flight from the moment it
+ * joins", and a session that breaks that could interleave two checks around one
+ * claim. That is a worker in breach of the wire rather than a race this hub
+ * arbitrates, and the cost is bounded — the extra dispatch is a real dispatch,
+ * journaled, and settled or superseded like any other.
  */
-function holding(session: string): boolean {
+function heldFor(session: string, placement: string): number {
+  let held = 0;
   for (const row of rows.values()) {
-    if (row.session === session && row.status === "dispatched" && awaiting.has(row.id)) return true;
+    if (row.session !== session || row.status !== "dispatched" || row.placement !== placement) {
+      continue;
+    }
+    if (awaiting.has(row.id) || cancelling.has(row.id)) held += 1;
   }
-  return false;
+  return held;
+}
+
+/** A placement's `max_running:`, the default of `1` applied (grammar §14.1). */
+function capacityOf(placement: string): number {
+  return placements.find((one) => one.name === placement)?.maxRunning ?? 1;
+}
+
+/**
+ * The session a parked dispatch of `placement` goes to now: of the sessions
+ * polling that may be dispatched to, claim it and hold fewer of its unsettled
+ * dispatches than its cap, the one holding **fewest** — and between two
+ * holding as many, the one whose poll arrived first (§2, PRD resolved q79,
+ * Decision D161). `undefined` where no session polling qualifies.
+ */
+function leastLoaded(placement: string): string | undefined {
+  const cap = capacityOf(placement);
+  let chosen: { id: string; load: number; since: number } | undefined;
+  for (const [id, since] of polling) {
+    const session = sessions.get(id);
+    if (session === undefined || !session.dispatchable) continue;
+    if (!session.claims.includes(placement)) continue;
+    const load = heldFor(id, placement);
+    if (load >= cap) continue;
+    if (
+      chosen === undefined ||
+      load < chosen.load ||
+      (load === chosen.load && since < chosen.since)
+    ) {
+      chosen = { id, load, since };
+    }
+  }
+  return chosen?.id;
 }
 
 /** One journaled effect, as the wire carries it. */
@@ -1956,6 +2108,7 @@ async function result(request: FastifyRequest, reply: FastifyReply): Promise<unk
   const outcome: JournalOutcome = await settlementOf(journal, row, body);
   await journal.settleDispatch(id, outcome);
   rows.delete(id);
+  cancelling.delete(id);
   const held = awaiting.get(id);
   if (held !== undefined) held.settle(outcome);
   // This session has settled what it was holding, so it may be handed the next
@@ -2022,6 +2175,40 @@ async function endingSettled(
   row: DispatchRow,
   body: Record<string, unknown>,
 ): Promise<JournalOutcome> {
+  // **The fourth ending** (§3.4, PRD resolved q75): the worker stopped this
+  // dispatch because the hub cancelled it. Settled as the cancellation it is —
+  // where the hub did cancel it — and as a failure of the attempt where it did
+  // not, or where the body carries another ending beside it: a cancel the hub
+  // never made is not one a node may be stopped by.
+  const status = body["status"];
+  if (status !== undefined && status !== null) {
+    const beside = ["output", "error", "paused"].filter(
+      (field) => body[field] !== undefined && body[field] !== null,
+    );
+    if (status !== "cancelled" || beside.length > 0) {
+      return {
+        kind: "error",
+        name: "CancelledResultUnreadable",
+        message: `this worker settled \`${row.id}\` with \`status\` ${JSON.stringify(status)}${
+          beside.length === 0
+            ? ""
+            : ` beside ${beside.map((field) => `\`${field}\``).join(" and ")}`
+        }: \`status\` is \`"cancelled"\` or absent, and a cancelled result carries no other ending (docs/distributed.md §3.4)`,
+      };
+    }
+    const execution = await journal.execution(row.execution);
+    const asked =
+      cancelling.has(row.id) ||
+      execution?.cancelRequestedAt !== undefined ||
+      execution?.status === "cancelled";
+    return asked
+      ? { kind: "error", name: CANCELLED, message: new ExecutionCancelled(row.execution).message }
+      : {
+          kind: "error",
+          name: "DispatchCancelledUnasked",
+          message: `this worker settled \`${row.id}\` cancelled and this hub cancelled nothing: \`${row.execution}\` has no cancel requested, so the attempt failed (docs/distributed.md §3.4)`,
+        };
+  }
   const paused = body["paused"];
   if (paused !== undefined && paused !== null) {
     const beside = ["output", "error"].filter(
@@ -2226,6 +2413,7 @@ async function sweep(windowMs: number): Promise<void> {
     const detail = `the session holding this dispatch made no request for ${windowMs}ms, so the hub gave up on it (docs/distributed.md §6.3)`;
     await journal.supersedeDispatch(id, detail);
     rows.delete(id);
+    cancelling.delete(id);
     const held = awaiting.get(id);
     if (held === undefined) continue;
     awaiting.delete(id);

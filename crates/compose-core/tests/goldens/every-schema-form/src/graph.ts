@@ -31,7 +31,6 @@ import {
   flowShapeNodeAskOutput,
   flowShapeNodeNotifyOutput,
   flowShapeNodeProbeOutput,
-  storeEventsValueSchema,
   storeLedgerToolAppendInput,
   storeLedgerToolDeleteInput,
   storeLedgerToolGetInput,
@@ -390,33 +389,6 @@ const flowShapeNodeShiftShape: runtime.Shape = {
   }
 };
 
-/** `flow.shape` node `record` — the `record.output` root its guards read. */
-const flowShapeNodeRecordShape: runtime.Shape = {
-  "properties": {
-    "applied": "bool",
-    "deduped": "bool",
-    "key": "string",
-    "version": "int"
-  }
-};
-
-/** `flow.shape` node `close` — the `close.output` root its guards read. */
-const flowShapeNodeCloseShape: runtime.Shape = {
-  "properties": {
-    "applied": "bool",
-    "deduped": "bool",
-    "failed": "int",
-    "results": {
-      "items": {
-        "properties": {
-          "key": "string",
-          "version": "int"
-        }
-      }
-    }
-  }
-};
-
 /**
  * `provider.aws` — a `bedrock` connection (grammar 12.1). Every value is read when a node calls it, never at import: a build carries no credential and `./index.ts` is where their presence is checked (PRD 5.9).
  */
@@ -478,24 +450,6 @@ const storeDocs: stores.StoreBinding = {
 };
 
 /**
- * `store.events` — a `kv` store with `scope: global`, on the `sqlite` backend (the `local` target substitutes local storage for every store unconditionally) (grammar 11.1, 11.3).
- */
-const storeEvents: stores.StoreBinding = {
-  address: "store.events",
-  name: "events",
-  kind: "kv",
-  scope: "global",
-  description: "One record per business event.",
-  metadata: false,
-  value: storeEventsValueSchema,
-  defaultTtl: 86400000,
-  backend: {
-    provider: "sqlite",
-    from: "the `local` target substitutes local storage for every store unconditionally",
-  },
-};
-
-/**
  * `store.ledger` — a `kv` store with `scope: execution`, on the `sqlite` backend (the `local` target substitutes local storage for every store unconditionally) (grammar 11.1, 11.3).
  */
 const storeLedger: stores.StoreBinding = {
@@ -533,7 +487,7 @@ const storeNotes: stores.StoreBinding = {
 /**
  * Every store this composition binds, so an execution's settlement prunes its ledger rows from each and a process start sweeps each of the keys that have expired (PRD resolved q69).
  */
-stores.bindsStores([storeDocs, storeEvents, storeLedger, storeNotes]);
+stores.bindsStores([storeDocs, storeLedger, storeNotes]);
 
 /**
  * `tool.dispatch` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for. This is the parse a `function:` node's binding faces, and it is a `ResultMismatch` that fails the node: the arguments are the composition's, checked field-by-field at compile time, so a value constraint they miss at runtime is the graph's own failure and there is nobody to hand it to. A **model's** arguments are refused one level out, at the entry in the agent's `tools:`, where `runtime.parseToolArguments` raises the `ToolCallRefused` the loop hands back (Decision D119). The tool's **result** is parsed with `runtime.parseResult` on both surfaces: a tool answering off-contract is not a call anybody can rephrase.
@@ -880,13 +834,12 @@ const agentShaper: runtime.AgentBinding = {
         ],
         "type": "object"
       },
-      invoke: async (args, context, site) =>
+      invoke: async (args, context) =>
         stores.runStoreTool(
           storeLedger,
           "get",
           runtime.parseToolArguments(storeLedgerToolGetInput, args, "the arguments `ledger_get` was called with") as Record<string, unknown>,
           context,
-          site,
         ),
     },
     {
@@ -942,13 +895,12 @@ const agentShaper: runtime.AgentBinding = {
         ],
         "type": "object"
       },
-      invoke: async (args, context, site) =>
+      invoke: async (args, context) =>
         stores.runStoreTool(
           storeLedger,
           "set",
           runtime.parseToolArguments(storeLedgerToolSetInput, args, "the arguments `ledger_set` was called with") as Record<string, unknown>,
           context,
-          site,
         ),
     },
     {
@@ -1001,13 +953,12 @@ const agentShaper: runtime.AgentBinding = {
         ],
         "type": "object"
       },
-      invoke: async (args, context, site) =>
+      invoke: async (args, context) =>
         stores.runStoreTool(
           storeLedger,
           "merge",
           runtime.parseToolArguments(storeLedgerToolMergeInput, args, "the arguments `ledger_merge` was called with") as Record<string, unknown>,
           context,
-          site,
         ),
     },
     {
@@ -1055,13 +1006,12 @@ const agentShaper: runtime.AgentBinding = {
         ],
         "type": "object"
       },
-      invoke: async (args, context, site) =>
+      invoke: async (args, context) =>
         stores.runStoreTool(
           storeLedger,
           "append",
           runtime.parseToolArguments(storeLedgerToolAppendInput, args, "the arguments `ledger_append` was called with") as Record<string, unknown>,
           context,
-          site,
         ),
     },
     {
@@ -1105,13 +1055,12 @@ const agentShaper: runtime.AgentBinding = {
         ],
         "type": "object"
       },
-      invoke: async (args, context, site) =>
+      invoke: async (args, context) =>
         stores.runStoreTool(
           storeLedger,
           "incr",
           runtime.parseToolArguments(storeLedgerToolIncrInput, args, "the arguments `ledger_incr` was called with") as Record<string, unknown>,
           context,
-          site,
         ),
     },
     {
@@ -1136,13 +1085,12 @@ const agentShaper: runtime.AgentBinding = {
         ],
         "type": "object"
       },
-      invoke: async (args, context, site) =>
+      invoke: async (args, context) =>
         stores.runStoreTool(
           storeLedger,
           "delete",
           runtime.parseToolArguments(storeLedgerToolDeleteInput, args, "the arguments `ledger_delete` was called with") as Record<string, unknown>,
           context,
-          site,
         ),
     },
   ],
@@ -1508,7 +1456,7 @@ const flowShapeNodeRecall: runtime.NodeDescriptor = {
       "search",
       input as stores.StoreParams,
       context,
-      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "recall")].join("/"), path: runtime.instancePath(view, "recall").join("/") },
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "recall")].join("/") },
     ),
   }),
   writes: [],
@@ -1600,7 +1548,7 @@ const flowShapeNodeClaim: runtime.NodeDescriptor = {
       "set",
       input as stores.StoreParams,
       context,
-      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "claim")].join("/"), path: runtime.instancePath(view, "claim").join("/") },
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "claim")].join("/") },
     ),
   }),
   writes: [],
@@ -1631,7 +1579,7 @@ const flowShapeNodeStamp: runtime.NodeDescriptor = {
       "append",
       input as stores.StoreParams,
       context,
-      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "stamp")].join("/"), path: runtime.instancePath(view, "stamp").join("/") },
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "stamp")].join("/") },
     ),
   }),
   writes: [],
@@ -1661,7 +1609,7 @@ const flowShapeNodeTick: runtime.NodeDescriptor = {
       "incr",
       input as stores.StoreParams,
       context,
-      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "tick")].join("/"), path: runtime.instancePath(view, "tick").join("/") },
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "tick")].join("/") },
     ),
   }),
   writes: [],
@@ -1692,7 +1640,7 @@ const flowShapeNodeTidy: runtime.NodeDescriptor = {
       "merge",
       input as stores.StoreParams,
       context,
-      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "tidy")].join("/"), path: runtime.instancePath(view, "tidy").join("/") },
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "tidy")].join("/") },
     ),
   }),
   writes: [],
@@ -1720,7 +1668,7 @@ const flowShapeNodeDrop: runtime.NodeDescriptor = {
       "delete",
       input as stores.StoreParams,
       context,
-      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "drop")].join("/"), path: runtime.instancePath(view, "drop").join("/") },
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "drop")].join("/") },
     ),
   }),
   writes: [],
@@ -1750,7 +1698,7 @@ const flowShapeNodePage: runtime.NodeDescriptor = {
       "list",
       input as stores.StoreParams,
       context,
-      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "page")].join("/"), path: runtime.instancePath(view, "page").join("/") },
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "page")].join("/") },
     ),
   }),
   writes: [],
@@ -1777,7 +1725,7 @@ const flowShapeNodeTally: runtime.NodeDescriptor = {
       "count",
       input as stores.StoreParams,
       context,
-      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "tally")].join("/"), path: runtime.instancePath(view, "tally").join("/") },
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "tally")].join("/") },
     ),
   }),
   writes: [],
@@ -1804,7 +1752,7 @@ const flowShapeNodeFetch: runtime.NodeDescriptor = {
       "get_many",
       input as stores.StoreParams,
       context,
-      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "fetch")].join("/"), path: runtime.instancePath(view, "fetch").join("/") },
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "fetch")].join("/") },
     ),
   }),
   writes: [],
@@ -1859,78 +1807,7 @@ const flowShapeNodeShift: runtime.NodeDescriptor = {
       "batch",
       input as stores.StoreParams,
       context,
-      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "shift")].join("/"), path: runtime.instancePath(view, "shift").join("/") },
-    ),
-  }),
-  writes: [],
-  edges: [
-    { to: "record" },
-  ],
-};
-
-/** `flow.shape` node `record` — a `set` on `store.events` (grammar 8.8). */
-const flowShapeNodeRecord: runtime.NodeDescriptor = {
-  flow: "flow.shape",
-  node: "record",
-  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from the built-in, `on_error` from the built-in.
-  policy: {
-    onError: "fail",
-  },
-  shapes: { input: flowShapeShape, state: stateShape, output: flowShapeNodeRecordShape },
-  input: (roots) => ({
-    key: String(runtime.toJson(runtime.evaluate("'event/' + input.goal", roots))),
-    idempotencyKey: String(runtime.toJson(runtime.evaluate("input.goal", roots))),
-    value: {
-      "seen": runtime.toJson(runtime.evaluate("1", roots)),
-    },
-  }),
-  run: async (input, context, view) => ({
-    output: await stores.runStoreOp(
-      storeEvents,
-      "set",
-      input as stores.StoreParams,
-      context,
-      { via: "node", idempotencyKey: stores.authoredKey("events", (input as stores.StoreParams).idempotencyKey), path: runtime.instancePath(view, "record").join("/") },
-    ),
-  }),
-  writes: [],
-  edges: [
-    { to: "close" },
-  ],
-};
-
-/** `flow.shape` node `close` — a `batch` on `store.events` (grammar 8.8). */
-const flowShapeNodeClose: runtime.NodeDescriptor = {
-  flow: "flow.shape",
-  node: "close",
-  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from the built-in, `on_error` from the built-in.
-  policy: {
-    onError: "fail",
-  },
-  shapes: { input: flowShapeShape, state: stateShape, output: flowShapeNodeCloseShape },
-  input: (roots) => ({
-    idempotencyKey: String(runtime.toJson(runtime.evaluate("'close/' + input.goal", roots))),
-    ops: [
-      {
-        op: "set",
-        key: String(runtime.toJson(runtime.evaluate("'closed/' + input.goal", roots))),
-        value: {
-          "seen": runtime.toJson(runtime.evaluate("2", roots)),
-        },
-      },
-      {
-        op: "delete",
-        key: String(runtime.toJson(runtime.evaluate("'event/' + input.goal", roots))),
-      },
-    ],
-  }),
-  run: async (input, context, view) => ({
-    output: await stores.runStoreOp(
-      storeEvents,
-      "batch",
-      input as stores.StoreParams,
-      context,
-      { via: "node", idempotencyKey: stores.authoredKey("events", (input as stores.StoreParams).idempotencyKey), path: runtime.instancePath(view, "close").join("/") },
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "shift")].join("/") },
     ),
   }),
   writes: [],
@@ -1985,12 +1862,6 @@ function flowShape() {
       ends: ["shift"],
     })
     .addNode("shift", (state: GraphState) => runtime.runNode(flowShapeNodeShift, state), {
-      ends: ["record"],
-    })
-    .addNode("record", (state: GraphState) => runtime.runNode(flowShapeNodeRecord, state), {
-      ends: ["close"],
-    })
-    .addNode("close", (state: GraphState) => runtime.runNode(flowShapeNodeClose, state), {
       ends: [END],
     })
     .addEdge(START, "shape")
@@ -2008,7 +1879,7 @@ const flowShapeGraph = flowShape();
 const flowShapeBinding: runtime.SubflowBinding = {
   address: "flow.shape",
   outputs: ["draft", "notes"],
-  recursionLimit: 42,
+  recursionLimit: 40,
   stream: (initial, options) =>
     flowShapeGraph.stream(initial, {
       ...options,
@@ -2107,7 +1978,7 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
     inputKinds: { "goal": "string", "goals": "json", },
     outputs: ["draft", "notes"],
     sessionStores: [],
-    recursionLimit: 42,
+    recursionLimit: 40,
     parse: (inputs: unknown) =>
       runtime.parseResult(flowShapeInputs, inputs, "the `inputs:` of `flow.shape`") as Record<string, unknown>,
     stream: (initial, options) =>
@@ -2639,6 +2510,8 @@ async function quiesceFlow(
   // and its own finally node run (`runtime.endInstancesInside`).
   if (options.resume === true) await runtime.settleDetached(executionId);
   const ending = runtime.instanceEnding(executionId, ended);
+  // A run somebody cancelled says so (PRD resolved q75, Decision D160).
+  if (ending?.outcome === "cancelled") what = "was cancelled";
   let closing: runtime.FinallyRun | undefined;
   try {
     const inside = await runtime.endInstancesInside(

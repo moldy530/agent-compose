@@ -47,8 +47,9 @@ const SOURCE: &str = include_str!("js/serve.ts");
 /// (grammar 13.3: "generated apps expose `start`, `resume`, and `status`
 /// routes").
 ///
-/// `start` is per trigger and is the one of the three a composition names. The
-/// other two are the app's own, at fixed addresses, and they are mounted
+/// `start` is per trigger and is the one of them a composition names. The
+/// others — status, resume, and the cancel PRD resolved q75 adds — are the
+/// app's own, at fixed addresses, and they are mounted
 /// unconditionally — so an `http` trigger that claims one of these pairs is a
 /// second declaration of a route the app already has, and the app refuses to
 /// start with `FST_ERR_DUPLICATED_ROUTE` exactly as two colliding triggers make
@@ -61,6 +62,7 @@ const SOURCE: &str = include_str!("js/serve.ts");
 pub const RESERVED_ROUTES: &[(&str, &str)] = &[
     ("GET", "/executions/:id"),
     ("POST", "/executions/:id/resume"),
+    ("POST", "/executions/:id/cancel"),
 ];
 
 /// `src/serve.ts`.
@@ -87,11 +89,13 @@ mod tests {
         assert!(emitted.ends_with(SOURCE), "the app is emitted verbatim");
     }
 
-    /// The three verbs PRD 5.11 names are all routed.
+    /// The three verbs PRD 5.11 names are all routed, and the cancel PRD
+    /// resolved q75 adds.
     #[test]
-    fn the_app_routes_start_status_and_resume() {
+    fn the_app_routes_start_status_resume_and_cancel() {
         assert!(SOURCE.contains("app.get(\"/executions/:id\""));
         assert!(SOURCE.contains("app.post(\"/executions/:id/resume\""));
+        assert!(SOURCE.contains("app.post(\"/executions/:id/cancel\""));
         assert!(SOURCE.contains("url: trigger.path"));
     }
 
