@@ -7,10 +7,10 @@
 // the statement that writes it (`localBatch` and `#batch` in `src/stores.ts`),
 // and nothing serialized before the transaction opens — this process records
 // no journal, and a batch entry's value is typed at `validate`, not parsed at
-// run time. So an entry value whose `toJSON` never returns is a process
-// stopped *between two entry writes* with the transaction open: the first
-// entry has landed in it, the second has not, and nothing has committed. The
-// `toJSON` writes a marker the moment it starts and then spins, and the parent
+// run time. So an entry value whose one field's getter never returns is a
+// process stopped *between two entry writes* with the transaction open: the
+// first entry has landed in it, the second has not, and nothing has committed.
+// The getter writes a marker the moment it starts and then spins, and the parent
 // kills this process with `SIGKILL` once it sees the marker — the crash the
 // ruling's verification names, on whichever arm the parent drives: SQLite's
 // file, its lock and its journal left as a killed process leaves them, or a
@@ -69,18 +69,25 @@ const store = {
  * The second entry's value: `{ n: 2 }`, whose serialization — the moment its
  * entry is written, with the first already in the transaction — marks the
  * window open and holds it.
+ *
+ * The hook is a **getter on the one field**, not a `toJSON`: `JSON.stringify`
+ * must read every own enumerable property, so a getter runs on every runtime,
+ * where a `toJSON` defined non-enumerable is one Bun 1.3.14 — the version CI
+ * pins — never calls (Bun 1.4 and Node do). A hook that is skipped is a batch
+ * that commits before the parent can kill it, which this case then reports as
+ * a window that never opened.
  */
-const held = { n: 2 };
-Object.defineProperty(held, "toJSON", {
-  enumerable: false,
-  value() {
+const held = {};
+Object.defineProperty(held, "n", {
+  enumerable: true,
+  get() {
     fs.writeFileSync(marker, "open");
     const until = Date.now() + HOLD_MS;
     while (Date.now() < until) {
       // Spinning is the point: the transaction stays open with the first
       // entry in it, and this process answers nothing until it is killed.
     }
-    return { n: 2 };
+    return 2;
   },
 });
 
