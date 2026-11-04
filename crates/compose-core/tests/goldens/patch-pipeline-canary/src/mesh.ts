@@ -1798,6 +1798,11 @@ async function poll(
           await released(String(dispatch["dispatch_id"]), session.id);
           return reply.code(204).send();
         }
+        // The list may name the very dispatch this answer hands over — a cancel
+        // that reached it inside [`taken`]'s reads, once the row was this
+        // session's — and this is the one answer that will name it. §3.2 has the
+        // worker put the dispatch on its books before it reads the list, so it
+        // is settled `cancelled` without its runner ever starting.
         const cancel = [...session.cancels];
         session.cancels.clear();
         return reply.code(200).send({ ...dispatch, cancel });
@@ -1851,12 +1856,27 @@ async function taken(session: Session): Promise<Record<string, unknown> | undefi
     if (!awaiting.has(row.id)) continue;
     const claimed = await journal.claimDispatch(row.id, session.id);
     if (claimed === undefined) continue;
-    rows.set(claimed.id, claimed);
+    // **The wait is asked about again, because the claim is not free of time.**
+    // A cancel that reached this dispatch while the claim was in flight — or the
+    // node's own deadline, or its execution ending — read the row as `rows` still
+    // had it, parked, and withdrew it as nobody's: it settled the node, took the
+    // wait off `awaiting` and the row off `rows`, and queued the write that
+    // supersedes it, which a journal that serialises its writes runs after this
+    // claim (PRD resolved q75). Handed out now, the dispatch would be work whose
+    // answer nothing reads, that no `cancel` list will ever name and that
+    // [`heldFor`] does not count — a runner left to run whole beside whatever
+    // the session is handed next. So the claim is handed back and the row is left
+    // to the write already on its way, which ends it as the withdrawal it was: on
+    // whichever side of this release that write lands, the row's last state is
+    // superseded with the withdrawal's own detail.
     const local = awaiting.get(claimed.id);
-    if (local !== undefined) {
-      local.taken = true;
-      announceWaits(claimed.execution);
+    if (local === undefined) {
+      await journal.releaseDispatch(claimed.id, session.id);
+      continue;
     }
+    rows.set(claimed.id, claimed);
+    local.taken = true;
+    announceWaits(claimed.execution);
     // §3.2's `session_key`, read off the execution's own lifecycle row rather
     // than off the dispatch: it is a fact about the execution, not about this
     // node, and §5's first rule is that everything is read out of the journal at
@@ -1899,9 +1919,41 @@ async function taken(session: Session): Promise<Record<string, unknown> | undefi
  * A row the journal will not hand back is left alone and announced to nobody:
  * `releaseDispatch` takes only a row still `dispatched` to *this* session, so a
  * result that arrived in the meantime, or a deadline that superseded it, wins.
+ *
+ * **Save a dispatch the hub stopped waiting for while it was being handed
+ * over** — a cancel, the node's deadline, or its execution ending, inside
+ * [`taken`]'s reads of the journal — which [`stopOnHolder`] told this session to
+ * stop and which is now known never to have reached it. Put back on the board,
+ * it would go to the next worker with no `cancel` list naming it and run whole,
+ * while the node waited on a cancelled result from a worker that never had it.
+ * So it ends here the way a stop ends a dispatch no worker holds: a deadline's
+ * is already settled and its superseding write already on its way, and a
+ * cancel's is withdrawn as a parked row is ([`awaited`]) — the node settled
+ * cancelled, the row superseded as the cancel it was (PRD resolved q75).
  */
 async function released(id: string, session: string): Promise<void> {
   const journal = await openJournal();
+  if (stopping.delete(id)) {
+    rows.delete(id);
+    sessions.get(session)?.cancels.delete(id);
+    stirPolls();
+    return;
+  }
+  if (cancelling.delete(id)) {
+    rows.delete(id);
+    sessions.get(session)?.cancels.delete(id);
+    const held = awaiting.get(id);
+    if (held !== undefined) {
+      held.settle({
+        kind: "error",
+        name: CANCELLED,
+        message: new ExecutionCancelled(held.execution).message,
+      });
+    }
+    await journal.supersedeDispatch(id, CANCELLED_DETAIL);
+    stirPolls();
+    return;
+  }
   if (!(await journal.releaseDispatch(id, session))) return;
   const parked = await journal.dispatchOf(id);
   if (parked !== undefined) rows.set(id, parked);

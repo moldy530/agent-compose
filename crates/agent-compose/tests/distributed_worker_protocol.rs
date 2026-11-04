@@ -1978,6 +1978,103 @@ fn a_runner_that_ignores_its_cancel_is_killed_after_the_grace() {
     let _ = std::fs::remove_file(&pids_at);
 }
 
+/// **A `cancel` list may name the dispatch its own answer hands over**, and that
+/// dispatch is settled `cancelled` without its runner ever starting (§3.2,
+/// §3.4, PRD resolved q75, Decision D160).
+///
+/// A hub answers this way when the cancel reaches a dispatch while the poll
+/// handing it out is still being assembled: the row is already the session's,
+/// so the cancel is queued for the session, and the hub names it in this answer
+/// and in no later one. A worker that read the list before putting the
+/// dispatch on its books would find nothing to stop, run the node to its own
+/// end — a whole `coder:` node, far past the ten seconds q75 sets — and post
+/// its ordinary result where the hub waits for the cancelled one. The runner
+/// here lingers for a minute, so that worker fails this test on time and on
+/// the body both.
+#[test]
+fn a_cancel_naming_the_dispatch_its_own_answer_hands_over_starts_no_runner() {
+    let hub = FixtureHub::start();
+    let (hash, tarball) = artifact();
+    hub.always("/workers/join", accepted(&hash, "wrk_ready"));
+    hub.always("/workers/artifact", Reply::bytes(200, tarball));
+    hub.script(
+        "/workers/poll",
+        Reply::json(
+            200,
+            &json!({
+                "cancel": ["dsp_same"],
+                "dispatch_id": "dsp_same",
+                "execution_id": "exec_fixture",
+                "node": "flow.release.sign",
+                "instance_path": "sign/0",
+                "inputs": { "path": "release.dmg" },
+                "effect_history": [],
+            }),
+        ),
+    );
+    hub.always("/workers/poll", Reply::empty(204));
+    hub.always("/workers/effects", Reply::empty(204));
+    hub.always("/workers/result", Reply::empty(204));
+
+    let pids_at = pid_file("same-answer");
+    let worker = Worker::with_environment(
+        &hub,
+        "same-answer-cancel",
+        &[
+            ("FIXTURE_RUNNER_LINGER_MS".to_string(), "60000".to_string()),
+            (
+                "FIXTURE_RUNNER_PID_FILE".to_string(),
+                pids_at.display().to_string(),
+            ),
+        ],
+    );
+    let asked = hub.until("settled the dispatch its own answer cancelled", |asked| {
+        asked
+            .iter()
+            .any(|request| request.path == "/workers/result")
+    });
+    let handed = asked
+        .iter()
+        .find(|request| request.path == "/workers/poll")
+        .expect("the poll that handed the dispatch over");
+    let result = asked
+        .iter()
+        .find(|request| request.path == "/workers/result")
+        .expect("a result");
+    assert_eq!(
+        result.body,
+        json!({ "dispatch_id": "dsp_same", "status": "cancelled" }),
+        "a dispatch its own answer cancelled is settled cancelled, with nothing else: {}",
+        worker.transcript()
+    );
+    let took = result.at.duration_since(handed.at);
+    assert!(
+        took < Duration::from_secs(4),
+        "the dispatch was settled {took:?} after the answer that handed it over and \
+         cancelled it: nothing was started, so there is nothing to wait for"
+    );
+    assert_eq!(
+        runner_pids(&pids_at, Duration::from_millis(500)),
+        Vec::<i32>::new(),
+        "a runner was started for a dispatch its own answer cancelled: {}",
+        worker.transcript()
+    );
+    assert!(
+        hub.asked_at("/workers/effects").is_empty(),
+        "a dispatch whose runner never started sent effects: {}",
+        worker.transcript()
+    );
+    let before = hub.asked_at("/workers/poll").len();
+    hub.until("polled again after the cancel", |asked| {
+        asked
+            .iter()
+            .filter(|request| request.path == "/workers/poll")
+            .count()
+            > before
+    });
+    let _ = std::fs::remove_file(&pids_at);
+}
+
 /// **`Ctrl-C` at a worker stops the runners it started** (§3.2, PRD resolved
 /// q75, Decision D160).
 ///
