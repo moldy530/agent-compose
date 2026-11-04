@@ -182,11 +182,15 @@ supplying `--session` is then a run-time requirement.
 
 **Looking inside a store needs no flow.**
 `agent-compose store get main.yml store.<name> <key>` and its siblings — `set`,
-`delete`, `list`, `count`, `export`, `import` — reach a `kv` store through the
-backend the target binds and the partition a flow would address, named by
-`--session <key>` or `--execution <id>` as the store's scope asks. A value
-written that way is held to `value_schema` like any other, and is not an effect
-of any execution: nothing records it. `agent-compose docs cli` has the flags.
+`delete`, `list`, `count`, `export`, `import`, and `log` on a store that keeps
+history — reach a `kv` store through the backend the target binds and the
+partition a flow would address, named by `--session <key>` or
+`--execution <id>` as the store's scope asks. A value written that way is held
+to `value_schema` like any other, and is not an effect of any execution: no
+journal or trace records it. On a store declaring `history: true` the key's
+history records it as actor `cli` — its only record anywhere ("A key's
+history", below) — and on any other store nothing does. `agent-compose docs cli`
+has the flags.
 
 ## Ops
 
