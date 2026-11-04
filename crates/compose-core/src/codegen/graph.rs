@@ -6072,14 +6072,16 @@ flow.f:
         assert!(emitted.contains("  metadata: false,\n"), "{emitted}");
 
         // The store-op node evaluates its parameters in the input phase and
-        // carries the idempotency key of grammar 9.4 to the backend.
+        // carries the idempotency key of grammar 9.4 to the backend — and,
+        // beside it, the node's instance path, which a `history: true` store's
+        // history row names its writer by (PRD resolved q74).
         assert!(
             emitted.contains("    key: String(runtime.toJson(runtime.evaluate(\"'k'\", roots))),"),
             "{emitted}"
         );
         assert!(
             emitted.contains(
-                "{ via: \"node\", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, \"load\")].join(\"/\") }"
+                "{ via: \"node\", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, \"load\")].join(\"/\"), path: runtime.instancePath(view, \"load\").join(\"/\") }"
             ),
             "{emitted}"
         );
