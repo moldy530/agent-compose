@@ -46,6 +46,55 @@ flow.f:
   finally: wrap_up
 ```
 
+The pause can sit further off than a flow the finally node instantiates — behind
+the `flow.*` tools of an agent it calls, where nothing in the finally node's own
+flow names a `human` node at all:
+
+```yaml triggers
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.recorder:
+  model: model.m
+  prompt: Record how the work ended, and have it signed off.
+  tools: [flow.sign_off]
+  input:
+    outcome: { type: string }
+  output:
+    note: { type: string }
+flow.sign_off:
+  inputs:
+    text: { type: string }
+  outputs: {}
+  nodes:
+    sign:
+      human:
+        input:
+          text: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input: { text: "input.text" }
+  edges:
+    - { from: start, to: sign }
+    - { from: sign, to: end }
+flow.f:
+  outputs: {}
+  nodes:
+    work:
+      exec: { command: "true" }
+    wrap_up:
+      agent: agent.recorder
+      input: { outcome: "execution.outcome" }
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: wrap_up
+```
+
 ## The fix
 
 **Take the pause out of what the finally node runs.** Ask the question in the

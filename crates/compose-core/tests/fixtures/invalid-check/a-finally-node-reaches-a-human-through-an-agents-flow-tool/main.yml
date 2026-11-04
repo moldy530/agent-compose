@@ -1,0 +1,71 @@
+# rule: a flow's `finally:` node reaches no `human` node through the `flow.*` tools of an agent it calls (grammar 7.9, 7.7, 8.7, Decision D159)
+# code: finally-interrupt
+# message: `rec`, the `finally:` node of `flow.e`, reaches the `human` node `ask` of `flow.deep`
+# at: main.yml:71:12
+# label: main.yml:49:5 the `human` node is declared here
+# help: a finally node runs once when its instance ends, and a step that must always finish cannot park on a question: it may be no `human` node and reach none — through a `flow:` node, a `map`'s dispatch targets, or the `flow.*` tools of an agent it calls. Take the pause out of what it runs (grammar 7.9, 8.7, 7.7, Decision D159)
+#
+# Grammar 7.7's fourth row, from the finally node's side: the node is an
+# `agent.*` node, and the pause is behind its `tools:` — two flows down, where
+# `flow.deep`'s `w` falls back to it. The `agent:` arm of the walk is the one
+# that reads an agent's attachments, and neither the `flow:` nor the `map`
+# fixture of this rule goes through it: with that arm gone this composition
+# validates, and its finally node would park the run.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.caller:
+  model: model.m
+  prompt: Record how the work ended.
+  tools: [flow.mid]
+  input:
+    outcome: { type: string }
+  output:
+    note: { type: string }
+flow.mid:
+  description: Record the end, one flow away from the question.
+  inputs:
+    text: { type: string }
+  outputs: {}
+  nodes:
+    deeper:
+      flow: flow.deep
+      input: { text: "input.text" }
+  edges:
+    - { from: start, to: deeper }
+    - { from: deeper, to: end }
+flow.deep:
+  inputs:
+    text: { type: string }
+  outputs: {}
+  nodes:
+    w:
+      exec: { command: "true" }
+      on_error: { fallback: ask }
+    ask:
+      human:
+        input:
+          text: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input: { text: "input.text" }
+  edges:
+    - { from: start, to: w }
+    - { from: w, to: end }
+    - { from: ask, to: end }
+flow.e:
+  outputs: {}
+  nodes:
+    work:
+      exec: { command: "true" }
+    rec:
+      agent: agent.caller
+      input: { outcome: "execution.outcome" }
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: rec
