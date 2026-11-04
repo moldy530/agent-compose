@@ -156,8 +156,11 @@ fn flow_input(flow: &Flow, address: &str) -> Type {
 /// front-end refuses them by name ([`crate::cel`]). `outcome` is a closed enum,
 /// so a comparison against a value it can never hold is a compile error rather
 /// than a silent false; `error` is optional, absent on an instance that
-/// completed, and reading it there fails the execution like every other absent
-/// value (Decision D110) — `has(execution.error)` is how a finally node asks.
+/// completed, and `has(execution.error)` is how a finally node asks. A read
+/// that does not ask is the one absent read that does not fail the execution
+/// (Decision D110): the finally node's input is built after its instance has
+/// ended, so what it cannot evaluate is that node's own failure — the
+/// execution's `finally_error`, its outcome unchanged (grammar 4.1, 7.9).
 fn execution(finally: bool) -> Type {
     let member = |name: &str, ty: Type, optional: bool| Property {
         name: name.to_string(),

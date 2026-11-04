@@ -255,7 +255,11 @@ before the caller's. That holds for an instance that was waiting on a person
 (its question is withdrawn) and for one whose finally node is a `flow:` node,
 a `map` or an agent calling flow tools. A finally node that had already
 started when the failure came is not stopped: the caller waits for it to
-finish. A detached `flow.*` dispatch is a child execution, and runs its own.
+finish. And once an instance has ended, its other branches begin nothing more
+inside it — not a `map` item still waiting its turn, not a `retry:` attempt,
+not a flow tool a model asks for late — though whatever they were already
+running runs on. A detached `flow.*` dispatch is a child execution, and runs
+its own.
 A body that ended through `on_error: skip` or a `fallback:` to `end`
 **completed**, and its finally node reads `completed`.
 
@@ -272,7 +276,10 @@ runs, so a completed run stays completed — same outputs, exit code `0` — eve
 when its finally node fails. Its own `retry:` and `timeout:` apply, through the
 whole policy chain; `on_error:` does not, at any level — once its retries are
 spent, its failure is `finally_error` on the execution's record (the journal row
-and the trace envelope), and a `run` prints it on one stderr line.
+and the trace envelope), and a `run` prints it on one stderr line. So is an
+`input:` it cannot evaluate — `execution.error` read without `has()` on a body
+that completed is the usual one — where the same read in any other node would
+fail the run.
 
 **A restart runs it once.** The end of the instance is journaled before the
 finally node starts, and its own effects are journaled like any node's: a
