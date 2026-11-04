@@ -1874,9 +1874,10 @@ async function poll(
         }
         // The lists may name the very dispatch this answer hands over — a
         // cancel or a stop that reached it inside [`taken`]'s reads, once the
-        // row was this session's — and this is the one answer that will name
-        // it. §3.2 has the worker put the dispatch on its books before it reads
-        // the lists, so it is settled without its runner ever starting.
+        // row was this session's — and the next answers name it again until
+        // its result arrives. §3.2 has the worker put the dispatch on its books
+        // before it reads the lists, so it is settled without its runner ever
+        // starting rather than a poll later.
         return reply.code(200).send({ ...dispatch, ...owed(session) });
       }
       const left = deadline - Date.now();

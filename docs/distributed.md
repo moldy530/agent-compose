@@ -592,10 +592,11 @@ Carries the session. Long-polls for up to one hold (§2).
   the worker does not hold — already settled, or never handed over — is nothing
   to stop. **Either list may name the dispatch the same answer hands over** — a
   cancel or a stop that reached it while the hub was writing the answer, once it
-  was this session's — and that answer is the only one that names it. So a
-  worker puts the dispatch an answer carries on its books **before** it acts on
-  that answer's lists: one that read them first would find nothing to stop, run
-  the node to its own end, and leave the hub waiting on it (§3.4). A dispatch its
+  was this session's — and the next answers name it again, as above, until its
+  result arrives. So a worker puts the dispatch an answer carries on its books
+  **before** it acts on that answer's lists: one that read them first would
+  find nothing to stop and run the node until the next answer named it again,
+  a poll later than it had to (§3.4). A dispatch its
   own answer cancels is settled `cancelled` with no runner started, and one its
   own answer stops is settled as a failure with no runner started.
 

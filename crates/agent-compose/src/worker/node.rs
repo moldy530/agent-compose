@@ -181,10 +181,11 @@ impl Running {
     /// Called by the **poll thread**, for the dispatch a poll answer hands over,
     /// before that answer's `cancel` and `stop` lists are acted on (§3.2, PRD
     /// resolved q75). A list may name that very dispatch — a cancel or a stop
-    /// that reached it while the hub was assembling the answer, which the hub
-    /// then names to nobody again — and a name not yet on the books finds
-    /// nothing to stop ([`Running::halt`]). So would the next poll's, if the
-    /// hold waited for the dispatch's own thread to be scheduled.
+    /// that reached it while the hub was assembling the answer, and which the
+    /// hub names again on every answer until its result arrives — and a name
+    /// not yet on the books finds nothing to stop ([`Running::halt`]), so the
+    /// stop would wait a poll. So would the next poll's, if the hold waited for
+    /// the dispatch's own thread to be scheduled.
     pub(crate) fn hold(&self, id: &str, generation: u64) -> Arc<Handle> {
         let handle = Arc::new(Handle {
             generation,
