@@ -880,6 +880,12 @@ const CODEGEN: &[Criterion] = &[
                 "an_ended_instance_whose_end_is_over_still_begins_nothing_inside_it",
                 Status::Live,
             ),
+            // An input a finally node cannot build — an unasked absent read —
+            // is its own failure, `finally_error`, not the execution's.
+            (
+                "a_finally_node_whose_input_cannot_be_built_fails_without_failing_the_run",
+                Status::Live,
+            ),
         ],
     },
     Criterion {

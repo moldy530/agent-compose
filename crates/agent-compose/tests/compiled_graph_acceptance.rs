@@ -26740,6 +26740,61 @@ fn a_detached_child_execution_runs_its_own_finally_node() {
     assert_eq!(order, ["all", "left"]);
 }
 
+/// **A finally node whose input cannot be built has failed, and that failure is
+/// its own** — `finally_error`, the run's outcome unchanged — where an absent
+/// read anywhere else fails the execution (grammar §4.1, §7.9, Decisions D110,
+/// D159; PRD resolved q76: "whose own failure is recorded without changing the
+/// outcome").
+///
+/// `flow.unasked`'s body completes, and its finally node's `input:` reads
+/// `execution.error` without `has()`: absent on an instance that did not fail.
+/// The run exits `0`, `completed`, with a `finally_error` naming the read; the
+/// finally entry is `failed` with `attempts: 0`, since no activity ran; the
+/// shim it would have run logged nothing; and the lifecycle row agrees.
+#[test]
+fn a_finally_node_whose_input_cannot_be_built_fails_without_failing_the_run() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, log, environment) = finally_environment(&provider, "finally-unasked");
+    let Some(project) = harness::scratch_project("finally-unasked") else {
+        return;
+    };
+    let run = harness::run_formatted(
+        &project,
+        FINALLY,
+        "flow.unasked",
+        &[],
+        None,
+        Some("json"),
+        &environment,
+    );
+    run.succeeded();
+    assert_eq!(run.output.status.code(), Some(0));
+    let report = run.outputs();
+    assert_eq!(report["status"], "completed", "{report:#}");
+    assert!(report.get("error").is_none(), "{report:#}");
+    let finally_error = report["finally_error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the read is the finally node's failure: {report:#}"))
+        .to_string();
+    assert!(
+        finally_error.starts_with("flow.unasked node `unasked_end` failed: ")
+            && finally_error.contains("`execution.error` is not present"),
+        "{finally_error}"
+    );
+    let entry = assert_finally_entry(&report["trace"], "unasked_end", "failed");
+    assert_eq!(entry["attempts"], 0, "no activity ran: {entry:#}");
+    assert!(
+        ended_lines(&log).is_empty(),
+        "the node's subprocess never ran: {:?}",
+        ended_lines(&log)
+    );
+    let execution = report["execution_id"].as_str().expect("an execution id");
+    assert_eq!(
+        lifecycle_row(&project, execution),
+        json!({ "status": "completed", "error": null, "finally_error": finally_error }),
+    );
+}
+
 /// **A finally node that fails after its retries changes nothing the run
 /// produced** — and the failure is on the record, once (grammar §7.9, PRD
 /// resolved q76).
