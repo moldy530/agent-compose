@@ -12946,6 +12946,29 @@ fn published_lease() -> String {
     lease.to_string()
 }
 
+/// The published lease with its provider pointed at the mock.
+///
+/// The topic's composition names no `base_url:`, so its client resolves the
+/// vendor's address; an invocation redirects that in the host preamble
+/// ([`REDIRECT_TO_MOCK`]). A **killed** run is launched directly — the process
+/// a crash has to reach (`harness::crash_run`) — and has no preamble, so the one
+/// line that names the mock's address goes into the composition instead. It is
+/// the only line that differs from what a reader copies, and every run of the
+/// test below uses this copy, so the journal and the store see one composition.
+fn published_lease_against_the_mock() -> String {
+    let lease = published_lease();
+    let redirected = lease.replacen(
+        "  api_key: ${ANTHROPIC_API_KEY}\n",
+        "  api_key: ${ANTHROPIC_API_KEY}\n  base_url: ${MOCK_BASE_URL}\n",
+        1,
+    );
+    assert_ne!(
+        redirected, lease,
+        "the published lease's provider still declares `api_key:` on a line of its own"
+    );
+    redirected
+}
+
 /// The one store record a node of a lease run filed (`docs/trace.md` §6).
 fn lease_record(run: &harness::Invocation, node: &str) -> Value {
     run.entries(node)
@@ -12955,37 +12978,63 @@ fn lease_record(run: &harness::Invocation, node: &str) -> Value {
         .unwrap_or_else(|| panic!("`{node}` filed no store record: {:?}", run.trace()))
 }
 
+/// The same, off a `--format json` report's `trace`.
+fn reported_lease_record(report: &Value, node: &str) -> Value {
+    report["trace"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["node"] == node)
+        .and_then(|entry| entry["stores"].get(0))
+        .cloned()
+        .unwrap_or_else(|| panic!("`{node}` filed no store record: {report:#}"))
+}
+
 /// **The published lease runs: a claim applies, a second claim declines, a keep
-/// extends it, and a release deletes it** (PRD resolved q69 with q68).
+/// extends it, and the flow's `finally:` node releases it however the run
+/// ended** (PRD resolved q69 with q68 and q76).
 ///
-/// The composition is the one `docs/topics/stores.md` publishes, read out of the
-/// topic rather than copied into a fixture, and it runs six times against one
-/// store, with the store's clock moved by the emitted module's own offset
-/// rather than slept through:
+/// The composition is the one `docs/topics/stores.md` publishes, read out of
+/// the topic rather than copied into a fixture (with its provider pointed at the
+/// mock — [`published_lease_against_the_mock`]), and it runs against one store
+/// with the store's clock moved by the emitted module's own offset rather than
+/// slept through:
 ///
-/// 1. worker `a` claims the job and dies in its first half — the lease stays,
-///    because nothing released it;
-/// 2. worker `b`, at the same instant, is refused the claim and ends;
-/// 3. a minute and a second later the claim has expired, so `b` takes it — the
+/// 1. worker `a` claims the job and is **killed** in its first half — a process
+///    that died runs no finally node, so the lease stays;
+/// 2. worker `b`, at the same instant, is refused the claim — and its `release`
+///    still runs, as the finally node, and **declines**: `held` is false, so the
+///    version it would have deleted under is one no lease carries, and `a`'s
+///    lease is untouched;
+/// 3. a minute and a second later `a`'s claim has expired, so `b` takes it — the
 ///    version one past `a`'s, since expiry consumes none — keeps it for ten
-///    minutes, and dies in its second half;
-/// 4. two minutes after that — past the claim's minute, inside the keep's ten —
-///    worker `c` is refused: the keep extended the lease;
-/// 5. past the keep's ten, `c` takes it, keeps it, finishes, and releases;
-/// 6. at that same instant `d` takes it at once: the release deleted it, so
-///    there was no expiry to wait out.
+///    minutes, and its second half **fails**: the run fails for its own reason,
+///    and `release` runs anyway and deletes the lease;
+/// 4. so `c`, at that same instant, takes it at once, keeps it, and is killed in
+///    its second half;
+/// 5. two minutes after that — past the claim's minute, inside the keep's ten —
+///    worker `d` is refused: the keep extended the lease, and `d`'s release
+///    declines;
+/// 6. past the keep's ten, `d` takes it, keeps it, finishes, and releases;
+/// 7. and the two killed executions are **resumed**, there: each replays what it
+///    had done, runs on, and ends — and each one's `release` runs at that end
+///    and declines, because neither holds the version it took any longer: `c`'s
+///    expired, and `a`'s keep found the lease gone, so `a` stopped holding it.
 ///
-/// And the ledger, read out of the store's own file at the end: every one of
-/// the six executions settled, `completed` or `failed`, so none of the keyed
-/// writes they made left a row behind.
+/// And the ledger, read out of the store's own file at the end: every execution
+/// has now settled, `completed` or `failed`, so none of the keyed writes they
+/// made left a row behind — and nobody holds the lease, because the last holder
+/// released it.
 #[test]
 fn the_published_lease_claims_declines_keeps_and_releases() {
     let scratch = harness::Scratch::new("published-lease");
     let entrypoint = scratch.path().join("main.yml");
-    std::fs::write(&entrypoint, published_lease()).expect("the scratch spec is writable");
-    // One data directory for every run, so the six builds share one store —
-    // a directory of its own rather than one beside the spec, so nothing a run
-    // writes sits in the directory the next build reads its composition from.
+    std::fs::write(&entrypoint, published_lease_against_the_mock())
+        .expect("the scratch spec is writable");
+    // One data directory for every run, so every build shares one store and one
+    // journal — a directory of its own rather than one beside the spec, so
+    // nothing a run writes sits in the directory the next build reads its
+    // composition from.
     let stored = harness::Scratch::new("published-lease-data");
     let data = stored.path().to_path_buf();
 
@@ -12999,44 +13048,85 @@ fn the_published_lease_claims_declines_keeps_and_releases() {
         "AGENT_COMPOSE_DATA_DIR".to_string(),
         data.display().to_string(),
     ));
+    let at = |clock: u64| {
+        let mut held = environment.clone();
+        held.push((STORE_CLOCK.to_string(), clock.to_string()));
+        held
+    };
     let done = || Outcome::structured(json!({ "done": true }));
+    let held_open = || done().after(Duration::from_secs(120));
     let run = |worker: &str, clock: u64, halves: Vec<Outcome>| {
         provider.enqueue_all(
             halves
                 .into_iter()
                 .map(|outcome| Script::new(LEASE_MODEL, outcome)),
         );
-        let mut at = environment.clone();
-        at.push((STORE_CLOCK.to_string(), clock.to_string()));
         harness::invoke_entrypoint(
             &entrypoint,
             "the published lease",
             "flow.job",
             &json!({ "job": "job-1", "worker": worker }),
-            &at,
-            Some(REDIRECT_TO_MOCK),
+            &at(clock),
+            None,
+        )
+    };
+    let Some((killed_in, built)) = harness::build_entrypoint(&entrypoint, "published-lease-killed")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the published lease did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let kill = |worker: &str, clock: u64, halves: Vec<Outcome>, asked: usize| {
+        provider.reset();
+        provider.enqueue_all(
+            halves
+                .into_iter()
+                .map(|outcome| Script::new(LEASE_MODEL, outcome)),
+        );
+        let worker = format!("worker={worker}");
+        let killed = harness::crash_run(
+            &killed_in,
+            &[
+                "run",
+                "flow.job",
+                "--input",
+                "job=job-1",
+                "--input",
+                &worker,
+            ],
+            &at(clock),
+            |_| provider.snapshot().requests >= asked,
+        );
+        provider.reset();
+        killed
+    };
+    let file = data.join("stores").join("leases.sqlite");
+    let holder = || {
+        harness::sqlite_rows(
+            &killed_in,
+            &file,
+            "SELECT key, value, version FROM entries ORDER BY key",
         )
     };
     let minute: u64 = 60_000;
 
-    // 1. `a` claims, and dies before it keeps or releases anything.
-    let Some(first) = run("a", 0, vec![Outcome::server_error()]) else {
-        return;
-    };
-    first.failed();
-    let claimed = lease_record(&first, "claim");
-    assert_eq!(claimed["applied"], json!(true), "{claimed}");
-    let held = claimed["version"]
-        .as_i64()
-        .expect("a claim that applied has a version");
-    assert!(
-        first.entries("keep").is_empty() && first.entries("release").is_empty(),
-        "the run ended in its first half: {:?}",
-        first.visited()
+    // 1. `a` claims, and is killed in its first half: no finally node ran.
+    let a = kill("a", 0, vec![held_open()], 1);
+    let leased = holder();
+    assert_eq!(
+        leased[0]["value"], "{\"owner\":\"a\"}",
+        "a killed holder's lease stays: {leased}"
     );
+    let held = leased[0]["version"]
+        .as_i64()
+        .expect("a lease carries its version");
 
     // 2. `b`, at the same instant: the lease is held, so the claim declines and
-    // answers the holder's version.
+    // answers the holder's version — and `release` declines with it, because
+    // `b` never held the lease.
     let Some(second) = run("b", 0, vec![]) else {
         return;
     };
@@ -13044,10 +13134,22 @@ fn the_published_lease_claims_declines_keeps_and_releases() {
     let refused = lease_record(&second, "claim");
     assert_eq!(refused["applied"], json!(false), "{refused}");
     assert_eq!(refused["version"], json!(held));
-    assert_eq!(second.visited(), ["claim"], "a declined claim ends the run");
+    assert_eq!(
+        second.visited(),
+        ["claim", "release"],
+        "a declined claim ends the body, and the finally node runs at the end"
+    );
+    let kept_away = lease_record(&second, "release");
+    assert_eq!(
+        kept_away["applied"],
+        json!(false),
+        "a run that never held the lease releases nothing: {kept_away}"
+    );
+    assert_eq!(holder()[0]["value"], "{\"owner\":\"a\"}");
 
-    // 3. A minute and a second on, the claim has expired: `b` takes it with the
-    // partition's very next version, keeps it, and dies in its second half.
+    // 3. A minute and a second on, `a`'s claim has expired: `b` takes it with
+    // the partition's very next version, keeps it, and fails in its second half
+    // — and releases it anyway.
     let expired = minute + 1_000;
     let Some(third) = run("b", expired, vec![done(), Outcome::server_error()]) else {
         return;
@@ -13067,73 +13169,125 @@ fn the_published_lease_claims_declines_keeps_and_releases() {
     let kept = lease_record(&third, "keep");
     assert_eq!(kept["applied"], json!(true), "{kept}");
     assert_eq!(kept["version"], json!(held + 2));
+    assert_eq!(
+        third.visited(),
+        ["claim", "first_half", "keep", "second_half", "release"],
+        "the finally node ran after the node that failed the run"
+    );
+    let released = lease_record(&third, "release");
+    assert_eq!(
+        released["applied"],
+        json!(true),
+        "a run that failed still releases what it held: {released}"
+    );
+    assert_eq!(
+        holder(),
+        json!([]),
+        "the failed run's release deleted the lease"
+    );
 
-    // 4. Two minutes later — past the claim's minute, inside the keep's ten —
-    // `c` is refused: the keep moved the expiry.
-    let Some(fourth) = run("c", expired + 2 * minute, vec![]) else {
+    // 4. …so `c`, at that same instant, takes it at once, keeps it, and is
+    // killed in its second half.
+    let c = kill("c", expired, vec![done(), held_open()], 2);
+    let leased = holder();
+    assert_eq!(leased[0]["value"], "{\"owner\":\"c\"}", "{leased}");
+    assert_eq!(
+        leased[0]["version"],
+        json!(held + 4),
+        "`c` claimed at `held + 3` and kept at `held + 4`: {leased}"
+    );
+
+    // 5. Two minutes later — past the claim's minute, inside the keep's ten —
+    // `d` is refused: the keep moved the expiry.
+    let Some(fifth) = run("d", expired + 2 * minute, vec![]) else {
         return;
     };
-    fourth.succeeded();
-    let extended = lease_record(&fourth, "claim");
+    fifth.succeeded();
+    let extended = lease_record(&fifth, "claim");
     assert_eq!(
         extended["applied"],
         json!(false),
         "the keep's fresh `ttl` extended the lease past the claim's: {extended}"
     );
-    assert_eq!(extended["version"], json!(held + 2));
+    assert_eq!(extended["version"], json!(held + 4));
+    assert_eq!(lease_record(&fifth, "release")["applied"], json!(false));
 
-    // 5. Past the keep's ten minutes, `c` takes it, keeps it, finishes, and
+    // 6. Past the keep's ten minutes, `d` takes it, keeps it, finishes, and
     // releases.
     let lapsed = expired + 11 * minute;
-    let Some(fifth) = run("c", lapsed, vec![done(), done()]) else {
+    let Some(sixth) = run("d", lapsed, vec![done(), done()]) else {
         return;
     };
-    fifth.succeeded();
+    sixth.succeeded();
     assert_eq!(
-        fifth.visited(),
+        sixth.visited(),
         ["claim", "first_half", "keep", "second_half", "release"]
     );
-    assert_eq!(lease_record(&fifth, "claim")["version"], json!(held + 3));
-    assert_eq!(lease_record(&fifth, "keep")["version"], json!(held + 4));
-    let released = lease_record(&fifth, "release");
+    assert_eq!(lease_record(&sixth, "claim")["version"], json!(held + 5));
+    assert_eq!(lease_record(&sixth, "keep")["version"], json!(held + 6));
+    let released = lease_record(&sixth, "release");
     assert_eq!(released["applied"], json!(true), "{released}");
     assert!(
         released.get("version").is_none(),
         "a delete that applied leaves the key holding nothing: {released}"
     );
 
-    // 6. …so `d`, at that same instant, takes it at once.
-    let Some(sixth) = run("d", lapsed, vec![Outcome::server_error()]) else {
-        return;
-    };
-    sixth.failed();
-    let after = lease_record(&sixth, "claim");
-    assert_eq!(
-        after["applied"],
-        json!(true),
-        "the release deleted the lease: {after}"
-    );
-    assert_eq!(after["version"], json!(held + 5));
+    // 7. The two killed executions, resumed now: each runs on to its end, and
+    // its `release` runs there and declines.
+    for (killed, halves, what) in [
+        (
+            &c,
+            vec![done()],
+            "`c` holds a version that expired under it",
+        ),
+        (
+            &a,
+            vec![done()],
+            "`a`'s keep found the lease gone, so `a` holds nothing",
+        ),
+    ] {
+        provider.enqueue_all(
+            halves
+                .into_iter()
+                .map(|outcome| Script::new(LEASE_MODEL, outcome)),
+        );
+        let resumed = harness::resume_entrypoint(
+            &killed_in,
+            &entrypoint,
+            &killed.execution,
+            Some("json"),
+            &at(lapsed),
+        );
+        let report = resumed.outputs();
+        assert_eq!(
+            report["status"],
+            "completed",
+            "{report:#}\n{}",
+            resumed.stderr()
+        );
+        let last = report["trace"]
+            .as_array()
+            .and_then(|entries| entries.last())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(last["node"], "release", "{report:#}");
+        assert_eq!(
+            reported_lease_record(&report, "release")["applied"],
+            json!(false),
+            "{what}: {report:#}"
+        );
+    }
 
     // Every execution settled, completed or failed, so the ledger holds none of
-    // the keyed writes they made — while the lease `d` took is still there.
-    let file = data.join("stores").join("leases.sqlite");
-    let ledger = harness::sqlite_rows(&sixth.project, &file, "SELECT COUNT(*) AS n FROM applied");
+    // the keyed writes they made — and the store holds no lease, because the
+    // last run to take one released it.
+    let ledger = harness::sqlite_rows(&killed_in, &file, "SELECT COUNT(*) AS n FROM applied");
     assert_eq!(
         ledger[0]["n"],
         json!(0),
         "a settled execution's ledger rows are deleted (PRD resolved q69)"
     );
-    let rows = harness::sqlite_rows(
-        &sixth.project,
-        &file,
-        "SELECT key, value FROM entries ORDER BY key",
-    );
-    assert_eq!(
-        rows,
-        json!([{ "key": "job-1", "value": "{\"owner\":\"d\"}" }]),
-        "the store keeps the data the ledger's rows were about"
-    );
+    assert_eq!(holder(), json!([]), "nobody holds the lease");
 }
 
 /// **A settled run leaves no ledger rows in any kind of store it wrote** — the
@@ -26122,4 +26276,956 @@ fn a_pending_delivery_the_allowlist_no_longer_admits_is_refused_rather_than_sent
         receiver.delivered()
     );
     drop(second);
+}
+
+// ---------------------------------------------------------------------------
+// A flow's `finally:` node (grammar §7.9, Decision D159, PRD resolved q76)
+// ---------------------------------------------------------------------------
+
+/// The acceptance fixture every test of this section runs.
+const FINALLY: &str = "finally";
+
+/// The shim `${TALLY_BIN}/ended` resolves to in this section, and the log it
+/// appends to.
+///
+/// One line per run of a finally node that reports: what it read as
+/// `execution.outcome` and `execution.error`, `|`-separated, with `none` where
+/// the binding found no error to read and nothing at all where the node binds
+/// none. Under `--fail` — `flow.untidy`'s finally node — it logs `tried
+/// <outcome>` per **attempt** and exits `1`, so a `retry:` ladder spent is a
+/// line count and the error it ends with is the subprocess's own.
+fn finally_environment(
+    provider: &MockProvider,
+    purpose: &str,
+) -> (harness::Scratch, std::path::PathBuf, Vec<(String, String)>) {
+    let shims = harness::Scratch::new(purpose);
+    let log = shims.path().join("ended.log");
+    harness::shim(
+        shims.path(),
+        "ended",
+        "if [ \"$1\" = \"--fail\" ]; then\n\
+         \x20 printf 'tried %s\\n' \"$OUTCOME\" >> \"$TALLY_LOG\"\n\
+         \x20 echo 'the cleanup could not finish' >&2\n\
+         \x20 exit 1\n\
+         fi\n\
+         printf '%s|%s\\n' \"$OUTCOME\" \"$ERROR\" >> \"$TALLY_LOG\"\n",
+    );
+    let mut environment = harness::environment(provider);
+    environment.push((
+        harness::TALLY_BIN.to_string(),
+        shims.path().display().to_string(),
+    ));
+    environment.push((harness::TALLY_LOG.to_string(), log.display().to_string()));
+    (shims, log, environment)
+}
+
+/// What the `ended` shim has logged, one element per line.
+fn ended_lines(log: &Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// The array `store.ended` holds at `order`, read out of the store's own file
+/// — the order the finally nodes that append to it ran in.
+fn ended_order(project: &Path) -> Value {
+    let file = project
+        .join(".agent-compose")
+        .join("stores")
+        .join("ended.sqlite");
+    let rows = harness::sqlite_rows(
+        project,
+        &file,
+        "SELECT value FROM entries WHERE key = 'order'",
+    );
+    let text = rows[0]["value"]
+        .as_str()
+        .unwrap_or_else(|| panic!("`store.ended` holds `order`: {rows}"));
+    let value: Value = serde_json::from_str(text).expect("a stored value is JSON");
+    value["order"].clone()
+}
+
+/// The node ids of a list of entries, in the order they are recorded.
+fn nodes_of(entries: &Value) -> Vec<String> {
+    entries
+        .as_array()
+        .unwrap_or_else(|| panic!("a list of entries: {entries}"))
+        .iter()
+        .map(|entry| entry["node"].as_str().expect("a node id").to_string())
+        .collect()
+}
+
+/// The entry `docs/trace.md` §3.5 describes: the instance's last, on its own
+/// outcome, at traversal `0`, with no `routing` whatever happened.
+fn assert_finally_entry(entries: &Value, node: &str, outcome: &str) -> Value {
+    let held = entries
+        .as_array()
+        .unwrap_or_else(|| panic!("a list of entries: {entries}"));
+    let last = held
+        .last()
+        .unwrap_or_else(|| panic!("the instance recorded entries: {entries:#}"))
+        .clone();
+    assert_eq!(
+        last["node"], node,
+        "the finally node's entry is the instance's last: {entries:#}"
+    );
+    assert_eq!(last["outcome"], outcome, "{last:#}");
+    assert_eq!(last["traversal"], 0, "{last:#}");
+    assert!(
+        last.get("routing").is_none(),
+        "a finally node has no edges, so its entry records no routing: {last:#}"
+    );
+    let before = held[..held.len() - 1]
+        .iter()
+        .map(|entry| entry["step"].as_u64().expect("a step"))
+        .max()
+        .unwrap_or(0);
+    assert_eq!(
+        last["step"].as_u64(),
+        Some(before + 1),
+        "one step past the body's last: {entries:#}"
+    );
+    assert_eq!(
+        held.iter().filter(|entry| entry["node"] == node).count(),
+        1,
+        "the instance ran its finally node once: {entries:#}"
+    );
+    last
+}
+
+/// The `finally` boundary records one execution's journal holds, as
+/// `(key, request, outcome)`.
+fn finally_boundaries(project: &Path, execution: &str) -> Vec<(String, Value, Value)> {
+    let rows = harness::journal_rows(
+        project,
+        &format!(
+            "SELECT \"key\" AS k, request, outcome, payload FROM effects \
+             WHERE execution = '{execution}' AND kind = 'finally' ORDER BY \"key\""
+        ),
+    );
+    rows.as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| {
+            let parse = |field: &str| -> Value {
+                serde_json::from_str(row[field].as_str().expect("a JSON column"))
+                    .expect("the column holds JSON")
+            };
+            (
+                row["k"].as_str().expect("a key").to_string(),
+                parse("request"),
+                json!({ "kind": row["outcome"], "value": parse("payload") }),
+            )
+        })
+        .collect()
+}
+
+/// One execution's lifecycle row: its `status`, `error` and `finally_error`.
+fn lifecycle_row(project: &Path, execution: &str) -> Value {
+    let rows = harness::journal_rows(
+        project,
+        &format!("SELECT status, error, finally_error FROM executions WHERE id = '{execution}'"),
+    );
+    assert_eq!(
+        rows.as_array().map(Vec::len),
+        Some(1),
+        "one lifecycle row for `{execution}`: {rows}"
+    );
+    rows[0].clone()
+}
+
+/// **A finally node runs once on every outcome, last, and reads how its
+/// instance ended** (grammar §7.9, Decision D159, PRD resolved q76).
+///
+/// `flow.ended`'s body is one subprocess exiting with the code it is given, so
+/// one flow ends either way on its input alone:
+///
+/// * exit `0` — the run completes, answers its outputs, and its finally node
+///   reads `completed` with no `execution.error` to read;
+/// * exit `3` — the run fails for its own reason, and the finally node runs
+///   anyway, after the entry that failed it, reading `failed` and that entry's
+///   own `error` verbatim.
+///
+/// And the two strategies that absorb a failure: `flow.skipped`'s body node
+/// fails under `on_error: skip` and `flow.retired`'s under `on_error: {
+/// fallback: end }`. Both instances **completed** — a skipped body completed
+/// (Decision D97), and so did one whose branch the fallback retired — so both
+/// finally nodes read `completed` and no error.
+///
+/// In every case the finally entry is the trace's last, at a step one past the
+/// body's, with no `routing`.
+#[test]
+fn a_finally_node_runs_once_on_every_outcome_and_reads_how_its_instance_ended() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, log, environment) = finally_environment(&provider, "finally-outcomes");
+    let Some(project) = harness::scratch_project("finally-outcomes") else {
+        return;
+    };
+
+    // Completed.
+    let completed = harness::run_formatted(
+        &project,
+        FINALLY,
+        "flow.ended",
+        &[("code", "0")],
+        None,
+        Some("json"),
+        &environment,
+    );
+    completed.succeeded();
+    let report = completed.outputs();
+    assert_eq!(report["status"], "completed", "{report:#}");
+    assert_eq!(
+        report["outputs"],
+        json!({ "worked": "done" }),
+        "the body's outputs are the run's: {report:#}"
+    );
+    assert!(report.get("finally_error").is_none(), "{report:#}");
+    assert_eq!(nodes_of(&report["trace"]), ["work", "record"]);
+    assert_finally_entry(&report["trace"], "record", "completed");
+    assert_eq!(ended_lines(&log), ["completed|none"]);
+
+    // Failed — and the finally node is handed the failure the body ended on.
+    let failed = harness::run_formatted(
+        &project,
+        FINALLY,
+        "flow.ended",
+        &[("code", "3")],
+        None,
+        Some("json"),
+        &environment,
+    );
+    let said = failed.failed();
+    assert_eq!(
+        failed.output.status.code(),
+        Some(1),
+        "a failed run exits `1`, finally node or not: {said}"
+    );
+    let report = failed.outputs();
+    assert_eq!(report["status"], "failed", "{report:#}");
+    assert!(report.get("finally_error").is_none(), "{report:#}");
+    assert_eq!(nodes_of(&report["trace"]), ["work", "record"]);
+    let aborted = &report["trace"][0];
+    assert_eq!(aborted["outcome"], "failed", "{report:#}");
+    let error = aborted["error"].as_str().expect("the failed entry's error");
+    assert!(
+        error.starts_with("NodeFailure: flow.ended node `work` failed: "),
+        "{error}"
+    );
+    assert_finally_entry(&report["trace"], "record", "completed");
+    assert_eq!(
+        ended_lines(&log),
+        ["completed|none".to_string(), format!("failed|{error}")],
+        "`execution.error` is the error the body ended on, as its entry carries it"
+    );
+
+    // Skipped, and retired by a fallback to `end`: both completed (D97).
+    for (flow, absorbed) in [("flow.skipped", "skipped"), ("flow.retired", "failed")] {
+        let run = harness::run_formatted(
+            &project,
+            FINALLY,
+            flow,
+            &[],
+            None,
+            Some("json"),
+            &environment,
+        );
+        run.succeeded();
+        let report = run.outputs();
+        assert_eq!(report["status"], "completed", "`{flow}`: {report:#}");
+        assert_eq!(nodes_of(&report["trace"]), ["work", "record"], "`{flow}`");
+        assert_eq!(
+            report["trace"][0]["outcome"], absorbed,
+            "`{flow}`: {report:#}"
+        );
+        assert_finally_entry(&report["trace"], "record", "completed");
+    }
+    assert_eq!(
+        ended_lines(&log)[2..],
+        ["completed|none", "completed|none"],
+        "an absorbed failure is not the instance's: neither read an error"
+    );
+}
+
+/// **A nested instance's finally node runs before the finally node of the
+/// instance that instantiated it** (grammar §7.9: innermost first).
+///
+/// `flow.nested`'s one body node is a `flow:` node into `flow.inner`, and both
+/// flows' finally nodes append to one array in `store.ended`. The order is read
+/// twice, from two places that cannot agree by accident: the store holds
+/// `["inner", "outer"]`, and the trace puts `inner_end` last inside `step`'s
+/// `inner` and `outer_end` last of all — each with no `routing`.
+#[test]
+fn a_nested_instances_finally_node_runs_before_the_one_that_instantiated_it() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, environment) = finally_environment(&provider, "finally-nested");
+    let Some(project) = harness::scratch_project("finally-nested") else {
+        return;
+    };
+    let run = harness::run_formatted(
+        &project,
+        FINALLY,
+        "flow.nested",
+        &[],
+        None,
+        Some("json"),
+        &environment,
+    );
+    run.succeeded();
+    let report = run.outputs();
+    assert_eq!(report["status"], "completed", "{report:#}");
+    assert_eq!(nodes_of(&report["trace"]), ["step", "outer_end"]);
+    let inner = &report["trace"][0]["inner"];
+    assert_eq!(nodes_of(inner), ["inner_work", "inner_end"], "{report:#}");
+    assert_finally_entry(inner, "inner_end", "completed");
+    assert_finally_entry(&report["trace"], "outer_end", "completed");
+    assert_eq!(ended_order(&project), json!(["inner", "outer"]));
+
+    let execution = report["execution_id"].as_str().expect("an execution id");
+    let keys: Vec<String> = finally_boundaries(&project, execution)
+        .into_iter()
+        .map(|(key, _, _)| key)
+        .collect();
+    assert_eq!(
+        keys,
+        ["outer_end/0#finally/0", "step/0/inner_end/0#finally/0"],
+        "one boundary per instance, each at its finally node's own site"
+    );
+}
+
+/// **Every instance a `map` dispatched runs its own finally node, and the
+/// map's flow runs its own after all of them** (grammar §7.9).
+///
+/// `flow.each` fans `flow.item` out over two names, one at a time, so the
+/// store's array is the items' finally nodes in source-item order and then
+/// `all_end`. Each dispatch record's `inner` ends with its own `item_end`, and
+/// the journal holds one boundary per instance — two under the map's items and
+/// one at the root.
+#[test]
+fn every_dispatched_instance_runs_its_own_finally_node() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, environment) = finally_environment(&provider, "finally-each");
+    let Some(project) = harness::scratch_project("finally-each") else {
+        return;
+    };
+    let run = harness::run_formatted(
+        &project,
+        FINALLY,
+        "flow.each",
+        &[("names", r#"["left","right"]"#)],
+        None,
+        Some("json"),
+        &environment,
+    );
+    run.succeeded();
+    let report = run.outputs();
+    assert_eq!(report["status"], "completed", "{report:#}");
+    assert_eq!(nodes_of(&report["trace"]), ["fan", "all_end"]);
+    assert_finally_entry(&report["trace"], "all_end", "completed");
+    let dispatches = report["trace"][0]["dispatches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the map's entry carries its dispatches: {report:#}"));
+    assert_eq!(dispatches.len(), 2, "{report:#}");
+    for dispatch in dispatches {
+        assert_eq!(dispatch["outcome"], "completed", "{dispatch:#}");
+        assert_eq!(nodes_of(&dispatch["inner"]), ["item_work", "item_end"]);
+        assert_finally_entry(&dispatch["inner"], "item_end", "completed");
+    }
+    assert_eq!(ended_order(&project), json!(["left", "right", "all"]));
+
+    let execution = report["execution_id"].as_str().expect("an execution id");
+    let keys: Vec<String> = finally_boundaries(&project, execution)
+        .into_iter()
+        .map(|(key, _, _)| key)
+        .collect();
+    assert_eq!(keys.len(), 3, "{keys:?}");
+    assert_eq!(keys[0], "all_end/0#finally/0", "{keys:?}");
+    for (key, dispatch) in keys[1..].iter().zip(dispatches) {
+        let path = dispatch["idempotencyKey"]
+            .as_str()
+            .expect("a dispatch's key")
+            .strip_prefix(&format!("{execution}/"))
+            .expect("a key is prefixed by its execution");
+        assert_eq!(
+            key,
+            &format!("{path}/item_end/0#finally/0"),
+            "each item's boundary is at its own instance's frame"
+        );
+    }
+}
+
+/// **A detached child execution runs its own finally node, under its own id**
+/// (grammar §7.9, Decision D150).
+///
+/// `flow.released` is `flow.each` with `detach: true`: the dispatch is a child
+/// execution, so the parent's trace holds the stub `"detached"` record and no
+/// `inner`, and the parent's finally node is the parent's alone. The child's
+/// boundary and its lifecycle row are its own, and both finally nodes reached
+/// the store — in no order the two executions share, so the array is compared
+/// as a set.
+#[test]
+fn a_detached_child_execution_runs_its_own_finally_node() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, environment) = finally_environment(&provider, "finally-released");
+    let Some(project) = harness::scratch_project("finally-released") else {
+        return;
+    };
+    let run = harness::run_formatted(
+        &project,
+        FINALLY,
+        "flow.released",
+        &[("names", r#"["left"]"#)],
+        None,
+        Some("json"),
+        &environment,
+    );
+    run.succeeded();
+    let report = run.outputs();
+    assert_eq!(report["status"], "completed", "{report:#}");
+    assert_eq!(nodes_of(&report["trace"]), ["fan", "all_end"]);
+    assert_finally_entry(&report["trace"], "all_end", "completed");
+    let stub = &report["trace"][0]["dispatches"][0];
+    assert_eq!(stub["outcome"], "detached", "{stub:#}");
+    assert!(stub.get("inner").is_none(), "{stub:#}");
+
+    let parent = report["execution_id"].as_str().expect("an execution id");
+    let child = harness::child_execution_id(
+        parent,
+        stub["idempotencyKey"].as_str().expect("a dispatch's key"),
+    );
+    let parents: Vec<String> = finally_boundaries(&project, parent)
+        .into_iter()
+        .map(|(key, _, _)| key)
+        .collect();
+    assert_eq!(
+        parents,
+        ["all_end/0#finally/0"],
+        "the parent journals its own end and nothing of its child's"
+    );
+    let children = finally_boundaries(&project, &child);
+    assert_eq!(children.len(), 1, "{children:?}");
+    assert_eq!(children[0].0, "item_end/0#finally/0");
+    assert_eq!(
+        children[0].1,
+        json!({ "node": "item_end", "outcome": "completed" })
+    );
+    assert_eq!(lifecycle_row(&project, &child)["status"], "completed");
+
+    let mut order: Vec<String> = ended_order(&project)
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|item| item.as_str().expect("a name").to_string())
+        .collect();
+    order.sort();
+    assert_eq!(order, ["all", "left"]);
+}
+
+/// **A finally node that fails after its retries changes nothing the run
+/// produced** — and the failure is on the record, once (grammar §7.9, PRD
+/// resolved q76).
+///
+/// `flow.untidy`'s finally node fails on every attempt of `retry: { max: 2 }`.
+///
+/// * Completed under `--format human`: exit `0`, the body's outputs on stdout,
+///   and exactly **one** stderr line, `finally_error: …`. The trace file's
+///   envelope says `"completed"` beside the `finally_error`, the finally entry
+///   is `"failed"` after three attempts with no routing, and the lifecycle row
+///   carries the same text in `finally_error` with no `error`.
+/// * Failed under `--format json`: exit `1`, `status: "failed"` with the body's
+///   own `error`, and `finally_error` beside it on the report and the row — the
+///   one document carries both, and neither replaced the other.
+#[test]
+fn a_finally_node_that_fails_after_its_retries_changes_no_outcome() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "the work is done" })),
+    ));
+    let (_shims, log, environment) = finally_environment(&provider, "finally-untidy");
+    let Some(project) = harness::scratch_project("finally-untidy") else {
+        return;
+    };
+
+    let run = harness::run_into(
+        &project,
+        FINALLY,
+        "flow.untidy",
+        &[("topic", "the cleanup")],
+        None,
+        &environment,
+    );
+    run.succeeded();
+    assert_eq!(run.output.status.code(), Some(0));
+    assert_eq!(
+        run.outputs(),
+        json!({ "note": "the work is done" }),
+        "the outputs are the body's"
+    );
+    let stderr = run.stderr();
+    let said: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("finally_error: "))
+        .collect();
+    assert_eq!(said.len(), 1, "one line on stderr: {stderr}");
+    let finally_error = said[0]
+        .strip_prefix("finally_error: ")
+        .expect("the prefix")
+        .to_string();
+    assert!(
+        finally_error.starts_with("flow.untidy node `record` failed: "),
+        "{finally_error}"
+    );
+    assert_eq!(
+        ended_lines(&log),
+        ["tried completed", "tried completed", "tried completed"],
+        "the node's own `retry:` ran its ladder out: one attempt and two retries"
+    );
+    let document = run.trace_document();
+    assert_eq!(document["status"], "completed", "{document:#}");
+    assert_eq!(document["finally_error"], finally_error.as_str());
+    assert!(document.get("error").is_none(), "{document:#}");
+    let entry = assert_finally_entry(&document["entries"], "record", "failed");
+    assert_eq!(entry["attempts"], 3, "{entry:#}");
+    assert!(entry["error"].is_string(), "{entry:#}");
+    let execution = document["execution_id"].as_str().expect("an execution id");
+    assert_eq!(
+        lifecycle_row(&project, execution),
+        json!({ "status": "completed", "error": null, "finally_error": finally_error }),
+    );
+
+    // The same, with a body that failed first.
+    provider.enqueue(Script::new(SONNET, Outcome::server_error()));
+    let failed = harness::run_formatted(
+        &project,
+        FINALLY,
+        "flow.untidy",
+        &[("topic", "the cleanup")],
+        None,
+        Some("json"),
+        &environment,
+    );
+    let said = failed.failed();
+    assert_eq!(failed.output.status.code(), Some(1), "{said}");
+    let report = failed.outputs();
+    assert_eq!(report["status"], "failed", "{report:#}");
+    let error = report["error"].as_str().expect("the body's error");
+    assert!(!error.contains("could not finish"), "{error}");
+    let finally_error = report["finally_error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the report carries the finally node's failure: {report:#}"));
+    assert!(
+        finally_error.starts_with("flow.untidy node `record` failed: "),
+        "{finally_error}"
+    );
+    assert!(
+        !said.contains("finally_error: "),
+        "under `--format json` the failure is the report's, not a stderr line: {said}"
+    );
+    assert_finally_entry(&report["trace"], "record", "failed");
+    let execution = report["execution_id"].as_str().expect("an execution id");
+    let row = lifecycle_row(&project, execution);
+    assert_eq!(row["status"], "failed", "{row}");
+    assert_eq!(row["error"], error, "{row}");
+    assert_eq!(row["finally_error"], finally_error, "{row}");
+    assert_eq!(
+        ended_lines(&log)[3..],
+        ["tried failed", "tried failed", "tried failed"]
+    );
+}
+
+/// **A served execution whose finally node failed reports `finally_error` on
+/// its status route, beside the outcome it did not change** (grammar §7.9,
+/// `docs/trace.md` §1.3, PRD resolved q76).
+///
+/// `serve` starts `flow.untidy` from its `http` trigger; the body answers and
+/// the finally node fails on every attempt. The report is `completed` with the
+/// body's outputs, its `finally_error` names the node, and the trace it carries
+/// ends with the failed finally entry — the same three things the trace file
+/// and the lifecycle row say for a `run`.
+#[test]
+fn a_served_executions_status_reports_its_finally_error() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "served and done" })),
+    ));
+    let (_shims, log, environment) = finally_environment(&provider, "finally-served");
+    let Some(project) = harness::scratch_project("finally-served") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, FINALLY, &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let started = app
+        .post_json("/untidy", &json!({ "topic": "the served cleanup" }))
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{}", started.text());
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+    let report = harness::settled(&app, &execution);
+    assert_eq!(report["status"], "completed", "{report:#}");
+    assert_eq!(
+        report["outputs"],
+        json!({ "note": "served and done" }),
+        "{report:#}"
+    );
+    let finally_error = report["finally_error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the report carries the finally node's failure: {report:#}"));
+    assert!(
+        finally_error.starts_with("flow.untidy node `record` failed: "),
+        "{finally_error}"
+    );
+    assert!(report.get("error").is_none(), "{report:#}");
+    let entry = assert_finally_entry(&report["trace"], "record", "failed");
+    assert_eq!(entry["attempts"], 3, "{entry:#}");
+    assert_eq!(ended_lines(&log).len(), 3, "one line per attempt");
+    drop(served);
+    assert_eq!(
+        lifecycle_row(&project, &execution),
+        json!({ "status": "completed", "error": null, "finally_error": finally_error }),
+    );
+}
+
+/// The run `flow.closed` makes, killed while its finally node's subflow is in
+/// flight; what a test asserts about it is the resume.
+struct ClosedKill {
+    provider: MockProvider,
+    _shims: harness::Scratch,
+    log: std::path::PathBuf,
+    environment: Vec<(String, String)>,
+    project: std::path::PathBuf,
+    killed: harness::Killed,
+}
+
+/// Run `flow.closed` to the point `ready` names and kill it.
+///
+/// `code` is the body subprocess's exit code, so the instance ends `completed`
+/// or `failed`; `scripts` are the finally subflow's two model calls, one of
+/// which the caller holds.
+fn closed_and_killed(
+    purpose: &str,
+    code: &str,
+    scripts: Vec<Script>,
+    ready: impl Fn(&MockProvider, &Path, &Path) -> bool,
+) -> Option<ClosedKill> {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all(scripts);
+    let (shims, log, environment) = finally_environment(&provider, purpose);
+    let (project, built) = harness::build_under_toolchain(FINALLY, purpose)?;
+    assert!(
+        built.status.success(),
+        "the finally fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let input = format!("code={code}");
+    let killed = harness::crash_run(
+        &project,
+        &["run", "flow.closed", "--input", &input],
+        &environment,
+        |_| ready(&provider, &project, &log),
+    );
+    Some(ClosedKill {
+        provider,
+        _shims: shims,
+        log,
+        environment,
+        project,
+        killed,
+    })
+}
+
+/// What both restart windows assert about the resumed run: it ends on the body's
+/// outcome, its finally entry is the trace's last and its only one, the
+/// subprocess ran once across both generations, and the journal holds one
+/// boundary — with the outcome the first generation recorded.
+fn assert_resumed_once(held: &ClosedKill, outcome: &str, asked: usize) {
+    let resumed = harness::resume(
+        &held.project,
+        FINALLY,
+        &held.killed.execution,
+        Some("json"),
+        &held.environment,
+    );
+    let report = resumed.outputs();
+    assert_eq!(
+        resumed.output.status.code(),
+        Some(if outcome == "completed" { 0 } else { 1 }),
+        "{report:#}\n{}",
+        resumed.stderr()
+    );
+    assert_eq!(report["status"], outcome, "{report:#}");
+    assert!(report.get("finally_error").is_none(), "{report:#}");
+    assert_eq!(nodes_of(&report["trace"]), ["work", "close"], "{report:#}");
+    let close = assert_finally_entry(&report["trace"], "close", "completed");
+    assert_eq!(nodes_of(&close["inner"]), ["ask", "mark", "settle"]);
+    assert_eq!(
+        ended_lines(&held.log),
+        [format!("{outcome}|")],
+        "the finally node's subprocess ran once across both generations"
+    );
+    assert_eq!(
+        held.provider.snapshot().requests,
+        asked,
+        "the resumed generation asked only what the first had not been answered"
+    );
+    let boundaries = finally_boundaries(&held.project, &held.killed.execution);
+    assert_eq!(boundaries.len(), 1, "{boundaries:?}");
+    assert_eq!(boundaries[0].0, "close/0#finally/0");
+    assert_eq!(
+        boundaries[0].1,
+        json!({ "node": "close", "outcome": outcome })
+    );
+    let row = lifecycle_row(&held.project, &held.killed.execution);
+    assert_eq!(row["status"], outcome, "{row}");
+    assert_eq!(row["finally_error"], Value::Null, "{row}");
+}
+
+/// The first window: the boundary is on the record and the finally node's
+/// effect is not. `ask`'s model call is held, so the subprocess has not run.
+fn a_finally_node_killed_before_its_effect_landed_runs_it_once(code: &str, outcome: &str) {
+    let Some(held) = closed_and_killed(
+        "finally-before-effect",
+        code,
+        vec![Script::new(
+            SONNET,
+            Outcome::structured(json!({ "note": "asked" })).after(Duration::from_secs(120)),
+        )],
+        |provider, project, _| {
+            provider.snapshot().requests >= 1
+                && harness::journal_holds(project, &["close/0#finally/0"])
+        },
+    ) else {
+        return;
+    };
+    assert_eq!(
+        harness::lines_in(&held.log),
+        0,
+        "the kill landed before the finally node's subprocess ran: {}",
+        held.killed.stderr
+    );
+    let boundary = finally_boundaries(&held.project, &held.killed.execution);
+    assert_eq!(
+        boundary.len(),
+        1,
+        "the boundary was journaled: {boundary:?}"
+    );
+    assert_eq!(boundary[0].2["kind"], "value", "{boundary:?}");
+    assert_eq!(boundary[0].2["value"]["outcome"], outcome, "{boundary:?}");
+    let row = lifecycle_row(&held.project, &held.killed.execution);
+    assert_eq!(row["status"], "open", "the row had not closed: {row}");
+
+    held.provider.reset();
+    held.provider.enqueue_all([
+        Script::new(SONNET, Outcome::structured(json!({ "note": "asked" }))),
+        Script::new(SONNET, Outcome::structured(json!({ "note": "settled" }))),
+    ]);
+    assert_resumed_once(&held, outcome, 2);
+}
+
+/// The second window: the finally node's subprocess has run and is on the
+/// record, and the execution's row has not closed. `settle`'s model call is
+/// held, so the finally node is still running.
+fn a_finally_node_killed_after_its_effect_landed_replays_it(code: &str, outcome: &str) {
+    let Some(held) = closed_and_killed(
+        "finally-after-effect",
+        code,
+        vec![
+            Script::new(SONNET, Outcome::structured(json!({ "note": "asked" }))),
+            Script::new(
+                SONNET,
+                Outcome::structured(json!({ "note": "settled" })).after(Duration::from_secs(120)),
+            ),
+        ],
+        |provider, project, log| {
+            provider.snapshot().requests >= 2
+                && harness::lines_in(log) == 1
+                && harness::journal_holds(project, &["close/0/mark/0#tool/0"])
+        },
+    ) else {
+        return;
+    };
+    assert_eq!(
+        harness::lines_in(&held.log),
+        1,
+        "the finally node's subprocess ran before the kill: {}",
+        held.killed.stderr
+    );
+    let row = lifecycle_row(&held.project, &held.killed.execution);
+    assert_eq!(row["status"], "open", "the row had not closed: {row}");
+
+    held.provider.reset();
+    held.provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "settled" })),
+    ));
+    assert_resumed_once(&held, outcome, 1);
+}
+
+/// **A completed run killed after its finally node's boundary was journaled
+/// and before its effect landed runs the finally node exactly once on resume**
+/// (grammar §7.9, `docs/durability.md` §3.5).
+///
+/// The first generation records the boundary — the end, `completed` — and is
+/// killed while the finally subflow's first model call is held, so its
+/// subprocess never ran. The resumed generation replays the body, reads the end
+/// off the record rather than deciding it again, and runs the finally node: two
+/// model calls and one subprocess run, which is the only one the log holds.
+#[test]
+fn a_completed_run_killed_before_its_finally_effect_landed_runs_it_once_on_resume() {
+    a_finally_node_killed_before_its_effect_landed_runs_it_once("0", "completed");
+}
+
+/// The same window in a run whose body **failed**: the boundary carries
+/// `failed`, the resumed generation reaches the same end, and the finally node
+/// runs once.
+#[test]
+fn a_failed_run_killed_before_its_finally_effect_landed_runs_it_once_on_resume() {
+    a_finally_node_killed_before_its_effect_landed_runs_it_once("1", "failed");
+}
+
+/// **A completed run killed after its finally node's effect landed and before
+/// the execution's row closed replays that effect on resume** (grammar §7.9,
+/// `docs/durability.md` §3.5).
+///
+/// The first generation's finally subflow ran its subprocess — on the record
+/// and in the log — and was killed in the model call after it, with the
+/// lifecycle row still open. The resumed generation replays the boundary, the
+/// first model call and the subprocess out of the record, asks only the held
+/// call again, and closes the row: the log still holds one line.
+#[test]
+fn a_completed_run_killed_after_its_finally_effect_landed_replays_it_on_resume() {
+    a_finally_node_killed_after_its_effect_landed_replays_it("0", "completed");
+}
+
+/// The same window in a run whose body **failed**.
+#[test]
+fn a_failed_run_killed_after_its_finally_effect_landed_replays_it_on_resume() {
+    a_finally_node_killed_after_its_effect_landed_replays_it("1", "failed");
+}
+
+/// The statements the surgery below makes about a journal, which are the shape
+/// of the file a build **before** the `finally:` boundary wrote
+/// (`docs/durability.md` §11.2).
+///
+/// The lifecycle row is rebuilt without its `finally_error` column, which is
+/// the one thing the boundary added to the physical schema — its record is an
+/// ordinary `effects` row of a new kind. The `INSERT … SELECT` names the
+/// column it drops, so a build that had never added it could not run this.
+const JOURNAL_BEFORE_THE_FINALLY_BOUNDARY: &str = "\
+CREATE TABLE before_finally (
+  id              TEXT PRIMARY KEY,
+  flow            TEXT NOT NULL,
+  trigger_kind    TEXT NOT NULL,
+  inputs          TEXT NOT NULL,
+  session_key     TEXT NOT NULL,
+  callback        TEXT,
+  traceparent     TEXT,
+  status          TEXT NOT NULL,
+  journal_version INTEGER NOT NULL,
+  started_at      TEXT NOT NULL,
+  ended_at        TEXT,
+  error           TEXT
+);
+INSERT INTO before_finally
+  SELECT id, flow, trigger_kind, inputs, session_key, callback, traceparent, status, journal_version, started_at, ended_at, error
+  FROM executions WHERE finally_error IS NULL;
+DROP TABLE executions;
+ALTER TABLE before_finally RENAME TO executions;
+";
+
+/// A journal written before the `finally:` boundary existed opens under this
+/// build, resumes the execution it holds, and records that execution's
+/// `finally_error` (`docs/durability.md` §11.2, PRD resolved q76).
+///
+/// §11.2 keeps `JOURNAL_VERSION` where it is because the column arrives by a
+/// probe: a journal without `finally_error` gains it on open, and one with it
+/// is left alone. Every other test creates its journal fresh under the current
+/// schema, so a probe that was missing — or that ran only on a fresh file —
+/// would leave them green and every deployed journal unable to close a row.
+///
+/// There is no older build in the tree to write the file, so the file is made:
+/// a real run of `flow.untidy`, killed while its body's model call is held —
+/// before the instance ended, so the journal holds no boundary — with the
+/// lifecycle row then rebuilt without the column. What is asserted is the
+/// claim's three halves: the resume opens it, the execution it holds replays
+/// to its end, and this build writes the failure of its finally node into the
+/// column it added.
+#[test]
+fn a_journal_written_before_the_finally_boundary_opens_and_records_one_under_this_build() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "the work is done" })).after(Duration::from_secs(120)),
+    ));
+    let (_shims, log, environment) = finally_environment(&provider, "finally-old-journal");
+    let Some((project, built)) = harness::build_under_toolchain(FINALLY, "finally-old-journal")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the finally fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let killed = harness::crash_run(
+        &project,
+        &["run", "flow.untidy", "--input", "topic=the cleanup"],
+        &environment,
+        |said| {
+            provider.snapshot().requests >= 1
+                && said.iter().any(|line| line.starts_with("execution: "))
+        },
+    );
+    assert!(
+        finally_boundaries(&project, &killed.execution).is_empty(),
+        "the instance had not ended, so nothing of the boundary is on the record"
+    );
+
+    let surgery = harness::journal_sql(&project, JOURNAL_BEFORE_THE_FINALLY_BOUNDARY);
+    assert!(
+        surgery.status.success(),
+        "{}",
+        String::from_utf8_lossy(&surgery.stderr)
+    );
+    let columns =
+        harness::journal_rows(&project, "SELECT name FROM pragma_table_info('executions')");
+    assert!(
+        !columns.to_string().contains("finally_error"),
+        "the surgery took the column away: {columns}"
+    );
+
+    provider.reset();
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "the work is done" })),
+    ));
+    let resumed = harness::resume(&project, FINALLY, &killed.execution, None, &environment);
+    resumed.succeeded();
+    assert_eq!(resumed.outputs(), json!({ "note": "the work is done" }));
+    let stderr = resumed.stderr();
+    let said: Vec<&str> = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("finally_error: "))
+        .collect();
+    assert_eq!(said.len(), 1, "{stderr}");
+    assert_eq!(
+        ended_lines(&log).len(),
+        3,
+        "the finally node ran its ladder out"
+    );
+    assert_eq!(
+        lifecycle_row(&project, &killed.execution),
+        json!({ "status": "completed", "error": null, "finally_error": said[0] }),
+        "the column this build added holds what the finally node raised"
+    );
+    let boundaries = finally_boundaries(&project, &killed.execution);
+    assert_eq!(boundaries.len(), 1, "{boundaries:?}");
+    assert_eq!(boundaries[0].0, "record/0#finally/0");
 }

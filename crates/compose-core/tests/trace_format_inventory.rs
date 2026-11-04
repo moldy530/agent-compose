@@ -825,9 +825,12 @@ fn every_store_op_is_documented() {
 
 /// The field names this format writes free text under.
 ///
-/// Five spellings and no more. Two carry a **diagnostic**: `error` on the three
-/// records that carry a failure, and `detail` on the one that carries what a
-/// provider answered. Three carry the **program a model wrote** — `command`,
+/// Six spellings and no more. Three carry a **diagnostic**: `error` on the
+/// records that carry a failure, `finally_error` on the envelope that carries
+/// what a `finally:` node raised after its retries (PRD resolved q76) — the
+/// same activity text under a second name, beside a `status` it did not change
+/// — and `detail` on the one that carries what a provider answered. Three carry
+/// the **program a model wrote** — `command`,
 /// `path` and `change` on the built-in record §7.4 specifies — which is the
 /// carve-out PRD resolved q54 ruling c makes to §11's rule that a tool's
 /// arguments stay out. Every other field of the format is a name, a number, a
@@ -835,11 +838,18 @@ fn every_store_op_is_documented() {
 ///
 /// So a field with one of these names is a message, and a message is the one
 /// thing in a trace that can hold bytes this process did not compose — bytes an
-/// *answering system* wrote, for the first two, and bytes the **model** wrote,
+/// *answering system* wrote, for the first three, and bytes the **model** wrote,
 /// for the last three, which is the more adversarial of the two origins and the
 /// reason the built-in fields are named here rather than trusted for being
 /// short.
-const MESSAGE_FIELDS: &[&str] = &["error", "detail", "command", "path", "change"];
+const MESSAGE_FIELDS: &[&str] = &[
+    "error",
+    "finally_error",
+    "detail",
+    "command",
+    "path",
+    "change",
+];
 
 /// Every message field is classified in the section that warns about untrusted
 /// text.
