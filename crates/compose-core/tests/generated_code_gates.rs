@@ -375,6 +375,17 @@
 //!     nothing staged over the shared install the drivers must read the real
 //!     packages — whose `exports` maps publish no `./package.json` — as exactly
 //!     the pins.
+//! 30. **The end an instance cannot reach yet** — `runtime.endInstance` handed
+//!     a `cancelled` ending for a golden's real `finally:` node, out of
+//!     `instance-ending.mjs`. Grammar §7.9's `execution.outcome` is the enum of
+//!     three values, and PRD resolved q75's cancel route — the one caller that
+//!     would end an instance `cancelled` — is not built, so no run the
+//!     acceptance suite can start reaches the third. The seam carries it anyway
+//!     (Decision D159), and this gate is what keeps that true until q75 lands:
+//!     the node reads `cancelled`, its entry is the instance's last with no
+//!     routing, the boundary is on the record under the outcome, a replay of the
+//!     same end reads the record and a replay of another end diverges, and a
+//!     finally node that fails after a cancellation is `finally_error`.
 //!
 //! # The toolchain fixture
 //!
@@ -10376,4 +10387,102 @@ fn a_contract_refusing_a_live_answer_marks_the_record_before_the_retry_writes_it
         "the attempt that met the failed mark wrote its record anyway, or the one after it did \
          not write at all: {observed:#}"
     );
+}
+
+/// Gate 30: **a `cancelled` end, driven straight into the end-of-instance
+/// seam** — `runtime.endInstance` over the `every-schema-form` golden's
+/// `flow.condense` node `note`, out of `instance-ending.mjs`.
+///
+/// This is a unit test of the seam and says so, because nothing else can test
+/// this arm: PRD resolved q75's cancel route is not built, so **no CLI or
+/// `serve` route ends an instance `cancelled` until it is**, and every
+/// acceptance test of a `finally:` node (`tests/compiled_graph_acceptance.rs`)
+/// reaches the seam through a run that completed or failed. Grammar §7.9 makes
+/// `execution.outcome` the enum of three values all the same, and Decision D159
+/// has the boundary record and the seam carry the third, so that q75 adds a
+/// caller rather than a code path. Driving the seam directly with the value is
+/// what holds that sentence to the code:
+///
+///   * the node's own input binding reads `cancelled` out of its `execution`
+///     root, with no `execution.error`;
+///   * its entry is the instance's last — one step past the body's, traversal
+///     `0`, no `routing` — and a node that completed leaves no `finally_error`;
+///   * the boundary is on the record at `note/0#finally/0`, claimed under
+///     `{node, outcome}` and holding the outcome;
+///   * a resuming generation that reaches the same end is handed the record,
+///     and one that reaches **another** end diverges at the boundary without
+///     running the node (PRD resolved q29);
+///   * a finally node that fails after a cancellation fails on its own entry
+///     and as the execution's `finally_error`, under a boundary that still says
+///     `cancelled`.
+#[test]
+fn the_end_of_instance_seam_carries_a_cancellation_no_route_reaches_yet() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(
+        goldens::golden("every-schema-form"),
+        root,
+        "instance-ending",
+    );
+    let output = runner("instance-ending.mjs")
+        .arg(&project)
+        .output()
+        .expect("bun runs");
+    assert!(
+        output.status.success(),
+        "the end-of-instance runner did not run:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let observed: Value =
+        serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
+    for (case, broken) in [
+        (
+            "the_golden_names_its_finally_node",
+            "`flow.condense`'s compiled flow carries no `finally` descriptor named `note`, so the \
+             runner drove nothing",
+        ),
+        (
+            "the_node_read_cancelled",
+            "the finally node's input binding did not read `cancelled` out of `execution.outcome`, \
+             or read an `execution.error` a cancellation does not carry",
+        ),
+        (
+            "its_entry_is_the_instances_last",
+            "the finally entry is not the instance's last — step one past the body's, traversal \
+             `0`, no `routing` (`docs/trace.md` §3.5)",
+        ),
+        (
+            "the_boundary_records_the_cancellation",
+            "the boundary at `note/0#finally/0` is not a `finally` record claimed under `{node, \
+             outcome}` holding `cancelled` (`docs/durability.md` §3.5)",
+        ),
+        (
+            "a_cancelled_end_whose_node_completed_has_no_finally_error",
+            "a finally node that completed left a `finally_error` on its execution",
+        ),
+        (
+            "a_replayed_cancellation_reads_the_record",
+            "a resuming generation that reached the recorded end did not run the node off the \
+             record",
+        ),
+        (
+            "another_end_over_a_recorded_cancellation_diverges",
+            "a resuming generation whose body ended differently from the record ran the finally \
+             node a second time under another story instead of diverging at the boundary (PRD \
+             resolved q29)",
+        ),
+        (
+            "a_failed_finally_node_after_a_cancellation_is_recorded",
+            "a finally node that failed after a cancellation is not a failed entry with its \
+             `error` and the execution's `finally_error` (grammar §7.9)",
+        ),
+        (
+            "the_failed_nodes_boundary_still_says_cancelled",
+            "the boundary under a failed finally node no longer holds the outcome the instance \
+             ended on",
+        ),
+    ] {
+        assert_eq!(observed[case], json!(true), "{broken}: {observed:#}");
+    }
 }

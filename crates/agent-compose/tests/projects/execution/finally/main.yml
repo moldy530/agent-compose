@@ -1,0 +1,356 @@
+# Acceptance fixture: a flow's `finally:` node — the node an instance runs once
+# when it ends, whatever its outcome (grammar §7.9, Decision D159, PRD resolved
+# q76, `docs/trace.md` §3.5, `docs/durability.md` §3.5).
+#
+# Each flow is one claim the construct makes, and every finally node here
+# leaves a mark a test can count: a line `${TALLY_BIN}/ended` appends to
+# `$TALLY_LOG` — what the node read as `execution.outcome` and
+# `execution.error` — or an item appended to `store.ended`, whose array is the
+# order the finally nodes of nested instances ran in.
+#
+#   * `flow.ended` — a subprocess that exits with the code it is given, so one
+#     flow ends `completed` or `failed` on its input alone, and its finally node
+#     records which.
+#   * `flow.skipped` and `flow.retired` — a body node that fails under
+#     `on_error: skip` and under `on_error: { fallback: end }`. Both absorb the
+#     failure, so both instances completed (D97), and the finally node says so
+#     with no `execution.error` to read.
+#   * `flow.nested` — a `flow:` node whose subflow has a finally node of its
+#     own: the inner instance ends first, so its finally node runs first, and
+#     the store's array is `["inner", "outer"]`.
+#   * `flow.each` — a joined `map` into `flow.item`: every dispatched instance
+#     runs its own finally node, and the map's flow runs its own after all of
+#     them.
+#   * `flow.released` — the same `map`, **detached**: each dispatch starts a
+#     child execution (Decision D150), which runs its own finally node under its
+#     own id when it ends.
+#   * `flow.closed` — a finally node that is a `flow:` node, whose subflow makes
+#     a model call, a counted subprocess run and another model call. A held
+#     model call on either side of the subprocess is where a test kills the
+#     process: before the finally node's effect landed, and after it landed but
+#     before the execution's row closed.
+#   * `flow.untidy` — a finally node that fails on every attempt of its
+#     `retry:`: the execution's outcome, outputs and exit code are its body's,
+#     and the failure is `finally_error` on the row and the envelope.
+version: "0.1"
+
+defaults:
+  timeout: 60s
+
+state:
+  note:
+    description: What the agent node of the body answered.
+    type: string
+    default: nothing yet
+  worked:
+    description: What the body's subprocess printed.
+    type: string
+    default: nothing yet
+
+provider.mock:
+  kind: anthropic
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+
+model.smart:
+  provider: provider.mock
+  id: claude-sonnet-4-6
+  settings:
+    max_tokens: 4096
+
+# `scope: global`, so the array outlives the run and a test reads it out of the
+# store's own file once the run has ended.
+store.ended:
+  kind: kv
+  scope: global
+  description: Which instances ended, in the order their finally nodes ran.
+  value_schema:
+    order:
+      type: array
+      max_items: 16
+      items: { type: string }
+
+agent.noter:
+  description: Writes one short note about a topic.
+  model: model.smart
+  prompt: |
+    Write one short note about the topic you are given.
+  input:
+    topic:
+      description: What to write a note about.
+      type: string
+  output:
+    note:
+      description: The note.
+      type: string
+
+flow.ended:
+  description: A subprocess that exits with the code it is given, and a record of how the run ended.
+  inputs:
+    code:
+      type: integer
+  outputs:
+    worked:
+      type: string
+  nodes:
+    work:
+      exec:
+        command: "${OPS_BIN}/sh"
+        args: ["-c", "printf done; exit $CODE"]
+        output:
+          stdout: { type: string }
+      input:
+        code: "input.code"
+      writes:
+        stdout: worked
+    record:
+      exec:
+        command: "${TALLY_BIN}/ended"
+      input:
+        outcome: "execution.outcome"
+        error: "has(execution.error) ? execution.error : 'none'"
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: record
+
+flow.skipped:
+  description: A body node whose failure `skip` absorbs.
+  outputs: {}
+  nodes:
+    work:
+      exec:
+        command: "${OPS_BIN}/false"
+      on_error: skip
+    record:
+      exec:
+        command: "${TALLY_BIN}/ended"
+      input:
+        outcome: "execution.outcome"
+        error: "has(execution.error) ? execution.error : 'none'"
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: record
+
+flow.retired:
+  description: A body node whose failure retires its branch through a fallback to `end`.
+  outputs: {}
+  nodes:
+    work:
+      exec:
+        command: "${OPS_BIN}/false"
+      on_error: { fallback: end }
+    record:
+      exec:
+        command: "${TALLY_BIN}/ended"
+      input:
+        outcome: "execution.outcome"
+        error: "has(execution.error) ? execution.error : 'none'"
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: record
+
+flow.nested:
+  description: A subflow with a finally node of its own, under a flow with one.
+  outputs: {}
+  nodes:
+    step:
+      flow: flow.inner
+    outer_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "'outer'"
+  edges:
+    - { from: start, to: step }
+    - { from: step, to: end }
+  finally: outer_end
+
+flow.inner:
+  description: The nested instance, which ends before the one that instantiated it.
+  outputs: {}
+  nodes:
+    inner_work:
+      exec:
+        command: "${OPS_BIN}/true"
+    inner_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "'inner'"
+  edges:
+    - { from: start, to: inner_work }
+    - { from: inner_work, to: end }
+  finally: inner_end
+
+flow.each:
+  description: A joined fan-out whose every instance has a finally node.
+  inputs:
+    names:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs: {}
+  nodes:
+    fan:
+      map:
+        over: input.names
+        as: name
+        node: flow.item
+        max_concurrency: 1
+        input:
+          name: "name"
+    all_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "'all'"
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: end }
+  finally: all_end
+
+flow.released:
+  description: The same fan-out, detached, so every instance is a child execution.
+  inputs:
+    names:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs: {}
+  nodes:
+    fan:
+      map:
+        over: input.names
+        as: name
+        node: flow.item
+        max_concurrency: 1
+        detach: true
+        input:
+          name: "name"
+    all_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "'all'"
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: end }
+  finally: all_end
+
+flow.item:
+  description: One dispatched instance, which records its own end.
+  inputs:
+    name:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    item_work:
+      exec:
+        command: "${OPS_BIN}/true"
+    item_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "input.name"
+  edges:
+    - { from: start, to: item_work }
+    - { from: item_work, to: end }
+  finally: item_end
+
+flow.closed:
+  description: A body that ends on its input, and a finally node with a model call either side of a counted subprocess.
+  inputs:
+    code:
+      type: integer
+  outputs: {}
+  nodes:
+    work:
+      exec:
+        command: "${OPS_BIN}/sh"
+        args: ["-c", "exit $CODE"]
+      input:
+        code: "input.code"
+    close:
+      flow: flow.closing
+      input:
+        outcome: "execution.outcome"
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: close
+
+flow.closing:
+  description: What `flow.closed` does once it has ended.
+  inputs:
+    outcome:
+      type: string
+  outputs: {}
+  nodes:
+    ask:
+      agent: agent.noter
+      input:
+        topic: "input.outcome"
+    mark:
+      exec:
+        command: "${TALLY_BIN}/ended"
+      input:
+        outcome: "input.outcome"
+    settle:
+      agent: agent.noter
+      input:
+        topic: "input.outcome"
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: mark }
+    - { from: mark, to: settle }
+    - { from: settle, to: end }
+
+flow.untidy:
+  description: A body that answers, and a finally node that fails on every attempt.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+  outputs:
+    note:
+      type: string
+  nodes:
+    work:
+      agent: agent.noter
+      input:
+        topic: "input.topic"
+      writes:
+        note: note
+    record:
+      exec:
+        command: "${TALLY_BIN}/ended"
+        args: ["--fail"]
+      input:
+        outcome: "execution.outcome"
+      retry: { max: 2, backoff: 10ms }
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: record
+
+triggers:
+  cli: { type: manual, flow: flow.ended }
+  # The status route's half of `flow.untidy`: an execution `serve` started, whose
+  # report carries the `finally_error` beside the outcome it did not change.
+  on_untidy:
+    type: http
+    flow: flow.untidy
+    path: /untidy
+    method: POST
+    input:
+      topic: "payload.body.topic"
+    respond: async

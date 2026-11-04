@@ -490,6 +490,18 @@ const CODEGEN: &[Criterion] = &[
                 "an_inline_nodes_parameters_reach_the_process_and_the_wire",
                 Status::Live,
             ),
+            // PRD resolved q76: a flow's `finally:` node is a node fn the graph
+            // never routes to — run once when the instance ends, on every
+            // outcome, reading how it ended (grammar 7.9) — and its failure
+            // after its own retries changes nothing the run produced.
+            (
+                "a_finally_node_runs_once_on_every_outcome_and_reads_how_its_instance_ended",
+                Status::Live,
+            ),
+            (
+                "a_finally_node_that_fails_after_its_retries_changes_no_outcome",
+                Status::Live,
+            ),
         ],
     },
     Criterion {
@@ -774,6 +786,22 @@ const CODEGEN: &[Criterion] = &[
             ),
             (
                 "a_node_deadline_that_abandons_a_tool_call_records_neither_half_of_it",
+                Status::Live,
+            ),
+            // …and the end of every instance a subgraph is: a nested instance's
+            // `finally:` node runs before its caller's, every dispatched
+            // instance runs its own, and a detached child execution runs its
+            // own under its own id (grammar 7.9, PRD resolved q76).
+            (
+                "a_nested_instances_finally_node_runs_before_the_one_that_instantiated_it",
+                Status::Live,
+            ),
+            (
+                "every_dispatched_instance_runs_its_own_finally_node",
+                Status::Live,
+            ),
+            (
+                "a_detached_child_execution_runs_its_own_finally_node",
                 Status::Live,
             ),
         ],
@@ -1238,6 +1266,13 @@ const COMMANDS: &[Criterion] = &[
                 "an_agent_nodes_budget_does_not_run_while_a_pause_below_its_tool_call_is_open",
                 Status::Live,
             ),
+            // …and the status route's report of an execution whose `finally:`
+            // node failed: `finally_error` beside the outcome and outputs it did
+            // not change (`docs/trace.md` §1.3, PRD resolved q76).
+            (
+                "a_served_executions_status_reports_its_finally_error",
+                Status::Live,
+            ),
         ],
     },
     // The committed half of this criterion — "goldens are reviewed in PRs like
@@ -1442,6 +1477,13 @@ const DURABILITY: &[Criterion] = &[
             // first generation's did and applies none of it again.
             (
                 "a_resumed_run_answers_a_batch_out_of_the_record_and_applies_none_of_it_again",
+                Status::Live,
+            ),
+            // …and PRD resolved q76's boundary is a compatible change to that
+            // record: a journal written before the lifecycle row could carry a
+            // `finally_error` opens, resumes, and takes one.
+            (
+                "a_journal_written_before_the_finally_boundary_opens_and_records_one_under_this_build",
                 Status::Live,
             ),
         ],
@@ -1671,6 +1713,28 @@ const DURABILITY: &[Criterion] = &[
             // driver's lock directory behind, and nothing else removes it.
             (
                 "a_lock_a_killed_writer_left_behind_does_not_seal_the_journal",
+                Status::Live,
+            ),
+            // …and the end of an instance survives one too (grammar 7.9, PRD
+            // resolved q76): killed after its `finally:` node's boundary was
+            // journaled and before the node's effect landed, a resume runs the
+            // node once; killed after the effect landed and before the row
+            // closed, a resume replays it — on a completed run and a failed one
+            // alike.
+            (
+                "a_completed_run_killed_before_its_finally_effect_landed_runs_it_once_on_resume",
+                Status::Live,
+            ),
+            (
+                "a_failed_run_killed_before_its_finally_effect_landed_runs_it_once_on_resume",
+                Status::Live,
+            ),
+            (
+                "a_completed_run_killed_after_its_finally_effect_landed_replays_it_on_resume",
+                Status::Live,
+            ),
+            (
+                "a_failed_run_killed_after_its_finally_effect_landed_replays_it_on_resume",
                 Status::Live,
             ),
         ],
