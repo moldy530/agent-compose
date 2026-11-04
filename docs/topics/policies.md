@@ -145,7 +145,7 @@ a strategy `defaults:` or a `policy:` would deliver is not applied to it.
 
 That is because its failure has exactly one meaning. Once its retries are spent,
 the error is recorded as `finally_error` on the execution's record — the journal
-row and the trace envelope, and one line on `agent-compose run`'s stderr — and
+row and the trace envelope, and one line on `run`'s stderr — and
 the instance ends with the outcome it already had: a run that completed stays
 completed, with its outputs and exit code `0`; a run that failed stays failed
 for its own reason.
