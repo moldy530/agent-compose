@@ -998,7 +998,7 @@ holding what a worker is handed and how the wait ended:
 | `inputs`, `itemIndex`, `history`, `policy` | the dispatch payload: what the node's input phase built, plus the three facts about the node execution the hub holds that a worker cannot derive. On the row rather than in memory, so a hub restarted mid-dispatch hands over what its predecessor would have |
 | `status` | `parked`, `dispatched`, `settled` or `superseded` — the vocabulary below |
 | `session`, `parkedAt`, `dispatchedAt`, `settledAt`, `detail` | which worker session is holding it while one is, and the three instants of the wait, for the reason §3.4 keeps all three of a human wait's |
-| `outcome` | what the worker answered, once one did: a value or a failure, in the shape §3.1's outcomes take — or, on a dispatch a **pause** ended, the wait itself (`docs/distributed.md` §3.4) |
+| `outcome` | what the worker answered, once one did: a value or a failure, in the shape §3.1's outcomes take — or, on a dispatch a **pause** ended, the wait itself (`docs/distributed.md` §3.4). Any of the three may carry `finallyError` beside it: what a `finally:` node that ran inside the placed node raised, which a resumed generation reading the row holds as the execution's own `finallyError` (§3.5), exactly as the live one did when the result came home |
 
 **What `status` means** is the same kind of statement §3.6 makes about an
 execution, and the four are not interchangeable:
@@ -2051,10 +2051,14 @@ table_info` on SQLite, `pg_attribute` on Postgres (the probe, because `ALTER TAB
 `information_schema` on MySQL (which has no `IF NOT EXISTS` for a column) — each
 under the writer guard, so one opener adds it. Nullable for every column's reason:
 no row written before it held a finally failure. Executed:
-`a_journal_written_before_the_finally_boundary_opens_and_serves_under_this_build`
-strips the column and every `finally` record from a real journal and restarts
-`serve` over it, and `journal_backend_conformance` carries the column's
-migration and the new record kind on all three arms.
+`a_journal_written_before_the_finally_boundary_opens_and_records_one_under_this_build`
+kills a real `run` while its body's model call is held — before the instance
+ended, so the journal holds no `finally` record at all — rebuilds the lifecycle
+table without the column, and `resume`s the execution over it: the probe grows
+the column back, the resumed generation records the boundary live and runs the
+finally node, and the failure that node raises lands in the column this build
+added. `journal_backend_conformance` carries the column's migration and the new
+record kind on all three arms.
 
 ### 11.3 What requires a version bump
 

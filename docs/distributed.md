@@ -610,12 +610,22 @@ key**: a record the journal already holds is accepted and dropped. A batch is
 therefore safe to re-send after a transport failure, and a worker SHOULD re-send
 rather than guess.
 
+A record's `kind` is one of five: `model`, `tool`, `store` and `human` — the
+calls a placed node makes — and `finally`, the **boundary** a flow instance
+crosses when it ends and its `finally:` node begins (grammar §7.9,
+`docs/durability.md` §3.10). The fifth reaches this route because an instance can
+end on a worker: everything a placed agent's attached `flow.*` reaches runs in
+the agent's placement (grammar §14.1 rule 4), so an instance of that flow ends
+there, and its boundary is journaled from there under the key the hub would have
+derived — `<finally node's site>#finally/<ordinal>` — exactly as the finally
+node's own effects are. A record of any other kind is the `400` row below.
+
 | condition | status | body |
 |---|---|---|
 | the batch is journaled | `204` | empty. Every record in it was inserted or was already held |
 | the token does not verify | `401` | no detail, as everywhere (§3.1) |
 | the session is unknown | `410` | names the rule of §3: join again, and send this batch again under the new session |
-| the body is not a batch — a missing `dispatch_id`, a missing `effects` array, or a record short of a field, naming a `site` outside the dispatch's, or carrying a `key` its own `site`, `kind` and `ordinal` do not derive | `400` | names what a batch and a record carry |
+| the body is not a batch — a missing `dispatch_id`, a missing `effects` array, or a record short of a field, of a `kind` outside the five above, naming a `site` outside the dispatch's, or carrying a `key` its own `site`, `kind` and `ordinal` do not derive | `400` | names what a batch and a record carry |
 | the `dispatch_id` names no dispatch this hub holds | `409` | names the dispatch. The batch is discarded, as at §3.4 |
 
 The last two rows are not about the batch's *contents* the way the first three
@@ -879,6 +889,30 @@ redispatch is what replays past it.
 This is a change an older peer would misread — a `1` peer sees a result with no
 `output` and reads it as a node that answered nothing — so `PROTOCOL_VERSION` is
 **2** (§10).
+
+#### `finally_error`: what a finally node raised on the worker
+
+A result MAY carry `finally_error`, a string, beside whichever of `output`,
+`error` and `paused` it carries — present exactly when a `finally:` node that ran
+**inside** the dispatched node failed after its own retries (grammar §7.9, PRD
+resolved q76). The case is a placed agent whose attached `flow.*` declares one:
+the flow's instances run in the agent's placement (grammar §14.1 rule 4), so each
+ends on the worker and runs its finally node there, and what that node raised is
+`finally_error` on the **execution's** record — the lifecycle row and the trace
+envelope — which only the hub writes (§3.3). The worker sends the first such
+failure its process saw, in the words a local run records it in; the hub holds it
+as the execution's own, under the same rule — the first one stands — and the row
+and the envelope carry it as they would had the node run on the hub. It changes
+no outcome: a node that answered still answered, and its failure entry still
+lives in the trace the dispatch's `tool_dispatches` carry.
+
+It is kept on the **settled outcome** as well as in the hub's memory, on all
+three endings (`docs/durability.md` §3.8), so a hub restarted before the
+execution settles reads it back off the row it replays rather than losing it with
+the process that was told. A value that is not a string is not a failure to
+report, and is dropped rather than costing the node its attempt. A peer that
+does not send it is one whose finally nodes did not fail — an OPTIONAL field a
+peer of the previous version ignores, which §10.2 makes no bump.
 
 #### The two verbs
 

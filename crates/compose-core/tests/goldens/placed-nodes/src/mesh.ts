@@ -78,6 +78,7 @@ import {
 } from "./journal.ts";
 import {
   handsOutPlacedNodes,
+  holdFinallyError,
   holdRemotePause,
   registerParkedWork,
   registersHumanNode,
@@ -306,6 +307,14 @@ export interface PlacedAnswer {
    * changing what a run *reports* (§4.3, PRD 5.6).
    */
   readonly stores?: readonly runtime.StoreRecord[];
+  /**
+   * What a `finally:` node that ran inside the placed node raised after its own
+   * retries, where one did — a flow-as-tool instance's, run on the worker
+   * (grammar 7.9, 14.1 rule 4) — §3.4's `finally_error`. The hub holds it as
+   * the execution's own ([`finallyOf`]), so the lifecycle row and the envelope
+   * carry it as they would had the node run here.
+   */
+  readonly finallyError?: string;
 }
 
 /**
@@ -589,6 +598,7 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
     // redone, which is `docs/durability.md` §5's replay discipline reaching the
     // one effect this module owns.
     if (row.status === "settled") {
+      if (row.outcome !== undefined) finallyOf(options.execution, row.outcome);
       const ending = endingOf(row);
       if (ending.kind === "answer") return absorb(options, ending.answer);
       // **A pause a dead hub was holding**, re-derived rather than remembered
@@ -654,6 +664,7 @@ function awaited(
       taken: row.status === "dispatched",
       settle: (outcome) => {
         finish();
+        finallyOf(options.execution, outcome);
         if (outcome.kind === "error") reject(replayedFailure(outcome));
         else resolve(endingIn(outcome.value));
       },
@@ -811,6 +822,25 @@ function absorb(options: DispatchOptions, answer: PlacedAnswer): PlacedAnswer {
 /** Why a dispatch a replaced process was holding is over. See [`supersedeOrphans`]. */
 const ORPHANED =
   "the hub process holding this dispatch was replaced, so the session it was issued to ended (docs/distributed.md §5)";
+
+/**
+ * Hold what a settled dispatch says a `finally:` node raised on the worker as
+ * this execution's own `finally_error` (§3.4, grammar 7.9) — on all three
+ * endings, since a finally node that failed did so whatever the node then did.
+ *
+ * Read wherever an outcome is consumed, live or replayed off a settled row, so
+ * a hub restarted before the execution settles learns it again from the row
+ * rather than losing it with the process that was told.
+ */
+function finallyOf(execution: string, outcome: JournalOutcome): void {
+  const held =
+    outcome.kind === "error"
+      ? outcome.finallyError
+      : outcome.value !== null && typeof outcome.value === "object"
+        ? (outcome.value as Record<string, unknown>)["finallyError"]
+        : undefined;
+  if (typeof held === "string") holdFinallyError(execution, held);
+}
 
 /** How a settled row ended: with the node's answer, or with a pause. */
 function endingOf(row: DispatchRow): Ending {
@@ -1790,7 +1820,15 @@ function recordOf(row: DispatchRow, entry: unknown): JournalRecord | undefined {
   if (typeof key !== "string" || typeof site !== "string" || typeof request !== "string") {
     return undefined;
   }
-  if (typeof kind !== "string" || !["model", "tool", "store", "human"].includes(kind)) {
+  // `finally` beside the four calls: the boundary a flow instance crosses when
+  // it ends (grammar 7.9, `docs/durability.md` §3.10), which a placed agent's
+  // attached `flow.*` reaches on the worker exactly as it would here — the
+  // instance runs in the agent's placement (grammar 14.1 rule 4), so its end is
+  // journaled from there.
+  if (
+    typeof kind !== "string" ||
+    !["model", "tool", "store", "human", "finally"].includes(kind)
+  ) {
     return undefined;
   }
   if (typeof ordinal !== "number" || !Number.isInteger(ordinal)) return undefined;
@@ -1957,6 +1995,29 @@ async function result(request: FastifyRequest, reply: FastifyReply): Promise<unk
  * so it decides neither and costs the attempt.
  */
 async function settlementOf(
+  journal: Journal,
+  row: DispatchRow,
+  body: Record<string, unknown>,
+): Promise<JournalOutcome> {
+  const outcome = await endingSettled(journal, row, body);
+  // §3.4's `finally_error`, beside whichever ending the body carried: a finally
+  // node that ran inside the placed node — a flow-as-tool instance's — and
+  // failed after its retries. Kept on the settled outcome rather than only in
+  // this process, so the row is where a restarted hub reads it back
+  // (`docs/durability.md` §3.8). A value that is not a string is no failure to
+  // report, and is dropped rather than costing the node its attempt.
+  const finallyError = body["finally_error"];
+  if (typeof finallyError !== "string") return outcome;
+  return outcome.kind === "error"
+    ? { ...outcome, finallyError }
+    : {
+        kind: "value",
+        value: { ...(outcome.value as Record<string, unknown>), finallyError },
+      };
+}
+
+/** The ending a result body carries, before §3.4's `finally_error` is added to it. */
+async function endingSettled(
   journal: Journal,
   row: DispatchRow,
   body: Record<string, unknown>,

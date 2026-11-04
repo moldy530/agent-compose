@@ -80,6 +80,20 @@ export const agentStamperOutput = z.object({
 }).strict();
 export type AgentStamperOutput = z.infer<typeof agentStamperOutput>;
 
+/** `agent.tidier` — its declared input (grammar 5.3). */
+export const agentTidierInput = z.object({
+  path: z.string(),
+}).strict();
+export type AgentTidierInput = z.infer<typeof agentTidierInput>;
+
+/**
+ * `agent.tidier` — the structured output the model is constrained to, and what routing reads (PRD 5.2, 5.3).
+ */
+export const agentTidierOutput = z.object({
+  signature: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type AgentTidierOutput = z.infer<typeof agentTidierOutput>;
+
 /** `flow.abandoned` — the module's parameters (grammar 7.5). */
 export const flowAbandonedInputs = z.object({
   path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
@@ -310,6 +324,50 @@ export const flowStampedOutputs = z.object({
   signature: z.string(),
 }).strict();
 export type FlowStampedOutputs = z.infer<typeof flowStampedOutputs>;
+
+/** `flow.tidied` — the module's parameters (grammar 7.5). */
+export const flowTidiedInputs = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type FlowTidiedInputs = z.infer<typeof flowTidiedInputs>;
+
+/**
+ * `flow.tidied` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowTidiedOutputs = z.object({
+  signature: z.string(),
+}).strict();
+export type FlowTidiedOutputs = z.infer<typeof flowTidiedOutputs>;
+
+/** `flow.tidying` — the module's parameters (grammar 7.5). */
+export const flowTidyingInputs = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type FlowTidyingInputs = z.infer<typeof flowTidyingInputs>;
+
+/**
+ * `flow.tidying` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowTidyingOutputs = z.object({}).strict();
+export type FlowTidyingOutputs = z.infer<typeof flowTidyingOutputs>;
+
+/**
+ * `flow.tidying` node `look` — what the subprocess produces (grammar 8.2), which it does not declare, so this is the kind default.
+ */
+export const flowTidyingNodeLookOutput = z.object({
+  exit_code: z.number().int(),
+  stdout: z.string(),
+}).strict();
+export type FlowTidyingNodeLookOutput = z.infer<typeof flowTidyingNodeLookOutput>;
+
+/**
+ * `flow.tidying` node `tidy_up` — what the subprocess produces (grammar 8.2), which it does not declare, so this is the kind default.
+ */
+export const flowTidyingNodeTidyUpOutput = z.object({
+  exit_code: z.number().int(),
+  stdout: z.string(),
+}).strict();
+export type FlowTidyingNodeTidyUpOutput = z.infer<typeof flowTidyingNodeTidyUpOutput>;
 
 /** `flow.watched` — the module's parameters (grammar 7.5). */
 export const flowWatchedInputs = z.object({

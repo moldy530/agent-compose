@@ -246,8 +246,10 @@ it is on no branch.
 every `flow:` node's, `map` dispatch's and flow-as-tool call's instance run
 their own flow's finally node when they end, so a subflow's finally node runs
 before the node that instantiated it settles, and the caller's runs at the
-caller's end. A detached `flow.*` dispatch is a child execution, and runs its
-own. A body that ended through `on_error: skip` or a `fallback:` to `end`
+caller's end. That includes a `flow:` node or a `map` whose own `timeout:` ran
+out: the deadline stops the instance, and the node fails only once the
+instance's finally node has run. A detached `flow.*` dispatch is a child
+execution, and runs its own. A body that ended through `on_error: skip` or a `fallback:` to `end`
 **completed**, and its finally node reads `completed`.
 
 **A pause is not an end.** A run that parks at a `human` node runs no finally

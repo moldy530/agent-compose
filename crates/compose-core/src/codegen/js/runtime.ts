@@ -1141,6 +1141,22 @@ export function backoffFor(policy: RetryPolicy, attempt: number): number {
  * supersteps — leaving one abandoned activity inside it, exactly as above,
  * rather than every node the instance had left to run.
  *
+ * # An instance ends before its node does
+ *
+ * Stopping an instance is not the same as it having ended. Once LangGraph has
+ * stopped scheduling it, the instance still has its end to reach — its
+ * `finally:` node, which grammar 7.9 runs once on every outcome, a deadline's
+ * included — and "the node that instantiated it settles after it has" (PRD
+ * resolved q76) is a statement about **this** way out as much as any other. So
+ * when the deadline wins the race the node does not settle at once: it waits
+ * until every instance at or under its own site has ended ([`instancesEnded`]),
+ * and only then fails with the [`NodeTimeout`]. The wait is the instances'
+ * finally nodes and nothing else — the instance's own supersteps stop when the
+ * signal aborts, and an instance a node had not yet begun is never begun
+ * ([`runSubflow`]) — so it is bounded by those nodes' own grammar 9.3 budgets.
+ * The same wait runs between two attempts, so one attempt's finally node never
+ * runs beside the next attempt.
+ *
  * # The budget does not run while a human is thinking
  *
  * Decision D102 withholds `timeout` from a `human` node at every level of
@@ -1262,8 +1278,14 @@ export async function runActivity<T>(
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       if (expired) break;
       made = attempt;
+      // This attempt's activity, and what it went on to settle with after the
+      // deadline had answered for it — read once the instances under this site
+      // have ended, for the one error that must still travel
+      // (see *An instance ends before its node does*).
+      let running: Promise<T> | undefined;
+      const late: { settled: boolean; error?: unknown } = { settled: false };
       try {
-        const running = activity({
+        running = activity({
           execution,
           signal: controller.signal,
           // A getter rather than a field: the budget it reports is held still
@@ -1284,7 +1306,12 @@ export async function runActivity<T>(
         // the node — and in Node an unhandled rejection ends the process. This
         // is the handler that keeps an abandoned activity from taking the run
         // down with it.
-        if (expiry !== undefined) running.catch(() => {});
+        if (expiry !== undefined) {
+          running.catch((error: unknown) => {
+            late.settled = true;
+            late.error = error;
+          });
+        }
         const value =
           expiry === undefined ? await running : await Promise.race([running, expiry]);
         return { value, attempts: attempt };
@@ -1338,7 +1365,47 @@ export async function runActivity<T>(
         // `ItemFailure`. A check on the class alone would let exactly those two
         // be retried.
         if (divergenceOf(error) !== undefined) throw error;
-        if (expired) break;
+        if (expired) {
+          // **The deadline answered; the instances it stopped have not ended
+          // yet.** Wait for them before this node settles — each one's
+          // `finally:` node runs now, inside this node execution, so the order
+          // grammar 7.9 promises holds on this way out too (see
+          // [`openInstances`]). Asked synchronously first, so a node that began
+          // no instance leaves on exactly the turn it always did.
+          if (instancesOpenUnder(execution.id, site)) {
+            // A pause left open below is abandoned first, so an instance
+            // parked on one ends rather than waiting on a person.
+            abandonPausesUnder(execution.id, site);
+            await instancesEnded(execution.id, site);
+            // …and one turn of the event loop for the continuations they leave
+            // behind: a `map` item's dispatch record, a flow-as-tool call's,
+            // and the activity's own settlement. An activity made of instances
+            // — a `flow:` node, a joined `map` — settles inside that turn; one
+            // that is not, such as an agent waiting on a host function, is left
+            // where it stands, exactly as before.
+            //
+            // What the stopped instance ran is **not** added to this entry's
+            // `inner`: `docs/trace.md` §3 makes that key absent on a `flow:`
+            // node its own `timeout:` ended, and widening a presence cell is a
+            // format version (§10.3). Its effects are journaled and its finally
+            // node's failure is `finally_error`, which is what the order above
+            // buys.
+            if (running !== undefined) {
+              await Promise.race([
+                running.then(
+                  () => undefined,
+                  () => undefined,
+                ),
+                new Promise<void>((resolve) => setTimeout(resolve, 0)),
+              ]);
+            }
+            // A record the instance did not match is un-absorbable on this
+            // path too — its finally boundary is where one most likely
+            // surfaces (PRD resolved q29).
+            if (late.settled && divergenceOf(late.error) !== undefined) throw late.error;
+          }
+          break;
+        }
         if (attempt === attempts) break;
         // This attempt is over, so every pause it left open below it is one
         // nothing will read the answer of — the same statement the `finally`
@@ -1352,6 +1419,11 @@ export async function runActivity<T>(
         // also what gives back the `map` permits and store handles the parked
         // instance is holding, before the next attempt queues for them.
         abandonPausesUnder(execution.id, site);
+        // And every instance the attempt began has ended before the next one
+        // begins — its `finally:` node included — so two attempts' finally
+        // nodes never run at once, and each claims its boundary at the site in
+        // the order the attempts ran (grammar 7.9, `docs/durability.md` §4).
+        if (instancesOpenUnder(execution.id, site)) await instancesEnded(execution.id, site);
         const delay = backoffFor(policy.retry!, attempt);
         try {
           await sleep(delay, controller.signal);
@@ -10000,10 +10072,13 @@ function traceOf(error: unknown): readonly TraceEntry[] | undefined {
  * [`ItemFailure`] ever arrives. The plan is [`runNode`]'s own object — it built
  * it, outside the policy — and the map writes each dispatch into it as that
  * dispatch resolves, so what survives here is every detached delivery (resolved
- * at dispatch, D94) and every joined instance that had settled. An instance
- * still in flight when the budget ran out has no outcome yet and so no record;
- * the entry's own `error`, which names the node and its budget, is what accounts
- * for it.
+ * at dispatch, D94) and every joined instance that had settled — which, for a
+ * `flow.*` instance, is every one the map had begun: a node settles only once
+ * the instances under it have ended, their `finally:` nodes included
+ * ([`runActivity`]'s *An instance ends before its node does*), so each one's
+ * record is here, failed on the deadline. An `agent.*` item still in flight
+ * when the budget ran out has no outcome yet and so no record; the entry's own
+ * `error`, which names the node and its budget, is what accounts for it.
  *
  * Recognised by its **brand** rather than by its shape, because `runNode` holds
  * every node's input as `unknown` and reaches here for *any* node that failed.
@@ -10572,6 +10647,35 @@ export async function runSubflow(
   binding: SubflowBinding,
   instance: Instantiation,
 ): Promise<NodeAnswer> {
+  // **An instance whose clock has already run out is not started.** What
+  // reaches here with an aborted signal is work the instantiating node had
+  // stopped waiting for before it began — a `map` item still queued for a
+  // permit when the map node's `timeout:` fired, a `flow.*` tool a model asked
+  // for after its agent node's budget was spent — so nothing of the instance
+  // runs: no node, no effect, and no `finally:` node, because an instance that
+  // never began has nothing to end (grammar 7.9).
+  if (instance.signal?.aborted === true) {
+    throw new SubflowFailure(
+      binding.address,
+      "was not started",
+      [],
+      abortReason(instance.signal),
+    );
+  }
+  const ending = runInstance(binding, instance);
+  instanceBegun(instance.execution.id, instance.path.join("/"), ending);
+  return ending;
+}
+
+/**
+ * One instance, from its first superstep to the end of its `finally:` node —
+ * the whole of [`runSubflow`] once it has decided to start one, and the promise
+ * [`instancesEnded`] waits on.
+ */
+async function runInstance(
+  binding: SubflowBinding,
+  instance: Instantiation,
+): Promise<NodeAnswer> {
   const seeded = instance.history ?? [];
   const initial: Record<string, unknown> = {
     $run: {
@@ -10661,6 +10765,86 @@ export async function runSubflow(
 // ---------------------------------------------------------------------------
 
 /**
+ * Every flow instance this process has begun and not yet ended, by execution:
+ * the promise of each one's end, and its instance path, flattened
+ * (grammar 9.4).
+ *
+ * What makes "the node that instantiated it settles after it has" (grammar 7.9,
+ * PRD resolved q76) true of a node whose **deadline** answered for it. A
+ * `timeout:` is raced ([`runActivity`]), so the node's wait for its activity
+ * ends the moment the budget does — while the instance it started is still
+ * stopping: LangGraph has been told to schedule no further superstep, and the
+ * instance has yet to run its `finally:` node. Left there, that finally node
+ * would run after the node had failed, after the instance above had ended and
+ * run its own, and after a one-shot `run` had closed the row and exited — out
+ * of order, unjournaled, and cut off part-way. So the node waits here, for every
+ * instance at or under its own site, before it settles ([`instancesEnded`]).
+ *
+ * An instance is entered by [`runSubflow`] — a `flow:` node's, a joined `map`
+ * dispatch's and a flow-as-tool call's alike — and leaves when its promise
+ * settles, which is after its finally node has run. A detached dispatch's child
+ * execution is not here: it is an execution of its own (PRD resolved q65), on no
+ * node's clock.
+ */
+const openInstances = new Map<string, Map<Promise<unknown>, string>>();
+
+/** Put one instance on the books until `ending` settles. */
+function instanceBegun(execution: string, path: string, ending: Promise<unknown>): void {
+  let open = openInstances.get(execution);
+  if (open === undefined) {
+    open = new Map();
+    openInstances.set(execution, open);
+  }
+  const held = open;
+  held.set(ending, path);
+  const ended = (): void => {
+    held.delete(ending);
+    if (held.size === 0 && openInstances.get(execution) === held) openInstances.delete(execution);
+  };
+  ending.then(ended, ended);
+}
+
+/**
+ * Whether any instance at or under `site` is still running — the synchronous
+ * half of [`instancesEnded`], so a node that began none settles on the turn it
+ * always did.
+ */
+function instancesOpenUnder(execution: string, site: string): boolean {
+  const open = openInstances.get(execution);
+  if (open === undefined) return false;
+  for (const path of open.values()) {
+    if (path === site || path.startsWith(`${site}/`)) return true;
+  }
+  return false;
+}
+
+/**
+ * Wait until no instance at or under `site` is still running — each one has
+ * ended, its `finally:` node included (grammar 7.9).
+ *
+ * The prefix relation instance paths already carry (grammar 9.4): a `flow:`
+ * node's instance is at the node's own site, a joined `map` item's and a
+ * flow-as-tool call's are under it, and so is every instance nested in any of
+ * them. Asked again after each wait, because an instance that was running when
+ * the wait began may begin another before it ends; nothing new can begin under
+ * a node whose clock has run out, which [`runSubflow`] refuses.
+ *
+ * Callers ask [`instancesOpenUnder`] first, because an `await` here costs a
+ * turn even where nothing is open.
+ */
+async function instancesEnded(execution: string, site: string): Promise<void> {
+  for (;;) {
+    const open = openInstances.get(execution);
+    if (open === undefined) return;
+    const under = [...open]
+      .filter(([, path]) => path === site || path.startsWith(`${site}/`))
+      .map(([ending]) => ending);
+    if (under.length === 0) return;
+    await Promise.allSettled(under);
+  }
+}
+
+/**
  * How one flow instance ended (grammar 7.9, PRD resolved q76): what a
  * `finally:` node reads as `execution.outcome`.
  *
@@ -10742,6 +10926,21 @@ const finallyFailures = new Map<string, string>();
 /** What `finally_error` holds for this execution, where a finally node failed. */
 export function finallyErrorOf(execution: string): string | undefined {
   return finallyFailures.get(execution);
+}
+
+/**
+ * Hold a `finally:` node's failure that another process ran into on this
+ * execution's behalf — a placed node's worker, whose flow-as-tool instance ran
+ * its finally node there (grammar 14.1 rule 4, `docs/distributed.md` §3.4) —
+ * as this process's own, under [`finallyFailures`]' rule: the first one stands.
+ *
+ * The worker cannot write it anywhere itself: the lifecycle row is the hub's
+ * (§3.3's single writer), so it travels home on the dispatch's result and lands
+ * here, where [`settleExecution`] and the run's envelope read it like one this
+ * process raised.
+ */
+export function holdFinallyError(execution: string, error: string): void {
+  if (!finallyFailures.has(execution)) finallyFailures.set(execution, error);
 }
 
 /**
@@ -11769,6 +11968,14 @@ export async function runMap(
         admitted();
         let attempts = 0;
         try {
+          // **An item still queued when the node's deadline ran out is never
+          // begun.** The node has stopped waiting for its fan-out, so this item
+          // has no outcome and files no record — which `docs/trace.md` §5.2
+          // reads as "no outcome resolved for this item" — and, for a `flow.*`
+          // target, no instance: nothing that never began has an end to run a
+          // `finally:` node at (grammar 7.9). The permits it just took go
+          // straight back, in the `finally` below.
+          if (scoped.signal.aborted) return;
           const answer = await attemptItem(map, instance, scoped);
           attempts = answer.attempts;
           landed.push({
