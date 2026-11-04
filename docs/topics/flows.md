@@ -251,15 +251,21 @@ out: the deadline stops the instance, and the node fails only once the
 instance's finally node has run. It includes a body node that fails while
 another branch is still running a subflow instance: the failure ends that
 instance too — it is stopped, its finally node reads `failed`, and it runs
-before the caller's. A detached `flow.*` dispatch is a child
-execution, and runs its own. A body that ended through `on_error: skip` or a `fallback:` to `end`
+before the caller's. That holds for an instance that was waiting on a person
+(its question is withdrawn) and for one whose finally node is a `flow:` node,
+a `map` or an agent calling flow tools. A finally node that had already
+started when the failure came is not stopped: the caller waits for it to
+finish. A detached `flow.*` dispatch is a child execution, and runs its own.
+A body that ended through `on_error: skip` or a `fallback:` to `end`
 **completed**, and its finally node reads `completed`.
 
 **A pause is not an end.** A run that parks at a `human` node runs no finally
 node; the resumed run answers the pause, runs the body on, and runs it when the
-instance ends. That is also why the finally node may not be a `human` node or
-reach one, through a subflow, a map or an agent's flow tools
-(`finally-interrupt`): a step that must always finish cannot wait on a person.
+instance ends. (An instance a sibling's failure stopped mid-question did end:
+nobody will ever ask it again, so its finally node runs, above.) That is also
+why the finally node may not be a `human` node or reach one, through a
+subflow, a map or an agent's flow tools (`finally-interrupt`): a step that must
+always finish cannot wait on a person.
 
 **It changes nothing the instance produced.** The outputs are read before it
 runs, so a completed run stays completed — same outputs, exit code `0` — even

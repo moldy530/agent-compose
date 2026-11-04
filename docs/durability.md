@@ -1201,10 +1201,13 @@ divergence of §7, raised before the finally node runs. Only nondeterminism the
 journal does not hold — a jittered backoff that outlasts a deadline it fit
 inside the first time — can produce it, and the next resume draws again.
 
-What is **not** an end records nothing: a `human` pause the run parks at, a
-divergence, and an instance whose pause was abandoned (`docs/grammar.md` §7.9).
-The resumed generation runs the body on from there, and the boundary is written
-when the instance does end.
+What is **not** an end records nothing: a `human` pause the run parks at —
+and every other instance still waiting on a person when it parks — and a
+divergence (`docs/grammar.md` §7.9). The resumed generation runs the body on
+from there, and the boundary is written when the instance does end. An
+instance that was waiting on a person when the end of the instance around it
+stopped it **has** ended: its boundary records `failed`, and its finally node
+runs.
 
 The record is read nowhere else. What the finally node **raised**, if it failed
 after its own retries, is not on this record — the boundary is down before the

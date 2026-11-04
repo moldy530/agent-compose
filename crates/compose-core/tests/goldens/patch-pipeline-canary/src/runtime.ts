@@ -1356,8 +1356,10 @@ export async function runActivity<T>(
         // second attempt would re-open a pause under a node that has already
         // ended — parked for ever on a board no watcher is left to hold. Thrown
         // on bare rather than wrapped in a [`NodeFailure`]: by construction
-        // there is nothing to report it to, which is what the class means.
-        if (abandonedOf(error) !== undefined) throw error;
+        // there is nothing to report it to, which is what the class means. The
+        // same goes for an instance the end around it stopped, for the same
+        // reason (see [`stoppedOf`]).
+        if (abandonedOf(error) !== undefined || stoppedOf(error) !== undefined) throw error;
         // A journal that does not describe this run is not an activity outcome
         // either, and it is the one failure a `retry:` could make *worse*: every
         // attempt would consume the next ordinal at this site, so a ladder of
@@ -10920,20 +10922,48 @@ export class InstanceStopped extends Error {
 }
 
 /**
- * What an instance ended on: what its supersteps raised — or, where the instance
- * around it pulled its stop ([`endInstancesInside`]), the reason it pulled it
- * with, in place of the bare `Abort` LangGraph's stream raises when its signal
- * fires: an [`InstanceStopped`] saying why, or — for an instance that was
- * holding a pause — the [`HumanAbandoned`] that makes it no end at all
- * (grammar 7.9). A pause the run parks at and a divergence keep their own
- * meaning whatever stopped the stream, because neither is an end either.
+ * What an instance ended on: what its supersteps raised — or, where its own stop
+ * was pulled, the stop (grammar 7.9).
+ *
+ * Pulled by the instance around it ending ([`endInstancesInside`]), the reason
+ * is an [`InstanceStopped`] saying why, in place of the bare `Abort` LangGraph's
+ * stream raises when its signal fires. And an instance whose stop was pulled
+ * while it was **waiting on a person** ended on that stop too, not on the
+ * abandonment of its pause that its supersteps raise: the end around it, or the
+ * instantiating node's deadline in the one tick a pause can open after it ran
+ * out ([`runActivity`]), is what ended it — so it is an end, `failed`, and runs
+ * its finally node like any stopped instance. An abandoned pause is no end only
+ * where nothing stopped its instance ([`instanceEnding`]). A pause the run
+ * parks at and a divergence keep their own meaning whatever stopped the stream,
+ * because neither is an end either.
  */
 function stoppedBy(signal: AbortSignal, error: unknown): unknown {
   if (error === undefined || !signal.aborted) return error;
-  const reason: unknown = signal.reason;
-  if (!(reason instanceof InstanceStopped) && !(reason instanceof HumanAbandoned)) return error;
   if (divergenceOf(error) !== undefined || interruptOf(error) !== undefined) return error;
-  return reason;
+  const reason: unknown = signal.reason;
+  if (reason instanceof InstanceStopped || abandonedOf(error) !== undefined) return reason;
+  return error;
+}
+
+/**
+ * The [`InstanceStopped`] on this error's `cause` chain, if it came out of one:
+ * the failure of an instance the end around it stopped, or of one that end
+ * would not let begin ([`endingAround`]).
+ *
+ * Read beside [`abandonedOf`] by the ladders and policies an abandonment passes
+ * through untouched, and for its reason: what reaches them is a task inside the
+ * ending instance that LangGraph has already let go of, so nothing is reading
+ * its result. A `retry:` acting on it would sleep out its backoff and begin the
+ * instance again after the end that stopped it had finished — in a `serve`
+ * process, inside an execution whose row has closed — and `skip` or a
+ * `fallback:` would route a graph that is no longer running.
+ */
+function stoppedOf(error: unknown): InstanceStopped | undefined {
+  for (let held: unknown = error; held !== undefined && held !== null; ) {
+    if (held instanceof InstanceStopped) return held;
+    held = (held as { cause?: unknown }).cause;
+  }
+  return undefined;
 }
 
 /**
@@ -10957,18 +10987,45 @@ interface EndingInstance {
  *
  * Strictly inside: an instance at the ending one's **own** path is the next
  * attempt of the node that ran it, which begins only once this one has ended.
- * And never inside the ending instance's finally node, whose `flow:` node or
- * `map` begins instances of its own as part of that end.
+ * And never under a finally node that is part of that end
+ * ([`underClosingFinally`]): the ending instance's own, and that of every
+ * instance ending inside it — one its end stopped, or one whose body had ended
+ * already — because each of those is how an instance the end is waiting for
+ * ends, and its `flow:` node, `map` or `flow.*` tool begins instances of its
+ * own to do it (grammar 7.9: the stopped instance runs its own finally node
+ * before the instance around it runs its).
  */
 function endingAround(execution: string, path: string): InstanceStopped | undefined {
   const ending = endingInstances.get(execution);
   if (ending === undefined) return undefined;
   for (const one of ending) {
     if (path === one.path || !under(path, one.path)) continue;
-    if (one.finallySite !== undefined && under(path, one.finallySite)) continue;
+    if (underClosingFinally(ending, one.path, path)) continue;
     return one.reason;
   }
   return undefined;
+}
+
+/**
+ * Whether `path` lies under the finally node of an instance that is ending **at
+ * or inside** `around` — the work an end at `around` waits for rather than
+ * refuses ([`endingAround`]) or stops ([`endInstancesInside`]).
+ *
+ * At or inside, and no further out: the finally node of an instance ending
+ * *around* `around` is that outer end's work, not one `around`'s end waits for —
+ * so where `around` is itself an instance that finally node began, and is
+ * ending, what begins inside `around` is refused like anything else.
+ */
+function underClosingFinally(
+  ending: ReadonlySet<EndingInstance>,
+  around: string,
+  path: string,
+): boolean {
+  for (const other of ending) {
+    if (other.finallySite === undefined || !under(other.path, around)) continue;
+    if (under(path, other.finallySite)) return true;
+  }
+  return false;
 }
 
 /**
@@ -10990,13 +11047,20 @@ function endingAround(execution: string, path: string): InstanceStopped | undefi
  * every pause under the ending instance is abandoned, because the task that
  * would read its answer is gone, and the instance waits for every one of them
  * to end, each one's own finally node run, which by the same rule runs only
- * after anything inside *it* has ended. One that was holding a pause is the
- * exception: its pause is abandoned with the rest, and an instance whose pause
- * was abandoned is not an end (grammar 7.9) — it, and any instance around it
- * inside the ending one, runs no finally node, exactly as when the node holding
- * the pause ends. Until the release, nothing new may begin inside the ending
- * instance ([`endingAround`]) — a let-go `flow:` node's next `retry:` attempt, a
- * `map`'s next item — except under its own finally node.
+ * after anything inside *it* has ended. One that was waiting on a person is
+ * stopped like the rest: its pause goes with the others, and the stop is how
+ * it ended — `failed`, reading this instance's failure as `execution.error`
+ * ([`stoppedBy`]) — so it runs its finally node too.
+ *
+ * What is **not** stopped is an end already under way inside it: an instance
+ * whose own body has ended — stopped by an end further in, or ended on its own
+ * — and is running its finally node, and every instance that finally node has
+ * begun ([`underClosingFinally`]). Pulling their stops would cut short the very
+ * cleanup this wait is for, so they are waited for, bounded by their finally
+ * nodes' own §9.3 budgets, exactly as a deadline's stop leaves them. Until the
+ * release, nothing new may begin inside the ending instance ([`endingAround`])
+ * — a let-go `flow:` node's next `retry:` attempt, a `map`'s next item — except
+ * under one of those finally nodes, or its own.
  *
  * Nothing at all where `ending` is `undefined` — a pause the run parks at, or a
  * divergence, neither of which is an end — and nothing to wait for where no
@@ -11035,29 +11099,24 @@ export async function endInstancesInside(
     }
   };
   const inside = (open: OpenInstance): boolean => open.path !== path && under(open.path, path);
+  // An end already under way inside this one, read afresh on every round
+  // because ends begin while this one waits: an instance this round stops ends
+  // its body, and its finally node then begins instances the next round must
+  // leave alone.
+  const closing = (open: OpenInstance): boolean =>
+    [...held].some((other) => other.path === open.path) ||
+    underClosingFinally(held, path, open.path);
   const open = openInstances.get(execution);
   if (open === undefined || ![...open.values()].some(inside)) return release;
   try {
-    // Which of them is holding a pause, read before the pauses go: an instance
-    // whose pause is abandoned is not ended by this stop but let go of, which
-    // grammar 7.9 does not count as an end — so it runs no finally node, and
-    // nor does one around it, exactly as when a node that held it ends.
-    const parked = new Map<Promise<unknown>, HumanWait>();
-    for (const [promise, one] of open) {
-      const wait = inside(one) ? pauseHeldUnder(execution, one.path) : undefined;
-      if (wait !== undefined) parked.set(promise, wait);
-    }
     abandonPausesUnder(execution, path);
     for (;;) {
       const now = openInstances.get(execution);
       if (now === undefined) break;
       const running = [...now].filter(([, one]) => inside(one));
       if (running.length === 0) break;
-      for (const [promise, one] of running) {
-        const wait = parked.get(promise);
-        one.stop.abort(
-          wait === undefined ? reason : new HumanAbandoned(wait.flow, wait.node, wait.id),
-        );
+      for (const [, one] of running) {
+        if (!closing(one)) one.stop.abort(reason);
       }
       await Promise.allSettled(running.map(([promise]) => promise));
     }
@@ -11172,11 +11231,16 @@ export class RecordedEnding extends Error {
  * row stays open ([`staysOpen`]): a `human` pause the run parks at (exit `3`,
  * `status: "interrupted"`), which the resumed run runs on from, and a replay
  * divergence, after which nothing this generation does is in the record. A
- * pause nobody is waiting for any more ([`HumanAbandoned`]) is not one either:
- * it belongs to an instance whose result is already discarded, and whose
- * attempt the node that owned it has finished with. Every other way out is an
- * end: no error is `completed` — a body that ended through `on_error: skip` or
- * a `fallback:` to `end` included (Decision D97) — and an error is `failed`.
+ * pause nobody is waiting for any more ([`HumanAbandoned`]) with nothing having
+ * stopped the instance holding it is not one either: what abandons a pause
+ * that way is the release of an execution that parked or diverged
+ * ([`releaseHumanWaits`]), whose row stays open for a resumed generation to run
+ * the instance on from. An instance whose own stop was pulled — the end of the
+ * instance around it, or its node's deadline — arrives here with the stop
+ * instead of the abandonment ([`stoppedBy`]), and has ended. Every other way
+ * out is an end: no error is `completed` — a body that ended through
+ * `on_error: skip` or a `fallback:` to `end` included (Decision D97) — and an
+ * error is `failed`.
  */
 export function instanceEnding(execution: string, error: unknown): InstanceEnding | undefined {
   if (staysOpen(execution, error) || abandonedOf(error) !== undefined) return undefined;
@@ -12345,8 +12409,9 @@ export async function runMap(
           // any more, so `skip` recording it as an item the fan-out absorbed
           // would put a dispatch record on a trace entry for an outcome that
           // never happened — and would carry the fan-out past a human for the
-          // reason above (see [`abandonedOf`]).
-          if (abandonedOf(cause) !== undefined) throw error;
+          // reason above (see [`abandonedOf`]) — and nor is an instance the end
+          // around it stopped, for the same one ([`stoppedOf`]).
+          if (abandonedOf(cause) !== undefined || stoppedOf(cause) !== undefined) throw error;
           // Nor is a journal that does not describe this run. `skip` would carry
           // the fan-out past an effect the record claims to hold, which is the
           // one thing resolved q29 refuses outright — and it would do so while
@@ -13195,7 +13260,10 @@ async function attemptItem(
         // And the same rule for a pause this instance is no longer being waited
         // on for: re-executing it would re-open the pause under a node that has
         // stopped waiting, on top of repeating every effect the instance issued.
-        if (abandonedOf(error) !== undefined) throw new ItemAttempts(made, error);
+        // Nor for an instance the end around it stopped ([`stoppedOf`]).
+        if (abandonedOf(error) !== undefined || stoppedOf(error) !== undefined) {
+          throw new ItemAttempts(made, error);
+        }
         // And a journal that does not describe this run, for [`runActivity`]'s
         // reason: a second attempt would walk the next recorded effect forward
         // and report a disagreement one step past the one that really happened.
@@ -13910,19 +13978,6 @@ export function pausesUnder(execution: string, site: string): number {
     if (one.settled === undefined && under(one.wait.id, site)) open += 1;
   }
   return open;
-}
-
-/**
- * The first pause `execution` is still holding at or inside `site`, if it holds
- * one — what [`endInstancesInside`] names the abandonment of an instance after.
- */
-function pauseHeldUnder(execution: string, site: string): HumanWait | undefined {
-  const board = humanBoards.get(execution);
-  if (board === undefined) return undefined;
-  for (const one of board.held.values()) {
-    if (one.settled === undefined && under(one.wait.id, site)) return one.wait;
-  }
-  return undefined;
 }
 
 /**
@@ -16303,8 +16358,9 @@ export async function runNode(
     // it would do so inside an instance whose result was already discarded. It
     // carries **no trace entry**, for the reason it carries no strategy: the
     // entry would belong to a task nothing is left to read (see
-    // [`abandonPausesUnder`], [`HumanAbandoned`]).
-    if (abandonedOf(error) !== undefined) throw error;
+    // [`abandonPausesUnder`], [`HumanAbandoned`]). An instance the end around
+    // it stopped leaves the same way, for the same reason ([`stoppedOf`]).
+    if (abandonedOf(error) !== undefined || stoppedOf(error) !== undefined) throw error;
     // A fourth is not an outcome either, and is the one an `on_error:` must not
     // be allowed to absorb: a journal that does not describe this run
     // (resolved q29). `skip` would carry this graph past an effect the record

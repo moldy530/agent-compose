@@ -855,10 +855,22 @@ const CODEGEN: &[Criterion] = &[
                 "a_failing_body_node_ends_the_instances_its_siblings_are_still_running_first",
                 Status::Live,
             ),
-            // …save one that is waiting on a person: its pause is abandoned,
-            // which is not an end, and it runs no finally node.
+            // …one that is waiting on a person among them: its pause is
+            // abandoned, and it ends `failed` and runs its finally node too.
             (
-                "a_sibling_waiting_on_a_person_when_the_body_fails_runs_no_finally_node",
+                "a_sibling_waiting_on_a_person_when_the_body_fails_ends_and_runs_its_finally_node",
+                Status::Live,
+            ),
+            // The finally node of an instance the failure stopped may begin
+            // instances of its own — a `flow:` node's, a `map`'s, a `flow.*`
+            // tool's — and each runs to its end; one already running when the
+            // failure came is waited for, never stopped.
+            (
+                "a_stopped_instances_finally_node_begins_and_ends_instances_of_its_own",
+                Status::Live,
+            ),
+            (
+                "a_finally_node_already_running_when_the_instance_around_it_ends_is_waited_for",
                 Status::Live,
             ),
         ],

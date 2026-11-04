@@ -27766,19 +27766,21 @@ fn a_resumed_run_whose_replay_completes_settles_on_the_end_its_boundary_records(
     );
 }
 
-/// **A sibling instance that is waiting on a person when the body fails is let
-/// go of, not ended: its pause is abandoned and it runs no finally node** —
-/// grammar §7.9's "nor an instance whose pause was abandoned", on the path a
-/// sibling's failure takes.
+/// **A sibling instance that is waiting on a person when the body fails is
+/// ended like any other: its pause is abandoned, and it ends `failed` and runs
+/// its finally node before the flow's own** — grammar §7.9's "one that was
+/// waiting on a person is stopped the same way", PRD resolved q76's "innermost
+/// first when a cancel or failure ends several at once".
 ///
-/// `flow.raced_ask` runs `doomed`, which fails after a second, beside
-/// `step`, a `flow:` node into `flow.asking`, whose `human` node is waiting at a
-/// terminal nobody types at. The failure ends `flow.raced_ask`; the instance it
-/// stops was holding a pause, so that pause is abandoned with it — the prompt is
-/// not left answerable — and `flow.asking`'s finally node, which would append
-/// `inner`, never runs. `flow.raced_ask`'s own runs, reading `failed`.
+/// `flow.raced_ask` runs `doomed`, which fails after a second, beside `step`, a
+/// `flow:` node into `flow.awaiting`, whose `human` node is waiting at a
+/// terminal nobody types at. The failure ends `flow.raced_ask`, and with it the
+/// instance waiting on the question: the pause is withdrawn — nothing is left to
+/// read the answer, and nobody will ask it again — and `flow.awaiting`'s finally
+/// node runs, reading `failed` and why, before `flow.raced_ask`'s does. A
+/// cleanup an author put there (a lease release, a record) is not stranded.
 #[test]
-fn a_sibling_waiting_on_a_person_when_the_body_fails_runs_no_finally_node() {
+fn a_sibling_waiting_on_a_person_when_the_body_fails_ends_and_runs_its_finally_node() {
     let provider = MockProvider::start().expect("a loopback port");
     let (_shims, _log, environment) = finally_environment(&provider, "finally-raced-ask");
     let Some(project) = harness::scratch_project("finally-raced-ask") else {
@@ -27802,6 +27804,10 @@ fn a_sibling_waiting_on_a_person_when_the_body_fails_runs_no_finally_node() {
     );
     let report = run.outputs();
     assert_eq!(report["status"], "failed", "{report:#}");
+    assert!(
+        report.get("finally_error").is_none(),
+        "both finally nodes ran to their end: {report:#}"
+    );
     assert_eq!(
         nodes_of(&report["trace"]),
         ["doomed", "asked_end"],
@@ -27810,13 +27816,191 @@ fn a_sibling_waiting_on_a_person_when_the_body_fails_runs_no_finally_node() {
     assert_finally_entry(&report["trace"], "asked_end", "completed");
     assert_eq!(
         ended_so_far(&project),
-        ["outer:failed"],
-        "the abandoned instance ran no finally node, and the flow's own ran"
+        ["inner:failed", "outer:failed"],
+        "the instance waiting on a person ended, failed, and ran its finally node first"
     );
     let execution = report["execution_id"].as_str().expect("an execution id");
+    let boundaries = finally_boundaries(&project, execution);
+    let keys: Vec<&str> = boundaries.iter().map(|(key, _, _)| key.as_str()).collect();
     assert_eq!(
-        boundary_keys(&project, execution),
-        ["asked_end/0#finally/0"],
-        "an instance whose pause was abandoned did not end, so it recorded no end"
+        keys,
+        ["asked_end/0#finally/0", "step/0/awaiting_end/0#finally/0"],
+        "the stopped instance recorded its end, as the flow did"
     );
+    let (_, _, stopped) = &boundaries[1];
+    assert_eq!(stopped["value"]["outcome"], "failed", "{stopped:#}");
+    let error = stopped["value"]["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the stopped instance records why: {stopped:#}"));
+    assert!(
+        error.starts_with(
+            "InstanceStopped: the instance of `flow.raced_ask` it ran inside failed: \
+             NodeFailure: flow.raced_ask node `doomed` failed: "
+        ),
+        "it read the failure that stopped it, not the abandoned pause: {error}"
+    );
+    assert_eq!(lifecycle_row(&project, execution)["status"], "failed");
+}
+
+/// **A stopped instance's finally node may begin instances of its own — a
+/// `flow:` node's, a `map`'s, a `flow.*` tool's — and each runs to its end
+/// before the instance around it runs its finally node** (grammar §7.9:
+/// "nothing new begins inside an instance that is ending, except under its own
+/// finally node or the finally node of an instance ending inside it").
+///
+/// `flow.raced_closing` runs `doomed`, which fails after half a second, beside
+/// three `flow:` nodes whose instances sleep for five. Each of those instances
+/// is stopped, and each one's finally node begins work of its own under the
+/// instance that is ending around it: `flow.linger_flowed`'s is a `flow:` node
+/// into `flow.marking`, `flow.linger_mapped`'s a `map` of `flow.marking`, and
+/// `flow.linger_tooled`'s an agent whose model calls `flow.toolish`. Every one
+/// of them begins and ends — the two marks read `failed`, the tool's own
+/// finally node marks `tool` — before `flow.raced_closing`'s finally node
+/// marks the outer end, and no finally node failed.
+#[test]
+fn a_stopped_instances_finally_node_begins_and_ends_instances_of_its_own() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new("toolish", json!({}))]),
+        ),
+        Script::new(SONNET, Outcome::text("the tool ran")),
+        Script::new(SONNET, Outcome::structured(json!({ "note": "closed" }))),
+    ]);
+    let (_shims, _log, environment) = finally_environment(&provider, "finally-raced-closing");
+    let Some(project) = harness::scratch_project("finally-raced-closing") else {
+        return;
+    };
+    let run = harness::run_formatted(
+        &project,
+        FINALLY,
+        "flow.raced_closing",
+        &[],
+        None,
+        Some("json"),
+        &environment,
+    );
+    let said = run.failed();
+    assert_eq!(run.output.status.code(), Some(1), "{said}");
+    let report = run.outputs();
+    assert_eq!(report["status"], "failed", "{report:#}");
+    assert!(
+        report.get("finally_error").is_none(),
+        "no finally node was refused the instances it began: {report:#}"
+    );
+    assert_eq!(
+        nodes_of(&report["trace"]),
+        ["doomed", "closing_end"],
+        "{report:#}"
+    );
+    assert_finally_entry(&report["trace"], "closing_end", "completed");
+
+    let order = ended_so_far(&project);
+    let [inner @ .., last] = order.as_slice() else {
+        panic!("the stopped instances' marks and the flow's: {order:?}");
+    };
+    assert_eq!(
+        last, "outer:failed",
+        "the flow's own finally node ran last: {order:?}"
+    );
+    let mut inner = inner.to_vec();
+    inner.sort();
+    assert_eq!(
+        inner,
+        ["flowed:failed", "mapped:failed", "tool"],
+        "each stopped instance's finally node ran the instance it began to its end: {order:?}"
+    );
+
+    let execution = report["execution_id"].as_str().expect("an execution id");
+    let boundaries = finally_boundaries(&project, execution);
+    let keys: Vec<&str> = boundaries.iter().map(|(key, _, _)| key.as_str()).collect();
+    assert_eq!(
+        keys,
+        [
+            "closing_end/0#finally/0",
+            "flowed/0/linger_end/0#finally/0",
+            "mapped/0/linger_end/0#finally/0",
+            "tooled/0/linger_end/0#finally/0",
+            "tooled/0/linger_end/0/toolish/0/tool_end/0#finally/0"
+        ],
+        "every instance that began recorded its end, the tool's under its call's frame"
+    );
+    for (key, _, recorded) in &boundaries {
+        let outcome = if key.contains("/toolish/") {
+            "completed"
+        } else {
+            "failed"
+        };
+        assert_eq!(
+            recorded["value"]["outcome"], outcome,
+            "`{key}`: {recorded:#}"
+        );
+    }
+    assert_eq!(lifecycle_row(&project, execution)["status"], "failed");
+}
+
+/// **A finally node already running when the instance around it ends is waited
+/// for, not stopped** (grammar §7.9: "an end already under way inside the one
+/// that is ending is waited for, never stopped").
+///
+/// `flow.raced_late` runs `doomed`, which fails after a second and a half,
+/// beside `step`, a `flow:` node into `flow.quick`. `flow.quick`'s body
+/// completes at once and its finally node begins: a `flow:` node into
+/// `flow.slow_marking`, which sleeps three seconds before it marks. The failure
+/// lands mid-sleep. `flow.raced_late` waits for that cleanup to finish rather
+/// than pulling its stop — the mark is there, reading the `completed` its
+/// instance really ended on — and only then runs its own finally node.
+#[test]
+fn a_finally_node_already_running_when_the_instance_around_it_ends_is_waited_for() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, environment) = finally_environment(&provider, "finally-raced-late");
+    let Some(project) = harness::scratch_project("finally-raced-late") else {
+        return;
+    };
+    let run = harness::run_formatted(
+        &project,
+        FINALLY,
+        "flow.raced_late",
+        &[],
+        None,
+        Some("json"),
+        &environment,
+    );
+    let said = run.failed();
+    assert_eq!(run.output.status.code(), Some(1), "{said}");
+    let report = run.outputs();
+    assert_eq!(report["status"], "failed", "{report:#}");
+    assert!(
+        report.get("finally_error").is_none(),
+        "the cleanup under way was not cut short: {report:#}"
+    );
+    assert_eq!(
+        nodes_of(&report["trace"]),
+        ["doomed", "late_end"],
+        "{report:#}"
+    );
+    assert_finally_entry(&report["trace"], "late_end", "completed");
+    assert_eq!(
+        ended_so_far(&project),
+        ["quick:completed", "outer:failed"],
+        "the finally node under way finished, and the flow's own ran after it"
+    );
+    let execution = report["execution_id"].as_str().expect("an execution id");
+    let ends: Vec<(String, Value)> = finally_boundaries(&project, execution)
+        .into_iter()
+        .map(|(key, _, recorded)| (key, recorded["value"]["outcome"].clone()))
+        .collect();
+    assert_eq!(
+        ends,
+        [
+            ("late_end/0#finally/0".to_string(), json!("failed")),
+            (
+                "step/0/quick_end/0#finally/0".to_string(),
+                json!("completed")
+            )
+        ],
+        "the root recorded `failed`, and the instance under way the `completed` it ended on"
+    );
+    assert_eq!(lifecycle_row(&project, execution)["status"], "failed");
 }

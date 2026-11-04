@@ -2384,17 +2384,27 @@ while another branch may still be running a `flow:` node's, a `map` item's or a
 flow-as-tool call's instance, and the failure ends that instance too — it is
 stopped, ends `failed` with an `execution.error` saying the instance around it
 failed and how, and runs its own finally node before the instance around it
-runs its. One that was holding a pause is let go of instead, with its pause
-abandoned — not an end, below — and runs none. Nothing new begins inside an
-instance that is ending, except under its own finally node. A **child execution** — what a detached `flow.*` dispatch starts (§8.6
-rule 7) — is an execution of its own, and its root instance runs its own finally
-node when it ends.
+runs its. One that was waiting on a person is stopped the same way: its pause
+is abandoned — nothing is left to read the answer — and it ends `failed`, its
+finally node run. An end already under way inside the one that is ending is
+waited for, never stopped: an instance whose body had ended — stopped by an end
+further in, or ended on its own — and is running its finally node, and every
+instance that finally node begins, run on until that finally node has, bounded
+by its own policy. Nothing new begins inside an instance that is ending, except
+under its own finally node or the finally node of an instance ending inside it.
+A **child execution** — what a detached `flow.*` dispatch starts (§8.6 rule 7)
+— is an execution of its own, and its root instance runs its own finally node
+when it ends.
 
 **What is not an end.** A `human` pause that parks the run (exit `3`,
 `status: "interrupted"`) is not one: the finally node does not run, and the
 resumed run answers the pause, runs the body on, and runs it when the instance
-does end. Neither is a replay divergence — the run's record stopped describing it
-— nor an instance whose pause was abandoned because the node holding it ended.
+does end. The same holds of every instance still waiting on a person when the
+run parks: the resumed run asks its question again. Neither is a replay
+divergence — the run's record stopped describing it. An instance that was
+waiting on a person when the end of the instance around it **stopped** it has
+ended, though: its question will never be asked again, so it ends `failed` and
+runs its finally node, as PRD resolved q75's cancel will end one `cancelled`.
 
 **What it reads.** Inside the finally node, and only there, the `execution` root
 carries `execution.outcome` (`completed | failed | cancelled`) and
@@ -11960,6 +11970,28 @@ running its own; it reads `failed`, and an `execution.error` naming the instance
 around it and that instance's failure, which is how it ended. Waiting for it to
 finish on its own instead would hold a failed run open for as long as the
 slowest sibling cared to run, for an answer nothing would read.
+A sibling that was **waiting on a person** is one of the several too. Its
+pause is abandoned with the rest, because the task that would read the answer
+is gone, and the stop ends it `failed` like any other: the ruling's finally
+node runs "completed, failed or cancelled", and q75's cancel "releases its
+waits" and runs `finally:` — so letting go of a wait is not a fourth way out
+that skips the cleanup. Reading the abandonment as no end at all would strand
+exactly what `finally:` exists for, since that instance is never asked its
+question again: a lease it took before asking would stay held until its TTL.
+What stays no end is the wait of a run that **parks** — exit `3`, the row open
+— which the resumed run asks again, and whose instance has not ended.
+An end that is **already under way** inside the one ending is waited for and
+never stopped: an instance whose body has ended — stopped by an end further
+in, or completed or failed on its own — and is running its finally node, and
+every instance that finally node begins through a `flow:` node, a `map` or an
+agent's `flow.*` tools. Stopping those would cut short the very cleanup the
+wait is for, so they run on under their finally node's own policy, as they do
+under a deadline; and nothing new begins inside an ending instance except
+under a finally node that is part of its end — its own, or one of an instance
+ending inside it. The node that began a stopped instance, a task LangGraph has
+let go of, neither retries it nor routes on it, exactly as for an abandoned
+pause: no one is left to read an attempt's answer, and one begun after the end
+had finished would run inside an execution whose row had closed.
 The wait is the stopped instances' finally nodes and nothing else, bounded by
 their own §9.3 budgets. It does not put the stopped instance's trace on a `flow:`
 node's entry, whose `inner` `docs/trace.md` §3 keeps absent on that path:
