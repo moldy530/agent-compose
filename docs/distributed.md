@@ -154,75 +154,77 @@ process, and the same auth story. A worker holds one outstanding `GET` at a time
 and the hub answers it when there is work for that worker or when the hold
 expires.
 
-**A worker polls while it is busy, and holds one dispatch at a time.** Both
-halves are normative for v1; they do not have the same authority behind them —
-the first is forced by the transport, the second is this document's own choice
-and §13 is where it is filed — and the paragraph after them says which is which:
+**A worker polls while it is busy, and runs every dispatch it holds at once.**
+Both halves are normative; the second is a placement's `max_running:` (grammar
+§14.1, PRD resolved q79, Decision D161):
 
 - A worker keeps exactly one poll in flight from the moment it joins until it
   stops. It does **not** suspend polling while a node runs: a four-minute build
   is four minutes of holds that return empty, and the session stays inside the
   liveness window the whole time. Without this clause the window below would
-  presume a working worker gone, supersede the dispatch it is in the middle of
-  (§6.3), and leave it with a result to post against a session the hub has
-  forgotten — an attempt failed, and a build's four minutes thrown away, for a
+  presume a working worker gone, supersede the dispatches it is in the middle of
+  (§6.3), and leave it with results to post against a session the hub has
+  forgotten — attempts failed, and a build's four minutes thrown away, for a
   worker that was never in trouble.
-- The hub MUST NOT answer a session's poll with a dispatch while that session
-  has a dispatch it has not settled. A busy worker's polls are therefore
-  heartbeats and nothing else, however much work is queued for the placement it
-  claims.
+- The hub offers a session work of a placement while the session's **unsettled
+  dispatches for that placement number fewer than the placement's
+  `max_running:`** — an integer of at least `1`, default `1`, declared in the
+  deploy file beside the placement's members. A worker claiming two placements
+  holds up to each one's cap of each. A worker runs every dispatch it holds
+  concurrently, each in its own node runner, and keeps polling while any is
+  unsettled.
+- **A parked dispatch goes to the least-loaded session asking for it**: of the
+  sessions holding a poll that claim its placement and are below its cap, the
+  one holding the **fewest** of that placement's unsettled dispatches — and
+  between two holding as many, the one whose poll arrived **first**. The oldest
+  parked work still goes first (§6.2's park order); what this rule decides is
+  which session it goes to, so a pool with uneven load evens out rather than
+  piling onto whoever polls fastest.
 
-**The second clause is a decision this document makes, not one a resolved PRD
-entry hands it**, and it is worth marking as such because it is the only rule in
-§2 that is not forced by the transport. What the resolutions do fix is where a
-placement's parallelism comes from: several workers claiming one name form a
-pool the hub dispatches across (PRD resolved q38, §1.1), and the project's
-standing answer to "more throughput" is more processes rather than a cleverer
-one (resolved q37 says it of hubs). None of them fixes how many dispatches a
-single *session* may hold. v1 fixes it at one, because one is what makes
-`dispatch_id` idempotency (§3.4), the mid-node disconnect rule (§7.3) and
-heartbeat loss (§6.3) statements about a session rather than about a per-worker
-scheduler nobody has written. **Raising it is a question for the PRD**
-(§13) rather than a hub's configuration knob: it changes what heartbeat loss
-costs an execution (§6.3). The wire is shaped so that whatever the answer is, it
-arrives additively — a worker declaring a capacity at join is an OPTIONAL
-request field whose absence means one, which §10.2 makes a compatible change.
-
-Concurrency in v1 therefore comes from **more sessions, never from more
-dispatches on one**: several workers claiming one name form a pool (§1.1), and a
-machine that should run two nodes at once runs two workers.
+**Capacity is a property of a session, and it is read off the journal's dispatch
+rows** each time the hub asks (PRD resolved q44): a session is one worker process
+and one join, and what it holds is the rows dispatched to it that no result has
+settled and the hub has not superseded — never a counter the rows could disagree
+with. A dispatch the hub **cancelled** stays on its session's count until the
+worker's cancelled result settles it (§3.4), because the process running it is
+still stopping. There is **no** hub option, environment variable or join field
+for the number: it is a property of the machine a placement names — what the
+machine with the GPU can run at once — so it is the deploy layer's, beside the
+members it is about, and a worker does not declare its own. This replaces v1's
+"a session holds exactly one unsettled dispatch", which §13 recorded as this
+document's own decision and PRD resolved q79 retired.
 
 **So `max_concurrency:` bounds admission, and a placed node's parallelism is the
-size of its pool.** A `map` declares how many instances the *graph* may have in
-flight (grammar §8.6); when the node it dispatches is placed, how many of them
-are **running** at once is the number of live sessions claiming that placement,
-and never more. A `max_concurrency: 8` over an `agent.signer` placed on `mac`,
-with one worker on the Mac, runs one at a time: the map admits eight, the
-placement delivers one, and the other seven are queued to the placement — §2
-queues work to a placement and never to a worker (§6.3) — with no session free to
-hand them to. An implementation MAY hold those seven as placement waits on the
-board (§6.1) or in an admission queue of its own; what is normative is that they
-are **undispatched**, which is §6.4's first row.
+sum of its pool's caps.** A `map` declares how many instances the *graph* may
+have in flight (grammar §8.6); when the node it dispatches is placed, how many of
+them are **running** at once is the sum of `max_running:` over the live sessions
+claiming that placement, and never more. A `max_concurrency: 8` over an
+`agent.signer` placed on `mac`, with one worker on the Mac and `max_running: 2`,
+runs two at a time: the map admits eight, the placement delivers two, and the
+other six are queued to the placement — §2 queues work to a placement and never
+to a worker (§6.3) — with no slot free to hand them to. An implementation MAY
+hold those six as placement waits on the board (§6.1) or in an admission queue
+of its own; what is normative is that they are **undispatched**, which is §6.4's
+first row.
 
 That is the same posture PRD 5.6's placement-synergy bullet takes, read through
 the shape that replaced the one it was written against: *map instances are the
 natural unit for `runtime: isolated` — one worker per sandbox with zero change to
-the logical definition*. The unit of isolation there is a worker too, and "one
-worker per sandbox" is "eight at once is eight workers" in the vocabulary of the
-address-keyed sketch resolved q38 retired (grammar D128). What the bullet
-promises is kept exactly: the *logical definition* does not change — one `map`
-runs eight-wide against a pool of eight and one-wide against a pool of one, with
-no edit to the graph. What the spec deliberately cannot express is how many
-workers show up, because resolved q38 put machines and their addresses outside
-the spec on purpose.
+the logical definition*. What the bullet promises is kept exactly: the *logical
+definition* does not change — one `map` runs eight-wide against a pool that can
+hold eight and one-wide against a pool that can hold one, with no edit to the
+graph. What the spec deliberately cannot express is how many workers show up,
+because resolved q38 put machines and their addresses outside the spec on
+purpose; what a machine can run at once, it can — that is `max_running:`.
 
 Undispatched is a pause rather than a failure, but it is not free of the clock:
 a node's `timeout:` chain runs from dispatch (§6.5), so an item that waits out
 its timeout behind a busy worker fails on it exactly as one waiting for a
 machine that is switched off does. Both halves of that are the author's to size.
-Eight signings at once needs eight workers claiming `mac`; a graph that should
-not admit more work than the mesh can run writes the `max_concurrency:` those
-workers can serve; and a `timeout:` on a placed node is a bound on **queueing
+Eight signings at once needs a pool whose caps sum to eight — eight workers
+claiming `mac`, or one whose placement says `max_running: 8`; a graph that should
+not admit more work than the mesh can run writes the `max_concurrency:` that pool
+can serve; and a `timeout:` on a placed node is a bound on **queueing
 plus execution**, not on execution alone.
 
 What it is not a bound on is *thinking*. A dispatch that settles paused (§3.4)
@@ -256,9 +258,9 @@ Both are acceptable for a graph whose nodes are model calls.
 
 | | value |
 |---|---|
-| poll hold | 25 seconds (the hub answers `204` at the end of a hold with no work for this session) |
+| poll hold | 25 seconds (the hub answers `204` at the end of a hold with no work and no cancel for this session) |
 | session liveness window | 90 seconds since the last request on a session |
-| worker re-poll after `204` | immediately, whether or not it is executing a dispatch |
+| worker re-poll after `204` | immediately, whether or not it is executing dispatches |
 | worker re-join after a transport failure | bounded exponential backoff, starting at 1 second and capped at 30 |
 
 A hold shorter than most intermediary idle timeouts and a liveness window
@@ -478,10 +480,11 @@ otherwise recovers the token byte by byte.
 
 Carries the session. Long-polls for up to one hold (§2).
 
-- **`200`** with a dispatch:
+- **`200`** with a dispatch, a cancel, or both:
 
   ```json
   {
+    "cancel": ["dsp_…"],
     "dispatch_id": "dsp_…",
     "execution_id": "exec_…",
     "node": "flow.release.sign",
@@ -494,6 +497,19 @@ Carries the session. Long-polls for up to one hold (§2).
     "effect_history": [ { "…": "…" } ]
   }
   ```
+
+  **`cancel`** is on every `200` (PRD resolved q75, Decision D160): the
+  dispatches this session holds that the hub has **cancelled** since it last
+  said so — an empty array where there are none. A worker stops each one it
+  names: it sends that dispatch's node runner `SIGTERM`, which the runner turns
+  into its execution's own cancel, so a model call's request, a spawned command
+  and a harness run stop where they are; a runner still running five seconds
+  later is killed with its whole process group. The worker then posts that
+  dispatch's result as `status: "cancelled"` (§3.4), whatever the runner managed
+  to say. A `200` carrying **only** `cancel` — no `dispatch_id` and none of the
+  fields after it — hands nothing over: the hub answers a held poll that way as
+  soon as a cancel is owed, rather than at the end of the hold. A name the worker
+  does not hold — already settled, or never handed over — is nothing to stop.
 
   `instance_path` is the flattened path grammar §9.4 fixes as the idempotency
   key, so the worker computes the same keys the hub would. `effect_history` is
@@ -527,10 +543,12 @@ Carries the session. Long-polls for up to one hold (§2).
   ignores — which is why the shape is written this way rather than as a second
   version of the route.
 
-- **`204`** when the hold expired with no work **for this session** — which
-  includes every hold while the session has a dispatch it has not settled (§2).
-  A busy worker keeps polling and keeps being answered `204`, however deep the
-  queue for the placement it claims; that is the mechanism, not a degenerate
+- **`204`** when the hold expired with no work and no cancel **for this
+  session** — which includes every hold while the session holds as many of a
+  placement's unsettled dispatches as that placement's `max_running:` allows
+  (§2), and every hold another session took the work of, being less loaded. A
+  session at its cap keeps polling and keeps being answered `204`, however deep
+  the queue for the placement it claims; that is the mechanism, not a degenerate
   case of it.
 
 - **`410`** when the session is unknown (§3): the worker joins again and resumes
@@ -650,7 +668,23 @@ an effect the replay of §7 cannot skip.
 ### 3.4 `POST /workers/result`
 
 Carries the session and the `dispatch_id`. The node's outcome: its output, its
-failure, or **the pause it stopped at**.
+failure, **the pause it stopped at**, or **that it was cancelled**.
+
+**A cancelled result** is `{ "dispatch_id": "dsp_…", "status": "cancelled" }`
+and nothing else (PRD resolved q75, Decision D160): the worker's statement
+that it stopped the work the hub named in a poll's `cancel` list (§3.2). It
+**settles** the dispatch — the `204` row — and it is what takes the dispatch off
+its session's capacity (§2): until it arrives the process is still stopping, so
+the dispatch still counts. The hub journals it as the dispatch's settled outcome
+with the error name `ExecutionCancelled`, which is how a restarted hub's replay
+reads it back as the cancel it was rather than as a failure
+(`docs/durability.md` §6.1). A cancelled result for a dispatch the hub did **not**
+cancel is a worker that stopped of its own accord, and the node's attempt fails
+on it (`DispatchCancelledUnasked`) under its own `retry:` chain; one that also
+carries `output`, `error` or `paused` is a body the hub cannot read as one
+ending, and so is any `status` but `"cancelled"`: either fails the attempt
+(`CancelledResultUnreadable`), because the result settles the dispatch either
+way and a hub that guessed would guess a node's outcome.
 
 **Idempotent by `dispatch_id`.** A second result for a dispatch an earlier one
 already **settled** is accepted and dropped, which is what makes at-least-once
@@ -925,8 +959,10 @@ each process, not across this wire. A `finally_error` such an instance raises
 after the execution has settled arrives with the result and is kept on the
 dispatch's settled outcome, too late for the closed lifecycle row and the
 shipped envelope; the hub says so on stderr and holds nothing for it
-(`docs/durability.md` §3.10). Carrying the end across is PRD resolved q75's: the poll
-response's `cancel` list, a protocol change of its own (§10).
+(`docs/durability.md` §3.10). What does cross the wire is a **cancel** (PRD
+resolved q75): the poll response's `cancel` list (§3.2) stops the dispatched node
+and every instance it began on the worker — each ending `cancelled` and running
+its own finally node there — and the cancelled result settles it.
 
 #### The two verbs
 
@@ -934,8 +970,9 @@ response's `cancel` list, a protocol change of its own (§10).
 — they are not synonyms and the table below turns on the difference. A dispatch
 is **settled** when a result posted for it is what ended it, and **superseded**
 when the hub ended it without one, which §6.3's declaration is the only way of
-doing. A dispatch in neither state is **unsettled**: still in flight, and the one
-piece of work a session may be holding (§2). So a re-posted result never matches
+doing. A dispatch in neither state is **unsettled**: still in flight, and what a
+session's capacity counts (§2). A dispatch the hub cancelled is unsettled until
+the worker's cancelled result settles it. So a re-posted result never matches
 two rows: `204` says the hub holds this dispatch's own result, `409` says the hub
 ended this dispatch without one and the execution has moved past it.
 
@@ -1206,6 +1243,14 @@ invariant:
 3. **Workers address a hub *name*, not a process.** A worker is configured with a
    URL, and replacing the process behind that URL is invisible to it.
 
+What a session record carries beyond its identity, its claims and when it was
+last seen is the **cancels it is owed** (§3.2, PRD resolved q75): the dispatches
+it holds that the hub has cancelled and not yet named in a poll's `cancel` list.
+They are advisory in the same sense. A session that ends has every dispatch it
+held superseded (§6.3), which a cancel needs no notice for; and its **load** is
+not on the record at all — it is read off the dispatch rows each time it is
+asked (§2), so there is no counter to lose.
+
 The reason is failover. Any process pointed at the journal recovers every
 execution — that is the failover primitive `docs/durability.md` §6 already
 proves — and these three rules are what stop the *worker protocol* from being
@@ -1305,16 +1350,17 @@ two share their whole cost model — the `410`, the re-join, and the treatment o
 an unsettled dispatch below — which is why §5 states that rule by pointing here
 rather than by writing a second one.
 
-What the declaration costs depends on the one thing a session can be holding.
-§2's pull model queues work to a **placement**, never to a worker, and hands it
-over one dispatch at a time, so a session holds at most one piece of work: the
-dispatch it has not settled. Two cases, and they are the whole rule.
+What the declaration costs depends on what a session can be holding. §2's pull
+model queues work to a **placement**, never to a worker, and a session holds up
+to each placement's `max_running:` of its dispatches: the dispatches it has not
+settled. Two cases, and they are the whole rule — the second applied to **each**
+dispatch the session held.
 
 - **The session had no unsettled dispatch.** Nothing re-parks, because nothing
   was ever this worker's. The placement's open placement-waits stay on the board
   untouched, and the next join claiming that placement takes them in park order
   (§6.2). This is the sleeping laptop, and it costs the execution nothing.
-- **The session had an unsettled dispatch.** The hub **supersedes** it — §3.4's
+- **The session had unsettled dispatches.** The hub **supersedes** each one — §3.4's
   second terminal state, the one no result ended, and never the settled one — and
   the node's attempt fails with it, under that node's `retry:`/`on_error:` chain
   exactly as §7.3 says — the liveness window is what *detects* the mid-node
@@ -1345,19 +1391,19 @@ PRD resolved q39 puts this as "heartbeat loss re-parks what was queued to the
 vanished worker". The phrase is written in the vocabulary of a push model, where
 a worker holds a queue of its own; this protocol pulls, and §2 queues work to a
 **placement** rather than to a worker, so what the clause names is the one thing
-a session can be holding. At v1's capacity of one that is the unsettled
-dispatch, and it does re-park — by the second case above: the attempt fails, and
+a session can be holding: its unsettled dispatches, and each does re-park — by the second case above: the attempt fails, and
 where `retry:` grants another the node re-enters dispatch and parks on the board
 if nothing is claiming the placement. What the re-park costs is an attempt, and
 that price is the one resolved q39 and q42 set together when they made mid-node a
 failure rather than a pause (§6.4).
 
-**This is the rule §2's open capacity question would move.** A session allowed to
-hold more than one dispatch makes "what was queued" a plural, and the choice
-between superseding all of it and handing back the part no effect record vouches
-for is a choice about what a closed laptop costs an execution — which is why §2
-sends the capacity to the PRD (§13) instead of leaving it to a hub's
-configuration.
+**A session holding several dispatches loses each of them alike.** PRD resolved
+q79 made "what was queued" a plural, and the rule did not change with it: every
+dispatch the gone session held is superseded and fails an attempt, because each
+was mid-node on a machine that stopped answering — none of them is undispatched
+work, which is what would re-park as a pause (§6.4). A closed laptop holding a
+placement's `max_running:` of its dispatches therefore costs that many
+attempts, which is what an author raising the cap is choosing.
 
 ### 6.4 Undispatched is a pause; mid-node is a failure
 
@@ -1409,6 +1455,13 @@ system learns "waiting for the Mac" exactly the way it learns "waiting for a
 human". The delivery is an ordinary journaled callback: at-least-once, bounded
 retry, ordered by event ordinal rather than by arrival
 (`docs/durability.md` §3.7).
+
+A **cancel** releases a placement wait the same way it releases every wait the
+execution holds (PRD resolved q75, Decision D160): a dispatch still parked is
+withdrawn from the board — no worker has it, so there is nobody to tell — and
+one a worker holds is cancelled over the wire (§3.2, §3.4). The execution's
+`settled` webhook then carries `status: "cancelled"`, which is the one new value
+the lifecycle's settle may carry; a parking announces nothing new.
 
 ---
 
@@ -1809,10 +1862,11 @@ the previous version behave **wrongly** rather than be refused:
 * changing a route's path or method, or *when* it may legally be called —
   including whether a poll may be outstanding while a dispatch is unsettled
   (§2), which an older worker would answer with silence the hub would read as
-  death. §2's other clause is the opposite case and belongs to §10.2: a hub that
-  learned to hold more than one dispatch on a session still answers one at a time
-  to a worker that declares no capacity, so nothing an older peer does becomes
-  wrong;
+  death — or what a poll's answer may hand a session that is already holding
+  one. Protocol `3` is that case: a hub that hands a second dispatch to a
+  session holding one, under a placement's `max_running:`, is answering a
+  protocol `2` worker with work that worker would queue behind the first, and
+  a `cancel` list it would never act on (§10.4);
 * changing which side writes the journal (§3.3), or where an idempotency key
   comes from (§3.3, §3.4);
 * changing what a status code means at a route — a `410` that stopped meaning
@@ -1834,10 +1888,11 @@ or a second implementation of this document.
 | version | what changed, and why it is a bump |
 |---|---|
 | **1** | this document, as the runtime that landed with it speaks it |
+| **3** | PRD resolved q75 and q79, one bump for both (2026-11-04). The poll's `200` gains **`cancel`** (§3.2) — the dispatches this session holds that the hub has cancelled — and may be that list alone; the result gains its fourth ending, **`status: "cancelled"`** (§3.4); and the hub may hand a session **more than one** unsettled dispatch of a placement, up to its `max_running:` (§2), so the poll answer's "`204` while a dispatch is unsettled" sentence is gone. A peer of `2` would be *wrong* rather than refused on each: it ignores a `cancel` list, so a cancelled node runs on to its end and its process is never stopped; it never posts the cancelled ending, so the dispatch it holds never settles and counts against its session's capacity until the liveness window supersedes it; and it queues a second dispatch behind the first, where the hub counted on both running. That is §10.3's first and second rows, and a protocol `2` worker is refused at the join with `409` naming both versions |
 | **2** | §3.4's **paused** result (PRD resolved q46, 2026-08-31). A result may settle a dispatch with the wait a `human:` node opened, and a peer of `1` would read one as a node that answered with no output — a node that "quietly means something else", which is §10.3's first row exactly, and its third: `paused` changes what a result *is*. The same release also **enforces** §3.3's effect-key derivation at `/workers/effects`: a record carrying a `key` its own `site`, `kind` and `ordinal` do not derive is `400` where it was journaled before. That is not what the bump is for and needs none of its own — the derivation is the rule §3.3 and grammar §9.4 already stated, so a conforming `1` peer sends what it always sent, and one that spelled a key its own fields do not derive is now *refused* rather than left to write into another node's slot, which is what §10 says a protocol check is for. It is recorded here because this table is where a second implementation reads what moved |
 
-**The bump to 2 costs nothing in practice, and saying so is the point of
-recording it.** A worker and the hub it talks to are built from one compiler
+**The bumps to 2 and to 3 cost nothing in practice, and saying so is the point
+of recording them.** A worker and the hub it talks to are built from one compiler
 release, so the handshake triple (§4.1) already refuses a mixed pair at the join
 — by compiler version, before `protocol` could ever be the deciding field. What
 the bump buys is the case the triple does not cover: a worker binary somebody
@@ -1891,7 +1946,10 @@ process could open (§14.1 rule 5, PRD resolved q45), the conditional join token
 and the `public_url:` shape. A deploy file that breaks one of those is a
 compile error.
 
-What a **build** emits for a target that declares `placements:`: the hub. The
+What a **build** emits for a target that declares `placements:`: the hub — and
+with it each placement's `max_running:` (§2, grammar §14.1), which the hub's poll
+handler asks before it hands a session work, choosing the least-loaded session
+polling for it. The
 five routes of §3 on the served app, the artifact server of §3.5 over a content
 hash the tree carries, the dispatch board with placement waits on it (§6), the
 liveness sweep of §6.3, idempotent effect ingestion (§3.3), the *paused* ending
@@ -1904,10 +1962,13 @@ dispatch-and-await rather than a call (§7).
 
 What **`agent-compose worker`** is: the spoke. `--hub <url> --claim <name>…
 --token-env <VAR> [--data-dir <path>]`, a complete protocol client — the
-provisioning cycle of §4, one held poll at a time with a node running beside it
-(§2), effect batches as they happen, results, §2's backoff for transport
-failures, and the status discipline of §3 and §5. It executes each dispatch by
-spawning the node runner the artifact carries, one process per dispatch. Its
+provisioning cycle of §4, one held poll at a time with every dispatch it holds
+running beside it (§2), effect batches as they happen, results — the cancelled
+one among them, for a dispatch a poll's `cancel` list names, whose runner it
+sends `SIGTERM` and then kills with its process group five seconds later
+(§3.2, §3.4) — §2's backoff for transport failures, and the status discipline
+of §3 and §5. It executes each dispatch by spawning the node runner the
+artifact carries, one process per dispatch, each in a process group of its own. Its
 store is the artifact in hand and the one it replaced, keyed by hash as §4 step 3
 says: a hub rolled back to the older of the two is answered off the disk, and no
 third tree accumulates.
@@ -2009,15 +2070,15 @@ nothing implements past them.
 
 ## 13. What this document does not settle
 
-Two questions are **open**, and each one is here because a normative document
-may fix a wire and may not fix a design decision the PRD has not made. `prd.md`
+One question is **open**, and it is here because a normative document may fix
+a wire and may not fix a design decision the PRD has not made. `prd.md`
 is the single source of truth for design decisions; this document is downstream
 of it, and §12's "held to" stops at this table.
 
 **So this section is a gate, not a note.** The project's discipline is that a new
 design question lands in the PRD's Open Questions and is resolved there before
-the affected area is implemented. These two are that list *staged*, which is as
-far as this document can take them: entering a question in the PRD's Open
+the affected area is implemented. This one is that list *staged*, which is as
+far as this document can take it: entering a question in the PRD's Open
 Questions, and resolving it there, is a change to `prd.md` and a reviewed
 decision of its own — never something a downstream document performs by
 describing it. **Before any code goes past a row's default, that row's question
@@ -2027,21 +2088,24 @@ that reads a "what stands in the meantime" cell as wire has decided a PRD
 question in a downstream document, which is the thing this section exists to
 prevent.
 
-Both remaining rows are the same shape: a **gap** — a knob nobody has weighed,
-filled here conservatively, where the wire admits any answer additively. So what
-the PRD owes each is a decision rather than a correction, and the runtime that
-landed was written to those defaults and no further. Their absences are held
-rather than remembered, and `crates/compose-core/src/codegen/mesh.rs` says
-exactly how far that holding reaches: it **pins** the emitted session to the four
-fields §5 gives it, so a capacity arriving under a spelling nobody has used yet is
-still a failing test, and it **greps** the hub's code for the spellings the two
-rows have arrived under before — `capacity`, `maxDispatches`, `max_dispatches`
-for the first; `sandbox`, `seccomp`, `restrictions` for the second. A grep is a
-floor rather than a proof, which is why the first row has the pin as well. Raising
-a default is what needs the PRD; keeping one needs a test.
+The remaining row is a **gap** — a knob nobody has weighed, filled here
+conservatively, where the wire admits any answer additively. So what the PRD owes
+it is a decision rather than a correction, and the runtime that landed was
+written to its default and no further. Its absence is held rather than
+remembered: `crates/compose-core/src/codegen/mesh.rs` **greps** the hub's code
+for the spellings it has arrived under before — `sandbox`, `seccomp`,
+`restrictions`. A grep is a floor rather than a proof; raising a default is what
+needs the PRD, and keeping one needs a test.
 
-**Three rows have left this table by being answered, which is what the table is
-for.** It held a row for a contradiction between resolved q40's mismatch clause
+**Four rows have left this table by being answered, which is what the table is
+for.** The latest is **a session's dispatch capacity**, which v1 fixed at one as
+this document's own proposal — "no capacity knob — a session holds exactly one
+unsettled dispatch" — until PRD resolved q79 (2026-11-04) answered it with a
+placement key: `max_running:` (grammar §14.1, Decision D161) is how many of a
+placement's dispatches one session may hold, read off the dispatch rows, with the
+free slot going to the least-loaded session asking for it (§2). The test that
+pinned the old decision is replaced by tests of the cap and of the least-loaded
+rule, and the move was protocol `3` (§10.4). Before it, the table held a row for a contradiction between resolved q40's mismatch clause
 and §4.1's repair, until q40's amendment of 2026-08-30 resolved it; §4.1 now
 states that rule as settled wire. It held a row for **a placed component's
 `store.*` on a process-local backend** — a *sharp edge*, a composition this
@@ -2059,10 +2123,9 @@ one here — which is what happened: the resolution took the decision, and
 
 | | what is unsettled | what stands in the meantime |
 |---|---|---|
-| **a session's dispatch capacity** (§2, §6.3) | how many dispatches one worker session may hold. Resolved q38 fixes that a placement's pool is several workers, and resolved q37 that scale comes from more processes; neither says anything about one session. Raising the number changes what heartbeat loss costs an execution — the difference between failing an attempt and handing work back to the board — which is why it is not a hub's knob | one, as §2 states it — a v1 default this document proposes, which no resolved entry contradicts and none has weighed. The wire admits any other answer additively (an OPTIONAL capacity at join, §10.2), so the runtime may build against one; **raising** it is what the PRD has to answer first |
 | **containment beyond the process boundary** (§11) | resolved q31 fixed v1 containment at root plus timeout and deferred containers, seccomp and "any deploy-target-level restriction (refusing bash on a distributed placement is a placement fact)" **to the distribution work**. The distribution resolutions did not take it up, and q44's out-list does not name it, so nothing has decided whether a placement may carry a sandbox or a capability restriction | no such key exists, in the grammar or on the wire; a worker runs the artifact with its own privileges. Grammar D128 retires the reserved `network:` key on the ground that no *resolved* containment story backs it, which is a statement about today rather than about what a later resolution may add |
 
-Neither row blocks the runtime: each names what stands until the PRD answers, and
-both arrive additively rather than as a re-cut, which is what lets the runtime
-build against their defaults. What they block is the same thing the three
-answered rows blocked: an implementation deciding one of them quietly.
+The row does not block the runtime: it names what stands until the PRD answers,
+and it arrives additively rather than as a re-cut, which is what lets the runtime
+build against its default. What it blocks is the same thing the four answered
+rows blocked: an implementation deciding it quietly.

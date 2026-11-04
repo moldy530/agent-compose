@@ -352,7 +352,7 @@ kind, that records a **boundary** rather than an effect:
 | `store` | `runStoreOp` in `src/stores.ts` | §3.3 |
 | `human` | `runHuman` in `src/runtime.ts` | §3.4 |
 | `harness` | `runCoder` in `src/runtime.ts` | §3.9 |
-| `finally` | `endInstance` in `src/runtime.ts` | §3.10 |
+| `finally` | `endInstanceAt` (under `endInstance`) in `src/runtime.ts` | §3.10 |
 
 Three constructs record nothing of their own, and need none: a `flow:` node, a
 `map` dispatch, and a flow-as-tool call are *instantiations*, not effects. What
@@ -779,14 +779,15 @@ One row per execution, written before the graph is streamed:
 | `sessionKey` | the session identity `scope: session` stores key off (`docs/grammar.md` §11.3) |
 | `callback` | where this execution's lifecycle webhooks go, for an `async` `http` trigger that asked for one (`docs/grammar.md` §13.3) — absent for every other invocation. Recorded because the process that *finishes* an execution need not be the one that started it (§6.1), and resolved when the request arrives rather than when the run ends, which is what makes that possible. The URL only: the request it came out of is not kept. §3.7 is what is delivered to it |
 | `lineage` | what started a **child execution** (§3.2, PRD resolved q65): the `parent` execution's id, the dispatch's `idempotency_key`, and its `item_index` where a `map` dispatched it — the value `execution.item_index` holds everywhere inside the child (Decision D115) — and its `admission`: the map node's `max_concurrency:` and the route's own bound it was issued under, each named by the key the runtime counts that node's permits against, as JSON. That last is what a recovery with no parent to re-issue the child admits it under (§6.1, Decision D28). Absent on every execution a trigger or a command started. Held in a table of its own, `lineage`, keyed by the execution id, rather than as columns here: a whole table is what `CREATE TABLE IF NOT EXISTS` adds to a journal an older build wrote, on every backend, with no column probe on any of them (§11.2). It is written **before** the lifecycle row, so a process that dies between the two leaves a lineage row nothing reads rather than a child that has forgotten its cause |
-| `status` | `open`, `completed` or `failed` — §3.6 |
+| `status` | `open`, `completed`, `failed` or `cancelled` — §3.6 |
 | `journalVersion` | the version at the head of this document |
-| `startedAt`, `endedAt`, `error` | when, and why it failed |
+| `startedAt`, `endedAt`, `error` | when, and why it failed — `error` is absent on a `cancelled` row: nothing went wrong with an execution somebody stopped (Decision D160) |
+| `cancelRequestedAt` | when somebody asked for this execution to be **cancelled** (`POST /executions/:id/cancel`, `agent-compose cancel`; PRD resolved q75, Decision D160) — absent on every row nobody cancelled. The request is recorded **before** anything is stopped, so a process that dies between the `202` and the settled row leaves an `open` row carrying it, and the recovery that finds it completes the cancel (§6.1). Held in a table of its own, `cancellations` — `execution` the primary key, `requested_at` the instant — and joined onto the row by both reads that return one, so it is a whole table `CREATE TABLE IF NOT EXISTS` adds to a journal an older build wrote, with no column probe on any backend (§11.2). A second request of the same execution is a no-op that keeps the first one's instant |
 | `finallyError` | what a flow's `finally:` node raised after its own retries, where one did (`docs/grammar.md` §7.9, PRD resolved q76): the **first** such failure in the execution — a subflow instance's finally node and the root's can both fail — as `<flow> node \`<id>\` failed: <error>`. Beside a `status` it does not change: a `completed` row carrying one is a run that produced its answer and whose cleanup did not. Absent on every row whose finally nodes completed, on every row of an execution that had none, and for a failure raised after the row was written (§3.10). The column is `finally_error`, nullable, and added to a journal an older build created by a probe on every backend (§11.2) |
 
 ### 3.6 What `status` means
 
-Three values, and which one a run leaves behind is what decides whether it can
+Four values, and which one a run leaves behind is what decides whether it can
 be resumed:
 
 * **`completed`** — the run produced its `outputs:`. Nothing left to replay.
@@ -794,10 +795,18 @@ be resumed:
   node failed and the composition's own `on_error:` decided the run. Replaying
   it would re-derive the same failure from the same record, so `resume` refuses
   it by name. A **divergence** is not one of these and never closes a row (§7).
+* **`cancelled`** — somebody cancelled the execution and the cancel completed:
+  every node it was running stopped, every instance it had open ended
+  `cancelled` and ran its `finally:` node, and every open child execution in its
+  lineage was cancelled too (PRD resolved q75, Decision D160). Ended for good:
+  `resume` refuses it naming the status, the cancel route answers `409`, and
+  recovery leaves it alone. It carries no `error`.
 * **`open`** — the run has not ended. Two ways to be open, and both are exactly
   what recovery is for: the process died, or the run reached a `human` pause
   with nobody to answer it (`docs/grammar.md` §8.7) and ended `3`. The second is
-  the reason an interrupt does not close the row.
+  the reason an interrupt does not close the row. An open row carrying
+  `cancelRequestedAt` is a cancel a process accepted and did not live to
+  complete; §6.1 is what becomes of it.
 
 ### 3.7 A delivery
 
@@ -1167,7 +1176,7 @@ One record per flow instance that **ended** and whose flow declares a `finally:`
 node (`docs/grammar.md` §7.9, PRD resolved q76): the root instance of an
 execution, each `flow:` node's instance, each joined `map` dispatch's, each
 flow-as-tool call's — and a child execution's root, which is an execution of its
-own. It is written by `endInstance` in `src/runtime.ts`, **before** the finally
+own. It is written by `endInstanceAt` (under `endInstance`) in `src/runtime.ts`, **before** the finally
 node runs, and it is the record of the instance crossing from its body into its
 finally node.
 
@@ -1519,6 +1528,37 @@ delivery the exit cuts off, and the start's sweep of expired keys
 the one the next start does not come back for, so rows a stop left behind would
 be rows no process ever removes. Each dial that wait makes is bounded at ten
 seconds, and nothing is closed under the executions still running beside it.
+
+#### Restart mid-cancel completes the cancel
+
+An `open` row carrying `cancelRequestedAt` (§3.5) is an execution whose cancel
+was accepted by a process that died before the row settled. The generation that
+recovers it — `serve`'s, or an `agent-compose resume` — **replays the recorded
+prefix** like any recovery, re-entering every instance the dying process had
+open, and the **first effect the journal does not hold** is where the cancel
+fires instead of the effect being issued (PRD resolved q75, Decision D160). So
+nothing new runs past the record but the ends the cancel owes: each re-entered
+instance ends `cancelled`, innermost first, and runs its `finally:` node —
+**once**, since its boundary (§3.10) and its effects are journaled, so a finally
+node the dying process had already run replays from its record rather than
+running twice — and the row settles `cancelled`.
+
+A finally node's own effects are not that frontier: a finally node is how an
+instance ends, so one the replay reaches runs whole, past the record, exactly as
+it would have in the process that accepted the cancel. A **placed dispatch**
+still unsettled is a frontier too, and the cancel withdraws it or tells the
+worker holding it (`docs/distributed.md` §3.2); so is a dispatch row a worker
+settled with the cancelled ending (`ExecutionCancelled`, `docs/distributed.md`
+§3.4), which the replay reads back as the cancel it was. And a body whose whole
+record replays to its end had ended before the cancel could reach it, and
+settles as it ended — the cancel changes no outcome it arrives after.
+
+**A stopped effect is not recorded.** An effect the cancel stops in flight — a
+model call whose request was aborted, a command killed part-way — writes no
+record. Recorded, it would be replayed as the world's answer by the generation
+that completes a cancel a restart interrupted, and absorbed by policies a cancel
+is never routed through; unrecorded, it is simply the frontier, where that
+generation fires the cancel again.
 
 ### 6.2 `run` journals; `resume` replays
 
@@ -2109,6 +2149,21 @@ the column back, the resumed generation records the boundary live and runs the
 finally node, and the failure that node raises lands in the column this build
 added. `journal_backend_conformance` carries the column's migration and the new
 record kind on all three arms.
+
+**A cancel arrived under the physical-schema clause and the vocabulary's**
+(§3.5, §3.6, PRD resolved q75): a whole table, `cancellations`, and a fourth
+`status` value. The table is `lineage`'s case — `CREATE TABLE IF NOT EXISTS`
+adds it to a journal an older build wrote, on every backend, with no probe — and
+every row in such a journal reads as one nobody cancelled, which is what every
+one of them was. The value is new to a reader, not to a record: no row an older
+build wrote is `cancelled`, so nothing a replay consumes changes meaning, and an
+older build reading this build's journal meets a closed row it neither recovers
+nor resumes, which is what `cancelled` asks of it. Executed:
+`journal_backend_conformance` drops the table from a journal on each of the three
+arms, re-opens it, and records a cancel of a row it holds open
+(`a_journal_without_the_cancellations_table_gains_it_on_open`), beside the
+request's round trip, its first-instant-wins rule and the settled row's absent
+`error`.
 
 ### 11.3 What requires a version bump
 

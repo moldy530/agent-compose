@@ -143,7 +143,14 @@ Two `http` triggers declaring one route — the same effective `path:` at the sa
 and cannot dispatch one pair two ways.
 
 Generated apps expose `start`, `resume` and `status` routes; resume payloads are
-validated against the interrupting `human` node's output schema.
+validated against the interrupting `human` node's output schema. They expose a
+`cancel` route too — `POST /executions/:id/cancel` — which stops an open
+execution and every open child execution it started: `202` when the request is
+recorded, `409` naming the status for an execution that has already ended,
+`404` for an id the app does not know. The execution then settles `cancelled`,
+and a `callback:` subscriber is told so by the `settled` webhook, whose body's
+`status` is `cancelled` and carries no `error`. `agent-compose cancel` sends it
+(`agent-compose docs cli`).
 
 ## Authenticating an `http` trigger
 
@@ -189,9 +196,10 @@ auth:                            # exactly ONE of bearer | hmac
   lowercases header names on the wire, which is why `payload.headers` shows them
   lowercased too. `X-Hub-Signature-256` finds `x-hub-signature-256`.
 
-**`auth:` guards three routes.** `resume` *injects data into a parked run* —
-strictly more sensitive than starting one — so `resume` and `status` enforce the
-auth of the trigger that **started that execution**. An execution an
+**`auth:` guards four routes.** `resume` *injects data into a parked run* —
+strictly more sensitive than starting one — and `cancel` stops one, so `resume`,
+`cancel` and `status` enforce the auth of the trigger that **started that
+execution**. An execution an
 authenticated trigger began never answers an unauthenticated poll; one a no-auth
 trigger began keeps open routes.
 
