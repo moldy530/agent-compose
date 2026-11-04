@@ -12109,7 +12109,13 @@ resolved q29) — its row is the one the first attempt recorded; and a write
 that rolled back — a partial update `V` refused, a statement the server failed,
 a crash before the commit — has none, because the row was inserted in the
 transaction that did not commit. That is the ruling's verification read
-straight: a failed `merge` leaves no entry. Two writes apply without changing
+straight: a failed `merge` leaves no entry. The row is inserted after the
+entry's own statement and before the ledger claim, and the store contract
+fails a write at each side of it on every arm — at its ledger claim, with its
+history row inserted and not yet visible outside its transaction, and at its
+history row itself, with its entry written — and finds nothing of either
+write left, so a history row inserted after the `COMMIT`, or outside the
+write's transaction, fails it. Two writes apply without changing
 the value, and each records a row, because the ruling's word is every write
 and both applied: a `delete` of a key that held nothing (`deleted: false`), whose
 row has no value on either side and no version, and an `append` with
@@ -12152,9 +12158,15 @@ storage on q69's schedule, inside the two sweeps an expired key does (D153): a
 write to a partition removes at most 100 of that partition's rows past
 retention, under the partition's sequence lock and before it reads its key,
 and the next process start removes the rest in batches of at most 1000 behind
-the ops, a dialled store's under each partition's lock in turn. A store that
-declares no `history_retention:` keeps every row, for good — one per write that
-lands — and that is the trade the stores topic states: the record is exact and
+the ops, a dialled store's under each partition's lock in turn. The store
+contract drives both bounds past their limits on every arm, with a write's
+sweep held to its own partition and, on a dialled store, each start-sweep
+batch to the partition whose lock it holds. An execution-scoped store's rows
+go with the run's other rows when it ends (§11.3): with the in-memory
+partition on a local store, and by the run's `DELETE` of every table a
+partition keeps rows in on a dialled one. A store that declares no
+`history_retention:` keeps every row, for good — one per write that lands —
+and that is the trade the stores topic states: the record is exact and
 complete, and it grows without bound.
 
 **The operator's command line.** `agent-compose store log <KEY>` (D155) reads
