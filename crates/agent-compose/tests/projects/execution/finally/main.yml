@@ -59,9 +59,16 @@
 #     running a `flow.lingering` instance, one a `flow:` node's and one a `map`
 #     item's. The failure ends all three: each running instance is stopped and
 #     runs its own finally node, reading `failed`, before `flow.raced`'s runs.
-#     `flow.raced_ask` is the same race against a `flow.asking` instance that is
-#     waiting on a person: its pause is abandoned, which is not an end, so only
-#     `flow.raced_ask`'s own finally node runs.
+#     `flow.raced_ask` is the same race against a `flow.awaiting` instance that
+#     is waiting on a person: its pause is abandoned with it, and it ends
+#     `failed` and runs its finally node like the others.
+#   * `flow.raced_closing` — the same race against three instances whose finally
+#     nodes begin instances of their own: a `flow:` node, a `map` and an agent
+#     calling a `flow.*` tool. Each stopped instance's finally node runs to its
+#     end, the instances it begins included, before `flow.raced_closing`'s runs.
+#   * `flow.raced_late` — a body node that fails while a sibling instance whose
+#     body has completed is still running its finally node, a slow `flow:`
+#     node. That cleanup is waited for, not stopped.
 #   * `flow.redone` — a body node whose `timeout:` ends its `retry:` ladder in
 #     one generation, and whose replay in the next completes: the attempt the
 #     deadline never let it make is made then. Its finally node marks the run
@@ -810,7 +817,7 @@ flow.raced_ask:
         command: "${OPS_BIN}/sh"
         args: ["-c", "sleep 1; exit 1"]
     step:
-      flow: flow.asking
+      flow: flow.awaiting
     asked_end:
       store: store.ended
       op: append
@@ -823,6 +830,207 @@ flow.raced_ask:
     - { from: doomed, to: end }
     - { from: step, to: end }
   finally: asked_end
+
+flow.awaiting:
+  description: An instance still waiting on a person when its sibling fails, which records how it ended.
+  outputs: {}
+  nodes:
+    ask:
+      human:
+        input:
+          question: { type: string }
+        output:
+          decision: { enum: [go, stop] }
+      input:
+        question: "'may the run go on?'"
+      writes:
+        decision: note
+    awaiting_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "'inner:' + execution.outcome"
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+  finally: awaiting_end
+
+flow.raced_closing:
+  description: A body node that fails while three siblings run instances whose finally nodes begin instances of their own.
+  outputs: {}
+  nodes:
+    # Half a second, so every sibling has begun its instance when it fails.
+    doomed:
+      exec:
+        command: "${OPS_BIN}/sh"
+        args: ["-c", "sleep 0.5; exit 1"]
+    flowed:
+      flow: flow.linger_flowed
+    mapped:
+      flow: flow.linger_mapped
+      input:
+        names: "['mapped']"
+    tooled:
+      flow: flow.linger_tooled
+    closing_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "'outer:' + execution.outcome"
+  edges:
+    - { from: start, to: doomed }
+    - { from: start, to: flowed }
+    - { from: start, to: mapped }
+    - { from: start, to: tooled }
+    - { from: doomed, to: end }
+    - { from: flowed, to: end }
+    - { from: mapped, to: end }
+    - { from: tooled, to: end }
+  finally: closing_end
+
+flow.linger_flowed:
+  description: An instance that outlasts its sibling's failure, whose finally node is a flow node.
+  outputs: {}
+  nodes:
+    linger_work:
+      exec:
+        command: "${OPS_BIN}/sleep"
+        args: ["5"]
+    linger_end:
+      flow: flow.marking
+      input:
+        mark: "'flowed:' + execution.outcome"
+  edges:
+    - { from: start, to: linger_work }
+    - { from: linger_work, to: end }
+  finally: linger_end
+
+flow.linger_mapped:
+  description: An instance that outlasts its sibling's failure, whose finally node is a map.
+  inputs:
+    names:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs: {}
+  nodes:
+    linger_work:
+      exec:
+        command: "${OPS_BIN}/sleep"
+        args: ["5"]
+    linger_end:
+      map:
+        over: input.names
+        as: name
+        node: flow.marking
+        max_concurrency: 1
+        input:
+          mark: "name + ':' + execution.outcome"
+  edges:
+    - { from: start, to: linger_work }
+    - { from: linger_work, to: end }
+  finally: linger_end
+
+flow.linger_tooled:
+  description: An instance that outlasts its sibling's failure, whose finally node is an agent that calls a flow as a tool.
+  outputs: {}
+  nodes:
+    linger_work:
+      exec:
+        command: "${OPS_BIN}/sleep"
+        args: ["5"]
+    linger_end:
+      agent: agent.closer
+      input:
+        topic: "execution.outcome"
+  edges:
+    - { from: start, to: linger_work }
+    - { from: linger_work, to: end }
+  finally: linger_end
+
+flow.marking:
+  description: What a finally node begins — one mark in the store, the one it is given.
+  inputs:
+    mark:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    mark_it:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "input.mark"
+  edges:
+    - { from: start, to: mark_it }
+    - { from: mark_it, to: end }
+
+flow.raced_late:
+  description: A body node that fails while a sibling instance whose body completed is still running its finally node.
+  outputs: {}
+  nodes:
+    # A second and a half: long after `step`'s body completed and its finally
+    # node began, and long before that finally node's three seconds are up.
+    doomed:
+      exec:
+        command: "${OPS_BIN}/sh"
+        args: ["-c", "sleep 1.5; exit 1"]
+    step:
+      flow: flow.quick
+    late_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "'outer:' + execution.outcome"
+  edges:
+    - { from: start, to: doomed }
+    - { from: start, to: step }
+    - { from: doomed, to: end }
+    - { from: step, to: end }
+  finally: late_end
+
+flow.quick:
+  description: An instance whose body completes at once, and whose finally node takes its time.
+  outputs: {}
+  nodes:
+    quick_work:
+      exec:
+        command: "${OPS_BIN}/true"
+    quick_end:
+      flow: flow.slow_marking
+      input:
+        mark: "'quick:' + execution.outcome"
+  edges:
+    - { from: start, to: quick_work }
+    - { from: quick_work, to: end }
+  finally: quick_end
+
+flow.slow_marking:
+  description: What `flow.quick` does once it has ended — a pause, then the mark it is given.
+  inputs:
+    mark:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    linger:
+      exec:
+        command: "${OPS_BIN}/sleep"
+        args: ["3"]
+    mark_it:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "input.mark"
+  edges:
+    - { from: start, to: linger }
+    - { from: linger, to: mark_it }
+    - { from: mark_it, to: end }
 
 flow.lingering:
   description: An instance that outlasts its sibling's failure, and records how it ended.
