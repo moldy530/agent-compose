@@ -6061,6 +6061,59 @@ const at_ = (key, path) => ({ via: "node", ...(key === undefined ? {} : { idempo
   }
 }
 
+if (provider !== "sqlite") {
+  // **A dialled history row is dated by the server's clock** (D158, on D153's
+  // clock): a row's `at` is the instant its write judged its key by, which on
+  // a server is the server's — so the rows writers on hosts whose clocks
+  // disagree leave are still dated in the order they commit, and are judged
+  // against `history_retention:` by the clock every read and sweep of them
+  // uses. The case above asks only that `at` never goes back, which a row
+  // dated by each writer's own clock answers just as well from one process.
+  // Here this process's clock ([`skewed`]) is ten days ahead for a single
+  // write and ten days behind for a batch of two entries, and every row's `at`
+  // has to lie between two reads of the server's own clock ([`SERVER_NOW`])
+  // taken either side of them — where a row dated by this process lies ten
+  // days outside them, one way or the other.
+  const store = historied("history_server_clock");
+  const id = execution("history_server_clock");
+  const run = ctx(id);
+  const serverNow = async () => Number((await storage(SERVER_NOW, []))[0]?.server_now);
+  try {
+    const before = await serverNow();
+    const single = await skewed(TEN_DAYS, () =>
+      write(store, "set", { key: "k", value: { n: 1 } }, run, `${id}/ahead/0`),
+    );
+    const batched = await skewed(-TEN_DAYS, () =>
+      batch(
+        store,
+        [
+          { op: "set", key: "k", value: { n: 2 } },
+          { op: "set", key: "j", value: { n: 3 } },
+        ],
+        run,
+        `${id}/behind/0`,
+      ),
+    );
+    const after = await serverNow();
+    const rows = [...(await historyOf(store, "k", run)).entries, ...(await historyOf(store, "j", run)).entries];
+    answer.a_dialled_history_row_is_dated_by_the_servers_clock =
+      Number.isSafeInteger(before) &&
+      Number.isSafeInteger(after) &&
+      single.applied === true &&
+      batched.applied === true &&
+      same(
+        rows.map((row) => row.new_value?.n),
+        [1, 2, 3],
+      ) &&
+      rows.every((row) => Number.isSafeInteger(row.at) && row.at >= before && row.at <= after);
+    answer.history_server_clock_trace = { before, after, at: rows.map((row) => row.at) };
+  } catch (error) {
+    answer.history_server_clock_error = String(error?.stack ?? error);
+  } finally {
+    await forget(store).catch(() => undefined);
+  }
+}
+
 {
   // **What does not land records nothing**: a write whose condition declined,
   // a retry the ledger answered, and a partial update the schema refused —
@@ -6607,6 +6660,68 @@ async function historyLockedBy(killer, id) {
     answer.history_start_trace = { before, beforeRetention, after, kept };
   } catch (error) {
     answer.history_start_error = String(error?.stack ?? error);
+  }
+}
+
+if (provider !== "sqlite") {
+  // **…and on a dialled store the retention is judged by the server's clock**
+  // (D158: "a row is past retention when its `at` is at least
+  // `history_retention:` behind the store's clock", which on a server is the
+  // server's, D153). The two cases above move the store clock, which moves this
+  // process's and the server's alike, so they cannot tell them apart; here this
+  // process's own clock ([`skewed`]) is ten days off as well. A `history`
+  // read, and a write's sweep of its partition, cut off at the server's
+  // instant less the retention — so a process whose clock runs fast neither
+  // hides nor removes a row the server's clock holds within the retention,
+  // and one whose clock runs slow neither shows nor keeps a row it holds past
+  // it. The row is written with no skew; it is read with this process ten
+  // days ahead and ten days behind, at the store clock of the write and an
+  // hour and a minute past it; then a write to another key of the partition
+  // is made ten days ahead with the row within the retention, and ten days
+  // behind with it past.
+  const store = historied("history_server_retention", HOUR);
+  const id = execution("history_server_retention");
+  const run = ctx(id);
+  try {
+    const seeded = await write(store, "set", { key: "k", value: { n: 1 } }, run, `${id}/w/0`);
+    const reads = {};
+    for (const [label, shift] of [
+      ["ahead", TEN_DAYS],
+      ["behind", -TEN_DAYS],
+    ]) {
+      for (const [moment, offset] of [
+        ["within", 0],
+        ["past", HOUR + MINUTE],
+      ]) {
+        reads[`${label}_${moment}`] = (
+          await skewed(shift, () => later(offset, () => historyOf(store, "k", run)))
+        ).entries.map((row) => row.new_value?.n);
+      }
+    }
+    const fast = await skewed(TEN_DAYS, () =>
+      write(store, "set", { key: "other", value: { n: 2 } }, run, `${id}/o/1`),
+    );
+    const keptByFast = await historyRows(store, "k");
+    const slow = await skewed(-TEN_DAYS, () =>
+      later(HOUR + MINUTE, () => write(store, "set", { key: "other", value: { n: 3 } }, run, `${id}/o/2`)),
+    );
+    const keptBySlow = await historyRows(store, "k");
+    answer.a_dialled_history_read_shows_a_row_the_servers_clock_holds_within_retention =
+      seeded.applied === true && same(reads.ahead_within, [1]) && same(reads.behind_within, [1]);
+    answer.a_dialled_history_read_hides_a_row_the_servers_clock_holds_past_retention =
+      same(reads.ahead_past, []) && same(reads.behind_past, []);
+    answer.a_dialled_writes_history_sweep_keeps_a_row_the_servers_clock_holds_within_retention =
+      fast.applied === true && keptByFast === 1;
+    // The row the slow write is asked to remove is the one the fast write had
+    // to keep, so a sweep that never ran fails this as well as one dated by
+    // this process.
+    answer.a_dialled_writes_history_sweep_takes_a_row_the_servers_clock_holds_past_retention =
+      slow.applied === true && keptByFast === 1 && keptBySlow === 0;
+    answer.history_server_retention_trace = { reads, keptByFast, keptBySlow };
+  } catch (error) {
+    answer.history_server_retention_error = String(error?.stack ?? error);
+  } finally {
+    await forget(store).catch(() => undefined);
   }
 }
 

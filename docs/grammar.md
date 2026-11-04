@@ -12064,9 +12064,12 @@ each absent where the key held nothing on that side; `version` is the version
 the write left, absent where it left the key holding nothing. `at` is the
 write's own clock in epoch milliseconds — the one it judged its key's expiry
 by and dated the entry with, which on a dialled store is the server's (D153),
-so a row's `at` and its retention are read by one clock. Values are stored as
-the JSON the entry holds, so a row is a copy of the value, not a reference to
-it.
+so a row's `at` and its retention are read by one clock. The store contract
+holds each dialled arm to that with its own process's clock ten days ahead and
+ten days behind: a single write's and a batch's rows are dated between two
+reads of the server's clock, and a `history` read and a write's sweep judge a
+row's retention by the server's clock alone. Values are stored as the JSON the
+entry holds, so a row is a copy of the value, not a reference to it.
 
 **The actor is tagged, and that amends the ruling's shape — provisionally.**
 The ruling names `{ execution, path }` for a node or tool write and `cli` for

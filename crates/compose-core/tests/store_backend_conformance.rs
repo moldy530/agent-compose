@@ -1178,6 +1178,19 @@ const TRUE_WHEN_DIALLED: &[&str] = &[
     // partition whose sequence lock it holds — the store's oldest row past
     // the retention — and none of another's.
     "a_store_wide_history_sweep_batch_takes_only_its_own_partitions_rows",
+    // PRD resolved q74 on q69's clock (D158, D153): a dialled history row's
+    // `at` is the server's instant — a single write's row made with this
+    // process's clock ten days ahead, and a batch's rows made with it ten days
+    // behind, lie between two reads of the server's clock — and the retention
+    // a `history` read and a write's sweep apply is cut off by that clock too:
+    // with this process ten days fast, a row the server's clock holds within
+    // the retention is read and kept; ten days slow, one it holds past it is
+    // hidden and removed.
+    "a_dialled_history_row_is_dated_by_the_servers_clock",
+    "a_dialled_history_read_shows_a_row_the_servers_clock_holds_within_retention",
+    "a_dialled_history_read_hides_a_row_the_servers_clock_holds_past_retention",
+    "a_dialled_writes_history_sweep_keeps_a_row_the_servers_clock_holds_within_retention",
+    "a_dialled_writes_history_sweep_takes_a_row_the_servers_clock_holds_past_retention",
     // A server's `scope: execution` history rows leave with the run's other
     // rows, by the `DELETE` its end makes, rather than staying for good under
     // an execution id nothing will address again.
