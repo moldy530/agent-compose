@@ -1,0 +1,15 @@
+# rule: a `history` page's `limit` is 1 to 1000, as a `list` page's is (grammar 11.4, PRD resolved q74)
+# code: value-out-of-range
+# message: `limit` must be between 1 and 1000, found 1001
+# at: 12:14
+flow.demo:
+  outputs: {}
+  nodes:
+    log:
+      store: store.notes
+      op: history
+      key: "'k'"
+      limit: 1001
+  edges:
+    - { from: start, to: log }
+    - { from: log, to: end }

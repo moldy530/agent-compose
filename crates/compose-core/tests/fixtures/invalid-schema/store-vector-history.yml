@@ -1,0 +1,10 @@
+# rule: `history:` is a kv key — a history row records what one kv write did to one key, and no vector op is one (grammar 11.1, PRD resolved q74)
+# at: /store.docs/history
+# via: /$defs/storeDef/allOf/1/then/properties/history
+store.docs:
+  kind: vector
+  scope: global
+  embed:
+    model: text-embedding-3-small
+    provider: provider.openai
+  history: true

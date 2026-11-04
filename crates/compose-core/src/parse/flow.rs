@@ -626,6 +626,7 @@ const STORE_OPS: &[(&str, StoreOp)] = &[
     ("count", StoreOp::Count),
     ("get_many", StoreOp::GetMany),
     ("batch", StoreOp::Batch),
+    ("history", StoreOp::History),
 ];
 
 /// The two literal conditions a `kv` write's `if:` takes (grammar 11.4, PRD

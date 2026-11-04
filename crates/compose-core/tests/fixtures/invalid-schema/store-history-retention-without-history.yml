@@ -1,0 +1,9 @@
+# rule: `history_retention:` bounds the rows `history: true` records, so on a store that declares no history it bounds nothing (grammar 11.1, PRD resolved q74)
+# at: /store.notes
+# via: /$defs/storeDef/allOf/3/then/required
+store.notes:
+  kind: kv
+  scope: global
+  value_schema:
+    body: { type: string }
+  history_retention: 24h

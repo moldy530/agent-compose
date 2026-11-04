@@ -1021,6 +1021,82 @@ flow.f:
     );
 }
 
+/// A store that keeps history, bounded and unbounded, read a page at a time
+/// past its cursor and routed on what it read (PRD resolved q74): `history:`
+/// and `history_retention:` on a `kv` definition, `history` on each with `key`,
+/// `limit` and `after`, an agent attached at `full` — which offers no history
+/// tool — and the derived row read by name, its `next` and its `entries`.
+#[test]
+fn a_kv_store_keeps_history_and_a_flow_reads_it_a_page_at_a_time() {
+    accepts(
+        "per-key-history",
+        r#"
+store.accounts:
+  kind: kv
+  scope: global
+  history: true
+  history_retention: 720h
+  description: Every account's balance, with who moved it and when.
+  agent_access: full
+  value_schema:
+    balance: { type: integer }
+store.audit:
+  kind: kv
+  scope: session
+  history: true
+  value_schema:
+    note: { type: string }
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.anthropic
+  id: claude-sonnet-4-5
+agent.clerk:
+  model: model.smart
+  prompt: Keep the books.
+  stores: [store.accounts]
+  output:
+    done: { type: boolean }
+state:
+  cursor: { type: string, default: "" }
+  moves: { type: integer, default: 0 }
+flow.audit:
+  outputs:
+    moves: { type: integer }
+  nodes:
+    credit:
+      store: store.accounts
+      op: incr
+      key: "'acct/1'"
+      field: balance
+      by: "10"
+    page:
+      store: store.accounts
+      op: history
+      key: "'acct/1'"
+      limit: 50
+      after: "state.cursor"
+      writes:
+        next: cursor
+    tally:
+      exec: { command: "true" }
+    note:
+      store: store.audit
+      op: history
+      key: "'note'"
+      limit: 1
+  edges:
+    - { from: start, to: credit }
+    - { from: credit, to: page }
+    - { from: page, to: tally, when: "size(page.output.entries) > 1" }
+    - { from: page, to: note, else: true }
+    - { from: tally, to: note }
+    - { from: note, to: end }
+"#,
+    );
+}
+
 /// An authored ledger key on every `kv` write that takes one, and one that is
 /// the **same** for every item of a fan-out (PRD resolved q73, Decision D67).
 ///

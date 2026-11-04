@@ -234,6 +234,8 @@ fn store(source: &ast_def::StoreDef) -> Option<ir::definition::Store> {
         description: source.description.clone(),
         agent_access: source.agent_access.as_ref().map(|access| access.value),
         default_ttl: source.default_ttl.clone(),
+        history: source.history.as_ref().is_some_and(|history| history.value),
+        history_retention: source.history_retention.clone(),
     })
 }
 

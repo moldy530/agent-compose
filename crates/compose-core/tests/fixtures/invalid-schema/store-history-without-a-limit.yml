@@ -1,0 +1,14 @@
+# rule: a `history` page's `limit` is required, as a `list` page's is (grammar 11.4, PRD resolved q74)
+# at: /flow.demo/nodes/log
+# via: /$defs/storeNode/allOf/17/then/required
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    log:
+      store: store.memory
+      op: history
+      key: "'k'"
+  edges:
+    - { from: start, to: log }
+    - { from: log, to: end }

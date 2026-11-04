@@ -1,0 +1,12 @@
+# rule: `history_retention` is grammar 4.4's literal duration (grammar 11.1, PRD resolved q74)
+# code: invalid-duration
+# message: `forever` is not a valid duration for `history_retention`
+# at: 12:22
+# help: durations are a positive integer followed by `ms`, `s`, `m`, or `h`, e.g. `30s`; compound forms like `1m30s` are not supported
+store.notes:
+  kind: kv
+  scope: global
+  value_schema:
+    body: { type: string }
+  history: true
+  history_retention: forever

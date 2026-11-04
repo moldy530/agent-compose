@@ -1,0 +1,10 @@
+# rule: `history: false` records no history, so a `history_retention:` beside it bounds nothing (grammar 11.1, PRD resolved q74)
+# at: /store.notes/history
+# via: /$defs/storeDef/allOf/3/then/properties/history/const
+store.notes:
+  kind: kv
+  scope: global
+  value_schema:
+    body: { type: string }
+  history: false
+  history_retention: 24h

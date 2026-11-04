@@ -1,0 +1,12 @@
+# rule: `history` is a `kv` key: a history row records what one `kv` write did to one key, and no `vector` op is one (grammar 11.1, PRD resolved q74)
+# code: conflicting-keys
+# message: `history` is not legal on a `vector` store
+# at: 12:3
+# help: per-key history is a `kv` store's: `history: true` records every write to one `kv` key — its op, the value before and after, the version it left, who wrote it and when — and a `vector` or `blob` write is none of those (grammar 11.1, PRD resolved q74)
+store.docs:
+  kind: vector
+  scope: global
+  embed:
+    model: text-embedding-3-small
+    provider: provider.openai
+  history: true
