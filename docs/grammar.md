@@ -3058,6 +3058,13 @@ that op is, its `op`, `if` and `ttl` literals of the eight's kind and its
 decidable in one file, and refused at parse and by the published schema alike,
 where a `get_many`'s are the run's.
 
+The `history` op (PRD resolved q74, Decision
+[D158](#d158-a-kv-store-may-keep-every-writes-history-row-in-the-writes-own-transaction))
+adds a row to §11.4 and **no parameter** to this table: it takes `key` and
+`after`, CEL strings of the twelve's kind, and `limit`, a literal of the
+eight's, each spelled and bounded exactly as on a `kv` `list`. So the count
+above stands — twenty-one parameters, twelve of them CEL.
+
 `idempotency_key` is the one parameter that is about the **ledger** rather than
 the store's data (PRD resolved q73, Decision
 [D157](#d157-a-kv-write-may-name-its-own-ledger-key-and-two-executions-writing-under-it-apply-once)):
@@ -3078,9 +3085,12 @@ terms where §11.4 says they are — a write that declined against a key holding
 nothing — and are read the same way: route on `applied` first. So is a `list`'s
 `next` on the last page of a walk, which is what a paging cycle routes on —
 `when: "has(page.output.next)"` — and a `get_many` entry's `value` and
-`version` where its `found` is `false`. So, last, are a `batch`'s `failed`,
+`version` where its `found` is `false`. So are a `batch`'s `failed`,
 present exactly when `applied` is `false`, and the `version` of a result its
-`delete` entry answered.
+`delete` entry answered. So, last, are a `history` page's `next` on its last
+page, and a history entry's `old_value`, `new_value` and `version` where the key
+held nothing on that side of the write, and its actor's `execution` and `path`
+on an operator's write (PRD resolved q74).
 
 ### 8.9 `coder`
 
@@ -4213,6 +4223,8 @@ store.docs:
 | `description` | string | no | LLM-facing for agent-attached stores |
 | `agent_access` | `read` \| `read_write` \| `full` | no (default `read_write`); `full` is `kv` only | how much of the synthesized tool surface an attaching agent gets (§11.5) |
 | `default_ttl` | duration (§4.4) | no; `kv` only, `vector`/`blob` illegal | how long the key a write that names no `ttl:` leaves lives — a store-op node's and a synthesized tool's alike; absent means such a key never expires (§11.4, PRD resolved q69) |
+| `history` | boolean (literal) | no (default `false`); `kv` only, `vector`/`blob` illegal | every write that lands records a history row — op, value before and after, version, actor, time — in its own transaction, which the `history` op (§11.4) and `agent-compose store log` read (PRD resolved q74) |
+| `history_retention` | duration (§4.4) | no; `kv` only, and only beside `history: true` | how long a history row is kept; absent means **every row is kept, for good** — the history grows by one row per write that lands (PRD resolved q74) |
 
 **`metadata_schema` is a `vector` key.** Nothing in this grammar reads a `blob`
 store's metadata: no `blob` op takes a `metadata` or a `filter` parameter — `put`
@@ -4243,6 +4255,24 @@ default it would be a second way to write the omission, and it is
 [D35](#d35-scope-is-required-on-store-definitions)): a `scope: execution` store
 may declare one, and its keys die with the execution whether or not they
 expired first.
+
+**`history` and `history_retention` are `kv` keys** (PRD resolved q74, Decision
+[D158](#d158-a-kv-store-may-keep-every-writes-history-row-in-the-writes-own-transaction)).
+A history row records what one `kv` write did to one key, and no `vector` or
+`blob` write is one, so on either kind each is `conflicting-keys` naming the
+store's kind, as `default_ttl` is. `history` is a literal boolean.
+`history_retention` is a §4.4 duration that bounds the rows `history: true`
+records, so beside a `history:` that is absent it is `missing-key`, and beside
+`history: false` it is `conflicting-keys` — it bounds nothing there, and is not
+a second way to turn history on. **Absent, every row is kept**: the history is
+unbounded, one row per write that lands, which is the trade a store that keeps
+history makes (`docs/topics/stores.md`). A row past its retention is invisible
+to a `history` read at once and leaves storage on PRD resolved q69's schedule —
+inside the next write to its partition, at most 100 rows, or at the next
+process start — and the cut-off is the retention the definition declares when
+the read or the sweep runs, so a changed `history_retention:` applies to every
+row the store already holds. `scope:` is orthogonal to both: an
+execution-scoped store's history dies with its partition.
 
 ### 11.2 `embed` (vector only)
 
@@ -4338,6 +4368,7 @@ below).
 | `kv` | `count` | `prefix` (CEL string, optional) | `{ count: integer }` |
 | `kv` | `get_many` | `keys` (CEL list of string, at most 1000) | `{ entries: array<{ key: string, value: V (optional), found: boolean, version: integer (optional) }> }` — one per key asked, in the order asked |
 | `kv` | `batch` | `ops` (literal list of 1..100 entries, required): each `{ op: set \| delete (literal), key (CEL string), value (map field→CEL matching `V`; `set` only, required there), C, T (`set` only) }` — a `delete` entry's `C` is `if_version` alone; `K`, the node's and no entry's | `{ applied: boolean, deduped: boolean, results: array<{ key: string, version: integer (optional) }>, failed: integer (optional) }` — one result per entry, in entry order, `version` absent on a `delete` entry's; `failed` present exactly when `applied` is `false`, and `results` then empty |
+| `kv` | `history` | `key` (CEL string), `limit` (integer 1..1000, required), `after` (CEL string, optional — the exclusive cursor); the store MUST declare `history: true` | `{ entries: array<{ seq: integer, op: string, old_value: V (optional), new_value: V (optional), version: integer (optional), actor: { kind: node \| tool \| cli, execution: string (optional), path: string (optional) }, at: integer }>, next: string (optional) }` — one entry per history row of the key, oldest first, bounded by `limit` |
 | `vector` | `search` | `query` (CEL string), `top_k` (integer 1..100, required), `filter` (map metadata-field→CEL, optional) | `{ matches: array<{ id: string, score: number, text: string, metadata: M }> }` |
 | `vector` | `upsert` | `key`, `value` (CEL string — the text), `metadata` (map field→CEL, optional) | `{ id: string }` |
 | `vector` | `delete` | `key` | `{ deleted: boolean }` |
@@ -4626,6 +4657,61 @@ Rules (PRD 5.8):
   `limit:` and `{ keys }` — and `after:` or `include_values:` there is a
   compile error naming the store: a cursor and the values beside a page's keys
   are a `kv` page's.
+- **Per-key history** (PRD resolved q74, Decision
+  [D158](#d158-a-kv-store-may-keep-every-writes-history-row-in-the-writes-own-transaction)).
+  A `kv` store that declares `history: true` (§11.1) records a **history row**
+  for every write that lands, in the write's own transaction, so a write that
+  does not commit — a partial update `V` refused, a crash before the commit —
+  leaves none, and neither does one that wrote nothing: a write whose condition
+  declined (`applied: false`), one the ledger answered (`deduped: true`), and a
+  write a resumed generation answered out of its journal, which reaches no
+  store (PRD resolved q29). Every write that **applied** records one, a `delete`
+  of a key holding nothing and an `append` with `unique: true` that changed
+  nothing among them; a `batch` records one per entry, each with its entry's
+  op, in the batch's one transaction, and one that declined records none. A
+  row is `{ seq, op, old_value, new_value, version, actor, at }`:
+
+  - **`seq`** orders one key's rows, oldest first. It is assigned as the row is
+    inserted and never handed out twice, so it is monotonic per key — not a
+    count: two rows of one key may skip the numbers other keys' rows took
+    between them.
+  - **`op`** is the write — `set`, `delete`, `merge`, `append` or `incr`, a
+    `batch` entry's own `set` or `delete`.
+  - **`old_value` and `new_value`** are the key's value before and after it,
+    `V` both: `old_value` absent where the key held nothing (or had expired),
+    `new_value` absent where the write left it holding nothing — a `delete`.
+  - **`version`** is the one the write left, absent where it left none — after
+    a `delete` — and the version the key kept on an `append` that changed
+    nothing.
+  - **`actor`** names who wrote: `{ kind: node, execution, path }` for a
+    store-op node — the execution's id and the node's §9.4 instance path,
+    whichever key its ledger holds, so an authored write (below) names the
+    writer its derived key would; `{ kind: tool, execution, path }` for a
+    synthesized tool's write (§11.5), the path the calling agent execution's
+    and the call's own `<tool name>/<call ordinal>` frame; and
+    `{ kind: cli }` for an operator's write at the project's command line
+    (`agent-compose store`), which belongs to no execution. A tagged object is
+    the one shape that types every writer in one derived field: `kind` is an
+    enum, and `execution` and `path` are optional, under D110's posture.
+  - **`at`** is the write's own clock, in epoch milliseconds — the server's on
+    a dialled backend, the process's on a local one.
+
+  The **`history` op** reads one key's rows a page at a time, exactly as a
+  `list` reads a partition's keys: `limit` rows (1..1000, required) after the
+  exclusive cursor `after:`, oldest first; `next` present exactly when more
+  remain, and then the page's last `seq` as a decimal string — the `after:` of
+  the page that follows; the empty string, which no row's `seq` is, the cursor
+  before the first. A cursor that is neither **fails the node**, naming it,
+  before anything is read. It is a **read** (below): recorded with the page it
+  answered — its record carries the `key` it addressed — answered out of the
+  record on a replay, carrying no idempotency key. On a store whose definition
+  does not declare `history: true` it is a compile error naming the store,
+  since that store records no row for it to read; on a `vector` or `blob`
+  store it is the kind not taking the op. A row past the store's
+  `history_retention:` (§11.1) is not read, and leaves storage on the expiry
+  schedule above, the entries the writes left untouched. History is a side
+  table keyed by the key, not a query surface (PRD 5.8): nothing reads it
+  across keys, and no agent tool reads it at all (§11.5).
 - **A store with no `M`.** `metadata_schema:` is optional on a `vector` store
   (§11.1), and a store that declares none has no metadata at all rather than
   empty metadata (Decision
@@ -4678,8 +4764,8 @@ Rules (PRD 5.8):
   answer, and a guard that reads `value` anyway is reading a value the op
   reported it does not have.
 - Store ops are **effects**: reads are recorded and replay consumes history, not
-  the live store — `get`, `list`, `count`, `get_many` and `search` are the reads,
-  and carry no idempotency key; writes — a `batch` among them, one write however
+  the live store — `get`, `list`, `count`, `get_many`, `history` and `search`
+  are the reads, and carry no idempotency key; writes — a `batch` among them, one write however
   many entries it holds — are at-least-once carrying the idempotency key of §9.4 —
   the execution id plus the store node's flattened instance path, which is what
   keeps two instantiations of one flow, and the repeating item indexes of nested
@@ -4842,6 +4928,15 @@ a store-op node's alone. Its list is a literal the author writes down — which
 keys move together, under which conditions — and a model handed it would be
 handed up to a hundred writes as one call with none of them readable before it
 ran.
+
+No row names a `history`, and no level grants one (PRD resolved q74; Decision
+[D158](#d158-a-kv-store-may-keep-every-writes-history-row-in-the-writes-own-transaction)):
+a key's history — every value it held, who wrote each and when — is an
+author's to read through a store-op node and an operator's through
+`agent-compose store log`, and a model handed it would be handed every value a
+key ever held, including the ones a later write replaced on purpose. A tool
+write to a store that declares `history: true` is still recorded, with actor
+`tool`; only the read is withheld.
 
 **`full` is PRD resolved q68's third level** (Decision
 [D152](#d152-a-kv-key-is-versioned-and-a-conditional-or-partial-write-is-serialized-against-every-write-to-its-key)):
@@ -11588,7 +11683,8 @@ nothing replays it), no trace record, no idempotency key — so a write is never
 deduped and leaves no ledger row, and `deduped` answers `false` — and no
 execution owning a partition. The ruling names this posture and its limit: a
 store keeping per-key history records such a write as actor `cli` (PRD resolved
-q74), and until that ships it is recorded nowhere, which the `cli` topic says.
+q74, D158), and a store keeping none records it nowhere, which the `cli` topic
+says.
 The alternative — minting an execution per command so the write had somewhere to
 be journaled — is what "belongs to no execution" rules out, and it would have
 been worse on its own terms: an execution is something that runs a flow and
@@ -11658,7 +11754,7 @@ lines a redirect is collecting for an import.
 **What this does not change.** No grammar: the command reads a composition and
 adds nothing to what one may say, so no section of this document gains a key and
 no static check changes. The agent tool surface (§11.5) is untouched. q74's
-`log` sub-verb and q71's `batch` are not part of it. The process-start sweep
+`log` sub-verb is D158's, and q71's `batch` is not part of it. The process-start sweep
 (D153) is the one each op's own store already starts at its first op; the command
 starts no sweep of the stores it does not address. Decisions D87, D152, D153 and
 D154 are what it is built on, and none is amended.
@@ -11918,6 +12014,179 @@ operator's command line (D155), whose writes carry none.
 **Status**: shipped. *PRD 5.8, resolved q29, q63, q68, q69, q71, q73; §8.8,
 §9.4, §11.4, §11.5; amends D104.*
 
+### D158. A `kv` store may keep every write's history row, in the write's own transaction
+
+A `kv` store definition may declare `history: true`. Every write to it that
+lands then records one **history row** — `{ seq, op, old_value, new_value,
+version, actor, at }` — in a side table beside its entries, inserted in the
+write's own transaction, so a write that commits has its row and one that does
+not has none. A store-op node reads a key's rows with the `history` op (`key`,
+`limit` 1..1000, `after:` a cursor), which answers `{ entries, next }` a page
+at a time; an operator reads them with `agent-compose store log`.
+`history_retention:`, a literal duration beside `history: true`, bounds how
+long a row is kept, and is swept on q69's schedule; absent, every row is kept.
+No agent reads a history at any access level. Both keys are `kv`-only, and the
+retention is refused without `history: true` (§11.1, §11.4, §11.5, PRD
+resolved q74).
+
+**Rationale**: a `kv` key holds its latest value and nothing else — the
+version (D152) says how many writes it has seen, not what they were or who
+made them. The question an operator meets after the fact — who set this
+balance, when, from what — has no answer in the store, and the trace answers it
+only for the runs whose traces were kept, one execution at a time, never for a
+key. The ruling's answer is a record kept by the store, of the store's own
+writes, under the store's own transaction, and each clause below is what keeps
+it exact rather than approximately right.
+
+**One side table per arm, created on open.** The rows live where the entries
+do: a store file's `history` table, and a dialled server's `store_history`
+(Postgres and MySQL), which holds every store's rows keyed by the store's name
+the way `store_entries` does. Each is `CREATE TABLE IF NOT EXISTS` beside the
+tables every open already creates, and that is the whole of its migration: a
+store opened by an earlier release has no history table, so there are no rows
+to bring forward and no column to add, and a database a release before this
+one opened comes back with the table empty and every other row as it was —
+the store contract opens a pre-history store on each arm and writes to it. On
+Postgres the table's indexes are probed by name and created only when absent,
+for the reason q68's `version` column was: an open of an upgraded store takes
+no lock it does not need. MySQL's index on the key is a prefix index, as
+`store_entries_partition` is, since a 2048-character key is past what one InnoDB
+index entry holds. A store that does not declare `history: true` writes no row
+and reads none; on a dialled server its writes leave the shared table
+untouched.
+
+**The row.** `op` is the write's own op — `set`, `delete`, `merge`, `append`,
+`incr`, or a `batch` entry's own `set` or `delete`. `old_value` is what the key
+held when the write read it under its lock and `new_value` what it holds after,
+each absent where the key held nothing on that side; `version` is the version
+the write left, absent where it left the key holding nothing. `at` is the
+write's own clock in epoch milliseconds — the one it judged its key's expiry
+by and dated the entry with, which on a dialled store is the server's (D153),
+so a row's `at` and its retention are read by one clock. Values are stored as
+the JSON the entry holds, so a row is a copy of the value, not a reference to
+it.
+
+**The actor is tagged, and that is this implementation's reading.** The ruling
+names `{ execution, path }` for a node or tool write and `cli` for an
+operator's: two shapes, an object and a word. A derived output is one type
+(§8.8), and a field that is sometimes an object and sometimes a string is no
+type a derived row can declare, so the row carries the ruling's content in the
+one shape that types every writer: `{ kind: "node", execution, path }`,
+`{ kind: "tool", execution, path }`, and `{ kind: "cli" }`. A node's `path` is
+its §9.4 instance path, so the trace and the history name one site — and it is
+carried on every node, derived key or authored (D157), since an authored key
+names no instance but the write still has a writer. A tool's `path` is the
+frame a call a model made takes — the agent execution's instance path, then
+`<tool name>/<call ordinal>`, as a flow-as-tool dispatch's key does. Nothing
+the ruling says is dropped and nothing is added beyond the tag; a later ruling
+choosing the untagged shape would change the derived row and nothing else. It
+stands until the owner rules on it, and nothing in the PRD records that ruling
+yet.
+
+**`seq` is an order, not a count.** It is an integer the table assigns as the
+row is inserted — SQLite's `AUTOINCREMENT`, a Postgres `BIGSERIAL`, a MySQL
+`AUTO_INCREMENT` — so it is never handed out twice, a swept row's included, and
+one key's rows may skip the numbers other keys' rows took between them. Every
+write to a key holds its partition's sequence lock (a store file's one writer
+locally), so a key's rows take their `seq` in the order their writes commit,
+and a page read past a cursor never misses a row committed after it.
+
+**What lands records a row, and nothing else does.** A write whose condition
+did not hold (`applied: false`) changed nothing and records nothing; a write
+the ledger answered (`deduped: true`) wrote nothing and records nothing; a
+replayed write is answered out of the journal and reaches no store (PRD
+resolved q29) — its row is the one the first attempt recorded; and a write
+that rolled back — a partial update `V` refused, a statement the server failed,
+a crash before the commit — has none, because the row was inserted in the
+transaction that did not commit. That is the ruling's verification read
+straight: a failed `merge` leaves no entry. Two writes apply without changing
+the value, and each records a row, because the ruling's word is every write
+and both applied: a `delete` of a key that held nothing (`deleted: false`), whose
+row has no value on either side and no version, and an `append` with
+`unique: true` whose item was already there, which keeps its version and
+refreshes its expiry, whose row holds the same value on both sides. **Those
+two are this implementation's reading**: the ruling does not say whether an
+applied write that changed no value is one it means, and recording it is the
+reading that loses nothing — an operator can skip a row, and cannot recover
+one that was never written.
+
+**A batch is one row per entry.** A batch is one write of many keys (D156),
+and the history is per key, so it records one row per entry, each with the
+entry's own op, values and version, all inside the batch's transaction and
+under the savepoint its entries are written under: a batch an entry's
+condition declines rolls back to the savepoint and records none, and a batch
+killed mid-transaction leaves none — the store contract kills one on each arm.
+
+**The `history` read.** It is a `kv` read, recorded as one (§11.4): its trace
+record is a `"read"` carrying the `key` it read and its page as the `answer`,
+and a resumed generation answers it out of that record without reaching the
+store (`docs/trace.md` §6, §10.2). It pages one key exactly as a `list` pages
+a partition (D154): the first `limit` rows after an exclusive cursor, oldest
+first, with `next` present exactly when more remain — the page's last `seq` as
+a decimal string, which the next page's `after:` takes; `after: ""` and no
+`after` are both the first page. A `history` on a store that does not declare
+`history: true` is a compile error naming the store, since it has no rows to
+read, and the runtime refuses it for a caller that is not the compiler; a
+cursor is CEL, so one that evaluates to a string that is no cursor fails the
+node by name before anything is read, as a `get_many` past its bound does.
+
+**Retention is computed when it is read.** A row is past retention when its
+`at` is at least `history_retention:` behind the store's clock, and the cut-off
+is computed at each read and each sweep from the retention as the definition
+declares it then — the row stores no expiry of its own. So a changed
+`history_retention:` applies to every row at once, the old ones included, and
+a row past it is invisible to every `history` read from that moment. It leaves
+storage on q69's schedule, inside the two sweeps an expired key does (D153): a
+write to a partition removes at most 100 of that partition's rows past
+retention, under the partition's sequence lock and before it reads its key,
+and the next process start removes the rest in batches of at most 1000 behind
+the ops, a dialled store's under each partition's lock in turn. A store that
+declares no `history_retention:` keeps every row, for good — one per write that
+lands — and that is the trade the stores topic states: the record is exact and
+complete, and it grows without bound.
+
+**The operator's command line.** `agent-compose store log <KEY>` (D155) reads
+one page through the same op, with `--limit` (1..1000, default 100) and
+`--after` (a page's `next`); its table prints each row's `seq`, `at`, `op`,
+`version`, actor and both values and, where more remain, the `--after` the
+next page takes. Under `--format json` it prints the op's answer as one JSON
+document, `{ entries, next }`, as `list` prints its page — not JSON Lines,
+since a page is one answer. It exits `0` when the page is read, an empty one
+included (said on stderr, as a `list` of no keys is), `1` on a backend failure,
+and `2` on a store that keeps no history or an `--after` that is not a cursor.
+D155's operator write, which until this ruling was recorded nowhere, is
+recorded on a store that declares `history: true` as actor `cli` — its only
+record anywhere, since it is still no effect — and on any other store it is
+recorded nowhere, as before. `export` and `import` carry no history: an export
+is a store's entries (D155), and its lines are `{ key, value, version,
+expires_at }` as they were; an import's writes are an operator's, each recorded
+as a `cli` row on a store that keeps history, so a restored store's history
+begins at its restore. Carrying rows across would make an import write a past
+that its target never had, under versions it did not assign.
+
+**Not exposed to agents.** No access level synthesizes a `history` tool
+(§11.5), and that is the ruling's own clause: a key's history holds every value
+it ever held — the ones a later write replaced on purpose among them — which is
+a different authority from the latest value a `get` hands a model. A tool
+*write* to a store that declares `history: true` is recorded like any other,
+with actor `tool`.
+
+**What it builds on, and what it does not touch.** It is the side table PRD
+5.8 allows and not the query surface it rules out: it is read one key at a time,
+by `seq`, and by nothing else — no `prefix`, no `filter`, no read across keys.
+It builds on D152's lock and version, which order a key's rows and number the
+values; D153's clock and sweeps, which date and bound them; D154's page and
+cursor, which the read reuses; D155's operator entry points, which `log` joins
+and whose writes it now records; D156's batch, whose entries it records one by
+one; and D157's site, whose path it names. q29's replay discipline is
+unchanged — a history is not replayed, the write is, and the row is the
+first attempt's. No journal row, no trace field and no `trace_version` changes
+(`docs/trace.md` §10.2), `vector` and `blob` stores are untouched, and so is
+every store that does not declare `history: true`.
+
+**Status**: shipped. *PRD 5.8, resolved q29, q68, q69, q70, q71, q72, q73,
+q74; §8.8, §11.1, §11.4, §11.5.*
+
 ## Appendix B — Editor integration
 
 [`schemas/agent-compose.schema.json`](../schemas/agent-compose.schema.json) is a
@@ -12014,7 +12283,11 @@ identifier, `unique` and `include_values` as booleans, `if` as `absent` or
 its keys that op's row, one condition at most (§11.4, D156) — store definition
 key sets per `kind`, both the schema each kind requires and the ones it refuses,
 `metadata_schema` being `vector`'s alone (§11.1, D113), `default_ttl` being
-`kv`'s alone and a duration (§11.1, D153), and the `provider:` a `vector`
+`kv`'s alone and a duration (§11.1, D153), `history` and `history_retention`
+being `kv`'s alone — a boolean and a duration — with `history_retention`
+requiring `history: true` beside it, one more `if`/`then` on the same object
+(§11.1, D158), a `history` read's `key` and `limit` required and every write's
+and every other read's parameters refused (§11.4), and the `provider:` a `vector`
 store's `embed:` block must name
 (§11.2, D116), provider key sets per `kind` — both halves, the required keys and
 the closed row the optional ones live in (§12.1, D106), including the one

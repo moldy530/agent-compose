@@ -86,6 +86,8 @@ triggers:
 | `description` | no | LLM-facing for agent-attached stores |
 | `agent_access` | no | `read` \| `read_write` (default) \| `full` (`kv` only) |
 | `default_ttl` | no; `kv` only | a duration: how long the key a write that names no `ttl:` leaves lives — see *Expiry and leases* below |
+| `history` | no (default `false`); `kv` only | `true` records every write that lands as a history row, which `op: history` and `agent-compose store log` read — see *A key's history* below |
+| `history_retention` | no; `kv` only, beside `history: true` | a duration: how long a history row is kept; absent, every row is kept for good |
 
 `metadata_schema` on a `blob` store is `conflicting-keys`: nothing in this
 grammar reads it — no `blob` op takes a `metadata` or `filter` parameter and no
@@ -202,6 +204,7 @@ of any execution: nothing records it. `agent-compose docs cli` has the flags.
 | `kv` | `append` | `key`, `field` (an array field of `V`), `value` (one item), `unique` (optional literal, default `false`), one optional condition, `ttl` (optional) | as `merge` |
 | `kv` | `incr` | `key`, `field` (an `integer`/`number` field of `V`), `by` (optional, default `1`), one optional condition, `ttl` (optional) | as `merge` |
 | `kv` | `batch` | `ops` (literal list of 1..100 `set` and `delete` entries, each with its own `key`, `value`, condition and `ttl`) | `{ applied: boolean, deduped: boolean, results: array<{ key, version (optional) }>, failed: integer (optional) }` |
+| `kv` | `history` | `key`, `limit` (1..1000, required), `after` (optional cursor) — on a store declaring `history: true` | `{ entries: array<{ seq, op, old_value: V (optional), new_value: V (optional), version (optional), actor: { kind, execution (optional), path (optional) }, at }>, next: string (optional) }` |
 | `vector` | `search` | `query`, `top_k` (1..100, required), `filter` (optional) | `{ matches: array<{ id, score, text, metadata: M }> }` |
 | `vector` | `upsert` | `key`, `value` (the text), `metadata` (optional) | `{ id: string }` |
 | `vector` | `delete` | `key` | `{ deleted: boolean }` |
@@ -877,6 +880,127 @@ an authored key removes at most 100 of the store's, and the next process start
 the rest. The default is the **store's**: a write's own `ttl:` sets how long
 its key lives, not how long its business key is remembered.
 
+## A key's history
+
+A `kv` key holds its latest value, and its `version` says how many writes it
+has seen — not what they were, or who made them. A store that declares
+**`history: true`** keeps that record: every write that lands leaves one
+**history row** beside the entry, written in the write's own transaction, and
+`op: history` reads a key's rows a page at a time, oldest first:
+
+```yaml spec
+version: "0.1"
+store.balances:
+  kind: kv
+  scope: global
+  history: true
+  history_retention: 2160h     # 90 days; leave it out to keep every row
+  value_schema:
+    cents: { type: integer }
+
+state:
+  cursor:
+    type: string
+    default: ""
+
+flow.credit:
+  inputs:
+    account: { type: string, min_length: 1 }
+    cents:   { type: integer }
+  outputs: {}
+  nodes:
+    credit:
+      store: store.balances
+      op: incr
+      key: "'acct/' + input.account"
+      field: cents
+      by: "input.cents"
+  edges:
+    - { from: start, to: credit }
+    - { from: credit, to: end }
+
+flow.audit:
+  inputs:
+    account: { type: string, min_length: 1 }
+  outputs: {}
+  nodes:
+    page:
+      store: store.balances
+      op: history
+      key: "'acct/' + input.account"
+      limit: 100
+      after: "state.cursor"
+      writes: { next: cursor }
+  edges:
+    - { from: start, to: page }
+    - { from: page, to: page, when: "has(page.output.next)", max_iterations: 50 }
+    - { from: page, to: end, else: true }
+
+triggers:
+  credit: { type: manual, flow: flow.credit }
+  audit: { type: manual, flow: flow.audit }
+```
+
+**A row is one write.** Each is `{ seq, op, old_value, new_value, version,
+actor, at }`: the write's op (`set`, `delete`, `merge`, `append`, `incr`, or a
+`batch` entry's own `set` or `delete`), what the key held before and after —
+absent where it held nothing — the version the write left, who wrote it, and
+when, in epoch milliseconds by the store's own clock. Three credits of
+`acct/a` leave three rows, each naming its execution. `actor` is tagged by
+`kind`:
+
+| `actor.kind` | Who | `execution`, `path` |
+|---|---|---|
+| `node` | a store-op node | the execution, and the node's instance path — the same site its trace record names |
+| `tool` | a synthesized store tool an agent called | the execution, and the agent's instance path with the call's own `<tool>/<ordinal>` |
+| `cli` | `agent-compose store set`, `delete` or `import` | none: an operator's write belongs to no execution |
+
+**What lands records a row, and nothing else does.** A write whose condition
+declined (`applied: false`) changed nothing and records nothing; a write the
+ledger answered (`deduped: true`) wrote nothing and records nothing; and a
+resumed run answers its writes out of its record and reaches no store, so the
+only row is the first attempt's. **A write that rolls back leaves no row** —
+a `merge` whose result `value_schema` refuses, a statement the server failed, a
+process killed before the commit — because the row was inserted in the
+transaction that did not commit. A `batch` records one row per entry, all in
+its one transaction, and a batch that declines records none. A `delete` of a
+key that held nothing, and an `append` with `unique: true` whose item was
+already there, each applied, so each records a row: the first with no value on
+either side, the second with the same value on both.
+
+**A page is the first `limit` rows after its cursor**, ordered by `seq`. `seq`
+is an order, not a count: the table assigns it as the row is inserted, so it is
+never reused, and one key's rows may skip the numbers other keys' rows took.
+`next` is present exactly when more remain and is the page's last `seq`, as a
+string — the next page's `after:`; `after: ""`, or no `after`, is the first
+page. `op: history` on a store that does not declare `history: true` is a
+compile error naming the store. It is a read: recorded, and answered out of the
+record on a resume, like any other.
+
+**Retention is the trade.** With no `history_retention:` every row is kept,
+**for good** — the history grows by one row per write that lands, never
+shrinking, and that is what makes it complete. With one, a row older than it is
+invisible to every read at once, and leaves storage the way an expired key
+does: a write to its partition removes at most 100, and the next process start
+the rest. The cut-off is read off the definition each time, so lengthening or
+shortening `history_retention:` applies to every row already recorded.
+
+**The operator reads it too.** `agent-compose store log store.balances
+acct/a` prints one page as a table — `--limit`, `--after` the `next` it printed,
+`--format json` for the page as one JSON document (`docs/topics/cli.md`). An
+operator's `set`, `delete` and `import` on this store are recorded with actor
+`cli`, their only record anywhere; on a store without `history: true` they are
+recorded nowhere. **An `export` carries no history**, and an `import` writes
+none of it back: an export is the entries, and an import's writes are an
+operator's, each recorded as a `cli` row — a restored store's history begins at
+its restore.
+
+**No agent reads it.** No `agent_access:` level synthesizes a history tool:
+a key's history holds every value it ever held, including the ones a later
+write replaced on purpose. A tool's *write* to the store is recorded like any
+other, as actor `tool`. History is a side table, read one key at a time, and
+not a query surface: there is no prefix, filter or cross-key read of it.
+
 ## Writes inside a `map`
 
 A store **write** performed inside a `map`-dispatched instance must be one of
@@ -942,7 +1066,8 @@ array field: `{"item": {"tags": "x"}}`.
 `<name>` is the store's local name, so `store.user_prefs` gives `user_prefs_get`.
 A synthesized name colliding with an attached tool name is
 `tool-name-collision`. No level synthesizes a `batch`: which keys move together
-is the author's to write down, in a node.
+is the author's to write down, in a node. Nor a `history`: a key's history is
+an author's and an operator's to read, never a model's (see *A key's history*).
 
 Each tool's arguments are its op row with the expressions replaced by what the
 model supplies, held to that schema **before the store sees them**. A call the

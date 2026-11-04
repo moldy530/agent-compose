@@ -65,7 +65,7 @@ compiled project.
 | `run <path> <flow>` | build, then run one flow; `--input k=v`, `--session <key>` |
 | `resume <path> <execution>` | build, then carry on a journaled execution — replaying its recorded effects rather than re-issuing them |
 | `serve <path>` | build, then serve the project's `http` triggers |
-| `store <sub-verb> <path> <store>` | build, then read or write one `kv` store through the target's own backend with no flow: `get`, `set`, `delete`, `list`, `count`, `export`, `import`; `--session <key>` or `--execution <id>` names the partition |
+| `store <sub-verb> <path> <store>` | build, then read or write one `kv` store through the target's own backend with no flow: `get`, `set`, `delete`, `list`, `count`, `export`, `import`, `log`; `--session <key>` or `--execution <id>` names the partition |
 | `worker --hub <url> --claim <name> --token-env <VAR>` | join a hub and run the nodes placed on the names it claims; takes no spec |
 | `docs [<topic>]` | the topic index, or one topic |
 | `explain <code>` | the expanded account of one diagnostic code |
@@ -125,12 +125,14 @@ needs no such command; it recovers every open execution on start. See
 ## Looking inside a store
 
 `agent-compose store get main.yml store.<name> <key>` reads what a flow would
-read, through the same backend; `set`, `delete`, `list`, `count`, `export` and
-`import` are the rest of the surface, and a value is held to the store's
-`value_schema` before it is written. Use it to seed a store before a run, or to
-see what a run left, rather than writing a flow to do either. A write made this
-way is not an effect of any execution and is recorded nowhere. See
-`agent-compose docs cli`.
+read, through the same backend; `set`, `delete`, `list`, `count`, `export`,
+`import` and `log` are the rest of the surface, and a value is held to the
+store's `value_schema` before it is written. Use it to seed a store before a
+run, or to see what a run left, rather than writing a flow to do either. On a
+store that declares `history: true`, `log <key>` reads who wrote the key, what
+and when, a page at a time. A write made this way is not an effect of any
+execution: it is recorded only in such a history, as actor `cli`, and
+otherwise nowhere. See `agent-compose docs cli`.
 
 ## The topics
 

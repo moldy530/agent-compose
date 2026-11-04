@@ -261,6 +261,7 @@ agent-compose store list main.yml store.visits --session user-42 --prefix 2026- 
 agent-compose store count main.yml store.visits --session user-42
 agent-compose store export main.yml store.notes > notes.jsonl
 agent-compose store import main.yml store.notes --if-absent < notes.jsonl
+agent-compose store log main.yml store.balances acct/a --limit 20
 ```
 
 | sub-verb | flags | answers |
@@ -272,6 +273,7 @@ agent-compose store import main.yml store.notes --if-absent < notes.jsonl
 | `count` | `--prefix <p>` | `{ count }` |
 | `export` | `--prefix <p>` | JSON Lines on stdout, one entry per line |
 | `import` | `--if-absent`, `--file <path>` | `{ read, written, skipped, expired, present }`; exit `2`, writing nothing, when any line is refused |
+| `log <key>` | `--limit <n>` (1 to 1000, default 100), `--after <seq>` | one page of the key's history, oldest first, `{ entries, next }`: `next` when more remain; exit `2` on a store that does not declare `history: true` |
 
 **The partition is named by the scope the store declares.** `--session <key>`
 for a `scope: session` store — the session identity itself, which is what a
@@ -320,7 +322,7 @@ which line it stopped at and how many were written before it.
 
 **The output is a table** for a person, on stdout, with what went wrong on
 stderr. `--format json` answers one JSON document on stdout instead: the op's
-own answer row for `get`, `set`, `delete`, `list` and `count` — the row a
+own answer row for `get`, `set`, `delete`, `list`, `count` and `log` — the row a
 store-op node's output carries — and the summary for `import`. `export`'s lines
 are its stdout under both formats, so its summary — `{"written": n}` under
 `--format json` — goes to stderr, and so does its failure, as
@@ -345,11 +347,28 @@ with a summary saying where — `{"written": n, "stopped": …}` under
 full disk under `> entries.jsonl` — is said on stderr; for an `export` it is the
 export failing, exit `1`, since that file does not hold the partition.
 
-**An operator's write is not an effect, and is recorded nowhere.** It belongs to
-no execution, carries no idempotency key — so `deduped` is always `false` — and
-writes no journal row, no ledger row and no trace record. Until per-key history
-ships (PRD resolved q74), nothing keeps who changed a key or when: a flow that
-reads it afterwards finds the value, and that is all.
+**An operator's write is not an effect, and is recorded in one place at
+most.** It belongs to no execution, carries no idempotency key — so `deduped`
+is always `false` — and writes no journal row, no ledger row and no trace
+record. On a store that declares `history: true` it is recorded in its key's
+history, as actor `cli` — a `set`, a `delete` and each line an `import` writes
+alike — and that row is its only record anywhere. On any other store it is
+recorded nowhere: a flow that reads the key afterwards finds the value, and
+that is all.
+
+**`log` reads a key's history**, on a store that declares `history: true`
+(PRD resolved q74; `agent-compose docs stores`): one page, oldest first, of the
+rows its writes left — each one's `seq`, `at` as an ISO 8601 UTC instant, `op`,
+`version`, actor (`node`, `tool` or `cli`, with the execution and instance path
+of a node or tool write) and the value before and after, `—` where the key held
+nothing. Where more rows remain the table ends with the `next` cursor, which
+`--after` takes to read the page after it; `--format json` prints the page as
+one document, `{ entries, next }`, the row a `history` node's output carries —
+not JSON Lines, since a page is one answer. A key with no rows exits `0`, said
+on stderr as a `list` of no keys is; a store without `history: true`, and an
+`--after` that is not a page's `next`, are usage errors and exit `2`. `export`
+and `import` carry no history: an export is the entries, and an import's
+writes are recorded as `cli` rows of their own.
 
 ## `worker`
 
@@ -424,7 +443,7 @@ dropped would leave you believing something had been installed under `$HOME`.
 |---|---|
 | `0` | clean: nothing was reported, or nothing but **warnings** was, or a `plan` was produced, or a document was printed, or a `store` op found or applied |
 | `1` | **errors** were reported, `build --check` found drift, a `run` produced no answer, a `resume` diverged from its journal, a `store` op found nothing, declined its condition or met a failing backend, a `store export` could not write its lines (a full disk, never a reader that left), a `plan`'s spec did not resolve, or a discovery verb found something already there and would not replace it |
-| `2` | the command could not run: bad usage, an unreadable entrypoint, an unwritable output directory, a missing or malformed environment variable, an uninstalled dependency set, no JavaScript runtime to launch, a `resume` naming an execution the journal does not hold open, a `store` address, sub-verb or partition flag the composition does not take, or a `store` value its `value_schema` refuses |
+| `2` | the command could not run: bad usage, an unreadable entrypoint, an unwritable output directory, a missing or malformed environment variable, an uninstalled dependency set, no JavaScript runtime to launch, a `resume` naming an execution the journal does not hold open, a `store` address, sub-verb or partition flag the composition does not take, a `store log` of a store that keeps no history, or a `store` value its `value_schema` refuses |
 | `3` | a `run` or `resume` with nobody to ask stopped at a `human` pause |
 
 The split between `1` and `2` is *the answer is no* versus *the command could

@@ -1517,7 +1517,8 @@ const LAST_INSTANT = 8.64e15;
  * operator entry points, which run the same ops a store-op node runs and
  * bypass exactly the effect machinery: **an operator's write is not an
  * effect** — it belongs to no execution, carries no idempotency key, writes no
- * journal row and no ledger row, and is recorded nowhere.
+ * journal row and no ledger row, and is recorded only in the history of a
+ * store that declares `history: true`, as actor `cli` (PRD resolved q74).
  *
  * The exit codes are the project's, read for a store: `0` found or applied;
  * `1` the answer is no — a `get` that found nothing, a condition that did not

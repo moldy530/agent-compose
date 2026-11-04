@@ -98,7 +98,9 @@
 //! `run` does and launches the emitted command line's own `store` verb, which
 //! opens the store the way a flow of that build would. What an operator writes
 //! there is **not an effect** — no execution, no idempotency key, no journal
-//! row — and the `cli` topic says it is recorded nowhere. See [`store`].
+//! row — and the `cli` topic says it is recorded only in the history of a store
+//! that declares `history: true`, as actor `cli`, and otherwise nowhere. See
+//! [`store`].
 //!
 //! The ninth takes no spec at all, and is the other half of a distributed
 //! deployment (`docs/distributed.md`, PRD 5.10):
