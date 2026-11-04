@@ -1,8 +1,9 @@
 //! Triggers: what causes an execution to exist (grammar 13).
 //!
-//! All four types are parsed in full. `manual` and `http` are active in v0;
-//! `schedule` and `event` are reserved grammar — parsed, type-checked, and
-//! carried into the IR, executing as no-ops until M3 (grammar 15, D46).
+//! All four types are parsed in full, and all four execute: `manual` from the
+//! CLI, `http` through the routes `serve` mounts, and — PRD resolved q78,
+//! Decision D162 — `schedule` from the scheduler `serve` runs and `event` from
+//! the consumer of the source it names.
 
 use crate::diag::{Span, Spanned};
 
@@ -52,9 +53,9 @@ pub enum TriggerKind {
     Manual,
     /// The graph as an HTTP endpoint (grammar 13.3).
     Http(HttpTrigger),
-    /// A cron schedule — reserved grammar (grammar 13.4).
+    /// A cron schedule, which `serve` fires (grammar 13.4).
     Schedule(ScheduleTrigger),
-    /// An event-source consumer — reserved grammar (grammar 13.5).
+    /// An event-source consumer, which `serve` runs (grammar 13.5).
     Event(EventTrigger),
 }
 
@@ -331,7 +332,7 @@ pub struct CallbackAllow {
     pub span: Span,
 }
 
-/// A `schedule` trigger — reserved grammar (grammar 13.4).
+/// A `schedule` trigger, which `serve` fires (grammar 13.4, PRD resolved q78).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScheduleTrigger {
     /// `cron:` — required; a 5-field POSIX cron expression.
@@ -342,7 +343,7 @@ pub struct ScheduleTrigger {
     pub input: Option<Bindings>,
 }
 
-/// An `event` trigger — reserved grammar (grammar 13.5).
+/// An `event` trigger, fed by its source's consumer under `serve` (grammar 13.5).
 #[derive(Clone, Debug, PartialEq)]
 pub struct EventTrigger {
     /// `source:` — required; a logical name bound by the deploy layer.

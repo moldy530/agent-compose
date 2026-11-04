@@ -1,0 +1,8 @@
+# rule: a `kind: command` event source names the program it runs (grammar 14.4 / PRD resolved q78)
+# at: /event_sources/feed
+# via: /$defs/commandEventSource/required
+version: "0.1"
+event_sources:
+  feed:
+    kind: command
+    args: ["--follow"]

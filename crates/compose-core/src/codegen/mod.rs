@@ -213,6 +213,7 @@ pub mod registry;
 pub mod runtime;
 pub mod schema;
 pub mod serve;
+pub mod sources;
 pub mod state;
 pub mod stores;
 pub mod trigger;
@@ -252,6 +253,7 @@ pub const EMITTED_PATHS: &[&str] = &[
     "src/artifact.ts",
     "src/cel.ts",
     "src/cli.ts",
+    "src/cron.ts",
     "src/delivery.ts",
     "src/deployment.ts",
     "src/env.ts",
@@ -265,6 +267,7 @@ pub const EMITTED_PATHS: &[&str] = &[
     "src/runtime.ts",
     "src/schemas.ts",
     "src/serve.ts",
+    "src/sources.ts",
     "src/state.ts",
     "src/stores.ts",
     "src/triggers.ts",
@@ -469,6 +472,7 @@ pub fn emit(ir: &Ir, authored: &authored::Authored) -> GeneratedProject {
         project::readme(ir, &partition),
         project::gitignore(ir),
         cel::module(ir),
+        sources::cron(ir),
         delivery::module(ir),
         deployment::module(ir, &partition),
         env::module(ir, &environment),
@@ -484,6 +488,7 @@ pub fn emit(ir: &Ir, authored: &authored::Authored) -> GeneratedProject {
         harness::module(ir),
         trigger::module(ir),
         serve::module(ir),
+        sources::module(ir),
         cli::module(ir),
         worker::module(ir),
         worker::manifest(ir, &partition),

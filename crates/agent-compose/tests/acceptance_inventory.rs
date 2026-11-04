@@ -72,6 +72,10 @@ enum Bullet {
     /// PRD §7 M3's fourth bullet: "**HTTP-native events** (resolved q32–q36):
     /// …".
     HttpEvents,
+    /// PRD §7 M3's bullet after it: "Execute `schedule` and queue-backed
+    /// `event` triggers — the sources HTTP cannot speak for (the clock; pubsub
+    /// consumer loops) — …", which PRD resolved q78 ships.
+    Sources,
 }
 
 /// Whether a criterion's tests run today.
@@ -2309,6 +2313,101 @@ const EVENTS: &[Criterion] = &[
     },
 ];
 
+/// PRD §7 M3's schedule and event triggers bullet, whose two parenthesised
+/// sources are the two claims PRD resolved q78 makes: the clock, which `serve`
+/// fires a `schedule` trigger from, and the consumer loop, which `serve` runs
+/// for a `kind: command` event source and refuses to pretend to run for a queue
+/// kind this release does not implement.
+///
+/// One sentence rather than an enumeration, so its phrases are held to it by
+/// containment, like `EVENTS`.
+const SOURCES: &[Criterion] = &[
+    Criterion {
+        bullet: Bullet::Sources,
+        phrase: "the clock",
+        tests: &[
+            // Each tick once, at its time, under an injected clock — and an
+            // outage's ticks skipped and named in the serve log.
+            (
+                "a_schedule_fires_each_tick_once_at_its_time_and_skips_the_ticks_an_outage_missed",
+                Status::Live,
+            ),
+            // …once per tick across two hubs on one dialled journal.
+            (
+                "two_serves_on_one_postgres_journal_fire_each_tick_once",
+                Status::Live,
+            ),
+            // …by an evaluator that agrees with the validator's, over the
+            // shared corpus and its daylight-saving cases.
+            (
+                "the_generated_cron_evaluator_agrees_with_the_validator_on_the_conformance_corpus",
+                Status::Live,
+            ),
+            // …and by `serve` alone: `run` fires no tick and starts no program.
+            ("a_run_fires_no_tick_and_starts_no_program", Status::Live),
+        ],
+    },
+    Criterion {
+        bullet: Bullet::Sources,
+        phrase: "pubsub consumer loops",
+        tests: &[
+            // A program that exits part-way is restarted from its checkpoint,
+            // and every event is one execution.
+            (
+                "a_command_source_that_exits_part_way_is_restarted_from_its_checkpoint_and_starts_one_execution_per_event",
+                Status::Live,
+            ),
+            // …a re-emitted window starts nothing for its repeats (dedupe).
+            (
+                "a_restarted_program_that_re_emits_events_starts_nothing_for_the_repeats",
+                Status::Live,
+            ),
+            // …a `serve` killed mid-stream loses and doubles nothing.
+            (
+                "a_serve_killed_mid_stream_restarts_its_program_from_the_accepted_checkpoint_and_loses_nothing",
+                Status::Live,
+            ),
+            // …a line that is not an object is refused and counted.
+            (
+                "a_line_that_is_not_a_json_object_is_refused_counted_and_starts_nothing",
+                Status::Live,
+            ),
+            // …the source's state is on `GET /sources/:name`.
+            (
+                "the_source_status_route_answers_its_state_and_refuses_a_name_the_target_does_not_declare",
+                Status::Live,
+            ),
+            // …the `sh` program `docs triggers` writes out runs as written.
+            (
+                "the_shell_program_the_triggers_topic_documents_feeds_its_trigger_under_serve",
+                Status::Live,
+            ),
+            // …and a queue kind no consumer exists for refuses `serve` rather
+            // than serving a trigger nothing feeds.
+            (
+                "serve_refuses_a_target_declaring_a_queue_source_and_validate_and_build_accept_it",
+                Status::Live,
+            ),
+        ],
+    },
+];
+
+/// The schedule and event rows are phrases of PRD §7 M3's bullet about them.
+///
+/// Containment and normalization, for the reason the siblings below give.
+#[test]
+fn the_source_rows_transcribe_the_prd_m3_bullet() {
+    let bullet = distribution_bullet("Execute `schedule`");
+    let flattened = bullet.split_whitespace().collect::<Vec<_>>().join(" ");
+    for criterion in SOURCES {
+        assert!(
+            flattened.contains(criterion.phrase),
+            "`{}` is not a phrase of PRD §7 M3's schedule and event triggers bullet: {flattened}",
+            criterion.phrase
+        );
+    }
+}
+
 /// The http-native events rows are phrases of PRD §7 M3's fourth bullet.
 ///
 /// Containment and normalization, for the reason the two siblings above give:
@@ -2336,6 +2435,7 @@ fn rows() -> impl Iterator<Item = &'static Criterion> {
         .chain(DURABILITY)
         .chain(BUILTINS)
         .chain(EVENTS)
+        .chain(SOURCES)
 }
 
 fn repository() -> PathBuf {
@@ -2749,6 +2849,11 @@ fn every_bullet_contributes_criteria() {
             Bullet::HttpEvents,
             5,
             "the http-native events bullet's five claims",
+        ),
+        (
+            Bullet::Sources,
+            2,
+            "the schedule and event triggers bullet's two sources",
         ),
     ] {
         let count = rows()

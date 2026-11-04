@@ -5,8 +5,8 @@
 //! trigger names it — contributes no entry here, and every rule that quantifies
 //! over triggers quantifies over this table (Decision D64).
 //!
-//! `schedule` and `event` are reserved grammar: parsed, type-checked, and
-//! carried into the artifact, executing as no-ops until M3 (grammar 15).
+//! `schedule` and `event` execute under `serve` (PRD resolved q78, Decision
+//! D162): its scheduler fires the one, and its source consumers feed the other.
 
 use serde::Serialize;
 
@@ -53,9 +53,9 @@ pub enum TriggerKind {
     Manual,
     /// The graph as an HTTP endpoint (grammar 13.3).
     Http(HttpTrigger),
-    /// A cron schedule — reserved grammar (grammar 13.4).
+    /// A cron schedule, which `serve` fires (grammar 13.4).
     Schedule(ScheduleTrigger),
-    /// An event-source consumer — reserved grammar (grammar 13.5).
+    /// An event-source consumer, which `serve` runs (grammar 13.5).
     Event(EventTrigger),
 }
 
@@ -179,7 +179,7 @@ pub struct CallbackHmac {
     pub secret: Spanned<EnvRef>,
 }
 
-/// A `schedule` trigger — reserved grammar (grammar 13.4).
+/// A `schedule` trigger, which `serve` fires (grammar 13.4, PRD resolved q78).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ScheduleTrigger {
     /// `cron:` — a 5-field POSIX cron expression.
@@ -192,7 +192,7 @@ pub struct ScheduleTrigger {
     pub input: Option<Bindings>,
 }
 
-/// An `event` trigger — reserved grammar (grammar 13.5).
+/// An `event` trigger, fed by its source's consumer under `serve` (grammar 13.5).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct EventTrigger {
     /// `source:` — a logical name the active target's `event_sources:` binds

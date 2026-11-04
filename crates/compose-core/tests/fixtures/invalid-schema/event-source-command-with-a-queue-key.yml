@@ -1,0 +1,9 @@
+# rule: a `kind: command` event source is closed - a queue kind's plugin keys are not its keys (grammar 14.4 / PRD resolved q78, Decision D50)
+# at: /event_sources/feed
+# via: /$defs/commandEventSource/additionalProperties
+version: "0.1"
+event_sources:
+  feed:
+    kind: command
+    command: ./bin/feed
+    consumer_group: agent-compose

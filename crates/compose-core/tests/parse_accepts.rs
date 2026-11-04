@@ -826,6 +826,69 @@ event_sources:
 /// for it (grammar 14.1, Decision D161, PRD resolved q79): `max_running: 3` is
 /// read as written, and a placement that says nothing carries no value — the
 /// default of `1` is the IR's to answer, not the parser's to invent.
+/// A `kind: command` event source in its minimal form — a program and nothing
+/// else — and with every key it takes (grammar 14.4, PRD resolved q78): `args`
+/// with the literal `{checkpoint}` argument, a `checkpoint:` expression, and a
+/// `restart:` policy whose `backoff` and `max` are each optional. The parser
+/// reads the source as a closed object, so this is the over-rejection half of
+/// `event-source-command-with-a-queue-key.yml`.
+#[test]
+fn a_command_event_source_in_its_minimal_and_whole_forms() {
+    let document = accepts(
+        "deploy/local.yml",
+        r#"
+version: "0.1"
+
+event_sources:
+  bare:
+    kind: command
+    command: ./bin/feed
+  whole:
+    kind: command
+    command: ${FEED_BIN}
+    args: ["--after", "{checkpoint}", "--source", "${FEED_NAME}"]
+    checkpoint: "payload.body.cursor"
+    restart:
+      backoff: 500ms
+      max: 2m
+  backoff_only:
+    kind: command
+    command: node
+    restart: { backoff: 2s }
+  max_only:
+    kind: command
+    command: node
+    restart: { max: 5m }
+"#,
+    );
+    assert_eq!(document.kind(), DocumentKind::Deploy);
+}
+
+/// The cron grammar's whole vocabulary, each spelling once (grammar 13.4,
+/// Decision D162): lists, ranges, steps over `*` and over a range, month and
+/// weekday names in any case, `7` for Sunday, both day fields restricted at
+/// once (the POSIX either-matches rule), and the leap day — an expression that
+/// fires once every four years still fires.
+#[test]
+fn every_cron_spelling_the_grammar_admits() {
+    for (name, cron) in [
+        ("lists", "0,15,30,45 * * * *"),
+        ("ranges", "0 9-17 * * 1-5"),
+        ("steps", "*/5 0-23/2 * * *"),
+        ("names", "0 0 1 jan,Jul MON-fri"),
+        ("sunday", "0 0 * * 7"),
+        ("both-days", "0 0 13 * FRI"),
+        ("leap-day", "0 12 29 2 *"),
+    ] {
+        accepts(
+            &format!("cron-{name}.yml"),
+            &format!(
+                "triggers:\n  t:\n    type: schedule\n    flow: flow.demo\n    cron: \"{cron}\"\n    timezone: Europe/Berlin\n"
+            ),
+        );
+    }
+}
+
 #[test]
 fn a_placement_may_say_how_many_dispatches_one_session_holds() {
     let document = accepts(

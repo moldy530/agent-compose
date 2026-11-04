@@ -5477,6 +5477,8 @@ a flow input field can accept it.
   one already cancelling included), `409` naming the status for one that has
   completed, failed or been cancelled, and `404` for an id the process does not
   know. Like the other two it is the app's own, so a trigger cannot declare it.
+  A fifth, `GET /sources/:name`, reports an event source's consumer (§14.4,
+  PRD resolved q78) and is reserved the same way.
 
 **`auth:`, `callback_auth:` and `callback_allow:` are enforced by the generated
 app.** A served trigger declaring `auth:` verifies its caller before it reads a
@@ -5738,27 +5740,84 @@ The retry schedule, what a refused or exhausted delivery leaves behind, and what
 a restarted `serve` picks up are `docs/durability.md` §3.7's, which is normative
 for the delivery ledger the way §13.3 is normative for the wire.
 
-### 13.4 `schedule` (RESERVED grammar — parsed and validated, no-op in v0)
+### 13.4 `schedule` (active: `serve` fires it)
 
 ```yaml
 nightly:
   type: schedule
   flow: flow.triage
   cron: "0 3 * * *"
-  timezone: UTC
-  input: { scope: "'full'" }
+  timezone: Europe/Berlin
+  input: { scope: "'full'", since: "payload.scheduled_at" }
 ```
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
-| `cron` | string, 5-field POSIX cron | yes | validated for shape at compile time, so no env refs (§4.3) |
-| `timezone` | IANA tz name | no (default `UTC`) | no env refs (§4.3) |
+| `cron` | string, 5-field POSIX cron | yes | held to the grammar below at compile time (`invalid-cron`), so no env refs (§4.3) |
+| `timezone` | IANA tz name | no (default `UTC`) | shape-checked at compile time; a name the runtime's timezone database does not know refuses `serve` at start; no env refs (§4.3) |
 | `input` | map field→CEL over `payload` | no | `payload.scheduled_at` (RFC 3339 string), `payload.trigger` (name) |
 
-Everything is parsed, type-checked, and carried into the IR; nothing schedules an
-execution in v0 (M3 owns the scheduler process — PRD 5.11).
+**Who fires it.** `agent-compose serve`, and nothing else (PRD resolved q78
+ruling a): the hub owns triggers (PRD resolved q37), so the scheduler runs in the
+process `serve` starts, after recovery, and stops with it. `agent-compose run`
+of the same flow fires no tick — a one-shot command is not a clock.
 
-### 13.5 `event` (RESERVED grammar — parsed and validated, no-op in v0)
+**The cron grammar.** Five whitespace-separated fields and nothing around them —
+the shape, checked first and reported as `invalid-value` — each holding values
+in its own range:
+
+| Field | Values | Names |
+|---|---|---|
+| minute | `0`-`59` | — |
+| hour | `0`-`23` | — |
+| day of the month | `1`-`31` | — |
+| month | `1`-`12` | `JAN`-`DEC` |
+| day of the week | `0`-`7`, `0` and `7` both Sunday | `SUN`-`SAT` |
+
+A field is a `,`-separated list of entries, and an entry is `*`, a value, a
+range `a-b` (smaller end first), or a step `*/n` or `a-b/n` with `n` at least
+`1`. Names are three letters in any case, and only in the two fields that take
+them. `validate` refuses, as `invalid-cron` and naming the field: a value
+outside its range; a step over a single value (`5/15`, which dialects read two
+ways — write `5-59/15` or `*/15`); a range that runs backwards; an empty entry;
+a name where none is taken; the extensions of other dialects (`?`, `L`, `W`,
+`#`, `@daily`); and an expression that **never fires** — `0 0 30 2 *` names a
+day no month it names has, which would be a trigger that waits for ever and says
+nothing. `serve` evaluates exactly this grammar, and a shared conformance corpus
+holds the two readers of it to one reading
+(`crates/compose-core/tests/fixtures/cron-conformance/`).
+
+**The day rule is POSIX's.** A field is *restricted* unless it is exactly `*`
+(so `*/1` restricts). When both day fields are restricted, a day matches when
+**either** does: `0 0 13 * 5` fires on the 13th and on every Friday.
+
+**Time zones and daylight saving.** The fields are matched against the wall
+clock of `timezone:`. A wall-clock time a spring-forward gap skips fires at the
+first instant after the gap, and several such times in one gap fire once there;
+a time an autumn overlap repeats fires once, at its first occurrence. Zones are
+read through the runtime's own `Intl`, the IANA data the corpus is checked
+against.
+
+**A tick fires once.** Each tick is journaled as a `fired` row keyed
+`(trigger, scheduled_at)` before its execution starts; the insert that wins
+fires, and a second claim of the same tick is answered with the execution that
+holds it (`docs/durability.md` §3.11). So a tick fires once across restarts and
+once across hubs sharing a journal. **Ticks that fell while no `serve` was
+running are skipped, never back-filled** (PRD resolved q78 ruling b): a starting
+scheduler reads the newest fired row, names the skipped span in the serve log,
+and arms the next tick strictly after now; a running one that wakes late — the
+process stalled, the machine slept — fires the tick it was waiting for and skips
+what fell after it on the same rule. A job catches itself up from
+`payload.scheduled_at`.
+
+**Payload.** `payload.scheduled_at` is the tick's **nominal** instant, written in
+the trigger's zone with a numeric offset (`2026-11-04T03:00:00+01:00`;
+`+00:00` under `UTC`) — when the tick was due, not when it ran.
+`payload.trigger` is the trigger's name. `session_key:` reads the same payload;
+`auth:`, `respond:`, `callback:` and the rest of §13.3's surface are `http`'s
+alone.
+
+### 13.5 `event` (active: `serve` runs its source's consumer)
 
 ```yaml
 ingest:
@@ -5772,15 +5831,35 @@ ingest:
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
-| `source` | identifier | yes | logical name; bound to infrastructure by `event_sources:` (§14.4) |
+| `source` | identifier | yes | logical name; bound to what feeds it by `event_sources:` (§14.4) |
 | `input` | map field→CEL over `payload` | no | `payload.id`, `payload.body`, `payload.attributes`, `payload.source` |
 | `dedupe_key` | CEL over `payload` → string | no (default `payload.id`) | inbound at-least-once dedupe (PRD 5.11) |
 
+**Who feeds it.** `serve` runs one consumer per declared source that some
+`event` trigger binds, after recovery (§14.4); `run` starts none (PRD resolved
+q78 ruling a). The payload a `kind: command` source produces is one line of its
+program's stdout: `payload.body` is the line's JSON object, `payload.id` the
+source's `checkpoint:` value — or, with none declared, the SHA-256 hex of the
+line's bytes — `payload.source` the source's name, and `payload.attributes`
+`{}`. Several triggers may bind one source, and each event is offered to each of
+them in turn.
+
+**Admission and dedupe.** An event reaches its trigger through the one admission
+function a served app has — the same one an `http` start goes through (§13.3)
+— which binds `input:` and `session_key:`, evaluates `dedupe_key:` and claims
+the key in the journal's `dedupe` table, keyed `(trigger, key)`
+(`docs/durability.md` §3.12). The first claim starts an execution; a **repeat
+starts nothing** and is logged naming the execution that holds the key. Rows do
+not expire. A claim whose execution was never journaled — `serve` died between
+the two — is taken over by the next event carrying the key, so a crash there
+cannot strand an event for good.
+
 A `source:` not defined in the active target's `event_sources:` is a compile
 error naming the target — target-dependent, like backend alias resolution
-(§11.3), and satisfied vacuously under `local`, which runs no consumer process
-and binds no event infrastructure (§14,
-[D87](#d87-local-is-a-reserved-target-and-deploylocalyml-carries-no-storage_backends)).
+(§11.3) — and satisfied vacuously under `local`: a trigger whose source
+`deploy/local.yml` does not declare validates, and `serve` logs that nothing
+consumes for it. `local` may declare `kind: command` sources and no other kind
+(§14, [D87](#d87-local-is-a-reserved-target-and-deploylocalyml-carries-no-storage_backends) as amended by [D162](#d162-serve-fires-schedules-and-runs-a-kind-command-source-through-one-admission-function)).
 
 ---
 
@@ -5811,7 +5890,7 @@ well-defined rather than a file the grammar half-recognizes (Decision
 
 - `deploy/local.yml` is OPTIONAL. When present it MAY declare `hub:`,
   `placements:`, `package_registry:`, `harnesses:`, `trace_sink:` and
-  `event_sources:`. The
+  `event_sources:` of `kind: command`. The
   first two are **live**
   static grammar (§14.1, §14.2) and are checked under every target including
   `local`, which is what a mesh looks like on one machine: this process is the
@@ -5824,10 +5903,11 @@ well-defined rather than a file the grammar half-recognizes (Decision
   mirror mandates it there too (§14.6). `harnesses:` is live under `local` on
   the same reasoning rather than on D87's: there is nothing in it for `local` to
   override, and the project built on the laptop is the project whose harness
-  runs there (§14.8). `event_sources:` is reserved grammar
-  (§15), parsed,
-  type-checked, and carried into the IR under every target, so it is not inert
-  there either.
+  runs there (§14.8). `event_sources:` is live under `local` for `kind:
+  command` only: a program on this machine is local infrastructure in the sense
+  the laptop is, so `serve` runs it there; a queue is not, so a
+  `redis_streams`, `sqs` or `nats` source in `deploy/local.yml` is a compile
+  error naming [D87](#d87-local-is-a-reserved-target-and-deploylocalyml-carries-no-storage_backends) as amended by [D162](#d162-serve-fires-schedules-and-runs-a-kind-command-source-through-one-admission-function) (§14.4).
 - It MUST NOT declare `storage_backends:`, and it MUST NOT declare `journal:`.
   Both are *active* grammar which `local` overrides unconditionally: no alias and
   no per-kind default is ever consulted, and the SQLite journal file beside the
@@ -6141,14 +6221,87 @@ while a conditional or partial write is serialized against every other write to
 its key (Decision
 [D152](#d152-a-kv-key-is-versioned-and-a-conditional-or-partial-write-is-serialized-against-every-write-to-its-key)).
 
-### 14.4 `event_sources` (RESERVED — parsed and validated, no-op in v0)
+### 14.4 `event_sources`
 
-Maps the logical `source:` names used by `event` triggers to infrastructure.
+Maps the logical `source:` names used by `event` triggers (§13.5) to what feeds
+them.
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
-| `kind` | `redis_streams` \| `sqs` \| `nats` | yes | consumer plugin |
-| kind-specific | per plugin | per plugin | e.g. `url`, `stream`, `consumer_group`, `queue_url`, `subject` |
+| `kind` | `command` \| `redis_streams` \| `sqs` \| `nats` | yes | `command` is implemented; the three queue kinds are vocabulary `serve` refuses (below) |
+| kind-specific | per kind | per kind | `command`'s keys are below; a queue kind's are plugin config, e.g. `url`, `stream`, `consumer_group`, `queue_url`, `subject` |
+
+**`kind: command`** is a long-running program on the machine `serve` runs on,
+emitting one JSON object per line (PRD resolved q78 ruling c). Its keys are a
+**closed** object — a key it does not read is `unknown-key` (D50) — because the
+runtime reads every one of them:
+
+| Key | Type | Required | Default | Notes |
+|---|---|---|---|---|
+| `command` | string | yes | | `argv[0]`, never a shell; `${ENV}` interpolated at `serve` start (§4.3 class 2) |
+| `args` | list of strings | no | `[]` | the rest of `argv`, each interpolated; an entry written exactly `{checkpoint}` is replaced by the newest checkpoint, the empty string before there is one |
+| `checkpoint` | CEL over `payload` → string | no | | over `payload.body`, `payload.source` and `payload.attributes` — never `payload.id`, which is its answer (`circular-checkpoint`); the event's id, and the position handed back on restart |
+| `restart` | `{ backoff, max }`, two durations | no | `backoff: 1s`, `max: 1m` | each positive, and `backoff` no longer than `max` |
+
+```yaml
+# deploy/local.yml
+version: "0.1"
+event_sources:
+  feed:
+    kind: command
+    command: ./bin/feed
+    args: ["--after", "{checkpoint}"]
+    checkpoint: "payload.body.cursor"
+    restart: { backoff: 500ms, max: 2m }
+```
+
+What `serve` does with one:
+
+- **The process.** Started after recovery, in a **process group of its own**,
+  with the generated app's environment and its working directory — the built
+  project's (`--out`), so a relative `command:` resolves there, and a program
+  outside the project is named by an absolute path or an `${ENV}` reference.
+  Its stdin is a pipe `serve` holds
+  and never writes — it ends when `serve` does, however `serve` ends. Stopped by
+  `SIGTERM` to the group and, two seconds later, `SIGKILL`. A source no `event`
+  trigger binds is not started.
+- **Lines.** Each line of stdout is one event; it becomes `payload.body` when it
+  is a JSON object. Anything else — not JSON, JSON that is not an object, a line
+  longer than 1 MiB — is **refused**: logged with the source and the line's
+  number, counted on the status route, and never an execution. stderr is copied
+  into the serve log, each line tagged `[source <name>]`.
+- **Backpressure.** Lines are admitted one at a time, in order, each to every
+  bound trigger before the next is read; reading pauses while one is admitted,
+  so a program writing faster than `serve` admits blocks on its own pipe rather
+  than queueing in `serve`. An event the journal could not record is retried,
+  holding the stream, rather than skipped.
+- **The checkpoint** is journaled **after** the intake accepts the event — a
+  trigger started an execution for it, or found the one it already had — and
+  never before (`docs/durability.md` §3.13). Every start hands the newest one
+  back, as `AGENT_COMPOSE_CHECKPOINT` in the environment and in place of a
+  literal `{checkpoint}` argument; before there is one the variable is unset and
+  the argument is the empty string. A program resumes **after** the checkpoint
+  it is handed. Whatever it emitted past the last accepted one before a crash is
+  emitted again and deduplicated on `payload.id` (§13.5).
+- **Restarts.** An exit — any code, any signal — is journaled as a `restarts`
+  row (`docs/durability.md` §3.14) and the program is started again after
+  `restart.backoff`, doubling per consecutive restart up to `restart.max`; a run
+  that lasted longer than `restart.max` starts the doubling over. It never gives
+  up.
+- **Status.** `GET /sources/:name` answers the source's state — `source`,
+  `kind`, `triggers`, `state` (`running`, `backing_off`, `starting` or
+  `stopped`), `running_since` or `backing_off_until`, `checkpoint`,
+  `accepted_events`, `refused_lines`, `restart_count` and the newest twenty
+  `restarts` — and `404` for a name the target does not declare. It enforces the
+  `auth:` of the `event` triggers bound to the source, and §13.5 gives an `event`
+  trigger none, so it is open ([D162](#d162-serve-fires-schedules-and-runs-a-kind-command-source-through-one-admission-function)).
+
+**The queue kinds.** `redis_streams`, `sqs` and `nats` keep their vocabulary:
+plugin config, parsed and validated (D46, D50), and accepted by `validate` and
+`build`. `serve` runs no consumer for them, and a target declaring one is
+refused at `serve` start, exit `2`, naming the source and its kind — a consumer
+that consumed nothing would be a trigger nothing ever feeds (PRD resolved q78,
+the q63 posture).
 
 ### 14.5 `trace_sink`
 
@@ -6661,19 +6814,16 @@ warrant the range rests on.
 ## 15. Reserved grammar summary
 
 Reserved constructs are **fully specified, parsed, type-checked, and carried into
-the IR**, but execute as no-ops in v0. Using one is never an error; relying on
-its runtime effect is a documented no-op (PRD 5.10, 5.11).
+the IR**, but this release does not execute them (PRD 5.10, 5.11).
 
-| Construct | Status in v0 | Lands in |
+| Construct | Status | Lands in |
 |---|---|---|
-| `event_sources` | parsed + validated, no-op | M3 |
-| `triggers.<t>.type: schedule` | parsed + validated, no-op | M3 |
-| `triggers.<t>.type: event` | parsed + validated, no-op | M3 |
 | `coder.harness: deepagents` | parsed, then **refused** (§8.9) | a resolved question |
 | `coder.harness: native` | parsed, then **refused** (§8.9) | a resolved question |
+| `event_sources.<s>.kind: redis_streams \| sqs \| nats` | parsed + validated, `serve` **refuses** (§14.4) | a resolved question |
 
-**The two harness names are the one row that is refused rather than a no-op**,
-and the difference is what a no-op would mean here. A reserved *trigger* that
+**Every row is refused rather than a no-op**, and the difference is what a
+no-op would mean. The two harness names came first. A reserved *trigger* that
 does nothing fires nothing, and a composition declaring one runs the rest of
 itself correctly; a reserved *harness* that did nothing would be a node in the
 middle of a flow with no answer to give, so every edge below it would be
@@ -6681,9 +6831,18 @@ unreachable and the flow would be a lie. They are in the grammar all the same,
 for the reason every reserved construct is: a name the enum does not have is a
 typo and gets a suggestion, while a name it has and does not lower is a **scope**
 statement and gets `unsupported-harness`, which names the two this release
-lowers (PRD resolved q57).
+lowers (PRD resolved q57). The queue kinds of `event_sources` joined them on
+the same argument: a consumer that consumed nothing would be an `event` trigger
+nothing ever feeds, so `serve` refuses the target naming the source rather than
+starting a trigger that cannot fire (§14.4).
 
-**Three constructs have left this list, and each left it a different way.**
+**Four constructs have left this list, and each left it a different way.**
+
+**`schedule` and `event` triggers, and `event_sources:`, left it by
+executing** (PRD resolved q78, [D162](#d162-serve-fires-schedules-and-runs-a-kind-command-source-through-one-admission-function)): `serve` fires schedules and runs a
+`kind: command` source's program, and the three headings of §13.4, §13.5 and
+§14.4 lost their RESERVED marks with it. What did not execute stayed: the
+queue kinds keep their vocabulary as the refused row above.
 
 `human` nodes were here until M2: a compiled project really pauses, publishes
 the question, and resumes (§8.7), and its waits now survive a restart as well —
@@ -6711,8 +6870,9 @@ is waiting.
 
 **The three authentication keys were here until the http-native events pass**,
 and they are the ones that read differently from every other row, which is why
-their retraction is bound rather than remembered. A no-op `schedule` runs
-nothing, which is visible the first morning it does not fire; a no-op `auth:`
+their retraction is bound rather than remembered. A no-op `schedule` — as one
+was, before PRD resolved q78 — ran nothing, which is visible the first morning
+it does not fire; a no-op `auth:`
 would **serve every caller** and be indistinguishable, from outside, from a
 guarded route — a wrong claim about a security control is worse than a missing
 one, in both directions. So `crates/compose-core/tests/trigger_auth_surface.rs`
@@ -7260,6 +7420,13 @@ plus `dedupe_key` defaulting to `payload.id`. **Rationale**: PRD 5.11 requires
 these to be parsed and validated now and executed in M3; the payload shapes and
 dedupe rule are specified so the IR carries everything M3 needs without a grammar
 change. *PRD 5.11.*
+
+**Amended by [D162](#d162-serve-fires-schedules-and-runs-a-kind-command-source-through-one-admission-function)** (PRD resolved q78): the shapes execute. `cron` is held to
+the grammar §13.4 states — the five-field shape check stays first, and the
+fields inside it are now the evaluator's (`invalid-cron`) — and `timezone` to
+the shape of an IANA name. `event_sources` gains `kind: command`, whose keys are
+a closed object the runtime reads rather than plugin config; the three queue
+kinds keep theirs.
 
 ### D47. Placement entries take `runtime` plus a reserved `network:` — RETIRED
 
@@ -7976,6 +8143,16 @@ whole point of the guarantee. Requiring a named target's file to exist is the
 same posture one level up: `--target stagng` is a typo, and resolving it to
 built-in backends would deploy against the wrong infrastructure without a
 diagnostic. *PRD 5.8, 5.10, 5.11, G3.*
+
+**Amended by [D162](#d162-serve-fires-schedules-and-runs-a-kind-command-source-through-one-admission-function)** (PRD resolved q78 ruling d), by one clause:
+`deploy/local.yml` may declare `event_sources:` of `kind: command` and nothing
+else of that section, and a source of another kind there is a compile error
+naming this decision. A program on this machine is local infrastructure in the
+sense the laptop is, so running it keeps the zero-infra guarantee; a queue is
+not. The sentence above about `event_sources:` being reserved grammar no target
+executes is history: under `local` a command source runs, and an `event`
+trigger whose source `deploy/local.yml` does not declare is still satisfied
+vacuously.
 
 ### D88. The scalar `input:` form is legal only where an unnamed value has a destination
 
@@ -12648,6 +12825,166 @@ it (`docs/distributed.md` §3.2, §10.4). With it, the whole of what a worker do
 when the hub stops waiting for a dispatch — named in D160's status — is
 provisional on the same ruling. *PRD resolved q38, q44, q75, q79; §14.1; builds on D128;
 retires the mesh capacity decision of `docs/distributed.md` §13.*
+
+### D162. `serve` fires schedules and runs a `kind: command` source, through one admission function
+
+`schedule` and `event` triggers execute under `agent-compose serve` and under
+nothing else (PRD resolved q78). `serve` evaluates every `schedule` trigger's
+`cron:` in its `timezone:` and runs one consumer per declared event source an
+`event` trigger binds; `event_sources` gains `kind: command` — a long-running
+program on the machine, one JSON object per line of its stdout — which is the
+kind this release implements and the reference backend. `redis_streams`, `sqs`
+and `nats` keep their vocabulary, `validate` and `build` accept them, and
+`serve` refuses a target declaring one at start, naming the source and its kind.
+Every tick and every event is admitted through **the one admission function** a
+served app has, which an `http` start goes through too. §13.4, §13.5 and §14.4
+state the surface; this entry records why it is that shape.
+
+**Rationale.** What was: the three constructs were reserved grammar — parsed,
+type-checked, carried into the IR, executed by nothing — on the reading of PRD
+resolved q36 that HTTP was the webhook and the clock and the pull source would
+wait. What is: the owner reversed that reservation and q7's reference backend
+together. A clock has no caller and a pull source no push, so both have to be
+run by the process that owns triggers (PRD resolved q37: the hub), and `run`, a
+one-shot command, owns neither. The reference backend is a program rather than
+Redis Streams because a program is the one source every reader already has: a
+shell script that tails a file, polls an API or reads a queue client is a
+source, and the plugin interface q7 asked for is exactly what `kind: command`
+implements — a consumer that hands the runtime one event at a time and is told
+where to resume.
+
+**The rulings, as built.**
+
+- **(a) Who fires.** The scheduler and the consumers start after recovery, so a
+  tick or an event never races a replay, and stop with `serve`.
+- **(b) Schedules.** The cron grammar is POSIX's five fields, evaluated by a
+  hand-written evaluator in each column — `compose_core::cron` for `validate`,
+  the emitted `src/cron.ts` for `serve` — over an IANA zone read through `Intl`,
+  and held to one reading by a shared conformance corpus with daylight-saving
+  cases in two zones (CLAUDE.md's CEL discipline, one level down). The compile
+  check is tightened to the same grammar with a named diagnostic,
+  `invalid-cron`, and its explain page. A tick is a `fired` row keyed
+  `(trigger, scheduled_at)` journaled **before** its execution starts, and the
+  insert that wins fires. Ticks that fell during downtime are skipped and the
+  serve log names the span. `payload.scheduled_at` is the nominal tick in the
+  trigger's zone, `payload.trigger` the trigger's name.
+- **(c) The command source.** `command`, `args`, `checkpoint` (CEL over the
+  event, before it has an id, to a string) and `restart { backoff, max }`,
+  defaulted to `1s` and `1m`; a closed object. The program runs in a process
+  group of its own — `SIGTERM`, then `SIGKILL` — as an `exec:` node's command
+  does ([D160](#d160-a-cancel-ends-an-execution-cancelled-through-one-controller-every-node-chains-to)). stdout lines become `payload.body`; stderr is tagged into the
+  serve log. `payload.id` is the checkpoint value, or the SHA-256 hex of the
+  line; `payload.source` the source's name; `payload.attributes` `{}`. A line
+  that is not a JSON object is refused and counted. The checkpoint is journaled
+  after the intake accepts the event and handed back as
+  `AGENT_COMPOSE_CHECKPOINT` and as a literal `{checkpoint}` argument — unset
+  and empty before there is one. Each restart is a journaled row, with backoff.
+  `GET /sources/:name` reports the state. Lines are admitted sequentially, which
+  is the backpressure. Several triggers may bind one source.
+- **(d) `local`.** [D87](#d87-local-is-a-reserved-target-and-deploylocalyml-carries-no-storage_backends) is amended so `deploy/local.yml` may declare `kind:
+  command` sources and no other kind.
+- **(e) Admission.** One function in `src/serve.ts`, `admit()`, decides whether
+  an execution starts for every trigger kind: it binds `input:` and
+  `session_key:`, claims the tick or the dedupe key, and registers the
+  execution. `http`'s `start()` is refactored onto it with its behaviour
+  unchanged. An `event` trigger's `dedupe_key:` — default `payload.id` — is
+  enforced through a `dedupe` table keyed `(trigger, key)` whose rows do not
+  expire; a repeat starts nothing and is logged.
+
+**Typing.** The `checkpoint:` expression is typed over `{body, source,
+attributes}` — the event payload without `id`, because the checkpoint *is* the
+id — and a read of `payload.id` there is `circular-checkpoint`, a named
+diagnostic with its explain page, rather than an unknown field: the field is
+spelled right, and it is the expression's own answer.
+
+**Lifecycle.** An execution a tick or an event starts carries its trigger's
+name everywhere an `http` one does — its lifecycle row, its status report and
+the serve log. The trace and its envelope gain nothing, so there is no
+`trace_version` bump (`docs/trace.md` §10.2).
+
+**The non-execution-scoped identities.** The `fired` row is the journal's one
+identity keyed by a trigger and an instant rather than by an execution, and it
+is an exception to `docs/distributed.md` §8 rule 2 that the rule now names. The
+`dedupe`, `checkpoints` and `restarts` tables are the same kind of row — keyed
+by a trigger or a source — and are named beside it there and in
+`src/journal.ts`'s index comment. None of them is a counter: each is one row per
+thing that happened, read back by key.
+
+**Collision review.** PRD resolved **q7** (an `event` backend abstraction with
+one blessed reference backend in M3): its reference backend is changed by the
+owner from Redis Streams to `command`, and the interface it asked for is the one
+`command` implements. **q36** (what §7 M3's trigger line ships): partially
+reversed — `schedule` and queue-backed `event` triggers are no longer reserved —
+and its other half stands: `http` is still the webhook, and no trigger kind is
+added. **q37** (the hub owns triggers) is why `serve` alone fires. **q28**
+("triggers fire once"): the fired row and the dedupe row *are* that rule, made
+durable; recovery still replays executions and re-fires nothing. **q32**
+(inbound auth): grammar 13.5 gives an `event` trigger no `auth:`, so the status
+routes of an execution one started are open, and so is `GET /sources/:name` —
+the q32 reading applied one level up. **q63** (named refusal of an
+unimplemented provider): the posture the queue kinds' refusal follows. **q77**
+(the intake ledger: `dedupe_window:`, `concurrency:`, debounce), resolved and
+not yet built, is what this admission function is the seam for: q78 ruling e
+says q77 applies to every event and tick, and the `dedupe` table here is the
+row q77's window becomes the TTL of; until it lands, rows do not expire and no
+group is enforced. **PRD 5.11** and **§7 M3**: the reserved line lands.
+**§13.4, §13.5, §14.4 and §15** lose their RESERVED headings and rows; §15 keeps
+the queue kinds as a refused row. [D87](#d87-local-is-a-reserved-target-and-deploylocalyml-carries-no-storage_backends): amended, with a note on it. [D59](#d59-checkpointing-is-a-target-property-and-detach-is-checked-per-target)
+(checkpointing per target): unaffected — `local`'s checkpointer is not what a
+fired row or a checkpoint is kept in; both live in the journal under every
+target. [D46](#d46-reserved-trigger-shapes-are-fully-specified): amended, with a note on it. [D117](#d117-payloadbody-is-an-empty-object-on-a-bodyless-request) (`payload.body` on a bodyless
+request): untouched — a command source's body is always the line's object, so
+there is no bodyless event. [D160](#d160-a-cancel-ends-an-execution-cancelled-through-one-controller-every-node-chains-to): the process-group discipline a command
+source's program is stopped by. **D163** is reserved for q77. `docs/distributed.md`
+**§8**: rule 2 is amended to name the fired row's exception, and the two-hub
+reading of a tick is stated there.
+
+**Status**: shipped as written here. The ruling fixes the keys, the payloads,
+the fired-row identity, the skip, the checkpoint hand-back and the refusals; the
+following are the implementation's own readings and await the owner's ruling:
+
+- `payload.scheduled_at` is the tick's nominal instant in the trigger's zone
+  with a numeric offset (`+00:00` for UTC, never `Z`); the fired row keys the
+  same instant as a UTC ISO string.
+- A scheduler that wakes late fires the one tick it was waiting for and skips
+  the rest, logged the way downtime is.
+- The fired row is claimed after the trigger's inputs are bound and before the
+  execution is registered, so a crash between the two loses that tick — at most
+  once, never twice.
+- A dedupe claim whose execution was never journaled is taken over, by a
+  conditional update naming the old holder, by the next event with that key.
+- The checkpoint advances only when some bound trigger accepted the event — a
+  start or a dedupe repeat; an event every trigger refused (an input that did
+  not bind) advances nothing.
+- An intake that fails at the journal is retried with backoff and holds the
+  stream rather than skipping the line.
+- Lines longer than 1 MiB are refused like lines that are not JSON objects.
+- `{checkpoint}` replaces a whole argument only, never a substring of one.
+- The program's working directory is the built project's (where the generated
+  app runs); its stdin is a pipe that
+  reaches end-of-file when `serve` exits, which is how a `SIGKILL`ed `serve`'s
+  program learns it has gone.
+- A source no `event` trigger binds is not started; an `event` trigger whose
+  source `local` does not declare is logged at start.
+- The refused-line and accepted-event counts are the running process's, not
+  journaled.
+- `GET /sources/:name` is open because no `event` trigger can declare `auth:`;
+  ruling c's "under the auth of the bound event triggers" is therefore
+  vacuous until grammar gives them one.
+- The restart defaults — `backoff: 1s`, `max: 1m` — and the two-second stop
+  grace.
+- A `timezone:` is shape-checked at compile time and checked against the
+  runtime's `Intl` at `serve` start.
+- The cron dialect: names accepted in any case; `a/n` refused; a backwards range
+  refused; an expression that never fires refused; a field restricted unless it
+  is exactly `*`.
+- The two-hub case on a dialled journal is held in practice by the journal's
+  writer guard (`docs/durability.md` §2.3) — the second `serve` is a standby
+  whose ticks are refused at the journal — with the fired row's identity the
+  rule that holds when hubs share a journal without it.
+
+*PRD resolved q7, q28, q32, q36, q37, q63, q77, q78; PRD 5.11, §7 M3; §13.4,
+§13.5, §14.4, §15; amends D46 and D87.*
 
 ## Appendix B — Editor integration
 

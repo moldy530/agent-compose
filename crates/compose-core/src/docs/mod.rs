@@ -77,6 +77,18 @@ pub const ENVIRONMENT: &[(&str, &str)] = &[
         "milliseconds an emitted project adds to the clock a `kv` store reads expiry by, which is how a test moves past a `ttl:` (grammar 11.4)",
     ),
     (
+        "AGENT_COMPOSE_SCHEDULE_CLOCK_OFFSET_MS",
+        "milliseconds an emitted project adds to the clock its `schedule` triggers' scheduler reads, which is how a test simulates an outage (grammar 13.4)",
+    ),
+    (
+        "AGENT_COMPOSE_SCHEDULE_CLOCK_RATE",
+        "how many scheduler milliseconds pass per real one in an emitted project, which is how a test makes a cron's ticks due without waiting (grammar 13.4)",
+    ),
+    (
+        "AGENT_COMPOSE_CHECKPOINT",
+        "set by `serve` in a `kind: command` event source's environment: the newest checkpoint the intake accepted, unset before there is one (grammar 14.4)",
+    ),
+    (
         "NO_COLOR",
         "any non-empty value turns styling off on every report (no-color.org)",
     ),

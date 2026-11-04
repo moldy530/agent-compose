@@ -1,0 +1,14 @@
+# rule: a `cron:` step runs over `*` or a range, never a single value (grammar 13.4, Decision D162)
+# code: invalid-cron
+# message: `cron` "5/15 * * * *" cannot be evaluated: the minute field `5/15` steps the single value `5`: a step needs a range, so write `5-59/15` or `*/15`
+# at: 14:11
+# help: a field is `*`, a number, a range `a-b`, a list `a,b`, or a step `*/n` or `a-b/n`; minutes run 0-59, hours 0-23, days of the month 1-31, months 1-12 or JAN-DEC, days of the week 0-7 or SUN-SAT with 0 and 7 both Sunday (grammar 13.4)
+#
+# Dialects disagree about `5/15` — "from 5, every 15" to some, an error to
+# others — so the grammar takes neither reading and asks for the one every
+# reader agrees on.
+triggers:
+  quarter_hourly:
+    type: schedule
+    flow: flow.triage
+    cron: "5/15 * * * *"

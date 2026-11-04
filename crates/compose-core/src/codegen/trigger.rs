@@ -22,9 +22,17 @@
 //! partitions by (grammar 11.3). Emitting the table is what keeps a declared
 //! remap from being a key the compiler accepts and nothing evaluates.
 //!
-//! `schedule` and `event` are reserved grammar (grammar 15): parsed,
-//! type-checked and carried into the IR, executed by nothing in v0. Emitting a
-//! route for one would be a route nothing ever calls.
+//! # The tables `serve` runs rather than mounts
+//!
+//! `schedule` and `event` triggers execute under `serve` (PRD resolved q78):
+//! the scheduler `./sources.ts` runs evaluates every `scheduleTriggers` entry's
+//! `cron:` in its `timezone:`, and the consumer it runs for each `kind: command`
+//! source admits every line to every `eventTriggers` entry bound to it. Neither
+//! is a route. Beside them, `eventSources` is the active target's
+//! `event_sources:` — every entry, with its kind, so `serve` can refuse a kind
+//! this release does not implement **by name** at start (the q63 posture), and
+//! for the one it does, the program, its arguments, its `checkpoint:` and its
+//! resolved `restart:`.
 //!
 //! # The payload is bound through a declared shape
 //!
@@ -35,11 +43,12 @@
 //! is a `string` on both sides, and a number in a decoded body is whatever the
 //! body says it is.
 
+use crate::ast::deploy::EventSourceKind;
 use crate::ast::trigger::{HmacAlgorithm, Respond, SignatureEncoding, TriggerMethod};
 use crate::ir::Ir;
 use crate::ir::trigger::{CallbackAuth, HttpTrigger, InboundAuth, TriggerKind};
 
-use super::{names, policy};
+use super::{graph, names, policy};
 
 /// `src/triggers.ts`.
 #[must_use]
@@ -63,8 +72,12 @@ const PREAMBLE: &str = r#"//
 // D64) — but it may declare the `session_key:` that remaps `--session` into the
 // session identity a `scope: session` store partitions by (grammar 13.2, 11.3).
 //
-// `schedule` and `event` are reserved grammar that executes as a no-op in v0
-// (grammar 15), and neither appears in either table.
+// `scheduleTriggers` and `eventTriggers` are what `./sources.ts` runs under
+// `serve` (PRD resolved q78): a schedule's ticks and a command source's lines
+// start executions through the same admission an `http` request does
+// (`./serve.ts`'s `admit`). `eventSources` is the active target's
+// `event_sources:`, every entry with its kind — a kind this release does not
+// implement is refused by name when `serve` starts (grammar 14.4).
 
 import * as runtime from "./runtime.ts";
 
@@ -193,6 +206,53 @@ function roots(payload: unknown): runtime.Roots {
   return { payload: runtime.bind(payload, httpPayload) };
 }
 
+/**
+ * The payload shape grammar 13.4 fixes for a `schedule` trigger: the tick's
+ * nominal instant in the trigger's zone (RFC 3339), and the trigger's name.
+ */
+const schedulePayload: runtime.Shape = {
+  properties: { scheduled_at: "string", trigger: "string" },
+};
+
+/**
+ * The payload shape grammar 13.5 fixes for an `event` trigger. A `kind:
+ * command` source fills it from one line: `body` is the decoded object, `id`
+ * its `checkpoint:` value or the SHA-256 of the line, `attributes` is `{}`,
+ * `source` the logical name (grammar 14.4).
+ */
+const eventPayload: runtime.Shape = {
+  properties: {
+    id: "string",
+    body: { properties: {}, rest: "any" },
+    attributes: { properties: {}, rest: "string" },
+    source: "string",
+  },
+};
+
+/** What a command source's `checkpoint:` reads: the event before it has an id. */
+const checkpointPayload: runtime.Shape = {
+  properties: {
+    body: { properties: {}, rest: "any" },
+    attributes: { properties: {}, rest: "string" },
+    source: "string",
+  },
+};
+
+/** The roots a `schedule` trigger's expressions are evaluated against. */
+function scheduleRoots(payload: SchedulePayload): runtime.Roots {
+  return { payload: runtime.bind(payload, schedulePayload) };
+}
+
+/** The roots an `event` trigger's expressions are evaluated against. */
+function eventRoots(payload: EventPayload): runtime.Roots {
+  return { payload: runtime.bind(payload, eventPayload) };
+}
+
+/** The roots a command source's `checkpoint:` is evaluated against. */
+function checkpointRoots(event: LineEvent): runtime.Roots {
+  return { payload: runtime.bind(event, checkpointPayload) };
+}
+
 /** The roots a `manual` trigger's `session_key:` is evaluated against. */
 function manualRoots(session: string): runtime.Roots {
   return { payload: runtime.bind({ session }, manualPayload) };
@@ -229,16 +289,300 @@ export interface ManualTrigger {
   sessionKey?(session: string): string;
 }
 
+/** One tick's payload (grammar 13.4). */
+export interface SchedulePayload {
+  readonly scheduled_at: string;
+  readonly trigger: string;
+}
+
+/** One event's payload (grammar 13.5, 14.4). */
+export interface EventPayload {
+  readonly id: string;
+  readonly body: Readonly<Record<string, unknown>>;
+  readonly attributes: Readonly<Record<string, string>>;
+  readonly source: string;
+}
+
+/** One line of a command source, decoded, before it has an id (grammar 14.4). */
+export interface LineEvent {
+  readonly body: Readonly<Record<string, unknown>>;
+  readonly attributes: Readonly<Record<string, string>>;
+  readonly source: string;
+}
+
+/**
+ * One declared `schedule` trigger (grammar 13.4), which `serve`'s scheduler
+ * fires at every tick of its `cron:` in its `timezone:` (PRD resolved q78).
+ */
+export interface ScheduleTrigger {
+  readonly name: string;
+  readonly flow: string;
+  /** `cron:` — five fields, already held to the evaluator's grammar by `validate`. */
+  readonly cron: string;
+  /** `timezone:` — an IANA name, defaulting to `UTC`. */
+  readonly timezone: string;
+  /** `input:` — the flow inputs this trigger binds from one tick. */
+  input(payload: SchedulePayload): Record<string, unknown>;
+  /** `session_key:` — the session identity for session-scoped stores. */
+  sessionKey?(payload: SchedulePayload): string;
+}
+
+/**
+ * One declared `event` trigger (grammar 13.5): every event its `source:`
+ * produces is admitted to it, deduplicated on its own `dedupe_key:`.
+ */
+export interface EventTrigger {
+  readonly name: string;
+  readonly flow: string;
+  /** `source:` — the logical name the active target's `event_sources:` binds. */
+  readonly source: string;
+  /** `input:` — the flow inputs this trigger binds from one event. */
+  input(payload: EventPayload): Record<string, unknown>;
+  /** `session_key:` — the session identity for session-scoped stores. */
+  sessionKey?(payload: EventPayload): string;
+  /** `dedupe_key:` — defaulting to `payload.id`. */
+  dedupeKey(payload: EventPayload): string;
+}
+
+/** grammar 14.4's kinds. */
+export type EventSourceKind = "command" | "redis_streams" | "sqs" | "nats";
+
+/**
+ * The kinds `serve` runs a consumer for in this release (PRD resolved q78).
+ * The others keep their vocabulary and are refused at start, by name.
+ */
+export const IMPLEMENTED_SOURCE_KINDS: readonly EventSourceKind[] = ["command"];
+
+/** One argument of a command source's program (grammar 14.4). */
+export type CommandArgument =
+  | { readonly text: readonly runtime.Interpolation[] }
+  /** An argument written exactly `{checkpoint}`: the source's newest checkpoint. */
+  | { readonly checkpoint: true };
+
+/** A `kind: command` source's program, `restart:` resolved (grammar 14.4). */
+export interface CommandSource {
+  /** `command:` — argv[0], interpolated at start (grammar 4.3 class 2). */
+  readonly command: readonly runtime.Interpolation[];
+  readonly args: readonly CommandArgument[];
+  /** `checkpoint:` — the event's id, and the position handed back on restart. */
+  checkpoint?(event: LineEvent): string;
+  readonly restartBackoffMs: number;
+  readonly restartMaxMs: number;
+}
+
+/** One `event_sources:` entry of the active target (grammar 14.4). */
+export interface EventSource {
+  readonly name: string;
+  readonly kind: EventSourceKind;
+  /** The program, on a `kind: command` source and no other. */
+  readonly command?: CommandSource;
+}
+
 "#;
 
-/// Both tables: the routes `./serve.ts` mounts, then the CLI entries
-/// `./cli.ts` reads.
+/// Every table: the routes `./serve.ts` mounts, the CLI entries `./cli.ts`
+/// reads, and the schedules, event triggers and sources `./sources.ts` runs.
 fn table(ir: &Ir) -> String {
     let mut text = http_table(ir);
     text.push('\n');
     text.push_str(&manual_table(ir));
+    text.push('\n');
+    text.push_str(&schedule_table(ir));
+    text.push('\n');
+    text.push_str(&event_table(ir));
+    text.push('\n');
+    text.push_str(&source_table(ir));
     text
 }
+
+/// One trigger's `input:` as a function of one payload, its roots bound once.
+fn input_function(
+    input: Option<&crate::ir::binding::Bindings>,
+    payload: &str,
+    roots: &str,
+) -> String {
+    let bindings: Vec<_> = input
+        .map(|map| map.entries.iter().collect())
+        .unwrap_or_default();
+    if bindings.is_empty() {
+        return "    input: () => ({}),\n".to_string();
+    }
+    let mut text = format!(
+        "    input: (payload: {payload}) => {{\n      const bound = {roots}(payload);\n      return {{\n"
+    );
+    for binding in bindings {
+        text.push_str(&format!(
+            "        {}: runtime.toJson(runtime.evaluate({}, bound)),\n",
+            names::string(binding.name.value.as_str()),
+            names::string(binding.value.value.as_str())
+        ));
+    }
+    text.push_str("      };\n    },\n");
+    text
+}
+
+/// The `schedule` entries, in the IR's canonical order (Decision D55).
+fn schedule_table(ir: &Ir) -> String {
+    let mut text = String::from("export const scheduleTriggers: readonly ScheduleTrigger[] = [\n");
+    for trigger in ir
+        .triggers
+        .iter()
+        .flat_map(|section| section.entries.values())
+    {
+        let TriggerKind::Schedule(schedule) = &trigger.kind else {
+            continue;
+        };
+        let name = trigger.name.value.as_str();
+        text.push_str("  {\n");
+        text.push_str(&format!("    name: {},\n", names::string(name)));
+        text.push_str(&format!(
+            "    flow: {},\n",
+            names::string(&trigger.flow.value.to_string())
+        ));
+        text.push_str(&format!(
+            "    cron: {},\n",
+            names::string(&schedule.cron.value)
+        ));
+        text.push_str(&format!(
+            "    timezone: {},\n",
+            names::string(
+                schedule
+                    .timezone
+                    .as_ref()
+                    .map_or("UTC", |timezone| timezone.value.as_str())
+            )
+        ));
+        text.push_str(&input_function(
+            schedule.input.as_ref(),
+            "SchedulePayload",
+            "scheduleRoots",
+        ));
+        if let Some(key) = &trigger.session_key {
+            text.push_str(&format!(
+                "    sessionKey: (payload) => text({}, scheduleRoots(payload), {}),\n",
+                names::string(key.value.as_str()),
+                names::string(&format!("`session_key` of the trigger `{name}`"))
+            ));
+        }
+        text.push_str("  },\n");
+    }
+    text.push_str("];\n");
+    text
+}
+
+/// The `event` entries, in the IR's canonical order (Decision D55).
+fn event_table(ir: &Ir) -> String {
+    let mut text = String::from("export const eventTriggers: readonly EventTrigger[] = [\n");
+    for trigger in ir
+        .triggers
+        .iter()
+        .flat_map(|section| section.entries.values())
+    {
+        let TriggerKind::Event(event) = &trigger.kind else {
+            continue;
+        };
+        let name = trigger.name.value.as_str();
+        text.push_str("  {\n");
+        text.push_str(&format!("    name: {},\n", names::string(name)));
+        text.push_str(&format!(
+            "    flow: {},\n",
+            names::string(&trigger.flow.value.to_string())
+        ));
+        text.push_str(&format!(
+            "    source: {},\n",
+            names::string(event.source.value.as_str())
+        ));
+        text.push_str(&input_function(
+            event.input.as_ref(),
+            "EventPayload",
+            "eventRoots",
+        ));
+        if let Some(key) = &trigger.session_key {
+            text.push_str(&format!(
+                "    sessionKey: (payload) => text({}, eventRoots(payload), {}),\n",
+                names::string(key.value.as_str()),
+                names::string(&format!("`session_key` of the trigger `{name}`"))
+            ));
+        }
+        // Grammar 13.5's default is the expression `payload.id`, evaluated like
+        // any the author wrote — one path for both, so the default cannot read
+        // the payload differently from the key it stands in for.
+        let dedupe = event
+            .dedupe_key
+            .as_ref()
+            .map_or("payload.id", |key| key.value.as_str());
+        text.push_str(&format!(
+            "    dedupeKey: (payload) => text({}, eventRoots(payload), {}),\n",
+            names::string(dedupe),
+            names::string(&format!("`dedupe_key` of the trigger `{name}`"))
+        ));
+        text.push_str("  },\n");
+    }
+    text.push_str("];\n");
+    text
+}
+
+/// The active target's `event_sources:`, every entry, by name (grammar 14.4).
+fn source_table(ir: &Ir) -> String {
+    let mut text = String::from("export const eventSources: readonly EventSource[] = [\n");
+    for source in ir
+        .deploy
+        .event_sources
+        .iter()
+        .flat_map(|section| section.entries.values())
+    {
+        let name = source.name.value.as_str();
+        text.push_str("  {\n");
+        text.push_str(&format!("    name: {},\n", names::string(name)));
+        text.push_str(&format!(
+            "    kind: {},\n",
+            names::string(source.kind.as_str())
+        ));
+        if let (EventSourceKind::Command, Some(command)) = (source.kind, &source.command) {
+            let site = format!("deploy.event_sources.{name}");
+            text.push_str("    command: {\n");
+            text.push_str(&format!(
+                "      command: {},\n",
+                graph::interpolation(&command.command.value, &format!("{site}.command"))
+            ));
+            text.push_str("      args: [\n");
+            for (index, arg) in command.args.iter().enumerate() {
+                if arg.value.as_str() == CHECKPOINT_ARGUMENT {
+                    text.push_str("        { checkpoint: true },\n");
+                } else {
+                    text.push_str(&format!(
+                        "        {{ text: {} }},\n",
+                        graph::interpolation(&arg.value, &format!("{site}.args[{index}]"))
+                    ));
+                }
+            }
+            text.push_str("      ],\n");
+            if let Some(checkpoint) = &command.checkpoint {
+                text.push_str(&format!(
+                    "      checkpoint: (event) => text({}, checkpointRoots(event), {}),\n",
+                    names::string(checkpoint.value.as_str()),
+                    names::string(&format!("`checkpoint` of the event source `{name}`"))
+                ));
+            }
+            text.push_str(&format!(
+                "      restartBackoffMs: {},\n",
+                command.restart_backoff_ms.min(1_u64 << 53)
+            ));
+            text.push_str(&format!(
+                "      restartMaxMs: {},\n",
+                command.restart_max_ms.min(1_u64 << 53)
+            ));
+            text.push_str("    },\n");
+        }
+        text.push_str("  },\n");
+    }
+    text.push_str("];\n");
+    text
+}
+
+/// The argument grammar 14.4 replaces with the source's newest checkpoint —
+/// written exactly so, as a whole argument (PRD resolved q78 ruling c).
+pub const CHECKPOINT_ARGUMENT: &str = "{checkpoint}";
 
 /// The `manual` entries, in the IR's canonical order (Decision D55).
 fn manual_table(ir: &Ir) -> String {

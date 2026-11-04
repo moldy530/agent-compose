@@ -188,6 +188,7 @@ import process from "node:process";
 
 import { placedNodes } from "./graph.ts";
 import {
+  type DedupeRow,
   type DeliveryAttempt,
   type DeliveryIntent,
   type DeliveryRecord,
@@ -195,9 +196,12 @@ import {
   type DispatchRow,
   type ExecutionRow,
   type ExecutionStatus,
+  type FiredRow,
   type Journal,
   type JournalOutcome,
   type JournalRecord,
+  type RestartPage,
+  type RestartRow,
   closeSession,
   hostJournal,
   noteStopped,
@@ -479,6 +483,47 @@ class DispatchJournal implements Journal {
 
   effectsUnder(_execution: string, _site: string): Promise<readonly JournalRecord[]> {
     throw new WorkerJournalReach("read an execution's effect history");
+  }
+
+  // The intake's ledger (PRD resolved q78): ticks, dedupe keys, checkpoints and
+  // restarts are what decide whether an execution exists, which is the hub's
+  // question — a tick and an event start executions on the hub, and a worker
+  // runs one dispatched node of one (`docs/distributed.md` §1).
+
+  fire(_row: FiredRow): Promise<FiredRow> {
+    throw new WorkerJournalReach("fire a schedule tick");
+  }
+
+  lastFired(_trigger: string): Promise<FiredRow | undefined> {
+    throw new WorkerJournalReach("read a schedule's fired ticks");
+  }
+
+  firedOf(_trigger: string): Promise<readonly FiredRow[]> {
+    throw new WorkerJournalReach("read a schedule's fired ticks");
+  }
+
+  claimDedupe(_row: DedupeRow): Promise<DedupeRow> {
+    throw new WorkerJournalReach("claim an event's dedupe key");
+  }
+
+  retakeDedupe(_trigger: string, _key: string, _from: string, _to: string): Promise<boolean> {
+    throw new WorkerJournalReach("claim an event's dedupe key");
+  }
+
+  checkpointOf(_source: string): Promise<string | undefined> {
+    throw new WorkerJournalReach("read an event source's checkpoint");
+  }
+
+  recordCheckpoint(_source: string, _checkpoint: string): Promise<void> {
+    throw new WorkerJournalReach("record an event source's checkpoint");
+  }
+
+  recordRestart(_row: RestartRow): Promise<void> {
+    throw new WorkerJournalReach("record an event source's restart");
+  }
+
+  restartsOf(_source: string, _limit: number): Promise<RestartPage> {
+    throw new WorkerJournalReach("read an event source's restarts");
   }
 
   /**

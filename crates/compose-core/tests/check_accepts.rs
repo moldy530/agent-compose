@@ -34,9 +34,21 @@ model.m:
 
 #[track_caller]
 fn accepts(name: &str, body: &str) {
+    accepts_with_local(name, body, None);
+}
+
+/// [`accepts`], with a `deploy/local.yml` beside the composition — for the
+/// cases whose subject is a deploy-layer section the built-in target may
+/// declare.
+#[track_caller]
+fn accepts_with_local(name: &str, body: &str, local: Option<&str>) {
     let dir = scratch(name);
     let source = format!("version: \"0.1\"\n{BACKEND}{body}");
     fs::write(dir.join("main.yml"), &source).expect("can write the project");
+    if let Some(local) = local {
+        fs::create_dir_all(dir.join("deploy")).expect("can write the project");
+        fs::write(dir.join("deploy/local.yml"), local).expect("can write the project");
+    }
     let resolution = resolve(dir.join("main.yml"));
     assert!(
         resolution.diagnostics.is_empty(),
@@ -2995,5 +3007,87 @@ flow.by_map:
     - { from: work, to: end }
   finally: close_each
 "#,
+    );
+}
+
+/// A `kind: command` source under the built-in target, bound by two `event`
+/// triggers of two flows, with a `checkpoint:` that answers a string from each
+/// of the members its scope has (grammar 14.4, PRD resolved q78, Decision D87 as
+/// amended by D162) — and a `schedule` trigger in a named zone beside them.
+///
+/// The accepting half of three refusals: `circular-checkpoint` and the
+/// checkpoint's `type-mismatch` (`invalid-check/`), and the non-command kind
+/// under `local` (`invalid-resolve/`). Several triggers may bind one source:
+/// each event is offered to each of them.
+#[test]
+fn a_command_source_two_event_triggers_bind_and_a_zoned_schedule() {
+    accepts_with_local(
+        "command-source",
+        r#"
+flow.ingest:
+  inputs:
+    id: { type: string }
+    text: { type: string }
+  outputs: {}
+  nodes:
+    note:
+      exec: { command: "true" }
+  edges:
+    - { from: start, to: note }
+    - { from: note, to: end }
+
+flow.audit:
+  inputs:
+    source: { type: string }
+  outputs: {}
+  nodes:
+    note:
+      exec: { command: "true" }
+  edges:
+    - { from: start, to: note }
+    - { from: note, to: end }
+
+flow.tick:
+  inputs:
+    scheduled_at: { type: string }
+  outputs: {}
+  nodes:
+    note:
+      exec: { command: "true" }
+  edges:
+    - { from: start, to: note }
+    - { from: note, to: end }
+
+triggers:
+  ingest:
+    type: event
+    flow: flow.ingest
+    source: feed
+    input: { id: "payload.id", text: "payload.body.text" }
+  audit:
+    type: event
+    flow: flow.audit
+    source: feed
+    dedupe_key: "payload.source + ':' + payload.id"
+    input: { source: "payload.source" }
+  nightly:
+    type: schedule
+    flow: flow.tick
+    cron: "30 2 * * MON-FRI"
+    timezone: America/New_York
+    input: { scheduled_at: "payload.scheduled_at" }
+"#,
+        Some(
+            r#"version: "0.1"
+
+event_sources:
+  feed:
+    kind: command
+    command: ./bin/feed
+    args: ["{checkpoint}"]
+    checkpoint: "payload.source + '/' + payload.body.cursor"
+    restart: { backoff: 250ms, max: 30s }
+"#,
+        ),
     );
 }

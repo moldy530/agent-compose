@@ -5,8 +5,8 @@
 # `function` node, kv and vector stores (both consumption surfaces), a `human`
 # node, reduced state channels, a pair of concurrent branches converging at
 # equal depth (grammar 7.6), a node reachable only through an `on_error:`
-# fallback (grammar 7.8), and the reserved grammar (schedule + event triggers,
-# placements, event_sources).
+# fallback (grammar 7.8), schedule + event triggers (grammar 13.4, 13.5), and
+# the deploy layer's placements and event_sources.
 #
 # The project is written to validate under `--target local` AND under the
 # `--target staging` it ships in deploy/ — which is why no route is detached

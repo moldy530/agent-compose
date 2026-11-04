@@ -1644,7 +1644,7 @@ fn triggers(ir: &Ir, flow: &str) -> Vec<TriggerView> {
                         .map_or("UTC", |zone| zone.value.as_str());
                     (
                         "schedule",
-                        format!("cron {} ({zone}) · reserved in v0", schedule.cron.value),
+                        format!("cron {} ({zone})", schedule.cron.value),
                         schedule
                             .input
                             .as_ref()
@@ -1654,7 +1654,7 @@ fn triggers(ir: &Ir, flow: &str) -> Vec<TriggerView> {
                 }
                 TriggerKind::Event(event) => (
                     "event",
-                    format!("source {} · reserved in v0", event.source.value.as_str()),
+                    format!("source {}", event.source.value.as_str()),
                     event.input.as_ref().map(binding_views).unwrap_or_default(),
                 ),
             };

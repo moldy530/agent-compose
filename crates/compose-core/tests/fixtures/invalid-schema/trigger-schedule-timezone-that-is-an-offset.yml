@@ -1,0 +1,9 @@
+# rule: a schedule's `timezone:` is an IANA zone name, never an offset (grammar 13.4 / Decision D162)
+# at: /triggers/nightly/timezone
+# via: /$defs/scheduleTrigger/properties/timezone/allOf/1/pattern
+triggers:
+  nightly:
+    type: schedule
+    flow: flow.triage
+    cron: "0 3 * * *"
+    timezone: "+02:00"

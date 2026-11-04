@@ -11,16 +11,19 @@
 //! `local` is built in and exempt from every rule that reads the deploy layer's
 //! bindings. It substitutes SQLite/local disk for every store unconditionally,
 //! so it resolves no alias — and therefore can neither fail to find one nor
-//! find one that serves the wrong kind — and it runs no consumer process, so it
-//! binds no event source. That is what lets a project with production
-//! infrastructure in `deploy/staging.yml` still validate and run with nothing
-//! installed — PRD 5.8's zero-infra guarantee (Decision D87).
+//! find one that serves the wrong kind — and it runs no queue consumer, so an
+//! `event` trigger's `source:` needs no binding there: one `deploy/local.yml`
+//! does bind is a `kind: command` program, the one kind `local` may declare
+//! (PRD resolved q78, Decision D87 as amended by D162), and one it does not is
+//! a trigger `serve` reports as having no source. That is what lets a project
+//! with production infrastructure in `deploy/staging.yml` still validate and
+//! run with nothing installed — PRD 5.8's zero-infra guarantee.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::common::{Ident, Namespace};
 use crate::ast::definition::{Definition, DefinitionBody, StoreDef};
-use crate::ast::deploy::{BackendAlias, BackendProvider};
+use crate::ast::deploy::{BackendAlias, BackendProvider, EventSourceKind};
 use crate::ast::trigger::TriggerKind;
 use crate::diag::{Diagnostic, DiagnosticCode, Diagnostics, Spanned};
 use crate::parse::reader::{list, suggest};
@@ -82,6 +85,44 @@ pub(crate) fn check(composition: &Composition, index: &Index<'_>, diagnostics: &
                     format!("`{}` may not declare `{key}:`", deploy.name),
                 )
                 .with_help(help),
+            );
+        }
+    }
+
+    if local {
+        // `event_sources:` under `local` is `kind: command` and nothing else
+        // (PRD resolved q78 ruling d, Decision D87 as amended by D162): a
+        // program on this machine is local infrastructure the way the laptop
+        // is, and `serve` runs it under `local` like anywhere else, while a
+        // queue is infrastructure `local` does not have — a `redis_streams`
+        // entry here could only be a source whose author expected a consumer
+        // the zero-infra target never starts.
+        for source in deploy
+            .file
+            .event_sources
+            .iter()
+            .flat_map(|section| section.sources.iter())
+        {
+            let Some(kind) = source.kind.as_ref() else {
+                continue;
+            };
+            if kind.value == EventSourceKind::Command {
+                continue;
+            }
+            diagnostics.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidValue,
+                    kind.span.clone(),
+                    format!(
+                        "`{}` may declare `event_sources` of `kind: command` only, and `{}` is `kind: {}`",
+                        deploy.name,
+                        source.name.value,
+                        kind.value.as_str()
+                    ),
+                )
+                .with_help(
+                    "`local` is the zero-infra target: a program on this machine is local infrastructure and runs there, while a queue is not, so `local` starts no consumer for one; bind the queue under a `--target` of its own and leave the trigger's source unbound here, which `local` satisfies vacuously (grammar 14, 14.4, Decision D87 as amended by D162)",
+                ),
             );
         }
     }

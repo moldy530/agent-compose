@@ -343,33 +343,157 @@ checks at process start, so a deployment holding neither is refused before it
 serves a request — which is what `agent-compose docs targets` means by a
 statically computable credential list.
 
-## `schedule` and `event` — reserved
+## `schedule` — fired by `serve`
 
-Both are reserved in the sense the closing section gives: **fully parsed,
-type-checked, and carried into the IR**, and executed as no-ops in v0.
+A `schedule` trigger starts an execution at each tick of a five-field POSIX
+cron, in an IANA time zone (default `UTC`). `agent-compose serve` is what fires
+it — `run` never does — and `validate` holds the expression to the grammar the
+scheduler evaluates, refusing what it could not read as `invalid-cron` (see
+`agent-compose explain invalid-cron` for the fields and the refusals).
 
 ```yaml
-nightly:
+nightly_digest:
   type: schedule
-  flow: flow.triage
-  cron: "0 3 * * *"      # 5-field POSIX cron, shape-checked at compile time
-  timezone: UTC          # an IANA name
-  input: { scope: "'full'" }
-
-ingest:
-  type: event
-  flow: flow.triage
-  source: bug_reports    # a logical name bound in deploy/<target>.yml
-  input: { report: "payload.body" }
-  dedupe_key: "payload.id"
+  flow: flow.digest
+  cron: "0 7 * * MON-FRI"   # 07:00 on weekdays
+  timezone: Europe/Berlin   # matched against Berlin's wall clock
+  input: { since: "payload.scheduled_at" }
 ```
 
-A `schedule` payload is `payload.scheduled_at` and `payload.trigger`; an `event`
-payload is `payload.id`, `payload.body`, `payload.attributes`,
-`payload.source`. `dedupe_key` defaults to `payload.id` and is the inbound
-at-least-once dedupe. A `source:` not defined in the active target's
-`event_sources:` is a compile error naming the target — satisfied vacuously
-under `local`, which runs no consumer.
+- **A tick fires once.** It is journaled before its execution starts, keyed by
+  the trigger and the tick, so a restarted `serve` — or a second hub on the same
+  journal — never starts it again.
+- **Downtime is skipped, never back-filled.** Ticks that fell while no `serve`
+  was running do not fire when it comes back; the serve log names the span.
+  `payload.scheduled_at` is the tick the execution was started for — its
+  nominal time, in the trigger's zone — which is what a job catches itself up
+  from.
+- **Daylight saving.** A time a spring-forward gap skips fires at the end of
+  the gap; a time an autumn overlap repeats fires once.
+- When **both** day fields are restricted, a day matching either fires:
+  `0 0 13 * 5` is the 13th *and* every Friday (POSIX's rule).
+
+The payload is `payload.scheduled_at` and `payload.trigger`.
+
+## `event` — fed by a program
+
+An `event` trigger names a logical `source:`, and the target binds it in
+`event_sources:` (`agent-compose docs targets`). The kind `serve` runs is
+`kind: command`: a long-running program whose stdout is **one JSON object per
+line**. Each line is an event, offered to every `event` trigger bound to the
+source, one at a time and in order.
+
+```yaml spec
+version: "0.1"
+
+flow.file_report:
+  inputs:
+    report: { type: string }
+  outputs: {}
+  nodes:
+    file:
+      exec: { command: "true" }   # stands in for the real work
+  edges:
+    - { from: start, to: file }
+    - { from: file, to: end }
+
+flow.digest:
+  inputs:
+    since: { type: string }
+  outputs: {}
+  nodes:
+    send:
+      exec: { command: "true" }
+  edges:
+    - { from: start, to: send }
+    - { from: send, to: end }
+
+triggers:
+  nightly_digest:
+    type: schedule
+    flow: flow.digest
+    cron: "0 7 * * MON-FRI"
+    timezone: Europe/Berlin
+    input: { since: "payload.scheduled_at" }
+
+  reports:
+    type: event
+    flow: flow.file_report
+    source: reports
+    input: { report: "payload.body.text" }
+```
+
+The source, in the deploy file — `kind: command` is the one kind
+`deploy/local.yml` may declare, because a program on this machine is local
+infrastructure:
+
+```yaml
+# deploy/local.yml
+version: "0.1"
+event_sources:
+  reports:
+    kind: command
+    command: sh
+    args: ["${REPORTS_FEED}"]
+    checkpoint: "payload.body.cursor"
+```
+
+And the program. Every line appended to a file is one report; its checkpoint is
+the line's number, so a restart resumes on the line after the last one `serve`
+accepted:
+
+```sh
+#!/bin/sh
+# Every line appended to $REPORTS_LOG is one event, for as long as serve runs.
+#
+# AGENT_COMPOSE_CHECKPOINT is the number of the last line serve accepted, and
+# unset before the first: the program resumes on the line after it.
+after="${AGENT_COMPOSE_CHECKPOINT:-0}"
+tail -n "+$((after + 1))" -F "${REPORTS_LOG:?name the file to follow}" 2>/dev/null |
+  while IFS= read -r line; do
+    after=$((after + 1))
+    text=$(printf '%s' "$line" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+    printf '{"cursor":"%d","text":"%s"}\n' "$after" "$text"
+  done &
+# stdin is a pipe serve holds and never writes: it ends when serve does, however
+# serve ends. Then end the process group serve started this program in.
+cat > /dev/null
+kill 0
+```
+
+What the runtime does around it:
+
+- **The payload.** `payload.body` is the line's object, `payload.id` the
+  `checkpoint:` value — the SHA-256 of the line when none is declared —
+  `payload.source` the source's name and `payload.attributes` `{}`.
+- **The checkpoint** is journaled once the trigger has accepted the event, and
+  handed back on every start: as `AGENT_COMPOSE_CHECKPOINT`, and in place of an
+  argument written exactly `{checkpoint}`. Before there is one, the variable is
+  unset and the argument is the empty string. `checkpoint:` reads the line —
+  `payload.body`, `payload.source`, `payload.attributes` — and never
+  `payload.id`, which is its own answer (`circular-checkpoint`).
+- **Dedupe.** `dedupe_key:` defaults to `payload.id`, so an event the program
+  emits twice — the lines after its last accepted checkpoint, when it is
+  restarted — starts one execution; the repeat is logged and starts nothing.
+- **A line that is not a JSON object** is refused, logged with its line number
+  and counted; it starts nothing. stderr goes to the serve log, tagged
+  `[source reports]`.
+- **Restarts.** When the program exits it is started again after
+  `restart.backoff` (default `1s`), doubling up to `restart.max` (default `1m`),
+  and each restart is journaled.
+- **Its state** is `GET /sources/reports`: running or backing off, the
+  checkpoint, the counts and the newest restarts.
+- **Backpressure.** The next line is read only once the last one is admitted,
+  so a program that writes faster than `serve` starts executions waits on its
+  own pipe.
+
+The program runs in a process group of its own, in the built project's
+directory, and is stopped with `SIGTERM` to the group and then `SIGKILL`. Its
+stdin is a pipe that ends when `serve` does, however `serve` ends — which is
+why the script above waits on it: a `serve` killed outright sends nothing, and
+the end of that pipe is how its program learns it has gone. `redis_streams`,
+`sqs` and `nats` keep their vocabulary and `validate` accepts them, but `serve`
+refuses a target that declares one, naming the source.
 
 ## Idempotency keys
 
@@ -406,24 +530,19 @@ process — an `idempotency_key` field on the invocation context it is called
 with. It is delivery metadata, never part of the target's input schema, and
 never authored — there is nothing here for `validate` to reject.
 
-## What `reserved` means
+## What `reserved` meant
 
-Reserved constructs are **fully specified, parsed, type-checked, and carried
-into the IR**, and execute as no-ops in v0. Using one is never an error; relying
-on its runtime effect is a documented no-op.
+No trigger kind is reserved any more. `schedule` and `event` were — fully
+specified, parsed, type-checked and carried into the IR, executed by nothing —
+until `serve` began firing the one and running the other's program.
 
-| Construct | Status in v0 |
-|---|---|
-| `triggers.<t>.type: schedule` | parsed + validated, no-op |
-| `triggers.<t>.type: event` | parsed + validated, no-op |
-
-**The three authentication keys were on this list and have left it.** `auth:`,
+**The three authentication keys were on that list and left it first.** `auth:`,
 `callback_auth:` and `callback_allow:` are enforced by the app a build emits: a
 caller is verified, a delivery is signed, and a callback URL outside the list is
-refused. They were the rows worth reading twice while they were here — a no-op
-`schedule` runs nothing and is visibly inert, while a no-op `auth:` would serve
+refused. They were the rows worth reading twice while they were there — a no-op
+`schedule` ran nothing and was visibly inert, while a no-op `auth:` would serve
 every caller and look exactly like a guarded route — which is why nothing in
 this topic says so any more. `human` nodes left the same way, one milestone
 earlier.
 
-Normative source: `docs/grammar.md` §9.4, §13, §13.1–13.5, §15
+Normative source: `docs/grammar.md` §9.4, §13, §13.1–13.5, §14.4, §15, `docs/durability.md` §3.11–3.14

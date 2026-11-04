@@ -1,0 +1,16 @@
+# The zero-infra target, declaring the one `event_sources:` kind it may: a
+# program on this machine (Decision D87 as amended by D162, PRD resolved q78
+# ruling d). `{checkpoint}` is replaced by the newest checkpoint the intake
+# accepted — the empty string before there is one — and the same value is in
+# the program's environment as `AGENT_COMPOSE_CHECKPOINT`.
+version: "0.1"
+
+event_sources:
+  feed:
+    kind: command
+    command: node
+    args: ["${FEED_PROGRAM}", "{checkpoint}"]
+    checkpoint: "payload.body.cursor"
+    restart:
+      backoff: 200ms
+      max: 2s

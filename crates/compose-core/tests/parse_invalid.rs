@@ -63,6 +63,7 @@ const PARSER_CODES: &[&str] = &[
     "invalid-reference",
     "invalid-duration",
     "invalid-path-expression",
+    "invalid-cron",
     "invalid-env-ref",
     "unexpected-env-ref",
     "reserved-name",

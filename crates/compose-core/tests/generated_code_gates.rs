@@ -9827,11 +9827,13 @@ const other = await import('./cel.ts');
     );
 }
 
-/// Gate 15: the two shared corpora, answered by the other engine.
+/// Gate 15: the shared corpora, answered by the other engine.
 ///
 /// CLAUDE.md's validation strategy keeps two pairs of implementations in lockstep
 /// with a shared corpus each — grammar 3.8's schema table (gate 6) and the two
-/// CEL interpreters. The *second* column of both corpora is JavaScript, and what
+/// CEL interpreters — and Decision D162 adds a third pair on the same terms: the
+/// cron evaluator `validate` links and the `src/cron.ts` `serve` fires
+/// schedules with, whose named-zone cases are the engine's own `Intl`. The *second* column of both corpora is JavaScript, and what
 /// it answers with belongs to the **engine**: an emitted `format:` is a `RegExp`,
 /// an emitted `max_length` is a code-point count, and `src/cel.ts` is `BigInt`
 /// arithmetic, `RegExp` matching and number formatting the whole way down.
@@ -9919,6 +9921,60 @@ fn the_shared_corpora_answer_the_same_under_the_node_fallback() {
          fallback than the validator does; two interpreters must not diverge (CLAUDE.md), and \
          the Bun column of this same corpus is the acceptance suite's \
          `the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corpus`"
+    );
+
+    // The cron corpus (grammar 13.4, Decision D162), over the evaluator a
+    // generated project embeds — the same shape as the CEL corpus and for the
+    // same reason: the validator's reading is `compose_core::cron`, `serve`'s is
+    // the emitted `src/cron.ts`, and its named-zone cases are answered by the
+    // engine's own `Intl`, so what one runtime's zone data says about a
+    // daylight-saving gap is not evidence about the other's.
+    let project = staged(goldens::golden(NODE_FALLBACK_GOLDEN), root, "cron-fallback");
+    let corpus_directory =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cron-conformance");
+    let output = node_command("cron-conformance.mjs")
+        .arg(&project)
+        .arg(&corpus_directory)
+        .output()
+        .expect("node runs");
+    assert!(
+        output.status.success(),
+        "the cron corpus did not run under the Node fallback:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "[]",
+        "the emitted cron evaluator answers the shared corpus differently under the Node \
+         fallback than the validator does (Decision D162); the Bun column of this same corpus \
+         is the acceptance suite's \
+         `the_generated_cron_evaluator_agrees_with_the_validator_on_the_conformance_corpus`"
+    );
+}
+
+/// `src/cron.ts` is one module every golden carries, which is what lets gate 15
+/// answer the cron corpus with a single golden — the sibling of
+/// [`the_cel_evaluator_is_one_module_every_golden_carries`], for the same
+/// reason.
+#[test]
+fn the_cron_evaluator_is_one_module_every_golden_carries() {
+    let mut evaluators: BTreeSet<String> = BTreeSet::new();
+    for golden in GOLDENS {
+        let project = emitted(golden);
+        let module = project
+            .file("src/cron.ts")
+            .unwrap_or_else(|| panic!("`{}` emits no `src/cron.ts`", golden.directory));
+        let (_, body) = module
+            .contents
+            .split_once('\n')
+            .expect("every emitted file carries a provenance line");
+        evaluators.insert(body.to_string());
+    }
+    assert_eq!(
+        evaluators.len(),
+        1,
+        "the emitted cron evaluator differs between goldens, so gate 15's one-golden run says \
+         nothing about the others"
     );
 }
 

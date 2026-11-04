@@ -1,0 +1,14 @@
+# rule: a schedule's `timezone:` is an IANA zone name (grammar 13.4, Decision D162)
+# code: invalid-value
+# message: `timezone` "+02:00" is not an IANA zone name
+# at: 14:15
+# help: an IANA name is `UTC` or `/`-joined segments such as `Europe/Berlin` or `America/Argentina/Buenos_Aires`; whether the runtime's timezone database knows the name is checked when `serve` starts (grammar 13.4)
+#
+# An offset is not a zone: it has no daylight-saving rule, which is the half of
+# a zone a schedule needs.
+triggers:
+  nightly:
+    type: schedule
+    flow: flow.triage
+    cron: "0 3 * * *"
+    timezone: "+02:00"

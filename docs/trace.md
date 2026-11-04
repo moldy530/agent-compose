@@ -1471,6 +1471,18 @@ but for the finally entry, whose `step` is past every other's, so it sorts last
 by the rule itself. The ruling states its trace change as additive; §10.3's test
 finds nothing to bump, so `trace_version` stays `6`.
 
+**PRD resolved q78 changes nothing here, and says so because it could have.**
+`schedule` and `event` triggers now start executions — `serve` fires the one and
+runs a `kind: command` source's program for the other (grammar Decision D162) —
+and an execution they start carries its trigger's name exactly where an `http`
+one's does: the status report's `trigger` (§1.3), the lifecycle row, the serve
+log. That name was always a string carried for whatever trigger started the
+run; a reader of version `7` meets a new *value* of a field it already reads,
+never a new field, record or presence cell. The tick's `scheduled_at` and an
+event's payload reach a run only as the flow's inputs, which `docs/grammar.md`
+§13.1 binds as it binds an `http` body. §10.3's test finds nothing to bump, so
+`trace_version` stays `7`.
+
 ### 10.3 What requires a version bump
 
 `trace_version` MUST be incremented for any change that would make a reader

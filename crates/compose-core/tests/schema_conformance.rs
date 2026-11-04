@@ -1009,6 +1009,86 @@ fn the_published_schema_accepts_the_whole_trace_sink_surface() {
     }
 }
 
+/// Grammar 14.4's `kind: command` source and grammar 13.4's zoned schedule, in
+/// the direction the negative corpus cannot reach: the shapes the schema must
+/// **accept** (PRD resolved q78).
+///
+/// Five fixtures under `invalid-schema/` pin the refusals — the missing
+/// `command`, the queue key a command source does not take, an `args:` entry
+/// that is not a string, a `restart:` key it does not read, and a `timezone:`
+/// that is an offset. Each is a keyword whose *accepting* direction breaks
+/// silently: an `if`/`then` written so that every source is held to the
+/// command shape refuses every queue source the editor used to accept, and a
+/// zone pattern one character too tight refuses `America/Argentina/Buenos_Aires`.
+/// So every instance here — each queue kind beside the command forms — is run
+/// through the parser too, for the reason
+/// [`the_published_schema_accepts_the_whole_trace_sink_surface`] gives.
+#[test]
+fn the_published_schema_accepts_a_command_source_beside_the_queue_kinds_and_a_zoned_schedule() {
+    let validator = compile_schema();
+    let deploys = [
+        json!({ "feed": { "kind": "command", "command": "./bin/feed" } }),
+        json!({ "feed": {
+            "kind": "command",
+            "command": "${FEED_BIN}",
+            "args": ["--after", "{checkpoint}"],
+            "checkpoint": "payload.body.cursor",
+            "restart": { "backoff": "500ms", "max": "2m" },
+        } }),
+        json!({ "feed": { "kind": "command", "command": "node", "restart": { "max": "5m" } } }),
+        json!({ "reports": {
+            "kind": "redis_streams",
+            "url": "${REDIS_URL}",
+            "stream": "reports",
+            "consumer_group": "agent-compose",
+        } }),
+        json!({ "reports": { "kind": "sqs", "queue_url": "https://sqs.example/1/q", "region": "eu-west-1" } }),
+        json!({ "reports": { "kind": "nats", "url": "${NATS_URL}", "subject": "reports" } }),
+    ];
+    for sources in deploys {
+        let instance = json!({ "version": "0.1", "event_sources": sources });
+        assert_accepted_and_parsed(&validator, &instance, "deploy/staging.yml");
+    }
+    for timezone in [
+        "UTC",
+        "Europe/Berlin",
+        "America/Argentina/Buenos_Aires",
+        "Etc/GMT+5",
+    ] {
+        let instance = json!({ "triggers": { "nightly": {
+            "type": "schedule",
+            "flow": "flow.demo",
+            "cron": "30 2 * * MON-FRI",
+            "timezone": timezone,
+        } } });
+        assert_accepted_and_parsed(&validator, &instance, "main.yml");
+    }
+}
+
+/// The schema accepts `instance`, and so does the parser — the pair agreeing.
+#[track_caller]
+fn assert_accepted_and_parsed(validator: &Validator, instance: &Value, name: &str) {
+    let errors = validation_errors(validator, instance);
+    assert!(
+        errors.is_empty(),
+        "the published schema must accept this legal shape:\n{}\n{}",
+        serde_json::to_string_pretty(instance).expect("a printable instance"),
+        errors.join("\n")
+    );
+    let source = serde_yaml_ng::to_string(instance).expect("a printable document");
+    let parsed = compose_core::parse_str(&source, name);
+    assert!(
+        parsed.diagnostics.is_empty(),
+        "the parser must accept what the published schema accepts:\n{source}\n{}",
+        parsed
+            .diagnostics
+            .iter()
+            .map(|diagnostic| format!("  [{}] {}", diagnostic.code, diagnostic.message))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
 /// Grammar 14.6's registry, in the direction the negative corpus cannot reach:
 /// the shapes the schema must **accept**.
 ///

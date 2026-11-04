@@ -1014,6 +1014,7 @@ fn deploy(source: &Composition) -> Option<ir::Deploy> {
                     kind: entry.kind.as_ref()?.value,
                     connection: connection(&entry.connection),
                     extra: plugin_entries(&entry.extra),
+                    command: optional(entry.command.as_ref(), command_source)?,
                     span: entry.span.clone(),
                 },
             );
@@ -1035,6 +1036,25 @@ fn deploy(source: &Composition) -> Option<ir::Deploy> {
         harnesses,
         trace_sink,
         event_sources,
+    })
+}
+
+/// A `kind: command` source, with `restart:`'s defaults applied (grammar 14.4).
+fn command_source(source: &ast_deploy::CommandSource) -> Option<ir::deploy::CommandSource> {
+    let restart = source.restart.as_ref();
+    Some(ir::deploy::CommandSource {
+        command: source.command.clone()?,
+        args: source.args.clone(),
+        checkpoint: source.checkpoint.clone(),
+        restart_backoff_ms: restart.and_then(|restart| restart.backoff.as_ref()).map_or(
+            crate::parse::deploy::DEFAULT_RESTART_BACKOFF_MS,
+            |backoff| backoff.value.as_millis(),
+        ),
+        restart_max_ms: restart
+            .and_then(|restart| restart.max.as_ref())
+            .map_or(crate::parse::deploy::DEFAULT_RESTART_MAX_MS, |max| {
+                max.value.as_millis()
+            }),
     })
 }
 

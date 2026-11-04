@@ -142,6 +142,10 @@ pub const FIXTURES: &[&str] = &[
     // it needs into a copy, as `trace-sink`'s tests do, and `local` is the one
     // target `detach: true` is legal under.
     "child-executions",
+    // A `kind: command` event source and the `event` trigger bound to it
+    // (grammar 13.5, 14.4, PRD resolved q78): `deploy/local.yml` declares the
+    // source, and its program is `feed.mjs` beside the composition.
+    "command-source",
     "durability",
     "fanout",
     // A flow's `finally:` node (grammar §7.9, PRD resolved q76): one flow per
@@ -167,6 +171,9 @@ pub const FIXTURES: &[&str] = &[
     // project, which is exactly the claim grammar §14 makes about the layer.
     "placed-nodes",
     "provider-kinds",
+    // A `schedule` trigger `serve` fires every minute (grammar 13.4, PRD
+    // resolved q78).
+    "schedules",
     "server-tools",
     "stores",
     // The one fixture whose subject is the deploy layer's `trace_sink:`

@@ -1683,7 +1683,20 @@ protocol equally.
    than a definition. The Postgres backend (resolved q27's slot) **MUST** offer
    per-execution or per-shard leases before multi-hub exists.
 2. **Effect-record identity is execution-scoped**, and MUST stay so. No key, no
-   index, and no uniqueness constraint may be journal-global.
+   index, and no uniqueness constraint may be journal-global — **with one stated
+   exception**, the intake's (PRD resolved q78, grammar Decision D162). A
+   `schedule` trigger's tick is a `fired` row keyed `(trigger, scheduled_at)`
+   (`docs/durability.md` §3.11), and that key is journal-global on purpose:
+   deciding **once, across every hub on the journal**, whether a tick has an
+   execution is the row's whole job, so it is the one identity in the schema
+   keyed by a trigger and an instant rather than by an execution. The other
+   intake tables are the same kind of row and are named with it — `dedupe`,
+   keyed `(trigger, key)` (§3.12); `checkpoints`, keyed by source (§3.13); and
+   `restarts`, keyed `(source, ended_at)` (§3.14). None is a counter, and none
+   is read as "the last row wins" across executions: each is one row per thing
+   that happened, claimed by an insert that either wins or is answered with the
+   row that did. `src/journal.ts`'s schema comment names the exception beside
+   the indexes rule 2 governs.
 3. **No schema or protocol may assume one writer per journal.** Concretely: no
    monotonic counter shared across executions, no "last row wins" read that spans
    them, no dispatch state held anywhere but the journal.
@@ -1698,6 +1711,19 @@ The assumption these forbid is the one that would make resolved q37's
 execution-sharded scale-out a *migration* instead of "run more hubs". Keeping it
 out is cheap now and expensive later, which is why it is an invariant rather than
 a plan.
+
+**Two hubs and one tick.** The exception above is what makes rule 1's future
+safe for schedules: when two hubs share a journal and both wake for the same
+tick, both claim it, the backend's primary key admits one insert, and the other
+claim is answered with the execution the winner started — so a tick fires once
+however many schedulers evaluate it. Today the journal's writer guard
+(`docs/durability.md` §2.3) is the stronger rule on a dialled journal: one
+`serve` holds it, and a second over the same journal is a standby whose claims
+the journal refuses — it logs each tick as not fired, and takes the schedule
+over when the first goes. The row is what keeps the tick once when leases are
+per execution set and the guard is gone. A consumer's checkpoint is the same
+shape at a source's granularity: one row per source, written by whichever hub
+admitted the event it names.
 
 **Ingress obeys the same discipline** (resolved q44's fourth invariant): URLs
 derive from a configurable public base — `hub.public_url:`, grammar §14.2 — and

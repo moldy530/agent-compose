@@ -5,11 +5,11 @@ use std::collections::BTreeMap;
 use crate::ast::common::Namespace;
 use crate::ast::definition::StoreKind;
 use crate::ast::deploy::{
-    BackendAlias, BackendConfig, BackendDefault, BackendProvider, ConnectionField, EventSource,
-    EventSourceKind, EventSourcesSection, HarnessEntry, HarnessesSection, HubSection,
+    BackendAlias, BackendConfig, BackendDefault, BackendProvider, CommandSource, ConnectionField,
+    EventSource, EventSourceKind, EventSourcesSection, HarnessEntry, HarnessesSection, HubSection,
     JournalProvider, JournalSection, PackageRegistryScope, PackageRegistrySection, Placement,
-    PlacementsSection, PluginEntry, PluginValue, SECRET_FIELDS, StorageBackendsSection,
-    TraceSinkFormat, TraceSinkSection,
+    PlacementsSection, PluginEntry, PluginValue, RestartPolicy, SECRET_FIELDS,
+    StorageBackendsSection, TraceSinkFormat, TraceSinkSection,
 };
 use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
 use crate::yaml::{Mapping, Node, Yaml};
@@ -1418,12 +1418,20 @@ fn backend_config(
 }
 
 const EVENT_SOURCE_KINDS: &[(&str, EventSourceKind)] = &[
+    ("command", EventSourceKind::Command),
     ("redis_streams", EventSourceKind::RedisStreams),
     ("sqs", EventSourceKind::Sqs),
     ("nats", EventSourceKind::Nats),
 ];
 
 /// Read the `event_sources:` section (grammar 14.4).
+///
+/// Two shapes behind one `kind:`. A `kind: command` source is a **closed**
+/// object whose keys are this grammar's own — `command`, `args`, `checkpoint`,
+/// `restart` — so an unknown key is a typo and refused (Decision D50). The three
+/// queue kinds keep the open plugin-config object they always had: their keys
+/// are a consumer plugin's, checked by its published schema, with the
+/// connection fields of grammar 4.3 held to `${ENV}` references.
 pub(crate) fn event_sources(node: &Node, cx: &mut Cx) -> Option<EventSourcesSection> {
     let mapping = expect_mapping(node, "`event_sources`", cx)?;
     let mut sources = Vec::new();
@@ -1439,12 +1447,23 @@ pub(crate) fn event_sources(node: &Node, cx: &mut Cx) -> Option<EventSourcesSect
         let kind = fields
             .require("kind", cx)
             .and_then(|node| lexical::keyword(node, "event source `kind`", EVENT_SOURCE_KINDS, cx));
-        let (connection, extra) = plugin_config(body, &["kind"], &subject, cx);
+        let (connection, extra, command) =
+            if kind.as_ref().map(|kind| kind.value) == Some(EventSourceKind::Command) {
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    Some(command_source(fields, &subject, cx)),
+                )
+            } else {
+                let (connection, extra) = plugin_config(body, &["kind"], &subject, cx);
+                (connection, extra, None)
+            };
         sources.push(EventSource {
             name,
             kind,
             connection,
             extra,
+            command,
             span: entry.key.span.joined(&entry.value.span),
         });
     }
@@ -1453,6 +1472,127 @@ pub(crate) fn event_sources(node: &Node, cx: &mut Cx) -> Option<EventSourcesSect
         span: node.span.clone(),
     })
 }
+
+/// A `kind: command` source's keys (grammar 14.4, PRD resolved q78).
+///
+/// `command` and `args` are grammar 4.3 class 2, exactly as an `exec:` block's
+/// are (Decision D92): substituted at `serve` start, never shell-interpreted, so
+/// a substituted value is one argv element. `checkpoint` is CEL, checked against
+/// the event payload by the validator (`check::triggers`), and `restart` is a
+/// closed block of two literal durations.
+fn command_source(mut fields: Fields<'_>, subject: &str, cx: &mut Cx) -> CommandSource {
+    let command = fields
+        .require("command", cx)
+        .and_then(|node| lexical::interpolated(node, "`command`", cx))
+        .filter(|command| {
+            if command.value.as_str().is_empty() {
+                cx.error(
+                    DiagnosticCode::InvalidValue,
+                    &command.span,
+                    "`command` must not be empty",
+                );
+                return false;
+            }
+            true
+        });
+    let mut args = Vec::new();
+    if let Some(node) = fields.take("args")
+        && let Some(items) = expect_sequence(node, "`args`", cx)
+    {
+        for item in items {
+            if let Some(arg) = lexical::interpolated(item, "each entry of `args`", cx) {
+                args.push(arg);
+            }
+        }
+    }
+    let checkpoint = fields
+        .take("checkpoint")
+        .and_then(|node| lexical::cel(node, "`checkpoint`", cx));
+    let restart = fields
+        .take("restart")
+        .and_then(|node| restart_policy(node, &format!("`restart` of {subject}"), cx));
+    fields.finish(cx);
+    CommandSource {
+        command,
+        args,
+        checkpoint,
+        restart,
+    }
+}
+
+/// A command source's `restart:` block: `backoff:` and `max:`, both optional
+/// literal durations, `backoff` no longer than `max` (grammar 14.4).
+fn restart_policy(node: &Node, subject: &str, cx: &mut Cx) -> Option<RestartPolicy> {
+    let mapping = expect_mapping(node, subject, cx)?;
+    let mut fields = Fields::new(mapping, node.span.clone(), subject);
+    let backoff = fields
+        .take("backoff")
+        .and_then(|node| lexical::duration(node, "`backoff`", cx))
+        .filter(|backoff| positive(backoff, "backoff", cx));
+    let max = fields
+        .take("max")
+        .and_then(|node| lexical::duration(node, "`max`", cx))
+        .filter(|max| positive(max, "max", cx));
+    fields.finish(cx);
+    let effective_backoff = backoff
+        .as_ref()
+        .map_or(DEFAULT_RESTART_BACKOFF_MS, |backoff| {
+            backoff.value.as_millis()
+        });
+    let effective_max = max
+        .as_ref()
+        .map_or(DEFAULT_RESTART_MAX_MS, |max| max.value.as_millis());
+    if effective_backoff > effective_max {
+        let span = backoff
+            .as_ref()
+            .map_or_else(|| node.span.clone(), |backoff| backoff.span.clone());
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidValue,
+                span,
+                format!(
+                    "`backoff` ({}) is longer than `max` ({}), the ceiling it doubles up to",
+                    backoff.as_ref().map_or("1s", |backoff| backoff.value.as_str()),
+                    max.as_ref().map_or("1m", |max| max.value.as_str())
+                ),
+            )
+            .with_help(
+                "a restart waits `backoff`, then twice that, and so on up to `max`, so `backoff` is at most `max`; the defaults are `backoff: 1s` and `max: 1m` (grammar 14.4)",
+            ),
+        );
+        return None;
+    }
+    Some(RestartPolicy {
+        backoff,
+        max,
+        span: node.span.clone(),
+    })
+}
+
+/// A restart delay of nothing restarts a program that exits at once as fast
+/// as it can exit, which is a spin rather than a backoff.
+fn positive(duration: &Spanned<crate::ast::common::Duration>, key: &str, cx: &mut Cx) -> bool {
+    if duration.value.as_millis() > 0 {
+        return true;
+    }
+    cx.push(
+        Diagnostic::error(
+            DiagnosticCode::InvalidValue,
+            duration.span.clone(),
+            format!("`{key}` must be longer than zero"),
+        )
+        .with_help(
+            "a restart delay of nothing would restart a program that exits at once as fast as it can exit: give it a duration such as `1s` (grammar 14.4)",
+        ),
+    );
+    false
+}
+
+/// `restart.backoff:`'s default: one second (grammar 14.4, Decision D162).
+pub const DEFAULT_RESTART_BACKOFF_MS: u64 = 1_000;
+
+/// `restart.max:`'s default: one minute (grammar 14.4, Decision D162).
+pub const DEFAULT_RESTART_MAX_MS: u64 = 60_000;
 
 /// Split an open plugin-config object into the connection fields grammar 4.3
 /// closes over — which must be `${ENV}` value-form references — and everything

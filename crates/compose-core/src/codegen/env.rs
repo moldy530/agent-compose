@@ -957,6 +957,15 @@ impl References {
                 for (key, value) in &source.extra {
                     references.plugin(&value.value, &format!("{at}.{key}"));
                 }
+                // A `kind: command` source is interpolated where `serve`
+                // starts its program (grammar 4.3 class 2, like an `exec:`
+                // block), so its references are the hub's to hold at launch.
+                if let Some(command) = &source.command {
+                    references.text(&command.command.value, &format!("{at}.command"));
+                    for (index, arg) in command.args.iter().enumerate() {
+                        references.text(&arg.value, &format!("{at}.args[{index}]"));
+                    }
+                }
             }
         }
 

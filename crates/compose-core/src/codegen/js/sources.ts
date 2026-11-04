@@ -1,0 +1,827 @@
+//
+// What `serve` runs beside its routes: the scheduler for every `schedule`
+// trigger and a consumer for every `kind: command` event source (PRD resolved
+// q78, grammar 13.4, 13.5, 14.4, Decision D162).
+//
+// PRD resolved q37 made the hub the owner of triggers, so both live here, in
+// the process `serve` starts and in no other: `agent-compose run` fires no tick
+// and starts no consumer. Neither decides whether an execution starts. A tick
+// and an event are handed to `./serve.ts`'s admission — the one function every
+// trigger kind's start passes through, an `http` request's included — through
+// the [`Intake`] it passes in, so what this module owns is *when* a tick is due
+// and *what* a program printed, and nothing about what an execution is.
+//
+// It is byte-identical in every project this compiler release builds, like
+// `./serve.ts`: what differs between two projects is `./triggers.ts`.
+//
+// # Schedules
+//
+// One scheduler per `schedule` trigger. On start it reads the newest tick the
+// trigger has fired (the journal's `fired` row, `docs/durability.md` §3.11) and
+// takes the next tick **strictly after now** — never one before it. Ticks that
+// fell while no `serve` was running are **skipped, never back-filled** (PRD
+// resolved q78 ruling b): the serve log names the span, and a job catches
+// itself up from `payload.scheduled_at`, which is the nominal tick it was
+// started for. A scheduler that wakes late for the tick it was waiting for —
+// the process stalled, or the machine slept — fires that one tick and skips
+// the rest of what fell while it could not see them, on the same rule.
+//
+// Firing is a claim: the fired row is journaled, keyed `(trigger,
+// scheduled_at)`, **before** the execution starts, and only the claim that wins
+// starts one. So a tick fires once across restarts, and across hubs sharing a
+// journal (`docs/distributed.md` §8).
+//
+// # Command sources
+//
+// One consumer per `kind: command` source that some `event` trigger binds. It
+// starts the program after recovery, in a **process group of its own** (the
+// exec discipline of Decision D160: `SIGTERM` to the group on stop, `SIGKILL`
+// to it after a grace), with:
+//
+//  * **stdout** read one JSON object per line. A line is admitted to every
+//    `event` trigger bound to the source, **sequentially** — the consumer
+//    awaits each event's intake before it reads the next line, so a slow start
+//    is backpressure on the program's stdout rather than a queue in this
+//    process. A line that is not a JSON object is refused: logged with the
+//    source and its line number, counted on the source's status, and never an
+//    execution.
+//  * **stderr** copied to the serve log, each line tagged with the source.
+//  * **stdin** a pipe this process holds open and never writes: it reaches
+//    end-of-file when `serve` exits, however it exits, which is the one signal
+//    a `SIGKILL`ed `serve` can still give its program.
+//  * the newest **checkpoint** the intake accepted, as `AGENT_COMPOSE_CHECKPOINT`
+//    in its environment and in place of any argument written exactly
+//    `{checkpoint}` — unset, and the empty string, before there is one.
+//
+// An exit, with any code or by any signal, restarts the program after a
+// backoff that doubles per consecutive restart up to `restart.max` and starts
+// over after a run that lasted longer than `restart.max`; each restart is a
+// journaled row (§3.14) that the serve log and `GET /sources/:name` show.
+
+import { type ChildProcess, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import process from "node:process";
+
+import { type Cron, type Zone, nextAfter, parseCron, render, zoneOf } from "./cron.ts";
+import { type RestartRow, openJournal } from "./journal.ts";
+import { interpolate } from "./runtime.ts";
+import {
+  type CommandSource,
+  type EventPayload,
+  type EventSource,
+  type EventTrigger,
+  IMPLEMENTED_SOURCE_KINDS,
+  type LineEvent,
+  type SchedulePayload,
+  type ScheduleTrigger,
+  eventSources,
+  eventTriggers,
+  scheduleTriggers,
+} from "./triggers.ts";
+
+// ---------------------------------------------------------------------------
+// What a tick and an event become
+// ---------------------------------------------------------------------------
+
+/** What `./serve.ts`'s admission did with one tick or one event. */
+export type Admitted =
+  /** An execution started. */
+  | { readonly outcome: "started"; readonly execution: string }
+  /** The tick was already fired, or the event's key already admitted, by `execution`. */
+  | { readonly outcome: "held"; readonly execution: string }
+  /** Nothing started, for a reason the trigger's own expressions or flow gave. */
+  | { readonly outcome: "refused"; readonly reason: string };
+
+/**
+ * The admission this module hands its ticks and events to — `./serve.ts`'s,
+ * which is the one every trigger kind's start passes through.
+ *
+ * A promise that **rejects** is a journal that could not be written: the tick
+ * did not fire, or the event was not admitted, and the caller says so rather
+ * than counting it either way.
+ */
+export interface Intake {
+  tick(trigger: ScheduleTrigger, at: number, payload: SchedulePayload): Promise<Admitted>;
+  event(trigger: EventTrigger, payload: EventPayload): Promise<Admitted>;
+}
+
+/** One line of the serve log. */
+function say(line: string): void {
+  process.stderr.write(`${line}\n`);
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+// ---------------------------------------------------------------------------
+// The scheduler's clock
+// ---------------------------------------------------------------------------
+
+/**
+ * The variable that shifts the clock every scheduler in this process reads, in
+ * whole milliseconds.
+ *
+ * A **test's hook**, documented beside `./stores.ts`'s
+ * `AGENT_COMPOSE_STORE_CLOCK_OFFSET_MS` and for its reason: it is how the
+ * acceptance suite makes a cron's ticks due without waiting for them, and how
+ * it simulates an outage — stop `serve`, restart it with a larger offset, and
+ * the ticks in between fell while nothing was running. Read once, when `serve`
+ * starts. A value that is not an integer refuses the start, which is D50's
+ * posture on an environment variable: a test that believes it moved the clock
+ * and did not would pass for the wrong reason.
+ */
+export const SCHEDULE_CLOCK_OFFSET = "AGENT_COMPOSE_SCHEDULE_CLOCK_OFFSET_MS";
+
+/**
+ * The variable that makes the scheduler's clock run **faster** than the
+ * process's: a whole number of scheduler milliseconds per real one, from the
+ * moment `serve` started. Test-only, like [`SCHEDULE_CLOCK_OFFSET`]: at `60`,
+ * an every-minute cron ticks once a second. Unset, it is `1`.
+ */
+export const SCHEDULE_CLOCK_RATE = "AGENT_COMPOSE_SCHEDULE_CLOCK_RATE";
+
+/** What a malformed clock variable, timezone or cron refuses `serve` with. */
+export class ScheduleError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ScheduleError";
+  }
+}
+
+interface Clock {
+  /** Now, as the schedulers read it, in epoch milliseconds. */
+  now(): number;
+  /** How many real milliseconds `span` scheduler milliseconds take. */
+  real(span: number): number;
+}
+
+function wholeNumber(variable: string, minimum: number, fallback: number): number {
+  const written = process.env[variable];
+  if (written === undefined) return fallback;
+  if (!/^-?[0-9]+$/.test(written.trim()) || Number(written.trim()) < minimum) {
+    throw new ScheduleError(
+      `\`${variable}\` is set to ${JSON.stringify(written)}, which is not a whole number${minimum > Number.MIN_SAFE_INTEGER ? ` of at least ${minimum}` : ""}: it is a test's hook on the clock \`serve\`'s scheduler reads (PRD resolved q78), so give it an integer or unset it`,
+    );
+  }
+  return Number(written.trim());
+}
+
+function scheduleClock(): Clock {
+  const offset = wholeNumber(SCHEDULE_CLOCK_OFFSET, Number.MIN_SAFE_INTEGER, 0);
+  const rate = wholeNumber(SCHEDULE_CLOCK_RATE, 1, 1);
+  const origin = Date.now();
+  return {
+    now: () => origin + offset + (Date.now() - origin) * rate,
+    real: (span) => Math.max(0, Math.ceil(span / rate)),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Refusing at start what would fail later
+// ---------------------------------------------------------------------------
+
+/**
+ * An `event_sources:` entry of a kind this release runs no consumer for.
+ *
+ * `redis_streams`, `sqs` and `nats` keep their vocabulary — `validate` and
+ * `build` accept them — and a `serve` whose target declares one refuses to
+ * start, naming the source and its kind (PRD resolved q78, the q63 posture): a
+ * consumer that consumed nothing would be a trigger that never fires and says
+ * nothing.
+ */
+export class UnimplementedSourceError extends Error {
+  constructor(source: EventSource) {
+    super(
+      `the event source \`${source.name}\` is \`kind: ${source.kind}\`, which this release of agent-compose does not implement: \`serve\` runs a consumer for ${IMPLEMENTED_SOURCE_KINDS.map((kind) => `\`kind: ${kind}\``).join(", ")} only, so it refuses to start rather than serve a trigger nothing would ever feed. Bind the source to a \`kind: command\` program, or serve a target that does not declare it (grammar 14.4, PRD resolved q78)`,
+    );
+    this.name = "UnimplementedSourceError";
+  }
+}
+
+/**
+ * Everything this module would otherwise fail on after the app is listening,
+ * checked before it is: a source of a kind this release does not run, a
+ * schedule whose `timezone:` the runtime's database does not know or whose
+ * `cron:` this evaluator cannot read, and a clock variable that is not one.
+ */
+export function preflightSources(): void {
+  for (const source of eventSources) {
+    if (!IMPLEMENTED_SOURCE_KINDS.includes(source.kind)) throw new UnimplementedSourceError(source);
+  }
+  for (const trigger of scheduleTriggers) {
+    try {
+      zoneOf(trigger.timezone);
+    } catch {
+      throw new ScheduleError(
+        `the schedule trigger \`${trigger.name}\` names the timezone \`${trigger.timezone}\`, which this runtime's timezone database does not know: give it an IANA name such as \`UTC\` or \`Europe/Berlin\` (grammar 13.4)`,
+      );
+    }
+    try {
+      parseCron(trigger.cron);
+    } catch (error) {
+      throw new ScheduleError(
+        `the schedule trigger \`${trigger.name}\`'s \`cron\` cannot be evaluated: ${messageOf(error)} (grammar 13.4)`,
+      );
+    }
+  }
+  scheduleClock();
+}
+
+// ---------------------------------------------------------------------------
+// Running them
+// ---------------------------------------------------------------------------
+
+/** What [`startSources`] started, by name. */
+const schedulers = new Map<string, Scheduler>();
+const consumers = new Map<string, Consumer>();
+
+/**
+ * Start a scheduler for every `schedule` trigger and a consumer for every
+ * `kind: command` source an `event` trigger binds.
+ *
+ * Called by `./serve.ts` **after** recovery, so an execution a tick or an
+ * event starts is never one the replays are racing, and a program is never
+ * handed a checkpoint older than one the process that died had accepted.
+ */
+export async function startSources(intake: Intake): Promise<void> {
+  const clock = scheduleClock();
+  for (const trigger of scheduleTriggers) {
+    if (schedulers.has(trigger.name)) continue;
+    const scheduler = new Scheduler(trigger, intake, clock);
+    schedulers.set(trigger.name, scheduler);
+    await scheduler.start();
+  }
+  for (const trigger of eventTriggers) {
+    if (!eventSources.some((source) => source.name === trigger.source)) {
+      // Grammar 13.5 under `local` (Decision D87): a source the zero-infra
+      // target does not bind is satisfied vacuously, and that is what it
+      // costs — nothing consumes for this trigger here.
+      say(
+        `event trigger \`${trigger.name}\`: no event source \`${trigger.source}\` is bound under this target, so nothing consumes for it`,
+      );
+    }
+  }
+  for (const source of eventSources) {
+    if (source.command === undefined || consumers.has(source.name)) continue;
+    const bound = eventTriggers.filter((trigger) => trigger.source === source.name);
+    const consumer = new Consumer(source, source.command, bound, intake);
+    consumers.set(source.name, consumer);
+    if (bound.length === 0) {
+      say(
+        `event source \`${source.name}\`: no event trigger binds it, so its program is not started`,
+      );
+      continue;
+    }
+    await consumer.start();
+  }
+}
+
+/**
+ * Stop every scheduler and every program: no tick is armed after this, and each
+ * program's group is sent `SIGTERM` and, after a grace, `SIGKILL`. Resolves when
+ * every program has exited.
+ */
+export async function stopSources(): Promise<void> {
+  for (const scheduler of schedulers.values()) scheduler.stop();
+  schedulers.clear();
+  const stopping = [...consumers.values()].map((consumer) => consumer.stop());
+  consumers.clear();
+  await Promise.all(stopping);
+}
+
+/** Whether `name` is an event source this target declares (`GET /sources/:name`'s 404). */
+export function declaresSource(name: string): boolean {
+  return eventSources.some((source) => source.name === name);
+}
+
+/** The `event` triggers bound to one source, by name. */
+export function triggersOf(source: string): readonly EventTrigger[] {
+  return eventTriggers.filter((trigger) => trigger.source === source);
+}
+
+/** How many restart rows `GET /sources/:name` shows, newest first. */
+export const RESTARTS_SHOWN = 20;
+
+/**
+ * What `GET /sources/:name` answers about one source: its program's state, its
+ * newest checkpoint, its restart rows and the lines it refused. `undefined` for
+ * a name this target does not declare.
+ */
+export async function sourceStatus(name: string): Promise<Record<string, unknown> | undefined> {
+  const source = eventSources.find((one) => one.name === name);
+  if (source === undefined) return undefined;
+  const consumer = consumers.get(name);
+  const journal = await openJournal();
+  const page = await journal.restartsOf(name, RESTARTS_SHOWN);
+  const checkpoint = consumer?.checkpoint ?? (await journal.checkpointOf(name));
+  return {
+    source: name,
+    kind: source.kind,
+    triggers: triggersOf(name).map((trigger) => trigger.name),
+    state: consumer?.state ?? "stopped",
+    ...(consumer?.runningSince === undefined ? {} : { running_since: consumer.runningSince }),
+    ...(consumer?.backingOffUntil === undefined
+      ? {}
+      : { backing_off_until: consumer.backingOffUntil }),
+    checkpoint: checkpoint ?? null,
+    accepted_events: consumer?.accepted ?? 0,
+    refused_lines: consumer?.refused ?? 0,
+    restart_count: page.total,
+    restarts: page.rows.map((row) => restartReport(row)),
+  };
+}
+
+function restartReport(row: RestartRow): Record<string, unknown> {
+  return {
+    ended_at: row.endedAt,
+    attempt: row.attempt,
+    exit_code: row.exitCode ?? null,
+    signal: row.signal ?? null,
+    ran_ms: row.ranMs,
+    backoff_ms: row.backoffMs,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// One schedule
+// ---------------------------------------------------------------------------
+
+/** The longest one timer sleeps before the scheduler looks at the clock again. */
+const LONGEST_SLEEP_MS = 60_000;
+
+/** How many skipped ticks the serve log counts before saying "at least". */
+const SKIPPED_COUNTED = 10_000;
+
+class Scheduler {
+  readonly #trigger: ScheduleTrigger;
+  readonly #intake: Intake;
+  readonly #clock: Clock;
+  readonly #cron: Cron;
+  readonly #zone: Zone;
+  #timer: ReturnType<typeof setTimeout> | undefined;
+  #stopped = false;
+
+  constructor(trigger: ScheduleTrigger, intake: Intake, clock: Clock) {
+    this.#trigger = trigger;
+    this.#intake = intake;
+    this.#clock = clock;
+    this.#cron = parseCron(trigger.cron);
+    this.#zone = zoneOf(trigger.timezone);
+  }
+
+  /** `schedule \`<name>\``, for the serve log. */
+  get #named(): string {
+    return `schedule \`${this.#trigger.name}\``;
+  }
+
+  async start(): Promise<void> {
+    const now = this.#clock.now();
+    let last: number | undefined;
+    try {
+      const fired = await (await openJournal()).lastFired(this.#trigger.name);
+      if (fired !== undefined) last = Date.parse(fired.scheduledAt);
+    } catch (error) {
+      say(`${this.#named}: the journal could not say when it last fired (${messageOf(error)}), so no skipped span is reported`);
+    }
+    if (last !== undefined) {
+      const first = nextAfter(this.#cron, last, this.#zone);
+      if (first !== undefined && first <= now) this.#skipped(first, now, "no serve was running");
+    }
+    const next = nextAfter(this.#cron, now, this.#zone);
+    say(
+      `${this.#named} (\`${this.#trigger.cron}\` in ${this.#trigger.timezone}): last fired ${last === undefined ? "never" : render(last, this.#zone)}, next tick ${next === undefined ? "none" : render(next, this.#zone)}`,
+    );
+    if (next !== undefined) this.#arm(next);
+  }
+
+  stop(): void {
+    this.#stopped = true;
+    if (this.#timer !== undefined) clearTimeout(this.#timer);
+    this.#timer = undefined;
+  }
+
+  /** Say which ticks fell between `first` and `now` without firing. */
+  #skipped(first: number, now: number, why: string): void {
+    let count = 0;
+    let latest = first;
+    for (let at: number | undefined = first; at !== undefined && at <= now; ) {
+      count += 1;
+      latest = at;
+      if (count >= SKIPPED_COUNTED) break;
+      at = nextAfter(this.#cron, at, this.#zone);
+    }
+    const counted = count >= SKIPPED_COUNTED ? `at least ${SKIPPED_COUNTED} ticks` : `${count} tick${count === 1 ? "" : "s"}`;
+    say(
+      `${this.#named}: skipped ${counted} from ${render(first, this.#zone)} through ${render(latest, this.#zone)}, which fell while ${why}: a tick is never back-filled, and a job catches itself up from \`payload.scheduled_at\``,
+    );
+  }
+
+  #arm(at: number): void {
+    if (this.#stopped) return;
+    const wait = Math.min(this.#clock.real(at - this.#clock.now()), LONGEST_SLEEP_MS);
+    this.#timer = setTimeout(() => {
+      void this.#due(at);
+    }, wait);
+    this.#timer.unref?.();
+  }
+
+  async #due(at: number): Promise<void> {
+    if (this.#stopped) return;
+    if (this.#clock.now() < at) {
+      this.#arm(at);
+      return;
+    }
+    await this.#fire(at);
+    if (this.#stopped) return;
+    const now = this.#clock.now();
+    let next = nextAfter(this.#cron, at, this.#zone);
+    if (next !== undefined && next <= now) {
+      this.#skipped(next, now, "this scheduler could not see them (the process stalled or the machine slept)");
+      next = nextAfter(this.#cron, now, this.#zone);
+    }
+    if (next !== undefined) this.#arm(next);
+  }
+
+  async #fire(at: number): Promise<void> {
+    const payload: SchedulePayload = {
+      scheduled_at: render(at, this.#zone),
+      trigger: this.#trigger.name,
+    };
+    const tick = `the ${payload.scheduled_at} tick`;
+    try {
+      const admitted = await this.#intake.tick(this.#trigger, at, payload);
+      if (admitted.outcome === "started") say(`${this.#named}: fired ${tick} as ${admitted.execution}`);
+      else if (admitted.outcome === "held") say(`${this.#named}: ${tick} was already fired, as ${admitted.execution}`);
+      else say(`${this.#named}: ${tick} started nothing: ${admitted.reason}`);
+    } catch (error) {
+      say(`${this.#named}: ${tick} could not be journaled, so it did not fire: ${messageOf(error)}`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// One command source
+// ---------------------------------------------------------------------------
+
+/** The variable a program finds its newest accepted checkpoint in. */
+export const CHECKPOINT_VARIABLE = "AGENT_COMPOSE_CHECKPOINT";
+
+/** How long a stopped program's group has after `SIGTERM` before `SIGKILL`. */
+const STOP_GRACE_MS = 2_000;
+
+/**
+ * The longest a line may be. A program that writes without a newline would
+ * otherwise grow this process's buffer for as long as it wrote; a line past
+ * this is refused like any line that is not a JSON object.
+ */
+const LONGEST_LINE_BYTES = 1 << 20;
+
+/** The longest the consumer waits between attempts to admit one event the journal refused. */
+const LONGEST_INTAKE_RETRY_MS = 30_000;
+
+class Consumer {
+  readonly #source: EventSource;
+  readonly #command: CommandSource;
+  readonly #triggers: readonly EventTrigger[];
+  readonly #intake: Intake;
+
+  state: "starting" | "running" | "backing_off" | "stopped" = "starting";
+  runningSince: string | undefined;
+  backingOffUntil: string | undefined;
+  checkpoint: string | undefined;
+  accepted = 0;
+  refused = 0;
+
+  #child: ChildProcess | undefined;
+  #startedAt = 0;
+  #attempt = 0;
+  #timer: ReturnType<typeof setTimeout> | undefined;
+  #stopping = false;
+  /** Resolves when the running program's stdio has closed. */
+  #closed: Promise<void> = Promise.resolve();
+
+  constructor(
+    source: EventSource,
+    command: CommandSource,
+    triggers: readonly EventTrigger[],
+    intake: Intake,
+  ) {
+    this.#source = source;
+    this.#command = command;
+    this.#triggers = triggers;
+    this.#intake = intake;
+  }
+
+  get #named(): string {
+    return `event source \`${this.#source.name}\``;
+  }
+
+  async start(): Promise<void> {
+    try {
+      this.checkpoint = await (await openJournal()).checkpointOf(this.#source.name);
+    } catch (error) {
+      say(`${this.#named}: the journal could not say its checkpoint (${messageOf(error)}), so the program starts without one`);
+    }
+    this.#spawn();
+  }
+
+  #spawn(): void {
+    if (this.#stopping) return;
+    this.backingOffUntil = undefined;
+    let program: string;
+    let args: string[];
+    try {
+      program = interpolate(this.#command.command);
+      args = this.#command.args.map((arg) =>
+        "checkpoint" in arg ? (this.checkpoint ?? "") : interpolate(arg.text),
+      );
+    } catch (error) {
+      say(`${this.#named}: the program could not be started: ${messageOf(error)}`);
+      this.#ended(undefined, undefined);
+      return;
+    }
+    const environment: NodeJS.ProcessEnv = { ...process.env };
+    if (this.checkpoint === undefined) delete environment[CHECKPOINT_VARIABLE];
+    else environment[CHECKPOINT_VARIABLE] = this.checkpoint;
+    this.#startedAt = Date.now();
+    let child: ChildProcess;
+    try {
+      child = spawn(program, args, {
+        env: environment,
+        detached: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch (error) {
+      say(`${this.#named}: the program could not be started: ${messageOf(error)}`);
+      this.#ended(undefined, undefined);
+      return;
+    }
+    this.#child = child;
+    this.state = "running";
+    this.runningSince = new Date(this.#startedAt).toISOString();
+    say(
+      `${this.#named}: started \`${program}\`${child.pid === undefined ? "" : ` (pid ${child.pid})`} with ${this.checkpoint === undefined ? "no checkpoint" : `checkpoint ${JSON.stringify(this.checkpoint)}`}`,
+    );
+    let spawnError: Error | undefined;
+    child.on("error", (error) => {
+      spawnError = error;
+    });
+    this.#closed = new Promise<void>((resolve) => {
+      child.on("close", (code, signal) => {
+        resolve();
+        if (spawnError !== undefined) {
+          say(`${this.#named}: the program could not be started: ${spawnError.message}`);
+          void this.#lines.then(() => this.#ended(undefined, undefined));
+          return;
+        }
+        void this.#lines.then(() => this.#ended(code ?? undefined, signal ?? undefined));
+      });
+    });
+    this.#tagStderr(child);
+    this.#readStdout(child);
+  }
+
+  /** The chain every line of the current run is admitted on, in order. */
+  #lines: Promise<void> = Promise.resolve();
+
+  #tagStderr(child: ChildProcess): void {
+    let held = "";
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => {
+      held += chunk;
+      let newline = held.indexOf("\n");
+      while (newline >= 0) {
+        say(`[source ${this.#source.name}] ${held.slice(0, newline)}`);
+        held = held.slice(newline + 1);
+        newline = held.indexOf("\n");
+      }
+    });
+    child.stderr?.on("end", () => {
+      if (held !== "") say(`[source ${this.#source.name}] ${held}`);
+    });
+  }
+
+  /**
+   * Read the program's stdout one line at a time, admitting each before the
+   * next: the stream is paused while a batch of lines is admitted, so a program
+   * whose events start slowly is held at its own `write` rather than queued
+   * here (PRD resolved q78 ruling c's backpressure).
+   */
+  #readStdout(child: ChildProcess): void {
+    const stdout = child.stdout;
+    if (stdout === null) return;
+    let held = Buffer.alloc(0);
+    let number = 0;
+    this.#lines = Promise.resolve();
+    stdout.on("data", (chunk: Buffer) => {
+      held = Buffer.concat([held, chunk]);
+      const lines: Buffer[] = [];
+      let newline = held.indexOf(0x0a);
+      while (newline >= 0) {
+        lines.push(held.subarray(0, newline));
+        held = held.subarray(newline + 1);
+        newline = held.indexOf(0x0a);
+      }
+      if (held.length > LONGEST_LINE_BYTES) {
+        lines.push(held);
+        held = Buffer.alloc(0);
+      }
+      if (lines.length === 0) return;
+      stdout.pause();
+      this.#lines = this.#lines.then(async () => {
+        for (const line of lines) {
+          number += 1;
+          await this.#line(line, number);
+        }
+        if (!this.#stopping) stdout.resume();
+      });
+    });
+    stdout.on("end", () => {
+      if (held.length === 0) return;
+      const last = held;
+      held = Buffer.alloc(0);
+      this.#lines = this.#lines.then(async () => {
+        number += 1;
+        await this.#line(last, number);
+      });
+    });
+  }
+
+  /** Admit one line to every bound trigger, then journal its checkpoint. */
+  async #line(bytes: Buffer, number: number): Promise<void> {
+    const text = bytes.toString("utf8");
+    let body: unknown;
+    try {
+      if (bytes.length > LONGEST_LINE_BYTES) throw new Error("longer than a line may be");
+      body = JSON.parse(text);
+    } catch {
+      body = undefined;
+    }
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      this.refused += 1;
+      say(
+        `${this.#named}: line ${number} is not a JSON object, so it was refused and starts nothing (${this.refused} refused so far)`,
+      );
+      return;
+    }
+    const event: LineEvent = {
+      body: body as Record<string, unknown>,
+      attributes: {},
+      source: this.#source.name,
+    };
+    let id: string;
+    try {
+      id =
+        this.#command.checkpoint === undefined
+          ? createHash("sha256").update(bytes).digest("hex")
+          : this.#command.checkpoint(event);
+    } catch (error) {
+      this.refused += 1;
+      say(
+        `${this.#named}: line ${number}'s \`checkpoint\` could not be read (${messageOf(error)}), so it was refused and starts nothing (${this.refused} refused so far)`,
+      );
+      return;
+    }
+    const payload: EventPayload = { id, ...event };
+    let accepted = false;
+    for (const trigger of this.#triggers) {
+      const admitted = await this.#admit(trigger, payload);
+      if (admitted === undefined) return;
+      if (admitted.outcome === "started") {
+        accepted = true;
+        say(`${this.#named}: event ${JSON.stringify(id)} started ${admitted.execution} for \`${trigger.name}\``);
+      } else if (admitted.outcome === "held") {
+        accepted = true;
+        say(
+          `${this.#named}: event ${JSON.stringify(id)} repeats one \`${trigger.name}\` already admitted as ${admitted.execution}, so it started nothing`,
+        );
+      } else {
+        say(`${this.#named}: event ${JSON.stringify(id)} started nothing for \`${trigger.name}\`: ${admitted.reason}`);
+      }
+    }
+    if (!accepted) return;
+    this.accepted += 1;
+    if (this.#command.checkpoint === undefined) return;
+    // **After** the intake accepted the event — started an execution or found
+    // the one it already had — so a checkpoint handed back on restart is never
+    // ahead of what was admitted (PRD resolved q78 ruling c).
+    this.checkpoint = id;
+    try {
+      await (await openJournal()).recordCheckpoint(this.#source.name, id);
+    } catch (error) {
+      say(
+        `${this.#named}: checkpoint ${JSON.stringify(id)} could not be journaled (${messageOf(error)}): a restart of serve hands the program an older one, and the events it repeats are deduplicated`,
+      );
+    }
+  }
+
+  /**
+   * Admit one event to one trigger, retrying while the journal refuses it —
+   * an event the journal could not record is not one this consumer may count
+   * as admitted or skip past, so it holds the stream until it is admitted.
+   * `undefined` when the consumer was stopped first.
+   */
+  async #admit(trigger: EventTrigger, payload: EventPayload): Promise<Admitted | undefined> {
+    let delay = 1_000;
+    for (;;) {
+      if (this.#stopping) return undefined;
+      try {
+        return await this.#intake.event(trigger, payload);
+      } catch (error) {
+        say(
+          `${this.#named}: event ${JSON.stringify(payload.id)} could not be admitted to \`${trigger.name}\` (${messageOf(error)}); trying it again in ${delay}ms, and reading no further line until it is`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay).unref?.());
+        delay = Math.min(delay * 2, LONGEST_INTAKE_RETRY_MS);
+      }
+    }
+  }
+
+  /** The program ended — or could not be started. Journal it, and restart it. */
+  #ended(code: number | undefined, signal: NodeJS.Signals | undefined): void {
+    this.#child = undefined;
+    this.runningSince = undefined;
+    if (this.#stopping) {
+      this.state = "stopped";
+      return;
+    }
+    const endedAt = Date.now();
+    const ran = this.#startedAt === 0 ? 0 : endedAt - this.#startedAt;
+    this.#attempt = ran > this.#command.restartMaxMs ? 1 : this.#attempt + 1;
+    const backoff = Math.min(
+      this.#command.restartBackoffMs * 2 ** (this.#attempt - 1),
+      this.#command.restartMaxMs,
+    );
+    const how =
+      signal !== undefined ? `was ended by ${signal}` : code !== undefined ? `exited with code ${code}` : "could not be started";
+    say(
+      `${this.#named}: the program ${how} after ${(ran / 1000).toFixed(1)}s; restarting it in ${backoff}ms (restart ${this.#attempt} in a row)`,
+    );
+    const row: RestartRow = {
+      source: this.#source.name,
+      endedAt: new Date(endedAt).toISOString(),
+      attempt: this.#attempt,
+      ...(code === undefined ? {} : { exitCode: code }),
+      ...(signal === undefined ? {} : { signal }),
+      ranMs: ran,
+      backoffMs: backoff,
+    };
+    void openJournal()
+      .then((journal) => journal.recordRestart(row))
+      .catch((error: unknown) => {
+        say(`${this.#named}: the restart could not be journaled: ${messageOf(error)}`);
+      });
+    this.state = "backing_off";
+    this.backingOffUntil = new Date(endedAt + backoff).toISOString();
+    this.#timer = setTimeout(() => {
+      this.#timer = undefined;
+      this.#spawn();
+    }, backoff);
+    this.#timer.unref?.();
+  }
+
+  /** Stop the program, group and all: `SIGTERM`, then `SIGKILL` after a grace. */
+  async stop(): Promise<void> {
+    this.#stopping = true;
+    if (this.#timer !== undefined) clearTimeout(this.#timer);
+    this.#timer = undefined;
+    const child = this.#child;
+    if (child === undefined) {
+      this.state = "stopped";
+      return;
+    }
+    signalGroup(child, "SIGTERM");
+    // What it printed and this consumer has not read is dropped rather than
+    // admitted: the stream is held paused while a batch is admitted, and a
+    // paused stream never closes. Nothing is lost by it — the checkpoint did
+    // not move past those lines, so the next start hands the program the
+    // position before them.
+    child.stdout?.destroy();
+    const kill = setTimeout(() => signalGroup(child, "SIGKILL"), STOP_GRACE_MS);
+    kill.unref?.();
+    await this.#closed;
+    clearTimeout(kill);
+    // A member of the group that outlived its leader is still the program's.
+    signalGroup(child, "SIGKILL");
+    this.state = "stopped";
+  }
+}
+
+/** `signal` to `child`'s process group, or to `child` alone where there are none. */
+function signalGroup(child: ChildProcess, signal: NodeJS.Signals): void {
+  const pid = child.pid;
+  if (pid !== undefined) {
+    try {
+      process.kill(-pid, signal);
+      return;
+    } catch {
+      // Already gone, or a host without process groups.
+    }
+  }
+  try {
+    child.kill(signal);
+  } catch {
+    // Already gone.
+  }
+}
