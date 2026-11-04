@@ -38,10 +38,11 @@ const SOURCE: &str = include_str!("js/mesh.ts");
 /// costs nothing in practice — §10 says so where it records it.
 ///
 /// `3` since PRD resolved q75 and q79, one bump for both: a poll answer carries
-/// a `cancel` list and a result may say `status: "cancelled"` (§3.2, §3.4), and
-/// a session holding work may be handed more while it is below its placement's
-/// `max_running:` (§2). A peer of version `2` would run on a dispatch the hub
-/// cancelled and queue work it is meant to run beside its first.
+/// a `cancel` list and a `stop` list and a result may say `status:
+/// "cancelled"` (§3.2, §3.4), and a session holding work may be handed more
+/// while it is below its placement's `max_running:` (§2). A peer of version `2`
+/// would run on a dispatch the hub cancelled or stopped waiting for, and queue
+/// work it is meant to run beside its first.
 pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The routes the hub mounts on a target that declares `placements:` (§3).
@@ -319,7 +320,8 @@ mod tests {
     }
 
     /// …and the positive half: a session carries exactly the fields §5 gives
-    /// it, the cancel notices it is owed among them (§3.2, PRD resolved q75).
+    /// it, the cancel and stop notices it is owed among them (§3.2, PRD
+    /// resolved q75) — two sets, because the worker stops the two differently.
     ///
     /// Its load is **not** a field: it is read off the dispatch rows each time
     /// it is asked ([`heldFor`] in the emitted source), which is PRD resolved
@@ -329,7 +331,7 @@ mod tests {
     fn a_session_carries_exactly_the_fields_the_document_gives_it() {
         assert_eq!(
             fields_of("interface Session {"),
-            ["id", "claims", "dispatchable", "seen", "cancels"],
+            ["id", "claims", "dispatchable", "seen", "cancels", "stops"],
             "`src/mesh.ts`'s `Session` is not the record `docs/distributed.md` §5 describes: a \
              load or a slot count on it would be a second record of what the dispatch rows hold"
         );

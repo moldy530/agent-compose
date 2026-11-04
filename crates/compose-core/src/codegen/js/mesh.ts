@@ -106,11 +106,12 @@ import type * as runtime from "./runtime.ts";
  * be refused", exactly. §10 records the bump and why it costs nothing.
  *
  * **`3` since PRD resolved q75 and q79, one bump for both**: a poll answer
- * carries a `cancel` list and a result may say `status: "cancelled"` (§3.2,
- * §3.4), and a session holding work may be handed more while it is below its
- * placement's `max_running:` (§2). A worker of version `2` would ignore the
- * list and run on a dispatch nobody wants, and would queue a second dispatch
- * behind the first rather than run it — so it is refused at join instead.
+ * carries a `cancel` list and a `stop` list and a result may say `status:
+ * "cancelled"` (§3.2, §3.4), and a session holding work may be handed more
+ * while it is below its placement's `max_running:` (§2). A worker of version
+ * `2` would ignore the lists and run on a dispatch nobody wants, and would
+ * queue a second dispatch behind the first rather than run it — so it is
+ * refused at join instead.
  */
 export const PROTOCOL_VERSION = 3;
 
@@ -255,6 +256,16 @@ interface Session {
    * `cancel` list (§3.2), and a held poll is answered at once to carry them.
    */
   readonly cancels: Set<string>;
+  /**
+   * The dispatches this session holds that the hub has **stopped waiting for**
+   * and not yet told it about — the node's `timeout:` ran out, or its
+   * execution ended around it ([`stopping`]): the next poll answers them as
+   * its `stop` list (§3.2), and a held poll is answered at once to carry them.
+   * Never on [`Session.cancels`], because the worker stops the two
+   * differently: a cancel is the execution's, and ends what the node began on
+   * the worker `cancelled`; a stop is nobody's cancel, and ends it `failed`.
+   */
+  readonly stops: Set<string>;
 }
 
 /** Every session this process has issued and not forgotten. */
@@ -291,7 +302,12 @@ const cancelling = new Set<string>();
  * cancelled result as the cancel it was, while one of these is superseded, and
  * a result for it — whichever reaches the hub first, the result or the write —
  * is refused `409` and only frees the slot. Read as a cancel, a deadline would
- * be replayed by a restarted hub as the execution's cancel.
+ * be replayed by a restarted hub as the execution's cancel. **And they are
+ * named on different lists** (§3.2): the worker stops a cancelled dispatch's
+ * runner as the execution's cancel, so the instances it began there end
+ * `cancelled`, and one of these by a stop that is nobody's cancel, so they end
+ * `failed` — as the same instances do on the hub when the node that began
+ * them runs out of time (grammar §7.9, PRD resolved q76).
  */
 const stopping = new Set<string>();
 
@@ -743,8 +759,15 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
  * What every way the hub stops waiting for a dispatch a worker holds goes
  * through — its execution's cancel, the node's own deadline, the execution
  * ending around it — because each leaves the same process running on the
- * worker: the dispatch is named in the holder's next poll's `cancel` list, the
- * worker stops the runner, and its result is what frees the slot ([`result`]).
+ * worker: the dispatch is named in the holder's next poll, the worker stops
+ * the runner, and its result is what frees the slot ([`result`]). **Which list
+ * names it is what the worker reads the stop as** (§3.2): a cancel goes on
+ * `cancel`, and the runner fires its execution's cancel, so every instance it
+ * began there ends `cancelled`; anything else goes on `stop`, and the runner
+ * stops the node with a failure, so they end `failed` — the outcome an
+ * unplaced node's deadline gives them. A deadline on the `cancel` list would
+ * end them `cancelled` in an execution nobody cancelled, and their finally
+ * nodes would read `execution.outcome == "cancelled"` (PRD resolved q76).
  * A slot freed the moment the hub stopped waiting would be handed new work while
  * the old process still ran, and a session at `max_running: 1` — the machine
  * with the GPU — would be running two.
@@ -754,8 +777,13 @@ function stopOnHolder(id: string, row: DispatchRow, why: "cancel" | "stop"): boo
   if (current.status !== "dispatched" || current.session === undefined) return false;
   const session = sessions.get(current.session);
   if (session === undefined) return false;
-  (why === "cancel" ? cancelling : stopping).add(id);
-  session.cancels.add(id);
+  if (why === "cancel") {
+    cancelling.add(id);
+    session.cancels.add(id);
+  } else {
+    stopping.add(id);
+    session.stops.add(id);
+  }
   return true;
 }
 
@@ -1629,6 +1657,7 @@ async function join(request: FastifyRequest, reply: FastifyReply): Promise<unkno
     dispatchable: current,
     seen: Date.now(),
     cancels: new Set(),
+    stops: new Set(),
   };
   sessions.set(session.id, session);
   // §6.2's wake: a join that may be dispatched to is what a parked placement
@@ -1765,16 +1794,15 @@ async function poll(
       // subscribed: see [`boardMoved`].
       const seen = boardMoved;
       const dispatch = await taken(session);
-      // **The cancel list** (§3.2, PRD resolved q75): every dispatch this
-      // session holds that the hub has cancelled since it last told it, on
-      // every `200` — and a reason to answer at once, with or without work.
-      // Taken off the session only once the answer is about to be written: a
-      // worker that hung up is told on the poll it makes next.
-      if (dispatch === undefined && session.cancels.size > 0) {
+      // **The cancel list and the stop list** (§3.2, PRD resolved q75): every
+      // dispatch this session holds that the hub has cancelled, or stopped
+      // waiting for, since it last told it, on every `200` — and a reason to
+      // answer at once, with or without work. Taken off the session only once
+      // the answer is about to be written: a worker that hung up is told on
+      // the poll it makes next.
+      if (dispatch === undefined && (session.cancels.size > 0 || session.stops.size > 0)) {
         if (away()) return reply.code(204).send();
-        const cancel = [...session.cancels];
-        session.cancels.clear();
-        return reply.code(200).send({ cancel });
+        return reply.code(200).send(owed(session));
       }
       if (dispatch !== undefined) {
         // **Checked again, because the claim is not free of time.** The latch at
@@ -1792,14 +1820,12 @@ async function poll(
           await released(String(dispatch["dispatch_id"]), session.id);
           return reply.code(204).send();
         }
-        // The list may name the very dispatch this answer hands over — a cancel
-        // that reached it inside [`taken`]'s reads, once the row was this
-        // session's — and this is the one answer that will name it. §3.2 has the
-        // worker put the dispatch on its books before it reads the list, so it
-        // is settled `cancelled` without its runner ever starting.
-        const cancel = [...session.cancels];
-        session.cancels.clear();
-        return reply.code(200).send({ ...dispatch, cancel });
+        // The lists may name the very dispatch this answer hands over — a
+        // cancel or a stop that reached it inside [`taken`]'s reads, once the
+        // row was this session's — and this is the one answer that will name
+        // it. §3.2 has the worker put the dispatch on its books before it reads
+        // the lists, so it is settled without its runner ever starting.
+        return reply.code(200).send({ ...dispatch, ...owed(session) });
       }
       const left = deadline - Date.now();
       if (left <= 0) return reply.code(204).send();
@@ -1822,6 +1848,20 @@ async function poll(
     request.raw.removeListener("aborted", hangUp);
     reply.raw.removeListener("close", hangUp);
   }
+}
+
+/**
+ * The two lists a poll's `200` carries (§3.2), taken off the session as they
+ * are written: the dispatches it holds that the hub has **cancelled** since it
+ * last said so, and those it has **stopped waiting for** — each an empty array
+ * where there are none.
+ */
+function owed(session: Session): { cancel: string[]; stop: string[] } {
+  const cancel = [...session.cancels];
+  const stop = [...session.stops];
+  session.cancels.clear();
+  session.stops.clear();
+  return { cancel, stop };
 }
 
 /**
@@ -1857,7 +1897,7 @@ async function taken(session: Session): Promise<Record<string, unknown> | undefi
     // wait off `awaiting` and the row off `rows`, and queued the write that
     // supersedes it, which a journal that serialises its writes runs after this
     // claim (PRD resolved q75). Handed out now, the dispatch would be work whose
-    // answer nothing reads, that no `cancel` list will ever name and that
+    // answer nothing reads, that no poll's lists will ever name and that
     // [`heldFor`] does not count — a runner left to run whole beside whatever
     // the session is handed next. So the claim is handed back and the row is left
     // to the write already on its way, which ends it as the withdrawal it was: on
@@ -1918,7 +1958,7 @@ async function taken(session: Session): Promise<Record<string, unknown> | undefi
  * over** — a cancel, the node's deadline, or its execution ending, inside
  * [`taken`]'s reads of the journal — which [`stopOnHolder`] told this session to
  * stop and which is now known never to have reached it. Put back on the board,
- * it would go to the next worker with no `cancel` list naming it and run whole,
+ * it would go to the next worker with no poll's lists naming it and run whole,
  * while the node waited on a cancelled result from a worker that never had it.
  * So it ends here the way a stop ends a dispatch no worker holds: a deadline's
  * is already settled and its superseding write already on its way, and a
@@ -1929,7 +1969,7 @@ async function released(id: string, session: string): Promise<void> {
   const journal = await openJournal();
   if (stopping.delete(id)) {
     rows.delete(id);
-    sessions.get(session)?.cancels.delete(id);
+    sessions.get(session)?.stops.delete(id);
     stirPolls();
     return;
   }
@@ -2617,7 +2657,19 @@ async function sweep(windowMs: number): Promise<void> {
   for (const [id, row] of [...rows]) {
     if (row.session === undefined || !stale.includes(row.session)) continue;
     if (row.status !== "dispatched") continue;
-    const detail = `the session holding this dispatch made no request for ${windowMs}ms, so the hub gave up on it (docs/distributed.md §6.3)`;
+    // **A dispatch the execution's cancel had already told this session to
+    // stop is superseded as the cancel it was**, exactly as
+    // [`releasePlacementWaits`] and [`released`] supersede one: the session
+    // that would have settled it `cancelled` is gone, but the cancel is not,
+    // and a replay that met the heartbeat's detail here would read the row as
+    // an ordinary attempt failure — fail the node under its `retry:` and
+    // `on_error:`, which a cancelled node is never routed through, and leave
+    // whether the execution ends `cancelled` to which frontier fires first
+    // (PRD resolved q75 ruling e, `docs/durability.md` §6.1).
+    const cancelled = cancelling.has(id);
+    const detail = cancelled
+      ? CANCELLED_DETAIL
+      : `the session holding this dispatch made no request for ${windowMs}ms, so the hub gave up on it (docs/distributed.md §6.3)`;
     await journal.supersedeDispatch(id, detail);
     rows.delete(id);
     cancelling.delete(id);
@@ -2625,7 +2677,11 @@ async function sweep(windowMs: number): Promise<void> {
     const held = awaiting.get(id);
     if (held === undefined) continue;
     awaiting.delete(id);
-    held.settle({ kind: "error", name: "DispatchSuperseded", message: detail });
+    held.settle(
+      cancelled
+        ? { kind: "error", name: CANCELLED, message: new ExecutionCancelled(held.execution).message }
+        : { kind: "error", name: "DispatchSuperseded", message: detail },
+    );
   }
   stirPolls();
 }

@@ -12534,16 +12534,31 @@ cancelled stays on its session's count until the worker's cancelled result
 settles it, because the process running it is still stopping (D160). So does
 one the hub **stopped waiting for** while a worker ran it — the node's own
 `timeout:` ran out, or its execution ended around it: the hub supersedes the
-row, names it in the holder's next poll's `cancel` list, and counts it until
+row, names it in the holder's next poll's **`stop`** list, and counts it until
 the worker's result for it arrives, which is refused `409` and frees the slot.
 The hub giving up on a dispatch is not the worker stopping it, and a slot freed
 at once would be handed new work while the old process still ran. The one slot
 the hub cannot count is a **lost session's** — a hub restarted, or one whose
 sweep gave up on the worker, no longer knows the session the rows were held
 under — so the worker counts it: a `410` that ends its session stops the runners
-still running under it as a cancel stops them, and a dispatch the new session is
-handed waits for them before its runner starts. A worker claiming two
-placements holds up to each one's cap of each.
+still running under it as a `stop` list's are stopped, and a dispatch the new
+session is handed waits for them to exit before its runner starts. A worker
+claiming two placements holds up to each one's cap of each.
+
+**A stop is not a cancel, and is not named on the `cancel` list.** Both end a
+process the worker is running, by the same grace and the same kill after it,
+but the runner reads them differently, and has to: a cancel is the
+execution's, so the instances the placed node began on the worker — an
+attached `flow.*` — end `cancelled`; a stop is the hub having stopped waiting,
+which is nobody's cancel, so they end `failed`, their finally nodes reading
+`execution.outcome == "failed"` exactly as when the same node runs out of time
+on the hub (§7.9, D159). On the `cancel` list, a deadline would end them
+`cancelled` in an execution whose own outcome is `failed`, and the boundary each
+crosses — journaled from the worker like any record — would be handed back to a
+retry's redispatch and replayed as the cancel nobody made. So the poll's `200`
+carries a second list, `stop`, its names are sent `SIGUSR2` where a cancel's are
+sent `SIGTERM`, and the runner turns that signal into a failure of the placed
+node and never into its execution's cancel (`docs/distributed.md` §3.2).
 
 **Why it is a placement key, and the knob it replaces.** The mesh decision
 "no capacity knob — a session holds exactly one unsettled dispatch"
@@ -12565,13 +12580,17 @@ pinning test replaced by tests of the cap and of the least-loaded rule. PRD
 resolved q38 (pools) is read, not amended: a pool's parallelism is now the sum of
 its sessions' caps. q44's invariants hold as stated above. D128's placement is a
 named claim, unchanged; this adds one key beside its members. The poll's `204`
-sentence and the result's new `status` are one protocol bump, shared with D160
-(`docs/distributed.md` §10.4, row `3`).
+sentence, its `stop` list and the result's new `status` are one protocol bump,
+shared with D160 (`docs/distributed.md` §10.4, row `3`). PRD resolved q75's
+ruling b — "the poll response gains a `cancel` list" — is read at its own
+words: the `cancel` list carries cancels and nothing else, and the `stop` list
+beside it carries what this decision's capacity rule needs the worker told.
 
 **Status**: shipped as written here. The ruling fixes the key, the cap and the
-least-loaded preference; the tie-break — the oldest poll — and that a cancelled
-dispatch counts until its result arrives are the implementation's, and await the
-owner's ruling. *PRD resolved q38, q44, q75, q79; §14.1; builds on D128;
+least-loaded preference; the tie-break — the oldest poll — that a cancelled
+dispatch counts until its result arrives, and that a dispatch the hub stopped
+waiting for is named on a `stop` list of its own and stopped without a cancel,
+are the implementation's, and await the owner's ruling. *PRD resolved q38, q44, q75, q79; §14.1; builds on D128;
 retires the mesh capacity decision of `docs/distributed.md` §13.*
 
 ## Appendix B — Editor integration

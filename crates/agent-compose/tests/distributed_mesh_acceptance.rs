@@ -3339,3 +3339,100 @@ fn a_cancel_on_a_worker_lets_the_finally_node_it_started_run_whole() {
     }
     assert!(worker.running(), "{}", worker.transcript());
 }
+
+/// What the model asks for in `flow.lapsed`: the attached flow, whose body
+/// outlasts the placed node's four seconds — so nothing past it is scripted.
+fn lapsing() -> Vec<Script> {
+    vec![Script::new(
+        SONNET,
+        Outcome::tool_calls(vec![ToolCall::new(
+            "lapsing",
+            json!({ "path": "release.dmg" }),
+        )]),
+    )]
+}
+
+/// **A placed node's deadline ends what it began on the worker `failed`, never
+/// `cancelled`** (grammar §7.9, §9.2; PRD resolved q75, q76;
+/// `docs/distributed.md` §3.2, §3.3).
+///
+/// `flow.lapsed`'s placed `lapse` has four seconds, and its model calls
+/// `flow.lapsing`, whose body runs for ten minutes on the worker. At four
+/// seconds the hub stops waiting: the node fails on its budget and the
+/// execution with it — `failed`, because nobody cancelled anything — and the
+/// worker is told to **stop** the dispatch, on the poll's `stop` list. The
+/// runner stops the placed node with a failure rather than firing its
+/// execution's cancel, so the attached instance ends `failed` and its finally
+/// node runs at that outcome; the boundary it crosses is journaled from the
+/// worker, and says `failed` — what the same instance records when an unplaced
+/// node runs out of time
+/// (`a_flow_node_whose_timeout_ran_out_waits_for_its_instances_finally_node`).
+/// Told to cancel instead, the runner would end it `cancelled` in an execution
+/// whose own outcome is `failed`, and a retry's redispatch would hand that
+/// record back to be replayed as the cancel nobody made.
+#[test]
+fn a_deadline_on_a_worker_ends_the_instances_it_began_failed_not_cancelled() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider.enqueue_all(lapsing());
+    let mut worker = mesh.worker("deadline-ends-failed");
+    let execution = mesh.start_execution("/lapsings", &json!({ "path": "release.dmg" }));
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] != "running" && report["status"] != "interrupted"
+    });
+    assert_eq!(
+        report["status"],
+        "failed",
+        "a placed node that ran out of time fails its execution, and cancels nothing: \
+         {report:#}\n{}",
+        worker.transcript()
+    );
+    assert!(
+        report["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("timed out")),
+        "{report:#}"
+    );
+
+    // The instance on the worker ends once the runner has been told to stop,
+    // and its boundary comes home over `/workers/effects` after the execution
+    // has settled on the hub.
+    const BOUNDARY: &str = "lapse/0/lapsing/0/lapse_up/0#finally/0";
+    until(
+        "the attached instance's finally boundary reached the hub's journal",
+        || worker.transcript(),
+        || harness::journal_holds(&mesh.project, &[BOUNDARY]),
+    );
+    let rows = harness::journal_rows(
+        &mesh.project,
+        &format!(
+            "SELECT \"key\" AS k, payload FROM effects \
+             WHERE execution = '{execution}' AND kind = 'finally'"
+        ),
+    );
+    let rows = rows.as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "one instance ended, one boundary: {rows:?}");
+    assert_eq!(rows[0]["k"], BOUNDARY, "{rows:?}");
+    let recorded: Value = serde_json::from_str(rows[0]["payload"].as_str().expect("a payload"))
+        .expect("the payload is JSON");
+    assert_eq!(
+        recorded["outcome"],
+        "failed",
+        "the instance a placed node began on the worker ended as its node's deadline ends it, \
+         and not as a cancel nobody made: {recorded:#}\n{}",
+        worker.transcript()
+    );
+
+    // The dispatch was ended by the hub's deadline, never settled as a cancel.
+    let dispatches = mesh.dispatch_rows(&execution);
+    assert!(
+        dispatches.len() == 1
+            && dispatches[0]["status"] == "superseded"
+            && dispatches[0]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("stopped waiting")),
+        "{dispatches:#?}"
+    );
+    assert!(worker.running(), "{}", worker.transcript());
+}

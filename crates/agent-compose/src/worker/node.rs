@@ -70,7 +70,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -79,14 +79,16 @@ use serde_json::{Value, json};
 use super::wire::{Answer, Hub};
 use super::{Sessions, Stop, note};
 
-/// How long a runner is given to stop on its own after a cancel's `SIGTERM`
-/// before its whole process group is killed (§3.2, PRD resolved q75).
+/// How long a runner is given to stop on its own after a cancel's `SIGTERM`,
+/// or a stop's `SIGUSR2`, before its whole process group is killed (§3.2, PRD
+/// resolved q75).
 ///
-/// The runner turns the signal into its execution's cancel, which aborts every
-/// signal its activities read — a model call's `fetch`, a spawned command, a
-/// harness run — so an ordinary node stops in well under this. The kill is for
-/// one that does not: a host function that never reads its signal, or a child
-/// that ignores `SIGTERM`. Inside the ten seconds PRD resolved q75 sets as the
+/// The runner turns `SIGTERM` into its execution's cancel and `SIGUSR2` into a
+/// failure of the placed node ([`Halt`]), and either aborts every signal its
+/// activities read — a model call's `fetch`, a spawned command, a harness run
+/// — so an ordinary node stops in well under this. The kill is for one that
+/// does not: a host function that never reads its signal, or a child that
+/// ignores the signal. Inside the ten seconds PRD resolved q75 sets as the
 /// bar, with room for the poll that carried the cancel.
 ///
 /// **Not while a `finally:` node is running in the runner**, which the runner
@@ -101,7 +103,48 @@ pub(crate) const CANCEL_GRACE: Duration = Duration::from_secs(5);
 /// ended.
 const FINALLY_POLL: Duration = Duration::from_millis(50);
 
-/// One dispatch this worker is running, as a cancel reaches it.
+/// How the hub ended a dispatch this worker holds (§3.2): the two lists a
+/// poll's `200` carries, and the two signals a runner reads them by.
+///
+/// **They are not one thing**, and the runner is the one that has to know
+/// which: a cancel is the execution's, and the instances the placed node began
+/// there — an attached `flow.*` — end `cancelled`, their finally nodes reading
+/// that outcome; a stop is the hub having stopped waiting — the node's
+/// `timeout:` ran out on the hub, its execution ended around it, or the session
+/// it was handed under ended ([`Running::orphan`]) — which is nobody's cancel,
+/// and those instances end `failed`, as they do on the hub when the node runs
+/// out of time there (grammar §7.9, PRD resolved q75, q76).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Halt {
+    /// The `cancel` list: the runner is sent `SIGTERM`, and the result is
+    /// `status: "cancelled"` (§3.4).
+    Cancel,
+    /// The `stop` list, or a session a `410` ended: the runner is sent
+    /// `SIGUSR2`, and the result is whatever the node ended on — which the hub
+    /// refuses `409` and only frees the slot by.
+    Stop,
+}
+
+impl Halt {
+    /// How this halt is recorded on a [`Handle`]: never `0`, which is none.
+    const fn mark(self) -> u8 {
+        match self {
+            Self::Cancel => 1,
+            Self::Stop => 2,
+        }
+    }
+
+    /// The halt a [`Handle`]'s mark records, if any.
+    const fn of(mark: u8) -> Option<Self> {
+        match mark {
+            1 => Some(Self::Cancel),
+            2 => Some(Self::Stop),
+            _ => None,
+        }
+    }
+}
+
+/// One dispatch this worker is running, as a cancel or a stop reaches it.
 #[derive(Default)]
 pub(crate) struct Handle {
     /// Which of this worker's sessions it was handed under ([`super::Held`]'s
@@ -111,15 +154,24 @@ pub(crate) struct Handle {
     generation: u64,
     /// The runner's pid, once it has one; `0` before it is spawned.
     pid: AtomicU32,
-    /// Whether the hub has cancelled this dispatch.
-    cancelled: AtomicBool,
+    /// How the hub ended this dispatch, if it has ([`Halt::mark`]): the first
+    /// word is the one it ends by.
+    halted: AtomicU8,
     /// Whether the runner says a `finally:` node is running in it — the work a
     /// cancel's grace does not cut off ([`CANCEL_GRACE`]).
     finally: AtomicBool,
 }
 
+impl Handle {
+    /// How the hub ended this dispatch, if it has.
+    fn halted(&self) -> Option<Halt> {
+        Halt::of(self.halted.load(Ordering::SeqCst))
+    }
+}
+
 /// The dispatches this worker is running, by `dispatch_id` — shared between the
-/// poll thread, which reads the `cancel` list, and each dispatch's own thread.
+/// poll thread, which reads the `cancel` and `stop` lists, and each dispatch's
+/// own thread.
 #[derive(Clone, Default)]
 pub(crate) struct Running(Arc<Mutex<HashMap<String, Arc<Handle>>>>);
 
@@ -127,12 +179,12 @@ impl Running {
     /// Put one dispatch on the books, answering its handle.
     ///
     /// Called by the **poll thread**, for the dispatch a poll answer hands over,
-    /// before that answer's `cancel` list is acted on (§3.2, PRD resolved q75).
-    /// The list may name that very dispatch — a cancel that reached it while the
-    /// hub was assembling the answer, which the hub then names to nobody again —
-    /// and a cancel of a dispatch not yet on the books finds nothing to stop
-    /// ([`Running::cancel`]). So would the next poll's, if the hold waited for
-    /// the dispatch's own thread to be scheduled.
+    /// before that answer's `cancel` and `stop` lists are acted on (§3.2, PRD
+    /// resolved q75). A list may name that very dispatch — a cancel or a stop
+    /// that reached it while the hub was assembling the answer, which the hub
+    /// then names to nobody again — and a name not yet on the books finds
+    /// nothing to stop ([`Running::halt`]). So would the next poll's, if the
+    /// hold waited for the dispatch's own thread to be scheduled.
     pub(crate) fn hold(&self, id: &str, generation: u64) -> Arc<Handle> {
         let handle = Arc::new(Handle {
             generation,
@@ -167,12 +219,13 @@ impl Running {
     /// A `410` is the hub saying it no longer knows the session — it was
     /// restarted, or its liveness sweep gave up on this worker — and either way
     /// it has superseded what that session held: a result for one is refused
-    /// `409`, and its effects with it. Left running, such a runner is work
-    /// nothing will read, and — since the new session holds nothing by the
-    /// hub's count — a slot the hub hands new work beside: a worker at
-    /// `max_running: 1` would be running two. So each is stopped the way a
-    /// cancel stops it ([`Running::cancel`]): `SIGTERM`, the grace — held while
-    /// a `finally:` node runs — and the group killed after.
+    /// `409`. Left running, such a runner is work nothing will read, and —
+    /// since the new session holds nothing by the hub's count — a slot the hub
+    /// hands new work beside: a worker at `max_running: 1` would be running
+    /// two. So each is **stopped** ([`Halt::Stop`]) — never cancelled: nobody
+    /// cancelled its execution, and what it began here ends `failed` — by
+    /// `SIGUSR2`, the grace — held while a `finally:` node runs — and the group
+    /// killed after.
     pub(crate) fn orphan(&self, generation: u64) {
         let older: Vec<String> = self
             .0
@@ -183,7 +236,7 @@ impl Running {
             .map(|(id, _)| id.clone())
             .collect();
         for id in older {
-            self.cancel(&id);
+            self.halt(&id, Halt::Stop);
         }
     }
 
@@ -204,13 +257,15 @@ impl Running {
         }
     }
 
-    /// Act on the hub's cancel of `id` (§3.2): mark it, send its runner
-    /// `SIGTERM`, and kill its process group if it is still running after
-    /// [`CANCEL_GRACE`] — a grace held while the runner reports a `finally:`
-    /// node running, and given again once it reports none. A dispatch this
-    /// worker does not hold — already settled, or never handed over — is
-    /// nothing to stop.
-    pub(crate) fn cancel(&self, id: &str) {
+    /// Act on the hub ending `id` (§3.2) — a name on a poll's `cancel` list
+    /// or its `stop` list, or a session a `410` ended ([`Running::orphan`]):
+    /// mark it, send its runner the signal [`Halt`] names, and kill its
+    /// process group if it is still running after [`CANCEL_GRACE`] — a grace
+    /// held while the runner reports a `finally:` node running, and given
+    /// again once it reports none. A dispatch this worker does not hold —
+    /// already settled, or never handed over — is nothing to stop, and one
+    /// already halted keeps the first word it was given.
+    pub(crate) fn halt(&self, id: &str, how: Halt) {
         let Some(handle) = self
             .0
             .lock()
@@ -220,12 +275,16 @@ impl Running {
         else {
             return;
         };
-        if handle.cancelled.swap(true, Ordering::SeqCst) {
+        if handle
+            .halted
+            .compare_exchange(0, how.mark(), Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
             return;
         }
         let pid = handle.pid.load(Ordering::SeqCst);
         if pid != 0 {
-            terminate(pid);
+            ask(pid, how);
         }
         let running = self.clone();
         let id = id.to_string();
@@ -247,18 +306,24 @@ impl Running {
     }
 }
 
-/// Ask a runner to stop: `SIGTERM`, which it turns into its execution's cancel.
+/// Ask a runner to stop, the way [`Halt`] says: `SIGTERM`, which it turns into
+/// its execution's cancel, or `SIGUSR2`, which it turns into a failure of the
+/// placed node and cancels nothing.
 #[cfg(unix)]
-fn terminate(pid: u32) {
+fn ask(pid: u32, how: Halt) {
+    let signal = match how {
+        Halt::Cancel => libc::SIGTERM,
+        Halt::Stop => libc::SIGUSR2,
+    };
     if let Ok(pid) = libc::pid_t::try_from(pid) {
         // SAFETY: a pid this worker spawned and has not reaped — the handle's
         // pid is cleared the moment the runner is waited on.
-        unsafe { libc::kill(pid, libc::SIGTERM) };
+        unsafe { libc::kill(pid, signal) };
     }
 }
 
 #[cfg(not(unix))]
-fn terminate(_pid: u32) {}
+fn ask(_pid: u32, _how: Halt) {}
 
 /// Kill a runner and every process in its group: what a cancel does to a
 /// runner that did not stop within [`CANCEL_GRACE`].
@@ -305,9 +370,10 @@ impl From<Stop> for Unsent {
 /// else.
 ///
 /// `handle` is the dispatch on the books, put there by the poll thread before
-/// the answer that handed it over had its `cancel` list read ([`Running::hold`]):
-/// a cancel in that same answer has already marked it, and its runner is never
-/// started. Its generation is the session that poll was made under. A dispatch
+/// the answer that handed it over had its `cancel` and `stop` lists read
+/// ([`Running::hold`]): a cancel or a stop in that same answer has already
+/// marked it, and its runner is never started. Its generation is the session
+/// that poll was made under. A dispatch
 /// handed to a session this worker joined while runners of an older one are
 /// still stopping waits for them before its own runner starts
 /// ([`Running::drained_before`]) — a wait inside the node's `timeout:` chain,
@@ -377,8 +443,26 @@ fn execute_held(
         }
         body
     };
-    if handle.cancelled.load(Ordering::SeqCst) {
-        return settle(&mut sender, &cancelled(None));
+    match handle.halted() {
+        Some(Halt::Cancel) => return settle(&mut sender, &cancelled(None)),
+        // Stopped before its runner started — named on the `stop` list of the
+        // answer that handed it over, or its session ended while it waited for
+        // an older one's runners ([`Running::drained_before`]). The hub has
+        // already superseded it, so this result is refused `409`; what it is
+        // for is the slot the hub keeps counted until a result arrives.
+        Some(Halt::Stop) => {
+            return settle(
+                &mut sender,
+                &json!({
+                    "dispatch_id": id,
+                    "error": {
+                        "name": "DispatchStopped",
+                        "message": "the hub stopped waiting for this dispatch before its runner started, so none was (docs/distributed.md §3.2)",
+                    },
+                }),
+            );
+        }
+        None => {}
     }
 
     let child = spawn(bun, tree, runner, dispatch);
@@ -399,10 +483,10 @@ fn execute_held(
     };
 
     handle.pid.store(child.id(), Ordering::SeqCst);
-    // A cancel that arrived between the hold and the spawn found no pid to
-    // signal, so it is signalled here.
-    if handle.cancelled.load(Ordering::SeqCst) {
-        terminate(child.id());
+    // A cancel or a stop that arrived between the hold and the spawn found no
+    // pid to signal, so it is signalled here.
+    if let Some(how) = handle.halted() {
+        ask(child.id(), how);
     }
     let stdout = child.stdout.take().expect("stdout is piped");
     let mut result: Option<Value> = None;
@@ -486,7 +570,10 @@ fn execute_held(
         return Err(stop);
     }
 
-    if handle.cancelled.load(Ordering::SeqCst) {
+    // A stopped dispatch is settled with whatever its runner ended on — the
+    // failure the stop raised in it, or a result it reached first — which the
+    // hub refuses `409` and frees the slot by (§3.4).
+    if handle.halted() == Some(Halt::Cancel) {
         return settle(&mut sender, &cancelled(result.as_ref()));
     }
     let settling = match (result, unreadable, rejected) {

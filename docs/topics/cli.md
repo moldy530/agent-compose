@@ -418,13 +418,18 @@ It runs **every dispatch it holds at once**, and keeps polling while any is
 running, so a placement's `max_running:` (how many of its dispatches one worker
 may hold — `1` unless the deploy file says otherwise) is how many nodes this
 machine runs side by side. A dispatch the hub names in a poll's `cancel` list is
-stopped — its runner is sent `SIGTERM`, and its whole process group `SIGKILL`
-five seconds later if it is still running, a grace held for as long as the
-runner reports a `finally:` node running, since that node runs whole — and
-reported `cancelled`. A session the hub has forgotten (a `410`: the hub
-restarted, or gave up on this worker) takes its dispatches with it, so the
-runners still running under it are stopped the same way, and work the new
-session is handed waits for them before it starts.
+stopped — its runner is sent `SIGTERM`, which it reads as its execution's
+cancel, and its whole process group `SIGKILL` five seconds later if it is still
+running, a grace held for as long as the runner reports a `finally:` node
+running, since that node runs whole — and reported `cancelled`. One the hub
+names in the poll's `stop` list — it stopped waiting, because the node's
+`timeout:` ran out or its execution ended — is stopped the same way but by
+`SIGUSR2`, which the runner reads as a failure of the node rather than a cancel,
+so what the node began there ends `failed`; the result is whatever the node
+ended on. A session the hub has forgotten (a `410`: the hub restarted, or gave
+up on this worker) takes its dispatches with it, so the runners still running
+under it are stopped as a `stop` list's are, and work the new session is handed
+waits for them before it starts.
 
 Each runner is a process group of its own, so `Ctrl-C` — and `SIGTERM` or
 `SIGHUP` — reaches the worker and not the runners; the worker hands the stop on

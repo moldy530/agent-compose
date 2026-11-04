@@ -44,8 +44,10 @@
 //!   detached `flow.*` of it starts —
 //!   [`a_finally_nodes_detached_delivery_runs_on_a_cancelled_execution`] and
 //!   [`a_finally_nodes_detached_child_execution_runs_on_a_cancelled_execution`];
-//! * `agent-compose cancel`'s exit codes —
-//!   [`agent_compose_cancel_exits_by_what_the_app_answered`];
+//! * `agent-compose cancel`'s exit codes, and the `hub.public_url` it sends to
+//!   when no `--url` is given —
+//!   [`agent_compose_cancel_exits_by_what_the_app_answered`] and
+//!   [`agent_compose_cancel_finds_the_app_at_the_targets_public_url`];
 //! * and `run`'s posture, which a cancel does not change: an interrupted run's
 //!   row stays open for `resume` (PRD resolved q28) —
 //!   [`an_interrupted_run_is_left_open_for_resume_rather_than_cancelled`].
@@ -1301,6 +1303,100 @@ fn agent_compose_cancel_exits_by_what_the_app_answered() {
         Some(2),
         "{}",
         String::from_utf8_lossy(&unreachable.stderr)
+    );
+}
+
+/// **`agent-compose cancel` sends the cancel to the target's `hub.public_url`
+/// when no `--url` is given, and is a usage error where the target declares
+/// none** (PRD resolved q75 ruling d: "`--url`, defaulting to
+/// `hub.public_url`"; Decision D160).
+///
+/// A literal `public_url:` cannot name a port the operating system chose, so
+/// the fixture is staged with a `deploy/local.yml` whose `hub:` names the
+/// served app — `local` may declare `hub:` (grammar §14), and it is the one
+/// target this fixture's detached dispatches compile under. Under it, a cancel
+/// with no `--url` reaches that app: exit `0`, the `202`, and the execution
+/// settles `cancelled`. An id the app does not know is the route's `404`, a
+/// refusal: exit `1`, carrying the status. And the fixture as committed, whose
+/// `local` declares no `hub:`, has nowhere to send it: exit `2`, with the
+/// sentence that says to pass `--url`.
+#[test]
+fn agent_compose_cancel_finds_the_app_at_the_targets_public_url() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("cancel-cli-public-url");
+    let (environment, log) = environment(&provider, &scratch);
+    let Some(project) = harness::scratch_project("cancel-cli-public-url") else {
+        return;
+    };
+    let Some(staged_out) = harness::scratch_project("cancel-cli-public-url-staged") else {
+        return;
+    };
+    let Some(committed_out) = harness::scratch_project("cancel-cli-public-url-committed") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, FIXTURE, &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let execution = started(&app, "/long", &json!({ "linger": 600 }));
+    pids(&log, 1);
+
+    let (_staged, entrypoint) = harness::staged_with_deploy(
+        "cancel-cli-public-url",
+        FIXTURE,
+        "local",
+        &format!(
+            "version: \"0.1\"\n\nhub:\n  public_url: \"{}\"\n",
+            served.base_url
+        ),
+    );
+    let cancelling = |entrypoint: &Path, out: &Path, id: &str| {
+        compiler(&environment)
+            .arg("cancel")
+            .arg(entrypoint)
+            .arg(id)
+            .args(["--target", "local", "--format", "json"])
+            .arg("--out")
+            .arg(out)
+            .output()
+            .expect("the compiler runs")
+    };
+
+    let accepted = cancelling(&entrypoint, &staged_out, &execution);
+    assert_eq!(
+        accepted.status.code(),
+        Some(0),
+        "a cancel with no `--url` did not reach the app at the target's `hub.public_url`: {}{}",
+        String::from_utf8_lossy(&accepted.stdout),
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    let document: Value =
+        serde_json::from_slice(&accepted.stdout).expect("`--format json` prints one document");
+    assert_eq!(document["http_status"], 202, "{document:#}");
+    reaches(&app, &execution, "cancelled", SETTLE);
+
+    let unknown = cancelling(&entrypoint, &staged_out, "exec_nobody_started");
+    assert_eq!(
+        unknown.status.code(),
+        Some(1),
+        "an id the app does not know is a refusal: {}",
+        String::from_utf8_lossy(&unknown.stderr)
+    );
+    let document: Value =
+        serde_json::from_slice(&unknown.stdout).expect("`--format json` prints one document");
+    assert_eq!(document["http_status"], 404, "{document:#}");
+
+    let nowhere = cancelling(&harness::fixture(FIXTURE), &committed_out, &execution);
+    assert_eq!(
+        nowhere.status.code(),
+        Some(2),
+        "a target with no `hub.public_url` and no `--url` is a usage error: {}",
+        String::from_utf8_lossy(&nowhere.stderr)
+    );
+    let said = String::from_utf8_lossy(&nowhere.stderr);
+    assert!(
+        said.contains("this target declares no `hub.public_url` to find it at: pass `--url"),
+        "{said}"
     );
 }
 

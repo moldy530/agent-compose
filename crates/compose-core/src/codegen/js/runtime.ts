@@ -1322,7 +1322,8 @@ export class NodeCancelled extends Error {
  * call fired it.
  *
  * Nothing durable: [`cancelExecution`] records the request first, and this is
- * what both it and a worker's node runner (on the hub's `cancel` list) call.
+ * what both it and a worker's node runner (on the hub's `cancel` list — never
+ * its `stop` list, which fails the placed node and cancels nothing) call.
  */
 export function fireCancel(execution: string): boolean {
   const controller = executionCancels.get(execution);
