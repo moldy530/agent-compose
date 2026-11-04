@@ -1,0 +1,59 @@
+# Acceptance fixture: grammar §9.3's level 3 — the composition's `defaults:` —
+# reaching a flow's `finally:` node (grammar §7.9, Decision D159, PRD resolved
+# q76).
+#
+# Kept apart from the `finally` fixture because `defaults:` applies to every node
+# of every flow in a composition: a `retry:` there would re-run every failing
+# body node that fixture's tests count, and a one-second `timeout:` would cut
+# short every model call it holds. Here the only nodes are the ones the claim
+# needs, so the defaults are the whole of the policy each finally node runs
+# under:
+#
+#   * `flow.cleaned` — a finally node that fails on every attempt, declaring no
+#     `retry:` of its own: the `defaults:` `retry:` is what re-runs it, so the
+#     `ended` shim logs one line per attempt the composition allowed.
+#   * `flow.overslept` — a finally node that sleeps past the `defaults:`
+#     `timeout:`, declaring none of its own: the budget is what ends it, and its
+#     failure is `finally_error` beside a run that completed.
+version: "0.1"
+
+defaults:
+  timeout: 1s
+  retry: { max: 1, backoff: 10ms }
+
+flow.cleaned:
+  description: A body that completes, and a finally node that fails on every attempt.
+  outputs: {}
+  nodes:
+    work:
+      exec:
+        command: "${OPS_BIN}/true"
+    record:
+      exec:
+        command: "${TALLY_BIN}/ended"
+        args: ["--fail"]
+      input:
+        outcome: "execution.outcome"
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: record
+
+flow.overslept:
+  description: A body that completes, and a finally node that sleeps past the default budget.
+  outputs: {}
+  nodes:
+    work:
+      exec:
+        command: "${OPS_BIN}/true"
+    nap:
+      exec:
+        command: "${OPS_BIN}/sleep"
+        args: ["3"]
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: nap
+
+triggers:
+  cli: { type: manual, flow: flow.cleaned }

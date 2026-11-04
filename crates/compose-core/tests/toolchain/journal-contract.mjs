@@ -528,6 +528,25 @@ its schema creation is not idempotent: ${error instanceof Error ? error.message 
     (await handle.settleDispatch(dispatch(1), { kind: "value", value: { ok: "again" } })) === false;
   results.a_settled_dispatch_keeps_its_outcome =
     (await handle.dispatchOf(dispatch(1)))?.outcome?.value?.ok === UNICODE;
+  // …and a settled **failure** keeps what a `finally:` node raised beside it on
+  // the worker (`docs/distributed.md` §3.4, `docs/durability.md` §3.8): the one
+  // field a failure carries beyond its name and message, kept on the row so a
+  // hub restarted before the execution settles reads it back. The value is the
+  // long one, for `error`'s reason: a finally node's failure is as long as its
+  // subprocess made it.
+  await handle.claimDispatch(dispatch(11), "session-d");
+  await handle.settleDispatch(dispatch(11), {
+    kind: "error",
+    name: "NodeFailure",
+    message: UNICODE,
+    finallyError: LARGE,
+  });
+  const failedHere = (await handle.dispatchOf(dispatch(11)))?.outcome;
+  results.a_settled_failure_keeps_its_finally_error =
+    failedHere?.kind === "error" &&
+    failedHere.name === "NodeFailure" &&
+    failedHere.message === UNICODE &&
+    failedHere.finallyError === LARGE;
   // …and the *other* ending, which is the hub's rather than a result's: a
   // session that fell outside the liveness window, or a dispatch issued under an
   // artifact that has been replaced (§3.8, `docs/distributed.md` §5, §6.3). The

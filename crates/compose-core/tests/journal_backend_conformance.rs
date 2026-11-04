@@ -690,6 +690,10 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "a_finally_error_round_trips_beside_its_outcome",
     "a_row_with_no_finally_error_reads_none",
     "a_journal_without_the_finally_error_column_gains_it_on_open",
+    // …and the dispatch board's half of the same field: a placed node's settled
+    // failure keeps what a finally node raised on the worker beside it
+    // (`docs/distributed.md` §3.4, §3.8).
+    "a_settled_failure_keeps_its_finally_error",
     // §7 — the mark that tells resolved q29's second divergence from a mismatch
     // the composition already had.
     "a_refusal_is_recorded",

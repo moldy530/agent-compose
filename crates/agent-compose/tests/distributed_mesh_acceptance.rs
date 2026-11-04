@@ -820,6 +820,106 @@ fn a_module_tool_attached_to_a_placed_agent_runs_in_its_loop_on_the_worker() {
     );
 }
 
+/// The three calls `agent.tidier` makes on the worker: the attached flow, a
+/// turn after it, and the structured answer.
+fn tidying(signature: &str) -> Vec<Script> {
+    vec![
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "tidying",
+                json!({ "path": "release.dmg" }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("looked over, and tidied up after")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "signature": signature })),
+        ),
+    ]
+}
+
+/// **A flow instance that ends on a worker brings both halves of its end home**
+/// (grammar §7.9, §14.1 rule 4, `docs/distributed.md` §3.3, §3.4, PRD resolved
+/// q76).
+///
+/// `flow.tidied`'s node is the placed `agent.tidier`, and its model calls the
+/// attached `flow.tidying`, whose finally node fails. The attached flow runs in
+/// the agent's placement, so its instance ends **on the worker**:
+///
+/// * the `finally` boundary its end crosses is streamed home over
+///   `/workers/effects` like any effect — a record of a kind the hub must take,
+///   or the batch is refused and the dispatch ends with it — and lands in the
+///   hub's journal under the key a local run derives;
+/// * what its finally node raised comes home on `/workers/result` as
+///   `finally_error`, and the hub holds it as the execution's own: on the status
+///   report and on the lifecycle row, beside a `"completed"` it did not change.
+#[test]
+fn an_instance_that_ends_on_a_worker_journals_its_boundary_and_reports_its_finally_error() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider.enqueue_all(tidying("tidied-on-the-worker"));
+    let worker = mesh.worker("attached-finally");
+
+    let execution = mesh.start_execution("/tidyings", &json!({ "path": "release.dmg" }));
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] == "completed" || report["status"] == "failed"
+    });
+    assert_eq!(
+        report["status"],
+        "completed",
+        "a finally node changes no outcome, on a worker as anywhere: {report:#}
+{}",
+        worker.transcript()
+    );
+    assert_eq!(
+        report["outputs"]["signature"], "tidied-on-the-worker",
+        "{report:#}"
+    );
+    let finally_error = report["finally_error"].as_str().unwrap_or_else(|| {
+        panic!(
+            "the finally node's failure on the worker is the execution's: {report:#}
+{}",
+            worker.transcript()
+        )
+    });
+    assert!(
+        finally_error.starts_with("flow.tidying node `tidy_up` failed: "),
+        "{finally_error}"
+    );
+
+    let rows = harness::journal_rows(
+        &mesh.project,
+        &format!(
+            "SELECT \"key\" AS k, request FROM effects \
+             WHERE execution = '{execution}' AND kind = 'finally'"
+        ),
+    );
+    let rows = rows.as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "one instance ended, one boundary: {rows:?}");
+    assert_eq!(
+        rows[0]["k"], "tidy/0/tidying/0/tidy_up/0#finally/0",
+        "the boundary is keyed under the placed node, as an unplaced loop keys it"
+    );
+    let request: Value = serde_json::from_str(rows[0]["request"].as_str().expect("a request"))
+        .expect("the request is JSON");
+    assert_eq!(
+        request,
+        json!({ "node": "tidy_up", "outcome": "completed" })
+    );
+
+    let lifecycle = harness::journal_rows(
+        &mesh.project,
+        &format!("SELECT status, finally_error FROM executions WHERE id = '{execution}'"),
+    );
+    assert_eq!(
+        lifecycle,
+        json!([{ "status": "completed", "finally_error": finally_error }]),
+        "the hub wrote the worker's failure into the row it alone writes"
+    );
+}
+
 /// A placed agent reads the conversation the node before it left, across the
 /// wire (§3.2, §4.3).
 ///
