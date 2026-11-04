@@ -184,8 +184,8 @@ So is the flow's `finally:` node, which is reachable because it is `finally:`.
 ## Finally
 
 `finally: <node id>` names the node an instance of the flow runs **once, when it
-ends** — whether the body completed, failed, or was cancelled (`agent-compose
-cancel`, `POST /executions/:id/cancel`). Inside that node, and nowhere else,
+ends** — whether the body completed, failed, or was cancelled (the `cancel`
+verb, `POST /executions/:id/cancel`). Inside that node, and nowhere else,
 `execution.outcome` says how (`completed`, `failed`, `cancelled`) and
 `execution.error` says why, where the body failed — it is absent on
 `cancelled`, since nothing went wrong with an instance somebody stopped. A
