@@ -1222,3 +1222,368 @@ fn a_run_whose_sink_credential_is_blank_journals_the_export_and_sends_nothing() 
         collector.of_event("settled")
     );
 }
+
+// ---------------------------------------------------------------------------
+// A failed `finally:` node, on every document that leaves the process
+// (grammar §7.9, `docs/trace.md` §2, §12.5, PRD resolved q76)
+// ---------------------------------------------------------------------------
+
+/// What `flow.untidy`'s finally node failing is recorded as, checked for its
+/// head and handed back so a test can compare two documents' copies of it.
+///
+/// `<flow> node \`<id>\` failed: <error>` (`docs/trace.md` §2): the head is
+/// this suite's to pin, and the tail is the subprocess's, which is not.
+fn untidy_finally_error(held: &Value, what: &str) -> String {
+    let text = held
+        .as_str()
+        .unwrap_or_else(|| panic!("{what} carries the finally node's failure: {held}"));
+    assert!(
+        text.starts_with("flow.untidy node `tidy` failed: "),
+        "{what} names the finally node that failed: {text}"
+    );
+    text.to_string()
+}
+
+/// The `finally_error:` line a human-format command writes on stderr, and the
+/// only one (`docs/trace.md` §1.1).
+fn said_finally_error(stderr: &str) -> String {
+    let said: Vec<&str> = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("finally_error: "))
+        .collect();
+    assert_eq!(
+        said.len(),
+        1,
+        "one `finally_error:` line on stderr: {stderr}"
+    );
+    untidy_finally_error(&Value::from(said[0]), "the command's stderr")
+}
+
+/// `flow.untidy`'s finally entry: the trace's last, failed, with no routing
+/// (`docs/trace.md` §3.5).
+fn assert_tidy_entry_failed(entries: &Value) {
+    let held = entries
+        .as_array()
+        .unwrap_or_else(|| panic!("a list of entries: {entries}"));
+    let nodes: Vec<&str> = held
+        .iter()
+        .filter_map(|entry| entry["node"].as_str())
+        .collect();
+    assert_eq!(nodes, ["say", "tidy"], "{entries:#}");
+    let last = &held[1];
+    assert_eq!(last["outcome"], "failed", "{last:#}");
+    assert!(
+        last.get("routing").is_none(),
+        "a finally node has no edges, so its entry records no routing: {last:#}"
+    );
+}
+
+/// **A served settle whose `finally:` node failed says so on both deliveries
+/// it journals** (grammar §7.9, `docs/trace.md` §2, PRD resolved q76).
+///
+/// `flow.untidy`'s body answers and its finally node fails, so the execution
+/// is `completed` — the outcome a finally node cannot change — and the failure
+/// is the record's. Two documents carry that record off the process, and
+/// neither is the status route a caller would have to poll: the `settled`
+/// webhook, whose body is the status route's report, and the sink export, whose
+/// body is the envelope. A receiver of either has no other way to learn that
+/// the cleanup did not happen, so each is asserted to say so — in the same
+/// words — beside `status: completed` and no `error`.
+#[test]
+fn a_served_settle_carries_its_finally_error_on_the_webhook_and_the_export() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let collector = harness::Receiver::start().expect("a loopback collector");
+    let subscriber = harness::Receiver::start().expect("a loopback subscriber");
+    let (_composition, entrypoint) = harness::staged_with_deploy(
+        "sink-untidy-served",
+        FIXTURE,
+        TARGET,
+        &sink_target(&format!("{}/v1/traces", collector.base_url), None, false),
+    );
+    let Some(project) = harness::scratch_project("sink-untidy-served") else {
+        return;
+    };
+    let environment = environment(&provider);
+    let Some(served) = harness::serve_target_into(&project, &entrypoint, TARGET, &environment)
+    else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let started = app
+        .send(Request::post("/untidy-greetings").json(&json!({
+            "subject": "a cleanup that fails",
+            "callback_url": format!("{}/done", subscriber.base_url),
+        })))
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{}", started.text());
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    let pushed = subscriber.wait_for_event("settled", 1, PATIENCE);
+    let webhook = &pushed[0].body;
+    assert_eq!(webhook["execution_id"], execution, "{webhook:#}");
+    assert_eq!(
+        webhook["status"], "completed",
+        "a finally node changes no outcome: {webhook:#}"
+    );
+    assert_eq!(
+        webhook["outputs"],
+        json!({ "greeting": "hello" }),
+        "the outputs are the body's: {webhook:#}"
+    );
+    assert!(webhook.get("error").is_none(), "{webhook:#}");
+    let finally_error = untidy_finally_error(&webhook["finally_error"], "the `settled` webhook");
+
+    let exported = collector.wait_for_event("settled", 1, PATIENCE);
+    let envelope = &exported[0].body;
+    assert_eq!(envelope["execution_id"], execution, "{envelope:#}");
+    assert_eq!(envelope["status"], "completed", "{envelope:#}");
+    assert!(envelope.get("error").is_none(), "{envelope:#}");
+    assert_eq!(
+        envelope["finally_error"],
+        finally_error.as_str(),
+        "the export says what the webhook said: {envelope:#}"
+    );
+    assert_tidy_entry_failed(&envelope["entries"]);
+}
+
+/// **A `run`'s OTLP export carries its `finally_error` as the root's
+/// `agentcompose.finally_error`, on a root that is still OK**
+/// (`docs/trace.md` §12.4, §12.5, grammar §7.9, PRD resolved q76).
+///
+/// Two halves in one delivery. The command's: `src/cli.ts` journals a run's
+/// export from the hook that closes its row, and the envelope it builds there
+/// has to carry the field for anything downstream to. The mapping's: the root
+/// carries it as an attribute rather than as an ERROR status, because the run
+/// completed and its outputs are its body's. The text is the one the command
+/// printed as its `finally_error:` line, so what an operator reads at the
+/// terminal and what their collector shows are one sentence. The finally node's
+/// own span is the ERROR one, as its entry is failed.
+#[test]
+fn a_runs_otlp_export_carries_its_finally_error_on_a_root_that_is_still_ok() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let collector = harness::Receiver::start().expect("a loopback collector");
+    let (_composition, entrypoint) = harness::staged_with_deploy(
+        "sink-untidy-otlp",
+        FIXTURE,
+        TARGET,
+        &sink_target(
+            &format!("{}/v1/traces", collector.base_url),
+            Some("otlp"),
+            false,
+        ),
+    );
+    let Some(project) = harness::scratch_project("sink-untidy-otlp") else {
+        return;
+    };
+    let run = harness::run_target(
+        &project,
+        &entrypoint,
+        TARGET,
+        "flow.untidy",
+        &[("subject", "a one-shot cleanup that fails")],
+        &environment(&provider),
+    );
+    run.succeeded();
+    assert_eq!(
+        run.outputs(),
+        json!({ "greeting": "hello" }),
+        "{}",
+        run.stderr()
+    );
+    let said = said_finally_error(&run.stderr());
+
+    let exported = collector.wait_for_event("settled", 1, PATIENCE);
+    let body = &exported[0].body;
+    let root = root_span(body);
+    assert_eq!(root["name"], "flow.untidy", "{root:#}");
+    assert_eq!(
+        root["status"],
+        json!({ "code": 1 }),
+        "a completed run whose cleanup failed is OK at the root (`docs/trace.md` §12.4): \
+         {root:#}"
+    );
+    let carried: Vec<&Value> = root["attributes"]
+        .as_array()
+        .expect("root attributes")
+        .iter()
+        .filter(|attribute| attribute["key"] == "agentcompose.finally_error")
+        .map(|attribute| &attribute["value"])
+        .collect();
+    assert_eq!(
+        carried,
+        [&json!({ "stringValue": said })],
+        "the root carries the command's `finally_error`, once (`docs/trace.md` §12.5): {root:#}"
+    );
+    let tidy = body["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .expect("spans")
+        .iter()
+        .find(|span| span["name"] == "tidy")
+        .unwrap_or_else(|| panic!("the finally node has a span: {body:#}"));
+    assert_eq!(tidy["status"]["code"], 2, "{tidy:#}");
+}
+
+/// **An execution finished by `agent-compose resume` journals its
+/// `finally_error` on the webhook it owes and on its export** (grammar §7.9,
+/// `docs/durability.md` §3.7, §6.2, PRD resolved q35, q76).
+///
+/// `serve` is not the only process that settles an execution with a
+/// `callback:`: a resume at the terminal does too. It journals the `settled`
+/// webhook for the next `serve` to send and the export for itself to ship, and
+/// it builds both documents in a code path of its own (`src/cli.ts`) from what
+/// the resumed run produced — so a `finally_error` that run raised is carried
+/// into them there or lost there, and a receiver handed a `completed` report
+/// with no `finally_error` has no sign that the cleanup failed.
+///
+/// **The state is made rather than raced**, as in
+/// [`a_generation_that_journaled_only_the_webhook_still_exports_on_recovery`]: a
+/// served settle runs for real, and the journal is put back into the shape a
+/// generation killed after its finally node failed and before its settle hook
+/// ran leaves behind — the lifecycle row open with no `finally_error` on it, and
+/// nothing on its ledger. The resume replays the body, reaches the boundary the
+/// first generation recorded, runs the finally node at it, and closes the row:
+/// on it, on the journaled webhook's body and on the export alike, the
+/// `finally_error` is the one the command printed.
+#[test]
+fn a_hand_resume_journals_its_finally_error_on_the_webhook_it_owes_and_its_export() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let collector = harness::Receiver::start().expect("a loopback collector");
+    let subscriber = harness::Receiver::start().expect("a loopback subscriber");
+    let (_composition, entrypoint) = harness::staged_with_deploy(
+        "sink-untidy-resumed",
+        FIXTURE,
+        TARGET,
+        &sink_target(&format!("{}/v1/traces", collector.base_url), None, false),
+    );
+    let Some(project) = harness::scratch_project("sink-untidy-resumed") else {
+        return;
+    };
+    let environment = environment(&provider);
+
+    let execution;
+    {
+        let Some(first) = harness::serve_target_into(&project, &entrypoint, TARGET, &environment)
+        else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        let started = app
+            .send(Request::post("/untidy-greetings").json(&json!({
+                "subject": "a cleanup a resume finishes",
+                "callback_url": format!("{}/done", subscriber.base_url),
+            })))
+            .expect("the trigger's route answers");
+        assert_eq!(started.status, 202, "{}", started.text());
+        execution = started.json()["execution_id"]
+            .as_str()
+            .expect("an execution id")
+            .to_string();
+        // Settled for real — the finally boundary recorded, both deliveries made
+        // — so the surgery below takes away rows this deployment wrote.
+        subscriber.wait_for_event("settled", 1, PATIENCE);
+        collector.wait_for_event("settled", 1, PATIENCE);
+    }
+
+    // The state a generation killed between its finally node and its settle
+    // hook leaves: the row open, no `finally_error` on it, nothing owed yet.
+    harness::journal_sql(
+        &project,
+        &format!(
+            "DELETE FROM deliveries WHERE execution = '{execution}';\n\
+             UPDATE executions SET status = 'open', ended_at = NULL, finally_error = NULL \
+             WHERE id = '{execution}';"
+        ),
+    );
+    let boundary = harness::journal_rows(
+        &project,
+        &format!(
+            "SELECT count(*) AS n FROM effects WHERE execution = '{execution}' AND kind = 'finally'"
+        ),
+    );
+    assert_eq!(
+        boundary[0]["n"], 1,
+        "the first generation recorded the boundary the resume reaches: {boundary:#}"
+    );
+
+    let resumed = harness::resume_target(&project, &entrypoint, TARGET, &execution, &environment);
+    resumed.succeeded();
+    assert_eq!(
+        resumed.outputs(),
+        json!({ "greeting": "hello" }),
+        "{}",
+        resumed.stderr()
+    );
+    let said = said_finally_error(&resumed.stderr());
+
+    let owed = harness::journal_rows(
+        &project,
+        &format!(
+            "SELECT kind, event, body FROM deliveries WHERE execution = '{execution}' \
+             ORDER BY ordinal ASC"
+        ),
+    );
+    let rows = owed.as_array().expect("the query answers rows");
+    let kinds: Vec<(&str, &str)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row["kind"].as_str().unwrap_or_default(),
+                row["event"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [("callback", "settled"), ("trace_sink", "settled")],
+        "the resume journals the webhook it owes, then the export: {owed:#}"
+    );
+    let decoded = |row: &Value| -> Value {
+        serde_json::from_str(row["body"].as_str().expect("a journaled body is text"))
+            .expect("a journaled body is JSON")
+    };
+
+    let webhook = decoded(&rows[0]);
+    assert_eq!(webhook["execution_id"], execution, "{webhook:#}");
+    assert_eq!(webhook["status"], "completed", "{webhook:#}");
+    assert_eq!(
+        webhook["outputs"],
+        json!({ "greeting": "hello" }),
+        "{webhook:#}"
+    );
+    assert!(webhook.get("error").is_none(), "{webhook:#}");
+    assert_eq!(
+        webhook["finally_error"],
+        said.as_str(),
+        "the webhook a resume owes says the cleanup failed: {webhook:#}"
+    );
+
+    let envelope = decoded(&rows[1]);
+    assert_eq!(envelope["status"], "completed", "{envelope:#}");
+    assert_eq!(
+        envelope["finally_error"],
+        said.as_str(),
+        "the export a resume journals says the cleanup failed: {envelope:#}"
+    );
+    assert_tidy_entry_failed(&envelope["entries"]);
+
+    // …and that export is what the collector is sent, by the command itself.
+    let shipped = collector.wait_for_event("settled", 2, PATIENCE);
+    assert_eq!(
+        shipped[1].body["finally_error"],
+        said.as_str(),
+        "{:#}",
+        shipped[1].body
+    );
+
+    let row = harness::journal_rows(
+        &project,
+        &format!("SELECT status, error, finally_error FROM executions WHERE id = '{execution}'"),
+    );
+    assert_eq!(
+        row,
+        json!([{ "status": "completed", "error": null, "finally_error": said }]),
+    );
+}
