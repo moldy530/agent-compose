@@ -149,7 +149,7 @@ execution and every open child execution it started: `202` when the request is
 recorded, `409` naming the status for an execution that has already ended,
 `404` for an id the app does not know. The execution then settles `cancelled`,
 and a `callback:` subscriber is told so by the `settled` webhook, whose body's
-`status` is `cancelled` and carries no `error`. `agent-compose cancel` sends it
+`status` is `cancelled` and carries no `error`. `agent-compose cancel <path> <execution>` sends it
 (`agent-compose docs cli`).
 
 ## Authenticating an `http` trigger
