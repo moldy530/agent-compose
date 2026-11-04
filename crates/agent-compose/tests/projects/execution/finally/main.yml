@@ -11,6 +11,10 @@
 #   * `flow.ended` — a subprocess that exits with the code it is given, so one
 #     flow ends `completed` or `failed` on its input alone, and its finally node
 #     records which.
+#   * `flow.unasked` — a finally node whose `input:` reads `execution.error`
+#     without `has()`, on a body that completed: the read fails, and that is
+#     the finally node's own failure — `finally_error`, the run still
+#     `completed` — not the execution's.
 #   * `flow.skipped` and `flow.retired` — a body node that fails under
 #     `on_error: skip` and under `on_error: { fallback: end }`. Both absorb the
 #     failure, so both instances completed (D97), and the finally node says so
@@ -178,6 +182,27 @@ flow.ended:
     - { from: start, to: work }
     - { from: work, to: end }
   finally: record
+
+# `execution.error` read without `has()`: absent on a body that completed, and
+# the node's input cannot be built — which is the finally node's own failure,
+# not the execution's (grammar §4.1, §7.9).
+flow.unasked:
+  description: A finally node that reads execution.error without asking whether it is there.
+  outputs: {}
+  nodes:
+    unasked_work:
+      exec:
+        command: "${OPS_BIN}/true"
+    unasked_end:
+      exec:
+        command: "${TALLY_BIN}/ended"
+      input:
+        outcome: "execution.outcome"
+        error: "execution.error"
+  edges:
+    - { from: start, to: unasked_work }
+    - { from: unasked_work, to: end }
+  finally: unasked_end
 
 flow.skipped:
   description: A body node whose failure `skip` absorbs.
