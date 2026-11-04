@@ -2378,7 +2378,15 @@ ended it: the deadline stops the instance, the node waits for it to end — its
 finally node run, under that node's own policy — and only then fails, so the
 parent's finally node still runs after it. An instance the node had not yet
 begun when its deadline ran out, such as a `map` item still waiting for a
-permit, is never begun, and has no end to run anything at. A **child execution** — what a detached `flow.*` dispatch starts (§8.6
+permit, is never begun, and has no end to run anything at. And it holds when a
+**sibling's failure** is what ended it: a body node that fails ends its instance
+while another branch may still be running a `flow:` node's, a `map` item's or a
+flow-as-tool call's instance, and the failure ends that instance too — it is
+stopped, ends `failed` with an `execution.error` saying the instance around it
+failed and how, and runs its own finally node before the instance around it
+runs its. One that was holding a pause is let go of instead, with its pause
+abandoned — not an end, below — and runs none. Nothing new begins inside an
+instance that is ending, except under its own finally node. A **child execution** — what a detached `flow.*` dispatch starts (§8.6
 rule 7) — is an execution of its own, and its root instance runs its own finally
 node when it ends.
 
@@ -2411,7 +2419,14 @@ its own trace entry, the instance's last, carries no `routing`
 (`docs/durability.md` §3.10): a restart that finds the body settled and the
 boundary recorded replays the body, reads the recorded outcome, and runs the
 finally node once — its own effects journaled like any node's, so what landed
-before the crash is replayed rather than applied again.
+before the crash is replayed rather than applied again. The recorded end is the
+instance's end: a replayed body that reaches another — a `timeout:` that ended a
+`retry:` ladder in the first generation leaves the next the time for an attempt
+the first never made — runs the finally node at the recorded outcome and ends
+there, `failed` though its replay completed. The one end a record cannot stand
+for is a completion the replay failed to reach: what a completed instance
+answers is its body's outputs, which no record holds, so that is a replay
+divergence (`docs/durability.md` §7).
 
 ---
 
@@ -11900,14 +11915,31 @@ its entry, consulting the journal per effect, so the body of an instance that
 ended replays to the same end. What the finally node reads, though, is the
 *outcome*, and a resumed generation could reach a different one — a `timeout:`
 that ended a `retry:` ladder runs against the new generation's clock
-(`docs/durability.md` §5). So the end is recorded before the node runs — a
-`finally` record at the node's own site, keyed and claimed through the effect
-seam — and a replay that reaches the end again is handed the recorded outcome,
-and diverges (q29) if its own disagrees, rather than running the finally node a
-second time under another story. The node's own effects are ordinary journaled
-effects, which is what makes "runs once" hold across a restart in either window:
-killed before its effect landed, a resume issues it live, once; killed after, a
-resume replays it. The lifecycle row's `finallyError` is a nullable column, added
+(`docs/durability.md` §5), and an attempt the first generation's deadline never
+let it make is made now. So the end is recorded before the node runs — a
+`finally` record at the node's own site, keyed by the node and claimed through
+the effect seam — and the **record is the end**: a replay that reaches it again
+is handed the recorded outcome and error, runs the finally node at them, and
+the instance settles on them, whatever end the replay itself reached. That is
+the ruling's "a restart that finds the body settled and `finally` begun runs
+`finally` alone, once" read literally: the body settled in the generation that
+recorded the boundary, and what that generation's end was is not re-decided by
+the next. Comparing the replay's end against the record instead — and
+diverging where they differ — would wedge exactly the execution the clock above
+describes: every resume reaches the same other end, so every resume diverges,
+and the finally node never finishes. That the instance also **settles** on the
+recorded end — a run whose replay completed closes `failed`, as the record
+says — rather than only running its finally node there is a reading of the
+ruling the owner may wish to confirm; the alternative would hand a caller an
+answer the finally node was told the instance never produced. The record cannot
+stand for one end only: a
+completion the replay did not reach, because a completed instance answers its
+body's outputs and no record holds them; that one is a divergence (q29), raised
+before the node runs, and nothing but nondeterminism the journal does not hold
+— a jittered backoff against a deadline — can produce it. The node's own
+effects are ordinary journaled effects, which is what makes "runs once" hold
+across a restart in either window: killed before its effect landed, a resume
+issues it live, once; killed after, a resume replays it. The lifecycle row's `finallyError` is a nullable column, added
 by a probe on all three journal backends (`docs/durability.md` §11.2).
 
 **Innermost first, against a deadline too.** A `timeout:` is raced (§9.2), so a
@@ -11918,6 +11950,16 @@ instance above had ended and run its own, and under `run` after the row had
 closed: out of order and off the record. So the node waits for every instance it
 began to end before it settles, and one it had not yet begun — a `map` item
 still queued for a permit — is never begun, and has no end to run anything at.
+A sibling's failure is the same race from the other side: LangGraph stops
+waiting for a superstep's other tasks the moment one fails, so the instance
+whose body failed has ended while a sibling branch's subflow instance is still
+running. The ruling's "innermost first when a cancel or failure ends several at
+once" makes that instance one of the several, so the instance that ended stops
+it — the stop a deadline pulls — and waits for it, its finally node run, before
+running its own; it reads `failed`, and an `execution.error` naming the instance
+around it and that instance's failure, which is how it ended. Waiting for it to
+finish on its own instead would hold a failed run open for as long as the
+slowest sibling cared to run, for an answer nothing would read.
 The wait is the stopped instances' finally nodes and nothing else, bounded by
 their own §9.3 budgets. It does not put the stopped instance's trace on a `flow:`
 node's entry, whose `inner` `docs/trace.md` §3 keeps absent on that path:

@@ -16,11 +16,15 @@
 //   * its entry is the instance's last, one step past the body's, with no
 //     `routing`;
 //   * the boundary is on the record at the node's own site, claimed under the
-//     outcome, holding the outcome;
+//     node's id, holding the outcome;
 //   * a later generation that reaches the same end is handed the recorded one
 //     and runs the node again only past its record — and one that reaches a
-//     **different** end is a `ReplayDivergence` naming the boundary, rather than
-//     a finally node run a second time under another story;
+//     **different** end is handed the recorded one too, and answers it as the
+//     end the instance settles on: the record is the end, not a story the
+//     replay is compared against (`docs/durability.md` §3.10);
+//   * the one end a record cannot stand for — a completion the replay failed to
+//     reach, whose answer is on no record — is a `ReplayDivergence` naming the
+//     boundary, raised before the node runs;
 //   * a `cancelled` instance whose finally node fails stays `cancelled`: the
 //     failure is the execution's `finally_error` and the node's own entry.
 //
@@ -125,7 +129,7 @@ try {
   const boundary = await handle.lookup(execution, "note/0#finally/0");
   results.the_boundary_records_the_cancellation =
     boundary?.kind === "finally" &&
-    boundary?.request === journal.canonical({ node: "note", outcome: "cancelled" }) &&
+    boundary?.request === journal.canonical({ node: "note" }) &&
     boundary?.outcome?.kind === "value" &&
     boundary?.outcome?.value?.outcome === "cancelled" &&
     boundary?.outcome?.value?.error === undefined;
@@ -148,24 +152,51 @@ try {
     replayed?.entry?.outcome === "completed" && again[0]?.built?.outcome === "cancelled";
 
   // 3. **Another end, replayed.** The record says `cancelled` and this
-  //    generation's body ended `completed`: a divergence at the boundary, and
-  //    the node never ran under the second story.
+  //    generation's body ended `completed` — the shape a deadline leaves, which
+  //    ends a body in one generation and not in the next. The record is the
+  //    end: the node reads `cancelled`, and the seam answers it as the end the
+  //    instance settles on.
   journal.openSession(execution, handle, true);
+  const overruled = [];
+  const settledOn = await runtime.endInstance(
+    observed(descriptor, overruled),
+    ended(execution, 1),
+    { outcome: "completed" },
+    body,
+  );
+  journal.closeSession(execution);
+  results.another_end_over_a_recorded_cancellation_settles_on_the_record =
+    settledOn?.ending?.outcome === "cancelled" &&
+    settledOn?.entry?.outcome === "completed" &&
+    overruled.length === 1 &&
+    overruled[0].built?.outcome === "cancelled";
+  runtime.closeExecution(execution);
+
+  // 3b. **A completion the replay did not reach.** Recorded `completed`, and
+  //     this generation's body failed: what a completed instance answers is its
+  //     body's outputs, which no record holds, so the record cannot be settled
+  //     on — a divergence at the boundary, and the node never runs.
+  const completed = freshExecution();
+  journal.openSession(completed, handle, false);
+  await runtime.endInstance(observed(descriptor, []), ended(completed, 1), { outcome: "completed" }, body);
+  journal.closeSession(completed);
+  journal.openSession(completed, handle, true);
   const diverged = [];
   const divergence = await raised(() =>
     runtime.endInstance(
       observed(descriptor, diverged),
-      ended(execution, 1),
-      { outcome: "completed" },
+      ended(completed, 1),
+      { outcome: "failed", error: "NodeFailure: flow.condense node `reduce` failed: late" },
       body,
     ),
   );
-  journal.closeSession(execution);
-  results.another_end_over_a_recorded_cancellation_diverges =
+  journal.closeSession(completed);
+  results.a_failure_over_a_recorded_completion_diverges =
     divergence?.name === "ReplayDivergence" &&
     divergence.message.includes("note/0#finally/0") &&
+    divergence.message.includes("replayed to failed") &&
     diverged.length === 0;
-  runtime.closeExecution(execution);
+  runtime.closeExecution(completed);
 
   // 4. **A cancelled instance whose finally node failed** stays cancelled: the
   //    failure is the node's entry and the execution's `finally_error`, and the

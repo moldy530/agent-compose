@@ -248,7 +248,10 @@ their own flow's finally node when they end, so a subflow's finally node runs
 before the node that instantiated it settles, and the caller's runs at the
 caller's end. That includes a `flow:` node or a `map` whose own `timeout:` ran
 out: the deadline stops the instance, and the node fails only once the
-instance's finally node has run. A detached `flow.*` dispatch is a child
+instance's finally node has run. It includes a body node that fails while
+another branch is still running a subflow instance: the failure ends that
+instance too — it is stopped, its finally node reads `failed`, and it runs
+before the caller's. A detached `flow.*` dispatch is a child
 execution, and runs its own. A body that ended through `on_error: skip` or a `fallback:` to `end`
 **completed**, and its finally node reads `completed`.
 
@@ -268,7 +271,10 @@ and the trace envelope), and a `run` prints it on one stderr line.
 **A restart runs it once.** The end of the instance is journaled before the
 finally node starts, and its own effects are journaled like any node's: a
 process killed in the middle of it resumes, replays the body, and runs it again
-only up to what it had not done yet.
+only up to what it had not done yet. The journaled end is the end: a resumed
+run whose replayed body gets further than the first generation's — a deadline
+that ended it then has time to spare now — still reads, and ends on, the
+outcome that was recorded.
 
 `execution.outcome` and `execution.error` anywhere but inside the finally node —
 an edge guard, another node's `input:`, a store key — are a compile error

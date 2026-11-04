@@ -52,6 +52,21 @@
 #     §9.3 level 1) reaching the finally node of the instance it starts: its
 #     `retry:` re-runs a failing finally node, and its `timeout:` bounds one
 #     that sleeps.
+#   * `flow.fanned` — a finally node that is a `map`: every item's own binding
+#     reads `execution.outcome` and `execution.error`, as the map's own
+#     configuration does.
+#   * `flow.raced` — a body node that fails while two sibling branches are each
+#     running a `flow.lingering` instance, one a `flow:` node's and one a `map`
+#     item's. The failure ends all three: each running instance is stopped and
+#     runs its own finally node, reading `failed`, before `flow.raced`'s runs.
+#     `flow.raced_ask` is the same race against a `flow.asking` instance that is
+#     waiting on a person: its pause is abandoned, which is not an end, so only
+#     `flow.raced_ask`'s own finally node runs.
+#   * `flow.redone` — a body node whose `timeout:` ends its `retry:` ladder in
+#     one generation, and whose replay in the next completes: the attempt the
+#     deadline never let it make is made then. Its finally node marks the run
+#     and lingers, so a test kills it there; the resumed run reads the end the
+#     boundary records and ends on it.
 version: "0.1"
 
 defaults:
@@ -713,6 +728,184 @@ flow.napping:
     - { from: start, to: work }
     - { from: work, to: end }
   finally: nap
+
+flow.fanned:
+  description: A body that ends on its input, and a finally node that is a map whose items read how the instance ended.
+  inputs:
+    code:
+      type: integer
+    names:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs: {}
+  nodes:
+    work:
+      exec:
+        command: "${OPS_BIN}/sh"
+        args: ["-c", "exit $CODE"]
+      input:
+        code: "input.code"
+    fan:
+      map:
+        over: input.names
+        as: name
+        node: flow.item
+        max_concurrency: 1
+        input:
+          name: "name + ':' + execution.outcome + ':' + (has(execution.error) ? 'error' : 'none')"
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: fan
+
+flow.raced:
+  description: A body node that fails while a sibling flow node's instance and a sibling map item are still running.
+  inputs:
+    names:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs: {}
+  nodes:
+    # Half a second, so both siblings have begun their instances when it fails.
+    doomed:
+      exec:
+        command: "${OPS_BIN}/sh"
+        args: ["-c", "sleep 0.5; exit 1"]
+    step:
+      flow: flow.lingering
+      input:
+        name: "'inner'"
+    fan:
+      map:
+        over: input.names
+        as: name
+        node: flow.lingering
+        max_concurrency: 1
+        input:
+          name: "name"
+    raced_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "'outer:' + execution.outcome"
+  edges:
+    - { from: start, to: doomed }
+    - { from: start, to: step }
+    - { from: start, to: fan }
+    - { from: doomed, to: end }
+    - { from: step, to: end }
+    - { from: fan, to: end }
+  finally: raced_end
+
+flow.raced_ask:
+  description: A body node that fails while a sibling's subflow instance is waiting on a person.
+  outputs: {}
+  nodes:
+    # A second, so the sibling's pause is on the board when it fails.
+    doomed:
+      exec:
+        command: "${OPS_BIN}/sh"
+        args: ["-c", "sleep 1; exit 1"]
+    step:
+      flow: flow.asking
+    asked_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "'outer:' + execution.outcome"
+  edges:
+    - { from: start, to: doomed }
+    - { from: start, to: step }
+    - { from: doomed, to: end }
+    - { from: step, to: end }
+  finally: asked_end
+
+flow.lingering:
+  description: An instance that outlasts its sibling's failure, and records how it ended.
+  inputs:
+    name:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    linger_work:
+      exec:
+        command: "${OPS_BIN}/sleep"
+        args: ["5"]
+    linger_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "input.name + ':' + execution.outcome"
+  edges:
+    - { from: start, to: linger_work }
+    - { from: linger_work, to: end }
+  finally: linger_end
+
+flow.redone:
+  description: A retry ladder a deadline ends in one generation and not the next, and a finally node that marks the run and lingers.
+  inputs:
+    mark:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    # Slow until the mark exists, then done at once: the three-second budget
+    # runs out inside the first attempt, before the ladder's second — and a
+    # resumed generation, with the mark in place and a clock of its own, has
+    # time to spare for whichever attempt its record leaves it to make live.
+    work:
+      exec:
+        command: "${OPS_BIN}/sh"
+        args: ["-c", "[ -f \"$MARK\" ] && exit 0; sleep 5; exit 1"]
+      input:
+        mark: "input.mark"
+      retry: { max: 1, backoff: 100ms }
+      timeout: 3s
+    cleanup:
+      flow: flow.redoing
+      input:
+        outcome: "execution.outcome"
+        error: "has(execution.error) ? execution.error : 'none'"
+        mark: "input.mark"
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: cleanup
+
+flow.redoing:
+  description: What `flow.redone` does once it has ended — logs how, leaves the mark, and lingers.
+  inputs:
+    outcome:
+      type: string
+    error:
+      type: string
+    mark:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    mark_it:
+      exec:
+        command: "${OPS_BIN}/sh"
+        args: ["-c", "printf '%s|%s\\n' \"$OUTCOME\" \"$ERROR\" >> \"$TALLY_LOG\"; : > \"$MARK\""]
+      input:
+        outcome: "input.outcome"
+        error: "input.error"
+        mark: "input.mark"
+    linger:
+      exec:
+        command: "${OPS_BIN}/sleep"
+        args: ["3"]
+  edges:
+    - { from: start, to: mark_it }
+    - { from: mark_it, to: linger }
+    - { from: linger, to: end }
 
 triggers:
   cli: { type: manual, flow: flow.ended }

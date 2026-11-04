@@ -1166,24 +1166,40 @@ finally node.
   `cleanup`, `sub/0/cleanup/0#finally/0` inside a `flow:` node `sub`. A `retry:`
   that re-runs a `flow:` node's whole instance ends it again at the same site,
   and the next ordinal records that end (§4).
-* **Its identity** is the finally node's id and the instance's **outcome**:
-  `completed`, `failed`, or `cancelled` — the last of which nothing produces until
-  PRD resolved q75's cancel exists.
-* **Its outcome** is a value: the outcome again and, on a `failed` instance, the
-  body's error in `docs/trace.md` §3's shape — what the finally node reads as
-  `execution.outcome` and `execution.error`.
+* **Its identity** is the finally node's id, alone. The outcome is not part of
+  it, because the outcome is what the record **answers** rather than something
+  a replay is compared against (below).
+* **Its outcome** is a value: how the instance ended — `completed`, `failed`, or
+  `cancelled`, the last of which nothing produces until PRD resolved q75's
+  cancel exists — and, on an instance that did not complete, the body's error in
+  `docs/trace.md` §3's shape: what the finally node reads as `execution.outcome`
+  and `execution.error`.
 
 What a resumed generation does with it is §5's rule applied: the body replays —
 every effect answered out of the journal — and reaches the end again; the claim
-**finds** the record, compares the outcome this replay reached with the one
-recorded, and hands the finally node the **recorded** outcome and error. So a
-restart that finds the body settled and the boundary down runs the finally node
-alone, once: its own effects are ordinary records at its site (§3.1–§3.9), so an
-effect that landed before the crash is replayed rather than re-applied, and one
-that had not is issued live — the frontier, exactly as anywhere else. A replayed
-body that ended with a **different** outcome is the first divergence of §7 —
-the record says the instance failed and this run says it completed — and the
-finally node does not run on a story the record does not tell.
+**finds** the record and hands the finally node the **recorded** outcome and
+error. So a restart that finds the body settled and the boundary down runs the
+finally node alone, once: its own effects are ordinary records at its site
+(§3.1–§3.9), so an effect that landed before the crash is replayed rather than
+re-applied, and one that had not is issued live — the frontier, exactly as
+anywhere else.
+
+**The record is the end.** A replayed body can reach a different end than the
+one recorded, because not everything that decides an end is an effect: a
+`timeout:` that ended a `retry:` ladder in the generation that recorded the
+boundary runs against the resumed generation's clock, and the attempt that
+deadline never let it make is made — live, past the frontier — and may succeed.
+The instance still ends where the record says: the finally node reads the
+recorded `failed`, and the instance settles on it — a subflow instance fails its
+node, and an execution's root closes its row `failed` — with a
+`RecordedEnding` error carrying the recorded error. A comparison would make every
+such resume diverge the same way, for ever, and the finally node would never
+finish. The one end a record cannot stand for is a **completion** the replay did
+not reach: what a completed instance answers is its body's outputs, which no
+record holds, so a recorded `completed` under a replay that failed is the first
+divergence of §7, raised before the finally node runs. Only nondeterminism the
+journal does not hold — a jittered backoff that outlasts a deadline it fit
+inside the first time — can produce it, and the next resume draws again.
 
 What is **not** an end records nothing: a `human` pause the run parks at, a
 divergence, and an instance whose pause was abandoned (`docs/grammar.md` §7.9).
