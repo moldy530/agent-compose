@@ -104,6 +104,11 @@ const FINALLY_POLL: Duration = Duration::from_millis(50);
 /// One dispatch this worker is running, as a cancel reaches it.
 #[derive(Default)]
 struct Handle {
+    /// Which of this worker's sessions it was handed under ([`super::Held`]'s
+    /// generation): once a newer one has been joined, the hub has ended the
+    /// session this dispatch belonged to, and with it the dispatch
+    /// ([`Running::orphan`]).
+    generation: u64,
     /// The runner's pid, once it has one; `0` before it is spawned.
     pid: AtomicU32,
     /// Whether the hub has cancelled this dispatch.
@@ -120,8 +125,11 @@ pub(crate) struct Running(Arc<Mutex<HashMap<String, Arc<Handle>>>>);
 
 impl Running {
     /// Put one dispatch on the books, answering its handle.
-    fn hold(&self, id: &str) -> Arc<Handle> {
-        let handle = Arc::new(Handle::default());
+    fn hold(&self, id: &str, generation: u64) -> Arc<Handle> {
+        let handle = Arc::new(Handle {
+            generation,
+            ..Handle::default()
+        });
         self.0
             .lock()
             .expect("the running table is not poisoned")
@@ -143,6 +151,49 @@ impl Running {
             .lock()
             .expect("the running table is not poisoned")
             .contains_key(id)
+    }
+
+    /// Stop every dispatch this worker took under a session **older** than
+    /// `generation` (§5, §6.3, PRD resolved q79).
+    ///
+    /// A `410` is the hub saying it no longer knows the session — it was
+    /// restarted, or its liveness sweep gave up on this worker — and either way
+    /// it has superseded what that session held: a result for one is refused
+    /// `409`, and its effects with it. Left running, such a runner is work
+    /// nothing will read, and — since the new session holds nothing by the
+    /// hub's count — a slot the hub hands new work beside: a worker at
+    /// `max_running: 1` would be running two. So each is stopped the way a
+    /// cancel stops it ([`Running::cancel`]): `SIGTERM`, the grace — held while
+    /// a `finally:` node runs — and the group killed after.
+    pub(crate) fn orphan(&self, generation: u64) {
+        let older: Vec<String> = self
+            .0
+            .lock()
+            .expect("the running table is not poisoned")
+            .iter()
+            .filter(|(_, handle)| handle.generation < generation)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in older {
+            self.cancel(&id);
+        }
+    }
+
+    /// Wait until nothing taken under a session older than `generation` is
+    /// still running here: the slot a dispatch handed to the new session takes
+    /// is one the hub counted free, and it is free once the old session's
+    /// runners have stopped ([`Running::orphan`]) — not before.
+    fn drained_before(&self, generation: u64) {
+        let older = || {
+            self.0
+                .lock()
+                .expect("the running table is not poisoned")
+                .values()
+                .any(|handle| handle.generation < generation)
+        };
+        while older() {
+            std::thread::sleep(FINALLY_POLL);
+        }
     }
 
     /// Act on the hub's cancel of `id` (§3.2): mark it, send its runner
@@ -192,8 +243,8 @@ impl Running {
 #[cfg(unix)]
 fn terminate(pid: u32) {
     if let Ok(pid) = libc::pid_t::try_from(pid) {
-        // SAFETY: a pid this worker spawned and has not reaped — the handle
-        // leaves the table before the runner is waited on.
+        // SAFETY: a pid this worker spawned and has not reaped — the handle's
+        // pid is cleared the moment the runner is waited on.
         unsafe { libc::kill(pid, libc::SIGTERM) };
     }
 }
@@ -244,6 +295,16 @@ impl From<Stop> for Unsent {
 /// and equally over (§3.4) — or left with the hub after a result it would not
 /// take ([`settle`]). `Err(Stop)` is the worker itself winding down, and nothing
 /// else.
+///
+/// `generation` is the session the poll that handed it over was made under. A
+/// dispatch handed to a session this worker joined while runners of an older
+/// one are still stopping waits for them before its own runner starts
+/// ([`Running::drained_before`]) — a wait inside the node's `timeout:` chain,
+/// which runs from dispatch (§6.5).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one dispatch's whole context, passed through once"
+)]
 pub(crate) fn execute(
     hub: &Hub,
     sessions: &Sessions,
@@ -252,13 +313,15 @@ pub(crate) fn execute(
     runner: &str,
     dispatch: &Value,
     running: &Running,
+    generation: u64,
 ) -> Result<(), Stop> {
     let id = dispatch
         .get("dispatch_id")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let handle = running.hold(&id);
+    let handle = running.hold(&id, generation);
+    running.drained_before(generation);
     let ended = execute_held(hub, sessions, tree, bun, runner, dispatch, &id, &handle);
     running.release(&id);
     ended
@@ -401,6 +464,12 @@ fn execute_held(
         let _ = child.kill();
     }
     let status = child.wait();
+    // Reaped, so its pid is no longer this worker's to signal: off the handle
+    // a cancel reads — a dispatch stays on the books while its result is
+    // posted, and an orphaned session's stop ([`Running::orphan`]) can reach
+    // it then — and off the books a stop signal reads.
+    handle.pid.store(0, Ordering::SeqCst);
+    super::stop::ended(child.id());
     if let Some(stop) = abandoned {
         // The worker itself is winding down — a redeployment, a refusal — so the
         // dispatch is not settled here: the hub ended it, or is about to.
@@ -491,7 +560,9 @@ fn spawn(bun: &Path, tree: &Path, runner: &str, dispatch: &Value) -> Result<Chil
     // commands an `exec:` node spawned are in groups of their own, which the
     // runner stops itself as the cancel reaches them — `SIGTERM`, then `SIGKILL`
     // two seconds later, well inside this worker's grace — and kills on its way
-    // out if it exits first (`src/runtime.ts`'s `stopExecGroup`).
+    // out if it exits first (`src/runtime.ts`'s `stopExecGroup`). A group the
+    // terminal no longer reaches, so a stop signal to this worker is delivered
+    // to it by the worker ([`super::stop`]).
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -504,6 +575,10 @@ fn spawn(bun: &Path, tree: &Path, runner: &str, dispatch: &Value) -> Result<Chil
             tree.display()
         )
     })?;
+    // On the books a stop signal to this worker reads: a group of its own is
+    // one the terminal's `Ctrl-C` no longer reaches, so the worker delivers it
+    // ([`super::stop`]).
+    super::stop::started(child.id());
     let mut stdin = child.stdin.take().expect("stdin is piped");
     let payload = serde_json::to_vec(dispatch).unwrap_or_else(|_| b"{}".to_vec());
     let written = stdin.write_all(&payload).and_then(|()| stdin.flush());
@@ -513,6 +588,7 @@ fn spawn(bun: &Path, tree: &Path, runner: &str, dispatch: &Value) -> Result<Chil
     if let Err(error) = written {
         let _ = child.kill();
         let _ = child.wait();
+        super::stop::ended(child.id());
         return Err(format!(
             "cannot hand the dispatch to the node runner: {error}"
         ));

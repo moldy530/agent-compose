@@ -189,6 +189,7 @@ import { mountWorkerRoutes, placementWaits, watchPlacementWaits } from "./mesh.t
 import { drainStores, sweepBoundStores } from "./stores.ts";
 import {
   cancelExecution,
+  cancelFired,
   deliverHumanAnswer,
   deliveriesOf,
   endedByCancel,
@@ -585,8 +586,22 @@ export function createApp(): FastifyInstance {
     // (`runtime.cancelExecution`, `docs/durability.md` §6.1). A second cancel
     // of an execution already cancelling is the same request again, and
     // answered the same way.
+    //
+    // Marked before the await, so an answer arriving while the request is
+    // being written is refused — and **unmarked if it fails**: a journal that
+    // would not take the request leaves nothing recorded and nothing fired,
+    // the execution running at its waits, and a mark left standing would
+    // refuse every answer to them for the life of the process. Kept where the
+    // cancel did fire before the failure — a cascade that could not finish —
+    // since its waits are released by then.
+    const was = execution.cancelling;
     execution.cancelling = true;
-    await cancelExecution(id);
+    try {
+      await cancelExecution(id);
+    } catch (error) {
+      if (!cancelFired(id)) execution.cancelling = was;
+      throw error;
+    }
     return reply.code(202).send({
       execution_id: id,
       status: statusOf(execution),

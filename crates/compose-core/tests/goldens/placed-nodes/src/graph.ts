@@ -34,6 +34,7 @@ import {
   flowAttestedInputs,
   flowBatchInputs,
   flowClosedInputs,
+  flowClosedNodeNotedOutput,
   flowClosingInputs,
   flowClosingNodeCloseUpOutput,
   flowClosingNodeLookLongOutput,
@@ -134,6 +135,14 @@ const flowClosedShape: runtime.Shape = {
 const flowClosedNodeCloseShape: runtime.Shape = {
   "properties": {
     "signature": "string"
+  }
+};
+
+/** `flow.closed` node `noted` — the `noted.output` root its guards read. */
+const flowClosedNodeNotedShape: runtime.Shape = {
+  "properties": {
+    "exit_code": "int",
+    "stdout": "string"
   }
 };
 
@@ -1127,6 +1136,38 @@ const flowClosedNodeClose: runtime.NodeDescriptor = {
   ],
 };
 
+/** `flow.closed` node `noted` — an inline subprocess (grammar 8.2). */
+const flowClosedNodeNoted: runtime.NodeDescriptor = {
+  flow: "flow.closed",
+  node: "noted",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from `defaults:`, `on_error` from no level, as a `finally:` node's failure is `finally_error` (Decision D159).
+  policy: {
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowClosedShape, state: stateShape, output: flowClosedNodeNotedShape },
+  input: () => ({}),
+  run: async (input, context) => ({
+    output: runtime.parseResult(
+      flowClosedNodeNotedOutput,
+      await runtime.runExec({
+        command: [{ env: "OPS_BIN", site: "flow.closed.node.noted.exec.command" }, "/sh"],
+        args: [
+          ["-c"],
+          ["exit 4"],
+        ],
+        env: [],
+        expectExit: [0],
+        decoding: { envelope: ["exit_code", "stdout"], decoded: [], empty: false },
+      }, input, context),
+      "the result of `flow.closed` node `noted`",
+    ),
+  }),
+  writes: [],
+  edges: [
+  ],
+};
+
 /** `flow.closed` — its nodes, its `start` edges, and the compiled graph. */
 function flowClosed() {
   return new StateGraph(State)
@@ -1148,7 +1189,8 @@ const flowClosedGraph = flowClosed();
 const flowClosedBinding: runtime.SubflowBinding = {
   address: "flow.closed",
   outputs: ["signature"],
-  recursionLimit: 26,
+  recursionLimit: 27,
+  finally: flowClosedNodeNoted,
   stream: (initial, options) =>
     flowClosedGraph.stream(initial, {
       ...options,
@@ -2607,7 +2649,8 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
     inputKinds: { "path": "string", },
     outputs: ["signature"],
     sessionStores: [],
-    recursionLimit: 26,
+    recursionLimit: 27,
+    finally: flowClosedNodeNoted,
     parse: (inputs: unknown) =>
       runtime.parseResult(flowClosedInputs, inputs, "the `inputs:` of `flow.closed`") as Record<string, unknown>,
     stream: (initial, options) =>

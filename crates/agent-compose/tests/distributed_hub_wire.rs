@@ -3358,8 +3358,10 @@ fn a_parked_dispatch_goes_to_the_least_loaded_session_and_then_the_oldest_poll()
 /// The cancel is answered `202`; the worker's next poll is a `200` carrying
 /// only the `cancel` list naming the dispatch; until the worker answers, the
 /// dispatch still counts against the session's capacity — a second execution's
-/// item is not handed over — and the cancelled result is `204` and settles the
-/// row `cancelled`, after which the session takes the waiting item.
+/// item is not handed over — and the execution is still running, its cancelled
+/// node waiting on what it began over there; and the cancelled result is `204`
+/// and settles the row `cancelled`, and with it the execution, after which the
+/// session takes the waiting item.
 #[test]
 fn a_cancel_reaches_the_worker_holding_its_dispatch_and_its_result_settles_it() {
     let Some(hub) = hub() else {
@@ -3388,6 +3390,14 @@ fn a_cancel_reaches_the_worker_holding_its_dispatch_and_its_result_settles_it() 
         204,
         "a cancelled dispatch stopped counting before its result arrived: {}",
         body_of(&held)
+    );
+    // …and the execution is still waiting for it: a cancelled node settles
+    // once what it began has ended, and a placed node began it on the worker
+    // (Decision D160).
+    let early = hub.report(&execution);
+    assert_eq!(
+        early["status"], "running",
+        "the execution settled before the worker said its dispatch had stopped: {early:#}"
     );
 
     let settled = hub.send(

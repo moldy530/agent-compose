@@ -193,7 +193,11 @@ the hub supersedes the row, names it in the holder's next poll's `cancel` list,
 and counts it until the worker's result for it arrives, which is refused `409`
 (§3.4) and frees the slot. The hub giving up on a dispatch is not the worker
 stopping it, and a slot freed at once would be handed new work while the old
-process still ran. There is **no** hub option, environment variable or join field
+process still ran. The one slot the hub cannot keep is a **lost session's** —
+the session the rows were held under is one it no longer knows (§5, §6.3) — so
+the worker keeps it: a worker whose session a `410` ended stops the runners
+still running under it as a cancel stops them, and starts nothing the new
+session is handed until they have. There is **no** hub option, environment variable or join field
 for the number: it is a property of the machine a placement names — what the
 machine with the GPU can run at once — so it is the deploy layer's, beside the
 members it is about, and a worker does not declare its own. This replaces v1's
@@ -690,7 +694,14 @@ and nothing else (PRD resolved q75, Decision D160): the worker's statement
 that it stopped the work the hub named in a poll's `cancel` list (§3.2). It
 **settles** the dispatch — the `204` row — and it is what takes the dispatch off
 its session's capacity (§2): until it arrives the process is still stopping, so
-the dispatch still counts. The hub journals it as the dispatch's settled outcome
+the dispatch still counts. It is also what **settles the node**: a cancelled
+node settles once every instance it began has ended (grammar §7.9, Decision
+D160), and a placed node began its instances on the worker — an attached
+`flow.*`, whose finally node the cancel starts there — so the hub's node waits
+for this result, and so does every instance around it. The inner finally node
+therefore runs before an outer one, and the `finally_error` the result carries
+is the execution's before it settles. A session the hub loses first ends the
+wait (§6.3); the worker's grace bounds it otherwise. The hub journals it as the dispatch's settled outcome
 with the error name `ExecutionCancelled`, which is how a restarted hub's replay
 reads it back as the cancel it was rather than as a failure
 (`docs/durability.md` §6.1). A cancelled result for a dispatch the hub did **not**
@@ -1989,7 +2000,14 @@ sends `SIGTERM` and then kills with its process group five seconds later, a
 grace held while the runner reports a `finally:` node running (§3.2, §3.4) —
 §2's backoff for transport failures, and the status discipline
 of §3 and §5. It executes each dispatch by spawning the node runner the
-artifact carries, one process per dispatch, each in a process group of its own. Its
+artifact carries, one process per dispatch, each in a process group of its own —
+one a terminal's `Ctrl-C` no longer reaches, so a `SIGINT`, `SIGTERM` or
+`SIGHUP` to the worker is handed to every runner's group as `SIGINT`, what is
+left of each killed two seconds later, and the worker then ends by the signal it
+was sent. A `410` that ends its session ends what that session held (§6.3): the
+runners still running under it are stopped as a cancel stops them, and a
+dispatch the new session is handed waits for them before its runner starts, so
+the slot the hub counts free is one no old process still holds (§2). Its
 store is the artifact in hand and the one it replaced, keyed by hash as §4 step 3
 says: a hub rolled back to the older of the two is answered off the disk, and no
 third tree accumulates.

@@ -1386,36 +1386,76 @@ export async function cancelExecution(execution: string): Promise<void> {
 async function cascadeCancel(journal: Journal, execution: string): Promise<void> {
   const open = await journal.openExecutions();
   const opened = new Set(open.map((row) => row.id));
-  // Each row's parent, read once: the open rows' off the walk above, a settled
+  // Each row's lineage, read once: the open rows' off the walk above, a settled
   // ancestor's off its own row the first time a lineage reaches it.
-  const parents = new Map<string, string | undefined>(
-    open.map((row) => [row.id, row.lineage?.parent]),
-  );
-  const parentOf = async (id: string): Promise<string | undefined> => {
-    if (parents.has(id)) return parents.get(id);
-    const parent = (await journal.execution(id))?.lineage?.parent;
-    parents.set(id, parent);
-    return parent;
+  const lineages = new Map<string, Lineage | undefined>(open.map((row) => [row.id, row.lineage]));
+  const lineageOf = async (id: string): Promise<Lineage | undefined> => {
+    if (lineages.has(id)) return lineages.get(id);
+    const lineage = (await journal.execution(id))?.lineage;
+    lineages.set(id, lineage);
+    return lineage;
   };
   for (const row of open) {
     if (row.id === execution) continue;
-    let ancestor = row.lineage?.parent;
+    // The links from this row up to the nearest open ancestor, each a
+    // dispatch that began the execution below it.
+    const links: Lineage[] = [];
+    let link = row.lineage;
     // Bounded by the lineage's depth; the set is for a journal whose rows name
     // each other in a cycle, which no runtime writes and a walk must still end.
     const passed = new Set<string>();
-    while (
-      ancestor !== undefined &&
-      ancestor !== execution &&
-      !opened.has(ancestor) &&
-      !passed.has(ancestor)
-    ) {
+    while (link !== undefined) {
+      links.push(link);
+      const ancestor = link.parent;
+      if (ancestor === execution || opened.has(ancestor) || passed.has(ancestor)) break;
       passed.add(ancestor);
-      ancestor = await parentOf(ancestor);
+      link = await lineageOf(ancestor);
     }
-    if (ancestor !== execution) continue;
+    if (links[links.length - 1]?.parent !== execution) continue;
     if (row.cancelRequestedAt !== undefined && cancelFired(row.id)) continue;
+    // **Work a finally node began is not the cancel's** (grammar 7.9, Decision
+    // D160): a row any of whose links is a dispatch a finally node issued —
+    // a cleanup run as a detached `flow.*` — runs whole, and so does what it
+    // goes on to begin.
+    let exempt = false;
+    for (const one of links) {
+      if (await begunByFinally(journal, one)) {
+        exempt = true;
+        break;
+      }
+    }
+    if (exempt) continue;
     await cancelExecution(row.id);
   }
+}
+
+/**
+ * Whether the dispatch one lineage link names was issued by a `finally:` node
+ * of the parent — at or under the site of one (grammar 7.9, Decision D160).
+ *
+ * Read off this process's marks while the node, or the delivery it issued,
+ * runs here ([`underRunningFinally`]), and otherwise off the parent's journal:
+ * the link's idempotency key is the dispatch's instance path under the
+ * parent's id (grammar 9.4), and a finally node's start is a `finally` record
+ * at its site (`docs/durability.md` §3.10) — so a prefix of the path holding
+ * one is a finally node the dispatch lies under, whichever generation issued
+ * it. That is what a recovered cancel's cascade reads: the marks of the
+ * process that began the child died with it.
+ */
+async function begunByFinally(journal: Journal, link: Lineage): Promise<boolean> {
+  const prefix = `${link.parent}/`;
+  if (!link.idempotencyKey.startsWith(prefix)) return false;
+  const path = link.idempotencyKey.slice(prefix.length);
+  if (underRunningFinally(link.parent, path)) return true;
+  const frames = path.split("/");
+  // A finally site is `<instance path>/<node id>/0`: two frames at least.
+  for (let length = 2; length <= frames.length; length += 1) {
+    const site = frames.slice(0, length).join("/");
+    if ((await journal.lookup(link.parent, effectKey(site, "finally", 0))) !== undefined) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -11658,6 +11698,28 @@ function instanceBegun(
 }
 
 /**
+ * Put a **placed node a cancel reached on its worker** on the books, until
+ * `ending` settles — the worker's cancelled result came home, or the hub lost
+ * the session holding it (`docs/distributed.md` §3.2, §3.4, §6.3; PRD resolved
+ * q75, Decision D160).
+ *
+ * What a placed node begins it begins on the worker — an attached `flow.*`
+ * instance and its `finally:` node run in the runner — so none of it is on
+ * this process's books, and without this entry a cancelled node would settle
+ * the moment it stopped waiting, while those instances were still ending: the
+ * instance around it would run its own finally node first, breaking
+ * innermost-first, and the execution would settle before the result carrying
+ * the inner finally node's `finally_error` arrived. Held at the node's own
+ * site, so the node's own cancel waits for it like any instance it began
+ * ([`runActivity`]), and so does every end around it ([`endInstancesInside`]).
+ * Its stop is pulled by nothing that matters: the worker has already been told
+ * to stop, and its grace is the bound (§3.2).
+ */
+export function holdRemoteEnd(execution: string, site: string, ending: Promise<unknown>): void {
+  instanceBegun(execution, site, ending, new AbortController(), deliveryAround(execution, site));
+}
+
+/**
  * Whether any instance at or under `site` is still running — the synchronous
  * half of [`instancesEnded`], so a node that began none settles on the turn it
  * always did.
@@ -13894,6 +13956,14 @@ export async function dispatchChild(
     ...(admission === undefined ? {} : { admission: admission.bounds }),
   };
   const id = childExecutionId(lineage.parent, lineage.idempotencyKey);
+  // **A child a finally node begins is how its instance ends**, not work
+  // inside one that has: a cancel stops none of it and nothing it begins
+  // (grammar 7.9, Decision D160) — so on a cancelled parent, where that node
+  // runs *because* of the cancel, the child is begun uncancelled, and the
+  // cascade passes it over ([`begunByFinally`]). Read now, in the dispatch's
+  // own tick: the delivery's site is marked for as long as it runs
+  // ([`runMap`]), so the reading holds for the child's whole life.
+  const fromFinally = underRunningFinally(lineage.parent, site.path.join("/"));
   const supervised = superviseChild(
     id,
     async () => {
@@ -13905,8 +13975,8 @@ export async function dispatchChild(
         // An open child a cancelled parent reaches again — a recovered parent's
         // re-issued dispatch — is cancelled as it resumes, exactly as one it
         // begins below is: the cascade's walk may have missed it (PRD resolved
-        // q75 ruling c).
-        if (cancelFired(lineage.parent) && row.cancelRequestedAt === undefined) {
+        // q75 ruling c). Save a finally node's.
+        if (cancelFired(lineage.parent) && row.cancelRequestedAt === undefined && !fromFinally) {
           await journal.requestCancel(id);
         }
         return childOf(row);
@@ -13939,8 +14009,9 @@ export async function dispatchChild(
       });
       // A parent already cancelled cancels a child it was issuing as the cancel
       // came — one the cascade's walk of the open rows could not have seen
-      // (PRD resolved q75 ruling c).
-      if (cancelFired(lineage.parent)) await journal.requestCancel(id);
+      // (PRD resolved q75 ruling c) — save one its finally node is issuing,
+      // which the cancel is the reason for.
+      if (cancelFired(lineage.parent) && !fromFinally) await journal.requestCancel(id);
       return child;
     },
     admission,

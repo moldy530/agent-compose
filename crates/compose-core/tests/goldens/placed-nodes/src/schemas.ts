@@ -164,6 +164,15 @@ export const flowClosedOutputs = z.object({
 }).strict();
 export type FlowClosedOutputs = z.infer<typeof flowClosedOutputs>;
 
+/**
+ * `flow.closed` node `noted` — what the subprocess produces (grammar 8.2), which it does not declare, so this is the kind default.
+ */
+export const flowClosedNodeNotedOutput = z.object({
+  exit_code: z.number().int(),
+  stdout: z.string(),
+}).strict();
+export type FlowClosedNodeNotedOutput = z.infer<typeof flowClosedNodeNotedOutput>;
+
 /** `flow.closing` — the module's parameters (grammar 7.5). */
 export const flowClosingInputs = z.object({
   path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),

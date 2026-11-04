@@ -40,8 +40,10 @@
 //!   [`a_cancel_stops_every_process_a_forking_command_started`] and
 //!   [`a_command_that_ignores_sigterm_is_killed_once_its_grace_has_passed`];
 //! * a finally node's detached delivery is part of how its instance ends, and
-//!   runs on a cancelled execution —
-//!   [`a_finally_nodes_detached_delivery_runs_on_a_cancelled_execution`];
+//!   runs on a cancelled execution — and so does the child execution a
+//!   detached `flow.*` of it starts —
+//!   [`a_finally_nodes_detached_delivery_runs_on_a_cancelled_execution`] and
+//!   [`a_finally_nodes_detached_child_execution_runs_on_a_cancelled_execution`];
 //! * `agent-compose cancel`'s exit codes —
 //!   [`agent_compose_cancel_exits_by_what_the_app_answered`];
 //! * and `run`'s posture, which a cancel does not change: an interrupted run's
@@ -738,6 +740,80 @@ fn a_finally_nodes_detached_delivery_runs_on_a_cancelled_execution() {
     );
 }
 
+/// **A finally node's detached child execution runs on a cancelled execution**
+/// (grammar 7.9, Decision D160: "a finally node and all it begins"; PRD
+/// resolved q65).
+///
+/// `flow.notifying_child`'s finally node is a detached `map` onto
+/// `flow.pinger`, so what it begins is a child execution with a row of its
+/// own. The cancel stops the command and the finally node runs *because* of it:
+/// the child it issues is begun on a parent whose cancel has fired — and is
+/// still not the cancel's, so it carries no cancel request of its own, runs its
+/// node, records `pinged cancelled`, and settles `completed`. Read as a child
+/// a cancelled parent was issuing as the cancel came, it would be begun
+/// cancelled and its node never run.
+#[test]
+fn a_finally_nodes_detached_child_execution_runs_on_a_cancelled_execution() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("cancel-finally-child");
+    let (environment, log) = environment(&provider, &scratch);
+    let Some(project) = harness::scratch_project("cancel-finally-child") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, FIXTURE, &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let execution = started(
+        &app,
+        "/notifying-child",
+        &json!({ "names": ["ops"], "linger": 600 }),
+    );
+    let running = pids(&log, 1);
+    assert_eq!(cancel(&app, &execution).0, 202);
+    let report = reaches(&app, &execution, "cancelled", SETTLE);
+    assert!(report.get("error").is_none(), "{report:#}");
+    assert!(
+        !alive(running[0]),
+        "the command the cancelled node was running is still alive"
+    );
+
+    // The child's row: begun by the finally node, and run to its own end.
+    let child_rows = || {
+        harness::journal_rows(
+            &project,
+            &format!(
+                "SELECT executions.id AS id, status, \
+                 (SELECT COUNT(*) FROM cancellations WHERE cancellations.execution = executions.id) \
+                 AS cancels FROM executions WHERE id != '{execution}'"
+            ),
+        )
+    };
+    let deadline = Instant::now() + SETTLE;
+    let mut rows = child_rows();
+    while rows[0]["status"] != "completed"
+        && rows[0]["status"] != "cancelled"
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(20));
+        rows = child_rows();
+    }
+    let rows = rows.as_array().cloned().unwrap_or_default();
+    assert_eq!(rows.len(), 1, "one child execution: {rows:#?}");
+    assert_eq!(
+        (rows[0]["status"].clone(), rows[0]["cancels"].clone()),
+        (json!("completed"), json!(0)),
+        "the child the finally node began was cancelled with its parent: {rows:#?}"
+    );
+    let pings = PathBuf::from(format!("{}.pings", log.display()));
+    assert_eq!(
+        std::fs::read_to_string(&pings).unwrap_or_default(),
+        "pinged cancelled\n",
+        "the finally node's child execution did not run its node: {report:#}"
+    );
+}
+
 /// **A restart between a parent's cancel and its child's completes both**
 /// (PRD resolved q75 rulings c and e, `docs/durability.md` §6.1).
 ///
@@ -957,6 +1033,78 @@ fn released_and_refused(app: &Client, execution: &str, resume_url: &str, report:
 /// (`src/serve.ts`'s `CANCELLING_RESUME`).
 const CANCELLING_RESUME: &str = "this execution is being cancelled, so every wait it held has \
                                  been released and nothing is waiting for an answer";
+
+/// **A cancel the journal would not record leaves the execution answerable**
+/// (PRD resolved q75 rulings d and e, `docs/durability.md` §6.1).
+///
+/// `flow.asking` parks at its question, and the journal is then made to refuse
+/// every write to its `cancellations` table — a trigger raising on insert, the
+/// shape a dialled journal's dropped connection takes at the moment the
+/// request arrives. The cancel route answers `500`: nothing was recorded, so
+/// nothing was fired, and the execution is still running at its pause, which
+/// the report still publishes. So an answer to it is **not** refused as one to
+/// an execution being cancelled: it is taken, `202`, and the execution runs on
+/// to its end — `completed`, its finally node reading so.
+#[test]
+fn a_cancel_the_journal_would_not_record_leaves_the_execution_answerable() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("cancel-unrecorded");
+    let (environment, log) = environment(&provider, &scratch);
+    let Some(project) = harness::scratch_project("cancel-unrecorded") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, FIXTURE, &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let execution = started(&app, "/asking", &json!({ "path": "release.dmg" }));
+    let resume_url = parked_at(&app, &execution);
+    let refused = harness::journal_sql(
+        &project,
+        "CREATE TRIGGER refuse_cancellations BEFORE INSERT ON cancellations \
+         BEGIN SELECT RAISE(ABORT, 'the journal is unreachable'); END;",
+    );
+    assert!(
+        refused.status.success(),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    let (status, body) = cancel(&app, &execution);
+    assert_eq!(
+        status, 500,
+        "a cancel the journal refused was answered as accepted: {body:#}"
+    );
+    let still: Value = app
+        .get(&format!("/executions/{execution}"))
+        .expect("the status route answers")
+        .json();
+    assert_eq!(still["status"], "interrupted", "{still:#}");
+    assert!(
+        still["interrupts"]
+            .as_array()
+            .is_some_and(|interrupts| interrupts.len() == 1),
+        "the pause a cancel never fired on is gone from the report: {still:#}"
+    );
+
+    let answered = app
+        .send(Request::post(&resume_url).json(&json!({ "decision": "approve" })))
+        .expect("the resume route answers");
+    assert_eq!(
+        answered.status,
+        202,
+        "an answer to an execution whose cancel was never recorded was refused: {}",
+        answered.text()
+    );
+    let report = reaches(&app, &execution, "completed", Duration::from_secs(30));
+    assert!(report.get("error").is_none(), "{report:#}");
+    assert_eq!(
+        ended(&log),
+        ["completed|none"],
+        "the finally node ran once, at the end the answered run reached"
+    );
+}
 
 /// **A cancel releases a `human` pause** (PRD resolved q75 ruling e: "human and
 /// placement waits are released"; Decision D160's *Waits*).

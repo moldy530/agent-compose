@@ -12918,7 +12918,15 @@ as it runs, and a node at or under that site chains to nothing. A detached
 its own site is marked for as long as the **delivery** runs — not only while
 the node that issued it does, which resolves the dispatch at once (D94) — so on
 a cancelled execution, where the finally node runs *because* of the cancel, the
-delivery and everything its model begins run whole. A cancel that
+delivery and everything its model begins run whole. A detached **`flow.*`**
+dispatch a finally node issues is among it too, though what it starts is a
+child execution of its own: begun on a parent whose cancel has fired, it is
+**not** begun cancelled, and the cascade passes it over — and passes over what
+it goes on to begin — whether the cascade runs in the process that began it or
+in one recovering the parent, which reads it off the parent's journal: the
+child's lineage key is the dispatch's instance path, and a prefix of it holding
+the parent's `finally` boundary record is a finally node the dispatch lies
+under (`docs/durability.md` §3.10). A cancel that
 ended the instance runs its finally node at `cancelled`, whole; one that arrives
 while an end is already under way — a sibling's failure ended a subflow and its
 finally node is running, or the root's body has completed and its finally node
@@ -12935,7 +12943,8 @@ walk is over **descendants**, not only children: a detached dispatch resolves
 when it is issued (D94), so a child routinely completes while a grandchild it
 started is still running, and the cascade reaches that grandchild through the
 settled child — an open execution is cancelled when the nearest open execution
-its lineage reaches, through any number of settled ones, is the one cancelled.
+its lineage reaches, through any number of settled ones, is the one cancelled —
+save one a finally node's dispatch began, anywhere along that lineage (above).
 Cancelling a child alone leaves its parent running: the parent's detached
 dispatch resolved when it was issued (D94), so nothing of the parent is waiting
 on the child, and the child's own envelope says `cancelled` while the parent runs
@@ -12975,7 +12984,13 @@ capacity, because its process is still stopping (D161). A finally node the
 cancel starts on the worker — an attached flow's, whose instance the cancel
 ended there — runs whole like any other: the worker's grace before it kills a
 runner is held while the runner reports finally work running, and its
-`finally_error` travels home on the cancelled result.
+`finally_error` travels home on the cancelled result. **The placed node waits
+for that result**, as any cancelled node waits for the instances it began: the
+hub holds the node open at its site until the worker's result settles the row —
+or the session is lost (`docs/distributed.md` §6.3) — so every instance around
+it, the root included, ends after the one on the worker, innermost first, and
+the `finally_error` it carries is the execution's, on the lifecycle row and the
+envelope, before the row settles.
 
 **Restart mid-cancel completes the cancel.** The request is a row of the
 journal's `cancellations` table, written before anything is stopped. A process
@@ -13093,8 +13108,13 @@ one the hub **stopped waiting for** while a worker ran it — the node's own
 row, names it in the holder's next poll's `cancel` list, and counts it until
 the worker's result for it arrives, which is refused `409` and frees the slot.
 The hub giving up on a dispatch is not the worker stopping it, and a slot freed
-at once would be handed new work while the old process still ran. A worker
-claiming two placements holds up to each one's cap of each.
+at once would be handed new work while the old process still ran. The one slot
+the hub cannot count is a **lost session's** — a hub restarted, or one whose
+sweep gave up on the worker, no longer knows the session the rows were held
+under — so the worker counts it: a `410` that ends its session stops the runners
+still running under it as a cancel stops them, and a dispatch the new session is
+handed waits for them before its runner starts. A worker claiming two
+placements holds up to each one's cap of each.
 
 **Why it is a placement key, and the knob it replaces.** The mesh decision
 "no capacity knob — a session holds exactly one unsettled dispatch"
