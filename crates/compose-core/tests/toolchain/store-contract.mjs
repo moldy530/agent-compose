@@ -3511,9 +3511,16 @@ async function inStoreFile(store, statement) {
   // version, no ledger row — so a retry applies once, and its own ledger row
   // answers the one after it. With the ledger insert moved past the `COMMIT`
   // on either arm, the entries are there and this case is `false`.
+  //
+  // **The store keeps history** (PRD resolved q74), so the batch's three
+  // history rows are inserted under the same savepoint before the ledger row
+  // is reached, and the same rollback has to take them: what is left is the
+  // seed's one row. A history row that outlived the claim — written on a
+  // connection of its own, or committed ahead of it — is still there, and
+  // `a_batch_that_fails_at_its_ledger_row_records_no_history` is `false`.
   const LEDGER_URL_ENV = "AGENT_COMPOSE_STORE_URL_BATCH_LEDGER";
   if (provider !== "sqlite") process.env[LEDGER_URL_ENV] = process.env[URL_ENV];
-  const store = kv("batch_unledgered", "global", LEDGER_URL_ENV, BATCHED);
+  const store = { ...kv("batch_unledgered", "global", LEDGER_URL_ENV, BATCHED), history: true };
   const run = ctx(execution("batch_unledgered"));
   const key = `${execution("batch_unledgered")}/move/0`;
   const ops = [
@@ -3585,6 +3592,11 @@ async function inStoreFile(store, statement) {
       seeded: still,
       last: await sequenceLast(store),
       ledger: await ledgerRows(store, key),
+      history: {
+        first: await historyRows(store, "first"),
+        second: await historyRows(store, "second"),
+        seeded: await historyRows(store, "seeded"),
+      },
     };
     answer.batch_unledgered_left = left;
     answer.a_batch_that_fails_at_its_ledger_row_leaves_none_of_it =
@@ -3609,6 +3621,19 @@ async function inStoreFile(store, statement) {
       same(again.results, retried.results) &&
       (await get(store, "first", run)).found === true &&
       (await ledgerRows(store, key)) === 1;
+    // The history the failure left, and the retry's: the seed's one row and
+    // nothing of the batch, then one row per entry — the deduped second retry
+    // adding none.
+    const recorded = {
+      first: (await historyOf(store, "first", run)).entries.length,
+      second: (await historyOf(store, "second", run)).entries.length,
+      seeded: (await historyOf(store, "seeded", run)).entries.map((entry) => entry.op),
+    };
+    answer.batch_unledgered_history = { left: left.history, recorded };
+    answer.a_batch_that_fails_at_its_ledger_row_records_no_history =
+      atTheLedgerRow &&
+      same(left.history, { first: 0, second: 0, seeded: 1 }) &&
+      same(recorded, { first: 1, second: 1, seeded: ["set", "delete"] });
   } catch (error) {
     answer.batch_unledgered_error = String(error?.message ?? error);
   } finally {
@@ -6073,6 +6098,277 @@ const at_ = (key, path) => ({ via: "node", ...(key === undefined ? {} : { idempo
   }
 }
 
+/**
+ * Whether the server session `id` holds the lock an insert into
+ * `store_history` takes and keeps until its transaction ends — on Postgres a
+ * `RowExclusiveLock` on the table (`pg_locks`), on MySQL InnoDB's intention
+ * lock on it (`performance_schema.data_locks`). A write takes that lock on
+ * `store_history` only by inserting its history row: a store with no
+ * `history_retention:` runs no history sweep, and nothing else a write does
+ * names the table. So a session waiting on its ledger claim and holding it has
+ * inserted its history row in the transaction it is waiting in.
+ */
+async function historyLockedBy(killer, id) {
+  const held =
+    provider === "postgres"
+      ? await rows(
+          killer,
+          "SELECT COUNT(*) AS n FROM pg_locks l JOIN pg_class c ON c.oid = l.relation " +
+            "WHERE l.pid = $1 AND l.granted AND l.mode = 'RowExclusiveLock' AND c.relname = 'store_history'",
+          [id],
+        )
+      : await rows(
+          killer,
+          "SELECT COUNT(*) AS n FROM performance_schema.data_locks d " +
+            "JOIN performance_schema.threads t ON t.THREAD_ID = d.THREAD_ID " +
+            "WHERE t.PROCESSLIST_ID = ? AND d.OBJECT_SCHEMA = DATABASE() AND d.OBJECT_NAME = 'store_history' " +
+            "AND d.LOCK_TYPE = 'TABLE' AND d.LOCK_STATUS = 'GRANTED'",
+          [id],
+        );
+  return Number(held[0]?.n) > 0;
+}
+
+{
+  // **A single write that fails at its ledger row leaves no history row** —
+  // PRD resolved q74's "written in the same transaction as the write, so a
+  // rolled-back write leaves no history", for the one-key write the batch case
+  // above does not reach. A write inserts its history row after its entry and
+  // before its ledger claim, so the claim is the last statement before the
+  // `COMMIT` a test can make fail with the row already inserted, and each arm
+  // is made to fail at exactly that claim, as the batch case does:
+  //
+  // - **on a server**, a connection of this file's holds an uncommitted ledger
+  //   row under the write's own key ([`holdTheLedgerRow`]). The write waits on
+  //   its claim with its entry and its history row inserted — the entry still
+  //   uncommitted, which an insert of the key proves; the history row inserted
+  //   by that transaction, which the table lock the insert keeps until the
+  //   transaction ends proves ([`historyLockedBy`]); and that row invisible
+  //   to a reader outside the transaction, which a count proves — and the
+  //   server ends that session;
+  // - **on SQLite**, a trigger in the store's file refuses that one ledger row,
+  //   and says in its refusal whether the write's new value and its history
+  //   row were both in the file as it reached the claim — which, in a file one
+  //   writer holds, means inserted by this write's transaction.
+  //
+  // What is left either way is the seed and its one row. A history row written
+  // outside the write's transaction — on a connection of its own, or committed
+  // ahead of the claim — is still there, and this case is `false`. A retry
+  // then applies once and records one row.
+  const LEDGER_URL_ENV = "AGENT_COMPOSE_STORE_URL_HISTORY_LEDGER";
+  if (provider !== "sqlite") process.env[LEDGER_URL_ENV] = process.env[URL_ENV];
+  const store = { ...kv("history_unledgered", "global", LEDGER_URL_ENV, HISTORIED), history: true };
+  const id = execution("history_unledgered");
+  const run = ctx(id);
+  const key = `${id}/bump/0`;
+  const bump = () => write(store, "merge", { key: "k", fields: { n: 5 } }, run, key);
+  // The trigger's two refusals: the first only where the write's value and
+  // its history row are both in the file as it reaches its ledger row.
+  const WRITTEN = "the probe refuses this ledger row with its write's value and history row written";
+  const UNWRITTEN = "the probe refuses this ledger row before its write's value and history row were written";
+  const TRIGGER = "refuse_the_write_ledger_row";
+  const killer = provider === "sqlite" ? undefined : await openServer(process.env[URL_ENV]);
+  let blocked;
+  try {
+    const seeded = await write(store, "set", { key: "k", value: { n: 0 } }, run, `${id}/seed/0`);
+    let refused;
+    let atTheLedgerRow;
+    if (killer === undefined) {
+      const literal = (text) => `'${text.replaceAll("'", "''")}'`;
+      await inStoreFile(
+        store,
+        `CREATE TRIGGER ${TRIGGER} BEFORE INSERT ON applied WHEN NEW.idempotency_key = ${literal(key)} ` +
+          `BEGIN SELECT RAISE(ABORT, ${literal(WRITTEN)}) WHERE ` +
+          `(SELECT COUNT(*) FROM entries WHERE scope_key = 'global' AND key = 'k' AND value = ${literal(JSON.stringify({ n: 5 }))}) = 1 ` +
+          "AND (SELECT COUNT(*) FROM history WHERE scope_key = 'global' AND key = 'k') = 2; " +
+          `SELECT RAISE(ABORT, ${literal(UNWRITTEN)}); END`,
+      );
+      try {
+        refused = (await refusal(bump())) ?? "";
+      } finally {
+        await inStoreFile(store, `DROP TRIGGER IF EXISTS ${TRIGGER}`);
+      }
+      atTheLedgerRow = refused.includes(WRITTEN);
+    } else {
+      await begin(killer);
+      await holdTheLedgerRow(killer, store.name, key);
+      blocked = bump().then(
+        () => undefined,
+        (error) => String(error?.message ?? error),
+      );
+      const victim = await waitingOn(killer, store.name, "store_applied");
+      answer.the_write_was_caught_waiting_on_its_ledger_row = victim !== undefined;
+      // Read only once the kill is in, as the batch case says: a write still
+      // waiting on a lock nothing has released would hang this runner.
+      if (victim === undefined) throw new Error("the write was never seen waiting on its ledger row");
+      const caught = {
+        entry: await heldUncommitted(store, "k"),
+        inserted: await historyLockedBy(killer, victim),
+        visible: await historyRows(store, "k"),
+      };
+      answer.history_unledgered_caught = caught;
+      await kill(killer, victim);
+      refused = (await blocked) ?? "";
+      // Before anything dials again, and after the kill, so the write never
+      // finds the row gone and claims it.
+      await rollback(killer).catch(() => undefined);
+      atTheLedgerRow =
+        caught.entry === true &&
+        caught.inserted === true &&
+        caught.visible === 1 &&
+        refused.includes(`lost its connection to the \`${provider}\` store backend`);
+    }
+    answer.history_unledgered_refusal = refused;
+    const still = await get(store, "k", run);
+    const left = {
+      value: still.value,
+      version: still.version,
+      last: await sequenceLast(store),
+      ledger: await ledgerRows(store, key),
+      history: await historyRows(store, "k"),
+    };
+    answer.history_unledgered_left = left;
+    answer.a_write_that_fails_at_its_ledger_row_records_no_history =
+      atTheLedgerRow &&
+      same(left.value, { n: 0 }) &&
+      left.version === seeded.version &&
+      left.last === seeded.version &&
+      left.ledger === 0 &&
+      left.history === 1;
+    const retried = await bump();
+    const again = await bump();
+    const rows = (await historyOf(store, "k", run)).entries;
+    answer.a_write_that_failed_at_its_ledger_row_records_one_row_when_retried =
+      retried.applied === true &&
+      retried.deduped === false &&
+      retried.version === seeded.version + 1 &&
+      again.deduped === true &&
+      rows.length === 2 &&
+      rows[1].op === "merge" &&
+      same(rows[1].old_value, { n: 0 }) &&
+      same(rows[1].new_value, { n: 5 }) &&
+      rows[1].version === retried.version;
+    answer.history_unledgered_trace = { retried, again, rows };
+  } catch (error) {
+    answer.history_unledgered_error = String(error?.stack ?? error);
+  } finally {
+    if (killer !== undefined) {
+      await rollback(killer).catch(() => undefined);
+      if (blocked !== undefined) await blocked;
+      await killer.end().catch(() => undefined);
+    }
+  }
+}
+
+{
+  // **…and a write that fails at its history row leaves nothing at all** —
+  // the other half of the same promise. The history row is the last row a
+  // write inserts before its ledger claim and its `COMMIT`, in that one
+  // transaction, so a write whose history row the store refuses has committed
+  // nothing: no value, no version, no ledger row — and a retry applies once.
+  // A history row inserted *after* the `COMMIT` is a write that has landed,
+  // and is answered by its ledger row, with no history row: the window a crash
+  // between the two would leave, and this case is `false`.
+  //
+  // Each arm refuses exactly that row with a trigger on its history table,
+  // whose refusal says whether the write's entry, at the version the row
+  // records, was already there as the row was inserted — which, inside the
+  // write's transaction, means written by it. On a server the trigger is on
+  // the shared `store_history`, so it fires for this run's store alone, and it
+  // — with its function, on Postgres — is dropped before anything else is
+  // read.
+  const store = { ...kv("history_refused", "global", URL_ENV, HISTORIED), history: true };
+  const id = execution("history_refused");
+  const run = ctx(id);
+  const key = `${id}/bump/0`;
+  const bump = () => write(store, "merge", { key: "k", fields: { n: 5 } }, run, key);
+  const WRITTEN = "the probe refuses this history row with its write's entry written";
+  const UNWRITTEN = "the probe refuses this history row before its write's entry was written";
+  const TRIGGER = `${RUN}_refuse_the_history_row`;
+  const literal = (text) => `'${text.replaceAll("'", "''")}'`;
+  const drop = async () => {
+    if (provider === "sqlite") {
+      await inStoreFile(store, `DROP TRIGGER IF EXISTS ${TRIGGER}`);
+    } else if (provider === "postgres") {
+      await storage(`DROP TRIGGER IF EXISTS ${TRIGGER} ON store_history`, []);
+      await storage(`DROP FUNCTION IF EXISTS ${TRIGGER}()`, []);
+    } else {
+      await storage(`DROP TRIGGER IF EXISTS ${TRIGGER}`, []);
+    }
+  };
+  try {
+    const seeded = await write(store, "set", { key: "k", value: { n: 0 } }, run, `${id}/seed/0`);
+    if (provider === "sqlite") {
+      await inStoreFile(
+        store,
+        `CREATE TRIGGER ${TRIGGER} BEFORE INSERT ON history WHEN NEW.key = 'k' AND NEW.op = 'merge' ` +
+          `BEGIN SELECT RAISE(ABORT, ${literal(WRITTEN)}) WHERE ` +
+          "(SELECT COUNT(*) FROM entries WHERE scope_key = 'global' AND key = 'k' AND version = NEW.version) = 1; " +
+          `SELECT RAISE(ABORT, ${literal(UNWRITTEN)}); END`,
+      );
+    } else if (provider === "postgres") {
+      await storage(
+        `CREATE FUNCTION ${TRIGGER}() RETURNS trigger LANGUAGE plpgsql AS $probe$ BEGIN ` +
+          'IF EXISTS (SELECT 1 FROM store_entries WHERE store = NEW.store AND scope_key = NEW.scope_key AND "key" = NEW."key" AND version = NEW.version) ' +
+          `THEN RAISE EXCEPTION ${literal(WRITTEN)}; END IF; RAISE EXCEPTION ${literal(UNWRITTEN)}; END $probe$`,
+        [],
+      );
+      await storage(
+        `CREATE TRIGGER ${TRIGGER} BEFORE INSERT ON store_history FOR EACH ROW ` +
+          `WHEN (NEW.store = ${literal(store.name)} AND NEW.op = 'merge') EXECUTE FUNCTION ${TRIGGER}()`,
+        [],
+      );
+    } else {
+      await storage(
+        `CREATE TRIGGER ${TRIGGER} BEFORE INSERT ON store_history FOR EACH ROW BEGIN ` +
+          `IF NEW.store = ${literal(store.name)} AND NEW.op = 'merge' THEN ` +
+          "IF (SELECT COUNT(*) FROM store_entries WHERE store = NEW.store AND scope_key = NEW.scope_key AND `key` = NEW.`key` AND version = NEW.version) = 1 " +
+          `THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = ${literal(WRITTEN)}; ` +
+          `ELSE SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = ${literal(UNWRITTEN)}; END IF; END IF; END`,
+        [],
+      );
+    }
+    let refused;
+    try {
+      refused = (await refusal(bump())) ?? "";
+    } finally {
+      await drop();
+    }
+    answer.history_refused_refusal = refused;
+    const still = await get(store, "k", run);
+    const left = {
+      value: still.value,
+      version: still.version,
+      last: await sequenceLast(store),
+      ledger: await ledgerRows(store, key),
+      history: await historyRows(store, "k"),
+    };
+    answer.history_refused_left = left;
+    answer.a_write_whose_history_row_is_refused_leaves_none_of_it =
+      refused.includes(WRITTEN) &&
+      same(left.value, { n: 0 }) &&
+      left.version === seeded.version &&
+      left.last === seeded.version &&
+      left.ledger === 0 &&
+      left.history === 1;
+    const retried = await bump();
+    const again = await bump();
+    const rows = (await historyOf(store, "k", run)).entries;
+    answer.a_write_whose_history_row_was_refused_is_retried_once =
+      retried.applied === true &&
+      retried.deduped === false &&
+      retried.version === seeded.version + 1 &&
+      again.deduped === true &&
+      rows.length === 2 &&
+      same(rows[1].new_value, { n: 5 }) &&
+      rows[1].version === retried.version;
+    answer.history_refused_trace = { retried, again, rows };
+  } catch (error) {
+    answer.history_refused_error = String(error?.stack ?? error);
+  } finally {
+    await drop().catch(() => undefined);
+  }
+}
+
 {
   // **A delete records the value it removed and none after; an applied write
   // that changed nothing records the same value on both sides.** A `delete`
@@ -6311,6 +6607,239 @@ const at_ = (key, path) => ({ via: "node", ...(key === undefined ? {} : { idempo
     answer.history_start_trace = { before, beforeRetention, after, kept };
   } catch (error) {
     answer.history_start_error = String(error?.stack ?? error);
+  }
+}
+
+/** How many history rows one partition of a store holds in storage, rows past their retention included. */
+async function historyPartitionRows(store, scopeKey) {
+  const counted = await storage(
+    "SELECT COUNT(*) AS n FROM store_history WHERE store = ? AND scope_key = ?",
+    [store.name, scopeKey],
+    [store.name, "SELECT COUNT(*) AS n FROM history WHERE scope_key = ?", [scopeKey]],
+  );
+  return Number(counted[0]?.n);
+}
+
+{
+  // **A write's sweep of the history is bounded, and its own partition's**
+  // (PRD resolved q74's "swept on q69's schedule", Decision D153): a write
+  // removes at most 100 of its partition's history rows past the retention,
+  // under that partition's sequence lock and no other's — the bound that
+  // keeps one write from holding the lock over an unbounded backlog, and the
+  // partition that keeps its `DELETE` off rows a write to another partition
+  // is about to reach for. So partition `a` holds 150 rows past the retention
+  // and `b` 50: one write to `a` leaves `a` 50 of them and itself, and every
+  // one of `b`'s, where a sweep with no `LIMIT` takes all 150 and a sweep with
+  // no partition in its `DELETE` reaches `b` by the second write.
+  const store = { ...kv("history_sweep", "session", URL_ENV, HISTORIED), history: true, historyRetention: HOUR };
+  const runs = {
+    a: ctx(execution("history_sweep_a"), "a"),
+    b: ctx(execution("history_sweep_b"), "b"),
+  };
+  try {
+    await later(0, async () => {
+      for (let n = 0; n < 150; n += 1) await write(store, "set", { key: "k", value: { n } }, runs.a);
+      for (let n = 0; n < 50; n += 1) await write(store, "set", { key: "k", value: { n } }, runs.b);
+    });
+    const partitions = async () => [
+      await historyPartitionRows(store, "session/a"),
+      await historyPartitionRows(store, "session/b"),
+    ];
+    const seeded = await partitions();
+    await later(HOUR + MINUTE, () => write(store, "set", { key: "k", value: { n: -1 } }, runs.a));
+    const afterOne = await partitions();
+    await later(HOUR + MINUTE, () => write(store, "set", { key: "k", value: { n: -2 } }, runs.a));
+    const afterTwo = await partitions();
+    await later(HOUR + MINUTE, () => write(store, "set", { key: "k", value: { n: -3 } }, runs.b));
+    const afterB = await partitions();
+    // 150 past the retention; one write removes 100 and adds itself, and the
+    // next removes the other 50 and adds itself.
+    answer.a_write_removes_at_most_100_history_rows_past_retention =
+      same(seeded, [150, 50]) && afterOne[0] === 150 - 100 + 1 && afterTwo[0] === 2;
+    // …and `b` keeps all 50 through both, until a write to `b` itself.
+    answer.a_writes_history_sweep_takes_no_other_partitions_rows =
+      afterOne[1] === 50 && afterTwo[1] === 50 && same(afterB, [2, 1]);
+    answer.history_sweep_trace = { seeded, afterOne, afterTwo, afterB };
+  } catch (error) {
+    answer.history_sweep_error = String(error?.stack ?? error);
+  }
+}
+
+{
+  // **The start sweep takes the history past its retention at most 1000 rows
+  // a batch, and on a server each batch only the rows of its own partition**
+  // (PRD resolved q74 on q69's schedule, Decision D153) — the entries case
+  // above (`sweep_batches`), read on the history: the bound is what keeps an op
+  // from waiting for more than the one batch in progress, and the partition
+  // is what keeps a batch, which holds that partition's sequence lock, from
+  // deadlocking a write to another one. A second process counts the backlog
+  // **between** the sweep's batches (`store-sweep-batches.mjs` with
+  // `history`), where one unbounded `DELETE` would take it all at once.
+  //
+  // Two partitions hold the backlog, laid down straight into storage and
+  // dated within the retention to every probe and past it to the sweep, whose
+  // clock is an hour and a minute ahead: `a` the ten oldest rows, `b` several
+  // batches' worth behind them. Every batch may take at most 1000 rows; and on
+  // a server the first batch is `a`'s — the partition holding the store's
+  // oldest row past the retention — and must take all ten of it and nothing of
+  // `b`, where a batch with no partition in its `DELETE` takes 1000 of the
+  // store's, at least 990 of them `b`'s. The local sweep is the file's, so on
+  // SQLite only the bound is asked of it.
+  //
+  // Each partition's sequence row — a history batch takes its partition's lock
+  // first, so a partition without one is one it cannot sweep — is given by a
+  // write through the same store with no `history: true`, which records no row:
+  // the backlog is the whole of what `a` and `b` hold.
+  const store = { ...kv("history_batches", "session"), history: true, historyRetention: HOUR };
+  const plain = kv("history_batches", "session");
+  const FIRST = 10;
+  const SECOND = 3_500;
+  /** Past the six turns the local sweep takes (entries, ledger, four history batches), and the server's six batches. */
+  const PROBES = 8;
+  const partitions = ["session/a", "session/b"];
+  /** A count, with a partition the backlog has left counted as zero rather than absent. */
+  const backlog = (counted) =>
+    Object.fromEntries(partitions.map((partition) => [partition, Number(counted?.[partition] ?? 0)]));
+  try {
+    for (const session of ["a", "b", "probe"]) {
+      await later(0, () => set(plain, "kept", { n: 0 }, ctx(execution(`history_batches_${session}`), session)));
+    }
+    const clock = provider === "sqlite" ? Date.now() : Number((await storage(SERVER_NOW, []))[0]?.server_now);
+    const laid = [
+      ...Array.from({ length: FIRST }, (_, index) => ["session/a", clock - HOUR / 2 + index]),
+      ...Array.from({ length: SECOND }, (_, index) => ["session/b", clock - HOUR / 2 + MINUTE + index]),
+    ];
+    const column = provider === "mysql" ? "`key`" : '"key"';
+    for (let at = 0; at < laid.length; at += 2_000) {
+      const chunk = laid.slice(at, at + 2_000);
+      if (provider === "sqlite") {
+        await storage(undefined, undefined, [
+          store.name,
+          "INSERT INTO history (scope_key, key, op, new_value, version, actor_kind, actor_execution, actor_path, at) VALUES " +
+            chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?)").join(", "),
+          chunk.flatMap(([partition, written]) => [partition, "k", "set", '{"n":0}', 1, "node", "exec_laid", "laid/0", written]),
+        ]);
+      } else {
+        await storage(
+          `INSERT INTO store_history (store, scope_key, ${column}, op, new_value, version, actor_kind, actor_execution, actor_path, at) VALUES ` +
+            chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").join(", "),
+          chunk.flatMap(([partition, written]) => [
+            store.name,
+            partition,
+            "k",
+            "set",
+            '{"n":0}',
+            1,
+            "node",
+            "exec_laid",
+            "laid/0",
+            written,
+          ]),
+        );
+      }
+    }
+    const before = backlog(
+      Object.fromEntries(
+        (
+          await storage(
+            "SELECT scope_key, COUNT(*) AS n FROM store_history WHERE store = ? GROUP BY scope_key",
+            [store.name],
+            [store.name, "SELECT scope_key, COUNT(*) AS n FROM history GROUP BY scope_key"],
+          )
+        ).map((row) => [String(row.scope_key), Number(row.n)]),
+      ),
+    );
+    const swept = await helper(
+      "store-sweep-batches.mjs",
+      [project, provider, data, JSON.stringify(store), String(PROBES), "history"],
+      { ...process.env, [CLOCK]: String(HOUR + MINUTE) },
+    );
+    const failed = swept.answer.observed.find((counted) => counted?.error !== undefined);
+    const observed = swept.answer.observed.map(backlog);
+    const after = backlog(swept.answer.after);
+    const total = (counted) => partitions.reduce((sum, partition) => sum + counted[partition], 0);
+    const totals = [before, ...observed].map(total);
+    const taken = totals.slice(1).map((left, index) => totals[index] - left);
+    answer.the_start_sweep_takes_at_most_1000_history_rows_a_batch =
+      failed === undefined &&
+      swept.answer.first?.found === true &&
+      same(before, { "session/a": FIRST, "session/b": SECOND }) &&
+      observed.length === PROBES &&
+      taken.every((n) => n >= 0 && n <= 1_000) &&
+      totals.some((n) => n > 0 && n < totals[0]) &&
+      total(after) === 0;
+    if (provider !== "sqlite") {
+      const steps = [before, ...observed];
+      answer.a_store_wide_history_sweep_batch_takes_only_its_own_partitions_rows =
+        failed === undefined &&
+        same(observed[0], { "session/a": 0, "session/b": SECOND }) &&
+        steps
+          .slice(1)
+          .every(
+            (counted, index) =>
+              partitions.filter((partition) => counted[partition] !== steps[index][partition]).length <= 1,
+          );
+    }
+    answer.history_batches_trace = { before, observed, after, failed, totals };
+  } catch (error) {
+    answer.history_batches_error = String(error?.stack ?? error);
+  } finally {
+    if (provider !== "sqlite") await forget(store).catch(() => undefined);
+  }
+}
+
+{
+  // **An execution-scoped store's history dies with its run** (grammar 11.3,
+  // PRD resolved q74): an execution's partition is its own and nothing
+  // addresses it once the run has ended, so its history goes with its entries
+  // and its ledger — on SQLite with the in-memory database the partition is,
+  // on a server by the `DELETE` the run's end makes of every table a partition
+  // keeps rows in, `store_history` among them. Without it every finished run's
+  // rows would stay on the server for good, under an execution id no read
+  // will name again. The run that has not ended keeps its own.
+  const store = { ...kv("history_scoped", "execution", URL_ENV, HISTORIED), history: true };
+  const ended = ctx(execution("history_scoped_ended"));
+  const running = ctx(execution("history_scoped_running"));
+  const partitionOf = (run) => `execution/${run.execution.id}`;
+  /** Each partition's rows on a server; SQLite's are in memory, where no other handle reaches. */
+  const stored = async () =>
+    provider === "sqlite"
+      ? undefined
+      : [await historyRows(store, "k", partitionOf(ended)), await historyRows(store, "k", partitionOf(running))];
+  try {
+    for (let n = 1; n <= 3; n += 1) {
+      await write(store, "set", { key: "k", value: { n } }, ended, `${ended.execution.id}/w/${n}`);
+    }
+    await write(store, "set", { key: "k", value: { n: 9 } }, running, `${running.execution.id}/w/1`);
+    const before = await stored();
+    const read = (await historyOf(store, "k", ended)).entries.length;
+    stores.releaseExecution(ended.execution.id);
+    // The `DELETE` is made on the way out of the run and not awaited (see the
+    // scope case above), so both reads are retried until they answer or the
+    // wait runs out.
+    let after = await stored();
+    for (let attempt = 0; attempt < 40 && after !== undefined && after[0] !== 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      after = await stored();
+    }
+    let page = await historyOf(store, "k", ended);
+    for (let attempt = 0; attempt < 40 && page.entries.length !== 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      page = await historyOf(store, "k", ended);
+    }
+    const kept = (await historyOf(store, "k", running)).entries;
+    answer.an_execution_scoped_history_dies_with_the_run =
+      read === 3 && page.entries.length === 0 && kept.length === 1 && same(kept[0].new_value, { n: 9 });
+    if (provider !== "sqlite") {
+      answer.an_ended_runs_history_rows_leave_the_server = same(before, [3, 1]) && same(after, [0, 1]);
+    }
+    answer.history_scoped_trace = { before, read, after, page, kept };
+  } catch (error) {
+    answer.history_scoped_error = String(error?.stack ?? error);
+  } finally {
+    // The read after the end reopened the ended run's partition on SQLite.
+    stores.releaseExecution(ended.execution.id);
+    stores.releaseExecution(running.execution.id);
   }
 }
 

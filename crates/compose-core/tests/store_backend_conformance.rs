@@ -971,6 +971,18 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "a_batch_of_three_entries_records_three_history_rows_in_one_transaction",
     "a_declined_batch_records_no_history",
     "a_batch_killed_mid_transaction_leaves_no_history_rows",
+    // The row is the write's own transaction's, which the claim and the
+    // history row bound on either side: a batch, and a single `merge`, made
+    // to fail at the ledger row each inserts after its history rows leave
+    // none of them behind; a `merge` whose history row the store refuses
+    // leaves no value, version or ledger row — so a history row inserted after
+    // the `COMMIT`, or on a handle of its own, fails one of the three on
+    // every arm. Each failed write's retry applies once and records its row.
+    "a_batch_that_fails_at_its_ledger_row_records_no_history",
+    "a_write_that_fails_at_its_ledger_row_records_no_history",
+    "a_write_that_failed_at_its_ledger_row_records_one_row_when_retried",
+    "a_write_whose_history_row_is_refused_leaves_none_of_it",
+    "a_write_whose_history_row_was_refused_is_retried_once",
     // `history` pages as `list` does: `limit` and `after`, `next` exactly when
     // more remain, the empty cursor the first page, a malformed one refused.
     "a_history_pages_with_limit_and_after_like_a_list",
@@ -983,6 +995,15 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "a_history_row_past_its_retention_is_invisible_at_once",
     "a_write_removes_its_partitions_history_past_retention_and_the_entries_stay",
     "a_history_row_past_its_retention_leaves_storage_when_a_process_starts",
+    // …within q69's bounds: a write removes at most 100 history rows of its
+    // own partition and none of another's, and the start sweep at most 1000 a
+    // batch, counted between its batches by a second process.
+    "a_write_removes_at_most_100_history_rows_past_retention",
+    "a_writes_history_sweep_takes_no_other_partitions_rows",
+    "the_start_sweep_takes_at_most_1000_history_rows_a_batch",
+    // An execution-scoped store's history dies with its run, and the run that
+    // has not ended keeps its own (grammar 11.3).
+    "an_execution_scoped_history_dies_with_the_run",
     // A store without `history: true` records nothing, and a `history` read of
     // it is refused by name for a caller that is not the compiler.
     "a_store_without_history_records_nothing",
@@ -1148,6 +1169,19 @@ const TRUE_WHEN_DIALLED: &[&str] = &[
     // whose entries and ledger row are one transaction.
     "the_batch_was_caught_waiting_on_its_ledger_row",
     "the_batch_caught_at_its_ledger_row_held_every_entry_uncommitted",
+    // …and the single write's on a server: caught waiting on its ledger row,
+    // with its entry uncommitted and its history row invisible outside its
+    // transaction (PRD resolved q74).
+    "the_write_was_caught_waiting_on_its_ledger_row",
+    // PRD resolved q74 on q69's schedule, as the entries' case above: each
+    // batch of the start sweep's history pass takes only the rows of the one
+    // partition whose sequence lock it holds — the store's oldest row past
+    // the retention — and none of another's.
+    "a_store_wide_history_sweep_batch_takes_only_its_own_partitions_rows",
+    // A server's `scope: execution` history rows leave with the run's other
+    // rows, by the `DELETE` its end makes, rather than staying for good under
+    // an execution id nothing will address again.
+    "an_ended_runs_history_rows_leave_the_server",
     // A server keeps what a run leaves on it, so the run takes every row of its
     // own run-unique stores back off it at the end (the large walk's hundred
     // thousand go first, in that case's own `finally`: `TRUE_EVERYWHERE`).

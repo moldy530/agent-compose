@@ -50,8 +50,19 @@
 // probes' own ledger rows are derived ones, which never expire, so they are
 // never part of it.
 //
-// Usage: bun store-sweep-batches.mjs <project> <provider> <data directory> <binding json> <probes> [entries|ledger]
-//        bun store-sweep-batches.mjs --count <provider> <binding json> [entries|ledger]
+// **The history's half** (PRD resolved q74) is counted the same way, with
+// `history` as the last argument, on a binding that declares `history: true`
+// and a `history_retention:`: once the keys and the ledger are swept, the
+// history rows past the retention leave a batch at a time behind the ops — on
+// a server each batch one partition's, under that partition's sequence lock
+// (the `history:` step of `RemoteKv`'s `#sweepStep`), on SQLite the third
+// table of `startLocalSweep` — at most the same 1000 a batch. That count is
+// every history row of the store, by partition: the parent lays the backlog
+// down with nothing beside it, and the probes' own rows are in a partition of
+// their own, which the parent does not read.
+//
+// Usage: bun store-sweep-batches.mjs <project> <provider> <data directory> <binding json> <probes> [entries|ledger|history]
+//        bun store-sweep-batches.mjs --count <provider> <binding json> [entries|ledger|history]
 // The first prints one JSON object: `observed`, the backlog by partition at each
 // probe, and `after`, the backlog once this process has let go of the store.
 // The second is the count a probe on a server spawns: the backlog by
@@ -72,17 +83,25 @@ const CLOCK = "AGENT_COMPOSE_STORE_CLOCK_OFFSET_MS";
  * but the backlog the parent laid down carries one — the keys that give each
  * partition its sequence row, and the probe's, never expire, and neither does
  * a derived ledger row. Of the keys, by partition (`entries`); of the ledger,
- * as one count (`ledger`). `store` is the placeholder a server's statement
- * binds the store's name to, and is absent on SQLite, whose file is the
- * store's.
+ * as one count (`ledger`); and of the history, every row by partition
+ * (`history`), since a history row carries no expiry of its own and the
+ * parent lays down nothing but the backlog in the partitions it reads. `store`
+ * is the placeholder a server's statement binds the store's name to, and is
+ * absent on SQLite, whose file is the store's.
  */
 function backlog(table, store = undefined) {
   const where = store === undefined ? "" : `store = ${store} AND `;
+  if (table === "history") {
+    const from = store === undefined ? "history" : `store_history WHERE store = ${store}`;
+    return `SELECT scope_key, COUNT(*) AS n FROM ${from} GROUP BY scope_key`;
+  }
   if (table === "ledger") {
     const from = store === undefined ? "applied" : "store_applied";
     return `SELECT 'ledger' AS scope_key, COUNT(*) AS n FROM ${from} WHERE ${where}expires_at IS NOT NULL`;
   }
-  if (table !== "entries") throw new Error(`there is no \`${table}\` backlog to count: \`entries\` or \`ledger\``);
+  if (table !== "entries") {
+    throw new Error(`there is no \`${table}\` backlog to count: \`entries\`, \`ledger\` or \`history\``);
+  }
   const from = store === undefined ? "entries" : "store_entries";
   return `SELECT scope_key, COUNT(*) AS n FROM ${from} WHERE ${where}expires_at IS NOT NULL GROUP BY scope_key`;
 }
@@ -126,7 +145,7 @@ if (process.argv[2] === "--count") {
 const [, , project, provider, data, binding, probes, table = "entries"] = process.argv;
 if (probes === undefined) {
   throw new Error(
-    "usage: bun store-sweep-batches.mjs <project> <provider> <data directory> <binding json> <probes> [entries|ledger]",
+    "usage: bun store-sweep-batches.mjs <project> <provider> <data directory> <binding json> <probes> [entries|ledger|history]",
   );
 }
 // A table there is no backlog of is refused here, before any op, rather than
