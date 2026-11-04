@@ -43,25 +43,35 @@
 //! One held `GET` at a time, from the moment it joins until it stops, **and it
 //! does not suspend while a node runs**: the poll is the heartbeat, and a
 //! four-minute build is four minutes of holds that come back empty. So the poll
-//! is this thread and a dispatch is another, which is the whole of the
-//! concurrency here — §2 fixes a session's capacity at one, and §13 forbids an
-//! implementation from deciding otherwise, so there is no capacity anywhere in
-//! this module.
+//! is this thread and each dispatch is another.
+//!
+//! **Every dispatch the hub hands over runs at once**, beside whatever else this
+//! worker is running (PRD resolved q79, Decision D161). How many that can be is
+//! the placement's `max_running:`, and it is the **hub's** to enforce: §2 has it
+//! offer a session work only while the session holds fewer of the placement's
+//! unsettled dispatches than the cap, so nothing here counts — a worker that
+//! queued what it was handed would run one at a time under a cap of three, and
+//! a worker that refused would leave a dispatch unsettled for its whole
+//! `timeout:` chain.
+//!
+//! **A cancel arrives on the poll** (§3.2, PRD resolved q75): the answer's
+//! `cancel` list names dispatches this session holds that the hub has
+//! cancelled, and each one's runner is sent `SIGTERM` — which the runner turns
+//! into the execution's own cancel, so its model calls, commands and harness
+//! runs stop by the path a deadline stops them by — and, if it has not exited
+//! within [`node::CANCEL_GRACE`], its whole process group is killed. The result
+//! posted for it is `status: "cancelled"`, whatever the runner managed to say.
 //!
 //! How long a hold lasts is the **hub's**, and §10.2 makes lengthening it a
 //! change no version bump announces — "which a worker learns by waiting". So
 //! this worker waits: [`Hold`] is the ceiling a poll is given, it starts at §2's
 //! twenty-five seconds, and it grows when a hub is slower than that.
 //!
-//! One node runs at a time, and that is the capacity. A dispatch answered while
-//! one is running is **queued**, never waited on: waiting would stop the poll,
-//! and a poll that stops is a worker the hub declares gone (§6.3). The hub hands
-//! one over legitimately once it has superseded the running dispatch on that
-//! node's `timeout:` — §3.4 makes a superseded dispatch not-unsettled, so §2's
-//! "MUST NOT answer a session's poll with a dispatch while that session has a
-//! dispatch it has not settled" is not breached and this worker cannot tell that
-//! from a hub that breached it. Both are answered the same way, because both are
-//! a real journaled dispatch this worker is owed a result for.
+//! Before protocol `3` one node ran at a time and a dispatch answered while one
+//! was running was queued behind it. That queue is gone with the rule that made
+//! it necessary: §2 no longer has the hub answer `204` to every poll of a busy
+//! session, so a dispatch handed over while another runs is one the hub means to
+//! run beside it.
 //!
 //! # What each status means, once
 //!
@@ -418,35 +428,21 @@ fn serve(
     // it learns rather than something it knows. One per cycle: a re-join that
     // brought a new artifact is a hub that may have been reconfigured with it.
     let mut hold = Hold::new();
+    // The dispatches this worker is running, by `dispatch_id`: what a `cancel`
+    // list is acted on through (§3.2).
+    let held = node::Running::default();
     std::thread::scope(|scope| -> Result<(), Stop> {
-        // At most one **running**, because §2 hands a session one dispatch at a
-        // time and §13 forbids this implementation from deciding otherwise.
-        let mut running: Option<std::thread::ScopedJoinHandle<'_, Result<(), Stop>>> = None;
-        // …and whatever the hub handed over anyway, in the order it arrived.
-        // Taken at the top of the next turn of this loop, which is **before**
-        // the next poll, so a dispatch answered to a free session starts with no
-        // latency added and one answered to a busy one starts the moment the
-        // node in hand ends. See the `200` arm.
-        let mut waiting: std::collections::VecDeque<Value> = std::collections::VecDeque::new();
+        // Every dispatch in hand, each on a thread of its own (§2, PRD resolved
+        // q79): the hub decides how many, and this worker runs them all.
+        let mut running: Vec<std::thread::ScopedJoinHandle<'_, Result<(), Stop>>> = Vec::new();
         loop {
-            if running
-                .as_ref()
-                .is_some_and(std::thread::ScopedJoinHandle::is_finished)
-            {
-                let held = running.take().expect("the handle was just seen");
-                settled(held.join())?;
-            }
-            if running.is_none()
-                && let Some(dispatch) = waiting.pop_front()
-            {
-                let sessions = Arc::clone(&sessions);
-                let tree = tree.clone();
-                let runner = runner.clone();
-                let hub = Arc::clone(hub);
-                running =
-                    Some(scope.spawn(move || {
-                        node::execute(&hub, &sessions, &tree, bun, &runner, &dispatch)
-                    }));
+            let mut index = 0;
+            while index < running.len() {
+                if running[index].is_finished() {
+                    settled(running.swap_remove(index).join())?;
+                } else {
+                    index += 1;
+                }
             }
             let began = std::time::Instant::now();
             let answered = hub.poll(&session.id, hold.expected());
@@ -460,24 +456,37 @@ fn serve(
             match answered {
                 Answer::Said(said) if said.status == 200 => {
                     backoff.reset();
-                    // **Queued, and the poll goes on.** A dispatch answered to a
-                    // session that has not settled the one it holds is ordinarily
-                    // a hub in breach of §2 — but it is also what a conformant hub
-                    // does once §3.4 has superseded the running dispatch on the
-                    // node's `timeout:`, because a superseded dispatch is no
-                    // longer *unsettled* and this worker has no way to know that
-                    // happened. Either way it is a real dispatch, journaled, and
-                    // this worker is owed a result for it, so it is queued rather
-                    // than dropped.
-                    //
-                    // What this must not do is **wait** for the node in hand. The
-                    // poll is the heartbeat (§3.2) and §2 requires it to continue
-                    // while a node runs: a thread blocked on a slow runner makes
-                    // no request for the whole of it, so at ninety seconds the hub
-                    // declares this session gone and supersedes the second
-                    // dispatch too — a second attempt burned for a condition that
-                    // was the hub's own dispatch decision.
-                    waiting.push_back(said.json());
+                    let answer = said.json();
+                    // **The cancel list first** (§3.2, PRD resolved q75): a
+                    // dispatch the hub has cancelled is stopped before anything
+                    // new starts beside it.
+                    for id in answer
+                        .get("cancel")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                    {
+                        held.cancel(id);
+                    }
+                    // **Started now, and the poll goes on.** A `200` carries a
+                    // dispatch exactly when it names a `dispatch_id`; one that
+                    // carries only a `cancel` list has nothing to start. What
+                    // this must not do is **wait** for the node: the poll is the
+                    // heartbeat (§3.2) and §2 requires it to continue while a
+                    // node runs — a thread blocked on a slow runner makes no
+                    // request for the whole of it, and at ninety seconds the hub
+                    // declares this session gone and supersedes what it holds.
+                    if answer.get("dispatch_id").and_then(Value::as_str).is_some() {
+                        let sessions = Arc::clone(&sessions);
+                        let tree = tree.clone();
+                        let runner = runner.clone();
+                        let hub = Arc::clone(hub);
+                        let held = held.clone();
+                        running.push(scope.spawn(move || {
+                            node::execute(&hub, &sessions, &tree, bun, &runner, &answer, &held)
+                        }));
+                    }
                 }
                 Answer::Said(said) if said.status == 204 => backoff.reset(),
                 Answer::Said(said) if said.status == 410 => {
