@@ -16,15 +16,17 @@ import { createConnection } from "mysql2/promise";
 import type { Connection, RowDataPacket } from "mysql2/promise";
 
 /**
- * The schema, created on first open and never migrated.
+ * The schema, created on first open, and grown by [`MYSQL_MIGRATIONS`] where a
+ * database an earlier build created lacks a column.
  *
  * `IF NOT EXISTS` throughout, so a second open of a journal this build already
- * created does nothing — which is the whole of what `docs/durability.md` §11.2
- * asks of a physical schema, and all it can ask of this one: a remote journal is
- * created by this release or a later one, so there is no older database whose
- * columns have to be probed for. The indexes are declared **inside** each table
- * rather than beside it, because MySQL has no `CREATE INDEX IF NOT EXISTS` and a
- * second open must not be an error.
+ * created does nothing, and a table added since (`lineage`, PRD resolved q65) is
+ * created in a database an earlier build created with no more work than that. A
+ * **column** added to a table that already existed is the one case this does
+ * not cover, and it is `docs/durability.md` §11.2's to read twice: those are
+ * probed for and added below, under the writer guard. The indexes are declared
+ * **inside** each table rather than beside it, because MySQL has no
+ * `CREATE INDEX IF NOT EXISTS` and a second open must not be an error.
  *
  * **`CHARACTER SET ascii COLLATE ascii_bin` on every column a statement compares
  * or orders by**, and that is a correctness choice twice over. MySQL's own
