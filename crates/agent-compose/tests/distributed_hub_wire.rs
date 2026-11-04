@@ -3404,6 +3404,94 @@ fn a_cancel_reaches_the_worker_holding_its_dispatch_and_its_result_settles_it() 
     assert_eq!(next["execution_id"], waiting, "{next:#}");
 }
 
+/// **A dispatch whose node ran out of time is stopped on its worker, and holds
+/// its slot until the worker says it has** (§2, §3.2, §6.5; PRD resolved q79,
+/// Decision D161).
+///
+/// `flow.overdue`'s `sign` has two seconds. A session at the default cap of one
+/// takes it and sits on it; at two seconds the hub gives up on it, and the
+/// session's poll is answered with the dispatch in its `cancel` list — the
+/// worker is still running it, and the hub giving up is not the worker
+/// stopping. Until the worker says it has, the dispatch still holds the
+/// session's one slot: a second execution's dispatch is not handed over beside
+/// it, which would be two runners on a placement whose cap is one. The
+/// worker's result for the overdue dispatch is refused `409` — the execution
+/// has moved past it — and frees the slot, and the next poll hands over the
+/// second execution's work.
+#[test]
+fn a_dispatch_whose_node_ran_out_of_time_is_stopped_on_its_worker_and_holds_its_slot() {
+    let Some(hub) = hub() else {
+        return;
+    };
+    let worker = hub.worker();
+    let execution = hub.start("/overdue-releases", &json!({ "path": "release.dmg" }));
+    let first = worker.dispatch(&hub);
+    let overdue = first["dispatch_id"].as_str().expect("an id").to_string();
+
+    // The session keeps polling — which is also what keeps it inside the
+    // liveness window — until the node's two seconds are spent and the hub
+    // tells it something.
+    let told = {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let answered = worker.poll(&hub);
+            if answered.status == 200 {
+                break answered.json();
+            }
+            assert_eq!(answered.status, 204, "{}", body_of(&answered));
+            assert!(
+                Instant::now() < deadline,
+                "the session holding an overdue dispatch was never told to stop it"
+            );
+        }
+    };
+    assert_eq!(
+        told,
+        json!({ "cancel": [overdue] }),
+        "the hub gave up on a dispatch without telling the worker running it to stop"
+    );
+    let report = hub.until(&execution, "failed on its budget", |report| {
+        report["status"] == "failed"
+    });
+    assert!(
+        report["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("timed out")),
+        "{report:#}"
+    );
+
+    let waiting = hub.start("/retried-releases", &json!({ "path": "second.dmg" }));
+    hub.until(&waiting, "parked", |report| {
+        report["placement_waits"][0]["status"] == "parked"
+    });
+    let still = worker.poll(&hub);
+    assert_eq!(
+        still.status,
+        204,
+        "a session still running an overdue dispatch was handed a second beside it, past its cap \
+         of one: {}",
+        body_of(&still)
+    );
+
+    let late = hub.send(
+        worker
+            .request("POST", "/workers/result")
+            .json(&json!({ "dispatch_id": overdue, "status": "cancelled" })),
+    );
+    assert_eq!(late.status, 409, "{}", body_of(&late));
+    let next = worker.dispatch(&hub);
+    assert_eq!(next["execution_id"], waiting, "{next:#}");
+    let settled = worker.settle(
+        &hub,
+        next["dispatch_id"].as_str().expect("an id"),
+        &json!({ "signature": "signed once the slot was free" }),
+    );
+    assert_eq!(settled.status, 204, "{}", body_of(&settled));
+    hub.until(&waiting, "completed", |report| {
+        report["status"] == "completed"
+    });
+}
+
 /// **A cancel withdraws a dispatch still parked on the board** (§6.6,
 /// Decision D160): no worker has it, so nobody is told, the row settles
 /// `cancelled`, and a worker that joins afterwards is handed nothing.

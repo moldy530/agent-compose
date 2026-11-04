@@ -427,6 +427,47 @@ mod tests {
         );
     }
 
+    /// An `exec:` command is forked into a process group of its own, with the
+    /// stop sweep armed **before** the fork, and the fork has one call site
+    /// (PRD resolved q75 ruling b, Decision D160).
+    ///
+    /// The group is what an abort stops — a cancel or a deadline sends it
+    /// `SIGTERM` and, after a grace, `SIGKILL` — so a command that forks leaves
+    /// nothing running behind the node that started it; the acceptance suite
+    /// (`a_cancel_stops_every_process_a_forking_command_started`) asks that of
+    /// every pid in the tree. A group of its own is also one the terminal no
+    /// longer reaches, which is why the sweep is armed first: the ordering
+    /// argument of the test above, made for the other command this runtime
+    /// forks.
+    #[test]
+    fn an_exec_command_is_forked_into_its_own_group_with_the_sweep_armed_first() {
+        let forked = function_body("function forkExecCommand(");
+        let armed = forked
+            .find("armCommandSweep();")
+            .expect("`forkExecCommand` arms the stop sweep");
+        let spawned = forked
+            .find("return spawn(command, args, { cwd, env: environment, detached: true });")
+            .expect("`forkExecCommand` forks the command detached, into a group of its own");
+        assert!(
+            armed < spawned,
+            "the sweep is armed after the command is forked, so a stop signal arriving in \
+             between is met by the kernel's default disposition and the command's group is left \
+             running (Decision D160): {forked}"
+        );
+        let run = function_body("async function runExecLive(");
+        assert!(
+            run.contains("forkExecCommand(command, args, cwd, environment)")
+                && !run.contains("spawn("),
+            "`runExecLive` forks its command somewhere other than `forkExecCommand`, the one call \
+             site that puts it in a group of its own: {run}"
+        );
+        assert_eq!(
+            SOURCE.matches("detached: true });").count(),
+            1,
+            "an `exec:` command is forked somewhere other than `forkExecCommand`"
+        );
+    }
+
     /// A typed command reads **its own** standard input, never the shell's
     /// (grammar 5.5, PRD resolved q54).
     ///

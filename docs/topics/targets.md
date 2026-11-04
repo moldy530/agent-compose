@@ -492,9 +492,25 @@ tool — rather than load assignment.
 | Key | Shape |
 |---|---|
 | `placements.<name>.members` | non-empty list of distinct `agent.*` / `tool.*` addresses that must resolve |
+| `placements.<name>.max_running` | integer ≥ 1, default `1` — how many of this placement's dispatches **one worker session** may hold at once |
 | `placements.<name>.description` | documentation |
 | `hub.join_token` | the bearer credential a worker joins with, as an `${ENV}` reference — required wherever `placements:` is non-empty |
 | `hub.public_url` | the absolute `http`/`https` base every ingress URL derives from; no wildcard, because this is your URL rather than an allowlist pattern |
+
+**`max_running:` is a session's capacity, not the placement's.** Leave it out
+and each worker runs one of the placement's nodes at a time, so a pool of one
+worker is one-at-a-time whatever its machine can take; `max_running: 3` lets
+each worker that claims the placement hold three of its dispatches and run them
+side by side, so two such workers run six. The hub hands a parked dispatch to
+the least-loaded worker polling for it — the one holding fewest of the
+placement's unsettled dispatches, the oldest poll between equals. It bounds
+what a pool *runs*, not what a graph *admits*: a `map`'s `max_concurrency:` is
+still how many instances are in flight, and a placed node's `timeout:` still
+runs from dispatch, so an item waiting for a free slot spends its budget
+waiting. A dispatch the hub stopped waiting for while a worker runs it — a
+cancel, or the node's own `timeout:` — keeps its slot until the worker says it
+has stopped it. An integer below `1` is `value-out-of-range`, and a string or a
+fraction is `wrong-type`.
 
 Six rules, each a compile error — grammar §14.1's five about a placement, in
 its numbering, and then §14.2's about the token:

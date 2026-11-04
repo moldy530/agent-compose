@@ -444,8 +444,11 @@ fn spawn(bun: &Path, tree: &Path, runner: &str, dispatch: &Value) -> Result<Chil
         // makes `agent-compose worker` a process an operator can read.
         .stderr(Stdio::inherit());
     // A **process group of its own**, so a cancel the runner does not answer in
-    // time takes everything it started with it — the commands an `exec:` node
-    // spawned are in the runner's group (§3.2, PRD resolved q75).
+    // time takes everything left in it with it (§3.2, PRD resolved q75). The
+    // commands an `exec:` node spawned are in groups of their own, which the
+    // runner stops itself as the cancel reaches them — `SIGTERM`, then `SIGKILL`
+    // two seconds later, well inside this worker's grace — and kills on its way
+    // out if it exits first (`src/runtime.ts`'s `stopExecGroup`).
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

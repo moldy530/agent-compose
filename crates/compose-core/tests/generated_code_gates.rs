@@ -6451,7 +6451,14 @@ fn a_compiled_graphs_coder_nodes_record_route_and_write() {
 ///   stopped in flight, and a run the cancel stopped records nothing
 ///   (`docs/trace.md` §3.2, `docs/durability.md` §6.1);
 /// * the lifecycle row settled `cancelled`, with no `error`, beside the request
-///   the journal recorded before anything was stopped.
+///   the journal recorded before anything was stopped;
+/// * and a cancel that arrives **while the run's row is still being begun** —
+///   the window `serve` answers a trigger's request in, which a dialled
+///   journal holds open for a network round trip — is not lost: the run's
+///   controller exists from the tick the run starts, so the cancel fires it,
+///   the run ends `cancelled` with no harness run begun, and the row settles
+///   `cancelled` (Decision D160). The runner slows the journal's `begin` to
+///   make the window a fact.
 #[test]
 fn a_cancel_stops_a_coder_node_mid_run_and_settles_it_cancelled() {
     let Some(root) = installed() else {
@@ -6505,6 +6512,17 @@ fn a_cancel_stops_a_coder_node_mid_run_and_settles_it_cancelled() {
     assert_eq!(answer["status"], "cancelled", "{answer:#}");
     assert_eq!(answer["rowError"], Value::Null, "{answer:#}");
     assert_eq!(answer["cancelRequested"], true, "{answer:#}");
+
+    assert_eq!(
+        answer["earlyEndedByCancel"], true,
+        "a cancel sent while the run's row was being begun was lost: {answer:#}"
+    );
+    assert_eq!(
+        answer["earlyHarnessRuns"], 0,
+        "the run a cancel had already reached began its coder node: {answer:#}"
+    );
+    assert_eq!(answer["earlyStatus"], "cancelled", "{answer:#}");
+    assert_eq!(answer["earlyRowError"], Value::Null, "{answer:#}");
 }
 
 /// Gate 26: the two shapes PRD resolved q61 added, through a compiled graph

@@ -17,6 +17,10 @@
 #     under a `retry:`, so a superseded attempt is followed by another that parks
 #     again and can be answered. Without a `retry:` the supersede would be the
 #     end of the run and there would be nothing to observe about the re-park.
+#   * `flow.overdue` is the same dispatch under a two-second `timeout:`: the hub
+#     gives up on an attempt a worker is still running, and the session holding
+#     it is told to stop it and is handed nothing else until its result says it
+#     has (§2, §3.2; PRD resolved q79).
 #   * `flow.batch` is §2's queueing clause: a `map` admitting twelve items onto a
 #     placement whose pool is whatever showed up. The map declares how many
 #     instances the *graph* may have in flight; how many are **running** is the
@@ -129,6 +133,15 @@ triggers:
     type: http
     flow: flow.retried
     path: /retried-releases
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
+  on_overdue_release:
+    type: http
+    flow: flow.overdue
+    path: /overdue-releases
     method: POST
     input:
       path: "payload.body.path"
@@ -749,6 +762,27 @@ flow.retried:
       # is that a superseded dispatch fails **an attempt** rather than the run
       # (§6.3), so the second attempt has to be reachable inside a test.
       retry: { max: 2, backoff: 1ms }
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+  edges:
+    - { from: start, to: sign }
+    - { from: sign, to: end }
+
+flow.overdue:
+  description: The same sign-off, under a deadline that outruns the worker.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+  nodes:
+    sign:
+      agent: agent.signer
+      timeout: 2s
       input:
         path: "input.path"
       writes:

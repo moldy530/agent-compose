@@ -1549,9 +1549,23 @@ it would have in the process that accepted the cancel. A **placed dispatch**
 still unsettled is a frontier too, and the cancel withdraws it or tells the
 worker holding it (`docs/distributed.md` §3.2); so is a dispatch row a worker
 settled with the cancelled ending (`ExecutionCancelled`, `docs/distributed.md`
-§3.4), which the replay reads back as the cancel it was. And a body whose whole
-record replays to its end had ended before the cancel could reach it, and
-settles as it ended — the cancel changes no outcome it arrives after.
+§3.4), which the replay reads back as the cancel it was, and one the cancel
+withdrew. A dispatch a worker held when the process died is not superseded as
+an orphan at the next start, as every other such row is (`docs/distributed.md`
+§5): read as one, the node's attempt would fail under its `retry:` and
+`on_error:` — the chain a cancel is never routed through — and the execution
+would end `failed`. It is left `dispatched` for the replay, which ends it as
+the cancel's. And a body whose whole record replays to its end had ended before
+the cancel could reach it, and settles as it ended — the cancel changes no
+outcome it arrives after.
+
+**The cascade is walked again.** The cancel route records the parent's request
+and then walks its open children, and a process can die between the two. So
+the generation that recovers a row carrying `cancelRequestedAt` cancels that
+row's open children — each one's request recorded, recursively — before its
+replay re-issues any dispatch: a child it reaches again resumes carrying its
+own request and completes its cancel at its own frontier, rather than running
+on as if nothing had asked it to stop.
 
 **A stopped effect is not recorded.** An effect the cancel stops in flight — a
 model call whose request was aborted, a command killed part-way — writes no

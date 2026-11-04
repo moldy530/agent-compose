@@ -163,7 +163,10 @@ records, harness runs and the child's own joined dispatches on them.
   child has run a node, and a child that fails fails on its own.
 * **A child never parks.** A detached dispatch that could reach a `human` node
   is refused at build time (Decision D118), so a child's envelope takes
-  `status: "completed"` or `"failed"` and never `"interrupted"`.
+  `status: "completed"`, `"failed"` or `"cancelled"` and never
+  `"interrupted"`. It is `"cancelled"` when its parent was cancelled — the
+  cancel cascades down the lineage — or when it was cancelled alone (PRD
+  resolved q75, Decision D160).
 * **A detached `agent.*` or `tool.*` delivery ships nothing of its own.** It
   runs no node and starts no child; the stub record stays its whole account.
 * **The wire does not move.** A child's export is a `settled` row on the
@@ -203,14 +206,17 @@ documents and no grammar section defines — prints one document:
   "execution_id": "exec_0f1e…",
   "status": "completed",
   "outputs": { "draft": "…" },
-  "trace_version": 6,
+  "trace_version": 7,
   "trace": [ /* entries */ ],
   "trace_path": "/…/.agent-compose/traces/flow.review_loop-exec_0f1e….json"
 }
 ```
 
-`status` is the envelope's three (§2). A run that produced no answer — `"failed"`
-or `"interrupted"` — answers with the same document, `error` in place of
+`status` is one of the envelope's (§2) — `"completed"`, `"failed"` or
+`"interrupted"`; never `"cancelled"`, because a cancel is `serve`'s and a
+`run` stopped at its terminal leaves its row open for `resume` (PRD resolved
+q28, Decision D160). A run that produced no answer — `"failed"` or
+`"interrupted"` — answers with the same document, `error` in place of
 `outputs`, and the trace it did make. A run whose `finally:` node failed carries
 the envelope's `finally_error` beside whichever of the two it has, and its exit
 code is the outcome's: a completed run whose cleanup failed still exits `0`.
@@ -245,17 +251,21 @@ POSTs on completion, report an execution as (grammar §13.3):
   "trigger": "on_request",
   "status": "completed",
   "outputs": { "draft": "…" },
-  "trace_version": 6,
+  "trace_version": 7,
   "trace": [ /* entries */ ]
 }
 ```
 
-`status` here is the *execution's* — `running`, `completed`, `failed` or
-`interrupted` — which is a larger vocabulary than the envelope's, because an
-execution tracked by a live process can be in states a finished run cannot. It
-is `serve`'s own vocabulary rather than one of §10.1's closed enumerations: this
-format's `status` is the envelope's three, and the word `interrupted` names a
-different thing in each. Here it is a run that is **still going** and is holding
+`status` here is the *execution's* — `running`, `completed`, `failed`,
+`interrupted` or `cancelled` — which is a larger vocabulary than the envelope's,
+because an execution tracked by a live process can be in states a finished run
+cannot. It is `serve`'s own vocabulary rather than one of §10.1's closed
+enumerations: this format's `status` is the envelope's four, and the word
+`interrupted` names a different thing in each. `cancelled` names the same
+thing in both — an execution somebody's cancel stopped (PRD resolved q75,
+Decision D160) — and a cancelled report carries its trace and no `error`; an
+execution whose cancel was accepted and has not settled yet is still
+`running`. Here it is a run that is **still going** and is holding
 a `human` pause somebody can still answer (grammar §8.7); in the envelope it is a
 run that **ended** holding one, which is what an `agent-compose run` with nobody
 to ask does with every pause it reaches — a run *at a terminal* answers its

@@ -2441,8 +2441,10 @@ failure it raises is not the execution's `finally_error`. The process says it on
 stderr instead, naming the execution, the node and the error. A **cancel** of
 the execution does reach a detached `agent.*` or `tool.*` delivery: it is a
 dispatch of this execution, so its signal is the execution's and it stops like
-any running node — while a detached `flow.*` dispatch is a child execution, and
-the cancel reaches it through the cascade (D160).
+any running node — save one a `finally:` node issued, which is part of how its
+instance ends and runs whole, on a cancelled execution too — while a detached
+`flow.*` dispatch is a child execution, and the cancel reaches it through the
+cascade (D160).
 
 **What is not an end.** A `human` pause that parks the run (exit `3`,
 `status: "interrupted"`) is not one: the finally node does not run, and the
@@ -9655,6 +9657,15 @@ about a process group, made about memory: a compiled graph is embedded code, and
 work no one is waiting for is a resource taken from every other execution beside
 it. *PRD resolved q31, q54, §5.5, §6.1, §9.2.*
 
+**Amended 2026-11-04** by
+[D160](#d160-a-cancel-ends-an-execution-cancelled-through-one-controller-every-node-chains-to),
+which is PRD resolved q75: an **`exec:` command** now runs in a process group
+of its own too, and an abort — a cancel, or the node's `timeout:` — stops the
+group (`SIGTERM`, then `SIGKILL` two seconds later), joining the same stop
+sweep. "Those escape a hand-rolled `exec:` tool identically" therefore reads of
+what left the group on purpose — `setsid`, `set -m`, a double fork — which
+escapes both; an `exec:` tool's ordinary forked children no longer do.
+
 ### D125. Inbound `auth:` is one scheme per trigger, with env-ref secrets
 
 An `http` trigger's `auth:` block declares **exactly one** of `bearer:` and
@@ -12899,7 +12910,12 @@ lifecycle row's `error` is null on a cancelled row and the envelope carries no
 
 **What a cancel does not stop: a finally node.** A finally node and all it
 begins are how an instance ends, so its site is marked as running for as long
-as it runs, and a node at or under that site chains to nothing. A cancel that
+as it runs, and a node at or under that site chains to nothing. A detached
+`agent.*` or `tool.*` delivery a finally node issues is among what it begins:
+its own site is marked for as long as the **delivery** runs — not only while
+the node that issued it does, which resolves the dispatch at once (D94) — so on
+a cancelled execution, where the finally node runs *because* of the cancel, the
+delivery and everything its model begins run whole. A cancel that
 ended the instance runs its finally node at `cancelled`, whole; one that arrives
 while an end is already under way — a sibling's failure ended a subflow and its
 finally node is running, or the root's body has completed and its finally node
@@ -12918,11 +12934,26 @@ on the child, and the child's own envelope says `cancelled` while the parent run
 to its own end. A **detached `agent.*` or `tool.*` delivery** is a different
 thing and is read differently: it is not a child execution but a dispatch of
 this execution — under its id, on its journal — so its signal is the execution's
-cancel and it stops like any running node, while a detached `flow.*` dispatch
-*is* a child and is reached by the cascade. That reading is the
+cancel and it stops like any running node (a finally node's excepted, above),
+while a detached `flow.*` dispatch *is* a child and is reached by the cascade. That reading is the
 implementation's: the ruling says "aborts every running node … placed
 dispatches" and "cascades to the execution's open children", and a delivery is
 the former.
+
+**A stopped command is stopped whole.** An `exec:` command runs in a process
+group of its own, and what an abort stops — the cancel, or the node's own
+`timeout:` — is the **group**: `SIGTERM` to it at once, and `SIGKILL` to it two
+seconds later, so a command that forks leaves no child behind and one that
+ignores `SIGTERM` is gone inside the field report's ten seconds ("no child
+process alive"). The node does not wait for either: it settles as soon as the
+signal fires, as it did when the platform killed the command's pid. A process
+that exits inside the two seconds kills the groups still in their grace on its
+way out. A group of its own is one the terminal no longer reaches, so a stop
+signal delivered to the process sweeps it exactly as it sweeps `builtin.bash`'s
+(D124), and `Ctrl-C` at a `run` still stops the command it was running; what
+still escapes is what left the group on purpose — `setsid`, a double-forked
+daemon. That amends D124's "those escape a hand-rolled `exec:` tool
+identically": an `exec:` tool's forked children no longer escape it.
 
 **Waits.** A `human` pause is released: its wait is abandoned, nothing will
 answer it now, and the instance holding it ends `cancelled` — q76's
@@ -12945,9 +12976,25 @@ the record but the ends the cancel owes: each re-entered instance ends
 `cancelled` and runs its finally node — once, since its boundary and its effects
 are journaled — and the row settles `cancelled` (`docs/durability.md` §6.1). A
 placed dispatch still unsettled is such a frontier too, and so is a dispatch row
-a worker settled cancelled, which the replay reads back as the cancel it was. A
-body whose whole record replays to its end had ended before the cancel could
-reach it, and settles as it ended.
+a worker settled cancelled, which the replay reads back as the cancel it was —
+and so is one the cancel withdrew. A dispatch a worker held when the process
+died is the commonest such frontier, so the next start does **not** supersede
+it as an orphan of the dead process's sessions (`docs/distributed.md` §5): read
+as one, the node's attempt would fail under its `retry:` and `on_error:` and the
+execution would end `failed`. It is left `dispatched` for the replay, which ends
+it as the cancel's. The **cascade** is walked again too: the generation that
+recovers a cancelled execution cancels its open children before its replay
+re-issues any dispatch, so a process that died between recording the parent's
+request and a child's leaves no child to resume as if nothing had asked it to
+stop. A body whose whole record replays to its end had ended before the cancel
+could reach it, and settles as it ended.
+
+**A cancel before the row is begun.** `serve` answers a trigger's request while
+the execution's lifecycle row is still being begun — on a dialled journal, a
+network round trip — and a cancel can arrive inside it. The execution's
+controller is opened in the tick the run starts, before anything is awaited, so
+that cancel records its request and fires the controller it finds: the run's
+first node begins already stopped, and the row settles `cancelled`.
 
 **Surfaces.** The route is under the auth of the trigger that started the
 execution (PRD resolved q32), checked exactly as the status and resume routes
@@ -13019,7 +13066,13 @@ hold: capacity is a property of a session — one worker process, one join — a
 what a session holds is read off the journal's dispatch rows each time it is
 asked, never kept as a counter the rows could disagree with. A dispatch the hub
 cancelled stays on its session's count until the worker's cancelled result
-settles it, because the process running it is still stopping (D160). A worker
+settles it, because the process running it is still stopping (D160). So does
+one the hub **stopped waiting for** while a worker ran it — the node's own
+`timeout:` ran out, or its execution ended around it: the hub supersedes the
+row, names it in the holder's next poll's `cancel` list, and counts it until
+the worker's result for it arrives, which is refused `409` and frees the slot.
+The hub giving up on a dispatch is not the worker stopping it, and a slot freed
+at once would be handed new work while the old process still ran. A worker
 claiming two placements holds up to each one's cap of each.
 
 **Why it is a placement key, and the knob it replaces.** The mesh decision

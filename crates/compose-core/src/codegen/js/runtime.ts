@@ -1322,8 +1322,29 @@ export async function cancelExecution(execution: string): Promise<void> {
   const journal = await openJournal();
   await journal.requestCancel(execution);
   fireCancel(execution);
+  await cascadeCancel(journal, execution);
+}
+
+/**
+ * Cancel every open child execution of `execution` whose own cancel is not yet
+ * recorded, each recursively ([`cancelExecution`]) — the cascade of PRD
+ * resolved q75 ruling c.
+ *
+ * Asked twice: by the cancel itself, and by a **recovered** execution whose
+ * cancel was requested ([`openExecution`]), because the first walk is not
+ * atomic with the request it follows. A process that died after recording the
+ * parent's request and before a child's left the child open with nothing
+ * asking it to stop, and the parent's replay re-issuing its dispatch would
+ * resume it as an ordinary child — ruling e's "restart mid-cancel completes the
+ * cancel" broken one generation down. A child already carrying a request is
+ * passed over: it completes its own cancel, cascade included, when it is
+ * recovered.
+ */
+async function cascadeCancel(journal: Journal, execution: string): Promise<void> {
   for (const row of await journal.openExecutions()) {
-    if (row.lineage?.parent === execution) await cancelExecution(row.id);
+    if (row.lineage?.parent !== execution) continue;
+    if (row.cancelRequestedAt !== undefined && cancelFired(row.id)) continue;
+    await cancelExecution(row.id);
   }
 }
 
@@ -6412,13 +6433,36 @@ async function runExecLive(
   // …) `` propagates as raised, and the catch keeps its one meaning: the
   // platform declined to start a command whose inputs all resolved.
   const cwd = binding.cwd === undefined ? undefined : interpolate(binding.cwd);
+  const signal = context.signal;
   const spawned = new Promise<{ code: number; stdout: string; stderr: string }>(
     (resolve, reject) => {
-      const child = spawn(command, args, {
-        cwd,
-        env: environment,
-        signal: context.signal,
-      });
+      // A signal that has already aborted forks nothing: the deadline or the
+      // cancel came first, and a command started now would be one to stop.
+      if (signal.aborted) {
+        reject(abortedBy(signal));
+        return;
+      }
+      const child = forkExecCommand(command, args, cwd, environment);
+      holdCommand(child);
+      // **The command's whole process group is what an abort stops** — the
+      // node's deadline or the execution's cancel (grammar 9.2, PRD resolved
+      // q75 ruling b): `SIGTERM` to the group at once, and `SIGKILL` to it once
+      // [`EXEC_STOP_GRACE_MS`] has passed ([`stopExecGroup`]). The group rather
+      // than the pid, because a command is very often a shell that forks — a
+      // `SIGTERM` aimed at it alone would end the shell and leave the `sleep`,
+      // the build or the server it started running, reparented, for as long as
+      // it likes. The promise rejects at once, as the platform's own `signal:`
+      // option would have: the node does not wait for a command it has told to
+      // stop.
+      const onAbort = (): void => {
+        stopExecGroup(child);
+        reject(abortedBy(signal));
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      const done = (): void => {
+        signal.removeEventListener("abort", onAbort);
+        releaseCommand(child);
+      };
       let stdout = "";
       let stderr = "";
       child.stdout.on("data", (chunk: Buffer) => {
@@ -6427,8 +6471,14 @@ async function runExecLive(
       child.stderr.on("data", (chunk: Buffer) => {
         stderr += chunk.toString();
       });
-      child.on("error", reject);
-      child.on("close", (code) => resolve({ code: code ?? -1, stdout, stderr }));
+      child.on("error", (error) => {
+        done();
+        reject(error);
+      });
+      child.on("close", (code) => {
+        done();
+        resolve({ code: code ?? -1, stdout, stderr });
+      });
       // A command that never reads its input closes the pipe while this write is
       // still in flight, and Node reports that as an `error` **event on the
       // stream** rather than as a rejected promise. Unhandled, an EventEmitter
@@ -6509,6 +6559,135 @@ async function runExecLive(
     },
     "trimmed",
   );
+}
+
+/**
+ * Fork one `exec:` command into a process group of its own, with the stop
+ * sweep armed **first** — [`forkBoundShell`]'s ordering, for the same reason
+ * (see [`armCommandSweep`]): `crates/compose-core/src/codegen/runtime.rs` holds
+ * the two lines in this order.
+ *
+ * `detached` is what puts the command in a group of its own, which is what an
+ * abort stops ([`stopExecGroup`]): a command that forks — a shell script, a
+ * build, a wrapper that starts a server — has its real work in its children,
+ * and a signal aimed at the command's pid alone would leave them running
+ * after the node that started them settled (PRD resolved q75 ruling b's "no
+ * child process alive"). A group of its own is also one the **terminal** no
+ * longer reaches, so the command joins the sweep that takes `builtin.bash`'s
+ * groups with a stop signal ([`holdCommand`]) — `Ctrl-C` at a `run` still
+ * stops what the run started.
+ *
+ * What still escapes is what left the group deliberately — a command that calls
+ * `setsid` or double-forks a daemon away — which [`killCommandGroup`] already
+ * says of a shell.
+ */
+function forkExecCommand(
+  command: string,
+  args: readonly string[],
+  cwd: string | undefined,
+  environment: NodeJS.ProcessEnv,
+) {
+  armCommandSweep();
+  try {
+    return spawn(command, args, { cwd, env: environment, detached: true });
+  } catch (error) {
+    if (runningCommands.size === 0) standDown();
+    throw error;
+  }
+}
+
+/**
+ * How long an aborted `exec:` command's process group has to end on `SIGTERM`
+ * before it is killed.
+ *
+ * Long enough for a command that cleans up on `SIGTERM` to do it; short enough
+ * that a command that ignores it is gone well inside the ten seconds PRD
+ * resolved q75 gives a cancel, and inside a worker's own five-second grace for
+ * the node runner it stops (`docs/distributed.md` §3.2) — so a runner that
+ * exits on time has killed its commands' groups first.
+ */
+const EXEC_STOP_GRACE_MS = 2_000;
+
+/**
+ * The `exec:` groups sent `SIGTERM` and not yet killed, each with the timer
+ * that will kill it.
+ *
+ * Held so that a process which **exits** inside a grace — a `run` whose
+ * cancelled node was its last, a node runner posting its cancelled result —
+ * kills them on its way out instead of leaving a command that ignored
+ * `SIGTERM` behind ([`killStoppingOnExit`]).
+ */
+const stoppingExecGroups = new Map<ChildProcess, ReturnType<typeof setTimeout>>();
+
+/** Whether the exit hook [`killStoppingOnExit`] has been installed. */
+let exitKillInstalled = false;
+
+/**
+ * Stop one aborted `exec:` command: `SIGTERM` to its whole process group now,
+ * and `SIGKILL` to it once [`EXEC_STOP_GRACE_MS`] has passed.
+ *
+ * The kill is aimed at the group whatever the command did with the `SIGTERM`:
+ * a shell that exits on it can leave a child behind that does not, and the
+ * group outlives its leader for as long as any member is alive. The timer does
+ * not hold this process open; a process that exits first kills the group on
+ * the way out instead.
+ */
+function stopExecGroup(child: ChildProcess): void {
+  signalGroup(child, "SIGTERM");
+  if (stoppingExecGroups.has(child)) return;
+  if (!exitKillInstalled) {
+    exitKillInstalled = true;
+    process.on("exit", killStoppingOnExit);
+  }
+  const timer = setTimeout(() => {
+    stoppingExecGroups.delete(child);
+    killCommandGroup(child);
+  }, EXEC_STOP_GRACE_MS);
+  timer.unref?.();
+  stoppingExecGroups.set(child, timer);
+}
+
+/** Kill every `exec:` group still inside its grace, as this process exits. */
+function killStoppingOnExit(): void {
+  for (const [child, timer] of stoppingExecGroups) {
+    clearTimeout(timer);
+    killCommandGroup(child);
+  }
+  stoppingExecGroups.clear();
+}
+
+/**
+ * Send `signal` to `child`'s process group, or to `child` alone on a host
+ * without groups ([`killCommandGroup`]'s fallback, at a signal of the
+ * caller's).
+ */
+function signalGroup(child: ChildProcess, signal: NodeJS.Signals): void {
+  const pid = child.pid;
+  if (pid !== undefined) {
+    try {
+      process.kill(-pid, signal);
+      return;
+    } catch {
+      // Already gone, or a host without process groups: fall through.
+    }
+  }
+  try {
+    child.kill(signal);
+  } catch {
+    // Already gone.
+  }
+}
+
+/**
+ * What an `exec:` command an abort stopped rejects with: the platform's own
+ * `AbortError` shape — what spawning with `signal:` raised — carrying the
+ * signal's reason as its `cause`, so a deadline or a cancel is read off it
+ * exactly as before ([`cancellationOf`]).
+ */
+function abortedBy(signal: AbortSignal): Error {
+  const error = new Error("The operation was aborted", { cause: signal.reason });
+  error.name = "AbortError";
+  return error;
 }
 
 // ---------------------------------------------------------------------------
@@ -7670,9 +7849,9 @@ function held(buffered: string): string {
  *
  * What still escapes is what **left the group deliberately**: a command that
  * calls `setsid`, one that turned job control on (`set -m`), a daemon that
- * double-forks away. Those are the same processes a hand-rolled `exec:` tool
- * would leave behind, and containing them is the distribution work's rather than
- * this bound's (grammar 5.5, Decision D124).
+ * double-forks away. Those escape an `exec:` command's group the same way
+ * ([`forkExecCommand`]), and containing them is the distribution work's rather
+ * than this bound's (grammar 5.5, Decisions D124, D160).
  *
  * The fallback is for the host where the group kill is not a thing —
  * `process.kill` with a negative pid is a POSIX call, and Windows is a posture
@@ -7698,7 +7877,7 @@ function killCommandGroup(child: ChildProcess): void {
   }
 }
 
-/** The `builtin.bash` shells this process has running right now. */
+/** The `builtin.bash` shells and `exec:` commands this process has running right now. */
 const runningCommands = new Set<ChildProcess>();
 
 /** The stop signals swept for, and the handlers installed for them. */
@@ -7713,9 +7892,9 @@ const commandSweeps: (() => void)[] = [];
  * the foreground one any more, so the `SIGINT` a person types reaches this
  * process and nothing below it. Left there, `Ctrl-C` on a `run` would end the
  * graph and leave the build it was in the middle of still writing into the
- * workspace — a regression against a hand-rolled `exec:` tool, whose child *is*
- * in that group and does die. So the group a session detached is swept here
- * instead, and what the terminal used to do the runtime now does.
+ * workspace. So the group a session detached is swept here instead, and what
+ * the terminal used to do the runtime now does — for an `exec:` command's group
+ * too, which is detached for the same reason a shell is ([`forkExecCommand`]).
  *
  * **Armed before the fork rather than after it**, which is an ordering and not a
  * detail. A stop signal has a *disposition* before it has a listener: until the
@@ -7753,13 +7932,13 @@ function armCommandSweep(): void {
   }
 }
 
-/** Register a running shell with the sweep [`armCommandSweep`] armed. */
+/** Register a running shell or command with the sweep [`armCommandSweep`] armed. */
 function holdCommand(child: ChildProcess): void {
   armCommandSweep();
   runningCommands.add(child);
 }
 
-/** Drop a shell that has ended, and the sweep with the last of them. */
+/** Drop a shell or command that has ended, and the sweep with the last of them. */
 function releaseCommand(child: ChildProcess): void {
   runningCommands.delete(child);
   if (runningCommands.size === 0) standDown();
@@ -12856,6 +13035,11 @@ export async function runMap(
         idempotencyKey: site.idempotencyKey,
       });
       const gate = gateOf(route);
+      // The delivery's own site, which is what a cancel's exemption is read at:
+      // a delivery a **finally** node issued is part of how its instance ends,
+      // and a cancel stops none of it (Decision D160, [`finallySites`]).
+      const deliverySite = site.path.join("/");
+      const fromFinally = underRunningFinally(scoped.execution.id, deliverySite);
       // Its own signal, never the node's: see *A detached delivery is off the
       // node's clock* above. One per delivery rather than one per call, so a
       // fan-out of many sinks does not pile listeners onto a shared signal.
@@ -12885,7 +13069,10 @@ export async function runMap(
         // any running node (PRD resolved q75 ruling b, Decision D160): it is a
         // dispatch of this execution, not an execution of its own — a detached
         // `flow.*` is, and the cancel reaches it through the cascade instead.
-        signal: executionCancels.get(scoped.execution.id)?.signal ?? new AbortController().signal,
+        // Read through [`cancelSignalFor`], so a delivery a finally node issued
+        // chains to nothing — on a cancelled execution that node runs *because*
+        // of the cancel, and the execution's signal has already fired.
+        signal: cancelSignalFor(scoped.execution.id, deliverySite) ?? new AbortController().signal,
         deadline: undefined,
         // …and off the instance's end, for the same reason: the delivery was
         // issued when its record was written, and the instance ending around
@@ -12909,7 +13096,15 @@ export async function runMap(
       // — including before `route.run` is reached. (A `flow.*` sink's nodes run
       // under the child execution's own id, which this execution's reading
       // never counted in the first place.)
-      const undetach = detaching(scoped.execution.id, site.path.join("/"));
+      const undetach = detaching(scoped.execution.id, deliverySite);
+      // And the exemption **lasts as long as the delivery does**, not only as
+      // long as the finally node that issued it: the node resolves a detached
+      // dispatch at once (D94) and settles, and what the delivery goes on to
+      // run — an agent's model turns, the instances its `flow.*` tools begin —
+      // reads its own cancel signal at its own site, after that node is gone.
+      // Marking the delivery's site as a finally node's keeps every one of
+      // those chained to nothing, which is "a finally node and all it begins".
+      const unmark = fromFinally ? finallyRunning(scoped.execution.id, deliverySite) : undefined;
       const delivering = (async () => {
         try {
           // **A child execution is issued now and admitted inside** (PRD
@@ -12961,6 +13156,7 @@ export async function runMap(
         } finally {
           retire(plan.admission, admission);
           undetach();
+          unmark?.();
         }
       })().catch((error: unknown) => {
         // Nothing it does can fail the enclosing flow instance, which is what an
@@ -13601,7 +13797,17 @@ export async function dispatchChild(
       if (!childrenBeginHere) throw new ChildOnAWorker(flow, lineage.idempotencyKey);
       const journal = await openJournal();
       const row = await journal.execution(id);
-      if (row !== undefined) return row.status === "open" ? childOf(row) : undefined;
+      if (row !== undefined) {
+        if (row.status !== "open") return undefined;
+        // An open child a cancelled parent reaches again — a recovered parent's
+        // re-issued dispatch — is cancelled as it resumes, exactly as one it
+        // begins below is: the cascade's walk may have missed it (PRD resolved
+        // q75 ruling c).
+        if (cancelFired(lineage.parent) && row.cancelRequestedAt === undefined) {
+          await journal.requestCancel(id);
+        }
+        return childOf(row);
+      }
       const adopted = await adoptDelivery(journal, lineage, id, site.path.join("/"));
       const parent = await journal.execution(lineage.parent);
       const child: ChildExecution = {
@@ -16039,6 +16245,17 @@ export async function openExecution(opening: ExecutionOpening): Promise<Lineage 
     );
   }
   openedExecutions.add(opening.execution);
+  // **The one controller a cancel of this execution pulls** (Decision D160),
+  // opened in this tick — before anything below is awaited — rather than once
+  // the row is begun. `src/serve.ts` answers a trigger's request while the
+  // `begin` below is still in flight, and on a dialled journal that is real
+  // network I/O: a cancel arriving inside it records its request and fires the
+  // controller it finds, so a controller opened only afterwards would be a
+  // fresh one nothing ever fires, and the run would go on to its end with its
+  // cancel recorded and its waits refusing every answer. Opened here, the
+  // cancel finds it and the first node begins already stopped.
+  const ownsController = !executionCancels.has(opening.execution);
+  executionCancelSignal(opening.execution);
   try {
     const journal = await openJournal();
     const resuming = opening.resuming === true;
@@ -16082,21 +16299,29 @@ export async function openExecution(opening: ExecutionOpening): Promise<Lineage 
       }
     }
     openSession(opening.execution, journal, resuming);
-    // The one controller a cancel of this execution pulls (Decision D160) — and
-    // a cancel already requested: a resumed generation completes it at its
+    // A cancel already requested: a resumed generation completes it at its
     // frontier, replaying what the record holds and issuing nothing past it
     // ([`completeCancel`]), and a child that has not run yet is cancelled
     // before its first node begins.
-    executionCancelSignal(opening.execution);
     if (cancelRequested !== undefined) {
       if (resuming) completeCancel(opening.execution);
       else fireCancel(opening.execution);
+    }
+    // …and the **cascade** a resumed one owes: the process that accepted the
+    // cancel may have died between recording this execution's request and its
+    // children's, so the walk [`cancelExecution`] began is walked again here —
+    // before the replay re-issues any dispatch, so a child it reaches again
+    // resumes carrying its own request and completes its cancel at its own
+    // frontier (PRD resolved q75 rulings c and e).
+    if (cancelRequested !== undefined && resuming) {
+      await cascadeCancel(journal, opening.execution);
     }
     settledJournals.set(opening.execution, journal);
     executionSessions.set(opening.execution, opening.sessionKey);
     return lineage;
   } catch (error) {
     openedExecutions.delete(opening.execution);
+    if (ownsController) executionCancels.delete(opening.execution);
     throw error;
   }
 }

@@ -282,6 +282,18 @@ const polling = new Map<string, number>();
 const cancelling = new Set<string>();
 
 /**
+ * The dispatches the hub **stopped waiting for** while a worker ran them — the
+ * node's own deadline ran out, or the execution ended around it — and told the
+ * holder to stop ([`stopOnHolder`]). Kept apart from [`cancelling`] because the
+ * two settle differently: a cancelled dispatch is settled by the worker's
+ * cancelled result as the cancel it was, while one of these is superseded, and
+ * a result for it — whichever reaches the hub first, the result or the write —
+ * is refused `409` and only frees the slot. Read as a cancel, a deadline would
+ * be replayed by a restarted hub as the execution's cancel.
+ */
+const stopping = new Set<string>();
+
+/**
  * How many times the board has moved in this process.
  *
  * Read **before** a poll looks at the board and compared **after** it has
@@ -661,30 +673,45 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
       continue;
     }
     if (row.status === "superseded") {
+      // A dispatch this execution's **cancel** withdrew — parked, or reached
+      // still open by a generation completing the cancel (below) — is read back
+      // as the cancel it was, exactly as a row a worker settled cancelled is
+      // above, and never as a failure a `retry:` or an `on_error:` would act on
+      // (PRD resolved q75, `docs/durability.md` §6.1).
+      if (row.detail === CANCELLED_DETAIL) {
+        fireCancel(options.execution);
+        throw new ExecutionCancelled(options.execution);
+      }
       throw new DispatchSuperseded(
         options.node,
         options.placement,
         row.detail ?? "the hub ended this dispatch without a result",
       );
     }
+    // A dispatch still open in an execution whose cancel a dead process had
+    // accepted is a **frontier** the record cannot replay past: the cancel is
+    // completed here instead of the wait being held (PRD resolved q75). Asked
+    // **before** the orphan rule below, because a row the dead process had
+    // handed to a worker is the commonest such frontier — the node was running
+    // when the cancel came — and one this start left `dispatched` for exactly
+    // this question ([`supersedeOrphans`]): read as an orphan first, it would
+    // fail the node's attempt under its `retry:`/`on_error:` chain, the one
+    // thing a cancelled node is never routed through.
+    const refusal = frontierRefusal(options.execution, site);
+    if (refusal !== undefined) {
+      await journal.supersedeDispatch(row.id, CANCELLED_DETAIL);
+      throw refusal;
+    }
     // …and a row some dead process had handed to a session: sessions are this
     // process's only (§5), so one it did not issue is one whose holder this hub
     // has ended. **Superseded, never put back on the board** — see
     // [`supersedeOrphans`], which is where the same rule is applied at start and
     // where the reasoning is. This is its belt-and-braces: a row that reached
-    // here still `dispatched` is one that start could not read.
+    // here still `dispatched` is one that start could not read, or one it left
+    // for the frontier above.
     if (row.status === "dispatched" && !sessions.has(row.session ?? "")) {
       await journal.supersedeDispatch(row.id, ORPHANED);
       throw new DispatchSuperseded(options.node, options.placement, ORPHANED);
-    }
-    // A dispatch still open in an execution whose cancel a dead process had
-    // accepted is a **frontier** the record cannot replay past: the cancel is
-    // completed here instead of the wait being held (PRD resolved q75). The
-    // abort it fires withdraws the row below, through the node's own signal.
-    const refusal = frontierRefusal(options.execution, site);
-    if (refusal !== undefined) {
-      await journal.supersedeDispatch(row.id, CANCELLED_DETAIL);
-      throw refusal;
     }
     rows.set(row.id, row);
 
@@ -692,6 +719,31 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
     if (ending.kind === "answer") return absorb(options, ending.answer);
     await answered(journal, options, ending.pause);
   }
+}
+
+/**
+ * Tell the session holding dispatch `id` to stop it, and keep it on that
+ * session's count until the worker's result arrives (§2, §3.2; PRD resolved
+ * q75, q79). Answers whether a session is holding it — `false` for a row still
+ * parked, or one whose session has already ended, which nobody is running.
+ *
+ * What every way the hub stops waiting for a dispatch a worker holds goes
+ * through — its execution's cancel, the node's own deadline, the execution
+ * ending around it — because each leaves the same process running on the
+ * worker: the dispatch is named in the holder's next poll's `cancel` list, the
+ * worker stops the runner, and its result is what frees the slot ([`result`]).
+ * A slot freed the moment the hub stopped waiting would be handed new work while
+ * the old process still ran, and a session at `max_running: 1` — the machine
+ * with the GPU — would be running two.
+ */
+function stopOnHolder(id: string, row: DispatchRow, why: "cancel" | "stop"): boolean {
+  const current = rows.get(id) ?? row;
+  if (current.status !== "dispatched" || current.session === undefined) return false;
+  const session = sessions.get(current.session);
+  if (session === undefined) return false;
+  (why === "cancel" ? cancelling : stopping).add(id);
+  session.cancels.add(id);
+  return true;
 }
 
 /**
@@ -729,23 +781,18 @@ function awaited(
       // poll and stops the process running it; its `status: "cancelled"` result
       // is what settles the row (§3.4). The node stops waiting either way.
       if (cancellationOf(options.signal?.reason) !== undefined) {
-        const current = rows.get(row.id) ?? row;
-        const holder = current.status === "dispatched" ? current.session : undefined;
         held.settle({
           kind: "error",
           name: CANCELLED,
           message: new ExecutionCancelled(options.execution).message,
         });
-        if (holder === undefined) {
+        if (!stopOnHolder(row.id, row, "cancel")) {
           rows.delete(row.id);
           void journal.supersedeDispatch(row.id, CANCELLED_DETAIL).catch((error: unknown) => {
             process.stderr.write(
               `could not withdraw \`${row.id}\`: ${error instanceof Error ? error.message : String(error)}\n`,
             );
           });
-        } else {
-          cancelling.add(row.id);
-          sessions.get(holder)?.cancels.add(row.id);
         }
         stirPolls();
         return;
@@ -766,7 +813,13 @@ function awaited(
       // on the turn the write lands, and a hub that died in between meets the
       // dispatch again at the next start's `unsettledDispatches` walk, which
       // supersedes exactly the rows this one would have.
-      rows.delete(row.id);
+      //
+      // **Save a row a worker is running**, which is kept and told to stop
+      // ([`stopOnHolder`]): the hub giving up on a dispatch is not the worker
+      // giving up on it, and a slot freed while its process still runs is a
+      // session running more than its placement's `max_running:` (§2, Decision
+      // D161).
+      if (!stopOnHolder(row.id, row, "stop")) rows.delete(row.id);
       held.settle({ kind: "error", name: "DispatchSuperseded", message: reason });
       void journal
         .supersedeDispatch(row.id, `the hub stopped waiting for this dispatch: ${reason}`)
@@ -1122,7 +1175,10 @@ export function releasePlacementWaits(execution: string): void {
   for (const [id, held] of [...awaiting]) {
     if (held.execution !== execution) continue;
     freed = true;
-    rows.delete(id);
+    // A dispatch a worker is running is told to stop, and counts until it has
+    // ([`stopOnHolder`]).
+    const row = rows.get(id);
+    if (row === undefined || !stopOnHolder(id, row, "stop")) rows.delete(id);
     // Settled as a failure rather than left pending: the promise belongs to a
     // node execution nothing is waiting for any more, and a promise nobody
     // resolves is a `serve` process holding one per abandoned branch.
@@ -1251,6 +1307,12 @@ function announceWaits(execution: string): void {
   for (const watcher of [...watchers]) watcher();
 }
 
+/** Whether any dispatch this process is awaiting is still parked, untaken. */
+function anyParked(): boolean {
+  for (const held of awaiting.values()) if (!held.taken) return true;
+  return false;
+}
+
 /**
  * How many placement waits `execution` is holding at or inside `site` that
  * **no worker has taken**.
@@ -1368,8 +1430,22 @@ export function mountWorkerRoutes(app: FastifyInstance): void {
 async function supersedeOrphans(): Promise<void> {
   try {
     const journal = await openJournal();
+    // **Save the rows of an execution whose cancel a dead process had
+    // accepted** (PRD resolved q75, `docs/durability.md` §6.1). The replay that
+    // completes that cancel reads a dispatch still unsettled as a *frontier* —
+    // where the cancel would have stopped the node — and a row superseded here
+    // would reach it as an ordinary orphan instead: the node's attempt failed,
+    // its `retry:` and `on_error:` run, and the execution ends `failed`. Left
+    // `dispatched`, the row is the replay's to end ([`dispatchPlaced`]); no
+    // session of this process names it, so nothing can hand it out meanwhile.
+    const cancelRequested = new Set(
+      (await journal.openExecutions())
+        .filter((execution) => execution.cancelRequestedAt !== undefined)
+        .map((execution) => execution.id),
+    );
     for (const row of await journal.unsettledDispatches()) {
-      if (row.status === "dispatched") await journal.supersedeDispatch(row.id, ORPHANED);
+      if (row.status !== "dispatched" || cancelRequested.has(row.execution)) continue;
+      await journal.supersedeDispatch(row.id, ORPHANED);
     }
   } catch (error) {
     // A journal this process cannot read is not a reason to refuse to serve:
@@ -1671,6 +1747,15 @@ async function poll(
     }
   } finally {
     polling.delete(session.id);
+    // **A poll leaving can be what a parked dispatch was waiting for.** The
+    // least-loaded rule ([`leastLoaded`]) may have passed another held poll
+    // over in favour of this session — for a placement this one then did not
+    // take, because it took another's work first — and that poll is asleep
+    // with the dispatch still parked for it. Nothing else moves the board, so
+    // it would sleep out its whole hold: §2's "one round trip after the hold is
+    // answered" lost to a choice made a moment too early. Stirred only while
+    // something is parked, so a quiet mesh is not woken by its own heartbeat.
+    if (anyParked()) stirPolls();
     // Off with the handler: `close` fires on an ordinary answer too, once the
     // response has been written, and a listener left behind would be one per
     // poll on a connection the runtime warns about at ten.
@@ -1789,7 +1874,7 @@ function heldFor(session: string, placement: string): number {
     if (row.session !== session || row.status !== "dispatched" || row.placement !== placement) {
       continue;
     }
-    if (awaiting.has(row.id) || cancelling.has(row.id)) held += 1;
+    if (awaiting.has(row.id) || cancelling.has(row.id) || stopping.has(row.id)) held += 1;
   }
   return held;
 }
@@ -2069,6 +2154,21 @@ async function result(request: FastifyRequest, reply: FastifyReply): Promise<unk
       error: "a result names the `dispatch_id` it settles, and this one names none",
     });
   }
+  // A dispatch the hub stopped waiting for while this worker ran it — the
+  // node ran out of time, or its execution ended — is off this session's count
+  // **now**: this result is the worker saying its process has stopped (§2,
+  // [`stopOnHolder`]). Refused `409` whatever it carries, and before the row is
+  // read, because the write superseding it may not have landed yet and a row
+  // still `dispatched` must not be settled by a result the execution has moved
+  // past.
+  if (stopping.delete(id)) {
+    rows.delete(id);
+    stirPolls();
+    return reply.code(409).send({
+      dispatch_id: id,
+      error: `\`${id}\` was superseded by this hub and the execution has moved past it: the hub stopped waiting for this dispatch`,
+    });
+  }
   const journal = await openJournal();
   const row = await journal.dispatchOf(id);
   // **`409`, not `410`.** §3.4: the hub knows this worker and does not want this
@@ -2085,6 +2185,12 @@ async function result(request: FastifyRequest, reply: FastifyReply): Promise<unk
   // and not over a case: settling a row no attempt exists for would journal an
   // outcome against work that never started.
   if (row === undefined || row.status === "superseded" || row.status === "parked") {
+    // A cancelled dispatch some other path superseded meanwhile is off its
+    // session's count too: the worker has stopped it.
+    if (cancelling.delete(id)) {
+      rows.delete(id);
+      stirPolls();
+    }
     return reply.code(409).send({
       dispatch_id: id,
       error:
@@ -2408,6 +2514,7 @@ async function sweep(windowMs: number): Promise<void> {
     await journal.supersedeDispatch(id, detail);
     rows.delete(id);
     cancelling.delete(id);
+    stopping.delete(id);
     const held = awaiting.get(id);
     if (held === undefined) continue;
     awaiting.delete(id);
