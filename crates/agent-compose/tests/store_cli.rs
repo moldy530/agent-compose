@@ -2016,6 +2016,48 @@ fn history(project: &Project, notes: &str) {
         "the table names the cursor of the page after it:\n{paged}"
     );
 
+    // An import's writes are an operator's too: each line it writes is a `set`
+    // recorded as actor `cli`, and the history the export did not carry is
+    // not written back — the imported key's history begins at the import.
+    let imported = project.store_with(
+        "import",
+        &[&audits, "--format", "json"],
+        Given {
+            input: Some(&format!(
+                "{}\n",
+                json!({ "key": "restored", "value": { "text": "back" }, "version": 7 })
+            )),
+            ..Given::default()
+        },
+    );
+    assert_eq!(
+        imported.exits(0).json(),
+        json!({ "read": 1, "written": 1, "skipped": 0, "expired": 0, "present": 0 })
+    );
+    let restored = project
+        .store("log", &[&audits, "restored", "--format", "json"])
+        .exits(0)
+        .json();
+    let restored = restored["entries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a log answers the history op's page: {restored}"));
+    assert_eq!(restored.len(), 1, "one line, one row: {restored:?}");
+    assert_eq!(restored[0]["op"], "set", "{restored:?}");
+    assert_eq!(
+        restored[0]["actor"],
+        json!({ "kind": "cli" }),
+        "{restored:?}"
+    );
+    assert_eq!(
+        restored[0]["new_value"],
+        json!({ "text": "back" }),
+        "{restored:?}"
+    );
+    assert!(
+        restored[0].get("old_value").is_none(),
+        "an import writes no history back, so its row is the key's first: {restored:?}"
+    );
+
     // A key with no history is an empty page, not a failure.
     let none = project.store("log", &[&audits, "nobody"]);
     none.exits(0);
