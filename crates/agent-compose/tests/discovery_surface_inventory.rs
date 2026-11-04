@@ -937,6 +937,7 @@ fn the_help_lists_the_verbs_that_act_before_the_verbs_that_teach() {
         "resume",
         "run",
         "serve",
+        "cancel",
         "store",
         "worker",
     ];

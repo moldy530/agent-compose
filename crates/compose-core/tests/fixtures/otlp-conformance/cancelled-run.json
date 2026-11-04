@@ -1,0 +1,342 @@
+{
+  "name": "cancelled-run",
+  "about": "A run somebody cancelled (PRD resolved q75, Decision D160) while its `code` node was running. The root span is UNSET — a cancel is neither a success nor something that went wrong, and `agentcompose.status` says `cancelled` — and carries no status message, because a cancelled envelope carries no `error`. The node the cancel stopped is an UNSET span whose `agentcompose.outcome` says `cancelled`, with no `agentcompose.error`; the instance's `finally:` node, which a cancel never stops, ran after it and completed.",
+  "context": {
+    "target": "production",
+    "artifact": "sha256:00000000000000000000000000000000000000000000000000000000000000c7",
+    "compiler": "0.0.0-dev",
+    "startedAt": "2026-11-04T09:00:00.000Z",
+    "endedAt": "2026-11-04T09:00:06.000Z"
+  },
+  "document": {
+    "trace_version": 7,
+    "flow": "flow.patch",
+    "execution_id": "exec_stopped",
+    "status": "cancelled",
+    "entries": [
+      {
+        "step": 1,
+        "flow": "flow.patch",
+        "node": "plan",
+        "traversal": 0,
+        "outcome": "completed",
+        "attempts": 1,
+        "writes": [
+          "plan"
+        ]
+      },
+      {
+        "step": 2,
+        "flow": "flow.patch",
+        "node": "code",
+        "traversal": 0,
+        "outcome": "cancelled",
+        "attempts": 1
+      },
+      {
+        "step": 3,
+        "flow": "flow.patch",
+        "node": "tidy",
+        "traversal": 0,
+        "outcome": "completed",
+        "attempts": 1,
+        "writes": []
+      }
+    ]
+  },
+  "expected": {
+    "resourceSpans": [
+      {
+        "resource": {
+          "attributes": [
+            {
+              "key": "service.name",
+              "value": {
+                "stringValue": "flow.patch"
+              }
+            },
+            {
+              "key": "service.namespace",
+              "value": {
+                "stringValue": "production"
+              }
+            },
+            {
+              "key": "service.version",
+              "value": {
+                "stringValue": "sha256:00000000000000000000000000000000000000000000000000000000000000c7"
+              }
+            },
+            {
+              "key": "deployment.environment.name",
+              "value": {
+                "stringValue": "production"
+              }
+            },
+            {
+              "key": "telemetry.sdk.name",
+              "value": {
+                "stringValue": "agent-compose"
+              }
+            },
+            {
+              "key": "telemetry.sdk.language",
+              "value": {
+                "stringValue": "nodejs"
+              }
+            },
+            {
+              "key": "telemetry.sdk.version",
+              "value": {
+                "stringValue": "0.0.0-dev"
+              }
+            }
+          ]
+        },
+        "scopeSpans": [
+          {
+            "scope": {
+              "name": "agent-compose",
+              "version": "0.0.0-dev"
+            },
+            "spans": [
+              {
+                "traceId": "c5473b06976a8f2df14f3f1bc37e1225",
+                "spanId": "120560734942e085",
+                "name": "flow.patch",
+                "kind": 1,
+                "startTimeUnixNano": "1793782800000000000",
+                "endTimeUnixNano": "1793782806000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.execution.id",
+                    "value": {
+                      "stringValue": "exec_stopped"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.patch"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.status",
+                    "value": {
+                      "stringValue": "cancelled"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.trace_version",
+                    "value": {
+                      "intValue": "7"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 0
+                }
+              },
+              {
+                "traceId": "c5473b06976a8f2df14f3f1bc37e1225",
+                "spanId": "3435ecf64a0effe2",
+                "parentSpanId": "120560734942e085",
+                "name": "plan",
+                "kind": 1,
+                "startTimeUnixNano": "1793782800000000000",
+                "endTimeUnixNano": "1793782806000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_stopped/plan/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.patch"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "plan"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "plan"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "c5473b06976a8f2df14f3f1bc37e1225",
+                "spanId": "b9571f749434bed3",
+                "parentSpanId": "120560734942e085",
+                "name": "code",
+                "kind": 1,
+                "startTimeUnixNano": "1793782800000000000",
+                "endTimeUnixNano": "1793782806000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_stopped/code/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.patch"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "code"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "2"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "cancelled"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 0
+                }
+              },
+              {
+                "traceId": "c5473b06976a8f2df14f3f1bc37e1225",
+                "spanId": "cce6141d5d14e56d",
+                "parentSpanId": "120560734942e085",
+                "name": "tidy",
+                "kind": 1,
+                "startTimeUnixNano": "1793782800000000000",
+                "endTimeUnixNano": "1793782806000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_stopped/tidy/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.patch"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "tidy"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "3"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": []
+                      }
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -3146,3 +3146,287 @@ fn a_hold_that_outlives_the_liveness_window_is_refused_at_launch() {
     );
     drop(harness::Scratch::at(out));
 }
+
+// ---------------------------------------------------------------------------
+// Protocol 3 — capacity, the least-loaded rule, and a cancel over the wire
+// (PRD resolved q75, q79; Decisions D160, D161)
+// ---------------------------------------------------------------------------
+
+/// The fixture served with `max_running: <cap>` on its `mac` placement.
+fn capped_hub(purpose: &str, cap: u32, extra: &[(&str, &str)]) -> Option<(Hub, harness::Scratch)> {
+    let deploy = std::fs::read_to_string(
+        harness::fixture(FIXTURE)
+            .parent()
+            .expect("a fixture directory")
+            .join("deploy")
+            .join(format!("{TARGET}.yml")),
+    )
+    .expect("the fixture's mesh target is readable");
+    let deploy = deploy.replacen("  mac:\n", &format!("  mac:\n    max_running: {cap}\n"), 1);
+    let (composition, entrypoint) = harness::staged_with_deploy(purpose, FIXTURE, TARGET, &deploy);
+    let out = harness::scratch_project(purpose)?;
+    let provider = MockProvider::start().expect("a loopback port");
+    let mut held = environment(&provider);
+    for (name, value) in extra {
+        held.push(((*name).to_string(), (*value).to_string()));
+    }
+    let served = harness::serve_target_into(&out, &entrypoint, TARGET, &held)?;
+    let client = Client::new(&served.base_url)
+        .expect("the hub's address parses")
+        .with_timeout(Duration::from_secs(30));
+    let base_url = served.base_url.clone();
+    Some((
+        Hub {
+            _served: served,
+            provider,
+            _scratch: Some(harness::Scratch::at(out)),
+            client,
+            base_url,
+        },
+        composition,
+    ))
+}
+
+/// One poll, made on a thread of its own so that two sessions can be holding
+/// polls at once; answers the status and the body.
+fn polling(hub: &Hub, worker: &Worker) -> std::thread::JoinHandle<(u16, Value)> {
+    let base_url = hub.base_url.clone();
+    let session = worker.session.clone();
+    std::thread::spawn(move || {
+        let client = Client::new(&base_url)
+            .expect("the hub's address parses")
+            .with_timeout(Duration::from_secs(30));
+        let answered = client
+            .send(Hub::authorized("GET", "/workers/poll").header("x-worker-session", &session))
+            .expect("the hub answers a poll");
+        let status = answered.status;
+        let body = if status == 200 {
+            answered.json()
+        } else {
+            Value::Null
+        };
+        (status, body)
+    })
+}
+
+/// A worker of protocol `2` is refused at the join, naming both versions
+/// (`docs/distributed.md` §10.4, row `3`).
+///
+/// Protocol `3` is the bump PRD resolved q75 and q79 share: a `2` worker would
+/// ignore a poll's `cancel` list, never post the cancelled ending, and queue a
+/// second dispatch behind the first. It is refused rather than let be wrong.
+#[test]
+fn a_protocol_two_worker_is_refused_at_the_join() {
+    assert_eq!(PROTOCOL, 3, "this build speaks protocol 3");
+    let Some(hub) = hub() else {
+        return;
+    };
+    let refused = hub.joining(&[("protocol", json!(2))]);
+    assert_eq!(refused.status, 409, "{}", body_of(&refused));
+    let body = refused.json();
+    assert_eq!(body["protocol"], 3, "{body:#}");
+    assert_eq!(
+        body["error"],
+        "this hub speaks protocol 3 and the worker speaks 2: the worker is behind — upgrade it",
+        "{body:#}"
+    );
+}
+
+/// **A session holds up to its placement's `max_running:`** and no more (§2,
+/// Decision D161).
+///
+/// At a cap of three, one session is handed three items of a five-item fan-out
+/// without settling any — three polls, three dispatches — and its fourth poll is
+/// answered empty, because it is at its cap. Settling one frees a slot, and the
+/// next poll is handed the fourth item.
+#[test]
+fn a_session_holds_up_to_its_placements_max_running_and_no_more() {
+    let Some((hub, _composition)) = capped_hub("wire-capacity", 3, &[]) else {
+        return;
+    };
+    let worker = hub.worker();
+    let execution = hub.start(
+        "/batches",
+        &json!({ "paths": ["a.dmg", "b.dmg", "c.dmg", "d.dmg", "e.dmg"] }),
+    );
+    let mut held: Vec<String> = Vec::new();
+    for _ in 0..3 {
+        let dispatch = worker.dispatch(&hub);
+        held.push(
+            dispatch["dispatch_id"]
+                .as_str()
+                .expect("a dispatch id")
+                .to_string(),
+        );
+        assert_eq!(
+            dispatch["cancel"],
+            json!([]),
+            "a dispatch's poll carries an empty cancel list"
+        );
+    }
+    let at_cap = worker.poll(&hub);
+    assert_eq!(
+        at_cap.status,
+        204,
+        "a session at its cap of three was handed a fourth: {}",
+        body_of(&at_cap)
+    );
+    let settled = worker.settle(&hub, &held[0], &json!({ "signature": "signed" }));
+    assert_eq!(settled.status, 204, "{}", body_of(&settled));
+    let fourth = worker.dispatch(&hub);
+    held.push(fourth["dispatch_id"].as_str().expect("an id").to_string());
+    let fifth = {
+        let settled = worker.settle(&hub, &held[1], &json!({ "signature": "signed" }));
+        assert_eq!(settled.status, 204, "{}", body_of(&settled));
+        worker.dispatch(&hub)
+    };
+    held.push(fifth["dispatch_id"].as_str().expect("an id").to_string());
+    for id in &held[2..] {
+        worker.settle(&hub, id, &json!({ "signature": "signed" }));
+    }
+    hub.until(&execution, "completed", |report| {
+        report["status"] == "completed"
+    });
+}
+
+/// **A parked dispatch goes to the least-loaded session polling for it** —
+/// and between two holding as many, to the one whose poll arrived first (§2,
+/// Decision D161).
+///
+/// At a cap of two: session A takes one item, so it holds one and B holds none.
+/// Both then hold a poll, **A's arriving first**, and the next item parks: it
+/// goes to B, the less loaded, though A asked earlier. Then both hold one, both
+/// poll again with **B's** arriving first, and the next item goes to B — the
+/// oldest poll between two at the same load. Each answer is read off the
+/// polls themselves, which is the dispatch row's session made visible.
+#[test]
+fn a_parked_dispatch_goes_to_the_least_loaded_session_and_then_the_oldest_poll() {
+    // Holds long enough for two polls to be waiting at once when the work
+    // arrives, in §2's relationship to the window.
+    let Some((hub, _composition)) = capped_hub(
+        "wire-least-loaded",
+        2,
+        &[
+            ("AGENT_COMPOSE_MESH_POLL_HOLD_MS", "4000"),
+            ("AGENT_COMPOSE_MESH_LIVENESS_WINDOW_MS", "20000"),
+        ],
+    ) else {
+        return;
+    };
+    let a = hub.worker();
+    let b = hub.worker();
+
+    let first = hub.start("/batches", &json!({ "paths": ["one.dmg"] }));
+    let taken = a.dispatch(&hub);
+    assert!(taken["dispatch_id"].is_string(), "{taken:#}");
+
+    // A asks first, B second; then the work arrives.
+    let asked_a = polling(&hub, &a);
+    std::thread::sleep(Duration::from_millis(300));
+    let asked_b = polling(&hub, &b);
+    std::thread::sleep(Duration::from_millis(300));
+    let second = hub.start("/batches", &json!({ "paths": ["two.dmg"] }));
+    let (status_b, body_b) = asked_b.join().expect("the poll thread ends");
+    let (status_a, body_a) = asked_a.join().expect("the poll thread ends");
+    assert_eq!(
+        (status_a, status_b),
+        (204, 200),
+        "the dispatch went to the more loaded session: A {body_a:#} B {body_b:#}"
+    );
+    assert_eq!(body_b["execution_id"], second, "{body_b:#}");
+
+    // Both hold one now. B asks first this time.
+    let asked_b = polling(&hub, &b);
+    std::thread::sleep(Duration::from_millis(300));
+    let asked_a = polling(&hub, &a);
+    std::thread::sleep(Duration::from_millis(300));
+    let third = hub.start("/batches", &json!({ "paths": ["three.dmg"] }));
+    let (status_a, body_a) = asked_a.join().expect("the poll thread ends");
+    let (status_b, body_b) = asked_b.join().expect("the poll thread ends");
+    assert_eq!(
+        (status_a, status_b),
+        (204, 200),
+        "between two at one load, the dispatch went to the later poll: A {body_a:#} B {body_b:#}"
+    );
+    assert_eq!(body_b["execution_id"], third, "{body_b:#}");
+    let _ = first;
+}
+
+/// **A cancel reaches the worker holding its dispatch, and the cancelled result
+/// settles it** (`docs/distributed.md` §3.2, §3.4, Decision D160).
+///
+/// The cancel is answered `202`; the worker's next poll is a `200` carrying
+/// only the `cancel` list naming the dispatch; until the worker answers, the
+/// dispatch still counts against the session's capacity — a second execution's
+/// item is not handed over — and the cancelled result is `204` and settles the
+/// row `cancelled`, after which the session takes the waiting item.
+#[test]
+fn a_cancel_reaches_the_worker_holding_its_dispatch_and_its_result_settles_it() {
+    let Some(hub) = hub() else {
+        return;
+    };
+    let worker = hub.worker();
+    let execution = hub.start("/batches", &json!({ "paths": ["one.dmg"] }));
+    let dispatch = worker.dispatch(&hub);
+    let id = dispatch["dispatch_id"].as_str().expect("an id").to_string();
+
+    let cancelled = hub.send(Request::post(format!("/executions/{execution}/cancel")));
+    assert_eq!(cancelled.status, 202, "{}", body_of(&cancelled));
+    let told = worker.poll(&hub);
+    assert_eq!(told.status, 200, "{}", body_of(&told));
+    assert_eq!(
+        told.json(),
+        json!({ "cancel": [id] }),
+        "a poll that only tells of a cancel carries the list alone"
+    );
+
+    // Still stopping, so still held: a second execution's item waits.
+    let waiting = hub.start("/batches", &json!({ "paths": ["two.dmg"] }));
+    let held = worker.poll(&hub);
+    assert_eq!(
+        held.status,
+        204,
+        "a cancelled dispatch stopped counting before its result arrived: {}",
+        body_of(&held)
+    );
+
+    let settled = hub.send(
+        worker
+            .request("POST", "/workers/result")
+            .json(&json!({ "dispatch_id": id, "status": "cancelled" })),
+    );
+    assert_eq!(settled.status, 204, "{}", body_of(&settled));
+    let report = hub.until(&execution, "was cancelled", |report| {
+        report["status"] == "cancelled"
+    });
+    assert!(report.get("error").is_none(), "{report:#}");
+    let next = worker.dispatch(&hub);
+    assert_eq!(next["execution_id"], waiting, "{next:#}");
+}
+
+/// **A cancel withdraws a dispatch still parked on the board** (§6.6,
+/// Decision D160): no worker has it, so nobody is told, the row settles
+/// `cancelled`, and a worker that joins afterwards is handed nothing.
+#[test]
+fn a_cancel_withdraws_a_dispatch_still_parked() {
+    let Some(hub) = hub() else {
+        return;
+    };
+    let execution = hub.start("/batches", &json!({ "paths": ["one.dmg"] }));
+    hub.until(&execution, "parked", |report| {
+        report["placement_waits"][0]["status"] == "parked"
+    });
+    let cancelled = hub.send(Request::post(format!("/executions/{execution}/cancel")));
+    assert_eq!(cancelled.status, 202, "{}", body_of(&cancelled));
+    hub.until(&execution, "was cancelled", |report| {
+        report["status"] == "cancelled"
+    });
+    let worker = hub.worker();
+    let answered = worker.poll(&hub);
+    assert_eq!(
+        answered.status,
+        204,
+        "a withdrawn dispatch was handed to a worker: {}",
+        body_of(&answered)
+    );
+}

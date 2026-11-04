@@ -129,6 +129,11 @@ pub const FIXTURES: &[&str] = &[
     "agent-openai",
     "bounded-cycle",
     "builtin-tools",
+    // Cancelling an execution (PRD resolved q75): a command that lingers under a
+    // finally node, the same with a finally node that lingers too, and a parent
+    // whose detached child lingers — what `tests/cancellation_acceptance.rs`
+    // serves and cancels.
+    "cancellation",
     // Child executions (PRD resolved q65): detached `flow.*` dispatches, each
     // starting an execution with its own id, journal, recovery and export.
     // Under `local` with no deploy file — which is what
