@@ -1194,6 +1194,8 @@ fn a_sub_verbs_arguments_are_counted_after_the_sub_verb() {
     assert_eq!((set.positionals, set.options.len()), (4, 0));
     let import = required_arguments(&["store", "import"]);
     assert_eq!((import.positionals, import.options.len()), (2, 0));
+    let log = required_arguments(&["store", "log"]);
+    assert_eq!((log.positionals, log.options.len()), (3, 0));
 
     let written: Vec<String> = "store get main.yml store.notes"
         .split_whitespace()
@@ -1207,9 +1209,11 @@ fn a_sub_verbs_arguments_are_counted_after_the_sub_verb() {
     assert_eq!(
         sub_verbs().get("store").map(Vec::as_slice),
         Some(
-            ["get", "set", "delete", "list", "count", "export", "import"]
-                .map(str::to_string)
-                .as_slice()
+            [
+                "get", "set", "delete", "list", "count", "export", "import", "log"
+            ]
+            .map(str::to_string)
+            .as_slice()
         ),
         "`store --help` lists the sub-verbs in the order the `cli` topic's table does"
     );

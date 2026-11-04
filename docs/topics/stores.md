@@ -985,7 +985,7 @@ does: a write to its partition removes at most 100, and the next process start
 the rest. The cut-off is read off the definition each time, so lengthening or
 shortening `history_retention:` applies to every row already recorded.
 
-**The operator reads it too.** `agent-compose store log store.balances
+**The operator reads it too.** `agent-compose store log main.yml store.balances
 acct/a` prints one page as a table — `--limit`, `--after` the `next` it printed,
 `--format json` for the page as one JSON document (`docs/topics/cli.md`). An
 operator's `set`, `delete` and `import` on this store are recorded with actor
