@@ -23,6 +23,16 @@
 #     `execution.outcome`. A cancel stops the command and runs the finally node,
 #     and what that node begins is not the cancel's to stop: the delivery runs
 #     and `${TALLY_BIN}/ping` appends `pinged cancelled` to `$TALLY_LOG.pings`.
+#   * `flow.asking` — a `human` pause with no `timeout:`, and a finally node that
+#     takes a few seconds before it records how the run ended. A cancel while it
+#     waits releases the wait at once — no question is published and an answer
+#     is refused for the whole of the finally node's few seconds — and then the
+#     row settles `cancelled` and the finally node reads `cancelled`.
+#   * `flow.grandparent` — a detached `flow.*` dispatch onto `flow.relay`, which
+#     itself detaches a `flow.long` and ends at once, and then a command of the
+#     grandparent's own. So the lineage is root → a child that has **completed**
+#     → a grandchild still running: a cancel of the root reaches the grandchild
+#     through the settled child.
 version: "0.1"
 
 defaults:
@@ -67,6 +77,25 @@ triggers:
     method: POST
     input:
       names: "payload.body.names"
+      linger: "payload.body.linger"
+    respond: async
+
+  on_asking:
+    type: http
+    flow: flow.asking
+    path: /asking
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
+  on_grandparent:
+    type: http
+    flow: flow.grandparent
+    path: /grandparent
+    method: POST
+    input:
+      relays: "payload.body.relays"
       linger: "payload.body.linger"
     respond: async
 
@@ -183,6 +212,99 @@ flow.notifying:
     - { from: start, to: noted_work }
     - { from: noted_work, to: end }
   finally: tell
+
+flow.asking:
+  description: A question nobody answers, and a record of how the run ended.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    ask:
+      human:
+        input:
+          path: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input:
+        path: "input.path"
+    asked_end:
+      exec:
+        command: "${TALLY_BIN}/ended"
+        args: ["--slowly"]
+      input:
+        outcome: "execution.outcome"
+        error: "has(execution.error) ? execution.error : 'none'"
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+  finally: asked_end
+
+flow.grandparent:
+  description: A detached child that detaches a grandchild and ends, then a command of the root's own.
+  inputs:
+    relays:
+      type: array
+      max_items: 1
+      items:
+        type: object
+        properties:
+          lingers:
+            type: array
+            max_items: 1
+            items: { type: integer }
+    linger:
+      type: integer
+  outputs: {}
+  nodes:
+    begin_relay:
+      map:
+        over: input.relays
+        as: relay
+        node: flow.relay
+        max_concurrency: 1
+        detach: true
+        input:
+          lingers: "relay.lingers"
+    root_hold:
+      exec:
+        command: "${TALLY_BIN}/linger"
+      input:
+        linger: "input.linger"
+    root_end:
+      exec:
+        command: "${TALLY_BIN}/ended"
+      input:
+        outcome: "execution.outcome"
+        error: "has(execution.error) ? execution.error : 'none'"
+  edges:
+    - { from: start, to: begin_relay }
+    - { from: begin_relay, to: root_hold }
+    - { from: root_hold, to: end }
+  finally: root_end
+
+flow.relay:
+  description: Detach a lingering grandchild, and end at once.
+  inputs:
+    lingers:
+      type: array
+      max_items: 1
+      items: { type: integer }
+  outputs: {}
+  nodes:
+    begin_long:
+      map:
+        over: input.lingers
+        as: seconds
+        node: flow.long
+        max_concurrency: 1
+        detach: true
+        input:
+          linger: "seconds"
+  edges:
+    - { from: start, to: begin_long }
+    - { from: begin_long, to: end }
 
 tool.ping:
   description: Appends the line it is handed to the ping log.

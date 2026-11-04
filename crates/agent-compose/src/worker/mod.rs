@@ -59,8 +59,12 @@
 //! cancelled, and each one's runner is sent `SIGTERM` — which the runner turns
 //! into the execution's own cancel, so its model calls, commands and harness
 //! runs stop by the path a deadline stops them by — and, if it has not exited
-//! within [`node::CANCEL_GRACE`], its whole process group is killed. The result
-//! posted for it is `status: "cancelled"`, whatever the runner managed to say.
+//! within [`node::CANCEL_GRACE`], its whole process group is killed. The grace
+//! is held while the runner reports a `finally:` node running, which runs whole
+//! whatever the cancel does (grammar §7.9, Decision D160), and given again once
+//! that work has settled. The result posted for it is `status: "cancelled"`,
+//! whatever else the runner managed to say, with the `finally_error` it
+//! reported beside it.
 //!
 //! How long a hold lasts is the **hub's**, and §10.2 makes lengthening it a
 //! change no version bump announces — "which a worker learns by waiting". So

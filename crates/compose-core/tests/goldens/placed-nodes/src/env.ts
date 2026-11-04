@@ -49,6 +49,8 @@ export const environmentReferences: readonly EnvironmentReference[] = [
   {
     name: "OPS_BIN",
     sites: [
+      "flow.closing.node.look_long.exec.command",
+      "flow.closing.node.close_up.exec.command",
       "flow.deadline.node.lapse.exec.command",
       "flow.tidying.node.look.exec.command",
       "flow.tidying.node.tidy_up.exec.command",

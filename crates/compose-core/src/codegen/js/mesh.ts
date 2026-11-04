@@ -667,7 +667,18 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
       // answered (§5, PRD resolved q46's parity bar). Planting is one function
       // for both generations ([`answered`]), so the pair a reader is shown is
       // derived once and here as there.
+      //
+      // **Unless the execution's cancel was recorded before this generation
+      // began.** An unanswered pause is a frontier exactly as a local one is —
+      // the local wait's claim is where `./journal.ts`'s frontier hook fires the
+      // cancel, and a remote pause never reaches that claim on this hub — so the
+      // same question is asked here before the wait goes back on the board. A
+      // wait re-planted on a cancelled execution would be one every resume
+      // refuses and nothing ever releases (PRD resolved q75 ruling e,
+      // `docs/durability.md` §6.1).
       if ((await journal.lookup(options.execution, ending.pause.effect.key)) === undefined) {
+        const refusal = frontierRefusal(options.execution, site);
+        if (refusal !== undefined) throw refusal;
         await answered(journal, options, ending.pause);
       }
       continue;

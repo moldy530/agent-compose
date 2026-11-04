@@ -24,6 +24,7 @@ import {
 } from "./modules.ts";
 import {
   agentBrieferOutput,
+  agentCloserOutput,
   agentEscalatorOutput,
   agentSignerOutput,
   agentStamperOutput,
@@ -32,6 +33,10 @@ import {
   flowAbandonedInputs,
   flowAttestedInputs,
   flowBatchInputs,
+  flowClosedInputs,
+  flowClosingInputs,
+  flowClosingNodeCloseUpOutput,
+  flowClosingNodeLookLongOutput,
   flowConversationInputs,
   flowDeadlineInputs,
   flowDeadlineNodeAskOutput,
@@ -115,6 +120,47 @@ const flowBatchShape: runtime.Shape = {
     "paths": {
       "items": "string"
     }
+  }
+};
+
+/** `flow.closed` — the `input` root inside it (grammar 7.5). */
+const flowClosedShape: runtime.Shape = {
+  "properties": {
+    "path": "string"
+  }
+};
+
+/** `flow.closed` node `close` — the `close.output` root its guards read. */
+const flowClosedNodeCloseShape: runtime.Shape = {
+  "properties": {
+    "signature": "string"
+  }
+};
+
+/** `flow.closing` — the `input` root inside it (grammar 7.5). */
+const flowClosingShape: runtime.Shape = {
+  "properties": {
+    "path": "string"
+  }
+};
+
+/**
+ * `flow.closing` node `look_long` — the `look_long.output` root its guards read.
+ */
+const flowClosingNodeLookLongShape: runtime.Shape = {
+  "properties": {
+    "exit_code": "int",
+    "stdout": "string"
+  }
+};
+
+/**
+ * `flow.closing` node `close_up` — the `close_up.output` root its guards read.
+ */
+const flowClosingNodeCloseUpShape: runtime.Shape = {
+  "properties": {
+    "exit_code": "int",
+    "stdout": "string"
   }
 };
 
@@ -463,6 +509,60 @@ const agentBriefer: runtime.AgentBinding = {
     },
   },
   tools: [],
+  maxToolIterations: 8,
+};
+
+/**
+ * `agent.closer` — one LLM call with structured output (PRD 5.2, grammar 5). The schema below is the **published** JSON Schema of grammar 3.8's table, which is the column the conformance corpus proves equal to the parse its answer then faces.
+ */
+const agentCloser: runtime.AgentBinding = {
+  address: "agent.closer",
+  prompt: "Look the path you are given over, and report what you found.\n",
+  model: modelSmart,
+  output: {
+    name: "closer_output",
+    description: "The structured output `agent.closer` must produce.",
+    schema: {
+      "additionalProperties": false,
+      "properties": {
+        "signature": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "signature"
+      ],
+      "type": "object"
+    },
+  },
+  tools: [
+    {
+      name: "closing",
+      address: "flow.closing",
+      description: "Look one release over at length, and close up after it slowly — which never works.",
+      schema: {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      invoke: (args, context, call) =>
+        runtime.callSubflowTool(
+          { name: "closing", binding: flowClosingBinding, inputs: flowClosingInputs },
+          args,
+          context,
+          call,
+        ),
+    },
+  ],
   maxToolIterations: 8,
 };
 
@@ -981,6 +1081,176 @@ const flowBatchBinding: runtime.SubflowBinding = {
       ...options,
       streamMode: "values",
       outputKeys: flowBatchGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
+
+// --- flow.closed ---
+
+/** `flow.closed` node `close` — `agent.closer` (grammar 8.1). */
+const flowClosedNodeClose: runtime.NodeDescriptor = {
+  flow: "flow.closed",
+  node: "close",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from `defaults:`, `on_error` from `defaults:`.
+  policy: {
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowClosedShape, state: stateShape, output: flowClosedNodeCloseShape },
+  input: (roots, view) => ({
+    "path": runtime.toJson(runtime.evaluate("input.path", roots)),
+  }),
+  run: async (input, context, view) => {
+    const answer = await mesh.dispatchPlaced({
+      placement: "mac",
+      node: "flow.closed.close",
+      execution: view.run.execution.id,
+      itemIndex: view.run.execution.item_index,
+      path: runtime.instancePath(view, "close"),
+      inputs: input,
+      history: runtime.historyTurns(view.state["messages"] as unknown[]),
+      policy: view.run.policy,
+      signal: context.signal,
+      stores: context.storeRecords,
+    });
+    return {
+      output: runtime.parseResult(agentCloserOutput, answer.output, "the answer of `agent.closer`"),
+      history: answer.history,
+      models: answer.models,
+      toolDispatches: answer.toolDispatches,
+    };
+  },
+  writes: [
+    { field: "signature", channel: "signature", reduce: "set" },
+  ],
+  edges: [
+    { to: END },
+  ],
+};
+
+/** `flow.closed` — its nodes, its `start` edges, and the compiled graph. */
+function flowClosed() {
+  return new StateGraph(State)
+    .addNode("close", (state: GraphState) => runtime.runNode(flowClosedNodeClose, state), {
+      ends: [END],
+    })
+    .addEdge(START, "close")
+    .compile();
+}
+
+/**
+ * `flow.closed`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowClosedGraph = flowClosed();
+
+/**
+ * `flow.closed` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowClosedBinding: runtime.SubflowBinding = {
+  address: "flow.closed",
+  outputs: ["signature"],
+  recursionLimit: 26,
+  stream: (initial, options) =>
+    flowClosedGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowClosedGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
+
+// --- flow.closing ---
+
+/** `flow.closing` node `look_long` — an inline subprocess (grammar 8.2). */
+const flowClosingNodeLookLong: runtime.NodeDescriptor = {
+  flow: "flow.closing",
+  node: "look_long",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from `defaults:`, `on_error` from `defaults:`.
+  policy: {
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowClosingShape, state: stateShape, output: flowClosingNodeLookLongShape },
+  input: () => ({}),
+  run: async (input, context) => ({
+    output: runtime.parseResult(
+      flowClosingNodeLookLongOutput,
+      await runtime.runExec({
+        command: [{ env: "OPS_BIN", site: "flow.closing.node.look_long.exec.command" }, "/sleep"],
+        args: [
+          ["600"],
+        ],
+        env: [],
+        expectExit: [0],
+        decoding: { envelope: ["exit_code", "stdout"], decoded: [], empty: false },
+      }, input, context),
+      "the result of `flow.closing` node `look_long`",
+    ),
+  }),
+  writes: [],
+  edges: [
+    { to: END },
+  ],
+};
+
+/** `flow.closing` node `close_up` — an inline subprocess (grammar 8.2). */
+const flowClosingNodeCloseUp: runtime.NodeDescriptor = {
+  flow: "flow.closing",
+  node: "close_up",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from `defaults:`, `on_error` from no level, as a `finally:` node's failure is `finally_error` (Decision D159).
+  policy: {
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowClosingShape, state: stateShape, output: flowClosingNodeCloseUpShape },
+  input: () => ({}),
+  run: async (input, context) => ({
+    output: runtime.parseResult(
+      flowClosingNodeCloseUpOutput,
+      await runtime.runExec({
+        command: [{ env: "OPS_BIN", site: "flow.closing.node.close_up.exec.command" }, "/sh"],
+        args: [
+          ["-c"],
+          ["sleep 8; exit 3"],
+        ],
+        env: [],
+        expectExit: [0],
+        decoding: { envelope: ["exit_code", "stdout"], decoded: [], empty: false },
+      }, input, context),
+      "the result of `flow.closing` node `close_up`",
+    ),
+  }),
+  writes: [],
+  edges: [
+  ],
+};
+
+/** `flow.closing` — its nodes, its `start` edges, and the compiled graph. */
+function flowClosing() {
+  return new StateGraph(State)
+    .addNode("look_long", (state: GraphState) => runtime.runNode(flowClosingNodeLookLong, state), {
+      ends: [END],
+    })
+    .addEdge(START, "look_long")
+    .compile();
+}
+
+/**
+ * `flow.closing`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowClosingGraph = flowClosing();
+
+/**
+ * `flow.closing` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowClosingBinding: runtime.SubflowBinding = {
+  address: "flow.closing",
+  outputs: [],
+  recursionLimit: 27,
+  finally: flowClosingNodeCloseUp,
+  stream: (initial, options) =>
+    flowClosingGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowClosingGraph.outputChannels,
     }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
 };
 
@@ -2331,6 +2601,39 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
         outputKeys: flowBatchGraph.outputChannels,
       }) as unknown as Promise<AsyncIterable<GraphState>>,
   },
+  "flow.closed": {
+    address: "flow.closed",
+    inputs: ["path"],
+    inputKinds: { "path": "string", },
+    outputs: ["signature"],
+    sessionStores: [],
+    recursionLimit: 26,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowClosedInputs, inputs, "the `inputs:` of `flow.closed`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowClosedGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowClosedGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
+  "flow.closing": {
+    address: "flow.closing",
+    inputs: ["path"],
+    inputKinds: { "path": "string", },
+    outputs: [],
+    sessionStores: [],
+    recursionLimit: 27,
+    finally: flowClosingNodeCloseUp,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowClosingInputs, inputs, "the `inputs:` of `flow.closing`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowClosingGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowClosingGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
   "flow.conversation": {
     address: "flow.conversation",
     inputs: ["path"],
@@ -3186,6 +3489,22 @@ export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {
     async (input, context, site) => {
       const answer = await runtime.callAgent(
         agentStamper,
+        input,
+        site.history ?? [],
+        context,
+        { path: site.path, policy: site.policy },
+      );
+      return {
+        output: answer.output,
+        history: answer.history,
+        models: answer.models,
+        toolDispatches: answer.toolDispatches,
+      };
+    },
+  "flow.closed.close":
+    async (input, context, site) => {
+      const answer = await runtime.callAgent(
+        agentCloser,
         input,
         site.history ?? [],
         context,

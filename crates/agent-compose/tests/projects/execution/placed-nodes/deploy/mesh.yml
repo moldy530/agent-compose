@@ -26,4 +26,5 @@ placements:
       - agent.stamper
       - agent.escalator
       - agent.tidier
+      - agent.closer
     description: The machine holding the signing keys.

@@ -9450,7 +9450,10 @@ of its own too, and an abort — a cancel, or the node's `timeout:` — stops th
 group (`SIGTERM`, then `SIGKILL` two seconds later), joining the same stop
 sweep. "Those escape a hand-rolled `exec:` tool identically" therefore reads of
 what left the group on purpose — `setsid`, `set -m`, a double fork — which
-escapes both; an `exec:` tool's ordinary forked children no longer do.
+escapes both; an `exec:` tool's ordinary forked children no longer do. And in a
+worker's node runner `SIGTERM` is the hub's cancel arriving (`docs/distributed.md`
+§3.2), not a stop: the sweep there takes `SIGINT` alone, and the cancel stops
+the groups it owes — never a finally node's, which runs whole.
 
 ### D125. Inbound `auth:` is one scheme per trigger, with env-ref secrets
 
@@ -12354,9 +12357,14 @@ that body ended. `202` says the request was recorded against an open execution;
 the status route says how it ended.
 
 **The cascade, and the child cancelled alone.** Cancelling an execution cancels
-every child in its lineage (PRD resolved q65) that the journal holds open —
+every execution in its lineage (PRD resolved q65) that the journal holds open —
 each one's request recorded, each one fired where it runs — and a child a
-cancelled parent was issuing as the cancel came is cancelled as it begins.
+cancelled parent was issuing as the cancel came is cancelled as it begins. The
+walk is over **descendants**, not only children: a detached dispatch resolves
+when it is issued (D94), so a child routinely completes while a grandchild it
+started is still running, and the cascade reaches that grandchild through the
+settled child — an open execution is cancelled when the nearest open execution
+its lineage reaches, through any number of settled ones, is the one cancelled.
 Cancelling a child alone leaves its parent running: the parent's detached
 dispatch resolved when it was issued (D94), so nothing of the parent is waiting
 on the child, and the child's own envelope says `cancelled` while the parent runs
@@ -12392,7 +12400,11 @@ holds is cancelled over the wire — the hub names it in the worker's next poll'
 `cancel` list, the worker stops the process running it and posts `status:
 "cancelled"`, and that result settles the row (`docs/distributed.md` §3.2,
 §3.4). Until it does, the dispatch still counts against the worker session's
-capacity, because its process is still stopping (D161).
+capacity, because its process is still stopping (D161). A finally node the
+cancel starts on the worker — an attached flow's, whose instance the cancel
+ended there — runs whole like any other: the worker's grace before it kills a
+runner is held while the runner reports finally work running, and its
+`finally_error` travels home on the cancelled result.
 
 **Restart mid-cancel completes the cancel.** The request is a row of the
 journal's `cancellations` table, written before anything is stopped. A process
@@ -12411,9 +12423,13 @@ died is the commonest such frontier, so the next start does **not** supersede
 it as an orphan of the dead process's sessions (`docs/distributed.md` §5): read
 as one, the node's attempt would fail under its `retry:` and `on_error:` and the
 execution would end `failed`. It is left `dispatched` for the replay, which ends
-it as the cancel's. The **cascade** is walked again too: the generation that
-recovers a cancelled execution cancels its open children before its replay
-re-issues any dispatch, so a process that died between recording the parent's
+it as the cancel's. A pause nobody had answered — a local one, or one a worker
+sent home that the replay finds settled on its dispatch row — is such a
+frontier as well: the cancel fires there instead of the wait being planted
+again, where every answer would be refused and nothing would ever end it. The
+**cascade** is walked again too: the generation that recovers a cancelled
+execution cancels its open descendants before its replay re-issues any
+dispatch, so a process that died between recording the parent's
 request and a child's leaves no child to resume as if nothing had asked it to
 stop. A body whose whole record replays to its end had ended before the cancel
 could reach it, and settles as it ended.
@@ -12444,7 +12460,12 @@ all — and carries the amendment note. D159's "what this release does not
 produce: `cancelled`" is superseded: the seam it built is what this drives, and
 its own clauses — innermost first, an end under way waited for, an abandoned
 pause an end, nothing new begun inside an ended instance — are read at the new
-outcome unchanged; it carries the amendment note. D94 is read, not amended: a
+outcome unchanged; it carries the amendment note. D124's "those escape a
+hand-rolled `exec:` tool identically" is amended: an `exec:` command now runs
+in a process group of its own, so its ordinary forked children no longer
+escape it — only what left the group on purpose does — and in a worker's node
+runner `SIGTERM` is the execution's cancel rather than a stop the sweep takes;
+it carries the amendment note. D94 is read, not amended: a
 detached delivery's outcome is still never observed, and the cancel stops it as
 a running node rather than waiting on it. D102 and D110 are untouched. D150's
 child executions are what the cascade walks. D118 stands. PRD resolved q28
@@ -12461,8 +12482,8 @@ it is the implementation's, and awaits the owner's ruling where marked: that
 root's body ended changes no outcome; that a detached `agent.*`/`tool.*`
 delivery is stopped as a running node; that a stopped effect is not recorded;
 and that a recovered cancel completes at the replay's frontier. *PRD resolved
-q28, q29, q32, q34, q65, q75, q76; §7.6.3, §7.9, §8.6, §13.3; amends D70, D159;
-builds on D94, D102, D150.*
+q28, q29, q32, q34, q65, q75, q76; §7.6.3, §7.9, §8.6, §13.3; amends D70, D124,
+D159; builds on D94, D102, D150.*
 
 ### D161. `max_running` is how many dispatches one worker session holds for a placement
 

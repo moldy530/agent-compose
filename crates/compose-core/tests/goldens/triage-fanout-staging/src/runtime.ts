@@ -1222,6 +1222,28 @@ export function cancelFired(execution: string): boolean {
  */
 const finallySites = new Map<string, Map<string, number>>();
 
+/** How many finally sites are running in this process, every execution's together. */
+let finallyWorkHere = 0;
+
+/** Who is told when this process starts and stops running finally work ([`onFinallyWork`]). */
+let finallyWatcher: ((running: boolean) => void) | undefined;
+
+/**
+ * Be told whenever this process **starts** running finally work — the first
+ * finally site of any execution marked running ([`finallySites`]) — and
+ * whenever it **stops**, the last of them settled.
+ *
+ * What a process that is itself stopped by a cancel from outside needs: a
+ * worker's node runner (`./worker-node.ts`), whose worker kills it once a
+ * cancel's grace has passed (`docs/distributed.md` §3.2). A finally node runs
+ * whole whatever the cancel does (grammar 7.9, Decision D160), so the runner
+ * reports this to its worker and the worker's grace runs from the moment the
+ * work ends rather than cutting it off.
+ */
+export function onFinallyWork(watcher: (running: boolean) => void): void {
+  finallyWatcher = watcher;
+}
+
 /** Mark one finally node's site as running until the answer is called. */
 function finallyRunning(execution: string, site: string): () => void {
   let held = finallySites.get(execution);
@@ -1231,11 +1253,18 @@ function finallyRunning(execution: string, site: string): () => void {
   }
   const sites = held;
   sites.set(site, (sites.get(site) ?? 0) + 1);
+  finallyWorkHere += 1;
+  if (finallyWorkHere === 1) finallyWatcher?.(true);
+  let released = false;
   return () => {
+    if (released) return;
+    released = true;
     const left = (sites.get(site) ?? 1) - 1;
     if (left > 0) sites.set(site, left);
     else sites.delete(site);
     if (sites.size === 0 && finallySites.get(execution) === sites) finallySites.delete(execution);
+    finallyWorkHere -= 1;
+    if (finallyWorkHere === 0) finallyWatcher?.(false);
   };
 }
 
@@ -1318,9 +1347,10 @@ export function fireCancel(execution: string): boolean {
  * a process that dies between accepting a cancel and settling the row leaves an
  * open row carrying it — and the recovery that finds it completes the cancel
  * ([`completeCancel`]). Then the cancel fires here, where the execution is
- * running; and then each open child is cancelled the same way, which is the
- * cascade the owner asked for ("if a parent establishes a child run then cancel
- * should kill children"). A child cancelled alone leaves its parent running: the
+ * running; and then each open descendant is cancelled the same way — a child,
+ * or one a settled child started ([`cascadeCancel`]) — which is the cascade the
+ * owner asked for ("if a parent establishes a child run then cancel should kill
+ * children"). A child cancelled alone leaves its parent running: the
  * parent's detached dispatch resolved when it was issued (Decision D94), so the
  * parent has nothing waiting on the child to stop.
  */
@@ -1332,9 +1362,22 @@ export async function cancelExecution(execution: string): Promise<void> {
 }
 
 /**
- * Cancel every open child execution of `execution` whose own cancel is not yet
- * recorded, each recursively ([`cancelExecution`]) — the cascade of PRD
- * resolved q75 ruling c.
+ * Cancel every open execution in `execution`'s lineage whose own cancel is not
+ * yet recorded, each recursively ([`cancelExecution`]) — the cascade of PRD
+ * resolved q75 ruling c: "every open child execution in its lineage,
+ * recursively".
+ *
+ * **Every open descendant, not only the open children.** A child that has
+ * already **settled** is not the end of the lineage: its own detached `flow.*`
+ * dispatch resolved when it was issued (Decision D94), so a child routinely
+ * completes while the grandchild it started is still running — and a walk that
+ * stopped at the settled child would leave that grandchild running under a
+ * cancelled root, with nothing in the cascade, now or on recovery, ever to stop
+ * it. So the walk is over the open rows, and an open row is this execution's to
+ * cancel when the **nearest open ancestor** its lineage reaches — through any
+ * number of settled ones — is this execution. One nearer that is open is that
+ * ancestor's own: its cancel, recursive in turn, reaches it, so each open
+ * descendant is cancelled once.
  *
  * Asked twice: by the cancel itself, and by a **recovered** execution whose
  * cancel was requested ([`openExecution`]), because the first walk is not
@@ -1347,8 +1390,35 @@ export async function cancelExecution(execution: string): Promise<void> {
  * recovered.
  */
 async function cascadeCancel(journal: Journal, execution: string): Promise<void> {
-  for (const row of await journal.openExecutions()) {
-    if (row.lineage?.parent !== execution) continue;
+  const open = await journal.openExecutions();
+  const opened = new Set(open.map((row) => row.id));
+  // Each row's parent, read once: the open rows' off the walk above, a settled
+  // ancestor's off its own row the first time a lineage reaches it.
+  const parents = new Map<string, string | undefined>(
+    open.map((row) => [row.id, row.lineage?.parent]),
+  );
+  const parentOf = async (id: string): Promise<string | undefined> => {
+    if (parents.has(id)) return parents.get(id);
+    const parent = (await journal.execution(id))?.lineage?.parent;
+    parents.set(id, parent);
+    return parent;
+  };
+  for (const row of open) {
+    if (row.id === execution) continue;
+    let ancestor = row.lineage?.parent;
+    // Bounded by the lineage's depth; the set is for a journal whose rows name
+    // each other in a cycle, which no runtime writes and a walk must still end.
+    const passed = new Set<string>();
+    while (
+      ancestor !== undefined &&
+      ancestor !== execution &&
+      !opened.has(ancestor) &&
+      !passed.has(ancestor)
+    ) {
+      passed.add(ancestor);
+      ancestor = await parentOf(ancestor);
+    }
+    if (ancestor !== execution) continue;
     if (row.cancelRequestedAt !== undefined && cancelFired(row.id)) continue;
     await cancelExecution(row.id);
   }
@@ -7927,6 +7997,10 @@ const commandSweeps: (() => void)[] = [];
 function armCommandSweep(): void {
   if (commandSweeps.length > 0) return;
   for (const signal of SWEPT_SIGNALS) {
+    // A process whose `SIGTERM` is an execution's cancel ([`cancelOnTerminate`])
+    // leaves that signal to the cancel: what it stops is what the cancel owes,
+    // and a finally node's command is not among it.
+    if (signal === "SIGTERM" && terminateCancels !== undefined) continue;
     const sweep = (): void => {
       for (const running of runningCommands) killCommandGroup(running);
       runningCommands.clear();
@@ -7936,6 +8010,35 @@ function armCommandSweep(): void {
     commandSweeps.push(() => process.removeListener(signal, sweep));
     process.on(signal, sweep);
   }
+}
+
+/** The execution a `SIGTERM` cancels in this process, where one does ([`cancelOnTerminate`]). */
+let terminateCancels: string | undefined;
+
+/**
+ * Make `SIGTERM` this process's **cancel** of `execution` rather than a stop
+ * (PRD resolved q75, Decision D160, `docs/distributed.md` §3.2) — what a
+ * worker's node runner (`./worker-node.ts`) is told by the signal its worker
+ * sends for a dispatch the hub cancelled.
+ *
+ * The signal fires the execution's controller ([`fireCancel`]), and the stop
+ * sweep ([`armCommandSweep`]) stands aside for it: swept, it would `SIGKILL`
+ * every command group running here the instant the signal landed — a finally
+ * node's among them, which runs whole whatever the cancel does (grammar 7.9) —
+ * where the cancel stops exactly the commands it owes, each by its own
+ * `SIGTERM`-then-`SIGKILL` ([`stopExecGroup`]). `SIGINT` is swept as before.
+ */
+export function cancelOnTerminate(execution: string): void {
+  terminateCancels = execution;
+  // A sweep armed before this call sweeps `SIGTERM` too, so it is re-armed
+  // without it.
+  if (commandSweeps.length > 0) {
+    standDown();
+    armCommandSweep();
+  }
+  process.on("SIGTERM", () => {
+    fireCancel(execution);
+  });
 }
 
 /** Register a running shell or command with the sweep [`armCommandSweep`] armed. */
