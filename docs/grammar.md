@@ -2137,11 +2137,17 @@ scheduled set is empty, which is to say every live branch has reached `end`
   final step's writes have been applied. Nothing is snapshotted at the moment a
   branch reaches `end`, so a value written by a branch that was still running is
   included rather than raced.
-- Concurrent branches are **never cancelled**. Cancelling on first arrival would
-  make the result depend on completion order — the replay hazard PRD 5.6 names —
-  and would leave already-issued effects (store writes, sinks, HTTP calls)
-  half-applied with no defined state. `on_error: fail` (§9.2) is how an execution
-  is aborted; `end` is not.
+- Concurrent branches are **never cancelled by a sibling's failure** — nor by a
+  sibling reaching `end`. Cancelling on first arrival would make the result
+  depend on completion order — the replay hazard PRD 5.6 names — and would leave
+  already-issued effects (store writes, sinks, HTTP calls) half-applied with no
+  defined state. `on_error: fail` (§9.2) is how an execution is aborted; `end` is
+  not. The one actor that stops them all is a **cancel** of the execution (PRD
+  resolved q75, Decision
+  [D160](#d160-a-cancel-ends-an-execution-cancelled-through-one-controller-every-node-chains-to)):
+  `POST /executions/:id/cancel` stops every running node of every branch at
+  once, each settling `cancelled`, and ends every open instance at outcome
+  `cancelled` (§7.9).
 - `end` in a control-transfer position — `on_error: { fallback: end }` (§9.2),
   `human.on_timeout: end` (§8.7) — retires that branch with the same meaning.
 - Several branches MAY reach `end`; each retires.
@@ -2323,7 +2329,7 @@ has no exit, because it is on no branch (§7.9).
 
 A flow definition MAY name one of its nodes as `finally:`. That node runs
 **once**, when an instance of the flow **ends** — whether it completed, failed,
-or (once `cancel` exists, PRD resolved q75) was cancelled — with how it ended
+or was cancelled (PRD resolved q75) — with how it ended
 readable inside it, and nowhere else (Decision
 [D159](#d159-finally-names-the-node-an-instance-runs-once-when-it-ends), PRD
 resolved q76).
@@ -2373,9 +2379,19 @@ flow-as-tool call's instance alike — at the instance's end:
   [D97](#d97-a-skip-changes-guard-values-not-the-routing-algorithm));
 - **failed** — the body's own error policy did not absorb a failure, or the body
   reached quiescence and could not materialize an output;
-- **cancelled** — PRD resolved q75's cancel, which this release does not yet
-  have; the outcome is in the language now so a finally node written against it
-  checks and runs today.
+- **cancelled** — somebody cancelled the execution (`POST
+  /executions/:id/cancel`, `agent-compose cancel`; PRD resolved q75, Decision
+  [D160](#d160-a-cancel-ends-an-execution-cancelled-through-one-controller-every-node-chains-to)).
+  Every node running in the instance when the cancel came settles `cancelled`,
+  no node begins after it, and the instance ends here with `execution.outcome`
+  `cancelled` and **no `execution.error`**: nothing went wrong with the
+  instance, somebody stopped it. A cancel ends the **root** instance and every
+  instance open inside it, innermost first, each running its own finally node —
+  and that node runs whole: a cancel stops none of it and nothing it begins,
+  whether the cancel ended its instance or arrived while that instance's end was
+  already under way (an end under way is waited for, never stopped). A cancel
+  that arrives after the root's body has ended changes no outcome: the end the
+  body reached is the execution's.
 
 **Innermost first.** A subflow instance's finally node runs when that instance
 ends — inside the `flow:` node's own execution, so the node that instantiated it
@@ -2406,9 +2422,12 @@ body is still running: a `map` item still queued for a permit, a `retry:` or
 any tool, a store's and a `flow.*` included — or its next model call, made after
 the end. Each of those belonged to the body, and nothing is left to read what it
 would answer. What is already running when the body ends runs on — concurrent
-branches are never cancelled (§7.6.3), and a model call or tool call in flight
-answers — but begins nothing more: an agent whose call answers after the end
-leaves its node there.
+branches are never cancelled by a sibling's failure (§7.6.3), and a model call
+or tool call in flight answers — but begins nothing more: an agent whose call
+answers after the end leaves its node there. (A **cancel** is the one actor
+that does stop them: every running node's own signal fires with the
+execution's, so a model call's `fetch`, a spawned command and a harness run
+stop, each node settling `cancelled` — D160.)
 A **child execution** — what a detached `flow.*` dispatch starts (§8.6 rule 7)
 — is an execution of its own, and its root instance runs its own finally node
 when it ends. A detached delivery to an `agent.*` or a `tool.*` is not the
@@ -2419,7 +2438,11 @@ it and refuses none of it — an instance the delivery's model begins from its
 the delivery has closed the execution's record — settled, or parked — ends past
 that record: its finally node runs, but its boundary is journaled nowhere, and a
 failure it raises is not the execution's `finally_error`. The process says it on
-stderr instead, naming the execution, the node and the error.
+stderr instead, naming the execution, the node and the error. A **cancel** of
+the execution does reach a detached `agent.*` or `tool.*` delivery: it is a
+dispatch of this execution, so its signal is the execution's and it stops like
+any running node — while a detached `flow.*` dispatch is a child execution, and
+the cancel reaches it through the cascade (D160).
 
 **What is not an end.** A `human` pause that parks the run (exit `3`,
 `status: "interrupted"`) is not one: the finally node does not run, and the
@@ -2429,7 +2452,8 @@ run parks: the resumed run asks its question again. Neither is a replay
 divergence — the run's record stopped describing it. An instance that was
 waiting on a person when the end of the instance around it **stopped** it has
 ended, though: its question will never be asked again, so it ends `failed` and
-runs its finally node, as PRD resolved q75's cancel will end one `cancelled`.
+runs its finally node — and a cancel, which releases every wait the execution
+holds, ends it `cancelled` the same way (D160).
 
 **What it reads.** Inside the finally node, and only there, the `execution` root
 carries `execution.outcome` (`completed | failed | cancelled`) and
@@ -5444,6 +5468,13 @@ a flow input field can accept it.
   (Decision [D81](#d81-timeout-is-illegal-on-an-async-http-trigger)).
 - Generated apps expose `start`, `resume`, and `status` routes; resume payloads
   are validated against the interrupting `human` node's output schema (PRD 5.11).
+  They expose a fourth, `cancel` — `POST /executions/:id/cancel`, which stops an
+  open execution and every open child execution in its lineage, recursively,
+  and settles it `cancelled` (PRD resolved q75, Decision [D160](#d160-a-cancel-ends-an-execution-cancelled-through-one-controller-every-node-chains-to)). It
+  takes no body, answers `202` for an execution that is open (a second cancel of
+  one already cancelling included), `409` naming the status for one that has
+  completed, failed or been cancelled, and `404` for an id the process does not
+  know. Like the other two it is the app's own, so a trigger cannot declare it.
 
 **`auth:`, `callback_auth:` and `callback_allow:` are enforced by the generated
 app.** A served trigger declaring `auth:` verifies its caller before it reads a
@@ -5537,10 +5568,11 @@ triggers:
   resolved q30 refused. Vendor presets can grow later as a curated table on q30's
   terms.
 
-**`auth:` covers three routes, not one.** The `resume` and `status` routes are
-per-execution, and resume *injects data into a parked run* — strictly more
-sensitive than starting one. So both enforce the auth of **the trigger that
-started that execution**: an execution an authenticated trigger began never
+**`auth:` covers four routes, not one.** The `resume`, `status` and `cancel`
+routes are per-execution, resume *injects data into a parked run* — strictly
+more sensitive than starting one — and cancel *stops* one. So all three enforce
+the auth of **the trigger that started that execution**, checked before anything
+about the execution is said: an execution an authenticated trigger began never
 answers an unauthenticated poll or resume, and an execution a no-auth trigger
 began keeps open routes (PRD resolved q32). `run` is untouched — no server, no
 caller to verify.
@@ -5884,6 +5916,7 @@ Keys are identifiers (§2.1).
 | Key | Type | Required | Notes |
 |---|---|---|---|
 | `members` | list of `agent.*` / `tool.*` addresses | yes | non-empty, each named once; every address MUST resolve in the composition |
+| `max_running` | integer ≥ 1 | no | how many unsettled dispatches of this placement **one worker session** may hold at once; default `1` (PRD resolved q79, Decision [D161](#d161-max_running-is-how-many-dispatches-one-worker-session-holds-for-a-placement)) |
 | `description` | string | no | documentation only (D54) |
 
 ```yaml
@@ -5893,7 +5926,21 @@ placements:
     description: the machine with the signing keys
   gpu:
     members: [agent.embedder]
+    max_running: 3
 ```
+
+**`max_running:` is a session's capacity, not the placement's.** A worker
+claiming `gpu` above may hold three of its dispatches at once, and runs them
+side by side; two such workers hold six. The hub hands a session work of the
+placement while the session holds fewer of its unsettled dispatches than the
+cap, and gives a parked dispatch to the **least-loaded** session polling for it
+— the one holding fewest of the placement's unsettled dispatches, the oldest
+poll between equals (`docs/distributed.md` §2, §3.2). It bounds *running*, not
+*admission*: a `map`'s `max_concurrency:` (§8.6) is still how many instances
+the graph lets be in flight, and the placement's capacity is how many of them
+a pool can be running (`docs/distributed.md` §2). An integer below `1` is
+`value-out-of-range`, and a string or a fraction is `wrong-type`: a placement
+no session may hold a dispatch of is one nothing would ever run.
 
 **Five rules, each a compile error, and they are numbered because other
 documents cite them by number** (Decisions
@@ -7550,6 +7597,18 @@ it costs no machinery, and it gives the two control-transfer positions
 (`on_error: {fallback: end}`, `human.on_timeout: end`) an honest meaning — "this
 branch is done" — leaving `on_error: fail` as the one way to abort a run.
 *PRD 5.5, 5.6, 5.8.*
+
+**Amended 2026-11-04** by
+[D160](#d160-a-cancel-ends-an-execution-cancelled-through-one-controller-every-node-chains-to),
+which is PRD resolved q75: "concurrent branches are never cancelled" now reads
+"never cancelled **by a sibling's failure**" (nor by a sibling reaching `end`).
+The one actor that stops them all is a cancel of the execution, requested from
+outside it — `POST /executions/:id/cancel` — and the hazards above are why it is
+an outcome of its own rather than a failure: every node it stops settles
+`cancelled`, never routed and never retried, so nothing is decided by
+completion order, and an effect it stops in flight is never recorded as the
+world's answer (`docs/durability.md` §6.1). Quiescence is still how an instance
+ends on its own; a cancel ends it from outside.
 
 ### D71. No silent dead ends: every node exits, and every run starts
 
@@ -12172,10 +12231,18 @@ travels home as an effect, and what its finally node raised as the result's
 `finally_error`, which the hub holds as the execution's own
 (`docs/distributed.md` §3.3, §3.4).
 
-**What this release does not produce: `cancelled`.** The enum value, the record
-and the end-of-instance seam all carry it, and nothing reaches them with it: PRD
-resolved q75's cancel route is not built. The seam is driven with it directly by
-a test that says so, so q75 adds a caller rather than a code path.
+**`cancelled` is produced by D160.** The enum value, the record and the
+end-of-instance seam carried it from this release, and PRD resolved q75's cancel
+is the caller that reaches them with it: every instance a cancel ends runs its
+finally node here at `cancelled`, under every clause above unchanged — innermost
+first, an end under way waited for, an abandoned pause an end — and the finally
+node itself is the one thing the cancel never stops.
+
+**Amended 2026-11-04** by
+[D160](#d160-a-cancel-ends-an-execution-cancelled-through-one-controller-every-node-chains-to),
+which is PRD resolved q75: the paragraph above said this release produced no
+`cancelled`, and the cancel route now does; what the seam does with it is what
+this decision already said.
 
 **Collision review.** D21's strategies and D103 are unchanged: `finally:` is a
 flow key, not an `on_error:` strategy (above). Five decisions are amended, and
@@ -12214,6 +12281,204 @@ instance settling on the recorded end. Nothing in the PRD records those rulings
 yet. *PRD resolved q28, q29, q65, q69, q75, q76; §2.4, §4.1, §7, §7.6.3, §7.8,
 §7.9, §8.7, §9.2, §9.3; amends D21, D52, D71, D95, D110; builds on D97, D103,
 D118, D150, D153.*
+
+### D160. A cancel ends an execution `cancelled`, through one controller every node chains to
+
+`POST /executions/:id/cancel` — and `agent-compose cancel <path> <execution>`,
+which sends it — stops an open execution and every open child execution in its
+lineage, recursively. The request is recorded on the journal before it is acted
+on; then the execution's **one abort controller** fires, and every node's own
+controller — the one its `timeout:` already aborts — is chained to it, so the
+signals that reach a model call's `fetch`, a spawned command, a harness run,
+a placed dispatch and every instance's supersteps all fire together. A node the
+cancel stops settles **`cancelled`**: not `failed`, through no `retry:` and no
+`on_error:`, routing nowhere. Every open instance ends at outcome `cancelled`,
+innermost first, each running its own `finally:` node (§7.9); every wait the
+execution holds is released; the row settles `cancelled`, the settle webhook
+carries it, the trace ships under `trace_version` 7, `resume` refuses the row
+naming the status, and recovery leaves it alone (PRD resolved q75).
+
+**Rationale**: the field report's run was inside a long `coder:` node with no
+way to stop it short of killing the process — which leaves the row open for a
+restart to resume, the opposite of stopping it. The ruling's mechanism is the
+one the runtime already had for a deadline, generalised one level up: a
+`timeout:` aborts one node's controller, and every activity a node runs already
+reads that controller's signal, so a controller per execution that each node's
+chains to reaches everything a deadline reaches, with nothing new at any
+activity site. The race a deadline uses is used too, so a host function that
+never reads its signal still leaves its node on time.
+
+**What a cancelled node is.** Its trace entry is `outcome: "cancelled"`, with
+every record it made — `models`, `harness`, `stores`, `inner` — and no `error`
+and no `routing`: a cancel is not something that went wrong with the node, and
+it routed nowhere (`docs/trace.md` §3.2). It begins no further attempt, and a
+backoff it is sleeping out ends at once. Like a deadline, it waits for every
+instance it began to end — each one's finally node run — before it settles, so
+the order §7.9 promises holds on this way out too. An effect the cancel stops in
+flight is **not recorded**: recorded, it would be replayed as the world's answer
+by the generation that completes a cancel a restart interrupted, and absorbed by
+the very policies a cancel is never routed through (`docs/durability.md` §3).
+
+**`execution.error` is absent on `cancelled`.** The ruling left it open — absent,
+or the cancel's reason — and the reading here is absent: nothing went wrong
+with an instance somebody stopped, `has(execution.error)` reads the instance
+that *failed*, and the cancel route takes no body that could carry a reason. The
+lifecycle row's `error` is null on a cancelled row and the envelope carries no
+`error`, for the same reason.
+
+**What a cancel does not stop: a finally node.** A finally node and all it
+begins are how an instance ends, so its site is marked as running for as long
+as it runs, and a node at or under that site chains to nothing. A cancel that
+ended the instance runs its finally node at `cancelled`, whole; one that arrives
+while an end is already under way — a sibling's failure ended a subflow and its
+finally node is running, or the root's body has completed and its finally node
+is — waits for it as D159 waits for any end under way, and **changes no
+outcome**: an execution whose body ended before the cancel reached it settles as
+that body ended. `202` says the request was recorded against an open execution;
+the status route says how it ended.
+
+**The cascade, and the child cancelled alone.** Cancelling an execution cancels
+every child in its lineage (PRD resolved q65) that the journal holds open —
+each one's request recorded, each one fired where it runs — and a child a
+cancelled parent was issuing as the cancel came is cancelled as it begins.
+Cancelling a child alone leaves its parent running: the parent's detached
+dispatch resolved when it was issued (D94), so nothing of the parent is waiting
+on the child, and the child's own envelope says `cancelled` while the parent runs
+to its own end. A **detached `agent.*` or `tool.*` delivery** is a different
+thing and is read differently: it is not a child execution but a dispatch of
+this execution — under its id, on its journal — so its signal is the execution's
+cancel and it stops like any running node, while a detached `flow.*` dispatch
+*is* a child and is reached by the cascade. That reading is the
+implementation's: the ruling says "aborts every running node … placed
+dispatches" and "cascades to the execution's open children", and a delivery is
+the former.
+
+**Waits.** A `human` pause is released: its wait is abandoned, nothing will
+answer it now, and the instance holding it ends `cancelled` — q76's
+abandoned-pause path, at this outcome. A placement wait is released by the same
+abort: a dispatch still parked is withdrawn from the board, and one a worker
+holds is cancelled over the wire — the hub names it in the worker's next poll's
+`cancel` list, the worker stops the process running it and posts `status:
+"cancelled"`, and that result settles the row (`docs/distributed.md` §3.2,
+§3.4). Until it does, the dispatch still counts against the worker session's
+capacity, because its process is still stopping (D161).
+
+**Restart mid-cancel completes the cancel.** The request is a row of the
+journal's `cancellations` table, written before anything is stopped. A process
+that dies between the `202` and the settled row leaves an open row carrying it,
+and the generation that recovers it — `serve`'s, or an `agent-compose resume` —
+**replays the recorded prefix** like any resume, re-entering every instance the
+dying process had open, and the first effect the journal does not hold is where
+the cancel fires instead of the effect being issued. So nothing new runs past
+the record but the ends the cancel owes: each re-entered instance ends
+`cancelled` and runs its finally node — once, since its boundary and its effects
+are journaled — and the row settles `cancelled` (`docs/durability.md` §6.1). A
+placed dispatch still unsettled is such a frontier too, and so is a dispatch row
+a worker settled cancelled, which the replay reads back as the cancel it was. A
+body whose whole record replays to its end had ended before the cancel could
+reach it, and settles as it ended.
+
+**Surfaces.** The route is under the auth of the trigger that started the
+execution (PRD resolved q32), checked exactly as the status and resume routes
+check it, before anything about the execution is said: `404` for an id this
+process does not know, the trigger's refusal for a caller it does not verify,
+`409` naming the status for an execution that has completed, failed or been
+cancelled, and `202` for one that is open — a second cancel of one already
+cancelling included, since the request stands either way. `agent-compose cancel`
+is the emitted command line's `cancel` verb: it sends the request to `--url`, or
+to the target's `hub.public_url`, with the headers `--header` names, and exits
+`0` on `202`, `1` on a refusal, and `2` where it could not ask. A `run` keeps
+PRD resolved q28's posture: `Ctrl-C` leaves its row open for `resume`, and a
+cancel is `serve`'s.
+
+**Collision review.** D70's "concurrent branches are never cancelled" is amended
+to "never by a sibling's failure" — a cancel is the one actor that stops them
+all — and carries the amendment note. D159's "what this release does not
+produce: `cancelled`" is superseded: the seam it built is what this drives, and
+its own clauses — innermost first, an end under way waited for, an abandoned
+pause an end, nothing new begun inside an ended instance — are read at the new
+outcome unchanged; it carries the amendment note. D94 is read, not amended: a
+detached delivery's outcome is still never observed, and the cancel stops it as
+a running node rather than waiting on it. D102 and D110 are untouched. D150's
+child executions are what the cascade walks. D118 stands. PRD resolved q28
+(`run` keeps its posture), q29 (a divergence still travels as itself and keeps
+the row open), q32 (the route's auth), q34 (`cancelled` joins the settle
+webhook's statuses), q35, q38 and q44 (a cancelled dispatch is per session and
+held in the journal's rows), q65 (lineage is the cascade) and q76 are read at
+their own words.
+
+**Status**: shipped as written here. The ruling fixes the mechanism, the status,
+the cascade, the surfaces and the restart; what the paragraphs above read into
+it is the implementation's, and awaits the owner's ruling where marked: that
+`execution.error` is absent on `cancelled`; that a cancel arriving after the
+root's body ended changes no outcome; that a detached `agent.*`/`tool.*`
+delivery is stopped as a running node; that a stopped effect is not recorded;
+and that a recovered cancel completes at the replay's frontier. *PRD resolved
+q28, q29, q32, q34, q65, q75, q76; §7.6.3, §7.9, §8.6, §13.3; amends D70, D159;
+builds on D94, D102, D150.*
+
+### D161. `max_running` is how many dispatches one worker session holds for a placement
+
+A placement may declare `max_running:` — an integer of at least `1`, default
+`1` — the number of unsettled dispatches of that placement **one worker
+session** may hold at once (§14.1). The hub's poll handler offers a session work
+of the placement while the session's unsettled dispatches for it number fewer
+than the cap, and hands a parked dispatch to the **least-loaded** session
+polling for it: of the sessions holding a poll that claim the placement and are
+below its cap, the one holding the **fewest** of its unsettled dispatches, and
+between two holding as many, the one whose poll arrived **first**. A worker runs
+every dispatch it holds concurrently and keeps polling while any is unsettled —
+the heartbeat rule of `docs/distributed.md` §2 holds — and the poll answer's
+"`204` while a dispatch is unsettled" sentence is gone (PRD resolved q79).
+
+**Rationale**: the field report's open question — "how does the hub decide which
+worker gets what" — had an answer nobody had written down, and the ruling
+records it first. **What was:** the hub handed the oldest parked dispatch to
+whichever free session polled first, one dispatch per session, with no fairness
+and no capacity; a machine that could run two nodes at once had to run two
+workers, and a fan-out onto one worker ran one item at a time whatever the
+machine could take. **What is:** the oldest parked work still goes first (§6.2's
+park order), a session may hold as many of a placement's dispatches as the
+placement's `max_running:` says, and the free slot goes to the least-loaded
+session asking for it, so a pool with uneven load evens out rather than piling
+onto whoever polls fastest.
+
+**Why per session, and why read off the rows.** PRD resolved q44's invariants
+hold: capacity is a property of a session — one worker process, one join — and
+what a session holds is read off the journal's dispatch rows each time it is
+asked, never kept as a counter the rows could disagree with. A dispatch the hub
+cancelled stays on its session's count until the worker's cancelled result
+settles it, because the process running it is still stopping (D160). A worker
+claiming two placements holds up to each one's cap of each.
+
+**Why it is a placement key, and the knob it replaces.** The mesh decision
+"no capacity knob — a session holds exactly one unsettled dispatch"
+(`docs/distributed.md` §2, §13) is **retired**, and the compiler test that pinned
+it with it: the number is the deploy layer's, beside the members it is about,
+because it is a property of the machine a placement names — what the machine
+with the GPU can run at once — and not of the hub that schedules it. There is no
+hub option or environment variable for it, and no join field: a worker does not
+declare its own capacity, the deploy file does.
+
+**What it is not.** It bounds what a pool *runs*, not what a graph *admits*: a
+`map`'s `max_concurrency:` (§8.6) is still how many instances are in flight, and
+a placed node's `timeout:` still runs from dispatch, so an item waiting for a
+free slot fails on its budget exactly as one waiting for a machine that is off
+(`docs/distributed.md` §6.5).
+
+**Collision review.** The mesh "no capacity knob" decision is retired, with its
+pinning test replaced by tests of the cap and of the least-loaded rule. PRD
+resolved q38 (pools) is read, not amended: a pool's parallelism is now the sum of
+its sessions' caps. q44's invariants hold as stated above. D128's placement is a
+named claim, unchanged; this adds one key beside its members. The poll's `204`
+sentence and the result's new `status` are one protocol bump, shared with D160
+(`docs/distributed.md` §10.4, row `3`).
+
+**Status**: shipped as written here. The ruling fixes the key, the cap and the
+least-loaded preference; the tie-break — the oldest poll — and that a cancelled
+dispatch counts until its result arrives are the implementation's, and await the
+owner's ruling. *PRD resolved q38, q44, q75, q79; §14.1; builds on D128;
+retires the mesh capacity decision of `docs/distributed.md` §13.*
 
 ## Appendix B — Editor integration
 

@@ -1,6 +1,6 @@
 # agent-compose — Trace Format
 
-**Trace version:** `6`
+**Trace version:** `7`
 **Status:** Normative for the trace a compiled project emits
 **Companion artifacts:** [`docs/grammar.md`](grammar.md) (the DSL this describes runs of), [`prd.md`](../prd.md) §5.3, §5.6, §5.8, §5.9
 
@@ -320,14 +320,14 @@ in full, and what `run --format json` spreads into the record it prints.
 
 | field | type | presence | meaning |
 |---|---|---|---|
-| `trace_version` | integer | always | The format the `entries` are written in. `6` is this document, and a compiled project spells it `TRACE_VERSION` (exported from its `src/runtime.ts`). See [Stability](#10-stability). |
+| `trace_version` | integer | always | The format the `entries` are written in. `7` is this document, and a compiled project spells it `TRACE_VERSION` (exported from its `src/runtime.ts`). See [Stability](#10-stability). |
 | `detached` | `true` | a child execution's envelope | Marks the envelope of a **child execution** — one a detached `flow.*` dispatch started (§1.4, PRD resolved q65). Never `false`: an execution a trigger or a command started omits the key. Carried by the envelopes a child's settlement writes — its trace-sink export, and the trace file an `agent-compose resume` of it writes; `run --format json` and a `serve` report carry no envelope head and so never do. |
 | `parent_execution` | string | a child execution's envelope | The execution whose detached dispatch started this one — its **parent**, and never this envelope's own `execution_id`: a child is an execution of its own. Half of the pair a reader joins the parent's stub record to this envelope on, and the pair a receiver may dedupe on (§1.4); also half of what the child's id is derived from (`docs/durability.md` §3.2). |
 | `idempotency_key` | string | a child execution's envelope | The grammar §9.4 key of the dispatch that started this child: byte for byte the `idempotencyKey` of the parent's stub `"detached"` dispatch record (§5.1), so the join between the parent's entry and this envelope is string equality (§8). The other half of the pair (§1.4). |
 | `flow` | string | always | The flow that was run, as its typed address (grammar §2.2). On a child execution's envelope, the `flow.*` the dispatch targeted. |
 | `execution_id` | string | always | The execution the entries belong to — grammar §4.1's `execution.id`, and the prefix of every idempotency key in the document (grammar §9.4). On a child execution's envelope it is the **child's** own id — derived from `parent_execution` and `idempotency_key` (`docs/durability.md` §3.2) — under which its effects are journaled and every key in its entries is derived. |
-| `status` | `"completed"` \| `"failed"` \| `"interrupted"` | always | How the run ended: with an answer, without one, or holding a `human` pause it had no way to answer (grammar §8.7, §9). The third is told apart from the second because the two ask different things of whoever is reading — one is a run to look into, the other a question to answer — and because a reader may not decide it from the message text (§10.1). A child execution's envelope takes the first two only: a detached dispatch that could reach a `human` node is refused at build time (Decision D118), so a child never parks. |
-| `error` | string | on `"failed"` and `"interrupted"` | What stopped the run. Present on every document that carries neither answer, because such a run's last entry does not always say: a run stopped by the superstep ceiling has no aborting node to carry one. On `"interrupted"` it names the node that is waiting and where an answer would come from. |
+| `status` | `"completed"` \| `"failed"` \| `"interrupted"` \| `"cancelled"` | always | How the run ended: with an answer, without one, holding a `human` pause it had no way to answer (grammar §8.7, §9), or stopped by somebody's **cancel** (`POST /executions/:id/cancel`, `agent-compose cancel`; PRD resolved q75, Decision D160). The third is told apart from the second because the two ask different things of whoever is reading — one is a run to look into, the other a question to answer — and because a reader may not decide it from the message text (§10.1); the fourth for the same reason: nothing went wrong with a run somebody stopped, and a reader that read it as a failure would look for one. A cancelled run's entries are whatever it had recorded when the cancel came: every node it stopped is a `"cancelled"` entry (§3.2), and every instance it ended ran its `finally:` node, whose entry is there too (§3.5). A child execution's envelope takes every status but `"interrupted"`: a detached dispatch that could reach a `human` node is refused at build time (Decision D118), so a child never parks — and a child is cancelled when its parent is, or alone (§1.4). |
+| `error` | string | on `"failed"` and `"interrupted"` — never on `"cancelled"` | What stopped the run. Present on every document that carries neither answer, because such a run's last entry does not always say: a run stopped by the superstep ceiling has no aborting node to carry one. On `"interrupted"` it names the node that is waiting and where an answer would come from. |
 | `finally_error` | string | when a `finally:` node of the execution failed after its own retries | What that node raised, as `<flow> node \`<id>\` failed: <error>` — the **first** such failure in the execution, since a subflow instance's finally node and the root's can both fail (grammar §7.9, PRD resolved q76). It sits beside a `status` it does **not** change: a `"completed"` envelope carrying one is a run that produced its answer and whose cleanup failed afterwards, and its outputs are its body's. Never empty. The failed node's own entry carries its `error` too (§3.5), and every later failure is on its own entry. Carried on every envelope this document describes — the trace file, the sink export, `run --format json`'s record and a `serve` report — and on the execution's lifecycle row as `finallyError` (`docs/durability.md` §3.5). |
 | `entries` | array of [entries](#3-entries) | always, possibly empty | Every entry the run recorded, in the order §3.1 fixes. Empty only on a run that recorded none at all — one that failed before any node produced an entry, which takes a failure the node a run aborts at cannot account for, since that node contributes one (§9). The trace **file** is not written for such a run (§1.2), so an empty array reaches a reader only as `run --format json`'s `trace` or a `serve` report's — or as a child execution's export, which ships whatever its run recorded. |
 
@@ -364,7 +364,7 @@ retries are attempts at one execution, and `attempts` is where they are recorded
 | `flow` | string | always | The typed address of the flow this node belongs to (grammar §2.2). It is the *instance's* flow, so entries nested under [`inner`](#8-nesting-instance-paths-and-idempotency-keys) name the subflow rather than the caller. |
 | `node` | string | always | The flow-local node id (grammar §2.4). |
 | `traversal` | integer | always | How many times this node had **already** begun executing in this flow instance — `0` on the first, `1` on the second traversal of a bounded cycle. It is grammar §9.4's traversal ordinal, the same number the instance path is built from. |
-| `outcome` | `"completed"` \| `"skipped"` \| `"failed"` | always | See §3.2. |
+| `outcome` | `"completed"` \| `"skipped"` \| `"failed"` \| `"cancelled"` | always | See §3.2. |
 | `attempts` | integer | always | How many attempts the node's `retry:` policy **made**, not how many it allowed (grammar §9.1) — a budget that ran out during the second of three made two. `0` when the node never ran: an input binding that could not be evaluated fails the execution before any attempt (grammar §4.1, §10.1). |
 | `writes` | array of strings | `"completed"`, `"skipped"`, possibly empty | The state channels this node wrote, by name (grammar §10.1). Empty on a skipped node, which writes nothing — and on a **completed** node that landed no channel: one whose `writes:` maps nothing, and one whose result omitted every field that is mapped (grammar §8.0, Decision D110). An empty array is therefore not a statement about `outcome`; read `outcome` for that. Absent on a failed entry: a node that failed produced no output to write from, and where the failure ended the run the superstep it died in lands nothing at all (§9). |
 | `routing` | [routing decision](#4-routing-decisions) | `"completed"`, `"skipped"` — except on a flow's `finally:` node (§3.5); on `"failed"` in the one case §9 names | What this node's outgoing edges answered. The one failed case is *no viable route*, where the edge decisions are the whole explanation; every other failure abandoned or never reached the decision. A `finally:` node's entry never carries it, whatever its outcome: the node has no edges, so there is no decision to record. See §4 and §9. |
@@ -424,6 +424,20 @@ entry it aborted at, exactly as the root's does.
     other.
   * without `fallback`, the failure ended the run. That entry is the last one in
     the document — see §9.
+
+* **`"cancelled"`** — the execution's **cancel** stopped the node while it ran
+  (PRD resolved q75, Decision D160): its model call's request, its command,
+  its harness run or its placed dispatch was stopped where it was, and it begins
+  no further attempt. It is not a failure, so it carries **no `error`** — and no
+  `routing` and no `fallback`, because a cancelled node routes nowhere: no
+  `retry:` and no `on_error:` decided anything about it. It carries every
+  record the node made before the cancel reached it — `models`, `harness`,
+  `stores`, `inner`, `toolDispatches` — except an effect the cancel stopped in
+  flight, which recorded nothing (`docs/durability.md` §3). A node waits for
+  every instance it began to end, each one's `finally:` node run, before it
+  settles, so an `inner` carries those instances' finally entries. A cancel
+  never stops a `finally:` node: an instance's finally node runs whole, and its
+  entry's outcome is its own (§3.5).
 
 A node that never ran at all — one whose *input* could not be built — is
 `"failed"` with `attempts: 0`.
@@ -1662,6 +1676,33 @@ half is the aliased package's own and the package half is still the name the
 driver imports. No other field of any record changed, and an envelope whose run
 held no coder node changed its `trace_version` and nothing else.
 
+### 10.3.6 What version `7` changed
+
+An execution can now be **cancelled** (PRD resolved q75, Decision D160), and
+the format grew the two values that say so. Both are new members of
+enumerations a reader of version `6` switches on, which is §10.3's "adding a
+member to an enumeration a reader may switch on", and that is the bump:
+
+* **`TraceDocument.status` gained `"cancelled"`** (§2). A cancelled envelope
+  carries no `error` — nothing went wrong with a run somebody stopped — so a
+  reader of `6` that took "not `completed`" for "carries `error`" now meets an
+  envelope where it does not hold, and the version is what tells it so. Every
+  surface that carries a settled envelope carries it: the trace file, the sink
+  export, `run --format json`'s record of a `resume` that completed a cancel, a
+  `serve` report and the settle webhook (`status` in its body, grammar §13.3).
+* **`TraceEntry.outcome` gained `"cancelled"`** (§3.2): a node the cancel
+  stopped, with no `error`, no `routing` and no `fallback`, carrying every
+  record it made. A reader of `6` that read the absence of `routing` on an entry
+  as `"failed"`'s "the failure ended the run" would read a cancelled node as the
+  one that aborted it.
+* **The OTLP export moved with them** (§12.4): a `"cancelled"` root and a
+  `"cancelled"` entry are both `UNSET` spans — neither OK nor ERROR — with
+  `agentcompose.status` and `agentcompose.outcome` saying `cancelled`.
+
+What did **not** move: every field's name, type and presence on the other
+statuses and outcomes, and the meaning of each. A run nobody cancelled changed
+its `trace_version` and nothing else.
+
 ### 10.4 How the two are held together
 
 The version number alone is a promise; two tests make it a checkable one:
@@ -2121,8 +2162,8 @@ way.
 
 | span | ok | error | unset |
 |---|---|---|---|
-| root | `status: "completed"` | `"failed"`, with the envelope's `error` as the status message | `"interrupted"` — a run holding a question is not an outcome, and `agentcompose.status` is where it is said |
-| entry | `outcome: "completed"` | `"failed"`, with the entry's `error` as the message | `"skipped"` — its `error` says what was absorbed, and it is on the attributes |
+| root | `status: "completed"` | `"failed"`, with the envelope's `error` as the status message | `"interrupted"` — a run holding a question is not an outcome — and `"cancelled"` — a run somebody stopped neither succeeded nor went wrong; `agentcompose.status` is where each is said |
+| entry | `outcome: "completed"` | `"failed"`, with the entry's `error` as the message | `"skipped"` — its `error` says what was absorbed, and it is on the attributes — and `"cancelled"`, which carries no `error`; `agentcompose.outcome` says it |
 | dispatch | `outcome: "completed"` | `"failed"`, with the record's `error` as the message | `"skipped"` and `"detached"` |
 | model call | any call a member answered | a call `refused` ended, with `<member>: <detail>` as the message | — |
 | harness run | `outcome: "completed"` | `"failed"`, with the record's `error` as the message where it has one | — |
