@@ -12522,7 +12522,15 @@ delivery is stopped as a running node; that a stopped effect is not recorded;
 that a recovered cancel completes at the replay's frontier; and that a worker
 holding a dispatch across a restart mid-cancel ends what it began there
 `failed`, not `cancelled` (above), which is a limitation the protocol does not
-close. *PRD resolved
+close. **Provisional, as a whole, on what a worker does when the hub stops
+waiting for a dispatch it runs** — the `stop` list and its `SIGUSR2`, that a
+stop ends the instances it began `failed` and reaches every node in the runner,
+that an effect a stop cut off is kept out of the journal, and what a worker
+holding a dispatch learns across a hub restart: that seam is read from the
+ruling, not stated by it, and the campaign's seven review rounds each found a
+new defect in it. It stands as shipped and tested, and awaits the owner's
+ruling before protocol `3` is treated as frozen (D161, `docs/distributed.md`
+§3.2, §10.4). *PRD resolved
 q28, q29, q32, q34, q65, q75, q76; §7.6.3, §7.9, §8.6, §13.3; amends D70, D124,
 D159; builds on D94, D102, D150.*
 
@@ -12636,7 +12644,9 @@ dispatch on every answer until its result arrives, are the implementation's,
 and await the owner's ruling. The **`stop` list in particular** is a wire field
 no ruling names — PRD resolved q75's ruling b gives the poll "a `cancel`
 list" — so protocol `3`'s `stop` field is provisional until the owner rules on
-it (`docs/distributed.md` §3.2, §10.4). *PRD resolved q38, q44, q75, q79; §14.1; builds on D128;
+it (`docs/distributed.md` §3.2, §10.4). With it, the whole of what a worker does
+when the hub stops waiting for a dispatch — named in D160's status — is
+provisional on the same ruling. *PRD resolved q38, q44, q75, q79; §14.1; builds on D128;
 retires the mesh capacity decision of `docs/distributed.md` §13.*
 
 ## Appendix B — Editor integration

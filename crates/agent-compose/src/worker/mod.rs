@@ -500,12 +500,13 @@ fn serve(
                     // first**, on this thread (§3.2, PRD resolved q75): the
                     // `cancel` or `stop` list below may name it — a cancel or a
                     // stop that reached it while the hub was assembling this
-                    // very answer, which the hub names to nobody again once it
-                    // is sent — and a name this worker does not hold yet is
-                    // nothing to stop ([`node::Running::halt`]). Marked here, it
-                    // is settled without its runner ever starting. Held by the
-                    // thread that runs it instead, it would race the next poll's
-                    // lists as well.
+                    // very answer, which the hub names again on every answer
+                    // until its result arrives — and a name this worker does not
+                    // hold yet is nothing to stop ([`node::Running::halt`]).
+                    // Marked here, it is settled without its runner ever
+                    // starting, rather than a poll later. Held by the thread
+                    // that runs it instead, it would race the next poll's lists
+                    // as well.
                     let handed = answer
                         .get("dispatch_id")
                         .and_then(Value::as_str)
