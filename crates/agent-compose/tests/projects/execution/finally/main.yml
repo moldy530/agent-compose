@@ -85,6 +85,12 @@
 #     `tool.*` with items queued for its permit, and a `map` of a failing
 #     `tool.*` whose items are due another `on_item_error` attempt. None of them
 #     begins anything once the subflow's body has ended either.
+#   * `flow.stranded_turns` — the same, against two agents whose loops still
+#     have work to begin while the subflow's finally node lingers: one whose
+#     model answers after the failure with an `exec:` tool call and a store
+#     write, and one whose tool is still running when the failure comes. The
+#     running tool runs on; neither agent calls another tool or makes another
+#     model call.
 #   * `flow.delivered` — a **detached** `map` delivery to an agent whose model
 #     calls `flow.slow_toolish`, outlasting the body that issued it. The
 #     delivery is off the instance (grammar §8.6 rule 7): the flow's end stops
@@ -118,6 +124,14 @@ provider.mock:
 model.smart:
   provider: provider.mock
   id: claude-sonnet-4-6
+  settings:
+    max_tokens: 4096
+
+# A second model, only so two agents running side by side in
+# `flow.stranding_turns` each answer from a queue of their own.
+model.quick:
+  provider: provider.mock
+  id: claude-haiku-4-5
   settings:
     max_tokens: 4096
 
@@ -1453,6 +1467,128 @@ flow.marked_lingering:
     - { from: start, to: mark_it }
     - { from: mark_it, to: linger }
     - { from: linger, to: end }
+
+# `scope: global`, so a test reads the store's own file once the run has ended
+# and finds no claim that a let-go agent's `claims_set` made.
+store.claims:
+  kind: kv
+  scope: global
+  description: Who claimed which topic.
+  value_schema:
+    owner: { type: string }
+
+tool.turn_mark:
+  description: Logs the mark it is given.
+  input:
+    name: { type: string }
+  output:
+    done: { type: string }
+  exec:
+    command: "${OPS_BIN}/sh"
+    args: ["-c", "printf 'mark:%s\\n' \"$NAME\" >> \"$TALLY_LOG\"; echo done"]
+
+tool.slow_turn_mark:
+  description: Logs that it began, takes two seconds, then logs that it ended.
+  input:
+    name: { type: string }
+  output:
+    done: { type: string }
+  exec:
+    command: "${OPS_BIN}/sh"
+    args:
+      - "-c"
+      - "printf '%s-start\\n' \"$NAME\" >> \"$TALLY_LOG\"; sleep 2; printf '%s-end\\n' \"$NAME\" >> \"$TALLY_LOG\"; echo done"
+
+# The two agents `flow.stranding_turns` runs beside its failing node, on two
+# models so a test scripts each one's answers on its own queue.
+agent.late_caller:
+  description: Marks and claims the topic it is given, then writes a short note.
+  model: model.smart
+  prompt: |
+    Mark the topic you are given, claim it, then write one short note about it.
+  tools: [tool.turn_mark]
+  stores: [store.claims]
+  input:
+    topic:
+      description: What to write a note about.
+      type: string
+  output:
+    remark:
+      description: The note.
+      type: string
+
+agent.busy_caller:
+  description: Marks the topic it is given slowly, then writes a short note.
+  model: model.quick
+  prompt: |
+    Mark the topic you are given, then write one short note about it.
+  tools: [tool.slow_turn_mark]
+  input:
+    topic:
+      description: What to write a note about.
+      type: string
+  output:
+    remark:
+      description: The note.
+      type: string
+
+flow.stranded_turns:
+  description: A flow whose subflow ends while agents in it still have tool calls and model turns to make.
+  outputs: {}
+  nodes:
+    mid:
+      flow: flow.stranding_turns
+      on_error: skip
+    # So whatever the ended subflow's agents went on to begin after its finally
+    # node had run would begin while this run is still going.
+    after:
+      exec:
+        command: "${OPS_BIN}/sleep"
+        args: ["2"]
+    stranded_turns_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "'outer:' + execution.outcome"
+  edges:
+    - { from: start, to: mid }
+    - { from: mid, to: after }
+    - { from: after, to: end }
+  finally: stranded_turns_end
+
+flow.stranding_turns:
+  description: A body node that fails beside two agents with tool calls and model turns still to make, and a finally node that lingers.
+  outputs: {}
+  nodes:
+    # A second: `busy_caller`'s tool, called at once, has a second still to
+    # run, and `late_caller`'s model has not answered — the test holds its
+    # answer for two and a half seconds, inside the three the finally node
+    # lingers for.
+    doomed:
+      exec:
+        command: "${OPS_BIN}/sh"
+        args: ["-c", "sleep 1; exit 1"]
+    late_caller:
+      agent: agent.late_caller
+      input:
+        topic: "'late'"
+    busy_caller:
+      agent: agent.busy_caller
+      input:
+        topic: "'busy'"
+    stranding_turns_end:
+      flow: flow.marked_lingering
+      input:
+        mark: "'inner:' + execution.outcome"
+  edges:
+    - { from: start, to: doomed }
+    - { from: start, to: late_caller }
+    - { from: start, to: busy_caller }
+    - { from: doomed, to: end }
+    - { from: late_caller, to: end }
+    - { from: busy_caller, to: end }
+  finally: stranding_turns_end
 
 triggers:
   cli: { type: manual, flow: flow.ended }
