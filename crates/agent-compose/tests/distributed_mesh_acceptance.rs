@@ -3353,23 +3353,33 @@ fn lapsing() -> Vec<Script> {
 }
 
 /// **A placed node's deadline ends what it began on the worker `failed`, never
-/// `cancelled`** (grammar §7.9, §9.2; PRD resolved q75, q76;
-/// `docs/distributed.md` §3.2, §3.3).
+/// `cancelled` — and waits for it to end** (grammar §7.9, §9.2; PRD resolved
+/// q75, q76; Decision D159; `docs/distributed.md` §3.2, §3.3, §3.4).
 ///
 /// `flow.lapsed`'s placed `lapse` has four seconds, and its model calls
-/// `flow.lapsing`, whose body runs for ten minutes on the worker. At four
-/// seconds the hub stops waiting: the node fails on its budget and the
-/// execution with it — `failed`, because nobody cancelled anything — and the
-/// worker is told to **stop** the dispatch, on the poll's `stop` list. The
-/// runner stops the placed node with a failure rather than firing its
-/// execution's cancel, so the attached instance ends `failed` and its finally
-/// node runs at that outcome; the boundary it crosses is journaled from the
-/// worker, and says `failed` — what the same instance records when an unplaced
-/// node runs out of time
+/// `flow.lapsing`, whose body runs for ten minutes on the worker and whose
+/// finally node fails at once. At four seconds the hub stops waiting: the node
+/// fails on its budget and the execution with it — `failed`, because nobody
+/// cancelled anything — and the worker is told to **stop** the dispatch, on the
+/// poll's `stop` list. The runner stops the placed node with a failure rather
+/// than firing its execution's cancel, so the attached instance ends `failed`
+/// and its finally node runs at that outcome; the boundary it crosses is
+/// journaled from the worker, and says `failed` — what the same instance
+/// records when an unplaced node runs out of time
 /// (`a_flow_node_whose_timeout_ran_out_waits_for_its_instances_finally_node`).
 /// Told to cancel instead, the runner would end it `cancelled` in an execution
 /// whose own outcome is `failed`, and a retry's redispatch would hand that
 /// record back to be replayed as the cancel nobody made.
+///
+/// **And the node waits for that end**, as a node whose deadline ran out waits
+/// for every instance it began: the hub holds `lapse` open at its site until
+/// the worker's result for the stopped dispatch comes home. So the boundary is
+/// in the journal by the time the execution settles, and the finally node's
+/// failure — carried on that result, which the hub refuses `409` — is the
+/// execution's `finally_error`, on the report and on the lifecycle row. A node
+/// that settled the moment its budget ran out would settle the execution
+/// before the instance on the worker had ended, and drop that failure with the
+/// refused result.
 #[test]
 fn a_deadline_on_a_worker_ends_the_instances_it_began_failed_not_cancelled() {
     let Some(mesh) = Mesh::start() else {
@@ -3395,14 +3405,37 @@ fn a_deadline_on_a_worker_ends_the_instances_it_began_failed_not_cancelled() {
         "{report:#}"
     );
 
-    // The instance on the worker ends once the runner has been told to stop,
-    // and its boundary comes home over `/workers/effects` after the execution
-    // has settled on the hub.
+    // The instance on the worker ended once the runner had been told to stop,
+    // and the node waited for it: its boundary came home over
+    // `/workers/effects` **before** the execution settled on the hub.
     const BOUNDARY: &str = "lapse/0/lapsing/0/lapse_up/0#finally/0";
-    until(
-        "the attached instance's finally boundary reached the hub's journal",
-        || worker.transcript(),
-        || harness::journal_holds(&mesh.project, &[BOUNDARY]),
+    assert!(
+        harness::journal_holds(&mesh.project, &[BOUNDARY]),
+        "the execution settled before the instance its placed node began on the worker had \
+         ended: {report:#}\n{}",
+        worker.transcript()
+    );
+    let finally_error = report["finally_error"].as_str().unwrap_or_else(|| {
+        panic!(
+            "the execution carries no `finally_error`, though the finally node the stop started \
+             on the worker failed and its result said so: {report:#}\n{}",
+            worker.transcript()
+        )
+    });
+    assert!(
+        finally_error.starts_with("flow.lapsing node `lapse_up` failed: ")
+            && finally_error.contains("exited 5"),
+        "the execution's `finally_error` is not the one the worker's result carried: \
+         {finally_error}"
+    );
+    let lifecycle = harness::journal_rows(
+        &mesh.project,
+        &format!("SELECT status, finally_error FROM executions WHERE id = '{execution}'"),
+    );
+    assert_eq!(
+        lifecycle,
+        json!([{ "status": "failed", "finally_error": finally_error }]),
+        "the journal's lifecycle row does not carry the worker's finally failure"
     );
     let rows = harness::journal_rows(
         &mesh.project,
@@ -3433,6 +3466,83 @@ fn a_deadline_on_a_worker_ends_the_instances_it_began_failed_not_cancelled() {
                 .as_str()
                 .is_some_and(|detail| detail.contains("stopped waiting")),
         "{dispatches:#?}"
+    );
+    assert!(worker.running(), "{}", worker.transcript());
+}
+
+/// **A stop on a worker leaves none of the commands the placed node's attached
+/// flow was running** (Decision D160's "a stopped command is stopped whole";
+/// `docs/distributed.md` §3.2; PRD resolved q79).
+///
+/// `flow.lapsed` again: at four seconds the hub stops waiting for `lapse`,
+/// while the `sleep 600` of `flow.lapsing`'s body is running in a process
+/// group of its own under the runner. The stop is what ends that command too —
+/// every node the runner runs chains to it beside the execution's cancel —
+/// not only the placed node, whose attached instance ends on it and lets its
+/// running node go. Asserted **past the worker's grace**, which is when the
+/// command would otherwise show itself: the runner kept alive by it would be
+/// killed with its own group, and the command — a group of its own — would
+/// survive it, re-parented, still writing into the worker's workspace beside
+/// whatever the freed slot was handed next.
+#[test]
+fn a_stop_on_a_worker_leaves_none_of_the_commands_its_attached_flow_ran() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider.enqueue_all(lapsing());
+    let mut worker = mesh.worker("stop-takes-the-command");
+    let started = Instant::now();
+    let execution = mesh.start_execution("/lapsings", &json!({ "path": "release.dmg" }));
+    // The runner, and the attached flow's command under it, off `/proc`; off
+    // Linux there is no `/proc` to ask, and the case has nothing to read.
+    if worker.runners().is_none() {
+        return;
+    }
+    let (runner, command) = {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let held = worker.runners().unwrap_or_default();
+            if let Some(runner) = held.first().copied() {
+                let body = u32::try_from(runner)
+                    .ok()
+                    .and_then(|runner| children_running(runner, "sleep"))
+                    .unwrap_or_default();
+                if let Some(command) = body.first().copied() {
+                    break (runner, command);
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the attached flow's command never started on the worker: {}",
+                worker.transcript()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] != "running" && report["status"] != "interrupted"
+    });
+    assert_eq!(
+        report["status"],
+        "failed",
+        "{report:#}\n{}",
+        worker.transcript()
+    );
+
+    // Past the node's four seconds and the worker's five-second grace after
+    // them, with a second to spare.
+    std::thread::sleep(Duration::from_secs(10).saturating_sub(started.elapsed()));
+    assert!(
+        gone_within(command, Duration::ZERO),
+        "the attached flow's command outlived the stop that ended its instance, past the \
+         worker's grace: {}",
+        std::fs::read_to_string(format!("/proc/{command}/stat")).unwrap_or_default()
+    );
+    assert!(
+        gone_within(runner, Duration::ZERO),
+        "the runner outlived the grace: {}",
+        worker.transcript()
     );
     assert!(worker.running(), "{}", worker.transcript());
 }

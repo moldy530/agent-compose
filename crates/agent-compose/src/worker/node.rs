@@ -226,6 +226,13 @@ impl Running {
     /// cancelled its execution, and what it began here ends `failed` — by
     /// `SIGUSR2`, the grace — held while a `finally:` node runs — and the group
     /// killed after.
+    ///
+    /// **A stop even where the hub was cancelling it.** A `410` says the
+    /// session ended, not why, so a dispatch whose execution a restarted hub
+    /// is completing a cancel of is stopped here like any other — what it
+    /// began ends `failed`, not `cancelled` — which is the limitation grammar
+    /// D160 and `docs/distributed.md` §5 name, and a protocol choice left to
+    /// the owner.
     pub(crate) fn orphan(&self, generation: u64) {
         let older: Vec<String> = self
             .0

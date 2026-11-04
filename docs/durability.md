@@ -1550,7 +1550,11 @@ still unsettled is a frontier too, and the cancel withdraws it or tells the
 worker holding it (`docs/distributed.md` §3.2); so is a dispatch row a worker
 settled with the cancelled ending (`ExecutionCancelled`, `docs/distributed.md`
 §3.4), which the replay reads back as the cancel it was, and one the cancel
-withdrew. So is a **pause nobody answered**: a local one at its claim, and one
+withdrew. A row settled by a result that **raced** the cancel — an ordinary
+ending, posted before the worker heard of the cancel — carries the cancelled
+ending too, because the live node it belonged to was the cancel's: journaled
+with the worker's answer, the replay would read the node as answered and a body
+whose last node it was would settle `completed`. So is a **pause nobody answered**: a local one at its claim, and one
 a worker sent home that the replay finds on a dispatch row settled paused with
 no answer recorded — an abandoned pause writes nothing — where the cancel fires
 instead of the wait being planted on the board again. Planted, it would be a

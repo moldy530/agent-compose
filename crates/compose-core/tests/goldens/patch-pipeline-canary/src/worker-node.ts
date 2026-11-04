@@ -135,7 +135,19 @@
 // `failed`, its finally node run at that outcome, exactly as it does when an
 // unplaced node runs out of time (grammar §7.9, PRD resolved q76). The result
 // line is the node's own ending; the hub refuses it `409` whatever it carries,
-// and frees the slot (§3.4).
+// reads the `finally_error` beside it, and frees the slot (§3.4).
+//
+// **And every node running under it stops too**, not only the placed one. On
+// the hub an instance a deadline ended lets its running node go — it runs on
+// to its own end, unread — but this process is one the worker kills a grace
+// after the stop, and an `exec:` command leads a process group of its own,
+// which that kill does not reach: an attached flow's ten-minute command would
+// run on, re-parented, beside the next dispatch the freed slot is handed. So
+// the stop is installed as one every node here chains to beside the
+// execution's cancel (`runtime.stopEveryNodeOn`): what each is running stops
+// as a deadline stops it — a command's group `SIGTERM`ed, then killed — and
+// the node leaves on a failure no ladder acts on. A finally node, and all it
+// begins, is exempt, as it is from a cancel.
 //
 // # Finally work is reported
 //
@@ -197,6 +209,7 @@ import {
   refuseChildExecutions,
   releaseWorkspaces,
   remotePauseOf,
+  stopEveryNodeOn,
 } from "./runtime.ts";
 
 /**
@@ -221,29 +234,47 @@ class DispatchStopped extends Error {
   }
 }
 
+/** A controller whose signal any number of activities may read at once. */
+function unbounded(): AbortController {
+  const controller = new AbortController();
+  try {
+    setMaxListeners(0, controller.signal);
+  } catch {
+    // A runtime without the call keeps its own default, which is a warning
+    // and never a failure.
+  }
+  return controller;
+}
+
 /**
  * The signal the placed node runs under: the execution's `cancel`, followed —
  * its reason carried as it is, so a cancel still reads as one — and aborted
  * with a [`DispatchStopped`] when the worker sends [`STOP_SIGNAL`].
  *
- * Its listener ceiling is lifted, as `runtime.executionCancelSignal` lifts the
- * execution's: the placed node's activities all read it at once.
+ * The same signal stops **every other node** this process runs, through a
+ * signal of its own that each one's controller chains to beside the
+ * execution's cancel (`runtime.stopEveryNodeOn`): the nodes of an attached
+ * `flow.*` the placed node is running are what a stop would otherwise leave
+ * behind (see *A stop arrives as `SIGUSR2`*). Kept apart from the placed
+ * node's own, because that one follows the cancel too, and a node chained to
+ * both would read the cancel twice.
+ *
+ * Their listener ceilings are lifted, as `runtime.executionCancelSignal` lifts
+ * the execution's: the activities all read them at once.
  */
 function stoppable(cancel: AbortSignal, dispatch: string): AbortSignal {
-  const stop = new AbortController();
-  try {
-    setMaxListeners(0, stop.signal);
-  } catch {
-    // A runtime without the call keeps its own default, which is a warning
-    // and never a failure.
-  }
+  const stop = unbounded();
+  const everyNode = unbounded();
   const follow = (): void => {
     if (!stop.signal.aborted) stop.abort(cancel.reason);
   };
   if (cancel.aborted) follow();
   else cancel.addEventListener("abort", follow, { once: true });
+  stopEveryNodeOn(everyNode.signal);
   process.on(STOP_SIGNAL, () => {
-    if (!stop.signal.aborted) stop.abort(new DispatchStopped(dispatch));
+    const reason = new DispatchStopped(dispatch);
+    if (!stop.signal.aborted) stop.abort(reason);
+    if (!everyNode.signal.aborted) everyNode.abort(reason);
   });
   return stop.signal;
 }
