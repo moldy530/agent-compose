@@ -514,6 +514,12 @@ const CODEGEN: &[Criterion] = &[
                 "the_composition_defaults_reach_a_finally_node",
                 Status::Live,
             ),
+            // …and a finally node that is a `map`: every item's own binding
+            // reads how the instance ended, as the map's configuration does.
+            (
+                "a_finally_map_hands_every_item_how_its_instance_ended",
+                Status::Live,
+            ),
         ],
     },
     Criterion {
@@ -840,6 +846,19 @@ const CODEGEN: &[Criterion] = &[
             ),
             (
                 "a_map_whose_timeout_ran_out_waits_for_the_instances_it_began_and_begins_no_more",
+                Status::Live,
+            ),
+            // …and on a sibling's failure: a body node that fails while other
+            // branches are still running subflow instances ends those first —
+            // each stopped, its finally node run — before its own flow's.
+            (
+                "a_failing_body_node_ends_the_instances_its_siblings_are_still_running_first",
+                Status::Live,
+            ),
+            // …save one that is waiting on a person: its pause is abandoned,
+            // which is not an end, and it runs no finally node.
+            (
+                "a_sibling_waiting_on_a_person_when_the_body_fails_runs_no_finally_node",
                 Status::Live,
             ),
         ],
@@ -1815,6 +1834,13 @@ const DURABILITY: &[Criterion] = &[
             // finally node, and the resume that answers it runs each once.
             (
                 "a_parked_run_runs_no_finally_node_and_its_resume_runs_each_once",
+                Status::Live,
+            ),
+            // …and a replay that reaches another end than its boundary records —
+            // a deadline that ended the body in one generation and not the next
+            // — runs the finally node alone, once, and ends on the recorded end.
+            (
+                "a_resumed_run_whose_replay_completes_settles_on_the_end_its_boundary_records",
                 Status::Live,
             ),
         ],

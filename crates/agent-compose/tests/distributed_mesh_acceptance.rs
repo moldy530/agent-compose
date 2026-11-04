@@ -892,7 +892,7 @@ fn an_instance_that_ends_on_a_worker_journals_its_boundary_and_reports_its_final
     let rows = harness::journal_rows(
         &mesh.project,
         &format!(
-            "SELECT \"key\" AS k, request FROM effects \
+            "SELECT \"key\" AS k, request, payload FROM effects \
              WHERE execution = '{execution}' AND kind = 'finally'"
         ),
     );
@@ -904,9 +904,12 @@ fn an_instance_that_ends_on_a_worker_journals_its_boundary_and_reports_its_final
     );
     let request: Value = serde_json::from_str(rows[0]["request"].as_str().expect("a request"))
         .expect("the request is JSON");
+    assert_eq!(request, json!({ "node": "tidy_up" }));
+    let recorded: Value = serde_json::from_str(rows[0]["payload"].as_str().expect("a payload"))
+        .expect("the payload is JSON");
     assert_eq!(
-        request,
-        json!({ "node": "tidy_up", "outcome": "completed" })
+        recorded["outcome"], "completed",
+        "the end the worker's instance reached is what the boundary holds"
     );
 
     let lifecycle = harness::journal_rows(

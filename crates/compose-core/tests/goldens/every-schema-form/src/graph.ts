@@ -2503,20 +2503,44 @@ async function quiesceFlow(
   // row open, and it has to be read before the end is — a finally node run
   // past a record that stopped describing this run is effects the record does
   // not hold (PRD resolved q29).
+  //
+  // And every instance still running inside the root ends before the root's
+  // own finally node runs — innermost first: a body node's failure leaves a
+  // sibling branch's subflow instance where it stood, and that one is stopped
+  // and its own finally node run (`runtime.endInstancesInside`).
   if (options.resume === true) await runtime.settleDetached(executionId);
+  const ending = runtime.instanceEnding(executionId, ended);
   let closing: runtime.FinallyRun | undefined;
   try {
-    closing = await runtime.endInstance(
+    const inside = await runtime.endInstancesInside(
+      executionId,
+      "",
+      address,
+      ending,
+      ended,
       flow.finally,
-      (state ?? initial) as runtime.GraphStateLike,
-      runtime.instanceEnding(executionId, ended),
-      trace,
     );
+    try {
+      closing = await runtime.endInstance(
+        flow.finally,
+        (state ?? initial) as runtime.GraphStateLike,
+        ending,
+        trace,
+      );
+    } finally {
+      inside();
+    }
   } catch (thrown) {
     await release(thrown);
     throw thrown;
   }
   if (closing !== undefined) trace = [...trace, closing.entry];
+  // A resumed run settles on the end its boundary records where its body,
+  // replayed, reached another (grammar 7.9, `docs/durability.md` §3.10).
+  if (ended === undefined && closing !== undefined && closing.ending.outcome !== "completed") {
+    ended = new runtime.RecordedEnding(closing.ending);
+    what = "ended as its journal records";
+  }
   await release(ended);
   const finallyError = runtime.finallyErrorOf(executionId);
   if (ended !== undefined) {

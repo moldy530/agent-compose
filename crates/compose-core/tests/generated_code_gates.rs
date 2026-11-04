@@ -10408,10 +10408,13 @@ fn a_contract_refusing_a_live_answer_marks_the_record_before_the_retry_writes_it
 ///   * its entry is the instance's last — one step past the body's, traversal
 ///     `0`, no `routing` — and a node that completed leaves no `finally_error`;
 ///   * the boundary is on the record at `note/0#finally/0`, claimed under
-///     `{node, outcome}` and holding the outcome;
+///     `{node}` and holding the outcome;
 ///   * a resuming generation that reaches the same end is handed the record,
-///     and one that reaches **another** end diverges at the boundary without
-///     running the node (PRD resolved q29);
+///     and one that reaches **another** end is handed it too and settles on it
+///     — the record is the end (PRD resolved q76: "runs `finally` alone,
+///     once") — while the one end no record can stand for, a completion the
+///     replay failed to reach, diverges at the boundary without running the
+///     node (PRD resolved q29);
 ///   * a finally node that fails after a cancellation fails on its own entry
 ///     and as the execution's `finally_error`, under a boundary that still says
 ///     `cancelled`.
@@ -10454,8 +10457,8 @@ fn the_end_of_instance_seam_carries_a_cancellation_no_route_reaches_yet() {
         ),
         (
             "the_boundary_records_the_cancellation",
-            "the boundary at `note/0#finally/0` is not a `finally` record claimed under `{node, \
-             outcome}` holding `cancelled` (`docs/durability.md` §3.5)",
+            "the boundary at `note/0#finally/0` is not a `finally` record claimed under `{node}` \
+             holding `cancelled` (`docs/durability.md` §3.10)",
         ),
         (
             "a_cancelled_end_whose_node_completed_has_no_finally_error",
@@ -10467,10 +10470,16 @@ fn the_end_of_instance_seam_carries_a_cancellation_no_route_reaches_yet() {
              record",
         ),
         (
-            "another_end_over_a_recorded_cancellation_diverges",
-            "a resuming generation whose body ended differently from the record ran the finally \
-             node a second time under another story instead of diverging at the boundary (PRD \
-             resolved q29)",
+            "another_end_over_a_recorded_cancellation_settles_on_the_record",
+            "a resuming generation whose body ended differently from the record did not run the \
+             finally node at the recorded end, or did not answer that end as the one the \
+             instance settles on (`docs/durability.md` §3.10)",
+        ),
+        (
+            "a_failure_over_a_recorded_completion_diverges",
+            "a resuming generation whose body failed where the record says the instance \
+             completed ran the finally node, or did not diverge at the boundary — a completion \
+             answers its body's outputs, which no record holds (PRD resolved q29)",
         ),
         (
             "a_failed_finally_node_after_a_cancellation_is_recorded",

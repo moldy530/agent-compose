@@ -287,7 +287,7 @@ its schema creation is not idempotent: ${error instanceof Error ? error.message 
 
   // …and the **end of an instance** (§3.5, grammar §7.9, PRD resolved q76). The
   //  boundary a `finally:` node's start leaves is an ordinary record of its own
-  //  kind, read back with the outcome it was claimed under; and `finally_error`
+  //  kind, claimed under the node and read back with the end it holds; and `finally_error`
   //  is a column of the lifecycle row beside an outcome it does not change —
   //  `LONGTEXT` on MySQL for `error`'s reason, since what a finally node raised
   //  is as long as what any node raises — and absent on a row that has none,
@@ -306,12 +306,12 @@ its schema creation is not idempotent: ${error instanceof Error ? error.message 
   await handle.append({
     ...record(ending, "close/0#finally/0", "close/0", { outcome: "failed", error: UNICODE }),
     kind: "finally",
-    request: journal.canonical({ node: "close", outcome: "failed" }),
+    request: journal.canonical({ node: "close" }),
   });
   const boundary = await handle.lookup(ending, "close/0#finally/0");
   results.a_finally_boundary_round_trips =
     boundary?.kind === "finally" &&
-    boundary?.request === journal.canonical({ node: "close", outcome: "failed" }) &&
+    boundary?.request === journal.canonical({ node: "close" }) &&
     boundary?.outcome?.value?.outcome === "failed" &&
     boundary?.outcome?.value?.error === UNICODE;
   await handle.end(ending, "completed", undefined, LARGE);
