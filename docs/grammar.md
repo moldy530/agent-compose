@@ -7693,9 +7693,22 @@ branch is done" — leaving `on_error: fail` as the one way to abort a run.
 
 ### D71. No silent dead ends: every node exits, and every run starts
 
-Every node MUST have at least one outgoing edge; at least one edge leaving
-`start` MUST be unconditional or `else: true`; a node declaring `on_error: skip`
-MUST have an outgoing edge of one of those two forms (§7.6.3) — where the
+**Amended 2026-11-02** by
+[D159](#d159-finally-names-the-node-an-instance-runs-once-when-it-ends),
+which is PRD resolved q76: "every node MUST have at least one outgoing edge" now
+holds of every node but a flow's `finally:` node, which has no edge in or out —
+an edge naming it is `routed-finally` — because it is on no branch: it runs once
+when the instance ends, after every branch has retired (§7.6.3 rule 1, §7.9).
+What the entry is about is unchanged: a branch retires only at `end`, so a node
+on one must exit, and the `start` and `on_error: skip` rules stand as written —
+the finally node declares no `on_error:` of its own. The amended text follows;
+the superseded sentence is quoted at the end so a reader of an older citation
+can see what moved.
+
+Every node but a flow's `finally:` node MUST have at least one outgoing edge;
+at least one edge leaving `start` MUST be unconditional or `else: true`; a node
+declaring `on_error: skip` MUST have an outgoing edge of one of those two forms
+(§7.6.3) — where the
 `else: true` spelling carries its own precondition, a `when:`-guarded sibling
 ([D107](#d107-an-else-edge-requires-a-when-guarded-sibling)), which the skip
 rule's node has by its premise and a single-edge `start` does not.
@@ -7709,7 +7722,15 @@ at a node with no exits, an execution can die before its first step with every
 a construct that is guaranteed to fail at runtime in a statically visible way is
 refused at compile time, and the fix costs one edge or one keyword. Guarded
 `start` edges stay legal — routing on `input.*` at entry is useful and its scope
-is well-defined (§4.1) — they just cannot be the *only* edges. *PRD 5.3, 5.4, G3.*
+is well-defined (§4.1) — they just cannot be the *only* edges.
+
+**What the amendment replaced**, verbatim: *"Every node MUST have at least one
+outgoing edge"*. The rule survives for every node on a branch — which, when it
+was written, was every node — and what moved is that the finally node is on
+none, so it has no branch to retire and no exit to need.
+
+**Status**: ratified, amended by PRD resolved q76. *PRD 5.3, 5.4, G3, resolved
+q76.*
 
 ### D72. Concurrent writes are applied in a canonical order
 
@@ -8213,8 +8234,22 @@ on would drop real deliveries. *PRD 5.6.*
 
 ### D95. Node reachability counts edges and the two control-transfer positions
 
-Every node MUST be reachable from its flow's `start` over edges,
-`on_error: { fallback: … }`, and `human.on_timeout:`; an unreachable node is a
+**Amended 2026-11-02** by
+[D159](#d159-finally-names-the-node-an-instance-runs-once-when-it-ends),
+which is PRD resolved q76: "every node MUST be reachable from its flow's `start`
+over" the three transfers now reads "every node but the flow's `finally:` node",
+and §7.8 gains a fourth clause that is not a transfer at all — the finally node
+is reachable **because it is `finally:`**, since every instance that ends runs
+it. What the entry is about is unchanged: the relation is still edges and the
+two control-transfer positions, guards are still ignored, and no transfer may
+name the finally node (`routed-finally`), so the clause adds a node to the
+reachable set without adding a path to the relation. The amended text follows;
+the superseded sentence is quoted at the end so a reader of an older citation
+can see what moved.
+
+Every node but its flow's `finally:` node MUST be reachable from its flow's
+`start` over edges, `on_error: { fallback: … }`, and `human.on_timeout:`; the
+finally node is reachable because it is `finally:`; an unreachable node is a
 compile error (§7.8).
 **Rationale**: PRD §7 M0 lists "unreachable nodes" among the static checks this
 grammar feeds, and it was the one check in that list with no defining section —
@@ -8237,7 +8272,18 @@ can cause to run, across flows, and it says fallback and `on_timeout` targets ar
 counts control transfers because it asks about addressability — a control
 transfer fires *instead of* a node's edges, so admitting it here cannot
 manufacture a concurrent branch there (§7.6.2). Three relations, three
-questions, one section each. *PRD 5.3, 5.5, G3.*
+questions, one section each.
+
+**What the amendment replaced**, verbatim: *"Every node MUST be reachable from
+its flow's `start` over edges, `on_error: { fallback: … }`, and
+`human.on_timeout:`; an unreachable node is a compile error (§7.8)."* The rule
+survives for every node a transfer can address — which, when it was written,
+was every node — and what moved is that the finally node, which none may
+address, is live code by its position, D21's reading of a fallback target
+applied to the one position that is not a transfer.
+
+**Status**: ratified, amended by PRD resolved q76. *PRD 5.3, 5.5, G3, resolved
+q76.*
 
 ### D96. An inline `exec`/`http` node's `output` is a result schema
 
@@ -12445,15 +12491,15 @@ target, which stays a control transfer inside the body.
 **Outside routing, reachable anyway.** A transfer into the finally node would run
 it mid-instance with no outcome to read, and one out of it would continue a
 branch that has ended, so every edge, fallback and `on_timeout:` naming it is
-refused one position at a time (`routed-finally`), and it is exempt from "every
-node exits" (§7.6.3 rule 1). D95 counts a node reachable when a transfer leads to
-it; the finally node is reachable because it is `finally:` — D21's reading of a
-fallback target, that a node addressed only by its position is live code, applied
-to the one position that is not a transfer. That is §7.8's fourth clause rather
-than a new relation: §7.7's component reachability walks every node of a flow and
-so includes the finally node already, which is what makes a `respond: sync`
-trigger's flow and a detached dispatch's target answer for what their finally
-nodes reach too.
+refused one position at a time (`routed-finally`), and it is exempt from
+D71's "every node MUST have at least one outgoing edge" (§7.6.3 rule 1). D95
+counts a node reachable when a transfer leads to it; the finally node is
+reachable because it is `finally:` — D21's reading of a fallback target, that a
+node addressed only by its position is live code, applied to the one position
+that is not a transfer. That is §7.8's fourth clause rather than a new relation:
+§7.7's component reachability walks every node of a flow and so includes the
+finally node already, which is what makes a `respond: sync` trigger's flow and a
+detached dispatch's target answer for what their finally nodes reach too.
 
 **Its failure has one meaning.** An `on_error:` on the finally node is refused
 (`routed-finally`) rather than ignored, and this is a reading of the ruling the
@@ -12578,8 +12624,13 @@ resolved q75's cancel route is not built. The seam is driven with it directly by
 a test that says so, so q75 adds a caller rather than a code path.
 
 **Collision review.** D21 and D103 are unchanged, and the finally node is not one
-of D21's targets (above). D95 and §7.8 gain clause 4, which no existing
-composition can meet because none has a `finally:` key. D97 is read, not
+of D21's targets (above). Two decisions are amended, and each carries the
+amendment note: D71's "every node MUST have at least one outgoing edge" now
+exempts the finally node, which has no edge in or out (§7.6.3 rule 1), and D95's
+"every node MUST be reachable" over the three transfers now reads every node but
+the finally node, which §7.8's fourth clause makes reachable by its position.
+Neither change reaches an existing composition, because none has a `finally:`
+key; D71's `start` and `on_error: skip` rules are untouched. D97 is read, not
 amended: a skipped body completed. D102 stands; the finally node is never a
 `human` node. D115 is unchanged; `outcome` and `error` are scoped where
 `item_index` is presence-checked. D118's interrupt-freedom relation gains a third
@@ -12589,8 +12640,8 @@ example moves its release into a `finally:` node, guarded so that a run which
 never held the lease releases nothing (`docs/topics/stores.md`).
 
 **Status**: shipped. *PRD resolved q28, q29, q65, q69, q75, q76; §2.4, §4.1,
-§7, §7.6.3, §7.8, §7.9, §8.7, §9.2, §9.3; builds on D21, D95, D97, D103, D118,
-D150, D153.*
+§7, §7.6.3, §7.8, §7.9, §8.7, §9.2, §9.3; amends D71, D95; builds on D21, D97,
+D103, D118, D150, D153.*
 
 ## Appendix B — Editor integration
 
