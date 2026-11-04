@@ -321,6 +321,47 @@ its schema creation is not idempotent: ${error instanceof Error ? error.message 
   results.a_row_with_no_finally_error_reads_none =
     ended?.finallyError === undefined && (await handle.execution(child))?.finallyError === undefined;
 
+  // …and **a cancel** (§3.5, §6.1, PRD resolved q75). The request is a row of
+  //  its own, written before anything is stopped, so a process that dies
+  //  between the `202` and the settled row leaves an open row carrying it: the
+  //  recovery scan reads it back on the open row, a second request of the same
+  //  execution is a no-op that keeps the first one's instant, and the row
+  //  settles `cancelled` with no `error` — nothing went wrong with an execution
+  //  somebody stopped — and is gone from the scan like any closed row.
+  const cancelling = `${execution}-cancelling`;
+  await handle.begin({
+    id: cancelling,
+    flow: "flow.review",
+    trigger: "manual",
+    inputs: {},
+    sessionKey: "",
+    status: "open",
+    journalVersion: journal.JOURNAL_VERSION,
+    startedAt: new Date().toISOString(),
+  });
+  results.an_execution_nobody_cancelled_carries_no_request =
+    (await handle.execution(cancelling))?.cancelRequestedAt === undefined;
+  await handle.requestCancel(cancelling);
+  const requested = await handle.execution(cancelling);
+  const scanned = (await handle.openExecutions()).find((row) => row.id === cancelling);
+  results.a_cancel_request_is_read_back_on_the_open_row =
+    typeof requested?.cancelRequestedAt === "string" &&
+    !Number.isNaN(Date.parse(requested.cancelRequestedAt)) &&
+    requested?.status === "open" &&
+    scanned?.cancelRequestedAt === requested.cancelRequestedAt;
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await handle.requestCancel(cancelling);
+  results.a_second_cancel_request_keeps_the_first =
+    (await handle.execution(cancelling))?.cancelRequestedAt === requested?.cancelRequestedAt;
+  await handle.end(cancelling, "cancelled");
+  const cancelledRow = await handle.execution(cancelling);
+  results.a_cancelled_row_settles_with_no_error =
+    cancelledRow?.status === "cancelled" &&
+    cancelledRow?.error === undefined &&
+    typeof cancelledRow?.endedAt === "string" &&
+    cancelledRow?.cancelRequestedAt === requested?.cancelRequestedAt &&
+    !(await handle.openExecutions()).some((row) => row.id === cancelling);
+
   // 6. **A refusal is marked on the record**, which is resolved q29's second
   //    divergence told apart from an ordinary mismatch (§7).
   await handle.refuse(execution, "review/0#model/0");
@@ -726,6 +767,46 @@ async function dropTheFinallyErrorColumn(provider, url) {
   }
 }
 
+/**
+ * Take the `cancellations` table away, from outside the journal, so the file or
+ * database is the shape a build before PRD resolved q75 wrote
+ * (`docs/durability.md` §11.2). Answers `true` once it is gone.
+ */
+async function dropTheCancellationsTable(provider, url) {
+  const statement = "DROP TABLE cancellations";
+  if (provider === "sqlite") {
+    const { Database } = await import("node-sqlite3-wasm");
+    const database = new Database(journal.journalPath());
+    try {
+      database.exec(`${statement};`);
+      return !database
+        .all("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .some((table) => table.name === "cancellations");
+    } finally {
+      database.close();
+    }
+  }
+  if (provider === "postgres") {
+    const { Client } = await import("pg");
+    const client = new Client({ connectionString: url });
+    await client.connect();
+    try {
+      await client.query(statement);
+      return true;
+    } finally {
+      await client.end().catch(() => undefined);
+    }
+  }
+  const { createConnection } = await import("mysql2/promise");
+  const connection = await createConnection({ uri: url });
+  try {
+    await connection.query(statement);
+    return true;
+  } finally {
+    await connection.end().catch(() => undefined);
+  }
+}
+
 // 8. **A journal written before the end of an instance was recorded opens, and
 //    takes one** (§3.5, §11.2, PRD resolved q76). `CREATE TABLE IF NOT EXISTS`
 //    leaves an older table exactly as it is, so a column the lifecycle row grew
@@ -756,6 +837,43 @@ async function dropTheFinallyErrorColumn(provider, url) {
       row?.status === "failed" &&
       row?.error === "the body failed" &&
       row?.finallyError === UNSERIALIZED;
+  } finally {
+    await journal.releaseJournal().catch(() => undefined);
+  }
+}
+
+// 8b. **A journal written before a cancel was recorded opens, and takes one**
+//     (§3.5, §11.2, PRD resolved q75). The request is a table of its own rather
+//     than a column, so what an older journal lacks is the whole table — which
+//     `CREATE TABLE IF NOT EXISTS` on open adds, with no probe — and a cancel of
+//     an execution that journal holds open is then recorded like any other.
+{
+  const url = process.env[journal.journalBinding.urlEnv ?? ""] ?? "";
+  const dropped = await dropTheCancellationsTable(journal.journalBinding.provider, url).catch(
+    (error) => (error instanceof Error ? error.message : String(error)),
+  );
+  try {
+    handle = await opened(journal);
+    const older = `exec_${Math.random().toString(16).slice(2)}${Date.now().toString(16)}-older`;
+    await handle.begin({
+      id: older,
+      flow: "flow.review",
+      trigger: "manual",
+      inputs: {},
+      sessionKey: "",
+      status: "open",
+      journalVersion: journal.JOURNAL_VERSION,
+      startedAt: new Date().toISOString(),
+    });
+    const before = await handle.execution(older);
+    await handle.requestCancel(older);
+    const after = await handle.execution(older);
+    results.a_journal_without_the_cancellations_table_gains_it_on_open =
+      dropped === true &&
+      before?.status === "open" &&
+      before?.cancelRequestedAt === undefined &&
+      typeof after?.cancelRequestedAt === "string";
+    await handle.end(older, "cancelled");
   } finally {
     await journal.releaseJournal().catch(() => undefined);
   }

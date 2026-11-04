@@ -95,6 +95,8 @@ struct Asked {
     session: Option<String>,
     authorization: Option<String>,
     body: Value,
+    /// When the hub was asked, for a test about what a worker runs at once.
+    at: Instant,
 }
 
 /// A hub that answers what a test scripts and records what it was asked.
@@ -246,6 +248,7 @@ fn serve_one(
         session,
         authorization,
         body: serde_json::from_slice(&body).unwrap_or(Value::Null),
+        at: Instant::now(),
     });
 
     let reply = scripted
@@ -293,6 +296,13 @@ const RUNNER: &str = r#"// A node runner for `tests/distributed_worker_protocol.
 // standard output. That is the contract `src/worker-node.ts` implements over a
 // real composition — see its header — and this is the least of it that a test
 // about `/workers/effects` and `/workers/result` needs.
+// Where a cancel test finds this runner's pid, and a runner that will not stop
+// when asked — the two knobs a test about a hub's `cancel` list needs.
+if (process.env.FIXTURE_RUNNER_PID_FILE) {
+  const { appendFileSync } = await import("node:fs");
+  appendFileSync(process.env.FIXTURE_RUNNER_PID_FILE, `${process.pid}\n`);
+}
+if (process.env.FIXTURE_RUNNER_IGNORE_TERM === "1") process.on("SIGTERM", () => {});
 let held = "";
 for await (const chunk of process.stdin) held += chunk;
 const dispatch = JSON.parse(held);
@@ -1367,7 +1377,10 @@ fn an_effect_batch_answered_410_is_sent_again_and_never_dropped() {
 /// So the attempt fails, named, and the process goes on: `413` here, which is
 /// exactly what a Fastify route left at its default limit answers, and the two
 /// halves asserted are the failure the hub is handed for the dispatch it was
-/// owed a result for, and the **next** dispatch running on the same process.
+/// owed a result for, and the **other** dispatch running on the same process.
+/// The worker runs the two at once (PRD resolved q79), so which of them posted
+/// the batch the hub refused is whichever posted first: the results are read by
+/// what they say rather than by the order they arrived in.
 #[test]
 fn an_effect_batch_refused_outside_its_table_fails_the_dispatch_and_keeps_the_worker() {
     let hub = FixtureHub::start();
@@ -1394,8 +1407,21 @@ fn an_effect_batch_refused_outside_its_table_fails_the_dispatch_and_keeps_the_wo
     });
 
     let results = hub.asked_at("/workers/result");
-    let refused = &results[0].body;
-    assert_eq!(refused["dispatch_id"], "dsp_refused", "{refused:#}");
+    let mut settled: Vec<&str> = results
+        .iter()
+        .filter_map(|result| result.body["dispatch_id"].as_str())
+        .collect();
+    settled.sort_unstable();
+    assert_eq!(
+        settled,
+        ["dsp_after", "dsp_refused"],
+        "both dispatches are settled, once each: {results:#?}"
+    );
+    let refused = &results
+        .iter()
+        .find(|result| result.body.get("error").is_some())
+        .unwrap_or_else(|| panic!("no dispatch failed on the refused batch: {results:#?}"))
+        .body;
     assert_eq!(
         refused["error"]["name"],
         "WorkerEffectsRefused",
@@ -1410,12 +1436,19 @@ fn an_effect_batch_refused_outside_its_table_fails_the_dispatch_and_keeps_the_wo
         "the failure does not name the status the hub gave: {refused:#}"
     );
 
-    let after = &results[1].body;
-    assert_eq!(
-        after["dispatch_id"],
-        "dsp_after",
-        "the placement's next dispatch was not run: {after:#}\n{}",
-        worker.transcript()
+    let after = &results
+        .iter()
+        .find(|result| result.body.get("output").is_some())
+        .unwrap_or_else(|| {
+            panic!(
+                "the placement's other dispatch was not run: {results:#?}\n{}",
+                worker.transcript()
+            )
+        })
+        .body;
+    assert_ne!(
+        after["dispatch_id"], refused["dispatch_id"],
+        "one dispatch failed and the other ran: {results:#?}"
     );
     assert_eq!(
         after["output"]["signature"], "from the fixture runner",
@@ -1551,9 +1584,19 @@ fn a_runner_that_pauses_settles_its_dispatch_paused_and_the_worker_keeps_polling
             >= 2
     });
 
+    // Read by the dispatch each one settles rather than by arrival: the worker
+    // runs every dispatch it holds at once (PRD resolved q79), so the second
+    // can settle before the first does.
     let results = hub.asked_at("/workers/result");
-    let paused = &results[0].body;
-    assert_eq!(paused["dispatch_id"], "dsp_asking", "{paused:#}");
+    let settling = |id: &str| -> Value {
+        results
+            .iter()
+            .find(|result| result.body["dispatch_id"] == id)
+            .unwrap_or_else(|| panic!("no result settled `{id}`: {results:#?}"))
+            .body
+            .clone()
+    };
+    let paused = &settling("dsp_asking");
     assert!(
         paused.get("output").is_none() && paused.get("error").is_none(),
         "a paused result carries a pause and neither of the other two endings: {paused:#}"
@@ -1582,8 +1625,7 @@ fn a_runner_that_pauses_settles_its_dispatch_paused_and_the_worker_keeps_polling
 
     // …and the worker kept polling: the second dispatch reached it on the same
     // session, which it could not have if it had gone quiet holding a question.
-    let answered = &results[1].body;
-    assert_eq!(answered["dispatch_id"], "dsp_answered", "{answered:#}");
+    let answered = &settling("dsp_answered");
     assert_eq!(
         answered["output"],
         json!({ "decision": "approve" }),
@@ -1646,27 +1688,25 @@ fn a_node_runner_that_says_nothing_settles_its_dispatch_as_a_failure() {
     );
 }
 
-/// A dispatch answered while a node is running is **queued**, and the poll goes
-/// on (§2, §3.2, §3.4).
+/// A dispatch answered while a node is running **runs beside it**, and the poll
+/// goes on (§2, §3.2, PRD resolved q79, Decision D161).
 ///
 /// §2 requires the poll to continue while a node runs — "the poll is the
 /// heartbeat" — and a session that stops making requests is declared gone at the
 /// liveness window, which supersedes whatever it was holding (§6.3). So the one
-/// thing a worker must not do with a second dispatch is **wait** for the first.
+/// thing a worker must not do with a second dispatch is **wait** for the first;
+/// and since a placement's `max_running:` lets one session hold several of its
+/// dispatches, the worker runs every dispatch it holds at once rather than
+/// queueing them — a machine that can run two nodes runs two.
 ///
-/// A hub hands one over legitimately: §3.4 makes a dispatch the hub superseded
-/// on the node's own `timeout:` no longer *unsettled*, so answering the next poll
-/// is not a breach of §2's "MUST NOT answer a session's poll with a dispatch
-/// while that session has a dispatch it has not settled" — and a worker cannot
-/// tell that apart from a hub that did breach it. Both are a real journaled
-/// dispatch it is owed a result for, so both are queued and neither is dropped.
-///
-/// Two halves are asserted, and a blocking recovery fails both: the results
-/// arrive, in order, for **both** dispatches; and polls keep arriving while the
-/// first node runs. The fixture runner lingers so that "while the first node
-/// runs" is a window a test can count requests in.
+/// Three halves are asserted, and a blocking or a queueing worker fails one of
+/// them: the results arrive for **both** dispatches, once each; they arrive
+/// **together**, well inside one runner's linger of each other, which a worker
+/// running them one after the other cannot do; and polls keep arriving while
+/// both nodes run. The fixture runner lingers so that "while the nodes run" is a
+/// window a test can count requests and measure time in.
 #[test]
-fn a_second_dispatch_is_queued_and_the_poll_never_stops() {
+fn a_second_dispatch_runs_beside_the_first_and_the_poll_never_stops() {
     let hub = FixtureHub::start();
     let (hash, tarball) = artifact();
     hub.always("/workers/join", accepted(&hash, "wrk_ready"));
@@ -1680,7 +1720,7 @@ fn a_second_dispatch_is_queued_and_the_poll_never_stops() {
     let worker = Worker::with_environment(
         &hub,
         "queued-dispatch",
-        &[("FIXTURE_RUNNER_LINGER_MS".to_string(), "2000".to_string())],
+        &[("FIXTURE_RUNNER_LINGER_MS".to_string(), "3000".to_string())],
     );
 
     let asked = hub.until("settled both dispatches", |asked| {
@@ -1690,22 +1730,36 @@ fn a_second_dispatch_is_queued_and_the_poll_never_stops() {
             .count()
             >= 2
     });
-    let settled: Vec<&str> = asked
+    let results: Vec<&Asked> = asked
         .iter()
         .filter(|request| request.path == "/workers/result")
+        .collect();
+    let mut settled: Vec<&str> = results
+        .iter()
         .filter_map(|request| request.body["dispatch_id"].as_str())
         .collect();
+    settled.sort_unstable();
     assert_eq!(
         settled,
         ["dsp_first", "dsp_second"],
-        "the queued dispatch was dropped, or the two ran out of order:\n{}",
+        "the second dispatch was dropped, or one was settled twice:\n{}",
+        worker.transcript()
+    );
+    // Each runner lingers three seconds, so two run one after the other settle
+    // at least three seconds apart; two run at once settle within a launch of
+    // each other.
+    let apart = results[1].at.duration_since(results[0].at);
+    assert!(
+        apart < Duration::from_millis(1500),
+        "the two dispatches settled {apart:?} apart, which is one runner's linger: the worker \
+         ran them one after the other instead of at once (Decision D161):\n{}",
         worker.transcript()
     );
 
-    // The window: from the poll that was answered `dsp_second` to the result
-    // that settled `dsp_first`. A worker that waited for the node in hand makes
-    // no request at all in it, which at §2's window is a session the hub
-    // declares gone — and the second dispatch superseded with it.
+    // The window: from the poll that was answered `dsp_second` to the first
+    // result. A worker that waited for the node in hand makes no request at all
+    // in it, which at §2's window is a session the hub declares gone — and the
+    // second dispatch superseded with it.
     let took_second = asked
         .iter()
         .enumerate()
@@ -1715,10 +1769,8 @@ fn a_second_dispatch_is_queued_and_the_poll_never_stops() {
         .expect("the worker polled twice");
     let settled_first = asked
         .iter()
-        .position(|request| {
-            request.path == "/workers/result" && request.body["dispatch_id"] == "dsp_first"
-        })
-        .expect("the first dispatch was settled");
+        .position(|request| request.path == "/workers/result")
+        .expect("a dispatch was settled");
     let polls = asked[took_second + 1..settled_first]
         .iter()
         .filter(|request| request.path == "/workers/poll")
@@ -1730,4 +1782,188 @@ fn a_second_dispatch_is_queued_and_the_poll_never_stops() {
          (docs/distributed.md §2, §3.2):\n{asked:#?}\n{}",
         worker.transcript()
     );
+}
+
+/// The pids a fixture runner wrote to `file`, once it has written one.
+fn runner_pids(file: &std::path::Path, within: Duration) -> Vec<i32> {
+    let deadline = Instant::now() + within;
+    loop {
+        let pids: Vec<i32> = std::fs::read_to_string(file)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect();
+        if !pids.is_empty() || Instant::now() > deadline {
+            return pids;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Whether a process is still there to signal.
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 delivers nothing; it asks whether `pid` exists.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// A fixture runner's pid file, fresh for one test.
+fn pid_file(purpose: &str) -> PathBuf {
+    let file = std::env::temp_dir().join(format!(
+        "agent-compose-worker-{purpose}-{}.pids",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&file);
+    file
+}
+
+/// A dispatch the hub names in a poll's `cancel` list is **stopped**, and
+/// settled `status: "cancelled"` (§3.2, §3.4, PRD resolved q75, Decision D160).
+///
+/// The worker's half of a cancel: the runner is sent `SIGTERM` — which a real
+/// node runner turns into its execution's own cancel — the process is gone
+/// well before the runner's own work would have ended, and the result the hub
+/// is handed is exactly the cancelled one, with no `output` and no `error`. The
+/// poll that carried the list is a poll like any other, so the worker keeps
+/// polling after it.
+#[test]
+fn a_dispatch_the_hub_cancels_is_stopped_and_settled_cancelled() {
+    let hub = FixtureHub::start();
+    let (hash, tarball) = artifact();
+    hub.always("/workers/join", accepted(&hash, "wrk_ready"));
+    hub.always("/workers/artifact", Reply::bytes(200, tarball));
+    hub.script("/workers/poll", dispatch("dsp_cancelled"));
+    hub.always("/workers/poll", Reply::empty(204));
+    hub.always("/workers/effects", Reply::empty(204));
+    hub.always("/workers/result", Reply::empty(204));
+
+    let pids_at = pid_file("cancelled");
+    let worker = Worker::with_environment(
+        &hub,
+        "cancelled-dispatch",
+        &[
+            ("FIXTURE_RUNNER_LINGER_MS".to_string(), "60000".to_string()),
+            (
+                "FIXTURE_RUNNER_PID_FILE".to_string(),
+                pids_at.display().to_string(),
+            ),
+        ],
+    );
+    let pids = runner_pids(&pids_at, Duration::from_secs(30));
+    assert_eq!(
+        pids.len(),
+        1,
+        "the runner did not start: {}",
+        worker.transcript()
+    );
+    // The cancel goes out only once the runner is running, so what is under
+    // test is a process stopped rather than one never begun.
+    let cancelled_at = Instant::now();
+    hub.script(
+        "/workers/poll",
+        Reply::json(200, &json!({ "cancel": ["dsp_cancelled"] })),
+    );
+    let asked = hub.until("settled the cancelled dispatch", |asked| {
+        asked
+            .iter()
+            .any(|request| request.path == "/workers/result")
+    });
+    let result = asked
+        .iter()
+        .find(|request| request.path == "/workers/result")
+        .expect("a result");
+    assert_eq!(
+        result.body,
+        json!({ "dispatch_id": "dsp_cancelled", "status": "cancelled" }),
+        "a cancelled dispatch is settled cancelled, with nothing else: {}",
+        worker.transcript()
+    );
+    let took = result.at.duration_since(cancelled_at);
+    assert!(
+        took < Duration::from_secs(4),
+        "the cancel took {took:?} to settle the dispatch: a runner that stops on SIGTERM \
+         is not waited out to the grace"
+    );
+    assert!(
+        !alive(pids[0]),
+        "the runner {} is still running after its dispatch was settled cancelled",
+        pids[0]
+    );
+    let before = hub.asked_at("/workers/poll").len();
+    hub.until("polled again after the cancel", |asked| {
+        asked
+            .iter()
+            .filter(|request| request.path == "/workers/poll")
+            .count()
+            > before
+    });
+    let _ = std::fs::remove_file(&pids_at);
+}
+
+/// A runner that does not stop when it is asked is **killed** (§3.2): the
+/// worker sends `SIGTERM`, waits its grace of five seconds, and then kills the
+/// runner's whole process group — so a node whose host code ignores its signal
+/// still leaves no process behind, and the dispatch is still settled
+/// `cancelled`.
+#[test]
+fn a_runner_that_ignores_its_cancel_is_killed_after_the_grace() {
+    let hub = FixtureHub::start();
+    let (hash, tarball) = artifact();
+    hub.always("/workers/join", accepted(&hash, "wrk_ready"));
+    hub.always("/workers/artifact", Reply::bytes(200, tarball));
+    hub.script("/workers/poll", dispatch("dsp_stubborn"));
+    hub.always("/workers/poll", Reply::empty(204));
+    hub.always("/workers/effects", Reply::empty(204));
+    hub.always("/workers/result", Reply::empty(204));
+
+    let pids_at = pid_file("stubborn");
+    let worker = Worker::with_environment(
+        &hub,
+        "stubborn-dispatch",
+        &[
+            ("FIXTURE_RUNNER_LINGER_MS".to_string(), "60000".to_string()),
+            ("FIXTURE_RUNNER_IGNORE_TERM".to_string(), "1".to_string()),
+            (
+                "FIXTURE_RUNNER_PID_FILE".to_string(),
+                pids_at.display().to_string(),
+            ),
+        ],
+    );
+    let pids = runner_pids(&pids_at, Duration::from_secs(30));
+    assert_eq!(
+        pids.len(),
+        1,
+        "the runner did not start: {}",
+        worker.transcript()
+    );
+    let cancelled_at = Instant::now();
+    hub.script(
+        "/workers/poll",
+        Reply::json(200, &json!({ "cancel": ["dsp_stubborn"] })),
+    );
+    let asked = hub.until("settled the stubborn dispatch", |asked| {
+        asked
+            .iter()
+            .any(|request| request.path == "/workers/result")
+    });
+    let result = asked
+        .iter()
+        .find(|request| request.path == "/workers/result")
+        .expect("a result");
+    assert_eq!(
+        result.body,
+        json!({ "dispatch_id": "dsp_stubborn", "status": "cancelled" }),
+        "{}",
+        worker.transcript()
+    );
+    let took = result.at.duration_since(cancelled_at);
+    assert!(
+        took >= Duration::from_secs(4) && took < Duration::from_secs(20),
+        "a runner that ignored SIGTERM was settled after {took:?}: the grace is five seconds"
+    );
+    assert!(
+        !alive(pids[0]),
+        "the stubborn runner {} survived its cancel",
+        pids[0]
+    );
+    let _ = std::fs::remove_file(&pids_at);
 }

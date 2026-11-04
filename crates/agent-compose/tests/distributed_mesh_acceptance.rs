@@ -2315,7 +2315,7 @@ fn a_mesh_execution_exports_its_whole_trace_from_the_hub() {
     let body = &exported[0].body;
     assert_eq!(body["execution_id"], execution, "{body:#}");
     assert_eq!(body["status"], "completed", "{body:#}");
-    assert_eq!(body["trace_version"], 6, "{body:#}");
+    assert_eq!(body["trace_version"], 7, "{body:#}");
 
     // The placed node's entry is in the hub's export, which is the whole of
     // "the hub owns the trace": `sign` ran in the worker's process, and its
@@ -2446,4 +2446,248 @@ fn a_mesh_execution_exports_its_whole_trace_from_the_hub() {
         "the hub's one export is still owed, so the collector's delivery came from somewhere \
          else: {rows:#}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 10. A session's capacity, and a cancel over the wire (PRD resolved q75, q79)
+// ---------------------------------------------------------------------------
+
+/// The fixture, staged with `max_running: <cap>` on its `mac` placement.
+fn capped(purpose: &str, cap: u32) -> Option<Mesh> {
+    let deploy = std::fs::read_to_string(
+        harness::fixture(FIXTURE)
+            .parent()
+            .expect("a fixture directory")
+            .join("deploy")
+            .join(format!("{TARGET}.yml")),
+    )
+    .expect("the fixture's mesh target is readable");
+    let deploy = deploy.replacen("  mac:\n", &format!("  mac:\n    max_running: {cap}\n"), 1);
+    assert!(
+        deploy.contains(&format!("max_running: {cap}")),
+        "the placement was not capped: {deploy}"
+    );
+    let (composition, entrypoint) = harness::staged_with_deploy(purpose, FIXTURE, TARGET, &deploy);
+    Mesh::start_from(purpose, entrypoint, Some(composition))
+}
+
+/// The two model calls one item of `flow.batch` makes — a turn of its loop,
+/// then the pinned structured answer, held for `held` so the item is in a
+/// worker's hands for that long.
+///
+/// Each is matched to **its** item's call rather than queued: items run at
+/// once here, and a queue would hand one item's answer to another's call. The
+/// loop's turn carries the item's path; the answer's request carries the turn
+/// it said, which no other item's request does.
+fn held_signature(path: &str, held: Duration) -> [Script; 2] {
+    let said = format!("thinking about {path}");
+    [
+        Script::new(SONNET, Outcome::text(said.clone())).matching(path),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "signature": format!("signed {path}") })).after(held),
+        )
+        .matching(said),
+    ]
+}
+
+/// Sample an execution's report while it runs, answering the most of its
+/// placement waits that were ever `dispatched` at once.
+fn most_dispatched_at_once(mesh: &Mesh, execution: &str, cap: usize) -> usize {
+    let watching = Instant::now() + Duration::from_secs(60);
+    let mut most = 0usize;
+    loop {
+        let report = mesh.report(execution);
+        if report["status"] != "running" || Instant::now() > watching {
+            return most;
+        }
+        let dispatched = report["placement_waits"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|wait| wait["status"] == "dispatched")
+            .count();
+        assert!(
+            dispatched <= cap,
+            "{dispatched} items were dispatched at once onto a pool whose caps sum to {cap} \
+             (docs/distributed.md §2, Decision D161): {report:#}"
+        );
+        most = most.max(dispatched);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// **Two workers at a cap of one run at most two items at once** (§2, PRD
+/// resolved q79, Decision D161).
+///
+/// A placement that declares no `max_running:` holds one dispatch per session,
+/// so a pool of two runs a five-item fan-out two at a time — never three, and,
+/// with each item held long enough to be seen, two at some point.
+#[test]
+fn two_workers_at_a_cap_of_one_run_at_most_two_items_at_once() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    for path in ["a.dmg", "b.dmg", "c.dmg", "d.dmg", "e.dmg"] {
+        mesh.provider
+            .enqueue_all(held_signature(path, Duration::from_millis(1500)));
+    }
+    let _first = mesh.worker("pool-of-two-a");
+    let _second = mesh.worker("pool-of-two-b");
+    let execution = mesh.start_execution(
+        "/batches",
+        &json!({ "paths": ["a.dmg", "b.dmg", "c.dmg", "d.dmg", "e.dmg"] }),
+    );
+    let most = most_dispatched_at_once(&mesh, &execution, 2);
+    assert_eq!(most, 2, "a pool of two never ran two items at once");
+    let outputs = mesh.completed(&execution);
+    assert_eq!(
+        outputs["signatures"].as_array().map(Vec::len),
+        Some(5),
+        "{outputs:#}"
+    );
+}
+
+/// **One worker whose placement says `max_running: 3` runs three at once**
+/// (§2, PRD resolved q79, Decision D161).
+///
+/// The same fan-out, three items, on a pool of one worker: the session holds
+/// all three, the worker runs them side by side — each item's call is held
+/// three seconds, so three dispatched at once is three running at once — and
+/// the fan-out completes.
+#[test]
+fn one_worker_whose_placement_says_max_running_three_runs_three_at_once() {
+    let Some(mesh) = capped("mesh-capacity-three", 3) else {
+        return;
+    };
+    for path in ["a.dmg", "b.dmg", "c.dmg"] {
+        mesh.provider
+            .enqueue_all(held_signature(path, Duration::from_secs(3)));
+    }
+    let _worker = mesh.worker("capacity-three");
+    let started = Instant::now();
+    let execution =
+        mesh.start_execution("/batches", &json!({ "paths": ["a.dmg", "b.dmg", "c.dmg"] }));
+    let most = most_dispatched_at_once(&mesh, &execution, 3);
+    assert_eq!(most, 3, "one session at a cap of three never held three");
+    let outputs = mesh.completed(&execution);
+    assert_eq!(
+        outputs["signatures"].as_array().map(Vec::len),
+        Some(3),
+        "{outputs:#}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "three items held three seconds each took {:?}: the worker ran them one after the \
+         other",
+        started.elapsed()
+    );
+}
+
+/// **A cancel stops a placed node on its worker** and settles the execution
+/// `cancelled` (PRD resolved q75 ruling b, `docs/distributed.md` §3.2, §3.4).
+///
+/// `flow.retried`'s `sign` is placed on `mac` and declares a `retry:`. Its first
+/// model call answers and is journaled; its second is held for ten minutes —
+/// the worker is in the middle of the node. The cancel reaches the worker on
+/// its next poll, the worker stops the runner and posts the cancelled ending,
+/// and the row settles `cancelled` within ten seconds, with the node's entry
+/// `cancelled` and no `error`. No retry ran — the provider was asked twice,
+/// never a third time — and the worker is still serving.
+#[test]
+fn a_cancel_stops_a_placed_node_on_its_worker_and_settles_the_execution_cancelled() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider.enqueue_all([
+        Script::new(SONNET, Outcome::text("thinking about it")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "signature": "never delivered" }))
+                .after(Duration::from_secs(600)),
+        ),
+    ]);
+    let mut worker = mesh.worker("cancelled-mid-node");
+    let execution = mesh.start_execution("/retried-releases", &json!({ "path": "release.dmg" }));
+    until(
+        "the first model call reached the hub's journal",
+        || worker.transcript(),
+        || harness::journal_holds(&mesh.project, &["sign/0#model/0"]),
+    );
+    mesh.until(&execution, "was taken by the worker", |report| {
+        report["placement_waits"][0]["status"] == "dispatched"
+    });
+
+    let asked = Instant::now();
+    let cancelled = mesh.send(Request::post(format!("/executions/{execution}/cancel")));
+    assert_eq!(cancelled.status, 202, "{}", body_of(&cancelled));
+    let report = mesh.until(&execution, "was cancelled", |report| {
+        report["status"] == "cancelled"
+    });
+    assert!(
+        asked.elapsed() < Duration::from_secs(10),
+        "the cancel took {:?} to settle a placed node",
+        asked.elapsed()
+    );
+    assert!(report.get("error").is_none(), "{report:#}");
+    let sign = report["trace"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["node"] == "sign")
+        .unwrap_or_else(|| panic!("the placed node has an entry: {report:#}"));
+    assert_eq!(sign["outcome"], "cancelled", "{sign:#}");
+    assert!(sign.get("error").is_none(), "{sign:#}");
+    assert_eq!(
+        mesh.provider.requests().len(),
+        2,
+        "a cancelled placed node was retried"
+    );
+    assert!(
+        worker.running(),
+        "the worker stopped with the node it was asked to cancel: {}",
+        worker.transcript()
+    );
+}
+
+/// **A cancel reaches a worker holding two of an execution's dispatches**
+/// (PRD resolved q75, q79; `docs/distributed.md` §3.2).
+///
+/// At `max_running: 2` one worker holds both items of a two-item fan-out, each
+/// in the middle of a ten-minute call. The cancel names both in the worker's
+/// next poll's `cancel` list, the worker stops both runners, and both cancelled
+/// results settle the row `cancelled`.
+#[test]
+fn a_cancel_reaches_a_worker_holding_two_of_its_dispatches() {
+    let Some(mesh) = capped("mesh-cancel-two", 2) else {
+        return;
+    };
+    for path in ["a.dmg", "b.dmg"] {
+        mesh.provider
+            .enqueue_all(held_signature(path, Duration::from_secs(600)));
+    }
+    let mut worker = mesh.worker("cancel-two");
+    let execution = mesh.start_execution("/batches", &json!({ "paths": ["a.dmg", "b.dmg"] }));
+    mesh.until(&execution, "had both items dispatched", |report| {
+        report["placement_waits"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|wait| wait["status"] == "dispatched")
+            .count()
+            == 2
+    });
+    let asked = Instant::now();
+    let cancelled = mesh.send(Request::post(format!("/executions/{execution}/cancel")));
+    assert_eq!(cancelled.status, 202, "{}", body_of(&cancelled));
+    let report = mesh.until(&execution, "was cancelled", |report| {
+        report["status"] == "cancelled"
+    });
+    assert!(
+        asked.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        asked.elapsed()
+    );
+    assert!(report.get("error").is_none(), "{report:#}");
+    assert!(worker.running(), "{}", worker.transcript());
 }

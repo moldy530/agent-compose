@@ -1,0 +1,140 @@
+# Acceptance fixture: cancelling an execution — `POST /executions/:id/cancel`
+# and `agent-compose cancel` (PRD resolved q75, Decision D160, grammar §7.9,
+# `docs/durability.md` §6.1, `docs/trace.md` §2).
+#
+# Every long-running node here is `${TALLY_BIN}/linger`, a shim that appends its
+# own pid to `$TALLY_LOG.pids` and then becomes a `sleep` of the length its
+# input names — so a test can ask, by pid, whether the process a cancel had to
+# stop is still alive. Every finally node is `${TALLY_BIN}/ended`, which appends
+# what it read as `execution.outcome` and `execution.error` to `$TALLY_LOG`.
+#
+#   * `flow.long` — a command that runs far longer than any test waits, and a
+#     finally node that records how the run ended. A cancel stops the command,
+#     the finally node reads `cancelled`, and the row settles `cancelled`.
+#   * `flow.lingering_end` — the same, with a finally node that takes a few
+#     seconds before it records anything: the window a test kills the serving
+#     process in, after the cancel was recorded and before the row settled.
+#   * `flow.parent` — a detached `flow.*` dispatch that starts a `flow.long`
+#     child execution (Decision D150), and then a command of its own. A cancel
+#     of the parent cascades to the child; a cancel of the child alone leaves
+#     the parent running to its own end.
+version: "0.1"
+
+defaults:
+  timeout: 300s
+
+triggers:
+  on_long:
+    type: http
+    flow: flow.long
+    path: /long
+    method: POST
+    input:
+      linger: "payload.body.linger"
+    respond: async
+    callback: "payload.body.callback_url"
+    callback_allow:
+      - "http://127.0.0.1:*"
+
+  on_lingering_end:
+    type: http
+    flow: flow.lingering_end
+    path: /lingering-end
+    method: POST
+    input:
+      linger: "payload.body.linger"
+    respond: async
+
+  on_parent:
+    type: http
+    flow: flow.parent
+    path: /parent
+    method: POST
+    input:
+      child_lingers: "payload.body.child_lingers"
+      linger: "payload.body.linger"
+    respond: async
+
+flow.long:
+  description: A command that runs as long as it is told to, and a record of how the run ended.
+  inputs:
+    linger:
+      type: integer
+  outputs: {}
+  nodes:
+    work:
+      exec:
+        command: "${TALLY_BIN}/linger"
+      input:
+        linger: "input.linger"
+    record:
+      exec:
+        command: "${TALLY_BIN}/ended"
+      input:
+        outcome: "execution.outcome"
+        error: "has(execution.error) ? execution.error : 'none'"
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: record
+
+flow.lingering_end:
+  description: The same, with a finally node that takes its time before it records anything.
+  inputs:
+    linger:
+      type: integer
+  outputs: {}
+  nodes:
+    slow_work:
+      exec:
+        command: "${TALLY_BIN}/linger"
+      input:
+        linger: "input.linger"
+    slow_record:
+      exec:
+        command: "${TALLY_BIN}/ended"
+        args: ["--slowly"]
+      input:
+        outcome: "execution.outcome"
+        error: "has(execution.error) ? execution.error : 'none'"
+  edges:
+    - { from: start, to: slow_work }
+    - { from: slow_work, to: end }
+  finally: slow_record
+
+flow.parent:
+  description: A detached child that lingers, then a command of the parent's own.
+  inputs:
+    child_lingers:
+      type: array
+      max_items: 1
+      items: { type: integer }
+    linger:
+      type: integer
+  outputs: {}
+  nodes:
+    spawn:
+      map:
+        over: input.child_lingers
+        as: seconds
+        node: flow.long
+        max_concurrency: 1
+        detach: true
+        input:
+          linger: "seconds"
+    hold:
+      exec:
+        command: "${TALLY_BIN}/linger"
+      input:
+        linger: "input.linger"
+    parent_end:
+      exec:
+        command: "${TALLY_BIN}/ended"
+      input:
+        outcome: "execution.outcome"
+        error: "has(execution.error) ? execution.error : 'none'"
+  edges:
+    - { from: start, to: spawn }
+    - { from: spawn, to: hold }
+    - { from: hold, to: end }
+  finally: parent_end
