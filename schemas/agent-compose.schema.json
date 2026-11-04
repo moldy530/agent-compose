@@ -3204,6 +3204,11 @@
             "pattern": "^(agent|tool)\\.[a-z][a-z0-9_]{0,63}$"
           }
         },
+        "max_running": {
+          "description": "How many unsettled dispatches of this placement one worker session may hold at once: an integer of at least 1, default 1. The hub offers a session work of this placement while the dispatches it holds for it number fewer than this, least-loaded session first, and a worker runs what it holds concurrently (grammar 14.1, Decision D161 / PRD resolved q79).",
+          "type": "integer",
+          "minimum": 1
+        },
         "description": { "description": "Documentation.", "type": "string" }
       },
       "additionalProperties": false

@@ -43,6 +43,11 @@ pub struct Placement {
     pub members: Vec<Spanned<Address>>,
     /// `description:`
     pub description: Option<Spanned<String>>,
+    /// `max_running:` — how many unsettled dispatches of this placement one
+    /// worker session may hold at once (grammar 14.1, Decision D161, PRD
+    /// resolved q79). An integer of at least `1`; absent is `1`, which is the
+    /// hub's capacity before the key existed.
+    pub max_running: Option<Spanned<i64>>,
     /// The whole entry's span, name and body together. [`Self::name`] carries
     /// the name alone, for the diagnostics that are about it.
     pub span: Span,

@@ -1,0 +1,10 @@
+# rule: a placement's max_running is an integer, never a string spelling one (grammar 14.1, Decision D161)
+# at: /placements/mac/max_running
+# via: /$defs/placement/properties/max_running/type
+version: "0.1"
+hub:
+  join_token: ${MESH_JOIN_TOKEN}
+placements:
+  mac:
+    members: [agent.signer]
+    max_running: "3"
