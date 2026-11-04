@@ -386,6 +386,14 @@
 //!     routing, the boundary is on the record under the outcome, a replay of the
 //!     same end reads the record and a replay of another end diverges, and a
 //!     finally node that fails after a cancellation is `finally_error`.
+//! 31. **The failure that arrives after the record has closed** —
+//!     `runtime.endInstance` and `runtime.holdFinallyError` out of
+//!     `finally-past-record.mjs`, once while an execution's session is open and
+//!     once after `closeExecution`. A detached delivery's tool instance can end
+//!     after the run that issued it has closed the execution's record (grammar
+//!     §7.9, §8.6 rule 7), and nothing releases a `finally_error` held then: so
+//!     the open case holds it and writes the boundary, and the closed case holds
+//!     nothing, writes no boundary, and says the failure on stderr.
 //!
 //! # The toolchain fixture
 //!
@@ -10494,4 +10502,125 @@ fn the_end_of_instance_seam_carries_a_cancellation_no_route_reaches_yet() {
     ] {
         assert_eq!(observed[case], json!(true), "{broken}: {observed:#}");
     }
+}
+
+/// Gate 31: **a finally failure that arrives after this process has closed the
+/// execution's record is said on stderr and held nowhere** — `runtime.endInstance`
+/// over the `every-schema-form` golden's `flow.condense` node `note`, and
+/// `runtime.holdFinallyError`, the hub's writer of a worker's failure, out of
+/// `finally-past-record.mjs`.
+///
+/// A detached delivery runs on past the run that issued it (grammar §8.6 rule
+/// 7), and an instance its model begins from its `tools:` ends on its own
+/// (grammar §7.9) — possibly after `closeExecution` has written the row,
+/// shipped the envelope and released the execution's `finally_error`. A
+/// failure held then would be read by nothing and released by nothing, one
+/// entry per such execution for the life of a `serve` process
+/// (`docs/durability.md` §3.10). So:
+///
+///   * with the session open — the control — the failure is the execution's
+///     `finally_error`, and the boundary is on the record;
+///   * with it closed, the node still answers a failed entry, but
+///     `finally_error` holds nothing and no boundary is written, and a worker's
+///     failure held after the close is held nowhere either;
+///   * and each of the two late failures is one stderr line naming its
+///     execution and the node's error, while the one held in time is none.
+#[test]
+fn a_finally_failure_after_the_record_has_closed_is_said_on_stderr_and_held_nowhere() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(
+        goldens::golden("every-schema-form"),
+        root,
+        "finally-past-record",
+    );
+    let output = runner("finally-past-record.mjs")
+        .arg(&project)
+        .output()
+        .expect("bun runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the past-the-record runner did not run:\n{stderr}",
+    );
+    let observed: Value =
+        serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
+    for (case, broken) in [
+        (
+            "the_golden_names_its_finally_node",
+            "`flow.condense`'s compiled flow carries no `finally` descriptor named `note`, so the \
+             runner drove nothing",
+        ),
+        (
+            "a_failure_while_the_record_is_open_is_its_finally_error",
+            "a finally node that failed while its execution's record was open is not that \
+             execution's `finally_error` — the gate below would pass on a runtime that held \
+             nothing at all",
+        ),
+        (
+            "an_end_while_the_record_is_open_writes_its_boundary",
+            "an instance that ended while its execution's record was open wrote no boundary",
+        ),
+        (
+            "a_finally_node_failing_past_the_record_still_answers_its_entry",
+            "a finally node that failed after the record closed did not answer a failed entry \
+             on the outcome the instance already had",
+        ),
+        (
+            "a_failure_past_the_record_is_held_nowhere",
+            "a finally failure raised after `closeExecution` is held as `finally_error`, which \
+             nothing will read or release (`docs/durability.md` §3.10)",
+        ),
+        (
+            "an_end_past_the_record_writes_no_boundary",
+            "an instance that ended after its execution's session closed wrote a boundary",
+        ),
+        (
+            "a_workers_failure_while_the_record_is_open_is_held",
+            "a worker's `finally_error` held while the record is open is not the execution's",
+        ),
+        (
+            "a_workers_failure_past_the_record_is_held_nowhere",
+            "a worker's `finally_error` held after `closeExecution` is held, which nothing will \
+             read or release (`docs/distributed.md` §3.4)",
+        ),
+    ] {
+        assert_eq!(observed[case], json!(true), "{broken}: {observed:#}");
+    }
+    let said = |execution: &str| {
+        stderr
+            .lines()
+            .filter(|line| {
+                line.starts_with(&format!(
+                    "warning: a finally node of execution `{execution}` failed after this \
+                     process had closed the execution's record, which therefore does not hold \
+                     it: flow.condense node `note` failed: "
+                ))
+            })
+            .count()
+    };
+    let id = |key: &str| {
+        observed[key]
+            .as_str()
+            .unwrap_or_else(|| panic!("the runner names its `{key}` execution: {observed:#}"))
+            .to_string()
+    };
+    assert_eq!(
+        said(&id("open")),
+        0,
+        "a failure held in time was also said on stderr:\n{stderr}"
+    );
+    assert_eq!(
+        said(&id("late")),
+        1,
+        "the finally node that failed after the record closed is not one stderr line naming \
+         its execution and its error:\n{stderr}"
+    );
+    assert_eq!(
+        said(&id("placed")),
+        1,
+        "the worker's failure held after the record closed is not one stderr line naming its \
+         execution and its error:\n{stderr}"
+    );
 }
