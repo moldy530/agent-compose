@@ -79,6 +79,8 @@ Spec(
                             Read @ 24:17..24:21,
                         ),
                         default_ttl: None,
+                        history: None,
+                        history_retention: None,
                     },
                 ),
                 span: 12:1..24:21,
