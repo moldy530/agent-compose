@@ -28542,6 +28542,169 @@ fn an_ended_instance_whose_end_is_over_still_begins_nothing_inside_it() {
     assert_eq!(lifecycle_row(&project, execution)["status"], "completed");
 }
 
+/// **Nothing that is not an instance begins inside an ended instance either —
+/// not a `retry:` attempt, not a queued `map` item, not an `on_item_error`
+/// attempt** (grammar §7.9: "nothing new begins inside an instance that is
+/// ending", Decision D159: "every task of a body that has ended is refused
+/// whatever it would begin next").
+///
+/// `flow.stranded_work`'s `mid` is a `flow:` node into `flow.stranding_work`,
+/// with no finally node, under `on_error: skip`. Its `doomed` fails after half
+/// a second while three siblings — none of which begins an instance, so no
+/// refusal downstream in a subflow could stand in for their own — each still
+/// have something to begin: `flaky`, an `exec:` node whose first attempt has
+/// failed, sleeping out a two-second unjittered backoff; `queued`, a `map` of
+/// `tool.logged_item` over `["a", "b", "c"]` one at a time, with `b` and `c`
+/// waiting for the permit `a` holds for a second; and `retried`, a `map` of
+/// `tool.refused_item` whose every item has failed once and is due another
+/// `on_item_error` attempt after two seconds. `after` sleeps on for four. Each
+/// line the log holds is one thing begun, and it holds exactly what began before
+/// the body ended: one attempt of `flaky`, item `a`, and one attempt per item
+/// of `retried`.
+#[test]
+fn an_ended_instance_begins_no_attempt_and_no_item_that_is_not_an_instance() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, log, environment) = finally_environment(&provider, "finally-stranded-work");
+    let Some(project) = harness::scratch_project("finally-stranded-work") else {
+        return;
+    };
+    let run = harness::run_formatted(
+        &project,
+        FINALLY,
+        "flow.stranded_work",
+        &[("names", r#"["a","b","c"]"#)],
+        None,
+        Some("json"),
+        &environment,
+    );
+    run.succeeded();
+    let report = run.outputs();
+    assert_eq!(report["status"], "completed", "{report:#}");
+    assert_eq!(
+        nodes_of(&report["trace"]),
+        ["mid", "after", "stranded_work_end"],
+        "{report:#}"
+    );
+    assert_eq!(report["trace"][0]["outcome"], "skipped", "{report:#}");
+    assert_finally_entry(&report["trace"], "stranded_work_end", "completed");
+    assert_eq!(
+        ended_so_far(&project),
+        ["outer:completed"],
+        "the root's finally node ran, and nothing inside the subflow had one"
+    );
+
+    let mut begun = ended_lines(&log);
+    begun.sort();
+    assert_eq!(
+        begun,
+        ["flaky", "item:a", "retried:a", "retried:b", "retried:c"],
+        "one attempt of the ladder, the one item that held the permit, and one \
+         attempt per retried item: nothing began after the subflow's body ended"
+    );
+    let execution = report["execution_id"].as_str().expect("an execution id");
+    assert_eq!(lifecycle_row(&project, execution)["status"], "completed");
+}
+
+/// **A detached delivery is off the instance that issued it: that instance's
+/// end stops nothing the delivery began, waits for none of it, and refuses none
+/// of it** (grammar §8.6 rule 7: "nothing it does can delay the enclosing flow
+/// instance", Decision D94; grammar §7.9 and D159 for the end it is off).
+///
+/// `flow.delivered` detaches a delivery per topic to `agent.slow_closer`, one
+/// permit at a time, then sleeps a second and ends. The first delivery's model
+/// calls `flow.slow_toolish` at once, and that instance — at a path under the
+/// `map` node's, and so under the root's — takes a second and a half: the body
+/// ends while it runs. The root does not stop it and does not wait for it: its
+/// finally node marks `outer:completed` first, and the tool's instance marks
+/// `first:completed` after, its own finally node reading the end it really
+/// reached. The second delivery starts once the first has answered, while the
+/// root's finally node is still lingering — the root is still ending — and its
+/// model's tool call is not refused: `second:completed`. Every one of the six
+/// model calls the two deliveries make is made.
+#[test]
+fn an_instances_end_stops_waits_for_and_refuses_nothing_a_detached_delivery_began() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "slow_toolish",
+                json!({ "mark": "first" }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("the tool ran")),
+        Script::new(SONNET, Outcome::structured(json!({ "remark": "first" }))),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "slow_toolish",
+                json!({ "mark": "second" }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("the tool ran")),
+        Script::new(SONNET, Outcome::structured(json!({ "remark": "second" }))),
+    ]);
+    let (_shims, _log, environment) = finally_environment(&provider, "finally-delivered");
+    let Some(project) = harness::scratch_project("finally-delivered") else {
+        return;
+    };
+    let run = harness::run_formatted(
+        &project,
+        FINALLY,
+        "flow.delivered",
+        &[("topics", r#"["one","two"]"#)],
+        None,
+        Some("json"),
+        &environment,
+    );
+    run.succeeded();
+    let report = run.outputs();
+    assert_eq!(report["status"], "completed", "{report:#}");
+    assert!(
+        report.get("finally_error").is_none(),
+        "the root's finally node ran to its end: {report:#}"
+    );
+    assert_eq!(
+        nodes_of(&report["trace"]),
+        ["notify", "wait", "delivered_end"],
+        "{report:#}"
+    );
+    assert_finally_entry(&report["trace"], "delivered_end", "completed");
+    assert_eq!(
+        ended_so_far(&project),
+        ["outer:completed", "first:completed", "second:completed"],
+        "the root ran its finally node without stopping or waiting for the first \
+         delivery's tool instance, and refused the second's nothing"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        6,
+        "both deliveries' agents made every model call: a tool call answered, \
+         not failed, is what lets each go on"
+    );
+    let execution = report["execution_id"].as_str().expect("an execution id");
+    let ends: Vec<(String, Value)> = finally_boundaries(&project, execution)
+        .into_iter()
+        .map(|(key, _, recorded)| (key, recorded["value"]["outcome"].clone()))
+        .collect();
+    assert_eq!(
+        ends,
+        [
+            ("delivered_end/0#finally/0".to_string(), json!("completed")),
+            (
+                "notify/0/0/slow_toolish/0/slow_tool_end/0#finally/0".to_string(),
+                json!("completed")
+            ),
+            (
+                "notify/0/1/slow_toolish/0/slow_tool_end/0#finally/0".to_string(),
+                json!("completed")
+            )
+        ],
+        "each tool instance recorded the end it reached, under its delivery's frame"
+    );
+    assert_eq!(lifecycle_row(&project, execution)["status"], "completed");
+}
+
 /// **A finally node already running when the instance around it ends is waited
 /// for, not stopped** (grammar §7.9: "an end already under way inside the one
 /// that is ending is waited for, never stopped").

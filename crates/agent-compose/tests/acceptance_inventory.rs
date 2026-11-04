@@ -880,6 +880,20 @@ const CODEGEN: &[Criterion] = &[
                 "an_ended_instance_whose_end_is_over_still_begins_nothing_inside_it",
                 Status::Live,
             ),
+            // …nor what begins no instance at all: an `exec:` node's next
+            // `retry:` attempt, a queued `map` item of a `tool.*`, and an
+            // item's next `on_item_error` attempt.
+            (
+                "an_ended_instance_begins_no_attempt_and_no_item_that_is_not_an_instance",
+                Status::Live,
+            ),
+            // A detached delivery is off the instance that issued it: the
+            // instances its agent's model begins from its `tools:` are neither
+            // stopped, waited for nor refused by that instance's end.
+            (
+                "an_instances_end_stops_waits_for_and_refuses_nothing_a_detached_delivery_began",
+                Status::Live,
+            ),
             // An input a finally node cannot build — an unasked absent read —
             // is its own failure, `finally_error`, not the execution's.
             (
