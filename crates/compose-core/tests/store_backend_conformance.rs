@@ -915,6 +915,19 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "an_expired_authored_row_leaves_storage_at_the_next_authored_write",
     "an_expired_authored_row_leaves_storage_when_a_process_next_starts",
     "an_authored_row_on_a_store_without_default_ttl_answers_after_any_wait",
+    // …and the default is the store's, never the write's (D157): a row written
+    // with a ten-minute `ttl:` still answers at eleven, and one written
+    // `ttl: never` stops answering with the store's hour.
+    "an_authored_row_outlives_a_shorter_ttl_its_write_gave_the_key",
+    "an_authored_row_written_with_ttl_never_expires_with_the_stores_default",
+    // …and the ledger's cleanup is bounded as a key's is: a write under an
+    // authored key removes at most 100 of the store's expired ledger rows —
+    // inside a transaction that, on a server, holds the store's authored lock
+    // — and the start sweep takes them at most 1000 a batch, counted between
+    // batches (`store-sweep-batches.mjs` with `ledger`).
+    "an_authored_writes_ledger_sweep_removes_at_most_100_rows",
+    "an_expired_ledger_backlog_leaves_storage_at_the_next_authored_writes",
+    "the_start_sweep_takes_at_most_1000_ledger_rows_a_batch",
     // …while a derived row on a store with `default_ttl:` never expires: a
     // retry of an open execution's write, long past the default, is still
     // answered by its row, which carries no expiry (PRD resolved q69(d)).
@@ -1029,6 +1042,14 @@ const TRUE_WHEN_DIALLED: &[&str] = &[
     // holds alive, and one ten days slow still takes a key it holds expired.
     "a_store_wide_sweep_keeps_a_key_the_servers_clock_holds_alive",
     "a_store_wide_sweep_takes_a_key_the_servers_clock_holds_expired",
+    // PRD resolved q73: an authored ledger row's expiry is the server's clock
+    // plus the store's `default_ttl:` too — the instant the key beside it holds
+    // — so writers whose own clocks disagree agree about when a business key
+    // stops deduping; and a redelivery with this process's clock ten days the
+    // other way is still answered by the row, which the ledger read judges by
+    // the server's clock.
+    "an_authored_rows_expiry_is_computed_by_the_servers_clock",
+    "a_dialled_ledger_read_answers_an_authored_row_the_servers_clock_holds_alive",
     // PRD resolved q69 (c): the two halves of the cleanup schedule — a write's
     // sweep of its partition and the store-wide sweep a connection's first op
     // starts — run at once in two processes over one backlog without either

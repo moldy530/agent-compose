@@ -4630,6 +4630,247 @@ const authored = (store, key) => stores.authoredKey(store.name, key);
 }
 
 {
+  // **…and the default is the store's, never the write's** (PRD resolved q73,
+  // Decision D157): a write's own `ttl:` sets how long its key lives, not how
+  // long its business key is remembered — the row is the business key's, not
+  // the value's. On a store whose default is an hour, a write under an
+  // authored key with `ttl:` ten minutes leaves a key gone at eleven and a row
+  // that still answers there; one written `ttl: never` leaves a key kept for
+  // good and a row that stops answering with the store's hour, so the
+  // redelivery after it applies as a first write does.
+  const store = { ...kv("authored_write_ttl", "global"), defaultTtl: HOUR };
+  const read = ctx(execution("authored_write_ttl_read"));
+  const writeUnder = (name, by, ttl, label) =>
+    write(store, "set", { key: name, value: { by }, ttl }, ctx(execution(`authored_write_ttl_${label}`)), authored(store, name));
+  try {
+    const short = await later(0, () => writeUnder("short", "first", 10 * MINUTE, "1"));
+    const forever = await later(0, () => writeUnder("forever", "first", "never", "1"));
+    // Past the write's ten minutes and inside the store's hour: the key is
+    // gone, and its business key is still remembered.
+    const shortGone = await later(11 * MINUTE, () => get(store, "short", read));
+    const shortAgain = await later(11 * MINUTE, () => writeUnder("short", "second", 10 * MINUTE, "2"));
+    // Past the store's hour: a key written `ttl: never` is still there, and
+    // its business key is forgotten.
+    const foreverKept = await later(HOUR + MINUTE, () => get(store, "forever", read));
+    const foreverAgain = await later(HOUR + MINUTE, () => writeUnder("forever", "second", "never", "3"));
+    const foreverHeld = await later(HOUR + MINUTE, () => get(store, "forever", read));
+    answer.an_authored_row_outlives_a_shorter_ttl_its_write_gave_the_key =
+      short.applied === true &&
+      short.deduped === false &&
+      shortGone.found === false &&
+      same({ ...short, deduped: true }, shortAgain);
+    answer.an_authored_row_written_with_ttl_never_expires_with_the_stores_default =
+      forever.applied === true &&
+      forever.deduped === false &&
+      foreverKept.found === true &&
+      foreverKept.value?.by === "first" &&
+      foreverAgain.applied === true &&
+      foreverAgain.deduped === false &&
+      foreverAgain.version > forever.version &&
+      foreverHeld.value?.by === "second";
+    answer.authored_write_ttl_trace = { short, shortGone, shortAgain, forever, foreverKept, foreverAgain, foreverHeld };
+  } catch (error) {
+    answer.authored_write_ttl_error = String(error?.stack ?? error);
+  } finally {
+    if (provider !== "sqlite") await forget(store).catch(() => undefined);
+  }
+}
+
+{
+  // **…and a write's half of the ledger's cleanup is bounded, as a key's is**
+  // (PRD resolved q73, grammar §11.4): a write under an authored key removes
+  // at most 100 of the store's expired ledger rows, inside its own transaction
+  // — on a server, one that holds the store's authored lock, which every other
+  // authored writer of the store waits on, so an unbounded sweep there would
+  // stall them all behind one write. A backlog of 150 loses 100 to one write
+  // and the rest to the next.
+  const store = { ...kv("authored_sweep", "global"), defaultTtl: HOUR };
+  const run = ctx(execution("authored_sweep"));
+  const writeUnder = (name, index) =>
+    write(store, "set", { key: name, value: { n: index } }, run, authored(store, name));
+  /** The store's authored rows still stored, expired ones included. */
+  const stored = () => ledgerRows(store, authored(store, ""));
+  try {
+    await later(0, async () => {
+      for (let index = 0; index < 150; index += 1) {
+        await writeUnder(`old-${String(index).padStart(3, "0")}`, index);
+      }
+    });
+    const seeded = await stored();
+    await later(HOUR + MINUTE, () => writeUnder("new-1", 0));
+    const afterOne = await stored();
+    await later(HOUR + MINUTE, () => writeUnder("new-2", 0));
+    const afterTwo = await stored();
+    // 150 expired; one write removes 100 and claims its own row.
+    answer.an_authored_writes_ledger_sweep_removes_at_most_100_rows = seeded === 150 && afterOne === 150 - 100 + 1;
+    // …and the next removes the other 50: `new-1`'s row, alive, and its own
+    // are what is left.
+    answer.an_expired_ledger_backlog_leaves_storage_at_the_next_authored_writes =
+      afterTwo === 2 && (await ledgerRows(store, authored(store, "new-"))) === 2;
+    answer.authored_sweep_trace = { seeded, afterOne, afterTwo };
+  } catch (error) {
+    answer.authored_sweep_error = String(error?.stack ?? error);
+  } finally {
+    if (provider !== "sqlite") await forget(store).catch(() => undefined);
+  }
+}
+
+{
+  // **…and the start sweep takes the ledger's expired rows at most 1000 a
+  // batch, as it does a store's keys** (PRD resolved q73, q69 (c)): once the
+  // keys are swept, the store's expired ledger rows — authored ones, the only
+  // ledger rows with an expiry — leave behind the ops a batch at a time, each
+  // batch its own transaction (on a server one under the store's authored
+  // lock, which every authored writer of the store waits on). A second process
+  // counts the ledger's backlog **between** the batches (`store-sweep-batches.mjs`
+  // with `ledger`), where one unbounded `DELETE` would take it all at once.
+  //
+  // The backlog is laid down straight into storage, dated as a `default_ttl:`
+  // would date it: alive to every probe for half an hour, and expired to the
+  // sweep, whose clock is an hour and a minute ahead. The store's authored
+  // lock — a ledger batch takes it, so a store without one is one whose ledger
+  // no batch sweeps — is taken by one write under an authored key on a store
+  // with no default, so its own row never expires and is never counted.
+  const store = kv("ledger_batches", "global");
+  const BACKLOG = 3_500;
+  /** One more than the batches the backlog takes, so the last count is past the sweep's end. */
+  const PROBES = 6;
+  /** A count of the ledger's backlog, as the helper answers it or this file reads it. */
+  const ledger = (counted) => Number(counted?.ledger ?? NaN);
+  try {
+    await later(0, () =>
+      write(store, "set", { key: "kept", value: { n: 0 } }, ctx(execution("ledger_batches")), authored(store, "kept")),
+    );
+    const clock = provider === "sqlite" ? Date.now() : Number((await storage(SERVER_NOW, []))[0]?.server_now);
+    const laid = Array.from({ length: BACKLOG }, (_, index) => {
+      const name = `z-${String(index).padStart(4, "0")}`;
+      return [
+        authored(store, name),
+        JSON.stringify({ key: name, applied: true, version: index + 2, deduped: false }),
+        clock + HOUR / 2 + index,
+      ];
+    });
+    for (let at = 0; at < laid.length; at += 2_000) {
+      const chunk = laid.slice(at, at + 2_000);
+      if (provider === "sqlite") {
+        await storage(undefined, undefined, [
+          store.name,
+          "INSERT INTO applied (idempotency_key, op, result, expires_at) VALUES " +
+            chunk.map(() => "(?, ?, ?, ?)").join(", "),
+          chunk.flatMap(([key, result, expiresAt]) => [key, "set", result, expiresAt]),
+        ]);
+      } else {
+        await storage(
+          "INSERT INTO store_applied (store, scope_key, idempotency_key, op, result, expires_at) VALUES " +
+            chunk.map(() => "(?, ?, ?, ?, ?, ?)").join(", "),
+          chunk.flatMap(([key, result, expiresAt]) => [store.name, "global", key, "set", result, expiresAt]),
+        );
+      }
+    }
+    const before = Number(
+      (
+        await storage(
+          "SELECT COUNT(*) AS n FROM store_applied WHERE store = ? AND expires_at IS NOT NULL",
+          [store.name],
+          [store.name, "SELECT COUNT(*) AS n FROM applied WHERE expires_at IS NOT NULL"],
+        )
+      )[0]?.n,
+    );
+    const swept = await helper(
+      "store-sweep-batches.mjs",
+      [project, provider, data, JSON.stringify(store), String(PROBES), "ledger"],
+      { ...process.env, [CLOCK]: String(HOUR + MINUTE) },
+    );
+    const failed = swept.answer.observed.find((counted) => counted?.error !== undefined);
+    const observed = swept.answer.observed.map(ledger);
+    const totals = [before, ...observed];
+    const taken = totals.slice(1).map((left, index) => totals[index] - left);
+    // Every probe found the sweep at most one batch further on, and at least
+    // one found it under way — neither untouched nor finished — so the counts
+    // are the sweep's own steps rather than its two ends; and the row with no
+    // expiry is still there once the sweep is done.
+    answer.the_start_sweep_takes_at_most_1000_ledger_rows_a_batch =
+      failed === undefined &&
+      swept.answer.first?.found === true &&
+      before === BACKLOG &&
+      observed.length === PROBES &&
+      taken.every((n) => n >= 0 && n <= 1_000) &&
+      totals.some((n) => n > 0 && n < totals[0]) &&
+      ledger(swept.answer.after) === 0 &&
+      (await ledgerRows(store, authored(store, "kept"))) === 1;
+    answer.ledger_batches_trace = { before, observed, after: swept.answer.after, failed, totals };
+  } catch (error) {
+    answer.ledger_batches_error = String(error?.stack ?? error);
+  } finally {
+    if (provider !== "sqlite") await forget(store).catch(() => undefined);
+  }
+}
+
+if (provider !== "sqlite") {
+  // **An authored row's expiry is the server's clock's too** (PRD resolved
+  // q73, q69 (a)), as a key's is: two writers whose own clocks disagree must
+  // still agree about when a business key stops deduping, or a redelivery past
+  // `default_ttl:` is deduped by one and one inside it applies again by the
+  // other. This process's clock is moved ten days ahead for one write and ten
+  // days behind for another; each row holds the server's instant plus the
+  // store's default — the instant the key beside it holds — and a redelivery
+  // with the clock moved the other way is still answered by it, because the
+  // ledger is read by the server's clock as well.
+  const store = { ...kv("authored_server_clock", "global"), defaultTtl: HOUR };
+  const key = provider === "postgres" ? '"key"' : "`key`";
+  const writeUnder = (label, n, shift, again = "") =>
+    skewed(shift, () =>
+      write(
+        store,
+        "set",
+        { key: label, value: { n } },
+        ctx(execution(`authored_server_clock_${label}${again}`)),
+        authored(store, label),
+      ),
+    );
+  try {
+    const written = {
+      ahead: await writeUnder("ahead", 1, TEN_DAYS),
+      behind: await writeUnder("behind", 1, -TEN_DAYS),
+    };
+    const serverNow = Number((await storage(SERVER_NOW, []))[0]?.server_now);
+    const ledger = Object.fromEntries(
+      (await storage("SELECT idempotency_key, expires_at FROM store_applied WHERE store = ?", [store.name])).map(
+        (row) => [String(row.idempotency_key), Number(row.expires_at)],
+      ),
+    );
+    const entries = Object.fromEntries(
+      (await storage(`SELECT ${key} AS k, expires_at FROM store_entries WHERE store = ?`, [store.name])).map(
+        (row) => [String(row.k), Number(row.expires_at)],
+      ),
+    );
+    const redelivered = {
+      ahead: await writeUnder("ahead", 2, -TEN_DAYS, "_again"),
+      behind: await writeUnder("behind", 2, TEN_DAYS, "_again"),
+    };
+    const ahead = Object.fromEntries(
+      ["ahead", "behind"].map((label) => [label, ledger[authored(store, label)] - serverNow]),
+    );
+    answer.an_authored_rows_expiry_is_computed_by_the_servers_clock = ["ahead", "behind"].every(
+      (label) =>
+        written[label]?.applied === true &&
+        written[label]?.deduped === false &&
+        ahead[label] > HOUR - MINUTE &&
+        ahead[label] < HOUR + MINUTE &&
+        Math.abs(ledger[authored(store, label)] - entries[label]) < MINUTE,
+    );
+    answer.a_dialled_ledger_read_answers_an_authored_row_the_servers_clock_holds_alive = ["ahead", "behind"].every(
+      (label) => same({ ...written[label], deduped: true }, redelivered[label]),
+    );
+    answer.authored_server_clock_trace = { serverNow, ahead, ledger, entries, written, redelivered };
+  } catch (error) {
+    answer.authored_server_clock_error = String(error?.stack ?? error);
+  } finally {
+    await forget(store).catch(() => undefined);
+  }
+}
+
+{
   // …**while a derived row never expires, whatever the store's default.** It
   // is its execution's, kept for as long as an attempt can repeat and pruned
   // when the execution settles (PRD resolved q69(d)) — so on a store with
