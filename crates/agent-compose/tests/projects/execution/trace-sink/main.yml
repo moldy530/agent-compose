@@ -13,12 +13,17 @@
 # binds takes a port the operating system chose, so each test writes the target
 # it needs into a copy of this directory — see the harness's `staged_with_deploy`.
 #
-# Two flows, because two things settle differently:
+# Three flows, because three things settle differently:
 #
 #   * `flow.greet` completes, and is what a `run`, a served request and a mesh
 #     execution all export;
 #   * `flow.refusing` fails, so the export a failed run ships — `status: failed`,
-#     the envelope's `error`, and the aborting node's entry — has a case.
+#     the envelope's `error`, and the aborting node's entry — has a case;
+#   * `flow.untidy` completes and its `finally:` node fails (grammar §7.9, PRD
+#     resolved q76), so the `finally_error` every settled document carries
+#     beside the outcome it did not change — the export, the OTLP root's
+#     `agentcompose.finally_error`, and the `settled` webhook, whichever process
+#     journals it — has a case.
 version: "0.1"
 
 defaults:
@@ -66,6 +71,18 @@ triggers:
     input:
       subject: "payload.body.subject"
     respond: async
+
+  # `flow.untidy` behind a `callback:`, so one settle puts a `finally_error` on
+  # both kinds of delivery the ledger holds: the webhook and the export.
+  on_untidy_request:
+    type: http
+    flow: flow.untidy
+    path: /untidy-greetings
+    method: POST
+    input:
+      subject: "payload.body.subject"
+    respond: async
+    callback: "payload.body.callback_url"
 
 flow.greet:
   description: Greet one subject, with no model and no network in the way.
@@ -118,3 +135,31 @@ flow.refusing:
   edges:
     - { from: start, to: fail }
     - { from: fail, to: end }
+
+flow.untidy:
+  description: A body that answers, and a finally node that fails after it.
+  inputs:
+    subject:
+      type: string
+      min_length: 1
+  outputs:
+    greeting:
+      type: string
+  nodes:
+    say:
+      exec:
+        command: "${OPS_BIN}/echo"
+        args: ['{"greeting":"hello"}']
+        output:
+          greeting: { type: string }
+
+    # Runs once the body has ended, and fails: no `retry:` of its own, so its
+    # one attempt is its last, and what it raised is `finally_error` on a run
+    # that still completed with the body's outputs.
+    tidy:
+      exec:
+        command: "${OPS_BIN}/false"
+  edges:
+    - { from: start, to: say }
+    - { from: say, to: end }
+  finally: tidy
