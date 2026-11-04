@@ -2526,13 +2526,94 @@ export function noteCancelled(execution: string): void {
 }
 
 /**
- * Whether what an effect threw is the cancel rather than the world: a
- * cancellation on its chain, or — once this execution's cancel has fired — the
- * `AbortError` a platform raises for a signal whose reason it did not keep.
+ * The executions whose **dispatch** this process was told to stop, and the
+ * reason it was stopped with — read by the effect seam beside
+ * [`cancelledHere`], for the same reason ([`stoppedInFlight`]).
+ *
+ * Only ever written in a worker's node runner (`./worker-node.ts`), whose
+ * worker stops the one dispatch it runs when the hub has stopped waiting for
+ * it: the node's `timeout:` ran out on the hub, its execution ended around it,
+ * or the session it was handed under ended — a hub restart's `410` among them
+ * (`docs/distributed.md` §3.2, §5). **Not** let go of by [`closeSession`], as a
+ * cancel's note is: a runner runs one dispatch and exits, and an effect the
+ * stop aborted whose rejection lands after the session has closed is the
+ * stop's as much as one that landed before.
  */
-function stoppedByCancel(execution: string, error: unknown): boolean {
+const stoppedHere = new Map<string, Error>();
+
+/**
+ * Note that the dispatch of `execution` this process runs was **stopped**, by
+ * `reason` (`./worker-node.ts`'s stop) — called before the stop aborts
+ * anything, so every effect it aborts is read as stopped ([`stoppedInFlight`]).
+ */
+export function noteStopped(execution: string, reason: Error): void {
+  stoppedHere.set(execution, reason);
+}
+
+/**
+ * Failures an effect site has already judged to be its effect **stopped** in
+ * flight ([`asStopped`]), by identity.
+ */
+const judgedStopped = new WeakSet<object>();
+
+/**
+ * Mark `error` as an effect stopped in flight, and answer it — for an effect
+ * site that knows more than the failure carries, so the seam it is thrown
+ * through keeps it off the record ([`stoppedInFlight`]). The one such site is
+ * a harness run (`./runtime.ts`'s `runCoder`), whose SDK may report the abort
+ * that stopped it as a failure of its own wording, with nothing of the stop on
+ * its `cause` chain; the run's signal still says what aborted it.
+ */
+export function asStopped<E extends object>(error: E): E {
+  judgedStopped.add(error);
+  return error;
+}
+
+/**
+ * Whether what an effect threw is its execution's work being **stopped** while
+ * it was in flight — by a cancel, or by a worker's stop — rather than the world
+ * answering it.
+ *
+ * * **A cancel** (PRD resolved q75, Decision D160): a cancellation on its
+ *   chain, or — once this execution's cancel has fired — the `AbortError` a
+ *   platform raises for a signal whose reason it did not keep.
+ * * **A worker's stop** (`docs/distributed.md` §3.2), once one has fired here
+ *   ([`noteStopped`]): the stop's own reason on its chain, an
+ *   `InstanceStopped` on it — what each task an instance the stop ended lets
+ *   go of raises (`./runtime.ts`) — or an `AbortError`. A stop is the hub
+ *   having stopped waiting for the dispatch, not the world failing the
+ *   effect, and what this process records is still posted home and appended
+ *   (§3.3). Recorded, a stopped model call would be replayed as a failure by
+ *   the very attempt that comes next: a `retry:` after a hub restart is handed
+ *   this dispatch's records as its history, which §7.3 makes the answers it
+ *   replays rather than re-issues — so every attempt would replay the stop,
+ *   and an execution nobody stopped would fail on it.
+ * * **A failure an effect site marked so** ([`asStopped`]), whatever it
+ *   carries.
+ *
+ * Unrecorded, the effect is simply the frontier for whichever generation
+ * reaches it next, and that one performs it. Read by [`journaled`], and by the
+ * two effect sites that keep a failure as a **value** rather than through the
+ * slot's error path — a model call and a harness run (`./runtime.ts`'s
+ * `callModel` and `runCoder`) — which would otherwise record exactly what this
+ * keeps off the record.
+ */
+export function stoppedInFlight(execution: string, error: unknown): boolean {
+  if (typeof error === "object" && error !== null && judgedStopped.has(error)) return true;
   if (cancellationOf(error) !== undefined) return true;
-  return cancelledHere.has(execution) && error instanceof Error && error.name === "AbortError";
+  const aborted = error instanceof Error && error.name === "AbortError";
+  if (cancelledHere.has(execution) && aborted) return true;
+  const stop = stoppedHere.get(execution);
+  if (stop === undefined) return false;
+  if (aborted) return true;
+  for (let held: unknown = error; held !== undefined && held !== null; ) {
+    if (held === stop) return true;
+    if (held instanceof Error && (held.name === stop.name || held.name === "InstanceStopped")) {
+      return true;
+    }
+    held = (held as { cause?: unknown }).cause;
+  }
+  return false;
 }
 
 /**
@@ -3312,8 +3393,10 @@ export async function journaled<T>(
     // replayed as the world's failure by the generation that completes a cancel
     // a restart interrupted — and absorbed by a `retry:` or an `on_error:` that a
     // cancel is never routed through. Left unrecorded, that generation meets a
-    // frontier here and the cancel stops it again ([`FrontierHook`]).
-    if (stoppedByCancel(recorder.execution, error)) throw error;
+    // frontier here and the cancel stops it again ([`FrontierHook`]). Nor is a
+    // worker's **stop**, which the attempt after it would replay as the world's
+    // failure in place of performing the effect ([`stoppedInFlight`]).
+    if (stoppedInFlight(recorder.execution, error)) throw error;
     await slot.fail(error);
     throw error;
   }

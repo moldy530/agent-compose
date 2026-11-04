@@ -149,6 +149,18 @@
 // the node leaves on a failure no ladder acts on. A finally node, and all it
 // begins, is exempt, as it is from a cancel.
 //
+// **What the stop aborts is never recorded.** An effect it stops in flight — a
+// model call whose request it aborted, a command it killed part-way — did not
+// fail; the hub stopped waiting for it. The records this process writes are
+// posted home and appended whatever became of the dispatch (§3.3), and the
+// attempt the hub opens next is handed them as its history, which §7.3 makes
+// the answers it replays rather than re-issues: a stop recorded as an effect's
+// failure would be replayed as the world's by every attempt that follows, and
+// an execution a hub restart orphaned would fail on a stop nobody asked for.
+// So the stop is noted on the journal before it aborts anything
+// (`journal.noteStopped`), and the effect seam keeps what it stopped off the
+// record exactly as it keeps a cancel's (`journal.stoppedInFlight`).
+//
 // # Finally work is reported
 //
 // A `finally:` node runs whole whatever a cancel does (grammar 7.9, Decision
@@ -194,6 +206,7 @@ import {
   type JournalRecord,
   closeSession,
   hostJournal,
+  noteStopped,
   openSession,
   recorderFor,
 } from "./journal.ts";
@@ -261,8 +274,14 @@ function unbounded(): AbortController {
  *
  * Their listener ceilings are lifted, as `runtime.executionCancelSignal` lifts
  * the execution's: the activities all read them at once.
+ *
+ * **And the stop is noted on the journal first** (`journal.noteStopped`),
+ * before it aborts anything: an effect it stops in flight did not fail — the
+ * hub stopped waiting for it — and recorded, it would be posted home and
+ * replayed as the world's failure by the attempt the hub opens next (see *A
+ * stop arrives as `SIGUSR2`*).
  */
-function stoppable(cancel: AbortSignal, dispatch: string): AbortSignal {
+function stoppable(cancel: AbortSignal, execution: string, dispatch: string): AbortSignal {
   const stop = unbounded();
   const everyNode = unbounded();
   const follow = (): void => {
@@ -271,10 +290,13 @@ function stoppable(cancel: AbortSignal, dispatch: string): AbortSignal {
   if (cancel.aborted) follow();
   else cancel.addEventListener("abort", follow, { once: true });
   stopEveryNodeOn(everyNode.signal);
+  let stopped: DispatchStopped | undefined;
   process.on(STOP_SIGNAL, () => {
-    const reason = new DispatchStopped(dispatch);
-    if (!stop.signal.aborted) stop.abort(reason);
-    if (!everyNode.signal.aborted) everyNode.abort(reason);
+    if (stopped !== undefined) return;
+    stopped = new DispatchStopped(dispatch);
+    noteStopped(execution, stopped);
+    if (!stop.signal.aborted) stop.abort(stopped);
+    if (!everyNode.signal.aborted) everyNode.abort(stopped);
   });
   return stop.signal;
 }
@@ -785,7 +807,7 @@ async function main(): Promise<void> {
   // and cancels nothing (see *A stop arrives as `SIGUSR2`*).
   const cancel = executionCancelSignal(dispatch.execution_id);
   cancelOnTerminate(dispatch.execution_id);
-  const placed = stoppable(cancel, dispatch.dispatch_id);
+  const placed = stoppable(cancel, dispatch.execution_id, dispatch.dispatch_id);
   // …and the worker is told whenever finally work starts and stops here, so a
   // cancel's grace does not cut off a `finally:` node that runs whole (see
   // *Finally work is reported*).
