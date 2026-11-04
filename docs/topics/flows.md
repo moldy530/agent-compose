@@ -257,9 +257,9 @@ a `map` or an agent calling flow tools. A finally node that had already
 started when the failure came is not stopped: the caller waits for it to
 finish. And once an instance has ended, its other branches begin nothing more
 inside it — not a `map` item still waiting its turn, not a `retry:` attempt,
-not a flow tool a model asks for late — though whatever they were already
-running runs on. A detached `flow.*` dispatch is a child execution, and runs
-its own.
+not another tool call or model call of an agent whose model answers late —
+though whatever they were already running runs on. A detached `flow.*` dispatch
+is a child execution, and runs its own.
 A body that ended through `on_error: skip` or a `fallback:` to `end`
 **completed**, and its finally node reads `completed`.
 
