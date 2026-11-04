@@ -18,6 +18,11 @@
 #     child execution (Decision D150), and then a command of its own. A cancel
 #     of the parent cascades to the child; a cancel of the child alone leaves
 #     the parent running to its own end.
+#   * `flow.notifying` — the same long command, and a finally node that is a
+#     **detached** `map` onto `tool.ping`, handing the sink the run's
+#     `execution.outcome`. A cancel stops the command and runs the finally node,
+#     and what that node begins is not the cancel's to stop: the delivery runs
+#     and `${TALLY_BIN}/ping` appends `pinged cancelled` to `$TALLY_LOG.pings`.
 version: "0.1"
 
 defaults:
@@ -52,6 +57,16 @@ triggers:
     method: POST
     input:
       child_lingers: "payload.body.child_lingers"
+      linger: "payload.body.linger"
+    respond: async
+
+  on_notifying:
+    type: http
+    flow: flow.notifying
+    path: /notifying
+    method: POST
+    input:
+      names: "payload.body.names"
       linger: "payload.body.linger"
     respond: async
 
@@ -138,3 +153,42 @@ flow.parent:
     - { from: spawn, to: hold }
     - { from: hold, to: end }
   finally: parent_end
+
+flow.notifying:
+  description: A long command, and a finally node that tells a sink how the run ended, detached.
+  inputs:
+    names:
+      type: array
+      max_items: 1
+      items: { type: string }
+    linger:
+      type: integer
+  outputs: {}
+  nodes:
+    noted_work:
+      exec:
+        command: "${TALLY_BIN}/linger"
+      input:
+        linger: "input.linger"
+    tell:
+      map:
+        over: input.names
+        as: name
+        node: tool.ping
+        max_concurrency: 1
+        detach: true
+        input:
+          line: "execution.outcome"
+  edges:
+    - { from: start, to: noted_work }
+    - { from: noted_work, to: end }
+  finally: tell
+
+tool.ping:
+  description: Appends the line it is handed to the ping log.
+  input:
+    line: { type: string }
+  output:
+    done: { type: string }
+  exec:
+    command: "${TALLY_BIN}/ping"

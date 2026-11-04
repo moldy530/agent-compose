@@ -41,6 +41,7 @@ import {
   flowEscalationInputs,
   flowEscalationNodeAskOutput,
   flowImpatientInputs,
+  flowOverdueInputs,
   flowReleaseInputs,
   flowRetriedInputs,
   flowSignedOffInputs,
@@ -218,6 +219,20 @@ const flowImpatientShape: runtime.Shape = {
 const flowImpatientNodeEscalateShape: runtime.Shape = {
   "properties": {
     "approval": "string"
+  }
+};
+
+/** `flow.overdue` — the `input` root inside it (grammar 7.5). */
+const flowOverdueShape: runtime.Shape = {
+  "properties": {
+    "path": "string"
+  }
+};
+
+/** `flow.overdue` node `sign` — the `sign.output` root its guards read. */
+const flowOverdueNodeSignShape: runtime.Shape = {
+  "properties": {
+    "signature": "string"
   }
 };
 
@@ -1497,6 +1512,79 @@ const flowImpatientBinding: runtime.SubflowBinding = {
     }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
 };
 
+// --- flow.overdue ---
+
+/** `flow.overdue` node `sign` — `agent.signer` (grammar 8.1). */
+const flowOverdueNodeSign: runtime.NodeDescriptor = {
+  flow: "flow.overdue",
+  node: "sign",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from the node, `on_error` from `defaults:`.
+  policy: {
+    timeoutMs: 2000,
+    onError: "fail",
+  },
+  shapes: { input: flowOverdueShape, state: stateShape, output: flowOverdueNodeSignShape },
+  input: (roots, view) => ({
+    "path": runtime.toJson(runtime.evaluate("input.path", roots)),
+  }),
+  run: async (input, context, view) => {
+    const answer = await mesh.dispatchPlaced({
+      placement: "mac",
+      node: "flow.overdue.sign",
+      execution: view.run.execution.id,
+      itemIndex: view.run.execution.item_index,
+      path: runtime.instancePath(view, "sign"),
+      inputs: input,
+      history: runtime.historyTurns(view.state["messages"] as unknown[]),
+      policy: view.run.policy,
+      signal: context.signal,
+      stores: context.storeRecords,
+    });
+    return {
+      output: runtime.parseResult(agentSignerOutput, answer.output, "the answer of `agent.signer`"),
+      history: answer.history,
+      models: answer.models,
+      toolDispatches: answer.toolDispatches,
+    };
+  },
+  writes: [
+    { field: "signature", channel: "signature", reduce: "set" },
+  ],
+  edges: [
+    { to: END },
+  ],
+};
+
+/** `flow.overdue` — its nodes, its `start` edges, and the compiled graph. */
+function flowOverdue() {
+  return new StateGraph(State)
+    .addNode("sign", (state: GraphState) => runtime.runNode(flowOverdueNodeSign, state), {
+      ends: [END],
+    })
+    .addEdge(START, "sign")
+    .compile();
+}
+
+/**
+ * `flow.overdue`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowOverdueGraph = flowOverdue();
+
+/**
+ * `flow.overdue` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowOverdueBinding: runtime.SubflowBinding = {
+  address: "flow.overdue",
+  outputs: ["signature"],
+  recursionLimit: 26,
+  stream: (initial, options) =>
+    flowOverdueGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowOverdueGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
+
 // --- flow.release ---
 
 /** `flow.release` node `sign` — `agent.signer` (grammar 8.1). */
@@ -2339,6 +2427,22 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
         outputKeys: flowImpatientGraph.outputChannels,
       }) as unknown as Promise<AsyncIterable<GraphState>>,
   },
+  "flow.overdue": {
+    address: "flow.overdue",
+    inputs: ["path"],
+    inputKinds: { "path": "string", },
+    outputs: ["signature"],
+    sessionStores: [],
+    recursionLimit: 26,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowOverdueInputs, inputs, "the `inputs:` of `flow.overdue`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowOverdueGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowOverdueGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
   "flow.release": {
     address: "flow.release",
     inputs: ["path"],
@@ -3132,6 +3236,22 @@ export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {
     async (input, context, site) => {
       const answer = await runtime.callAgent(
         agentEscalator,
+        input,
+        site.history ?? [],
+        context,
+        { path: site.path, policy: site.policy },
+      );
+      return {
+        output: answer.output,
+        history: answer.history,
+        models: answer.models,
+        toolDispatches: answer.toolDispatches,
+      };
+    },
+  "flow.overdue.sign":
+    async (input, context, site) => {
+      const answer = await runtime.callAgent(
+        agentSigner,
         input,
         site.history ?? [],
         context,

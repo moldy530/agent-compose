@@ -14,6 +14,14 @@
 // `cancelled` with the harness record it made and no `error` and no `routing`,
 // and that the journal's lifecycle row settled `cancelled` with no `error`.
 //
+// And a second run, for the cancel that arrives **before the run has a row**:
+// `serve` answers a trigger's request while the lifecycle row's `begin` is
+// still in flight — on a dialled journal, real network I/O — and a cancel sent
+// at once lands inside it. The journal's `begin` is slowed here to make that
+// window a fact rather than a race, and the cancel is sent the moment the run
+// is started. It reports whether that run ended `cancelled` with no harness run
+// begun, and how its row settled (`early*`).
+//
 // **The seam is `registerHarnessDriver`**, as `coder-graph.mjs` explains: a
 // harness SDK speaks its own wire, so the driver is the one place a test can
 // stand in for it. What the driver reads is `run.signal` — the node's own
@@ -55,12 +63,24 @@ const running = new Promise((resolve) => {
   started = resolve;
 });
 
+/** How many harness runs began — the second run's must be none. */
+let implementerRuns = 0;
+
 /** A harness that works for ten minutes, the way a long coding run does. */
 const implementer = {
   sdk: "agent-compose:cancel-probe/cc",
   version: "0",
   enforcesTools: true,
   run(run) {
+    implementerRuns += 1;
+    // A run begun in an execution whose cancel was already requested is the
+    // failure the second scenario looks for: it fails at once, so the
+    // scenario ends rather than waiting out a ten-minute probe.
+    if (implementerRuns > 1) {
+      return (async function* refused() {
+        throw new Error("a harness run began in an execution whose cancel was already requested");
+      })();
+    }
     return (async function* yielded() {
       yield {
         source: { type: "assistant" },
@@ -121,6 +141,26 @@ async function alive(held) {
 
 const row = await journal.execution(execution);
 const trace = settled.error?.trace ?? settled.value?.trace ?? [];
+
+// The second run: the cancel lands while the row is still being begun.
+const begin = journal.begin.bind(journal);
+journal.begin = async (begun) => {
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  return begin(begun);
+};
+const earlyId = `exec_${globalThis.crypto.randomUUID()}`;
+const earlyEnded = runFlow(
+  "flow.patch",
+  { goal: "make the failing test pass" },
+  { executionId: earlyId },
+).then(
+  (value) => ({ value }),
+  (error) => ({ error }),
+);
+await runtime.cancelExecution(earlyId);
+const early = await earlyEnded;
+journal.begin = begin;
+const earlyRow = await journal.execution(earlyId);
 const results = {
   completed: settled.value !== undefined,
   endedByCancel: settled.error !== undefined && runtime.endedByCancel(settled.error),
@@ -130,6 +170,10 @@ const results = {
   rowError: row?.error ?? null,
   cancelRequested: typeof row?.cancelRequestedAt === "string",
   reviewRuns: reviewer.runs.length,
+  earlyEndedByCancel: early.error !== undefined && runtime.endedByCancel(early.error),
+  earlyHarnessRuns: implementerRuns - 1,
+  earlyStatus: earlyRow?.status ?? null,
+  earlyRowError: earlyRow?.error ?? null,
   entries: trace.map((entry) => ({
     node: entry.node,
     outcome: entry.outcome,

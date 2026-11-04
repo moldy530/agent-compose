@@ -254,6 +254,20 @@ export const flowImpatientOutputs = z.object({
 }).strict();
 export type FlowImpatientOutputs = z.infer<typeof flowImpatientOutputs>;
 
+/** `flow.overdue` — the module's parameters (grammar 7.5). */
+export const flowOverdueInputs = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type FlowOverdueInputs = z.infer<typeof flowOverdueInputs>;
+
+/**
+ * `flow.overdue` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowOverdueOutputs = z.object({
+  signature: z.string(),
+}).strict();
+export type FlowOverdueOutputs = z.infer<typeof flowOverdueOutputs>;
+
 /** `flow.release` — the module's parameters (grammar 7.5). */
 export const flowReleaseInputs = z.object({
   path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),

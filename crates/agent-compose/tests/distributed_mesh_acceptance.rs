@@ -187,6 +187,70 @@ impl Mesh {
         .expect("the hub is served again");
     }
 
+    /// [`Mesh::restart`], with `between` run against the project while no
+    /// process is serving it — for a test that writes the journal a crash at
+    /// that moment would have left.
+    fn restart_after(&mut self, between: impl FnOnce(&Path)) {
+        let port = self
+            .base_url
+            .rsplit(':')
+            .next()
+            .and_then(|port| port.parse::<u16>().ok())
+            .expect("the hub's address names a port");
+        self.served.stop();
+        between(&self.project);
+        self.served = harness::serve_target_on(
+            &self.project,
+            &self.entrypoint,
+            TARGET,
+            port,
+            &self.environment,
+        )
+        .expect("the hub is served again");
+    }
+
+    /// This execution's dispatch rows, as the hub's journal holds them.
+    fn dispatch_rows(&self, execution: &str) -> Vec<Value> {
+        harness::journal_rows(
+            &self.project,
+            &format!(
+                "SELECT id, status, outcome, payload, detail FROM dispatches \
+                 WHERE execution = '{execution}' ORDER BY parked_at"
+            ),
+        )
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    }
+
+    /// Wait until every one of this execution's dispatch rows has been
+    /// **settled by its worker's cancelled result** (§3.4) — an `error`
+    /// outcome named `ExecutionCancelled`, which only that result writes: the
+    /// hub stopping waiting leaves a row a worker holds `dispatched` — and
+    /// answer the rows.
+    fn settled_cancelled(&self, execution: &str, count: usize, within: Duration) -> Vec<Value> {
+        let deadline = Instant::now() + within;
+        loop {
+            let rows = self.dispatch_rows(execution);
+            let settled = rows.iter().all(|row| {
+                row["status"] == "settled"
+                    && row["outcome"] == "error"
+                    && row["payload"]
+                        .as_str()
+                        .is_some_and(|payload| payload.contains("\"ExecutionCancelled\""))
+            });
+            if rows.len() == count && settled {
+                return rows;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the worker never settled this execution's dispatches with its cancelled \
+                 result: {rows:#?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Start one worker against this hub, claiming `PLACEMENT`.
     fn worker(&self, purpose: &str) -> Worker {
         Worker::start(&self.base_url, &self.environment, purpose, None)
@@ -395,6 +459,13 @@ impl Worker {
         }
     }
 
+    /// The node runners this worker has running right now — its child
+    /// processes running `worker-node` — read off `/proc`. `None` off Linux,
+    /// where there is no `/proc` to read them from.
+    fn runners(&self) -> Option<Vec<i32>> {
+        runners_of(self.child.id())
+    }
+
     /// Everything this worker has written, for a failure message.
     fn transcript(&self) -> String {
         self.said
@@ -449,6 +520,62 @@ impl Drop for Worker {
             end(&mut self.child);
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
+    }
+}
+
+/// The child processes of `parent` running `worker-node`, off `/proc`.
+#[cfg(target_os = "linux")]
+fn runners_of(parent: u32) -> Option<Vec<i32>> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // `pid (comm) state ppid …`, where `comm` may hold spaces and parens.
+        let Some(after) = stat.rfind(')').map(|at| &stat[at + 1..]) else {
+            continue;
+        };
+        let ppid = after
+            .split_whitespace()
+            .nth(1)
+            .and_then(|field| field.parse::<u32>().ok());
+        if ppid != Some(parent) {
+            continue;
+        }
+        // A zombie's command line is empty, so a runner that has exited and
+        // not yet been reaped is not counted as running.
+        let command = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
+        if String::from_utf8_lossy(&command).contains("worker-node") {
+            found.push(pid);
+        }
+    }
+    Some(found)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn runners_of(_parent: u32) -> Option<Vec<i32>> {
+    None
+}
+
+/// Whether a process is gone within `budget`.
+fn gone_within(pid: i32, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        // SAFETY: signal 0 delivers nothing; it asks whether `pid` exists.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return true;
+        }
+        if Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -2594,6 +2721,13 @@ fn one_worker_whose_placement_says_max_running_three_runs_three_at_once() {
 /// and the row settles `cancelled` within ten seconds, with the node's entry
 /// `cancelled` and no `error`. No retry ran — the provider was asked twice,
 /// never a third time — and the worker is still serving.
+///
+/// And the worker is what stopped it, which the hub's own report cannot show:
+/// the hub settles the node `cancelled` the moment it stops waiting, whatever
+/// the worker does. So the runner process the worker started for the dispatch
+/// is gone, and the journal's dispatch row is settled with the
+/// `ExecutionCancelled` outcome that only the worker's `status: "cancelled"`
+/// result writes (§3.4) — both inside the ten seconds.
 #[test]
 fn a_cancel_stops_a_placed_node_on_its_worker_and_settles_the_execution_cancelled() {
     let Some(mesh) = Mesh::start() else {
@@ -2617,6 +2751,14 @@ fn a_cancel_stops_a_placed_node_on_its_worker_and_settles_the_execution_cancelle
     mesh.until(&execution, "was taken by the worker", |report| {
         report["placement_waits"][0]["status"] == "dispatched"
     });
+    let running = worker.runners();
+    if let Some(running) = &running {
+        assert_eq!(
+            running.len(),
+            1,
+            "one runner for the one dispatch: {running:?}"
+        );
+    }
 
     let asked = Instant::now();
     let cancelled = mesh.send(Request::post(format!("/executions/{execution}/cancel")));
@@ -2624,6 +2766,18 @@ fn a_cancel_stops_a_placed_node_on_its_worker_and_settles_the_execution_cancelle
     let report = mesh.until(&execution, "was cancelled", |report| {
         report["status"] == "cancelled"
     });
+    mesh.settled_cancelled(
+        &execution,
+        1,
+        Duration::from_secs(10).saturating_sub(asked.elapsed()),
+    );
+    for pid in running.into_iter().flatten() {
+        assert!(
+            gone_within(pid, Duration::from_secs(10).saturating_sub(asked.elapsed())),
+            "the runner {pid} the worker started for the cancelled dispatch is still alive: {}",
+            worker.transcript()
+        );
+    }
     assert!(
         asked.elapsed() < Duration::from_secs(10),
         "the cancel took {:?} to settle a placed node",
@@ -2656,7 +2810,9 @@ fn a_cancel_stops_a_placed_node_on_its_worker_and_settles_the_execution_cancelle
 /// At `max_running: 2` one worker holds both items of a two-item fan-out, each
 /// in the middle of a ten-minute call. The cancel names both in the worker's
 /// next poll's `cancel` list, the worker stops both runners, and both cancelled
-/// results settle the row `cancelled`.
+/// results settle the row `cancelled` — read off the journal's dispatch rows,
+/// each settled with the outcome only the worker's result writes, and off the
+/// runner processes, both gone.
 #[test]
 fn a_cancel_reaches_a_worker_holding_two_of_its_dispatches() {
     let Some(mesh) = capped("mesh-cancel-two", 2) else {
@@ -2677,6 +2833,24 @@ fn a_cancel_reaches_a_worker_holding_two_of_its_dispatches() {
             .count()
             == 2
     });
+    // Both runners are up once both dispatches are in the worker's hands.
+    let running = worker.runners().map(|_| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let held = worker.runners().unwrap_or_default();
+            if held.len() == 2 || Instant::now() > deadline {
+                break held;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    if let Some(running) = &running {
+        assert_eq!(
+            running.len(),
+            2,
+            "two runners for two dispatches: {running:?}"
+        );
+    }
     let asked = Instant::now();
     let cancelled = mesh.send(Request::post(format!("/executions/{execution}/cancel")));
     assert_eq!(cancelled.status, 202, "{}", body_of(&cancelled));
@@ -2689,5 +2863,97 @@ fn a_cancel_reaches_a_worker_holding_two_of_its_dispatches() {
         asked.elapsed()
     );
     assert!(report.get("error").is_none(), "{report:#}");
+    mesh.settled_cancelled(
+        &execution,
+        2,
+        Duration::from_secs(10).saturating_sub(asked.elapsed()),
+    );
+    for pid in running.into_iter().flatten() {
+        assert!(
+            gone_within(pid, Duration::from_secs(10).saturating_sub(asked.elapsed())),
+            "a runner the worker started for a cancelled dispatch is still alive: {}",
+            worker.transcript()
+        );
+    }
+    assert!(worker.running(), "{}", worker.transcript());
+}
+
+/// **A restart while a worker holds a cancelled execution's dispatch
+/// completes the cancel** (PRD resolved q75 ruling e, `docs/distributed.md`
+/// §5, `docs/durability.md` §6.1).
+///
+/// `flow.release`'s `sign` declares no `retry:` and its flow `on_error: fail`,
+/// so an attempt read as failed ends the execution `failed`. The worker is in
+/// the middle of the node; the hub is killed, and the journal is left as a
+/// crash right after the cancel route recorded its request would leave it —
+/// the request on the `cancellations` table, the dispatch still `dispatched`
+/// to a session the dead process issued. The hub that replaces it does not
+/// read that row as an orphan: the replay reaches it as the frontier of the
+/// cancel, so the node is cancelled, the execution settles `cancelled` with no
+/// `error`, and the row is withdrawn as the cancel's rather than superseded as
+/// a lost session's.
+#[test]
+fn a_restart_while_a_worker_holds_a_cancelled_dispatch_completes_the_cancel() {
+    let Some(mut mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider.enqueue_all([
+        Script::new(SONNET, Outcome::text("thinking about it")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "signature": "never delivered" }))
+                .after(Duration::from_secs(5)),
+        ),
+    ]);
+    let mut worker = mesh.worker("restart-mid-cancel");
+    let execution = mesh.start_execution("/releases", &json!({ "path": "release.dmg" }));
+    until(
+        "the first model call reached the hub's journal",
+        || worker.transcript(),
+        || harness::journal_holds(&mesh.project, &["sign/0#model/0"]),
+    );
+    mesh.until(&execution, "was taken by the worker", |report| {
+        report["placement_waits"][0]["status"] == "dispatched"
+    });
+
+    mesh.restart_after(|project| {
+        let wrote = harness::journal_sql(
+            project,
+            &format!(
+                "INSERT INTO cancellations (execution, requested_at) \
+                 VALUES ('{execution}', '2026-11-04T00:00:00.000Z');"
+            ),
+        );
+        assert!(
+            wrote.status.success(),
+            "{}",
+            String::from_utf8_lossy(&wrote.stderr)
+        );
+    });
+
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] == "cancelled" || report["status"] == "failed"
+    });
+    assert_eq!(
+        report["status"], "cancelled",
+        "a restart read the cancelled execution's held dispatch as an orphan: {report:#}"
+    );
+    assert!(report.get("error").is_none(), "{report:#}");
+    let sign = report["trace"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["node"] == "sign")
+        .unwrap_or_else(|| panic!("the placed node has an entry: {report:#}"));
+    assert_eq!(sign["outcome"], "cancelled", "{sign:#}");
+    let rows = mesh.dispatch_rows(&execution);
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(rows[0]["status"], "superseded", "{rows:#?}");
+    assert!(
+        rows[0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("was cancelled")),
+        "the held dispatch was ended as an orphan rather than as the cancel's: {rows:#?}"
+    );
     assert!(worker.running(), "{}", worker.transcript());
 }

@@ -24,7 +24,17 @@
 //!   [`a_cancelled_execution_is_refused_by_resume_at_the_route_and_the_command_line`];
 //! * a restart between the `202` and the settled row completes the cancel and
 //!   issues nothing new —
-//!   [`a_restart_in_the_middle_of_a_cancel_completes_it_and_issues_nothing_new`];
+//!   [`a_restart_in_the_middle_of_a_cancel_completes_it_and_issues_nothing_new`]
+//!   — and one between the parent's request and its child's completes the
+//!   cascade too —
+//!   [`a_restart_between_a_parents_cancel_and_its_childs_cancels_both`];
+//! * "no child process alive" asked of every process in the tree, not of the
+//!   command's own pid: a command that forks, and one that ignores `SIGTERM` —
+//!   [`a_cancel_stops_every_process_a_forking_command_started`] and
+//!   [`a_command_that_ignores_sigterm_is_killed_once_its_grace_has_passed`];
+//! * a finally node's detached delivery is part of how its instance ends, and
+//!   runs on a cancelled execution —
+//!   [`a_finally_nodes_detached_delivery_runs_on_a_cancelled_execution`];
 //! * `agent-compose cancel`'s exit codes —
 //!   [`agent_compose_cancel_exits_by_what_the_app_answered`];
 //! * and `run`'s posture, which a cancel does not change: an interrupted run's
@@ -60,6 +70,40 @@ fn shims(shims: &Path) {
         "if [ \"$1\" = \"--slowly\" ]; then echo $$ >> \"$TALLY_LOG.slow\"; sleep 4; fi\n\
          printf '%s|%s\\n' \"$OUTCOME\" \"$ERROR\" >> \"$TALLY_LOG\"\n",
     );
+    harness::shim(
+        shims,
+        "ping",
+        "printf 'pinged %s\\n' \"$LINE\" >> \"$TALLY_LOG.pings\"\necho done\n",
+    );
+}
+
+/// Whether a process is gone within `budget` of being asked about.
+fn gone_within(pid: i32, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        // SAFETY: signal 0 delivers nothing; it asks whether `pid` exists.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return true;
+        }
+        if Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Kill every pid a shim wrote to `file`, for a test whose crash leaves them
+/// behind: an `exec:` command runs in a process group of its own, so the
+/// harness's `SIGKILL` to the serving process's group does not reach it.
+fn kill_listed(file: &Path) {
+    for pid in std::fs::read_to_string(file)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.trim().parse::<i32>().ok())
+    {
+        // SAFETY: a pid this test's shim wrote; a gone one answers ESRCH.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
 }
 
 /// The environment a served fixture runs under, with its tally at `log`.
@@ -528,18 +572,10 @@ fn a_restart_in_the_middle_of_a_cancel_completes_it_and_issues_nothing_new() {
         );
         served.stop();
         // The machine went with it: the finally node's command runs in a
-        // process group of its own (grammar 5.5, Decision D124), so the kill
+        // process group of its own (grammar 5.5, Decision D160), so the kill
         // above does not reach it, and a crash that left it alive to finish
         // would not be the crash this test is about.
-        let slow = PathBuf::from(format!("{}.slow", log.display()));
-        for pid in std::fs::read_to_string(&slow)
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| line.trim().parse::<i32>().ok())
-        {
-            // SAFETY: a pid this test's shim wrote; a gone one answers ESRCH.
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-        }
+        kill_listed(&PathBuf::from(format!("{}.slow", log.display())));
         execution
     };
 
@@ -558,6 +594,225 @@ fn a_restart_in_the_middle_of_a_cancel_completes_it_and_issues_nothing_new() {
         ended(&log),
         ["cancelled|none"],
         "the finally node recorded once, at `cancelled`"
+    );
+}
+
+/// **A cancel stops every process a forking command started** (PRD resolved
+/// q75 ruling b's "no child process alive", Decision D160).
+///
+/// The linger shim here does not `exec` its `sleep`: it forks it, records both
+/// pids — its own and the `sleep`'s — and waits. A signal aimed at the
+/// command's own pid would end the shell and leave the `sleep` running,
+/// reparented; the cancel stops the command's whole process group, so both are
+/// gone, and the row settles `cancelled` inside the field report's ten seconds.
+#[test]
+fn a_cancel_stops_every_process_a_forking_command_started() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("cancel-forking");
+    let (environment, log) = environment(&provider, &scratch);
+    harness::shim(
+        scratch.path(),
+        "linger",
+        "echo $$ >> \"$TALLY_LOG.pids\"\nsleep \"$LINGER\" &\necho $! >> \"$TALLY_LOG.pids\"\nwait\n",
+    );
+    let Some(project) = harness::scratch_project("cancel-forking") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, FIXTURE, &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let execution = started(&app, "/long", &json!({ "linger": 600 }));
+    let tree = pids(&log, 2);
+    let asked = Instant::now();
+    assert_eq!(cancel(&app, &execution).0, 202);
+    reaches(&app, &execution, "cancelled", SETTLE);
+    for pid in &tree {
+        assert!(
+            gone_within(*pid, SETTLE.saturating_sub(asked.elapsed())),
+            "process {pid} of the cancelled command's tree {tree:?} is still alive"
+        );
+    }
+    assert_eq!(ended(&log), ["cancelled|none"]);
+}
+
+/// **A command that ignores `SIGTERM` is killed once its grace has passed**
+/// (PRD resolved q75 ruling b, Decision D160).
+///
+/// The shim turns `SIGTERM` off — for itself and, since an ignored signal is
+/// inherited, for the `sleep` it forks — so the polite half of the stop
+/// reaches nothing. The node does not wait for it: the row settles `cancelled`
+/// and the finally node runs at once. The kill that follows the grace takes
+/// the whole group, so both processes are gone inside the ten seconds.
+#[test]
+fn a_command_that_ignores_sigterm_is_killed_once_its_grace_has_passed() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("cancel-stubborn");
+    let (environment, log) = environment(&provider, &scratch);
+    harness::shim(
+        scratch.path(),
+        "linger",
+        "trap '' TERM\necho $$ >> \"$TALLY_LOG.pids\"\nsleep \"$LINGER\" &\n\
+         echo $! >> \"$TALLY_LOG.pids\"\nwait\n",
+    );
+    let Some(project) = harness::scratch_project("cancel-stubborn") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, FIXTURE, &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let execution = started(&app, "/long", &json!({ "linger": 600 }));
+    let tree = pids(&log, 2);
+    let asked = Instant::now();
+    assert_eq!(cancel(&app, &execution).0, 202);
+    reaches(&app, &execution, "cancelled", SETTLE);
+    for pid in &tree {
+        assert!(
+            gone_within(*pid, SETTLE.saturating_sub(asked.elapsed())),
+            "process {pid} of a command that ignores SIGTERM outlived the cancel's ten \
+             seconds; its tree was {tree:?}"
+        );
+    }
+    assert_eq!(ended(&log), ["cancelled|none"]);
+}
+
+/// **A finally node's detached delivery runs on a cancelled execution**
+/// (grammar 7.9, Decision D160: "a finally node and all it begins").
+///
+/// `flow.notifying`'s finally node is a detached `map` onto `tool.ping`, handed
+/// `execution.outcome`. A cancel stops the command, and the finally node runs
+/// *because* of it — so the delivery it issues chains to nothing, rather than
+/// to the execution's cancel, which has already fired: the sink runs and
+/// records `pinged cancelled`. Read through the execution's signal, the
+/// delivery would be stopped before its command began.
+#[test]
+fn a_finally_nodes_detached_delivery_runs_on_a_cancelled_execution() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("cancel-finally-delivery");
+    let (environment, log) = environment(&provider, &scratch);
+    let Some(project) = harness::scratch_project("cancel-finally-delivery") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, FIXTURE, &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let execution = started(
+        &app,
+        "/notifying",
+        &json!({ "names": ["ops"], "linger": 600 }),
+    );
+    let running = pids(&log, 1);
+    assert_eq!(cancel(&app, &execution).0, 202);
+    let report = reaches(&app, &execution, "cancelled", SETTLE);
+    assert!(report.get("error").is_none(), "{report:#}");
+    assert!(
+        !alive(running[0]),
+        "the command the cancelled node was running is still alive"
+    );
+
+    let pings = PathBuf::from(format!("{}.pings", log.display()));
+    let deadline = Instant::now() + SETTLE;
+    while std::fs::read_to_string(&pings)
+        .unwrap_or_default()
+        .is_empty()
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&pings).unwrap_or_default(),
+        "pinged cancelled\n",
+        "the finally node's detached delivery did not run on the cancelled execution: {report:#}"
+    );
+}
+
+/// **A restart between a parent's cancel and its child's completes both**
+/// (PRD resolved q75 rulings c and e, `docs/durability.md` §6.1).
+///
+/// The cancel route records the parent's request and then walks its open
+/// children, and a process can die between the two. Made here as the journal
+/// that crash leaves: a parent and its child both running, the serving process
+/// killed, and the parent's request — and only the parent's — written into the
+/// `cancellations` table. The generation that recovers the parent walks the
+/// cascade again before its replay re-issues the dispatch, so the child
+/// resumes carrying a request of its own: both rows settle `cancelled`, both
+/// finally nodes run at `cancelled`, and neither command is started again.
+#[test]
+fn a_restart_between_a_parents_cancel_and_its_childs_cancels_both() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("cancel-restart-cascade");
+    let (environment, log) = environment(&provider, &scratch);
+    let Some(project) = harness::scratch_project("cancel-restart-cascade") else {
+        return;
+    };
+    let pid_file = PathBuf::from(format!("{}.pids", log.display()));
+    let parent = {
+        let Some(mut served) = harness::serve_into(&project, FIXTURE, &environment) else {
+            return;
+        };
+        let app = Client::new(&served.base_url).expect("a client for the generated app");
+        let parent = started(
+            &app,
+            "/parent",
+            &json!({ "child_lingers": [600], "linger": 600 }),
+        );
+        pids(&log, 2);
+        served.stop();
+        // The commands run in process groups of their own, so the kill above
+        // does not reach them; the machine went with it.
+        kill_listed(&pid_file);
+        parent
+    };
+    let child = child_of(&project, &parent).expect("the parent's child has a row");
+    let wrote = harness::journal_sql(
+        &project,
+        &format!(
+            "INSERT INTO cancellations (execution, requested_at) \
+             VALUES ('{parent}', '2026-11-04T00:00:00.000Z');"
+        ),
+    );
+    assert!(
+        wrote.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wrote.stderr)
+    );
+
+    let Some(recovered) = harness::serve_into(&project, FIXTURE, &environment) else {
+        return;
+    };
+    let app = Client::new(&recovered.base_url).expect("a client for the recovered app");
+    let report = reaches(&app, &parent, "cancelled", Duration::from_secs(30));
+    assert!(report.get("error").is_none(), "{report:#}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        let rows = harness::journal_rows(
+            &project,
+            &format!("SELECT status FROM executions WHERE id = '{child}'"),
+        );
+        let status = rows[0]["status"].as_str().unwrap_or_default().to_string();
+        if status != "open" || Instant::now() > deadline {
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(
+        status, "cancelled",
+        "the child the dying process never reached was not cancelled by the recovery"
+    );
+    assert_eq!(
+        pids(&log, 2).len(),
+        2,
+        "the recovered generation started a stopped command again"
+    );
+    assert_eq!(
+        ended(&log),
+        ["cancelled|none", "cancelled|none"],
+        "both finally nodes ran once, at `cancelled`"
     );
 }
 

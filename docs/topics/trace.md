@@ -69,7 +69,7 @@ file:
   "execution_id": "exec_0f1e…",
   "status": "completed",
   "outputs": { "draft": "…" },
-  "trace_version": 6,
+  "trace_version": 7,
   "trace": [ /* entries */ ],
   "trace_path": "/…/.agent-compose/traces/flow.review_loop-exec_0f1e….json"
 }
@@ -80,11 +80,21 @@ file:
 The **file**'s document, and the one to write a consumer against:
 `trace_version`, `flow`, `execution_id`, `status`, `entries` — always — plus
 `error` on a run that carried no answer. `status` is `"completed"`, `"failed"`,
-or `"interrupted"`; the third is told apart from the second because they ask
-different things of whoever is reading. One is a run to look into, the other a
-question to answer. `finally_error` is there when a flow's `finally:` node
-failed after its retries — beside a `status` it did not change, so a
-`"completed"` run carrying one is a run that answered and whose cleanup did not.
+`"interrupted"` or `"cancelled"`; the third is told apart from the second
+because they ask different things of whoever is reading. One is a run to look
+into, the other a question to answer. The fourth is a run somebody stopped with
+`POST /executions/:id/cancel` or `agent-compose cancel <path> <execution>`
+(`agent-compose docs cli`): nothing went wrong with it, so it carries **no** `error`, its stopped
+nodes are `"cancelled"` entries, and every instance it ended ran its
+`finally:` node, whose entry is there too. `finally_error` is there when a
+flow's `finally:` node failed after its retries — beside a `status` it did not
+change, so a `"completed"` run carrying one is a run that answered and whose
+cleanup did not.
+
+`trace_version` is `7`: the version that added `"cancelled"` to both the
+envelope's `status` and an entry's `outcome`. A consumer written against `6`
+that switches on three statuses and three outcomes meets a fourth of each, which
+is what the bump announces (`docs/trace.md` §10.3).
 
 Envelope keys are `snake_case`; an entry's are `camelCase`. The seam is
 deliberate: the envelope's are document keys, an entry's are runtime record
@@ -118,13 +128,16 @@ one thing: it carries no `routing`, because the node has no edges. Nested
 entries have step numbers of their own instance, starting again at 1.
 
 **An entry's `outcome`** is `"completed"`, `"skipped"` (the activity failed and
-`on_error: skip` absorbed it — it carries an `error` too) or `"failed"`. A
-failed entry has two shapes told apart by `fallback`: with it, the failure
-routed to the named node and the run continues; without it, the failure ended
-the run.
+`on_error: skip` absorbed it — it carries an `error` too), `"failed"` or
+`"cancelled"`. A failed entry has two shapes told apart by `fallback`: with it,
+the failure routed to the named node and the run continues; without it, the
+failure ended the run. A cancelled entry is a node the execution's cancel
+stopped while it ran: it carries every record it had made, and no `error`, no
+`routing` and no `fallback`, because it routed nowhere and no `on_error:`
+decided anything about it.
 
 Three record types carry an `outcome` and each closes over its own set, so read
-the enumeration for the field you are holding: an **entry**'s is the three
+the enumeration for the field you are holding: an **entry**'s is the four
 above, a **dispatch record**'s adds `"detached"` (a `detach: true` delivery,
 resolved at issue — no outcome was ever observed, which is why its `attempts` is
 `0`), and a **tool call**'s is `"completed"`, `"refused"` or `"failed"`.

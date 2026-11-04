@@ -22598,8 +22598,8 @@ fn nothing_settled(receiver: &harness::Receiver, budget: Duration) {
 /// either as final drops an answer nothing was wrong with, and the execution
 /// waits for ever.
 ///
-/// `flow.held` makes the window a fact rather than a race. Its subprocess is
-/// killed with the first generation, so no record of it lands and the generation
+/// `flow.held` makes the window a fact rather than a race. The first generation
+/// is killed inside its subprocess, so no record of it lands and the generation
 /// that recovers the execution has to run it **live** before it can re-park —
 /// and the shim runs until this test releases it. Nothing here is timed.
 #[test]
@@ -22646,8 +22646,11 @@ fn a_recovered_execution_still_catching_up_tells_a_resume_to_send_it_again() {
         // effect" a fact rather than a sleep: the line is written before it
         // starts waiting to be released.
         wait_for_lines(&log, 1);
-        // Dropping it signals the whole process group, so the blocked subprocess
-        // goes with the app that spawned it and its record never lands.
+        // Dropping it kills the app's process group, so the record of the
+        // blocked subprocess never lands. The subprocess itself is in a group of
+        // its own (an `exec:` command's, Decision D160) and outlives the app,
+        // waiting on the same release file as its successor — which is what
+        // lets it go once this test is done with both.
     }
 
     let Some(second) = harness::serve_into(&project, "durability", &environment) else {

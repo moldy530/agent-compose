@@ -187,7 +187,13 @@ and one join, and what it holds is the rows dispatched to it that no result has
 settled and the hub has not superseded — never a counter the rows could disagree
 with. A dispatch the hub **cancelled** stays on its session's count until the
 worker's cancelled result settles it (§3.4), because the process running it is
-still stopping. There is **no** hub option, environment variable or join field
+still stopping — and so does one the hub **stopped waiting for** while a worker
+ran it, because the node's `timeout:` ran out (§6.5) or its execution ended:
+the hub supersedes the row, names it in the holder's next poll's `cancel` list,
+and counts it until the worker's result for it arrives, which is refused `409`
+(§3.4) and frees the slot. The hub giving up on a dispatch is not the worker
+stopping it, and a slot freed at once would be handed new work while the old
+process still ran. There is **no** hub option, environment variable or join field
 for the number: it is a property of the machine a placement names — what the
 machine with the GPU can run at once — so it is the deploy layer's, beside the
 members it is about, and a worker does not declare its own. This replaces v1's
@@ -500,7 +506,10 @@ Carries the session. Long-polls for up to one hold (§2).
 
   **`cancel`** is on every `200` (PRD resolved q75, Decision D160): the
   dispatches this session holds that the hub has **cancelled** since it last
-  said so — an empty array where there are none. A worker stops each one it
+  said so — an empty array where there are none. A cancelled dispatch is one
+  whose execution was cancelled, or one the hub stopped waiting for while this
+  session ran it: the node's `timeout:` ran out (§6.5), or its execution ended
+  around it. The worker cannot tell the two apart and need not. A worker stops each one it
   names: it sends that dispatch's node runner `SIGTERM`, which the runner turns
   into its execution's own cancel, so a model call's request, a spawned command
   and a harness run stop where they are; a runner still running five seconds
@@ -1276,7 +1285,12 @@ same: the next request on such a session meets `410`, the worker joins again, an
 and re-joins under, by §4's five steps. An unsettled dispatch on an ended session
 is superseded exactly as §6.3 supersedes one, so its node's attempt fails under
 that node's `retry:`/`on_error:` chain and the retry is dispatched under the new
-artifact rather than the old.
+artifact rather than the old. So is every dispatch a **replaced process** left
+`dispatched`: sessions live in its memory, so each such row names a session
+that has ended — save a row of an execution whose **cancel** that process had
+accepted, which is left `dispatched` for the replay that completes the cancel
+to end as the cancel's rather than fail as an orphan's (PRD resolved q75,
+`docs/durability.md` §6.1).
 
 This is the mechanism behind §4's "redeployment is automatic on the next join",
 and without it there would be no next join to be automatic on: a worker that has
