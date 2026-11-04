@@ -14,6 +14,7 @@ Commands:
   count   Count the keys the partition holds
   export  Write every live entry as JSON Lines on stdout: `{ key, value, version, expires_at }`
   import  Write the entries of an export, read from standard input or `--file`, at fresh versions
+  log     Read one page of a key's history, oldest first, on a store that declares `history: true`
   help    Print this message or the help of the given subcommand(s)
 
 Options:
