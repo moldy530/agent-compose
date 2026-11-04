@@ -80,6 +80,7 @@ import {
   fireCancel,
   handsOutPlacedNodes,
   holdFinallyError,
+  holdRemoteEnd,
   holdRemotePause,
   registerParkedWork,
   registersHumanNode,
@@ -274,10 +275,11 @@ const polling = new Map<string, number>();
 
 /**
  * The dispatches the hub has cancelled and is waiting on the worker for (PRD
- * resolved q75): no node is awaiting them any more, but the worker is still
- * stopping the process running each, so each still counts against its session's
- * capacity until the worker's `status: "cancelled"` result settles it (§3.4) —
- * or the session ends and the sweep supersedes it (§6.3).
+ * resolved q75): the worker is still stopping the process running each — and
+ * the instances it began there are still ending, each one's finally node run —
+ * so each still counts against its session's capacity, and the cancelled node
+ * still waits on it, until the worker's `status: "cancelled"` result settles it
+ * (§3.4) — or the session ends and the sweep supersedes it (§6.3).
  */
 const cancelling = new Set<string>();
 
@@ -773,14 +775,26 @@ function awaited(
   site: string,
 ): Promise<Ending> {
   return new Promise<Ending>((resolve, reject) => {
+    // Settles when this wait is over, however it ends — what a cancel that
+    // reached a worker holds the node's site open on ([`holdRemoteEnd`]).
+    let over = (): void => {};
+    const ended = new Promise<void>((done) => {
+      over = done;
+    });
+    // Whether the cancel reached this dispatch on its worker, so whatever the
+    // worker answers ends the node as the cancel it is: a node that finished,
+    // or reached a question, as the stop arrived is still a cancelled node, and
+    // a pause brought home now is one nobody will answer (Decision D160).
+    let cancelledOnWorker = false;
     const held: Awaiting = {
       execution: options.execution,
       site,
       taken: row.status === "dispatched",
       settle: (outcome) => {
-        finish();
         finallyOf(options.execution, outcome);
+        finish();
         if (outcome.kind === "error") reject(replayedFailure(outcome));
+        else if (cancelledOnWorker) reject(new ExecutionCancelled(options.execution));
         else resolve(endingIn(outcome.value));
       },
     };
@@ -790,21 +804,35 @@ function awaited(
       // — no worker has it — and one a session holds stays dispatched, counting
       // against that session's capacity, while the worker is told on its next
       // poll and stops the process running it; its `status: "cancelled"` result
-      // is what settles the row (§3.4). The node stops waiting either way.
+      // is what settles the row (§3.4).
       if (cancellationOf(options.signal?.reason) !== undefined) {
+        // **And what settles the node.** A node a worker is running began its
+        // instances there — an attached `flow.*`, whose finally node the cancel
+        // starts in the runner — and a cancelled node settles only once every
+        // instance it began has ended (Decision D160). So the wait is kept
+        // until the result comes home ([`result`]) — or the session is lost
+        // (§6.3) — and held on the runtime's books at this node's site, which
+        // is what the node's own cancel and every end around it wait for: the
+        // inner finally node runs before an outer one, and the `finally_error`
+        // the result carries is the execution's before it settles
+        // ([`finallyOf`]). The worker's grace bounds it (§3.2).
+        if (stopOnHolder(row.id, row, "cancel")) {
+          cancelledOnWorker = true;
+          holdRemoteEnd(options.execution, site, ended);
+          stirPolls();
+          return;
+        }
         held.settle({
           kind: "error",
           name: CANCELLED,
           message: new ExecutionCancelled(options.execution).message,
         });
-        if (!stopOnHolder(row.id, row, "cancel")) {
-          rows.delete(row.id);
-          void journal.supersedeDispatch(row.id, CANCELLED_DETAIL).catch((error: unknown) => {
-            process.stderr.write(
-              `could not withdraw \`${row.id}\`: ${error instanceof Error ? error.message : String(error)}\n`,
-            );
-          });
-        }
+        rows.delete(row.id);
+        void journal.supersedeDispatch(row.id, CANCELLED_DETAIL).catch((error: unknown) => {
+          process.stderr.write(
+            `could not withdraw \`${row.id}\`: ${error instanceof Error ? error.message : String(error)}\n`,
+          );
+        });
         stirPolls();
         return;
       }
@@ -853,13 +881,17 @@ function awaited(
       awaiting.delete(row.id);
       options.signal?.removeEventListener("abort", abort);
       announceWaits(options.execution);
+      over();
     };
+    // On the books before an abort is read, so a cancel that keeps the wait
+    // for its worker's result ([`stopOnHolder`]) leaves one the result can
+    // settle.
+    awaiting.set(row.id, held);
     if (options.signal?.aborted === true) {
       abort();
       return;
     }
     options.signal?.addEventListener("abort", abort, { once: true });
-    awaiting.set(row.id, held);
     announceWaits(options.execution);
     // A worker may already be holding a poll: this is a wait that has just gone
     // on the board, and §6.2's wake is "a joining worker's claims are scanned
@@ -1186,6 +1218,18 @@ export function releasePlacementWaits(execution: string): void {
   for (const [id, held] of [...awaiting]) {
     if (held.execution !== execution) continue;
     freed = true;
+    // A dispatch the execution's cancel already told its worker to stop is
+    // left to the worker's cancelled result, which settles the row as the
+    // cancel it was (§3.4) — superseded here, a restarted hub would replay it
+    // as a deadline's. The node waiting on it is let go all the same.
+    if (cancelling.has(id)) {
+      held.settle({
+        kind: "error",
+        name: CANCELLED,
+        message: new ExecutionCancelled(execution).message,
+      });
+      continue;
+    }
     // A dispatch a worker is running is told to stop, and counts until it has
     // ([`stopOnHolder`]).
     const row = rows.get(id);

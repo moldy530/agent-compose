@@ -23,6 +23,11 @@
 #     `execution.outcome`. A cancel stops the command and runs the finally node,
 #     and what that node begins is not the cancel's to stop: the delivery runs
 #     and `${TALLY_BIN}/ping` appends `pinged cancelled` to `$TALLY_LOG.pings`.
+#   * `flow.notifying_child` — the same, with the finally node's detached `map`
+#     onto `flow.pinger`, so what it begins is a **child execution** of its own
+#     (PRD resolved q65): begun by a finally node of a cancelled execution, the
+#     child is not the cancel's either — it is begun uncancelled, runs, and
+#     appends `pinged cancelled` the same way.
 #   * `flow.asking` — a `human` pause with no `timeout:`, and a finally node that
 #     takes a few seconds before it records how the run ended. A cancel while it
 #     waits releases the wait at once — no question is published and an answer
@@ -74,6 +79,16 @@ triggers:
     type: http
     flow: flow.notifying
     path: /notifying
+    method: POST
+    input:
+      names: "payload.body.names"
+      linger: "payload.body.linger"
+    respond: async
+
+  on_notifying_child:
+    type: http
+    flow: flow.notifying_child
+    path: /notifying-child
     method: POST
     input:
       names: "payload.body.names"
@@ -212,6 +227,53 @@ flow.notifying:
     - { from: start, to: noted_work }
     - { from: noted_work, to: end }
   finally: tell
+
+flow.notifying_child:
+  description: A long command, and a finally node that tells a sink how the run ended through a detached child execution.
+  inputs:
+    names:
+      type: array
+      max_items: 1
+      items: { type: string }
+    linger:
+      type: integer
+  outputs: {}
+  nodes:
+    child_noted_work:
+      exec:
+        command: "${TALLY_BIN}/linger"
+      input:
+        linger: "input.linger"
+    tell_child:
+      map:
+        over: input.names
+        as: name
+        node: flow.pinger
+        max_concurrency: 1
+        detach: true
+        input:
+          line: "execution.outcome"
+  edges:
+    - { from: start, to: child_noted_work }
+    - { from: child_noted_work, to: end }
+  finally: tell_child
+
+# A detached `flow.*` sink, so a dispatch onto it starts a child execution.
+flow.pinger:
+  description: Append the line it is handed to the ping log, as an execution of its own.
+  inputs:
+    line:
+      type: string
+  outputs: {}
+  nodes:
+    ping_once:
+      exec:
+        command: "${TALLY_BIN}/ping"
+      input:
+        line: "input.line"
+  edges:
+    - { from: start, to: ping_once }
+    - { from: ping_once, to: end }
 
 flow.asking:
   description: A question nobody answers, and a record of how the run ended.

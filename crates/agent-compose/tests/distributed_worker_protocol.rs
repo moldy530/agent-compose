@@ -593,8 +593,18 @@ impl Drop for Worker {
         if !self.reaped {
             #[cfg(unix)]
             if let Ok(pid) = libc::pid_t::try_from(self.child.id()) {
+                // `SIGINT` first, which the worker hands to its runners' own
+                // process groups before it ends — a `SIGKILL` cannot be, and
+                // would leave a lingering fixture runner behind it — and the
+                // kill once it has had a moment.
                 // SAFETY: a child of this process, spawned into its own group
                 // and not yet reaped.
+                unsafe { libc::kill(-pid, libc::SIGINT) };
+                let deadline = Instant::now() + Duration::from_secs(4);
+                while Instant::now() < deadline && matches!(self.child.try_wait(), Ok(None)) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                // SAFETY: as above; `ESRCH` for a group already gone.
                 unsafe { libc::kill(-pid, libc::SIGKILL) };
             }
             let _ = self.child.kill();
@@ -1965,5 +1975,191 @@ fn a_runner_that_ignores_its_cancel_is_killed_after_the_grace() {
         "the stubborn runner {} survived its cancel",
         pids[0]
     );
+    let _ = std::fs::remove_file(&pids_at);
+}
+
+/// **`Ctrl-C` at a worker stops the runners it started** (§3.2, PRD resolved
+/// q75, Decision D160).
+///
+/// A runner leads a process group of its own — so a cancel the runner does not
+/// answer takes everything in it — and the terminal's `SIGINT` goes to the
+/// worker's group, not to that one. So the worker delivers it: a runner in the
+/// middle of a minute-long node is gone within moments of the signal, and the
+/// worker itself ends **by** the signal, as it did when its runners shared its
+/// group. Left to the terminal alone, the runner would go on running with
+/// nothing supervising it.
+#[cfg(unix)]
+#[test]
+fn ctrl_c_at_the_worker_stops_the_runners_it_started() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let hub = FixtureHub::start();
+    let (hash, tarball) = artifact();
+    hub.always("/workers/join", accepted(&hash, "wrk_ready"));
+    hub.always("/workers/artifact", Reply::bytes(200, tarball));
+    hub.script("/workers/poll", dispatch("dsp_lingering"));
+    hub.always("/workers/poll", Reply::empty(204));
+    hub.always("/workers/effects", Reply::empty(204));
+    hub.always("/workers/result", Reply::empty(204));
+
+    let pids_at = pid_file("ctrl-c");
+    let mut worker = Worker::with_environment(
+        &hub,
+        "ctrl-c",
+        &[
+            ("FIXTURE_RUNNER_LINGER_MS".to_string(), "60000".to_string()),
+            (
+                "FIXTURE_RUNNER_PID_FILE".to_string(),
+                pids_at.display().to_string(),
+            ),
+        ],
+    );
+    let pids = runner_pids(&pids_at, Duration::from_secs(30));
+    assert_eq!(
+        pids.len(),
+        1,
+        "the runner did not start: {}",
+        worker.transcript()
+    );
+
+    // What `Ctrl-C` is: `SIGINT` to the terminal's foreground group, which is
+    // the worker's — and not the runner's.
+    let worker_group = libc::pid_t::try_from(worker.child.id()).expect("a pid");
+    // SAFETY: the group this test spawned the worker into.
+    unsafe { libc::kill(-worker_group, libc::SIGINT) };
+    let status = worker.waited();
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGINT),
+        "the worker did not end by the signal it was sent: {status:?}\n{}",
+        worker.transcript()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while alive(pids[0]) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !alive(pids[0]),
+        "the worker ended on Ctrl-C and its runner {} is still running: {}",
+        pids[0],
+        worker.transcript()
+    );
+    let _ = std::fs::remove_file(&pids_at);
+}
+
+/// **A new session runs nothing beside a runner the old session left** (§2,
+/// §5, §6.3; PRD resolved q79, Decision D161).
+///
+/// The poll hands the worker `dsp_old`, whose runner lingers; the next poll is
+/// a `410` — the hub was restarted, or its sweep gave up on the session — and
+/// the one after it, under the session the worker joins again for, hands it
+/// `dsp_new`. By the hub's count the new session holds nothing, so at the
+/// default `max_running:` of one it was handed one dispatch; but the old
+/// session's runner is still running here. So that runner is stopped — the hub
+/// has superseded the dispatch it was running, and its result is the cancelled
+/// one — and `dsp_new`'s runner starts only once it has: sampled throughout,
+/// never two runners at once, and both dispatches settled.
+#[cfg(unix)]
+#[test]
+fn a_new_session_runs_nothing_beside_a_runner_the_old_session_left() {
+    let hub = FixtureHub::start();
+    let (hash, tarball) = artifact();
+    hub.always("/workers/join", accepted(&hash, "wrk_ready"));
+    hub.always("/workers/artifact", Reply::bytes(200, tarball));
+    hub.script("/workers/poll", dispatch("dsp_old"));
+    hub.always("/workers/poll", Reply::empty(204));
+    hub.always("/workers/effects", Reply::empty(204));
+    hub.always("/workers/result", Reply::empty(204));
+
+    let pids_at = pid_file("renewed-session");
+    let worker = Worker::with_environment(
+        &hub,
+        "renewed-session",
+        &[
+            ("FIXTURE_RUNNER_LINGER_MS".to_string(), "4000".to_string()),
+            (
+                "FIXTURE_RUNNER_PID_FILE".to_string(),
+                pids_at.display().to_string(),
+            ),
+        ],
+    );
+    // The session ends only once the old session's runner is running, so what
+    // is under test is a runner left behind rather than one never begun.
+    let first = runner_pids(&pids_at, Duration::from_secs(30));
+    assert_eq!(
+        first.len(),
+        1,
+        "the old session's runner did not start: {}",
+        worker.transcript()
+    );
+    hub.script(
+        "/workers/poll",
+        Reply::json(410, &json!({ "error": "gone" })),
+    );
+    hub.script("/workers/poll", dispatch("dsp_new"));
+
+    // Sampled until `dsp_new` has settled: how many runners were alive at once.
+    let mut most = 0;
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let alive_now = std::fs::read_to_string(&pids_at)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().parse::<i32>().ok())
+            .filter(|pid| alive(*pid))
+            .count();
+        most = most.max(alive_now);
+        let settled_new = hub
+            .asked_at("/workers/result")
+            .iter()
+            .any(|request| request.body["dispatch_id"] == "dsp_new");
+        if settled_new {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the new session's dispatch never settled: {:#?}\n{}",
+            hub.asked(),
+            worker.transcript()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        most <= 1,
+        "{most} runners at once across a session renewal at a cap of one: the old session's \
+         runner was left running beside the new session's work\n{}",
+        worker.transcript()
+    );
+    let results = hub.asked_at("/workers/result");
+    let old = results
+        .iter()
+        .find(|request| request.body["dispatch_id"] == "dsp_old")
+        .unwrap_or_else(|| panic!("the old session's dispatch was never settled: {results:#?}"));
+    assert_eq!(
+        old.body,
+        json!({ "dispatch_id": "dsp_old", "status": "cancelled" }),
+        "the old session's runner was not stopped: {}",
+        worker.transcript()
+    );
+    let new = results
+        .iter()
+        .find(|request| request.body["dispatch_id"] == "dsp_new")
+        .expect("found above");
+    assert_eq!(
+        new.body["output"],
+        json!({ "signature": "from the fixture runner" }),
+        "the new session's dispatch did not run to its end: {}",
+        worker.transcript()
+    );
+    assert!(
+        old.at <= new.at,
+        "the new session's dispatch settled before the old session's runner had stopped"
+    );
+    let pids: Vec<i32> = std::fs::read_to_string(&pids_at)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect();
+    assert_eq!(pids.len(), 2, "one runner per dispatch: {pids:?}");
     let _ = std::fs::remove_file(&pids_at);
 }

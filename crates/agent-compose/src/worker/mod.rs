@@ -77,6 +77,20 @@
 //! session, so a dispatch handed over while another runs is one the hub means to
 //! run beside it.
 //!
+//! **Save across a new session.** A `410` is the hub no longer knowing this
+//! worker's session — restarted, or its liveness sweep gave up on it — and it
+//! has superseded what that session held, so the new session holds nothing by
+//! the hub's count while the old session's runners may still be running here.
+//! Those runners are stopped as a cancel stops them, and a dispatch the new
+//! session is handed waits until they have before its own runner starts — the
+//! slot the hub counted free is free then, and not before (§2's own reason: "a
+//! slot freed at once would be handed new work while the old process still
+//! ran"). See [`node::Running::orphan`].
+//!
+//! **A stop signal reaches the runners.** Each runner leads a process group of
+//! its own, which a terminal's `Ctrl-C` no longer reaches, so the worker hands
+//! it the stop itself and then ends by the signal it was sent ([`stop`]).
+//!
 //! # What each status means, once
 //!
 //! | where | status | what this worker does |
@@ -108,6 +122,7 @@
 
 mod artifact;
 mod node;
+mod stop;
 mod wire;
 
 use std::path::{Path, PathBuf};
@@ -248,6 +263,10 @@ const UNUSABLE: u8 = 2;
 
 /// Run the verb.
 pub(crate) fn run(options: &Options) -> ExitCode {
+    // Before any runner exists: a stop signal to this worker is delivered to
+    // the runners' own process groups, which the terminal no longer reaches
+    // ([`stop`]).
+    stop::install();
     let token = match std::env::var(&options.token_env) {
         Ok(token) if !token.trim().is_empty() => token,
         _ => {
@@ -435,6 +454,11 @@ fn serve(
     // The dispatches this worker is running, by `dispatch_id`: what a `cancel`
     // list is acted on through (§3.2).
     let held = node::Running::default();
+    // The session the dispatches in hand were taken under. A newer one is a hub
+    // that ended the older — restarted, or its sweep gave up on this worker —
+    // and superseded what it held, so what is still running from it is stopped
+    // and holds back what the new session is handed until it has ([`node::Running::orphan`]).
+    let mut taken_under = session.generation;
     std::thread::scope(|scope| -> Result<(), Stop> {
         // Every dispatch in hand, each on a thread of its own (§2, PRD resolved
         // q79): the hub decides how many, and this worker runs them all.
@@ -487,8 +511,11 @@ fn serve(
                         let runner = runner.clone();
                         let hub = Arc::clone(hub);
                         let held = held.clone();
+                        let generation = session.generation;
                         running.push(scope.spawn(move || {
-                            node::execute(&hub, &sessions, &tree, bun, &runner, &answer, &held)
+                            node::execute(
+                                &hub, &sessions, &tree, bun, &runner, &answer, &held, generation,
+                            )
                         }));
                     }
                 }
@@ -532,6 +559,10 @@ fn serve(
             }
             // A session the *node* thread renewed is the one this poll must use.
             session = sessions.current()?;
+            if session.generation > taken_under {
+                held.orphan(session.generation);
+                taken_under = session.generation;
+            }
         }
     })
 }

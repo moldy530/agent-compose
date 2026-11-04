@@ -475,9 +475,24 @@ impl Worker {
     }
 
     /// Kill this worker and everything it started — the disconnect of §7.3.
+    ///
+    /// A runner leads a process group of its own, which a kill aimed at the
+    /// worker's group does not reach, so each runner's group is killed too:
+    /// a machine that died takes its runners with it.
     fn kill(&mut self) {
+        self.kill_runners();
         end(&mut self.child);
         self.reaped = true;
+    }
+
+    /// `SIGKILL` to every runner's own group, read off `/proc`.
+    fn kill_runners(&self) {
+        #[cfg(unix)]
+        for pid in self.runners().unwrap_or_default() {
+            // SAFETY: the group of a runner this worker spawned; `ESRCH` for
+            // one already gone.
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
     }
 
     /// Whether this worker is still running.
@@ -517,6 +532,20 @@ enum Reader {
 impl Drop for Worker {
     fn drop(&mut self) {
         if !self.reaped {
+            // `SIGINT` first, which the worker hands to its runners' own
+            // groups — each sweeping the `exec:` groups it detached — before
+            // it ends; then the kill, for whatever is left.
+            #[cfg(unix)]
+            if let Ok(pid) = libc::pid_t::try_from(self.child.id()) {
+                // SAFETY: a child this process spawned into a group of its own
+                // and has not yet reaped.
+                unsafe { libc::kill(-pid, libc::SIGINT) };
+                let deadline = Instant::now() + Duration::from_secs(4);
+                while Instant::now() < deadline && matches!(self.child.try_wait(), Ok(None)) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+            self.kill_runners();
             end(&mut self.child);
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
@@ -2734,12 +2763,14 @@ fn one_worker_whose_placement_says_max_running_three_runs_three_at_once() {
 /// `cancelled` and no `error`. No retry ran — the provider was asked twice,
 /// never a third time — and the worker is still serving.
 ///
-/// And the worker is what stopped it, which the hub's own report cannot show:
-/// the hub settles the node `cancelled` the moment it stops waiting, whatever
-/// the worker does. So the runner process the worker started for the dispatch
-/// is gone, and the journal's dispatch row is settled with the
-/// `ExecutionCancelled` outcome that only the worker's `status: "cancelled"`
-/// result writes (§3.4) — both inside the ten seconds.
+/// And the worker is what stopped it: the hub settles the node — and so the
+/// execution — only once the worker's `status: "cancelled"` result is home,
+/// because a cancelled node waits for what it began, and a placed node began
+/// it on the worker (Decision D160). So by the time the report says
+/// `cancelled` the journal's dispatch row is already settled with the
+/// `ExecutionCancelled` outcome that only that result writes (§3.4), and the
+/// runner process the worker started for the dispatch is gone — both inside
+/// the ten seconds.
 #[test]
 fn a_cancel_stops_a_placed_node_on_its_worker_and_settles_the_execution_cancelled() {
     let Some(mesh) = Mesh::start() else {
@@ -2778,11 +2809,8 @@ fn a_cancel_stops_a_placed_node_on_its_worker_and_settles_the_execution_cancelle
     let report = mesh.until(&execution, "was cancelled", |report| {
         report["status"] == "cancelled"
     });
-    mesh.settled_cancelled(
-        &execution,
-        1,
-        Duration::from_secs(10).saturating_sub(asked.elapsed()),
-    );
+    // Already settled — the execution waited for it.
+    mesh.settled_cancelled(&execution, 1, Duration::ZERO);
     for pid in running.into_iter().flatten() {
         assert!(
             gone_within(pid, Duration::from_secs(10).saturating_sub(asked.elapsed())),
@@ -3152,7 +3180,7 @@ fn closing() -> Vec<Script> {
 
 /// **A cancel on a worker lets the finally node it started run whole** (grammar
 /// §7.9: "a cancel stops none of it, and nothing it begins"; PRD resolved q75,
-/// Decision D160, `docs/distributed.md` §3.2).
+/// q76, Decision D160, `docs/distributed.md` §3.2, §3.4).
 ///
 /// `flow.closed`'s placed agent attaches `flow.closing`, whose body is a
 /// ten-minute command and whose finally node takes eight seconds and then
@@ -3164,6 +3192,15 @@ fn closing() -> Vec<Script> {
 /// by the worker's cancelled result, that result carries the failure the
 /// finally node ended on after its eight seconds — work a kill at five would
 /// have cut off, leaving a result with no `finally_error` at all.
+///
+/// **And the execution waits for it.** A cancelled node settles only once every
+/// instance it began has ended, and a placed node began this one on the
+/// worker: so past the grace the execution is still not settled, and it
+/// settles only after the dispatch row has. The inner finally node's failure is
+/// then the **execution's** `finally_error` — on the status report and the
+/// journal's lifecycle row (PRD resolved q76) — and the root's own finally
+/// node, `noted`, which fails too, ran after it: the first failure stands, and
+/// the one that stands is the worker's, innermost first.
 #[test]
 fn a_cancel_on_a_worker_lets_the_finally_node_it_started_run_whole() {
     let Some(mesh) = Mesh::start() else {
@@ -3207,12 +3244,9 @@ fn a_cancel_on_a_worker_lets_the_finally_node_it_started_run_whole() {
     let asked = Instant::now();
     let cancelled = mesh.send(Request::post(format!("/executions/{execution}/cancel")));
     assert_eq!(cancelled.status, 202, "{}", body_of(&cancelled));
-    let report = mesh.until(&execution, "settled", |report| {
-        report["status"] != "running" && report["status"] != "interrupted"
-    });
-    assert_eq!(report["status"], "cancelled", "{report:#}");
 
-    // Past the worker's grace, and inside the finally node's eight seconds.
+    // Past the worker's grace, and inside the finally node's eight seconds: the
+    // runner is alive, the dispatch held — and the execution not settled.
     std::thread::sleep(Duration::from_millis(6_500).saturating_sub(asked.elapsed()));
     let rows = mesh.dispatch_rows(&execution);
     assert_eq!(
@@ -3224,6 +3258,12 @@ fn a_cancel_on_a_worker_lets_the_finally_node_it_started_run_whole() {
          run it whole: {rows:#?}\n{}",
         worker.transcript()
     );
+    let early = mesh.report(&execution);
+    assert_eq!(
+        early["status"], "running",
+        "the execution settled while the instance its placed node began on the worker was still \
+         running its finally node: {early:#}"
+    );
     if let Some(runner) = runner {
         assert!(
             !gone_within(runner, Duration::ZERO),
@@ -3233,11 +3273,25 @@ fn a_cancel_on_a_worker_lets_the_finally_node_it_started_run_whole() {
         );
     }
 
-    let rows = mesh.settled_cancelled(&execution, 1, Duration::from_secs(30));
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] != "running" && report["status"] != "interrupted"
+    });
+    assert_eq!(report["status"], "cancelled", "{report:#}");
     assert!(
         asked.elapsed() >= Duration::from_secs(8),
-        "the row settled {:?} after the cancel, before the finally node's eight seconds",
+        "the execution settled {:?} after the cancel, before the finally node's eight seconds",
         asked.elapsed()
+    );
+    // Settled before the execution was, so read once the execution is.
+    let rows = mesh.dispatch_rows(&execution);
+    assert!(
+        rows.len() == 1
+            && rows[0]["status"] == "settled"
+            && rows[0]["payload"]
+                .as_str()
+                .is_some_and(|payload| payload.contains("\"ExecutionCancelled\"")),
+        "the execution settled before its worker's cancelled result did: {rows:#?}\n{}",
+        worker.transcript()
     );
     let payload = rows[0]["payload"].as_str().unwrap_or_default();
     assert!(
@@ -3245,6 +3299,36 @@ fn a_cancel_on_a_worker_lets_the_finally_node_it_started_run_whole() {
         "the cancelled result does not carry the failure the finally node ended on, so it did \
          not run to its end: {rows:#?}\n{}",
         worker.transcript()
+    );
+    // The worker's finally failure is the execution's, and it came first: the
+    // root's own `noted` failed after it, and the first failure stands.
+    let finally_error = report["finally_error"].as_str().unwrap_or_else(|| {
+        panic!(
+            "the cancelled execution carries no `finally_error`, though its worker's result did: \
+             {report:#}"
+        )
+    });
+    assert!(
+        finally_error.starts_with("flow.closing node `close_up` failed: ")
+            && finally_error.contains("exited 3"),
+        "the execution's `finally_error` is not the worker's, so the root's finally node ran \
+         before the instance inside it had ended: {finally_error}"
+    );
+    let noted = report["trace"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["node"] == "noted")
+        .unwrap_or_else(|| panic!("the root's finally node has an entry: {report:#}"));
+    assert_eq!(noted["outcome"], "failed", "{noted:#}");
+    let lifecycle = harness::journal_rows(
+        &mesh.project,
+        &format!("SELECT status, finally_error FROM executions WHERE id = '{execution}'"),
+    );
+    assert_eq!(
+        lifecycle,
+        json!([{ "status": "cancelled", "finally_error": finally_error }]),
+        "the journal's lifecycle row does not carry the worker's finally failure"
     );
     if let Some(runner) = runner {
         assert!(

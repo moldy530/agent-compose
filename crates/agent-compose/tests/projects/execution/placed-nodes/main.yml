@@ -71,7 +71,10 @@
 #     seconds and then fails. A cancel during the body ends the attached
 #     instance, which starts its finally node on the worker — and that node runs
 #     whole, past the worker's five-second grace, so the failure it ends on comes
-#     home on the cancelled result as the execution's `finally_error`.
+#     home on the cancelled result as the execution's `finally_error`. Its own
+#     root `finally:` node fails too, and runs only once the worker's result is
+#     home — innermost first — so the `finally_error` that stands, the first, is
+#     the worker's.
 #
 # `agent.signer` attaches `tool.sign` and both are members of `mac`, which is
 # grammar §14.1 rule 4's second row: the same answer written twice. `tool.sign`'s
@@ -693,7 +696,10 @@ flow.tidied:
 # A cancel reaching an attached flow's finally node on a worker: `close` is
 # placed, its model calls `flow.closing`, and a cancel during that instance's
 # body starts its finally node there — which runs whole, past the worker's
-# grace, and fails (grammar §7.9, PRD resolved q75).
+# grace, and fails (grammar §7.9, PRD resolved q75). `noted`, the root's own
+# finally node, runs on the hub and fails as well: it is the outer of the two
+# ends, so it runs after the worker's result is home, and its failure is the
+# second `finally_error` — which the first, the worker's, outranks.
 flow.closed:
   description: A placed agent whose attached flow's slow finally node a cancel starts on the worker.
   inputs:
@@ -710,9 +716,14 @@ flow.closed:
         path: "input.path"
       writes:
         signature: signature
+    noted:
+      exec:
+        command: "${OPS_BIN}/sh"
+        args: ["-c", "exit 4"]
   edges:
     - { from: start, to: close }
     - { from: close, to: end }
+  finally: noted
 
 flow.release:
   description: Sign a release on a worker, and notarize it on the hub.
