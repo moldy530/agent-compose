@@ -782,7 +782,7 @@ One row per execution, written before the graph is streamed:
 | `status` | `open`, `completed` or `failed` — §3.6 |
 | `journalVersion` | the version at the head of this document |
 | `startedAt`, `endedAt`, `error` | when, and why it failed |
-| `finallyError` | what a flow's `finally:` node raised after its own retries, where one did (`docs/grammar.md` §7.9, PRD resolved q76): the **first** such failure in the execution — a subflow instance's finally node and the root's can both fail — as `<flow> node \`<id>\` failed: <error>`. Beside a `status` it does not change: a `completed` row carrying one is a run that produced its answer and whose cleanup did not. Absent on every row whose finally nodes completed and on every row of an execution that had none. The column is `finally_error`, nullable, and added to a journal an older build created by a probe on every backend (§11.2) |
+| `finallyError` | what a flow's `finally:` node raised after its own retries, where one did (`docs/grammar.md` §7.9, PRD resolved q76): the **first** such failure in the execution — a subflow instance's finally node and the root's can both fail — as `<flow> node \`<id>\` failed: <error>`. Beside a `status` it does not change: a `completed` row carrying one is a run that produced its answer and whose cleanup did not. Absent on every row whose finally nodes completed, on every row of an execution that had none, and for a failure raised after the row was written (§3.10). The column is `finally_error`, nullable, and added to a journal an older build created by a probe on every backend (§11.2) |
 
 ### 3.6 What `status` means
 
@@ -1223,6 +1223,18 @@ runs.
 The record is read nowhere else. What the finally node **raised**, if it failed
 after its own retries, is not on this record — the boundary is down before the
 node runs — but on the lifecycle row, as `finallyError` (§3.5).
+
+**An end past the record writes neither.** A detached delivery runs on after
+the run that issued it has closed the execution's record — settled, or parked
+(`docs/grammar.md` §8.6 rule 7) — and an instance its model begins from its
+`tools:` can end after that. No session is open to claim its boundary in, so
+none is written; and what its finally node raises is not `finallyError`,
+because the row has been written and the envelope has shipped. The process
+says it on stderr — `warning: a finally node of execution … failed after this
+process had closed the execution's record …` — and holds nothing for it, so a
+long-lived `serve` accumulates nothing for such failures. A placed node's
+result that a worker posts after the hub settled is the same case on the hub
+(`docs/distributed.md` §3.4).
 
 ## 4. Keys
 

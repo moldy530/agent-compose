@@ -2544,6 +2544,20 @@ export function closeSession(execution: string): void {
 }
 
 /**
+ * Whether this process is keeping `execution`'s record: true from
+ * [`openSession`] until [`closeSession`].
+ *
+ * The question a write that belongs **on** that record asks before it lands —
+ * what a `finally:` node raised (`src/runtime.ts`'s `endInstance`) — because a
+ * detached delivery's work runs on past the execution's settle (grammar 8.6
+ * rule 7), and a write after the record has closed reaches nothing a reader
+ * will read.
+ */
+export function journaling(execution: string): boolean {
+  return sessions.has(execution);
+}
+
+/**
  * The recorder for one effect site, or `undefined` where nothing is journaling.
  *
  * `undefined` is a real answer rather than a defensive one: an ejected project

@@ -97,6 +97,7 @@ import {
   effectKey,
   journalExists,
   journaled,
+  journaling,
   latchDivergence,
   latchedDivergence,
   openJournal,
@@ -11589,8 +11590,40 @@ function executionRoot(execution: ExecutionIdentity, ending?: InstanceEnding): C
  * its own `error`, so nothing a second one said is lost. Read by
  * [`settleExecution`] for the lifecycle row and by the run for the envelope, and
  * released with the execution ([`closeExecution`]).
+ *
+ * Written only while this process is keeping the execution's record
+ * ([`journaling`]), through [`keepFinallyFailure`]: see there for the one
+ * failure that arrives after it has closed.
  */
 const finallyFailures = new Map<string, string>();
+
+/**
+ * Put one finally node's failure on its execution's record — or, where that
+ * record has already closed, say on stderr that it could not.
+ *
+ * This process closes the record at [`closeExecution`] — the run settled, or
+ * parked — and something of the execution can still end after that: a
+ * detached `agent.*` or `tool.*` delivery runs on past it by design (grammar
+ * 8.6 rule 7), and so does an instance its model begins from its `tools:`,
+ * which ends on its own (grammar 7.9); and a worker can post a placed node's
+ * result after the hub settled (`docs/distributed.md` §3.4). A failure a
+ * finally node raises then has no row to go on and no envelope to ride in: the
+ * row has been written and the trace has shipped. Held here regardless, it
+ * would be read by nobody and released by nothing — [`closeExecution`] has
+ * already run — so it would stay for the life of a `serve` process, one entry
+ * per such execution. So it is not held: the line on stderr is its account,
+ * naming the execution, the node and the error. (Its boundary is journaled
+ * nowhere either: [`recorderFor`] answers nothing once the session is gone.)
+ */
+function keepFinallyFailure(execution: string, failure: string): void {
+  if (!journaling(execution)) {
+    process.stderr.write(
+      `warning: a finally node of execution \`${execution}\` failed after this process had closed the execution's record, which therefore does not hold it: ${failure} (grammar 7.9)\n`,
+    );
+    return;
+  }
+  if (!finallyFailures.has(execution)) finallyFailures.set(execution, failure);
+}
 
 /** What `finally_error` holds for this execution, where a finally node failed. */
 export function finallyErrorOf(execution: string): string | undefined {
@@ -11609,7 +11642,7 @@ export function finallyErrorOf(execution: string): string | undefined {
  * process raised.
  */
 export function holdFinallyError(execution: string, error: string): void {
-  if (!finallyFailures.has(execution)) finallyFailures.set(execution, error);
+  keepFinallyFailure(execution, error);
 }
 
 /**
@@ -11641,8 +11674,10 @@ export function holdFinallyError(execution: string, error: string): void {
  *    reduce policies.
  * 3. **Its failure changes nothing it ran after.** Once its retries are spent —
  *    or where its input could not even be built — the error is
- *    `finally_error` on the execution's record ([`finallyErrorOf`]) and on its
- *    own entry, and the instance ends with the outcome it already had: a
+ *    `finally_error` on the execution's record ([`finallyErrorOf`]) — or on
+ *    stderr, where this process has already closed that record
+ *    ([`keepFinallyFailure`]) — and on its own entry, and the instance ends
+ *    with the outcome it already had: a
  *    completed run stays completed, its outputs and exit code what they were.
  *    No `on_error:` applies at any level; a divergence is the one error that
  *    still travels, because it is un-absorbable everywhere (PRD resolved q29).
@@ -11809,9 +11844,7 @@ export async function endInstance(
       error instanceof NodeFailure
         ? error.message
         : `${descriptor.flow} node \`${descriptor.node}\` failed: ${describe(error)}`;
-    if (!finallyFailures.has(run.execution.id)) {
-      finallyFailures.set(run.execution.id, failure);
-    }
+    keepFinallyFailure(run.execution.id, failure);
     const dispatched = dispatchesOf(error);
     const entry: TraceEntry = {
       step,

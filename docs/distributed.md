@@ -924,7 +924,8 @@ nodes may run before theirs: grammar §7.9's innermost-first order holds inside
 each process, not across this wire. A `finally_error` such an instance raises
 after the execution has settled arrives with the result and is kept on the
 dispatch's settled outcome, too late for the closed lifecycle row and the
-shipped envelope. Carrying the end across is PRD resolved q75's: the poll
+shipped envelope; the hub says so on stderr and holds nothing for it
+(`docs/durability.md` §3.10). Carrying the end across is PRD resolved q75's: the poll
 response's `cancel` list, a protocol change of its own (§10).
 
 #### The two verbs
