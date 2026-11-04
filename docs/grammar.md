@@ -4692,7 +4692,9 @@ Rules (PRD 5.8):
     `{ kind: cli }` for an operator's write at the project's command line
     (`agent-compose store`), which belongs to no execution. A tagged object is
     the one shape that types every writer in one derived field: `kind` is an
-    enum, and `execution` and `path` are optional, under D110's posture.
+    enum, and `execution` and `path` are optional, under D110's posture. The
+    tag changes the shape the ruling names (`{ execution, path }`, and the word
+    `cli`), so it is provisional until the owner rules on it (D158).
   - **`at`** is the write's own clock, in epoch milliseconds — the server's on
     a dialled backend, the process's on a local one.
 
@@ -12066,22 +12068,30 @@ so a row's `at` and its retention are read by one clock. Values are stored as
 the JSON the entry holds, so a row is a copy of the value, not a reference to
 it.
 
-**The actor is tagged, and that is this implementation's reading.** The ruling
-names `{ execution, path }` for a node or tool write and `cli` for an
-operator's: two shapes, an object and a word. A derived output is one type
+**The actor is tagged, and that amends the ruling's shape — provisionally.**
+The ruling names `{ execution, path }` for a node or tool write and `cli` for
+an operator's: two shapes, an object and a word. A derived output is one type
 (§8.8), and a field that is sometimes an object and sometimes a string is no
-type a derived row can declare, so the row carries the ruling's content in the
-one shape that types every writer: `{ kind: "node", execution, path }`,
+type a derived row can declare — §3.7's union is of objects told apart by a
+discriminator field — so the row carries the ruling's content in the one shape
+that types every writer: `{ kind: "node", execution, path }`,
 `{ kind: "tool", execution, path }`, and `{ kind: "cli" }`. A node's `path` is
 its §9.4 instance path, so the trace and the history name one site — and it is
 carried on every node, derived key or authored (D157), since an authored key
 names no instance but the write still has a writer. A tool's `path` is the
 frame a call a model made takes — the agent execution's instance path, then
-`<tool name>/<call ordinal>`, as a flow-as-tool dispatch's key does. Nothing
-the ruling says is dropped and nothing is added beyond the tag; a later ruling
-choosing the untagged shape would change the derived row and nothing else. It
-stands until the owner rules on it, and nothing in the PRD records that ruling
-yet.
+`<tool name>/<call ordinal>`, as a flow-as-tool dispatch's key does. **This is
+not a reading of the ruling but a change to the shape it names**, and it is
+not this implementation's to make: an operator's row is the object
+`{ kind: "cli" }` where the ruling says the word `cli`, so a reader of the PRD
+who tests `actor === "cli"` finds no row, and a node's or tool's row carries a
+`kind` the ruling never names. Whether to supersede the ruling's shape is the
+owner's call, and it has not been made: the tag ships because the ruling's
+literal shape cannot be typed, and it stands only until the owner rules —
+ratifying the tag, or choosing another typed shape. A ruling for any other
+shape would change the derived row (`check::model`), the reading of the stored
+actor's three columns and the `store log` table, and no write, lock or sweep.
+Nothing in the PRD records that ruling yet.
 
 **`seq` is an order, not a count.** It is an integer the table assigns as the
 row is inserted — SQLite's `AUTOINCREMENT`, a Postgres `BIGSERIAL`, a MySQL
@@ -12105,10 +12115,12 @@ and both applied: a `delete` of a key that held nothing (`deleted: false`), whos
 row has no value on either side and no version, and an `append` with
 `unique: true` whose item was already there, which keeps its version and
 refreshes its expiry, whose row holds the same value on both sides. **Those
-two are this implementation's reading**: the ruling does not say whether an
-applied write that changed no value is one it means, and recording it is the
-reading that loses nothing — an operator can skip a row, and cannot recover
-one that was never written.
+two are this implementation's reading, and await the owner's ruling as the
+actor's tag does**: the ruling does not say whether an applied write that
+changed no value is one it means, and recording it is the reading that loses
+nothing — an operator can skip a row, and cannot recover one that was never
+written. A ruling that such a write records nothing would drop the two rows
+and change nothing else; nothing in the PRD records one yet.
 
 **A batch is one row per entry.** A batch is one write of many keys (D156),
 and the history is per key, so it records one row per entry, each with the
@@ -12184,8 +12196,12 @@ first attempt's. No journal row, no trace field and no `trace_version` changes
 (`docs/trace.md` §10.2), `vector` and `blob` stores are untouched, and so is
 every store that does not declare `history: true`.
 
-**Status**: shipped. *PRD 5.8, resolved q29, q68, q69, q70, q71, q72, q73,
-q74; §8.8, §11.1, §11.4, §11.5.*
+**Status**: provisional — implemented as written here, and awaiting the
+owner's ruling on three points this decision marks as its own rather than the
+ruling's: the actor's tag, which changes the shape PRD resolved q74 names, and
+the rows a `delete` of a key holding nothing and an unchanged `unique: true`
+`append` record. Nothing in the PRD records that ruling yet. *PRD 5.8, resolved
+q29, q68, q69, q70, q71, q72, q73, q74; §8.8, §11.1, §11.4, §11.5.*
 
 ## Appendix B — Editor integration
 
