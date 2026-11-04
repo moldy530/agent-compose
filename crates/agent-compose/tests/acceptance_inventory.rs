@@ -502,6 +502,18 @@ const CODEGEN: &[Criterion] = &[
                 "a_finally_node_that_fails_after_its_retries_changes_no_outcome",
                 Status::Live,
             ),
+            // …and grammar 9.3's chain reaching it from the two levels a finally
+            // node does not declare itself: an instantiating `flow:` node's
+            // `policy:` (level 1) and the composition's `defaults:` (level 3),
+            // each a `retry:` that re-runs it and a `timeout:` that ends it.
+            (
+                "a_flow_nodes_policy_reaches_the_finally_node_of_the_instance_it_starts",
+                Status::Live,
+            ),
+            (
+                "the_composition_defaults_reach_a_finally_node",
+                Status::Live,
+            ),
         ],
     },
     Criterion {
@@ -785,7 +797,7 @@ const CODEGEN: &[Criterion] = &[
                 Status::Live,
             ),
             (
-                "a_node_deadline_that_abandons_a_tool_call_records_neither_half_of_it",
+                "a_node_deadline_that_stops_a_tool_call_records_both_halves_once_its_instance_ends",
                 Status::Live,
             ),
             // …and the end of every instance a subgraph is: a nested instance's
@@ -802,6 +814,32 @@ const CODEGEN: &[Criterion] = &[
             ),
             (
                 "a_detached_child_execution_runs_its_own_finally_node",
+                Status::Live,
+            ),
+            // …on the failing paths too: a subflow and a fan-out item whose body
+            // failed still end, and their finally nodes run before the caller
+            // settles — as does a flow a model called as a tool.
+            (
+                "a_failing_subflow_runs_its_finally_node_before_its_callers",
+                Status::Live,
+            ),
+            (
+                "every_item_of_a_failed_fan_out_runs_its_finally_node_before_the_maps_flow",
+                Status::Live,
+            ),
+            (
+                "a_flow_called_as_a_tool_runs_its_finally_node_before_the_agent_settles",
+                Status::Live,
+            ),
+            // …and on a deadline: a `flow:` node or `map` whose own `timeout:`
+            // ran out stops its instances and fails only once each has ended,
+            // finally node run — and begins none it had not begun.
+            (
+                "a_flow_node_whose_timeout_ran_out_waits_for_its_instances_finally_node",
+                Status::Live,
+            ),
+            (
+                "a_map_whose_timeout_ran_out_waits_for_the_instances_it_began_and_begins_no_more",
                 Status::Live,
             ),
         ],
@@ -1764,6 +1802,19 @@ const DURABILITY: &[Criterion] = &[
             ),
             (
                 "a_failed_run_killed_after_its_finally_effect_landed_replays_it_on_resume",
+                Status::Live,
+            ),
+            // …and the window before either: a generation that died after the
+            // body's last effect and before the boundary leaves no boundary, and
+            // the resume records it live and runs the finally node once.
+            (
+                "a_restart_before_the_finally_boundary_records_it_and_runs_the_node_once",
+                Status::Live,
+            ),
+            // …and the stop that is not an end: a run parked at a pause runs no
+            // finally node, and the resume that answers it runs each once.
+            (
+                "a_parked_run_runs_no_finally_node_and_its_resume_runs_each_once",
                 Status::Live,
             ),
         ],

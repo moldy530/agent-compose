@@ -32,6 +32,26 @@
 #   * `flow.untidy` — a finally node that fails on every attempt of its
 #     `retry:`: the execution's outcome, outputs and exit code are its body's,
 #     and the failure is `finally_error` on the row and the envelope.
+#   * `flow.paused` — a subflow that parks at a `human` node, under a flow with
+#     a finally node of its own. A pause is not an end, so neither finally node
+#     runs until the resumed run answers it — and then each runs once, inner
+#     first.
+#   * `flow.nested_failing` and `flow.each_failing` — `flow.nested` and
+#     `flow.each` with a body that **fails**: a failure propagating out of a
+#     subflow still runs the subflow's finally node first, and every item of a
+#     failed fan-out runs its own before the map's flow runs its own.
+#   * `flow.tooled` — a model calls `flow.toolish` as a tool: a flow-as-tool
+#     instance runs its own finally node, before the agent node that called it
+#     settles and the calling flow's finally node runs.
+#   * `flow.timed` and `flow.fan_timed` — a `flow:` node and a joined `map` whose
+#     own `timeout:` runs out while their instances sleep. The deadline stops
+#     each instance, and the node fails only once that instance's finally node
+#     has run — so the calling flow's finally node still runs last. An item the
+#     map had not begun when the deadline ran out is never begun.
+#   * `flow.policed` and `flow.hurried` — a `flow:` node's `policy:` (grammar
+#     §9.3 level 1) reaching the finally node of the instance it starts: its
+#     `retry:` re-runs a failing finally node, and its `timeout:` bounds one
+#     that sleeps.
 version: "0.1"
 
 defaults:
@@ -69,6 +89,22 @@ store.ended:
       type: array
       max_items: 16
       items: { type: string }
+
+# The agent `flow.tooled` runs: its one tool is a flow with a finally node.
+agent.closer:
+  description: Calls its one tool, then writes a short note.
+  model: model.smart
+  prompt: |
+    Call your tool once, then write one short note about the topic you are given.
+  tools: [flow.toolish]
+  input:
+    topic:
+      description: What to write a note about.
+      type: string
+  output:
+    note:
+      description: The note.
+      type: string
 
 agent.noter:
   description: Writes one short note about a topic.
@@ -341,6 +377,342 @@ flow.untidy:
     - { from: start, to: work }
     - { from: work, to: end }
   finally: record
+
+flow.paused:
+  description: A subflow that parks at a person's question, under a flow with a finally node of its own.
+  outputs: {}
+  nodes:
+    step:
+      flow: flow.asking
+    paused_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "'outer'"
+  edges:
+    - { from: start, to: step }
+    - { from: step, to: end }
+  finally: paused_end
+
+flow.asking:
+  description: The nested instance, which parks before it ends.
+  outputs: {}
+  nodes:
+    ask:
+      human:
+        input:
+          question: { type: string }
+        output:
+          decision: { enum: [go, stop] }
+      input:
+        question: "'may the run go on?'"
+      writes:
+        decision: note
+    asking_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "'inner'"
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+  finally: asking_end
+
+flow.nested_failing:
+  description: A subflow whose body fails, under a flow with a finally node of its own.
+  outputs: {}
+  nodes:
+    step:
+      flow: flow.inner_failing
+    outer_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "'outer'"
+  edges:
+    - { from: start, to: step }
+    - { from: step, to: end }
+  finally: outer_end
+
+flow.inner_failing:
+  description: The nested instance, which fails and still ends first.
+  outputs: {}
+  nodes:
+    inner_work:
+      exec:
+        command: "${OPS_BIN}/false"
+    inner_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "'inner'"
+  edges:
+    - { from: start, to: inner_work }
+    - { from: inner_work, to: end }
+  finally: inner_end
+
+flow.each_failing:
+  description: A joined fan-out one of whose items fails, every item with a finally node.
+  inputs:
+    names:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs: {}
+  nodes:
+    fan:
+      map:
+        over: input.names
+        as: name
+        node: flow.item_failing
+        max_concurrency: 1
+        input:
+          name: "name"
+    all_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "'all'"
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: end }
+  finally: all_end
+
+flow.item_failing:
+  description: One dispatched instance, which fails on the name `bad` and records its own end either way.
+  inputs:
+    name:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    item_work:
+      exec:
+        command: "${OPS_BIN}/sh"
+        args: ["-c", "test \"$NAME\" != bad"]
+      input:
+        name: "input.name"
+    item_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "input.name"
+  edges:
+    - { from: start, to: item_work }
+    - { from: item_work, to: end }
+  finally: item_end
+
+flow.tooled:
+  description: An agent that calls a flow as a tool, under a flow with a finally node of its own.
+  outputs:
+    note:
+      type: string
+  nodes:
+    ask:
+      agent: agent.closer
+      input:
+        topic: "'the tool'"
+      writes:
+        note: note
+    tooled_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "'outer'"
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+  finally: tooled_end
+
+flow.toolish:
+  description: The flow a model calls as a tool, which records its own end.
+  outputs: {}
+  nodes:
+    tool_work:
+      exec:
+        command: "${OPS_BIN}/true"
+    tool_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "'tool'"
+  edges:
+    - { from: start, to: tool_work }
+    - { from: tool_work, to: end }
+  finally: tool_end
+
+flow.timed:
+  description: A flow node whose own timeout runs out while its instance sleeps.
+  outputs: {}
+  nodes:
+    step:
+      flow: flow.slow
+      timeout: 1s
+    timed_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "'outer'"
+  edges:
+    - { from: start, to: step }
+    - { from: step, to: end }
+  finally: timed_end
+
+flow.slow:
+  description: An instance that sleeps past its caller's budget, and records its own end — slowly.
+  outputs: {}
+  nodes:
+    slow_work:
+      exec:
+        command: "${OPS_BIN}/sleep"
+        args: ["3"]
+    # A `flow:` node, so the end takes long enough to lose a race: a finally node
+    # that ran beside its caller's failure, rather than before it, would append
+    # after the caller's own finally node did.
+    slow_end:
+      flow: flow.slow_closing
+  edges:
+    - { from: start, to: slow_work }
+    - { from: slow_work, to: end }
+  finally: slow_end
+
+flow.slow_closing:
+  description: What `flow.slow` does once it has ended — a pause, then its mark in the store.
+  outputs: {}
+  nodes:
+    linger:
+      exec:
+        command: "${OPS_BIN}/sleep"
+        args: ["1"]
+    mark:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "'slow'"
+  edges:
+    - { from: start, to: linger }
+    - { from: linger, to: mark }
+    - { from: mark, to: end }
+
+flow.fan_timed:
+  description: A joined fan-out whose own timeout runs out while its first item sleeps.
+  inputs:
+    names:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs: {}
+  nodes:
+    fan:
+      map:
+        over: input.names
+        as: name
+        node: flow.slow_item
+        max_concurrency: 1
+        input:
+          name: "name"
+      timeout: 1s
+    fan_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "'all'"
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: end }
+  finally: fan_end
+
+flow.slow_item:
+  description: One dispatched instance, which sleeps past the map's budget and records its own end.
+  inputs:
+    name:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    slow_work:
+      exec:
+        command: "${OPS_BIN}/sleep"
+        args: ["3"]
+    slow_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "input.name"
+  edges:
+    - { from: start, to: slow_work }
+    - { from: slow_work, to: end }
+  finally: slow_end
+
+flow.policed:
+  description: A flow node whose policy retries the finally node of the instance it starts.
+  outputs: {}
+  nodes:
+    step:
+      flow: flow.cleaning
+      policy:
+        retry: { max: 1, backoff: 10ms }
+  edges:
+    - { from: start, to: step }
+    - { from: step, to: end }
+
+flow.cleaning:
+  description: A body that completes, and a finally node that fails on every attempt it is given.
+  outputs: {}
+  nodes:
+    work:
+      exec:
+        command: "${OPS_BIN}/true"
+    record:
+      exec:
+        command: "${TALLY_BIN}/ended"
+        args: ["--fail"]
+      input:
+        outcome: "execution.outcome"
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: record
+
+flow.hurried:
+  description: A flow node whose policy bounds the finally node of the instance it starts.
+  outputs: {}
+  nodes:
+    step:
+      flow: flow.napping
+      policy:
+        timeout: 1s
+  edges:
+    - { from: start, to: step }
+    - { from: step, to: end }
+
+flow.napping:
+  description: A body that completes, and a finally node that sleeps past its budget.
+  outputs: {}
+  nodes:
+    work:
+      exec:
+        command: "${OPS_BIN}/true"
+    nap:
+      exec:
+        command: "${OPS_BIN}/sleep"
+        args: ["3"]
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: nap
 
 triggers:
   cli: { type: manual, flow: flow.ended }
