@@ -1,0 +1,13 @@
+# rule: a placement's `max_running:` is never below one, so a negative count is refused like zero (grammar 14.1, Decision D161)
+# code: value-out-of-range
+# message: `max_running` of placement `mac` must be at least 1, found -1
+# at: 13:18
+version: "0.1"
+
+hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
+placements:
+  mac:
+    members: [agent.signer]
+    max_running: -1

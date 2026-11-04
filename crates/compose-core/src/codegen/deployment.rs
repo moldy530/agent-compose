@@ -59,7 +59,10 @@ pub fn module(ir: &Ir, partition: &Partition) -> super::GeneratedFile {
             for member in members(ir, name) {
                 contents.push_str(&format!("      {},\n", names::string(&member)));
             }
-            contents.push_str("    ],\n    environment: [\n");
+            contents.push_str(&format!(
+                "    ],\n    maxRunning: {},\n    environment: [\n",
+                capacity(ir, name)
+            ));
             for variable in References::for_process(ir, partition, process).names() {
                 contents.push_str(&format!("      {},\n", names::string(variable)));
             }
@@ -174,6 +177,21 @@ pub fn module(ir: &Ir, partition: &Partition) -> super::GeneratedFile {
     }
 }
 
+/// How many unsettled dispatches of one placement a session may hold:
+/// `max_running:`, or `1` (grammar 14.1, Decision D161).
+fn capacity(ir: &Ir, name: &str) -> i64 {
+    ir.deploy
+        .placements
+        .as_ref()
+        .and_then(|section| {
+            section
+                .entries
+                .values()
+                .find(|placement| placement.name.value.as_str() == name)
+        })
+        .map_or(1, crate::ir::deploy::Placement::capacity)
+}
+
 /// The members of one placement, in the order the deploy file writes them.
 fn members(ir: &Ir, name: &str) -> Vec<String> {
     let Some(section) = ir.deploy.placements.as_ref() else {
@@ -249,6 +267,14 @@ export interface PlacementManifest {
    * machine that claimed it.
    */
   readonly members: readonly string[];
+  /**
+   * `max_running:` — how many unsettled dispatches of this placement one worker
+   * session may hold at once, with the default of `1` already applied (grammar
+   * §14.1, `docs/distributed.md` §2, Decision D161). The hub's poll handler
+   * offers a session work of this placement while the dispatches it holds for
+   * it number fewer than this.
+   */
+  readonly maxRunning: number;
   /**
    * The variables of every component that can execute in this placement's
    * process, sorted by name — `docs/distributed.md` §9.1's partition.

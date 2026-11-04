@@ -20,6 +20,7 @@ Deploy(
                         description: Some(
                             "The machines holding a checkout: agent.fixer reads files under the repo root, and tool.repo_grep — reached from a `function:` node, so its own placement governs it — greps the same tree." @ 25:7..29:1,
                         ),
+                        max_running: None,
                         span: 20:3..29:1,
                     },
                 ],
