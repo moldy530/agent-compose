@@ -2402,10 +2402,13 @@ by its own policy. Nothing new begins inside an instance that is ending, except
 under its own finally node or the finally node of an instance ending inside it
 — and nothing begins inside one that has ended, for as long as anything of its
 body is still running: a `map` item still queued for a permit, a `retry:` or
-`on_item_error` attempt still to be made, a `flow.*` tool a model asks for after
+`on_item_error` attempt still to be made, and an agent's next tool call — of
+any tool, a store's and a `flow.*` included — or its next model call, made after
 the end. Each of those belonged to the body, and nothing is left to read what it
 would answer. What is already running when the body ends runs on — concurrent
-branches are never cancelled (§7.6.3) — but begins nothing more.
+branches are never cancelled (§7.6.3), and a model call or tool call in flight
+answers — but begins nothing more: an agent whose call answers after the end
+leaves its node there.
 A **child execution** — what a detached `flow.*` dispatch starts (§8.6 rule 7)
 — is an execution of its own, and its root instance runs its own finally node
 when it ends. A detached delivery to an `agent.*` or a `tool.*` is not the
@@ -12142,10 +12145,14 @@ agent whose model answers late — and the end of an instance with no finally no
 of its own is over the moment its last running instance has ended. So the refusal
 is tied to the **body**, not to the end's duration: every task of a body that has
 ended is refused whatever it would begin next — an instance, an attempt, a
-dispatch — while a fresh generation at the same instance path, the next attempt
-of the node that ran it, begins normally. A **detached** delivery is no task of
-the body: it was resolved when its record was written, and nothing it does may
-delay the instance that issued it (§8.6 rule 7, D94). So the instances an
+dispatch, an agent's tool call or model call — while a fresh generation at the
+same instance path, the next attempt of the node that ran it, begins normally.
+The agent's calls are the case a lease turns on: a store write a let-go agent
+made during or after a `finally:` node's release would take the lease again
+until its TTL, which is exactly what the release exists to prevent. A
+**detached** delivery is no task of the body: it was resolved when its record
+was written, and nothing it does may delay the instance that issued it (§8.6
+rule 7, D94). So the instances an
 `agent.*` sink's model begins from its `tools:` — under the execution's own id,
 at paths under the issuing instance's — are neither stopped, waited for nor
 refused by that instance's end, or by the deadline or `retry:` of the `map` node

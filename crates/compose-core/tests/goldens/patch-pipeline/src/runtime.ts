@@ -898,8 +898,9 @@ export interface RunContext {
    * is already running (grammar 7.6.3). What this stops is what the node would
    * **begin** next — another `retry:` attempt ([`runActivity`]), a `map` item
    * still queued for a permit or due another `on_item_error` attempt
-   * ([`runMap`]), an instance of any flow ([`Instantiation.bodyEnded`]) —
-   * because the body that would have read the result is over.
+   * ([`runMap`]), an agent's next tool call or model turn ([`callAgent`]), an
+   * instance of any flow ([`Instantiation.bodyEnded`]) — because the body that
+   * would have read the result is over.
    *
    * Absent on a detached `map` delivery's context, which is off the instance
    * the way it is off [`signal`]'s clock (grammar 8.6 rule 7, D94), and on a
@@ -5545,6 +5546,25 @@ const CLOSING_TURN: Turn = { role: "user", text: "Now produce the structured res
  * exchange is closed with one fixed user turn before the output tool is pinned.
  * The tool-less path composes a request that already ends on the user turn and
  * is untouched.
+ *
+ * **A let-go agent begins nothing more** (grammar 7.9, Decision D159). An agent
+ * node is a task of its instance's body, and LangGraph lets go of it when a
+ * sibling's failure ends that body, or the instance is stopped
+ * ([`RunContext.bodyEnded`]). The model call or tool call in flight at that
+ * moment runs on — a sibling's failure cuts nothing short (grammar 7.6.3), and
+ * a model call answers through its whole route — but the loop begins nothing
+ * after it: no further tool call of any kind, and no further model turn, the
+ * pinned one included. Each would be new work inside an instance that has
+ * ended — a subprocess spawned, a request sent, a store write landed, an
+ * instance begun — and a store write is where that shows: one landing after a
+ * `finally:` node released a lease takes the lease again until its TTL (PRD
+ * resolved q69, q76). So [`leaveEnded`] is read before every model call and
+ * before every tool is invoked, and the node leaves on the end's own
+ * [`InstanceStopped`], as a `retry:` ladder does between attempts
+ * ([`runActivity`]). A call the contract refuses (D119) begins nothing and is
+ * still answered; the turn it would have led to is what is refused. A finally
+ * node's agent reads its own end, which comes only once it has settled
+ * ([`endInstance`]), and a detached delivery's has none to read ([`runMap`]).
  */
 export async function callAgent(
   agent: AgentBinding,
@@ -5571,6 +5591,14 @@ export async function callAgent(
     // that a `return` alone would not release ([`endShellSessions`]).
     endShellSessions(context);
   }
+}
+
+/**
+ * Leave a let-go agent's loop on the end of the body it belongs to, where that
+ * body has ended — see *A let-go agent begins nothing more* on [`callAgent`].
+ */
+function leaveEnded(context: RunContext): void {
+  if (isAborted(context.bodyEnded)) throw abortReason(context.bodyEnded!);
 }
 
 /** [`callAgent`]'s loop, with the sessions it opens released around it. */
@@ -5632,6 +5660,9 @@ async function agentLoop(
     // ever saw would say the opposite of what happened.
     let refusal: string | undefined;
     for (;;) {
+      // Before the bound, so a let-go loop leaves on the end it is let go by
+      // rather than on a bound it would have reached only by turning again.
+      leaveEnded(context);
       if (iterations >= agent.maxToolIterations) {
         throw new Error(
           `\`${agent.address}\` reached its \`max_tool_iterations\` bound of ${agent.maxToolIterations} without answering (Decision D51)${
@@ -5712,6 +5743,11 @@ async function agentLoop(
           );
           continue;
         }
+        // Every tool begins something — a subprocess, a request, a store write,
+        // an instance — so a let-go loop stops here, between one call and the
+        // next, as well as between turns. The refusal above begins nothing, and
+        // is answered whatever the body's state.
+        leaveEnded(context);
         // Claimed here and **handed back** where the contract refuses the call:
         // grammar §9.4's ordinal counts how many times this tool has already
         // been *invoked*, and a refusal never reaches the tool. Claiming it up
@@ -5806,6 +5842,7 @@ async function agentLoop(
     }
   }
 
+  leaveEnded(context);
   const { answer: final, served: finalServed } = await callModel(
     agent.model,
     {
@@ -10368,12 +10405,13 @@ export interface RunChannel {
    * of — a sibling's failure ended the superstep it was in, or the instance's
    * own stop was pulled — and that is still running: a `map` with items queued
    * for a permit, a `retry:` ladder sleeping out its backoff, an agent whose
-   * model asks for a `flow.*` tool. None of them may begin anything once the
-   * body is over (grammar 7.9: nothing new begins inside an instance that is
-   * ending), and none of them has anything else to learn that from: the
-   * instance's own stop is the instantiating node's clock, and the task's own
-   * clock is its node's. [`runActivity`] hands it on as
-   * [`RunContext.bodyEnded`], and [`runSubflow`] refuses through it
+   * model answers with another tool call or whose tool call answers into
+   * another turn. None of them may begin anything once the body is over
+   * (grammar 7.9: nothing new begins inside an instance that is ending), and
+   * none of them has anything else to learn that from: the instance's own stop
+   * is the instantiating node's clock, and the task's own clock is its node's.
+   * [`runActivity`] hands it on as [`RunContext.bodyEnded`], the agent loop
+   * leaves through it ([`callAgent`]), and [`runSubflow`] refuses through it
    * ([`Instantiation.bodyEnded`]).
    *
    * It never **stops** anything — an activity in flight runs on, exactly as one
