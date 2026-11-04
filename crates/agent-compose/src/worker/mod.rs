@@ -485,9 +485,22 @@ fn serve(
                 Answer::Said(said) if said.status == 200 => {
                     backoff.reset();
                     let answer = said.json();
-                    // **The cancel list first** (§3.2, PRD resolved q75): a
-                    // dispatch the hub has cancelled is stopped before anything
-                    // new starts beside it.
+                    // **The dispatch this answer hands over is on the books
+                    // first**, on this thread (§3.2, PRD resolved q75): the
+                    // `cancel` list below may name it — a cancel that reached it
+                    // while the hub was assembling this very answer, which the
+                    // hub names to nobody again once it is sent — and a cancel
+                    // of a dispatch this worker does not hold yet is nothing to
+                    // stop ([`node::Running::cancel`]). Marked here, it is
+                    // settled `cancelled` without its runner ever starting. Held
+                    // by the thread that runs it instead, it would race the next
+                    // poll's list as well.
+                    let handed = answer
+                        .get("dispatch_id")
+                        .and_then(Value::as_str)
+                        .map(|id| held.hold(id, session.generation));
+                    // **The cancel list next**: a dispatch the hub has cancelled
+                    // is stopped before anything new starts beside it.
                     for id in answer
                         .get("cancel")
                         .and_then(Value::as_array)
@@ -505,16 +518,15 @@ fn serve(
                     // node runs — a thread blocked on a slow runner makes no
                     // request for the whole of it, and at ninety seconds the hub
                     // declares this session gone and supersedes what it holds.
-                    if answer.get("dispatch_id").and_then(Value::as_str).is_some() {
+                    if let Some(handle) = handed {
                         let sessions = Arc::clone(&sessions);
                         let tree = tree.clone();
                         let runner = runner.clone();
                         let hub = Arc::clone(hub);
                         let held = held.clone();
-                        let generation = session.generation;
                         running.push(scope.spawn(move || {
                             node::execute(
-                                &hub, &sessions, &tree, bun, &runner, &answer, &held, generation,
+                                &hub, &sessions, &tree, bun, &runner, &answer, &held, &handle,
                             )
                         }));
                     }

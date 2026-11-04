@@ -103,7 +103,7 @@ const FINALLY_POLL: Duration = Duration::from_millis(50);
 
 /// One dispatch this worker is running, as a cancel reaches it.
 #[derive(Default)]
-struct Handle {
+pub(crate) struct Handle {
     /// Which of this worker's sessions it was handed under ([`super::Held`]'s
     /// generation): once a newer one has been joined, the hub has ended the
     /// session this dispatch belonged to, and with it the dispatch
@@ -125,7 +125,15 @@ pub(crate) struct Running(Arc<Mutex<HashMap<String, Arc<Handle>>>>);
 
 impl Running {
     /// Put one dispatch on the books, answering its handle.
-    fn hold(&self, id: &str, generation: u64) -> Arc<Handle> {
+    ///
+    /// Called by the **poll thread**, for the dispatch a poll answer hands over,
+    /// before that answer's `cancel` list is acted on (§3.2, PRD resolved q75).
+    /// The list may name that very dispatch — a cancel that reached it while the
+    /// hub was assembling the answer, which the hub then names to nobody again —
+    /// and a cancel of a dispatch not yet on the books finds nothing to stop
+    /// ([`Running::cancel`]). So would the next poll's, if the hold waited for
+    /// the dispatch's own thread to be scheduled.
+    pub(crate) fn hold(&self, id: &str, generation: u64) -> Arc<Handle> {
         let handle = Arc::new(Handle {
             generation,
             ..Handle::default()
@@ -296,9 +304,12 @@ impl From<Stop> for Unsent {
 /// take ([`settle`]). `Err(Stop)` is the worker itself winding down, and nothing
 /// else.
 ///
-/// `generation` is the session the poll that handed it over was made under. A
-/// dispatch handed to a session this worker joined while runners of an older
-/// one are still stopping waits for them before its own runner starts
+/// `handle` is the dispatch on the books, put there by the poll thread before
+/// the answer that handed it over had its `cancel` list read ([`Running::hold`]):
+/// a cancel in that same answer has already marked it, and its runner is never
+/// started. Its generation is the session that poll was made under. A dispatch
+/// handed to a session this worker joined while runners of an older one are
+/// still stopping waits for them before its own runner starts
 /// ([`Running::drained_before`]) — a wait inside the node's `timeout:` chain,
 /// which runs from dispatch (§6.5).
 #[allow(
@@ -313,16 +324,15 @@ pub(crate) fn execute(
     runner: &str,
     dispatch: &Value,
     running: &Running,
-    generation: u64,
+    handle: &Handle,
 ) -> Result<(), Stop> {
     let id = dispatch
         .get("dispatch_id")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let handle = running.hold(&id, generation);
-    running.drained_before(generation);
-    let ended = execute_held(hub, sessions, tree, bun, runner, dispatch, &id, &handle);
+    running.drained_before(handle.generation);
+    let ended = execute_held(hub, sessions, tree, bun, runner, dispatch, &id, handle);
     running.release(&id);
     ended
 }
