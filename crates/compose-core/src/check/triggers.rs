@@ -209,7 +209,7 @@ fn routes(ctx: &mut Ctx) {
                     ),
                 )
                 .with_help(format!(
-                    "a generated app mounts `status` and `resume` for itself, beside each trigger's `start` (grammar 13.3) — {} — and cannot dispatch one method and path two ways: give the trigger its own `path:`",
+                    "a generated app mounts `status`, `resume` and `cancel` for itself, beside each trigger's `start` (grammar 13.3) — {} — and cannot dispatch one method and path two ways: give the trigger its own `path:`",
                     crate::parse::reader::list(
                         crate::codegen::serve::RESERVED_ROUTES
                             .iter()

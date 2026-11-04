@@ -175,6 +175,7 @@ import {
   deliverHumanAnswer,
   deliveriesOf,
   divergenceOf,
+  endedByCancel,
   executionReport,
   hostChildren,
   humanWaitEnded,
@@ -202,6 +203,7 @@ import {
   sweepBoundStores,
 } from "./stores.ts";
 import type { OperatorTarget, StoreBinding, StoreParams } from "./stores.ts";
+import { publicUrl } from "./deployment.ts";
 import { httpTriggers, manualTriggers } from "./triggers.ts";
 
 /** What a `--format` selects. */
@@ -345,8 +347,9 @@ export async function main(argv: readonly string[]): Promise<number> {
     if (verb === "resume") return await resumeVerb(rest);
     if (verb === "serve") return await serveVerb(rest);
     if (verb === "store") return await storeVerb(rest);
+    if (verb === "cancel") return await cancelVerb(rest);
     throw new UsageError(
-      `\`${verb ?? ""}\` is not a verb of this project: it takes \`run\`, \`resume\`, \`serve\` or \`store\` (see README.md)`,
+      `\`${verb ?? ""}\` is not a verb of this project: it takes \`run\`, \`resume\`, \`serve\`, \`store\` or \`cancel\` (see README.md)`,
     );
   } catch (error) {
     if (error instanceof UsageError) {
@@ -435,6 +438,15 @@ async function resumeVerb(argv: readonly string[]): Promise<number> {
       }`,
     );
   }
+  // A cancelled execution is ended for good (PRD resolved q75): the refusal
+  // names the status, as the route's does.
+  if (row.status === "cancelled") {
+    throw new UsageError(
+      `\`${execution}\` was cancelled${
+        row.endedAt === undefined ? "" : ` (${row.endedAt})`
+      }, so there is nothing to resume: a cancelled execution is ended for good, and the journal keeps its record`,
+    );
+  }
   if (row.status !== "open") {
     throw new UsageError(
       `\`${execution}\` has already ${row.status}${
@@ -470,6 +482,85 @@ async function resumeVerb(argv: readonly string[]): Promise<number> {
     // so (PRD resolved q65, `docs/trace.md` §2).
     ...(row.lineage === undefined ? {} : { lineage: row.lineage }),
   });
+}
+
+/**
+ * `cancel <execution> [--url <base>] [--header 'Name: value']... [--format
+ * human|json]` — ask the serving process to cancel an execution (PRD resolved
+ * q75, Decision D160).
+ *
+ * A cancel is `serve`'s: the execution is running in that process, and the
+ * route it answers on is the one place its controller can be pulled. So this
+ * sends `POST /executions/<id>/cancel` to the app at `--url`, or at the target's
+ * `hub.public_url` where it declares one, and reports what the app answered. A
+ * `run` is not cancelled this way — `Ctrl-C` leaves its row open for `resume`
+ * (PRD resolved q28).
+ *
+ * The route is under the auth of the trigger that started the execution (PRD
+ * resolved q32), and this command does not know which trigger that was: the
+ * credential is the operator's to supply, as `--header 'Authorization: Bearer
+ * …'` or whatever header the trigger's `auth:` reads.
+ *
+ * Exit `0` on `202` — the cancel is recorded and under way; the status route
+ * says how the execution ended — `1` on any refusal the app answered with (a
+ * settled execution's `409`, an unknown one's `404`, a `401`), and `2` where the
+ * command could not run: bad usage, no URL to send to, or an app that did not
+ * answer.
+ */
+async function cancelVerb(argv: readonly string[]): Promise<number> {
+  const [execution, ...rest] = argv;
+  if (execution === undefined || execution.startsWith("--")) {
+    throw new UsageError(
+      "`cancel` takes an execution id: `cancel <execution-id> [--url <base>]` — `serve` answers it as `execution_id`",
+    );
+  }
+  const options = parse("cancel", rest, { url: "single", header: "repeatable", format: "single" });
+  const format = formatOf(options.single["format"]);
+  const base = options.single["url"] ?? publicUrl;
+  if (base === undefined) {
+    throw new UsageError(
+      "`cancel` sends the cancel to the process serving the execution, and this target declares no `hub.public_url` to find it at: pass `--url <the app's base URL>`",
+    );
+  }
+  const headers: Record<string, string> = {};
+  for (const header of options.repeated["header"] ?? []) {
+    const colon = header.indexOf(":");
+    if (colon <= 0) {
+      throw new UsageError(`\`--header ${header}\` is not \`Name: value\``);
+    }
+    headers[header.slice(0, colon).trim()] = header.slice(colon + 1).trim();
+  }
+  const url = `${base.replace(/\/+$/, "")}/executions/${encodeURIComponent(execution)}/cancel`;
+  let response: Response;
+  try {
+    response = await fetch(url, { method: "POST", headers });
+  } catch (error) {
+    throw new UsageError(`the app at \`${base}\` could not be reached: ${describe(error)}`);
+  }
+  const text = await response.text();
+  let answer: Record<string, unknown>;
+  try {
+    answer = JSON.parse(text === "" ? "{}" : text) as Record<string, unknown>;
+  } catch {
+    answer = { error: text };
+  }
+  const document = { http_status: response.status, ...answer };
+  const accepted = response.status === 202;
+  if (format === "json") {
+    process.stdout.write(`${JSON.stringify(document, null, 2)}\n`);
+  } else if (accepted) {
+    process.stdout.write(
+      `cancelling \`${execution}\`: the status route at ${String(answer["status_url"] ?? `/executions/${execution}`)} says how it ends\n`,
+    );
+  } else {
+    process.stderr.write(
+      `the app refused to cancel \`${execution}\` (${response.status}): ${String(answer["error"] ?? text)}\n`,
+    );
+  }
+  if (accepted) return 0;
+  // A status this route does not give is an app that could not be read — the
+  // command did not get an answer to its question.
+  return response.status >= 400 && response.status < 500 ? 1 : 2;
 }
 
 /** One invocation of a flow, whichever verb asked for it. */
@@ -677,7 +768,12 @@ async function executing(
     // different — so it is recognized by what is on the chain rather than by
     // what class arrived.
     const interrupt = interruptOf(error);
-    const status = interrupt === undefined ? "failed" : "interrupted";
+    // A run somebody cancelled — which a `resume` completes where a restart
+    // interrupted the cancel (PRD resolved q75, `docs/durability.md` §6.1) —
+    // is neither: it produced no answer and nothing went wrong with it, so its
+    // document says `cancelled` and carries no `error`, and it exits `1`.
+    const cancelled = interrupt === undefined && endedByCancel(error);
+    const status = interrupt !== undefined ? "interrupted" : cancelled ? "cancelled" : "failed";
     // A **divergence** is read off the chain for the reason an interrupt is: the
     // wrapper says the run did not reach quiescence, which is true of every
     // failure, and what a reader has to act on is the step the journal and this
@@ -700,7 +796,7 @@ async function executing(
       status,
       trace,
       job.lineage,
-      reason,
+      cancelled ? undefined : reason,
       finallyError,
     );
     if (format === "json") {
@@ -713,7 +809,7 @@ async function executing(
             flow: address,
             execution_id: execution,
             status,
-            error: reason,
+            ...(cancelled ? {} : { error: reason }),
             ...(finallyError === undefined ? {} : { finally_error: finallyError }),
             trace_version: TRACE_VERSION,
             trace,
@@ -725,8 +821,8 @@ async function executing(
       );
     } else {
       process.stderr.write(render(trace));
-      process.stderr.write(`\n${reason}\n`);
-      if (interrupt === undefined) {
+      process.stderr.write(cancelled ? `\nexecution \`${execution}\` was cancelled\n` : `\n${reason}\n`);
+      if (interrupt === undefined && !cancelled) {
         for (let cause: unknown = (error as { cause?: unknown }).cause; cause !== undefined; ) {
           process.stderr.write(`  cause: ${describe(cause)}\n`);
           cause = (cause as { cause?: unknown }).cause;
@@ -843,10 +939,10 @@ async function journalExport(
       record = await shipTrace({
         execution,
         flow,
-        // Two of the envelope's three: this hook is reached only where the
+        // Three of the envelope's four: this hook is reached only where the
         // lifecycle row closes, and a run holding a pause leaves it open.
-        status: produced === undefined ? "failed" : "completed",
-        ...(produced === undefined ? { error: describe(error) } : {}),
+        status: settledStatus(produced, error),
+        ...(produced === undefined && !endedByCancel(error) ? { error: describe(error) } : {}),
         ...(finallyError === undefined ? {} : { finallyError }),
         entries: trace ?? [],
       });
@@ -925,8 +1021,12 @@ async function owed(job: Job, produced: FlowRun | undefined, error: unknown): Pr
           // Off the row this resume read, so the report says what started the
           // execution rather than what finished it.
           trigger: job.trigger ?? "manual",
-          status: produced === undefined ? "failed" : "completed",
-          ...(produced === undefined ? { error: describe(error) } : { outputs: produced.outputs }),
+          status: settledStatus(produced, error),
+          ...(produced !== undefined
+            ? { outputs: produced.outputs }
+            : endedByCancel(error)
+              ? {}
+              : { error: describe(error) }),
           ...(finallyError === undefined ? {} : { finallyError }),
           ...(trace === undefined ? {} : { trace }),
         }),
@@ -2596,10 +2696,22 @@ function formatOf(given: string | undefined): Format {
  * that writes one: a `resume` of a child by its own id (PRD resolved q65,
  * `docs/trace.md` §2).
  */
+/**
+ * How a run whose lifecycle row is closing ended: with its answer, cancelled
+ * (PRD resolved q75), or failed.
+ */
+function settledStatus(
+  produced: FlowRun | undefined,
+  error: unknown,
+): "completed" | "failed" | "cancelled" {
+  if (produced !== undefined) return "completed";
+  return endedByCancel(error) ? "cancelled" : "failed";
+}
+
 function writeTrace(
   address: string,
   execution: string,
-  status: "completed" | "failed" | "interrupted",
+  status: "completed" | "failed" | "interrupted" | "cancelled",
   trace: readonly runtime.TraceEntry[],
   lineage: runtime.Lineage | undefined,
   error?: string,

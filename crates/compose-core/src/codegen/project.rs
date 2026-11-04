@@ -644,13 +644,15 @@ bun src/index.ts
 `bun src/index.ts` with no arguments starts nothing: loading the project is the
 environment check, and there is nothing else a bare launch could mean. With a
 verb it is this project's command line, which is exactly what `agent-compose
-run`, `agent-compose serve` and `agent-compose store` launch:
+run`, `agent-compose serve`, `agent-compose store` and `agent-compose cancel`
+launch:
 
 ```sh
 bun src/index.ts run flow.<name> --input goal=... [--session <key>] [--format json]
 bun src/index.ts resume <execution-id> [--format json]
 bun src/index.ts serve --port 8787
 bun src/index.ts store get store.<name> <key> [--session <key> | --execution <id>] [--format json]
+bun src/index.ts cancel <execution-id> [--url <base>] [--header 'Name: value']... [--format json]
 ```
 
 `run` prints the flow's `outputs:` as one JSON object on **stdout** and its
@@ -674,7 +676,21 @@ this verb takes (`execution: exec_…`); under `--format json` the same value is
 effect **consumed** — the model answers it got, the results its tools produced,
 what its stores read, what a person answered — and only the frontier, the first
 effect the journal does not hold, reaches the network. It takes no `--input` and
-no `--session`: the invocation it replays is the one the journal recorded.
+no `--session`: the invocation it replays is the one the journal recorded. An
+execution that was **cancelled** is refused, naming the status: a cancelled
+execution is ended for good.
+
+`cancel` sends `POST /executions/:id/cancel` to the app serving the execution —
+`--url`, or this target's `hub.public_url` where it declares one — with the
+headers `--header` names, which is how the credential the starting trigger's
+`auth:` reads travels. The app stops every node the execution is running (a
+model call, a command, a harness run, a placed dispatch) and every open child
+execution it started; each open instance ends `cancelled`, running its
+`finally:` node; and the row settles `cancelled`. The exit code is `0` when the
+app accepted the request (`202`), `1` when it refused it (`404`, `409` for an
+execution that has already ended, or the trigger's own refusal), and `2` when
+it could not be asked. A `run` is not cancelled this way: interrupting it leaves
+its row open for `resume`.
 
 `store` reads and writes one `kv` store of this composition through this
 target's own backend, with no flow written: `get <key>`, `set <key> <json>`
@@ -699,9 +715,10 @@ so it is recorded nowhere.
 
 `serve` starts the app over the composition's declared `http` triggers and
 announces where it is listening as one JSON line on stdout. Beside them it
-mounts two routes of its own — `GET /executions/:id` for an execution's status
-and `POST /executions/:id/resume` — so those two are the app's and a trigger
-cannot declare either: the compiler refuses one that does. On start it
+mounts three routes of its own — `GET /executions/:id` for an execution's
+status, `POST /executions/:id/resume` and `POST /executions/:id/cancel` — so
+those are the app's and a trigger cannot declare one: the compiler refuses one
+that does. On start it
 **recovers** every execution the journal holds open, before it accepts a
 connection, so a pause comes back under the same wait id and a resume URL
 prepared against the process that died still finds it; triggers are not
@@ -717,8 +734,8 @@ requests it has answered, and restarting it is what reclaims that.
 
 **Who may call, and who a delivery says it is.** A trigger declaring `auth:`
 verifies its caller before it reads a payload, and the execution it starts
-carries that guard: its `GET /executions/:id` and `POST /executions/:id/resume`
-enforce the auth of the trigger that started it, in this process and in the one
+carries that guard: its `GET /executions/:id`, `POST /executions/:id/resume` and
+`POST /executions/:id/cancel` enforce the auth of the trigger that started it, in this process and in the one
 that recovers it after a restart. An execution a trigger with no `auth:` began
 keeps open routes. A trigger's `callback:` is a subscription to the execution's
 **lifecycle** rather than only to its end: one webhook per parking, listing every
@@ -1824,7 +1841,7 @@ mod tests {
             .collect();
         assert_eq!(
             verbs,
-            ["run", "resume", "serve", "store"],
+            ["run", "resume", "serve", "store", "cancel"],
             "the emitted command line's verbs, as `main` dispatches them"
         );
         let readme = readme_of(&ir_of("version: \"0.1\"\n")).contents;

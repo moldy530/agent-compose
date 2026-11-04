@@ -175,6 +175,14 @@ const MYSQL_SCHEMA = [
   admission       LONGTEXT,
   PRIMARY KEY (execution)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
+  // A cancel that was requested (PRD resolved q75, Decision D160): a table of
+  // its own for `lineage`'s reason — a database an earlier build created grows
+  // it by `IF NOT EXISTS` and needs no probe (`docs/durability.md` §11.2).
+  `CREATE TABLE IF NOT EXISTS cancellations (
+  execution    VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  requested_at VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  PRIMARY KEY (execution)
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
 ];
 
 /**

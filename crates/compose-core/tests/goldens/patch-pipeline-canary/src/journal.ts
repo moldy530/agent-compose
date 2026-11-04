@@ -581,8 +581,16 @@ export interface DispatchRow {
   readonly detail?: string;
 }
 
-/** How an execution ended, or that it has not. */
-export type ExecutionStatus = "open" | "completed" | "failed";
+/**
+ * How an execution ended, or that it has not.
+ *
+ * `cancelled` is the fourth, and the one no run reaches on its own: it is what a
+ * cancel requested through `serve`'s `POST /executions/:id/cancel` ends an
+ * execution as (PRD resolved q75, Decision D160). The column is a word, never a
+ * constraint, on every arm, so a journal an earlier build wrote takes the new
+ * one with no migration (`docs/durability.md` §11.2).
+ */
+export type ExecutionStatus = "open" | "completed" | "failed" | "cancelled";
 
 /**
  * A **child execution**'s cause: the detached `flow.*` dispatch that started it
@@ -728,6 +736,21 @@ export interface ExecutionRow {
    * an execution that had none.
    */
   readonly finallyError?: string;
+  /**
+   * When a cancel of this execution was **requested**, as an ISO 8601 instant —
+   * present from the moment `serve` accepted one (PRD resolved q75, Decision
+   * D160, `docs/durability.md` §3.5).
+   *
+   * The request, not the end: it is recorded before the cancel is acted on, so
+   * a process that dies between accepting a cancel and settling the row leaves
+   * an **open** row carrying this, and the recovery that finds it completes the
+   * cancel rather than resuming the body ("restart mid-cancel completes the
+   * cancel", §6.1). Held in a table of its own beside `executions`, for the
+   * reason [`lineage`][`ExecutionRow.lineage`] is: a whole table is what a
+   * journal an earlier build wrote grows by `CREATE TABLE IF NOT EXISTS`, on
+   * every backend, with no column probe.
+   */
+  readonly cancelRequestedAt?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -764,6 +787,13 @@ export interface Journal {
     error?: string,
     finallyError?: string,
   ): Promise<void>;
+  /**
+   * Record that a cancel of this execution was requested (PRD resolved q75,
+   * Decision D160) — before the cancel is acted on, so a restart finds the
+   * request on an open row and completes it ([`ExecutionRow.cancelRequestedAt`]).
+   * Idempotent: a second request keeps the instant of the first.
+   */
+  requestCancel(id: string): Promise<void>;
   /** One execution's lifecycle row. */
   execution(id: string): Promise<ExecutionRow | undefined>;
   /** Every execution the journal holds open, oldest first. */
@@ -1050,8 +1080,10 @@ const WITH_LINEAGE = `SELECT executions.*,
          lineage.parent AS lineage_parent,
          lineage.idempotency_key AS lineage_key,
          lineage.item_index AS lineage_item_index,
-         lineage.admission AS lineage_admission
-       FROM executions LEFT JOIN lineage ON lineage.execution = executions.id`;
+         lineage.admission AS lineage_admission,
+         cancellations.requested_at AS cancel_requested_at
+       FROM executions LEFT JOIN lineage ON lineage.execution = executions.id
+         LEFT JOIN cancellations ON cancellations.execution = executions.id`;
 
 /** `ON CONFLICT … DO NOTHING`, which SQLite and Postgres both speak. */
 function standardConflict(target: string, _noop: string): string {
@@ -1192,6 +1224,16 @@ class SqlJournal implements Journal {
       this.#run(
         "UPDATE executions SET status = ?, ended_at = ?, error = ?, finally_error = ? WHERE id = ?",
         [status, new Date().toISOString(), error ?? null, finallyError ?? null, id],
+      ),
+    );
+  }
+
+  requestCancel(id: string): Promise<void> {
+    return this.#serial(() =>
+      this.#run(
+        `INSERT INTO cancellations (execution, requested_at) VALUES (?, ?)
+         ${this.#conflict("(execution)", "execution = execution")}`,
+        [id, new Date().toISOString()],
       ),
     );
   }
@@ -1691,6 +1733,16 @@ CREATE TABLE IF NOT EXISTS lineage (
   item_index      INTEGER,
   admission       TEXT
 );
+-- A cancel that was requested (PRD resolved q75, Decision D160,
+-- \`docs/durability.md\` §3.5): one row per execution somebody asked to cancel,
+-- written before the cancel is acted on, so a restart that finds the execution
+-- still open completes the cancel rather than resuming it. A table of its own,
+-- for \`lineage\`'s reason: a journal an older build wrote grows it by the
+-- \`IF NOT EXISTS\` and no probe.
+CREATE TABLE IF NOT EXISTS cancellations (
+  execution    TEXT PRIMARY KEY,
+  requested_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS effects_of_execution ON effects (execution);
 CREATE INDEX IF NOT EXISTS executions_by_status ON executions (status, started_at);
 CREATE INDEX IF NOT EXISTS deliveries_by_status ON deliveries (status, intended_at);
@@ -2019,6 +2071,9 @@ function executionOf(row: Row): ExecutionRow {
   // column on, which reads `null` — the same answer as a run whose finally node
   // did not fail, or that had none (`docs/durability.md` §3.5, §11.2).
   const finallyError = held["finally_error"];
+  // Absent wherever nobody asked to cancel this execution: the `cancellations`
+  // table holds no row for it, and the join answers `null` (see [`WITH_LINEAGE`]).
+  const cancelRequestedAt = held["cancel_requested_at"];
   const callback = held["callback"];
   const traceparent = held["traceparent"];
   const parent = held["lineage_parent"];
@@ -2057,6 +2112,9 @@ function executionOf(row: Row): ExecutionRow {
     ...(finallyError === null || finallyError === undefined
       ? {}
       : { finallyError: String(finallyError) }),
+    ...(cancelRequestedAt === null || cancelRequestedAt === undefined
+      ? {}
+      : { cancelRequestedAt: String(cancelRequestedAt) }),
   };
 }
 
@@ -2418,6 +2476,106 @@ function sorted(value: unknown): unknown {
 }
 
 // ---------------------------------------------------------------------------
+// Cancellation (PRD resolved q75, Decision D160)
+// ---------------------------------------------------------------------------
+
+/**
+ * Why an execution's work stopped: somebody cancelled it (PRD resolved q75,
+ * Decision D160).
+ *
+ * The **reason** the execution's one abort controller aborts with
+ * (`./runtime.ts`'s `cancelExecution`), and so what every signal chained to it
+ * carries — the `fetch` a model call made, a spawned command's, a harness run's,
+ * every instance's stop. Defined here rather than beside the controller because
+ * the effect seam has to recognise it: an effect the cancel stopped is not an
+ * outcome of the world, and recording it would hand a later generation a
+ * failure it would replay as one ([`journaled`]). Recognised by its **name** as
+ * well as by its class ([`cancellationOf`]), because one crosses a process: a
+ * worker posts `status: "cancelled"` and the hub settles the dispatch row with
+ * an error of this name (`docs/distributed.md` §3.4), which a replay reads back
+ * as a plain `Error` carrying it.
+ */
+export class ExecutionCancelled extends Error {
+  /** The execution that was cancelled. */
+  readonly execution: string;
+
+  constructor(execution: string) {
+    super(`execution \`${execution}\` was cancelled`);
+    this.name = "ExecutionCancelled";
+    this.execution = execution;
+  }
+}
+
+/**
+ * The cancellation on this error's `cause` chain, if a cancel is what stopped
+ * the work that raised it — the [`ExecutionCancelled`] itself, or an error of
+ * that name a replay or a worker carried home.
+ */
+export function cancellationOf(error: unknown): Error | undefined {
+  for (let held: unknown = error; held !== undefined && held !== null; ) {
+    if (held instanceof ExecutionCancelled) return held;
+    if (held instanceof Error && held.name === "ExecutionCancelled") return held;
+    held = (held as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+/**
+ * The executions whose cancel has fired in this process — read by the effect
+ * seam to keep an effect the cancel stopped off the record ([`journaled`]).
+ */
+const cancelledHere = new Set<string>();
+
+/** Note that `execution`'s cancel has fired here (`./runtime.ts`'s `cancelExecution`). */
+export function noteCancelled(execution: string): void {
+  cancelledHere.add(execution);
+}
+
+/**
+ * Whether what an effect threw is the cancel rather than the world: a
+ * cancellation on its chain, or — once this execution's cancel has fired — the
+ * `AbortError` a platform raises for a signal whose reason it did not keep.
+ */
+function stoppedByCancel(execution: string, error: unknown): boolean {
+  if (cancellationOf(error) !== undefined) return true;
+  return cancelledHere.has(execution) && error instanceof Error && error.name === "AbortError";
+}
+
+/**
+ * Who decides what a **frontier** does in an execution whose cancel was
+ * requested before this generation began (PRD resolved q75, Decision D160,
+ * `docs/durability.md` §6.1): the hook `./runtime.ts` installs for a recovered
+ * row carrying a cancel request.
+ *
+ * Restart mid-cancel completes the cancel, and this is where: the recovered
+ * generation replays its recorded prefix as any resume does — every instance
+ * the dying process had open is re-entered, so each ends here, innermost first,
+ * and runs its own `finally:` node — and the first effect the journal does not
+ * hold is where the dying process's cancel would have stopped it. The hook
+ * fires the cancel there and answers the reason, which the claim raises: the
+ * effect is never issued, and nothing past the record runs but the ends the
+ * cancel owes. It answers `undefined` for a site the cancel does not stop — a
+ * `finally:` node's, which runs whatever ended its instance.
+ */
+export type FrontierHook = (site: string) => Error | undefined;
+
+const frontiers = new Map<string, FrontierHook>();
+
+/** Install `execution`'s frontier hook ([`FrontierHook`]). */
+export function cancelAtFrontier(execution: string, hook: FrontierHook): void {
+  frontiers.set(execution, hook);
+}
+
+/**
+ * What the frontier at `site` of `execution` raises, where its hook says the
+ * cancel stops it there — also asked by a frontier the effect seam does not see,
+ * a placed node re-attaching to a dispatch still unsettled (`./mesh.ts`).
+ */
+export function frontierRefusal(execution: string, site: string): Error | undefined {
+  return frontiers.get(execution)?.(site);
+}
+
+// ---------------------------------------------------------------------------
 // Divergence
 // ---------------------------------------------------------------------------
 
@@ -2541,6 +2699,8 @@ export function closeSession(execution: string): void {
   sessions.delete(execution);
   latched.delete(execution);
   marks.delete(execution);
+  cancelledHere.delete(execution);
+  frontiers.delete(execution);
 }
 
 /**
@@ -2658,6 +2818,11 @@ export class EffectRecorder {
     return this.#site;
   }
 
+  /** The execution this recorder journals. */
+  get execution(): string {
+    return this.#session.execution;
+  }
+
   /**
    * The recorder for a site nested under this one — a `map`'s dispatch.
    *
@@ -2743,6 +2908,14 @@ export class EffectRecorder {
       // because a frontier is per key rather than a state the execution enters —
       // a `map` whose third item had run and whose fourth had not resumes with
       // three replayed branches and one live one.
+      //
+      // …unless a cancel was requested before this generation began: the
+      // frontier is where it stops the execution, and this effect is never
+      // issued ([`FrontierHook`]).
+      if (found === undefined) {
+        const refusal = frontierRefusal(session.execution, site);
+        if (refusal !== undefined) throw refusal;
+      }
     }
 
     const from: ReplayedFrom = {
@@ -3140,6 +3313,13 @@ export async function journaled<T>(
     // effect never reached, and a later resume would replay that error as the
     // world's, absorbable by the very policies resolved q29 keeps it away from.
     if (error instanceof ReplayDivergence) throw error;
+    // Nor is a **cancel** (PRD resolved q75): the effect did not fail, its
+    // execution was stopped while it was in flight. Recorded, it would be
+    // replayed as the world's failure by the generation that completes a cancel
+    // a restart interrupted — and absorbed by a `retry:` or an `on_error:` that a
+    // cancel is never routed through. Left unrecorded, that generation meets a
+    // frontier here and the cancel stops it again ([`FrontierHook`]).
+    if (stoppedByCancel(recorder.execution, error)) throw error;
     await slot.fail(error);
     throw error;
   }

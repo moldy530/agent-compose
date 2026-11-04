@@ -317,9 +317,11 @@ export function exportRequest(
         ? { code: 1 }
         : document.status === "failed"
           ? { code: 2, ...(document.error === undefined ? {} : { message: document.error }) }
-          : // A run holding a question nobody answered is neither: it is the one
-            // envelope status that is not an outcome, so it is left `UNSET` and
-            // said in `agentcompose.status` instead (`docs/trace.md` §12.4).
+          : // A run holding a question nobody answered is neither: it is not an
+            // outcome. Nor is a cancelled run either: somebody stopped it, which
+            // is not something that went wrong and not a success (PRD resolved
+            // q75). Both are left `UNSET` and said in `agentcompose.status`
+            // instead (`docs/trace.md` §12.4).
             { code: 0 },
   });
 
@@ -445,7 +447,8 @@ function walk(
             ? { code: 2, ...(entry.error === undefined ? {} : { message: entry.error }) }
             : // A node its `on_error:` skipped did not succeed and did not fail
               // the run; its `error` says what was absorbed, and it is on the
-              // attributes.
+              // attributes. A node a cancel stopped carries no `error` at all
+              // (`docs/trace.md` §3.2): `agentcompose.outcome` says it.
               { code: 0 },
     });
 

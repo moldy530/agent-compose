@@ -924,6 +924,7 @@ mod tests {
         assert_eq!(
             expected.keys().collect::<Vec<_>>(),
             vec![
+                "cancellations",
                 "deliveries",
                 "dispatches",
                 "effects",
@@ -931,8 +932,9 @@ mod tests {
                 "lineage"
             ],
             "the SQLite schema is the inventory every other backend is held to, and it no \
-             longer holds the five tables `docs/durability.md` §3 describes — the fifth \
-             being a child execution's cause, beside its lifecycle row (§3.5, PRD resolved q65)"
+             longer holds the six tables `docs/durability.md` §3 describes — a child \
+             execution's cause (§3.5, PRD resolved q65) and a cancel's request (§3.5, PRD \
+             resolved q75) beside the lifecycle row"
         );
         for (arm, name) in [
             (POSTGRES, "journal-postgres.ts"),
@@ -1187,7 +1189,7 @@ mod tests {
             // Not a call to the world: the boundary a flow instance crosses into
             // its `finally:` node, journaled through the same seam so a resumed
             // generation reads how the instance ended (grammar 7.9, §3.10).
-            ("endInstance", runtime, "src/runtime.ts"),
+            ("endInstanceAt", runtime, "src/runtime.ts"),
         ] {
             let body = function_body(source, site);
             assert!(
@@ -1734,11 +1736,15 @@ mod tests {
     ///    *command*, like `writeTrace`'s file: a recovered execution is replayed
     ///    into a server that is already listening, so nothing here is ever
     ///    reached a second time by a replay.
-    const INERT_MODULES: [&str; 6] = [
+    ///  * `node:events` — `setMaxListeners`, which lifts the listener ceiling on
+    ///    an execution's cancel signal (PRD resolved q75): bookkeeping on an
+    ///    in-process object, which reaches nothing outside it.
+    const INERT_MODULES: [&str; 7] = [
         "node:path",
         "node:process",
         "node:url",
         "node:crypto",
+        "node:events",
         "@langchain/langgraph",
         "fastify",
     ];
@@ -1815,6 +1821,13 @@ mod tests {
         //    writes reach the store through `perform`, the function every
         //    store-op node's op runs, so they are read under that seam's name
         //    rather than exempted here.
+        //  * `cancelVerb` — the project's command line asking a running app to
+        //    cancel an execution (`POST /executions/:id/cancel`, PRD resolved
+        //    q75). An operator's request at the command line, like a `store`
+        //    verb's: no graph issues it, no execution's journal holds it, and the
+        //    app it reaches records the request on its own journal before it
+        //    acts, so a second request is the route's no-op rather than a
+        //    second effect.
         //  * the journal's **own** storage: the three drivers, the open paths
         //    that create and migrate each backend's schema, the lock a killed
         //    writer leaves behind (§2), and `journalExists`. These are the record
@@ -1822,7 +1835,7 @@ mod tests {
         //    its own journal, which is what a replay *is*. The two remote arms
         //    are read here like every other emitted module, so a driver call
         //    that ever escaped one of them fails this test rather than nothing.
-        const NOT_AN_EFFECT: [(&str, &str); 17] = [
+        const NOT_AN_EFFECT: [(&str, &str); 18] = [
             ("src/stores.ts", "releaseExecution"),
             ("src/stores.ts", "pruneStore"),
             ("src/stores.ts", "pruneBlobLedger"),
@@ -1831,6 +1844,7 @@ mod tests {
             ("src/delivery.ts", "attemptDelivery"),
             ("src/cli.ts", "writeTrace"),
             ("src/cli.ts", "readImportFile"),
+            ("src/cli.ts", "cancelVerb"),
             ("src/journal.ts", "SqliteDriver"),
             ("src/journal.ts", "openSqlite"),
             ("src/journal.ts", "breakStaleLock"),
