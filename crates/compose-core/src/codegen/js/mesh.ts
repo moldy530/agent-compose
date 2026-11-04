@@ -251,22 +251,28 @@ interface Session {
   /** When this session last made a request — what the window is measured from. */
   seen: number;
   /**
-   * The dispatches this session holds that the hub has **cancelled** and not
-   * yet told it about (PRD resolved q75): the next poll answers them as its
-   * `cancel` list (§3.2), and a held poll is answered at once to carry them.
+   * The dispatches this session holds that the hub has cancelled or stopped
+   * waiting for ([`cancelling`], [`stopping`]) and that a held poll is still
+   * answered **at once** for, each with how many more answers that is.
+   *
+   * What the lists carry is not this: every `200` names every such dispatch
+   * the session holds, until its result arrives ([`owed`]). This is only
+   * whether a poll waits out its hold first, and a name is owed two answers
+   * at once ([`SAID_AT_ONCE`]): the one that first carries it, and the one
+   * after — so a first answer lost on the way, a connection reset after the
+   * write, costs the round trip of the poll the worker makes next rather than
+   * a whole hold.
    */
-  readonly cancels: Set<string>;
-  /**
-   * The dispatches this session holds that the hub has **stopped waiting for**
-   * and not yet told it about — the node's `timeout:` ran out, or its
-   * execution ended around it ([`stopping`]): the next poll answers them as
-   * its `stop` list (§3.2), and a held poll is answered at once to carry them.
-   * Never on [`Session.cancels`], because the worker stops the two
-   * differently: a cancel is the execution's, and ends what the node began on
-   * the worker `cancelled`; a stop is nobody's cancel, and ends it `failed`.
-   */
-  readonly stops: Set<string>;
+  readonly unsaid: Map<string, number>;
 }
+
+/**
+ * How many answers a held poll is given **at once** for a dispatch the hub has
+ * just cancelled or stopped waiting for ([`Session.unsaid`]): the one that
+ * first names it, and one more — what the next poll is answered with, at
+ * once, whether or not the first answer arrived.
+ */
+const SAID_AT_ONCE = 2;
 
 /** Every session this process has issued and not forgotten. */
 const sessions = new Map<string, Session>();
@@ -290,9 +296,11 @@ const polling = new Map<string, number>();
  * the instances it began there are still ending, each one's finally node run —
  * so each still counts against its session's capacity, and the cancelled node
  * still waits on it, until the worker's `status: "cancelled"` result settles it
- * (§3.4) — or the session ends and the sweep supersedes it (§6.3).
+ * (§3.4) — or the session ends and the sweep supersedes it (§6.3). Each with
+ * the session holding it, which every poll that session makes is told of it
+ * until then ([`owed`]).
  */
-const cancelling = new Set<string>();
+const cancelling = new Map<string, string>();
 
 /**
  * The dispatches the hub **stopped waiting for** while a worker ran them — the
@@ -309,7 +317,7 @@ const cancelling = new Set<string>();
  * `failed` — as the same instances do on the hub when the node that began
  * them runs out of time (grammar §7.9, PRD resolved q76).
  */
-const stopping = new Set<string>();
+const stopping = new Map<string, string>();
 
 /**
  * How many times the board has moved in this process.
@@ -523,6 +531,13 @@ interface Awaiting {
   readonly settle: (outcome: JournalOutcome) => void;
   /** Whether a worker is holding it, for [`parkedWork`]. */
   taken: boolean;
+  /**
+   * Why the hub stopped waiting for it while a worker ran it — the node's
+   * `timeout:` ran out — where it did: the node is held open on the worker's
+   * result for it all the same ([`releaseStopped`]), and this is the failure
+   * it is let go with.
+   */
+  stopped?: string;
 }
 
 /**
@@ -777,14 +792,28 @@ function stopOnHolder(id: string, row: DispatchRow, why: "cancel" | "stop"): boo
   if (current.status !== "dispatched" || current.session === undefined) return false;
   const session = sessions.get(current.session);
   if (session === undefined) return false;
-  if (why === "cancel") {
-    cancelling.add(id);
-    session.cancels.add(id);
-  } else {
-    stopping.add(id);
-    session.stops.add(id);
-  }
+  if (why === "cancel") cancelling.set(id, session.id);
+  else stopping.set(id, session.id);
+  session.unsaid.set(id, SAID_AT_ONCE);
   return true;
+}
+
+/**
+ * Let go of a placed node held open on a dispatch its deadline stopped waiting
+ * for ([`Awaiting.stopped`]): the worker's result for it came home, or it is
+ * known never to have reached a runner — failed as the hub stopped waiting,
+ * with the `finally_error` the result carried, which is the execution's
+ * (§3.4, PRD resolved q76). Nothing for any other dispatch.
+ */
+function releaseStopped(id: string, finallyError?: string): void {
+  const held = awaiting.get(id);
+  if (held?.stopped === undefined) return;
+  held.settle({
+    kind: "error",
+    name: "DispatchSuperseded",
+    message: held.stopped,
+    ...(finallyError === undefined ? {} : { finallyError }),
+  });
 }
 
 /**
@@ -886,8 +915,25 @@ function awaited(
       // giving up on it, and a slot freed while its process still runs is a
       // session running more than its placement's `max_running:` (§2, Decision
       // D161).
-      if (!stopOnHolder(row.id, row, "stop")) rows.delete(row.id);
-      held.settle({ kind: "error", name: "DispatchSuperseded", message: reason });
+      //
+      // **And the node waits for it**, as a cancelled one does. What the node
+      // began, it began on the worker — an attached `flow.*`, whose finally
+      // node the stop starts there — and a node whose deadline ran out settles
+      // only once every instance it began has ended, each one's finally node
+      // run (grammar §7.9, Decision D159). So the wait is kept until that
+      // dispatch's result comes home — refused `409` as ever, and read for the
+      // `finally_error` beside it ([`releaseStopped`]) — or the session is lost
+      // (§6.3), and held at this node's site, which the node's deadline and
+      // every end around it wait for: the inner finally node runs before an
+      // outer one, and its failure is the execution's. The worker's grace
+      // bounds it (§3.2).
+      if (stopOnHolder(row.id, row, "stop")) {
+        held.stopped = reason;
+        holdRemoteEnd(options.execution, site, ended);
+      } else {
+        rows.delete(row.id);
+        held.settle({ kind: "error", name: "DispatchSuperseded", message: reason });
+      }
       void journal
         .supersedeDispatch(row.id, `the hub stopped waiting for this dispatch: ${reason}`)
         .catch((error: unknown) => {
@@ -1256,6 +1302,12 @@ export function releasePlacementWaits(execution: string): void {
         name: CANCELLED,
         message: new ExecutionCancelled(execution).message,
       });
+      continue;
+    }
+    // One whose node's deadline already stopped waiting for it is told to stop
+    // and superseded already: only the node held open on it is let go.
+    if (held.stopped !== undefined) {
+      releaseStopped(id);
       continue;
     }
     // A dispatch a worker is running is told to stop, and counts until it has
@@ -1656,8 +1708,7 @@ async function join(request: FastifyRequest, reply: FastifyReply): Promise<unkno
     // A provisioning join is answered normally and dispatched nothing (§3.1).
     dispatchable: current,
     seen: Date.now(),
-    cancels: new Set(),
-    stops: new Set(),
+    unsaid: new Map(),
   };
   sessions.set(session.id, session);
   // §6.2's wake: a join that may be dispatched to is what a parked placement
@@ -1796,11 +1847,12 @@ async function poll(
       const dispatch = await taken(session);
       // **The cancel list and the stop list** (§3.2, PRD resolved q75): every
       // dispatch this session holds that the hub has cancelled, or stopped
-      // waiting for, since it last told it, on every `200` — and a reason to
-      // answer at once, with or without work. Taken off the session only once
-      // the answer is about to be written: a worker that hung up is told on
-      // the poll it makes next.
-      if (dispatch === undefined && (session.cancels.size > 0 || session.stops.size > 0)) {
+      // waiting for, on every `200` until its result arrives — and a reason to
+      // answer at once, with or without work, while one is owed that
+      // ([`Session.unsaid`]). Counted off the session only once the answer is
+      // about to be written: a worker that hung up is told on the poll it
+      // makes next.
+      if (dispatch === undefined && owesAtOnce(session)) {
         if (away()) return reply.code(204).send();
         return reply.code(200).send(owed(session));
       }
@@ -1828,7 +1880,15 @@ async function poll(
         return reply.code(200).send({ ...dispatch, ...owed(session) });
       }
       const left = deadline - Date.now();
-      if (left <= 0) return reply.code(204).send();
+      if (left <= 0) {
+        // A hold that ends with a cancel or a stop still outstanding names it
+        // again rather than answering `204`: whatever became of the answers
+        // that named it before, the worker hears of it once a hold (§3.2).
+        const lists = owed(session);
+        return lists.cancel.length === 0 && lists.stop.length === 0
+          ? reply.code(204).send()
+          : reply.code(200).send(lists);
+      }
       await held(Math.min(left, holdMs), seen, holds);
     }
   } finally {
@@ -1851,17 +1911,43 @@ async function poll(
 }
 
 /**
- * The two lists a poll's `200` carries (§3.2), taken off the session as they
- * are written: the dispatches it holds that the hub has **cancelled** since it
- * last said so, and those it has **stopped waiting for** — each an empty array
- * where there are none.
+ * The two lists a poll's `200` carries (§3.2): the dispatches this session
+ * holds that the hub has **cancelled**, and those it has **stopped waiting
+ * for** — each an empty array where there are none — every one of them named
+ * on every answer **until its result arrives** ([`cancelling`], [`stopping`]),
+ * not only on the first. An answer lost on the way — a connection reset after
+ * it was written, a worker whose request timed out as it was — would otherwise
+ * be the only one that ever named it, and the cancel would complete only when
+ * the node ended by itself. A worker keeps the first word it was given for a
+ * dispatch and holds no name it is told twice (§3.2), so saying it again costs
+ * it nothing. Each answer is one fewer owed at once ([`Session.unsaid`]).
  */
 function owed(session: Session): { cancel: string[]; stop: string[] } {
-  const cancel = [...session.cancels];
-  const stop = [...session.stops];
-  session.cancels.clear();
-  session.stops.clear();
+  const cancel: string[] = [];
+  const stop: string[] = [];
+  for (const [id, holder] of cancelling) if (holder === session.id) cancel.push(id);
+  for (const [id, holder] of stopping) if (holder === session.id) stop.push(id);
+  for (const [id, left] of [...session.unsaid]) {
+    if (left <= 1) session.unsaid.delete(id);
+    else session.unsaid.set(id, left - 1);
+  }
   return { cancel, stop };
+}
+
+/**
+ * Whether a poll of this session is answered **at once** for a cancel or a
+ * stop ([`Session.unsaid`]) — a name owed that whose dispatch the hub is still
+ * waiting on the worker for. One that has left [`cancelling`] and
+ * [`stopping`] — its result arrived, or the claim that would have handed it
+ * over was undone — is owed nothing, and is forgotten here.
+ */
+function owesAtOnce(session: Session): boolean {
+  for (const id of [...session.unsaid.keys()]) {
+    if (cancelling.get(id) !== session.id && stopping.get(id) !== session.id) {
+      session.unsaid.delete(id);
+    }
+  }
+  return session.unsaid.size > 0;
 }
 
 /**
@@ -1961,21 +2047,25 @@ async function taken(session: Session): Promise<Record<string, unknown> | undefi
  * it would go to the next worker with no poll's lists naming it and run whole,
  * while the node waited on a cancelled result from a worker that never had it.
  * So it ends here the way a stop ends a dispatch no worker holds: a deadline's
- * is already settled and its superseding write already on its way, and a
- * cancel's is withdrawn as a parked row is ([`awaited`]) — the node settled
- * cancelled, the row superseded as the cancel it was (PRD resolved q75).
+ * superseding write is already on its way, and the node it held open is let
+ * go ([`releaseStopped`]); and a cancel's is withdrawn as a parked row is
+ * ([`awaited`]) — the node settled cancelled, the row superseded as the cancel
+ * it was (PRD resolved q75).
  */
 async function released(id: string, session: string): Promise<void> {
   const journal = await openJournal();
   if (stopping.delete(id)) {
     rows.delete(id);
-    sessions.get(session)?.stops.delete(id);
+    sessions.get(session)?.unsaid.delete(id);
+    // A node its deadline held open on this dispatch's result: no runner
+    // ever had it, so no result is coming.
+    releaseStopped(id);
     stirPolls();
     return;
   }
   if (cancelling.delete(id)) {
     rows.delete(id);
-    sessions.get(session)?.cancels.delete(id);
+    sessions.get(session)?.unsaid.delete(id);
     const held = awaiting.get(id);
     if (held !== undefined) {
       held.settle({
@@ -2310,6 +2400,12 @@ async function result(request: FastifyRequest, reply: FastifyReply): Promise<unk
   // past.
   if (stopping.delete(id)) {
     rows.delete(id);
+    // …and the node its deadline held open on this result is let go, with the
+    // `finally_error` the result carries beside its ending: a finally node the
+    // stop started on the worker, and that failed, failed inside this
+    // execution, which records it before it settles (§3.4, PRD resolved q76).
+    const finallyError = body["finally_error"];
+    releaseStopped(id, typeof finallyError === "string" ? finallyError : undefined);
     stirPolls();
     return reply.code(409).send({
       dispatch_id: id,
@@ -2399,7 +2495,7 @@ async function settlementOf(
   row: DispatchRow,
   body: Record<string, unknown>,
 ): Promise<JournalOutcome> {
-  const outcome = await endingSettled(journal, row, body);
+  const outcome = racedTheCancel(row, body) ?? (await endingSettled(journal, row, body));
   // §3.4's `finally_error`, beside whichever ending the body carried: a finally
   // node that ran inside the placed node — a flow-as-tool instance's — and
   // failed after its retries. Kept on the settled outcome rather than only in
@@ -2414,6 +2510,29 @@ async function settlementOf(
         kind: "value",
         value: { ...(outcome.value as Record<string, unknown>), finallyError },
       };
+}
+
+/**
+ * The cancellation a result settles its dispatch with where it **raced the
+ * cancel**: an ordinary ending — an output, a failure, a pause, with no
+ * `status` — for a dispatch the hub had already cancelled and told its worker
+ * to stop ([`cancelling`]), because the runner finished, or reached a
+ * question, before the stop arrived. `undefined` for every other result.
+ *
+ * Live, that node is cancelled whatever the worker answered ([`awaited`]'s
+ * `cancelledOnWorker`), so the row says so too: journaled with the ordinary
+ * ending, it would be read back by a restarted hub's replay as the node's
+ * answer, and a body whose last node it was would settle `completed` rather
+ * than `cancelled` (PRD resolved q75 ruling e, `docs/durability.md` §6.1). A
+ * body that carries a `status` is read by its own rules ([`endingSettled`]).
+ */
+function racedTheCancel(
+  row: DispatchRow,
+  body: Record<string, unknown>,
+): JournalOutcome | undefined {
+  if (!cancelling.has(row.id)) return undefined;
+  if (body["status"] !== undefined && body["status"] !== null) return undefined;
+  return { kind: "error", name: CANCELLED, message: new ExecutionCancelled(row.execution).message };
 }
 
 /** The ending a result body carries, before §3.4's `finally_error` is added to it. */
@@ -2654,6 +2773,13 @@ async function sweep(windowMs: number): Promise<void> {
   if (stale.length === 0) return;
   for (const id of stale) sessions.delete(id);
   const journal = await openJournal();
+  // What the hub was waiting on a stale session's worker for, and holds no
+  // row of here any more, is nothing anyone will now answer.
+  for (const owing of [cancelling, stopping]) {
+    for (const [id, holder] of [...owing]) {
+      if (stale.includes(holder) && !rows.has(id)) owing.delete(id);
+    }
+  }
   for (const [id, row] of [...rows]) {
     if (row.session === undefined || !stale.includes(row.session)) continue;
     if (row.status !== "dispatched") continue;

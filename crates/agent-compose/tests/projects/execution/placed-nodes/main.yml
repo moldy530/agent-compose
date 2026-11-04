@@ -81,7 +81,10 @@
 #     is still running on the worker, and tells the worker to **stop** it —
 #     never to cancel it, because nobody cancelled the execution. So that
 #     instance ends `failed`, as it does when an unplaced node runs out of time,
-#     and its finally boundary — journaled from the worker — says so.
+#     and its finally boundary — journaled from the worker — says so. The stop
+#     takes the instance's running command with it, and the placed node waits
+#     for the worker's result, so the finally node's own failure is the
+#     execution's `finally_error`.
 #
 # `agent.signer` attaches `tool.sign` and both are members of `mac`, which is
 # grammar §14.1 rule 4's second row: the same answer written twice. `tool.sign`'s
@@ -539,10 +542,10 @@ agent.lapser:
       min_length: 1
 
 # Attached, never triggered: a body that outlasts any test, and a finally node
-# that ends at once, so the outcome its boundary records is the whole of what
-# a test reads.
+# that ends at once and fails, so the outcome its boundary records and the
+# `finally_error` it raises are the whole of what a test reads.
 flow.lapsing:
-  description: Look one release over at length, and tidy up after it.
+  description: Look one release over at length, and tidy up after it — which never works.
   inputs:
     path:
       type: string
@@ -555,7 +558,8 @@ flow.lapsing:
         args: ["600"]
     lapse_up:
       exec:
-        command: "${OPS_BIN}/true"
+        command: "${OPS_BIN}/sh"
+        args: ["-c", "exit 5"]
   edges:
     - { from: start, to: look_long }
     - { from: look_long, to: end }
@@ -784,8 +788,10 @@ flow.closed:
 # A placed node's deadline reaching an attached flow's finally node on a worker:
 # `lapse` is placed with four seconds, its model calls `flow.lapsing`, and the
 # hub stops waiting while that instance's body runs. The worker is told to stop
-# the dispatch — not to cancel it — so the instance ends `failed` there and its
-# finally node runs at that outcome (grammar §7.9, `docs/distributed.md` §3.2).
+# the dispatch — not to cancel it — so the instance ends `failed` there, its
+# command stopped with it, and its finally node runs at that outcome and fails;
+# and `lapse` waits for that, so the failure is the execution's (grammar §7.9,
+# `docs/distributed.md` §3.2).
 flow.lapsed:
   description: A placed agent whose own deadline runs out while its attached flow runs on the worker.
   inputs:

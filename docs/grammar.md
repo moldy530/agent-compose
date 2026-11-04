@@ -12399,16 +12399,24 @@ signal delivered to the process sweeps it exactly as it sweeps `builtin.bash`'s
 (D124), and `Ctrl-C` at a `run` still stops the command it was running; what
 still escapes is what left the group on purpose — `setsid`, a double-forked
 daemon. That amends D124's "those escape a hand-rolled `exec:` tool
-identically": an `exec:` tool's forked children no longer escape it.
+identically": an `exec:` tool's forked children no longer escape it. **A
+worker's stop reaches it too** (D161): in a node runner every node chains to
+the runner's stop beside the execution's cancel, so a command an attached
+`flow.*` is running when the hub stops waiting for the placed node is stopped
+whole like any other — not left, as an ended instance's let-go node is on the
+hub, to outlive the runner its worker kills a grace later.
 
 **Waits.** A `human` pause is released: its wait is abandoned, nothing will
 answer it now, and the instance holding it ends `cancelled` — q76's
 abandoned-pause path, at this outcome. A placement wait is released by the same
 abort: a dispatch still parked is withdrawn from the board, and one a worker
-holds is cancelled over the wire — the hub names it in the worker's next poll's
-`cancel` list, the worker stops the process running it and posts `status:
-"cancelled"`, and that result settles the row (`docs/distributed.md` §3.2,
-§3.4). Until it does, the dispatch still counts against the worker session's
+holds is cancelled over the wire — the hub names it in the `cancel` list of
+every poll answer it gives that worker until the result arrives, the worker
+stops the process running it and posts `status: "cancelled"`, and that result
+settles the row (`docs/distributed.md` §3.2, §3.4). A result without a
+`status` that raced the cancel — the runner finished before the stop reached
+it — settles the row as the cancel all the same, so a replay never reads the
+cancelled node as answered. Until it does, the dispatch still counts against the worker session's
 capacity, because its process is still stopping (D161). A finally node the
 cancel starts on the worker — an attached flow's, whose instance the cancel
 ended there — runs whole like any other: the worker's grace before it kills a
@@ -12448,6 +12456,21 @@ dispatch, so a process that died between recording the parent's
 request and a child's leaves no child to resume as if nothing had asked it to
 stop. A body whose whole record replays to its end had ended before the cancel
 could reach it, and settles as it ended.
+
+**What a worker cannot learn across the restart.** A dispatch a worker was
+running when the process died ends as the cancel's on the hub, but the worker
+hears only the `410` its session meets — which says the session ended, not
+why — and stops what that session held as a **stop** (D161), never as a
+cancel. So the instances the placed node began there end `failed`, their
+finally nodes read `execution.outcome == "failed"`, and the boundary each
+crosses is journaled into an execution that settles `cancelled` — PRD resolved
+q75 ruling e's "the q76 `finally:` runs with outcome `cancelled`" is met on the
+hub and not on that worker. The same holds where the hub dies between
+recording a cancel and writing the poll answer that names it. Closing it needs
+the restarted hub to tell the worker — on the first answer under its new
+session, every row it left `dispatched` for a cancel's frontier — and the
+worker to hold its orphan stops until that answer: a protocol choice, left to
+the owner (`docs/distributed.md` §5).
 
 **A cancel before the row is begun.** `serve` answers a trigger's request while
 the execution's lifecycle row is still being begun — on a dialled journal, a
@@ -12496,7 +12519,10 @@ it is the implementation's, and awaits the owner's ruling where marked: that
 `execution.error` is absent on `cancelled`; that a cancel arriving after the
 root's body ended changes no outcome; that a detached `agent.*`/`tool.*`
 delivery is stopped as a running node; that a stopped effect is not recorded;
-and that a recovered cancel completes at the replay's frontier. *PRD resolved
+that a recovered cancel completes at the replay's frontier; and that a worker
+holding a dispatch across a restart mid-cancel ends what it began there
+`failed`, not `cancelled` (above), which is a limitation the protocol does not
+close. *PRD resolved
 q28, q29, q32, q34, q65, q75, q76; §7.6.3, §7.9, §8.6, §13.3; amends D70, D124,
 D159; builds on D94, D102, D150.*
 
@@ -12534,8 +12560,9 @@ cancelled stays on its session's count until the worker's cancelled result
 settles it, because the process running it is still stopping (D160). So does
 one the hub **stopped waiting for** while a worker ran it — the node's own
 `timeout:` ran out, or its execution ended around it: the hub supersedes the
-row, names it in the holder's next poll's **`stop`** list, and counts it until
-the worker's result for it arrives, which is refused `409` and frees the slot.
+row, names it in the **`stop`** list of the holder's poll answers until the
+worker's result for it arrives, and counts it until then; that result is
+refused `409` and frees the slot.
 The hub giving up on a dispatch is not the worker stopping it, and a slot freed
 at once would be handed new work while the old process still ran. The one slot
 the hub cannot count is a **lost session's** — a hub restarted, or one whose
@@ -12558,7 +12585,21 @@ crosses — journaled from the worker like any record — would be handed back t
 retry's redispatch and replayed as the cancel nobody made. So the poll's `200`
 carries a second list, `stop`, its names are sent `SIGUSR2` where a cancel's are
 sent `SIGTERM`, and the runner turns that signal into a failure of the placed
-node and never into its execution's cancel (`docs/distributed.md` §3.2).
+node and never into its execution's cancel (`docs/distributed.md` §3.2). The
+signal stops **every** node the runner is running, an attached flow's among
+them — each node there chains to it beside the cancel, a finally node and what
+it begins excepted — so what they are running stops whole (D160's stopped
+command), and the node leaves on a failure no ladder acts on. And a placed node
+whose own `timeout:` ran out **waits for the stopped dispatch's result**, as
+D159 has a timed-out node wait for the instances it began: the hub holds it
+open at its site until the result arrives or the session is lost, so the
+instances on the worker end before any around the node, and the
+`finally_error` the refused result carries is the execution's. **Both lists
+name a dispatch on every answer until its result arrives**, not once: a held
+poll is answered at once for a dispatch just added and once more after, and a
+hold that ends while a list is non-empty ends with the lists rather than a
+`204`, so an answer lost on the way does not lose the stop or the cancel for
+good.
 
 **Why it is a placement key, and the knob it replaces.** The mesh decision
 "no capacity knob — a session holds exactly one unsettled dispatch"
@@ -12588,9 +12629,14 @@ beside it carries what this decision's capacity rule needs the worker told.
 
 **Status**: shipped as written here. The ruling fixes the key, the cap and the
 least-loaded preference; the tie-break — the oldest poll — that a cancelled
-dispatch counts until its result arrives, and that a dispatch the hub stopped
+dispatch counts until its result arrives, that a dispatch the hub stopped
 waiting for is named on a `stop` list of its own and stopped without a cancel,
-are the implementation's, and await the owner's ruling. *PRD resolved q38, q44, q75, q79; §14.1; builds on D128;
+that the stop reaches every node in the runner, and that both lists name a
+dispatch on every answer until its result arrives, are the implementation's,
+and await the owner's ruling. The **`stop` list in particular** is a wire field
+no ruling names — PRD resolved q75's ruling b gives the poll "a `cancel`
+list" — so protocol `3`'s `stop` field is provisional until the owner rules on
+it (`docs/distributed.md` §3.2, §10.4). *PRD resolved q38, q44, q75, q79; §14.1; builds on D128;
 retires the mesh capacity decision of `docs/distributed.md` §13.*
 
 ## Appendix B — Editor integration

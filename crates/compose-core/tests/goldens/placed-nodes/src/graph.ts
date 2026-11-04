@@ -728,7 +728,7 @@ const agentLapser: runtime.AgentBinding = {
     {
       name: "lapsing",
       address: "flow.lapsing",
-      description: "Look one release over at length, and tidy up after it.",
+      description: "Look one release over at length, and tidy up after it — which never works.",
       schema: {
         "additionalProperties": false,
         "properties": {
@@ -2046,8 +2046,11 @@ const flowLapsingNodeLapseUp: runtime.NodeDescriptor = {
     output: runtime.parseResult(
       flowLapsingNodeLapseUpOutput,
       await runtime.runExec({
-        command: [{ env: "OPS_BIN", site: "flow.lapsing.node.lapse_up.exec.command" }, "/true"],
-        args: [],
+        command: [{ env: "OPS_BIN", site: "flow.lapsing.node.lapse_up.exec.command" }, "/sh"],
+        args: [
+          ["-c"],
+          ["exit 5"],
+        ],
         env: [],
         expectExit: [0],
         decoding: { envelope: ["exit_code", "stdout"], decoded: [], empty: false },

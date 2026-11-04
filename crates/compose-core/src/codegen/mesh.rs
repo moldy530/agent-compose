@@ -320,8 +320,12 @@ mod tests {
     }
 
     /// …and the positive half: a session carries exactly the fields §5 gives
-    /// it, the cancel and stop notices it is owed among them (§3.2, PRD
-    /// resolved q75) — two sets, because the worker stops the two differently.
+    /// it, the cancels and stops it is owed an answer **at once** for among
+    /// them (§3.2, PRD resolved q75) — one map, and nothing about which list
+    /// names each: a poll names every dispatch the hub is still waiting on
+    /// that session's worker for, read off the hub's own books (`cancelling`,
+    /// `stopping`) until its result arrives, so a session that kept the lists
+    /// would be a second record of them.
     ///
     /// Its load is **not** a field: it is read off the dispatch rows each time
     /// it is asked ([`heldFor`] in the emitted source), which is PRD resolved
@@ -331,7 +335,7 @@ mod tests {
     fn a_session_carries_exactly_the_fields_the_document_gives_it() {
         assert_eq!(
             fields_of("interface Session {"),
-            ["id", "claims", "dispatchable", "seen", "cancels", "stops"],
+            ["id", "claims", "dispatchable", "seen", "unsaid"],
             "`src/mesh.ts`'s `Session` is not the record `docs/distributed.md` §5 describes: a \
              load or a slot count on it would be a second record of what the dispatch rows hold"
         );

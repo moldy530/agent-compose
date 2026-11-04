@@ -1291,6 +1291,56 @@ function cancelSignalFor(execution: string, site: string): AbortSignal | undefin
 }
 
 /**
+ * The stop every node this process runs chains to beside its execution's
+ * cancel ([`stopEveryNodeOn`]), or `undefined` where nothing installed one.
+ */
+let processStop: AbortSignal | undefined;
+
+/**
+ * Chain every node this process runs to `signal`, beside its execution's
+ * cancel — what a worker's node runner (`./worker-node.ts`) installs, and
+ * aborts when its worker stops the dispatch it runs: the hub stopped waiting
+ * for it (`docs/distributed.md` §3.2's `stop` list), or the session it was
+ * handed under ended.
+ *
+ * **A stop is not a cancel, and is not a deadline either.** The placed node
+ * fails on it, and the instances it began in the runner end `failed`, as they
+ * do on the hub when the same node runs out of time there (grammar 7.9). But
+ * on the hub a node an ended instance let go runs on to its own end — nothing
+ * reads it, and the process outlives it — while a stopped runner is one its
+ * worker kills a grace later. A let-go node there is a command, a harness run
+ * or a model call that the kill would cut off, and a command leads a process
+ * group of its own ([`forkExecCommand`]), which a kill aimed at the runner's
+ * group does not reach: it would run on, re-parented, writing into the
+ * worker's workspace with nothing supervising it — and beside the next
+ * dispatch the freed slot is handed. So in a runner every node's own
+ * controller follows this signal as it follows the cancel ([`runActivity`]):
+ * what each node is running stops by the path a deadline stops it by — an
+ * `exec:` command's group `SIGTERM`ed and then killed ([`stopExecGroup`]) —
+ * and the node leaves on an [`InstanceStopped`], which every ladder lets
+ * through, so no `retry:` and no `on_error:` acts on it and the instance it
+ * belongs to ends `failed`.
+ *
+ * **Save a finally node, and all it begins** ([`finallySites`]): the stop ends
+ * the instances it reaches, and each one's finally node is how it ends, so it
+ * runs whole whatever the stop does — exactly as it does under a cancel
+ * (grammar 7.9, Decision D160) — and the worker's grace waits for it (§3.2).
+ */
+export function stopEveryNodeOn(signal: AbortSignal): void {
+  processStop = signal;
+}
+
+/**
+ * The process-wide stop a node execution at `site` chains to
+ * ([`stopEveryNodeOn`]), or `undefined` where none is installed or the site is
+ * a finally node's or under one ([`finallySites`]).
+ */
+function stopSignalFor(execution: string, site: string): AbortSignal | undefined {
+  if (processStop === undefined) return undefined;
+  return underRunningFinally(execution, site) ? undefined : processStop;
+}
+
+/**
  * A node the cancel stopped: it settles `cancelled`, not `failed`, and no
  * `on_error:` decides anything about it (PRD resolved q75 ruling b, Decision
  * D160).
@@ -1688,7 +1738,11 @@ export async function runActivity<T>(
   // node's site and under one, which a cancel never stops ([`finallySites`]).
   const cancel = cancelSignalFor(execution.id, site);
   let cancelled = false;
+  // Whether the process's stop reached the node first (below): the first of
+  // the two to fire is the one it ends on.
+  let halted = false;
   const onCancel = (): void => {
+    if (halted) return;
     cancelled = true;
     controller.abort(cancel?.reason);
   };
@@ -1696,13 +1750,37 @@ export async function runActivity<T>(
     if (cancel.aborted) onCancel();
     else cancel.addEventListener("abort", onCancel, { once: true });
   }
+  // **The process's stop**, where a worker's node runner installed one
+  // ([`stopEveryNodeOn`]): chained like the cancel, and like it absent on a
+  // finally node's site and under one — but what it leaves is a failure every
+  // ladder lets through, never a cancelled node.
+  const halt = stopSignalFor(execution.id, site);
+  const onHalt = (): void => {
+    if (cancelled) return;
+    halted = true;
+    controller.abort(halt?.reason);
+  };
+  if (halt !== undefined) {
+    if (halt.aborted) onHalt();
+    else halt.addEventListener("abort", onHalt, { once: true });
+  }
   // Raced on the node's **own** signal, which the cancel aborts, rather than on
   // the execution's: the one listener a node puts on the execution's signal is
-  // `onCancel` above, which it takes back as it settles.
-  const stopped = cancel === undefined ? undefined : (expiry ?? untilAborted(controller.signal));
+  // `onCancel` above, which it takes back as it settles. The process's stop is
+  // raced the same way.
+  const stopped =
+    cancel === undefined && halt === undefined
+      ? undefined
+      : (expiry ?? untilAborted(controller.signal));
   stopped?.catch(() => undefined);
   /** The cancelled node's own failure, with the attempts it had made. */
   const cancellation = (): NodeCancelled => new NodeCancelled(flow, node, made, cancel?.reason);
+  /**
+   * The stopped node's own failure: the instance it runs in is ending on the
+   * process's stop, so what it raises is let through by every ladder
+   * ([`stoppedOf`]).
+   */
+  const halting = (): InstanceStopped => new InstanceStopped(flow, halt?.reason);
   // One recorder per node **execution**, not per attempt: the ordinals a key
   // carries count every effect this site ever issues in this execution, so a
   // second attempt's model call is a second record rather than a collision with
@@ -1716,8 +1794,10 @@ export async function runActivity<T>(
   try {
     let last: unknown;
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
-      // A cancelled node begins no attempt (Decision D160).
+      // A cancelled node begins no attempt (Decision D160), and nor does a
+      // stopped one ([`stopEveryNodeOn`]).
       if (cancelled) throw cancellation();
+      if (halted) throw halting();
       if (expired) break;
       // See *No attempt begins once the body has ended*.
       if (isAborted(bodyEnded)) throw abortReason(bodyEnded!);
@@ -1810,6 +1890,17 @@ export async function runActivity<T>(
             innerTraces.push(...late.error.trace);
           }
           throw cancellation();
+        }
+        // **The process's stop answered for the node** ([`stopEveryNodeOn`]):
+        // it leaves on the stop, through no `retry:` and no `on_error:` — once
+        // every instance it began has ended, each one's finally node run, as
+        // the cancel and the deadline wait for them.
+        if (halted && divergenceOf(error) === undefined) {
+          if (instancesOpenUnder(execution.id, site)) {
+            abandonPausesUnder(execution.id, site);
+            await instancesEnded(execution.id, site);
+          }
+          throw halting();
         }
         // A pause this run has no way to answer is not something the activity
         // did wrong, and it is emphatically not the retry ladder's to re-run:
@@ -1910,8 +2001,10 @@ export async function runActivity<T>(
           await sleep(delay, controller.signal, bodyEnded);
         } catch (asleep) {
           // A cancel, which ends the backoff like the deadline and leaves the
-          // node `cancelled` (Decision D160).
+          // node `cancelled` (Decision D160) — or the process's stop, which
+          // leaves it stopped ([`stopEveryNodeOn`]).
           if (cancelled) throw cancellation();
+          if (halted) throw halting();
           // The body's end, rather than the deadline: no attempt follows, and
           // the node leaves on the end itself (see *No attempt begins once the
           // body has ended*).
@@ -1921,6 +2014,7 @@ export async function runActivity<T>(
       }
     }
     if (cancelled) throw cancellation();
+    if (halted) throw halting();
     if (expired) {
       throw new NodeFailure(
         flow,
@@ -1934,6 +2028,7 @@ export async function runActivity<T>(
   } finally {
     if (timer !== undefined) clearTimeout(timer);
     cancel?.removeEventListener("abort", onCancel);
+    halt?.removeEventListener("abort", onHalt);
     watching?.();
     // However this node execution ended, it has ended — so a pause still open
     // below it is one nothing will ever read the answer of, and leaving it on

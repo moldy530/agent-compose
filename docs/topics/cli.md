@@ -425,11 +425,16 @@ running, since that node runs whole — and reported `cancelled`. One the hub
 names in the poll's `stop` list — it stopped waiting, because the node's
 `timeout:` ran out or its execution ended — is stopped the same way but by
 `SIGUSR2`, which the runner reads as a failure of the node rather than a cancel,
-so what the node began there ends `failed`; the result is whatever the node
-ended on. A session the hub has forgotten (a `410`: the hub restarted, or gave
-up on this worker) takes its dispatches with it, so the runners still running
-under it are stopped as a `stop` list's are, and work the new session is handed
-waits for them before it starts.
+so what the node began there ends `failed` — and every node the runner is
+running stops with it, so a command an attached flow was in the middle of is
+stopped too rather than left behind; the result is whatever the node ended on.
+The hub names a dispatch on every answer it gives this worker until its result
+arrives, so a stop or a cancel whose first answer was lost on the way is heard
+on the next. A session the hub has forgotten (a `410`: the hub restarted, or
+gave up on this worker) takes its dispatches with it, so the runners still
+running under it are stopped as a `stop` list's are — never as a cancel, even
+where the hub was cancelling one when it restarted, since a `410` does not say
+— and work the new session is handed waits for them before it starts.
 
 Each runner is a process group of its own, so `Ctrl-C` — and `SIGTERM` or
 `SIGHUP` — reaches the worker and not the runners; the worker hands the stop on
