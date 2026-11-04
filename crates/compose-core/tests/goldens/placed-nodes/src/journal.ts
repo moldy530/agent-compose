@@ -283,7 +283,19 @@ export type EffectKind = "model" | "tool" | "store" | "human" | "harness" | "fin
 /** How one recorded effect ended. */
 export type JournalOutcome =
   | { readonly kind: "value"; readonly value: unknown }
-  | { readonly kind: "error"; readonly name: string; readonly message: string };
+  | {
+      readonly kind: "error";
+      readonly name: string;
+      readonly message: string;
+      /**
+       * On a **placement dispatch's** settled failure only: what a `finally:`
+       * node that ran inside the dispatched node raised, where one did
+       * (grammar 7.9, `docs/distributed.md` §3.4, `docs/durability.md` §3.8).
+       * Kept on the row so a hub restarted before the execution settles reads it
+       * back with the failure it travelled beside. Never on an effect record.
+       */
+      readonly finallyError?: string;
+    };
 
 /** One effect, as the journal holds it. */
 export interface JournalRecord {
@@ -1508,7 +1520,11 @@ class SqlJournal implements Journal {
     const payload =
       outcome.kind === "value"
         ? canonical(outcome.value)
-        : canonical({ name: outcome.name, message: outcome.message });
+        : canonical({
+            name: outcome.name,
+            message: outcome.message,
+            ...(outcome.finallyError === undefined ? {} : { finallyError: outcome.finallyError }),
+          });
     return this.#serial(async () => {
       // **Read first, and the read is what answers.** The `WHERE` clause is still
       // the guard — a row already ended keeps the outcome it has — but a status
@@ -1981,11 +1997,16 @@ function deliveryOf(row: Row): DeliveryRecord {
 
 /** One error outcome, read back off its stored payload. */
 function errorOutcome(payload: string): JournalOutcome {
-  const held = JSON.parse(payload) as { name?: unknown; message?: unknown };
+  const held = JSON.parse(payload) as {
+    name?: unknown;
+    message?: unknown;
+    finallyError?: unknown;
+  };
   return {
     kind: "error",
     name: typeof held.name === "string" ? held.name : "Error",
     message: typeof held.message === "string" ? held.message : payload,
+    ...(typeof held.finallyError === "string" ? { finallyError: held.finallyError } : {}),
   };
 }
 

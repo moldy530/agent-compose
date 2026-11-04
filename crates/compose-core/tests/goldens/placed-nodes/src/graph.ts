@@ -27,6 +27,7 @@ import {
   agentEscalatorOutput,
   agentSignerOutput,
   agentStamperOutput,
+  agentTidierOutput,
   builtinBashInput,
   flowAbandonedInputs,
   flowAttestedInputs,
@@ -45,6 +46,10 @@ import {
   flowSignedOffInputs,
   flowSignedOffNodeApproveOutput,
   flowStampedInputs,
+  flowTidiedInputs,
+  flowTidyingInputs,
+  flowTidyingNodeLookOutput,
+  flowTidyingNodeTidyUpOutput,
   flowWatchedInputs,
   toolNotarizeInput,
   toolNotarizeOutput,
@@ -285,6 +290,43 @@ const flowStampedShape: runtime.Shape = {
 const flowStampedNodeStampShape: runtime.Shape = {
   "properties": {
     "stamped": "string"
+  }
+};
+
+/** `flow.tidied` — the `input` root inside it (grammar 7.5). */
+const flowTidiedShape: runtime.Shape = {
+  "properties": {
+    "path": "string"
+  }
+};
+
+/** `flow.tidied` node `tidy` — the `tidy.output` root its guards read. */
+const flowTidiedNodeTidyShape: runtime.Shape = {
+  "properties": {
+    "signature": "string"
+  }
+};
+
+/** `flow.tidying` — the `input` root inside it (grammar 7.5). */
+const flowTidyingShape: runtime.Shape = {
+  "properties": {
+    "path": "string"
+  }
+};
+
+/** `flow.tidying` node `look` — the `look.output` root its guards read. */
+const flowTidyingNodeLookShape: runtime.Shape = {
+  "properties": {
+    "exit_code": "int",
+    "stdout": "string"
+  }
+};
+
+/** `flow.tidying` node `tidy_up` — the `tidy_up.output` root its guards read. */
+const flowTidyingNodeTidyUpShape: runtime.Shape = {
+  "properties": {
+    "exit_code": "int",
+    "stdout": "string"
   }
 };
 
@@ -619,6 +661,60 @@ const agentStamper: runtime.AgentBinding = {
         toolStamp(
           runtime.parseToolArguments(toolStampInput, args, "the arguments `stamp` was called with"),
           context,
+        ),
+    },
+  ],
+  maxToolIterations: 8,
+};
+
+/**
+ * `agent.tidier` — one LLM call with structured output (PRD 5.2, grammar 5). The schema below is the **published** JSON Schema of grammar 3.8's table, which is the column the conformance corpus proves equal to the parse its answer then faces.
+ */
+const agentTidier: runtime.AgentBinding = {
+  address: "agent.tidier",
+  prompt: "Look the path you are given over, and report what you found.\n",
+  model: modelSmart,
+  output: {
+    name: "tidier_output",
+    description: "The structured output `agent.tidier` must produce.",
+    schema: {
+      "additionalProperties": false,
+      "properties": {
+        "signature": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "signature"
+      ],
+      "type": "object"
+    },
+  },
+  tools: [
+    {
+      name: "tidying",
+      address: "flow.tidying",
+      description: "Look one release over, and tidy up after it — which never works.",
+      schema: {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      invoke: (args, context, call) =>
+        runtime.callSubflowTool(
+          { name: "tidying", binding: flowTidyingBinding, inputs: flowTidyingInputs },
+          args,
+          context,
+          call,
         ),
     },
   ],
@@ -1775,6 +1871,176 @@ const flowStampedBinding: runtime.SubflowBinding = {
     }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
 };
 
+// --- flow.tidied ---
+
+/** `flow.tidied` node `tidy` — `agent.tidier` (grammar 8.1). */
+const flowTidiedNodeTidy: runtime.NodeDescriptor = {
+  flow: "flow.tidied",
+  node: "tidy",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from `defaults:`, `on_error` from `defaults:`.
+  policy: {
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowTidiedShape, state: stateShape, output: flowTidiedNodeTidyShape },
+  input: (roots, view) => ({
+    "path": runtime.toJson(runtime.evaluate("input.path", roots)),
+  }),
+  run: async (input, context, view) => {
+    const answer = await mesh.dispatchPlaced({
+      placement: "mac",
+      node: "flow.tidied.tidy",
+      execution: view.run.execution.id,
+      itemIndex: view.run.execution.item_index,
+      path: runtime.instancePath(view, "tidy"),
+      inputs: input,
+      history: runtime.historyTurns(view.state["messages"] as unknown[]),
+      policy: view.run.policy,
+      signal: context.signal,
+      stores: context.storeRecords,
+    });
+    return {
+      output: runtime.parseResult(agentTidierOutput, answer.output, "the answer of `agent.tidier`"),
+      history: answer.history,
+      models: answer.models,
+      toolDispatches: answer.toolDispatches,
+    };
+  },
+  writes: [
+    { field: "signature", channel: "signature", reduce: "set" },
+  ],
+  edges: [
+    { to: END },
+  ],
+};
+
+/** `flow.tidied` — its nodes, its `start` edges, and the compiled graph. */
+function flowTidied() {
+  return new StateGraph(State)
+    .addNode("tidy", (state: GraphState) => runtime.runNode(flowTidiedNodeTidy, state), {
+      ends: [END],
+    })
+    .addEdge(START, "tidy")
+    .compile();
+}
+
+/**
+ * `flow.tidied`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowTidiedGraph = flowTidied();
+
+/**
+ * `flow.tidied` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowTidiedBinding: runtime.SubflowBinding = {
+  address: "flow.tidied",
+  outputs: ["signature"],
+  recursionLimit: 26,
+  stream: (initial, options) =>
+    flowTidiedGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowTidiedGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
+
+// --- flow.tidying ---
+
+/** `flow.tidying` node `look` — an inline subprocess (grammar 8.2). */
+const flowTidyingNodeLook: runtime.NodeDescriptor = {
+  flow: "flow.tidying",
+  node: "look",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from `defaults:`, `on_error` from `defaults:`.
+  policy: {
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowTidyingShape, state: stateShape, output: flowTidyingNodeLookShape },
+  input: (roots) => ({
+    "looked_at": runtime.toJson(runtime.evaluate("input.path", roots)),
+  }),
+  run: async (input, context) => ({
+    output: runtime.parseResult(
+      flowTidyingNodeLookOutput,
+      await runtime.runExec({
+        command: [{ env: "OPS_BIN", site: "flow.tidying.node.look.exec.command" }, "/sh"],
+        args: [
+          ["-c"],
+          ["test -n \"$LOOKED_AT\""],
+        ],
+        env: [],
+        expectExit: [0],
+        decoding: { envelope: ["exit_code", "stdout"], decoded: [], empty: false },
+      }, input, context),
+      "the result of `flow.tidying` node `look`",
+    ),
+  }),
+  writes: [],
+  edges: [
+    { to: END },
+  ],
+};
+
+/** `flow.tidying` node `tidy_up` — an inline subprocess (grammar 8.2). */
+const flowTidyingNodeTidyUp: runtime.NodeDescriptor = {
+  flow: "flow.tidying",
+  node: "tidy_up",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from `defaults:`, `on_error` from no level, as a `finally:` node's failure is `finally_error` (Decision D159).
+  policy: {
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowTidyingShape, state: stateShape, output: flowTidyingNodeTidyUpShape },
+  input: () => ({}),
+  run: async (input, context) => ({
+    output: runtime.parseResult(
+      flowTidyingNodeTidyUpOutput,
+      await runtime.runExec({
+        command: [{ env: "OPS_BIN", site: "flow.tidying.node.tidy_up.exec.command" }, "/false"],
+        args: [],
+        env: [],
+        expectExit: [0],
+        decoding: { envelope: ["exit_code", "stdout"], decoded: [], empty: false },
+      }, input, context),
+      "the result of `flow.tidying` node `tidy_up`",
+    ),
+  }),
+  writes: [],
+  edges: [
+  ],
+};
+
+/** `flow.tidying` — its nodes, its `start` edges, and the compiled graph. */
+function flowTidying() {
+  return new StateGraph(State)
+    .addNode("look", (state: GraphState) => runtime.runNode(flowTidyingNodeLook, state), {
+      ends: [END],
+    })
+    .addEdge(START, "look")
+    .compile();
+}
+
+/**
+ * `flow.tidying`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowTidyingGraph = flowTidying();
+
+/**
+ * `flow.tidying` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowTidyingBinding: runtime.SubflowBinding = {
+  address: "flow.tidying",
+  outputs: [],
+  recursionLimit: 27,
+  finally: flowTidyingNodeTidyUp,
+  stream: (initial, options) =>
+    flowTidyingGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowTidyingGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
+
 // --- flow.watched ---
 
 /**
@@ -2134,6 +2400,39 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
         ...options,
         streamMode: "values",
         outputKeys: flowStampedGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
+  "flow.tidied": {
+    address: "flow.tidied",
+    inputs: ["path"],
+    inputKinds: { "path": "string", },
+    outputs: ["signature"],
+    sessionStores: [],
+    recursionLimit: 26,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowTidiedInputs, inputs, "the `inputs:` of `flow.tidied`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowTidiedGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowTidiedGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
+  "flow.tidying": {
+    address: "flow.tidying",
+    inputs: ["path"],
+    inputKinds: { "path": "string", },
+    outputs: [],
+    sessionStores: [],
+    recursionLimit: 27,
+    finally: flowTidyingNodeTidyUp,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowTidyingInputs, inputs, "the `inputs:` of `flow.tidying`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowTidyingGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowTidyingGraph.outputChannels,
       }) as unknown as Promise<AsyncIterable<GraphState>>,
   },
   "flow.watched": {
@@ -2868,6 +3167,22 @@ export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {
     },
   "flow.stamped.stamp":
     async (input, context) => ({ output: await toolStamp(input, context) }),
+  "flow.tidied.tidy":
+    async (input, context, site) => {
+      const answer = await runtime.callAgent(
+        agentTidier,
+        input,
+        site.history ?? [],
+        context,
+        { path: site.path, policy: site.policy },
+      );
+      return {
+        output: answer.output,
+        history: answer.history,
+        models: answer.models,
+        toolDispatches: answer.toolDispatches,
+      };
+    },
 };
 
 /**

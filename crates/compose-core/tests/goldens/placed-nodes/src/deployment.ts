@@ -148,6 +148,7 @@ export const placements: readonly PlacementManifest[] = [
       "tool.stamp",
       "agent.stamper",
       "agent.escalator",
+      "agent.tidier",
     ],
     environment: [
       "KEYCHAIN_PASSWORD",

@@ -2373,7 +2373,12 @@ flow-as-tool call's instance alike — at the instance's end:
 ends — inside the `flow:` node's own execution, so the node that instantiated it
 settles after it has — and the parent's when the parent ends. A failure that
 propagates out of a subflow therefore runs the subflow's finally node, then the
-parent's. A **child execution** — what a detached `flow.*` dispatch starts (§8.6
+parent's. That holds when the instantiating node's own `timeout:` (§9.2) is what
+ended it: the deadline stops the instance, the node waits for it to end — its
+finally node run, under that node's own policy — and only then fails, so the
+parent's finally node still runs after it. An instance the node had not yet
+begun when its deadline ran out, such as a `map` item still waiting for a
+permit, is never begun, and has no end to run anything at. A **child execution** — what a detached `flow.*` dispatch starts (§8.6
 rule 7) — is an execution of its own, and its root instance runs its own finally
 node when it ends.
 
@@ -12475,6 +12480,23 @@ effects, which is what makes "runs once" hold across a restart in either window:
 killed before its effect landed, a resume issues it live, once; killed after, a
 resume replays it. The lifecycle row's `finallyError` is a nullable column, added
 by a probe on all three journal backends (`docs/durability.md` §11.2).
+
+**Innermost first, against a deadline too.** A `timeout:` is raced (§9.2), so a
+`flow:` node, a `map` or an agent whose budget runs out stops waiting for its
+activity at once — while the instance it began is still stopping. Settling there
+would run that instance's finally node after the node had failed, after the
+instance above had ended and run its own, and under `run` after the row had
+closed: out of order and off the record. So the node waits for every instance it
+began to end before it settles, and one it had not yet begun — a `map` item
+still queued for a permit — is never begun, and has no end to run anything at.
+The wait is the stopped instances' finally nodes and nothing else, bounded by
+their own §9.3 budgets. It does not put the stopped instance's trace on a `flow:`
+node's entry, whose `inner` `docs/trace.md` §3 keeps absent on that path:
+widening a presence cell is a format version. And an instance can end on a
+**worker**, under a placed agent's attached flow (§14.1 rule 4): its boundary
+travels home as an effect, and what its finally node raised as the result's
+`finally_error`, which the hub holds as the execution's own
+(`docs/distributed.md` §3.3, §3.4).
 
 **What this release does not produce: `cancelled`.** The enum value, the record
 and the end-of-instance seam all carry it, and nothing reaches them with it: PRD

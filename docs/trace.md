@@ -370,7 +370,7 @@ retries are attempts at one execution, and `attempts` is where they are recorded
 | `routing` | [routing decision](#4-routing-decisions) | `"completed"`, `"skipped"` — except on a flow's `finally:` node (§3.5); on `"failed"` in the one case §9 names | What this node's outgoing edges answered. The one failed case is *no viable route*, where the edge decisions are the whole explanation; every other failure abandoned or never reached the decision. A `finally:` node's entry never carries it, whatever its outcome: the node has no edges, so there is no decision to record. See §4 and §9. |
 | `dispatches` | array of [dispatch records](#5-dispatch-records) | `map` nodes with a fan-out to report, possibly empty | What a fan-out dispatched, one record per source item in **index** order (grammar §8.6, PRD 5.6). A map over an **empty** array records `[]` — present and empty. The key is absent, rather than empty, exactly where the fan-out has nothing resolved to report: a map whose input binding failed, so no plan was ever built, and a map whose failure abandoned its plan with no dispatch resolved in it — which §5.2's `timeout:` is the reachable case of. A node that is not a `map` never carries the key. See §5. |
 | `toolDispatches` | array of [dispatch records](#5-dispatch-records) | nodes that ran an agent — an `agent:` node, or a `map` dispatching `agent.*` targets — whose tool loop resolved an outcome for a `flow.*` attached to that agent's `tools:` | What a **model** dispatched: one record per flow-as-tool call (grammar §5.4, PRD 5.1), in the order the calls were made — with the hedge §5 states for the records a `map` node could not put in source-item order. The same record type `dispatches` holds and a key of its own, because the two are different fan-outs a single entry can carry at once: a `map` over source items and a tool loop over the calls a model asked for. Present on every entry whose tool loop resolved an outcome for something, whatever became of the node — a call that ended it is in here with the ones before it — and never empty: a node that resolved none carries no key. The one call a record can be missing for is the one a node deadline caught **mid-flight** — caught while the instance it started was still running, so no outcome had resolved when the entry was written. A call the deadline catches earlier started no instance either, and has no half anywhere. §5.2 describes the shape for the other carrier and §5.3 for this one, and §5.3 is the binding account. See §5. |
-| `inner` | array of entries | `flow:` nodes that ran an instance | The trace of the subflow instance this node ran (grammar §8.5). Absent on a `flow:` node that ran none — one whose *input* could not be built — and on one whose own `timeout:` abandoned its instance mid-flight, which leaves no trace to carry. A **dispatched** instance is never here: a `map`'s items report under their own dispatch records (§5), including the item whose failure ended the map node. See §8. |
+| `inner` | array of entries | `flow:` nodes that ran an instance | The trace of the subflow instance this node ran (grammar §8.5). Absent on a `flow:` node that ran none — one whose *input* could not be built — and on one whose own `timeout:` fired while its instance ran: the deadline answers for the node, and what the instance did as it stopped — its `finally:` node included, which runs before the node fails (grammar §7.9) — is not on the entry. A **dispatched** instance is never here: a `map`'s items report under their own dispatch records (§5), including the item whose failure ended the map node. See §8. |
 | `stores` | array of [store records](#6-store-records) | when the node performed any | Every store op this node performed, in the order it performed them (PRD 5.8). Never empty: a node that performed none carries no key. See §6. |
 | `models` | array of [model calls](#7-model-calls) | when the node made any | Every model call this node execution made (PRD 5.9). Never empty: a node that made none carries no key. See §7. |
 | `harness` | array of [harness runs](#76-a-harness-run) | `coder` nodes that started a run | Every coding-harness run this node execution made (grammar §8.9, PRD resolved q57). A coder node makes **one run per attempt**, so what an entry carries across a `retry:` ladder is one record per attempt, in the order they were made — the same set rule `models` is under, and for the same reason: a run that failed on the first attempt really ran. Never empty: a node that started none carries no key. A node whose *input* could not be built is one such entry — `attempts: 0`, exactly as that leaves `inner` off a `flow:` node — but it is not the only one: an attempt that failed *before* the run began starts nothing either, which is what a bound harness this process has no driver for, an `${ENV}` the environment did not hold, and a `workspace:` the node's input scope could not answer — an expression that read an absent value, evaluated to something that is not a string, or resolved to an empty path — all produce. Those report `attempts` of one or more with no record to show for them. **The absence is a statement about runs started, not about attempts made**; read `attempts` for that. A node that is not a `coder` node never carries it. See §7.6. |
@@ -709,7 +709,11 @@ in what survives:
   Such an instance has no outcome at the moment the budget runs out, so there is
   nothing to record for it — but it is not stopped dead either: it unwinds
   against the aborted signal, and whether that unwinding lands a record before
-  the entry is written is a matter of scheduling. So read a missing record as
+  the entry is written is a matter of scheduling. (A `flow.*` instance's
+  unwinding is one the map node waits out — the instance ends, and runs its
+  `finally:` node, before the node fails, grammar §7.9 — so this runtime files
+  its record first; the promise a reader may rely on is still only this
+  paragraph's.) So read a missing record as
   "no outcome resolved for this item", never as "this item never ran", and read
   a record for an item the deadline caught as an outcome that did resolve rather
   than as a contradiction. A deadline that caught every instance can therefore
@@ -723,19 +727,26 @@ The same thing happens one carrier over, and it is worth stating separately
 because the two keys have different vocabularies of absence. An `agent:` node's
 own `timeout:` (grammar §9.2) is raced against its tool loop, so a call the
 deadline catches **while the instance is still running** has no outcome at the
-moment the budget runs out: `toolDispatches` carries the calls that had settled
-and not that one, and where it was the only call the key is absent rather than
-empty. `ModelCall.toolCalls` (§7.3) is absent on the same call for the same
-reason, and where that call was the first its answer asked for, the model call's
-key is absent too.
+moment the budget runs out. Where none resolves before the entry is written,
+`toolDispatches` carries the calls that had settled and not that one, and where
+it was the only call the key is absent rather than empty. `ModelCall.toolCalls`
+(§7.3) is absent on the same call for the same reason, and where that call was
+the first its answer asked for, the model call's key is absent too.
 
 Read those absences as §5.2 says to read its own — "no outcome resolved for this
 call", never "this call never ran". The abandoned instance is not stopped dead:
 it unwinds against the aborted signal, and whether that unwinding lands a record
-before the entry is written is a matter of scheduling. What is **not** a matter
-of scheduling is the entry: it is complete when it is written, and an outcome
-that resolves afterwards does not appear on it. So an absence here is a fact
-about the entry rather than a value a reader might see change.
+before the entry is written is a matter of scheduling. (The node does wait for
+the instance to **end** — its `finally:` node runs before the agent node fails,
+grammar §7.9 — so this runtime resolves the call first, `"failed"` on the
+deadline, and files **both** halves of it: the dispatch record and the
+`toolCalls` entry naming its instance. A call to a tool that is not a flow — a
+host function the deadline abandoned — has no instance to wait for, and is the
+absence above. The promise a reader may rely on is still only this
+paragraph's.) What is **not** a matter of scheduling is the entry: it is
+complete when it is written, and an outcome that resolves afterwards does not
+appear on it. So an absence here is a fact about the entry rather than a value a
+reader might see change.
 
 `toolDispatches` has no counterpart to `dispatches: []` here, because a tool loop
 that dispatched nothing and a tool loop that resolved nothing are the same
