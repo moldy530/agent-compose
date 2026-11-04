@@ -764,6 +764,7 @@ const flowTriageNodeEnrich: runtime.NodeDescriptor = {
       execution: view.run.execution,
       path: runtime.instancePath(view, "enrich"),
       signal: context.signal,
+      bodyEnded: context.bodyEnded,
       policy: runtime.instancePolicy(view.run.policy, {
         timeoutMs: 30000,
         onError: "fail",

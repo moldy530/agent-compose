@@ -2070,6 +2070,7 @@ const flowWatchedNodeWatchMap: runtime.MapDescriptor = {
           execution: site.execution,
           path: site.path,
           signal: context.signal,
+          bodyEnded: context.bodyEnded,
         }),
       writes: [
         { field: "signature", channel: "signatures", reduce: "append" },

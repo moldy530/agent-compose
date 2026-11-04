@@ -69,6 +69,13 @@
 #   * `flow.raced_late` — a body node that fails while a sibling instance whose
 #     body has completed is still running its finally node, a slow `flow:`
 #     node. That cleanup is waited for, not stopped.
+#   * `flow.stranded` — a subflow, `flow.stranding`, with **no** finally node,
+#     whose body node fails while its siblings still have something to begin:
+#     a `map` with items queued for a permit, a `flow:` node sleeping out a
+#     `retry:` backoff, and an agent whose model asks for a `flow.*` tool after
+#     the failure. The subflow's end is over the moment its one running
+#     instance has ended, and its node is skipped while those siblings are
+#     still running; none of them begins anything afterwards.
 #   * `flow.redone` — a body node whose `timeout:` ends its `retry:` ladder in
 #     one generation, and whose replay in the next completes: the attempt the
 #     deadline never let it make is made then. Its finally node marks the run
@@ -1031,6 +1038,97 @@ flow.slow_marking:
     - { from: start, to: linger }
     - { from: linger, to: mark_it }
     - { from: mark_it, to: end }
+
+flow.stranded:
+  description: A flow whose subflow ends while siblings in it still have something to begin.
+  inputs:
+    names:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs: {}
+  nodes:
+    mid:
+      flow: flow.stranding
+      input:
+        names: "input.names"
+      on_error: skip
+    # Longer than the ladder's backoff and the model's answer, so whatever the
+    # ended subflow went on to begin would begin while this run is still going.
+    after:
+      exec:
+        command: "${OPS_BIN}/sleep"
+        args: ["3"]
+    stranded_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "'outer:' + execution.outcome"
+  edges:
+    - { from: start, to: mid }
+    - { from: mid, to: after }
+    - { from: after, to: end }
+  finally: stranded_end
+
+flow.stranding:
+  description: A body node that fails beside siblings that still have something to begin, and no finally node.
+  inputs:
+    names:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs: {}
+  nodes:
+    # Half a second: the map's first item is running, the ladder is sleeping
+    # out its first backoff — two seconds, unjittered — and the model has not
+    # answered yet: the test holds its answer for two seconds.
+    doomed:
+      exec:
+        command: "${OPS_BIN}/sh"
+        args: ["-c", "sleep 0.5; exit 1"]
+    fan:
+      map:
+        over: input.names
+        as: name
+        node: flow.lingering
+        max_concurrency: 1
+        input:
+          name: "name"
+    retrier:
+      flow: flow.failing_fast
+      retry: { max: 3, backoff: 2s, jitter: false }
+    asker:
+      agent: agent.closer
+      input:
+        topic: "'the tool'"
+  edges:
+    - { from: start, to: doomed }
+    - { from: start, to: fan }
+    - { from: start, to: retrier }
+    - { from: start, to: asker }
+    - { from: doomed, to: end }
+    - { from: fan, to: end }
+    - { from: retrier, to: end }
+    - { from: asker, to: end }
+
+flow.failing_fast:
+  description: An instance that fails at once, and records how it ended.
+  outputs: {}
+  nodes:
+    fast_work:
+      exec:
+        command: "${OPS_BIN}/false"
+    fast_end:
+      store: store.ended
+      op: append
+      key: "'order'"
+      field: order
+      value: "'fast:' + execution.outcome"
+  edges:
+    - { from: start, to: fast_work }
+    - { from: fast_work, to: end }
+  finally: fast_end
 
 flow.lingering:
   description: An instance that outlasts its sibling's failure, and records how it ended.

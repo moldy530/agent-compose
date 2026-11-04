@@ -28393,6 +28393,100 @@ fn a_stopped_instances_finally_node_begins_and_ends_instances_of_its_own() {
     assert_eq!(lifecycle_row(&project, execution)["status"], "failed");
 }
 
+/// **Nothing begins inside an instance that has ended — not once its end is
+/// over, either** (grammar §7.9: "nothing new begins inside an instance that is
+/// ending", PRD resolved q76: "innermost first").
+///
+/// `flow.stranded`'s `mid` is a `flow:` node into `flow.stranding`, which has
+/// **no** finally node, under `on_error: skip`. `flow.stranding`'s `doomed`
+/// fails after half a second while three siblings each still have something
+/// to begin: `fan`, a `map` of `flow.lingering` over `["a", "b", "c"]` one at
+/// a time, with `b` and `c` queued for its permit; `retrier`, a `flow:` node
+/// into `flow.failing_fast` under `retry: { max: 3, backoff: 2s, jitter: false }`,
+/// sleeping out its first backoff; and `asker`, an agent whose model answers two
+/// seconds in with a call to its `flow.toolish` tool. The failure stops item
+/// `a`, and with no finally node to run the subflow's end is over the moment
+/// `a` has ended — while every one of those siblings is still running, and
+/// `mid` is skipped and `after` sleeps on. None of them begins anything
+/// afterwards: no item `b` or `c`, no second instance of `flow.failing_fast`,
+/// no instance of `flow.toolish` — so the store, the journal's boundaries and
+/// its effects hold the two instances that began inside the subflow and the
+/// root, nothing else.
+#[test]
+fn an_ended_instance_whose_end_is_over_still_begins_nothing_inside_it() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::tool_calls(vec![ToolCall::new("toolish", json!({}))])
+            .after(Duration::from_secs(2)),
+    ));
+    let (_shims, _log, environment) = finally_environment(&provider, "finally-stranded");
+    let Some(project) = harness::scratch_project("finally-stranded") else {
+        return;
+    };
+    let run = harness::run_formatted(
+        &project,
+        FINALLY,
+        "flow.stranded",
+        &[("names", r#"["a","b","c"]"#)],
+        None,
+        Some("json"),
+        &environment,
+    );
+    run.succeeded();
+    let report = run.outputs();
+    assert_eq!(report["status"], "completed", "{report:#}");
+    assert_eq!(
+        nodes_of(&report["trace"]),
+        ["mid", "after", "stranded_end"],
+        "{report:#}"
+    );
+    assert_eq!(report["trace"][0]["outcome"], "skipped", "{report:#}");
+    assert_finally_entry(&report["trace"], "stranded_end", "completed");
+
+    let order = ended_so_far(&project);
+    assert_eq!(
+        order.last().map(String::as_str),
+        Some("outer:completed"),
+        "the root's finally node ran last: {order:?}"
+    );
+    let mut inner = order[..order.len() - 1].to_vec();
+    inner.sort();
+    assert_eq!(
+        inner,
+        ["a:failed".to_string(), "fast:failed".to_string()],
+        "item `a` was stopped and the ladder's one attempt ended; no queued item, \
+         no second attempt and no tool call began an instance after the subflow ended: \
+         {order:?}"
+    );
+
+    let execution = report["execution_id"].as_str().expect("an execution id");
+    assert_eq!(
+        boundary_keys(&project, execution),
+        [
+            "mid/0/fan/0/0/linger_end/0#finally/0",
+            "mid/0/retrier/0/fast_end/0#finally/0",
+            "stranded_end/0#finally/0"
+        ],
+        "one end per instance that began, and none for what the ended subflow was refused"
+    );
+    let stray = harness::journal_rows(
+        &project,
+        &format!(
+            "SELECT \"key\" AS k FROM effects WHERE execution = '{execution}' AND \
+             (\"key\" LIKE 'mid/0/fan/0/1/%' OR \"key\" LIKE 'mid/0/fan/0/2/%' \
+             OR \"key\" LIKE 'mid/0/asker/0/toolish/%' \
+             OR \"key\" LIKE 'mid/0/retrier/0/fast_work/0#tool/1')"
+        ),
+    );
+    assert_eq!(
+        stray,
+        json!([]),
+        "no effect of a queued item, a tool's instance or a second attempt was journaled"
+    );
+    assert_eq!(lifecycle_row(&project, execution)["status"], "completed");
+}
+
 /// **A finally node already running when the instance around it ends is waited
 /// for, not stopped** (grammar §7.9: "an end already under way inside the one
 /// that is ending is waited for, never stopped").
