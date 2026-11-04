@@ -28605,6 +28605,131 @@ fn an_ended_instance_begins_no_attempt_and_no_item_that_is_not_an_instance() {
     assert_eq!(lifecycle_row(&project, execution)["status"], "completed");
 }
 
+/// **A let-go agent calls no tool and makes no model call once its body has
+/// ended — while the instance is still ending, too — though the tool it was
+/// already running runs on** (grammar §7.9: "nothing new begins inside an
+/// instance that is ending", Decision D159: "every task of a body that has
+/// ended is refused whatever it would begin next").
+///
+/// `flow.stranded_turns`'s `mid` is a `flow:` node into `flow.stranding_turns`
+/// under `on_error: skip`. There `doomed` fails after a second, beside two
+/// agents, and the subflow's finally node marks `inner:failed` and lingers for
+/// three. `busy_caller`'s model answers at once with a call to
+/// `tool.slow_turn_mark`, which is still running when the body ends: it runs on
+/// to its end, and the turn that would follow it is never made.
+/// `late_caller`'s model answers two and a half seconds in — inside the
+/// finally node — with a call to `tool.turn_mark` and a `claims_set`, and
+/// neither is invoked: nothing is marked, nothing is claimed, and no second
+/// model call is made. That store write is the case that matters: the same
+/// write landing after a `finally:` node had released a lease would take it
+/// again (PRD resolved q69, q76).
+#[test]
+fn a_let_go_agent_begins_no_tool_call_and_no_model_turn_after_its_body_ends() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            HAIKU,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "slow_turn_mark",
+                json!({ "name": "busy" }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![
+                ToolCall::new("turn_mark", json!({ "name": "late" })),
+                ToolCall::new(
+                    "claims_set",
+                    json!({ "key": "late", "value": { "owner": "late" } }),
+                ),
+            ])
+            .after(Duration::from_millis(2500)),
+        ),
+    ]);
+    let (_shims, log, environment) = finally_environment(&provider, "finally-stranded-turns");
+    let Some(project) = harness::scratch_project("finally-stranded-turns") else {
+        return;
+    };
+    let run = harness::run_formatted(
+        &project,
+        FINALLY,
+        "flow.stranded_turns",
+        &[],
+        None,
+        Some("json"),
+        &environment,
+    );
+    run.succeeded();
+    let report = run.outputs();
+    assert_eq!(report["status"], "completed", "{report:#}");
+    assert_eq!(
+        nodes_of(&report["trace"]),
+        ["mid", "after", "stranded_turns_end"],
+        "{report:#}"
+    );
+    assert_eq!(report["trace"][0]["outcome"], "skipped", "{report:#}");
+    assert_finally_entry(&report["trace"], "stranded_turns_end", "completed");
+    assert_eq!(
+        ended_so_far(&project),
+        ["inner:failed", "outer:completed"],
+        "the subflow ended failed and ran its finally node, and the root's ran last"
+    );
+
+    assert_eq!(
+        ended_lines(&log),
+        ["busy-start", "busy-end"],
+        "the tool already running when the body ended ran on to its end, and the \
+         let-go agent whose model answered late invoked nothing"
+    );
+    let claims = project
+        .join(".agent-compose")
+        .join("stores")
+        .join("claims.sqlite");
+    let claimed = if claims.is_file() {
+        harness::sqlite_rows(&project, &claims, "SELECT key FROM entries")
+    } else {
+        json!([])
+    };
+    assert_eq!(
+        claimed,
+        json!([]),
+        "the store write the late model asked for never landed"
+    );
+    let mut asked: Vec<String> = provider
+        .requests()
+        .into_iter()
+        .map(|request| request.model)
+        .collect();
+    asked.sort();
+    assert_eq!(
+        asked,
+        [HAIKU.to_string(), SONNET.to_string()],
+        "each agent made the one model call it had begun before the body ended, \
+         and neither made another"
+    );
+
+    let execution = report["execution_id"].as_str().expect("an execution id");
+    let effects = harness::journal_rows(
+        &project,
+        &format!(
+            "SELECT \"key\" AS k FROM effects WHERE execution = '{execution}' AND \
+             (\"key\" LIKE 'mid/0/late_caller/%' OR \"key\" LIKE 'mid/0/busy_caller/%') \
+             ORDER BY \"key\""
+        ),
+    );
+    assert_eq!(
+        effects,
+        json!([
+            { "k": "mid/0/busy_caller/0#model/0" },
+            { "k": "mid/0/busy_caller/0#tool/0" },
+            { "k": "mid/0/late_caller/0#model/0" }
+        ]),
+        "the two agents journaled the model calls and the tool call they began \
+         before the body ended, and nothing after"
+    );
+    assert_eq!(lifecycle_row(&project, execution)["status"], "completed");
+}
+
 /// **A detached delivery is off the instance that issued it: that instance's
 /// end stops nothing the delivery began, waits for none of it, and refuses none
 /// of it** (grammar §8.6 rule 7: "nothing it does can delay the enclosing flow

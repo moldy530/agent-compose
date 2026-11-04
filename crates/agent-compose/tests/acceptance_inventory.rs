@@ -887,6 +887,13 @@ const CODEGEN: &[Criterion] = &[
                 "an_ended_instance_begins_no_attempt_and_no_item_that_is_not_an_instance",
                 Status::Live,
             ),
+            // …nor a let-go agent's next tool call — an `exec:` tool, a store
+            // write — or its next model turn, while the instance is still
+            // ending as well as after; a tool already running runs on.
+            (
+                "a_let_go_agent_begins_no_tool_call_and_no_model_turn_after_its_body_ends",
+                Status::Live,
+            ),
             // A detached delivery is off the instance that issued it: the
             // instances its agent's model begins from its `tools:` are neither
             // stopped, waited for nor refused by that instance's end.
