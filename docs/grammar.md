@@ -12769,9 +12769,22 @@ q29's divergence are what the boundary record is read under. D153's lease
 example moves its release into a `finally:` node, guarded so that a run which
 never held the lease releases nothing (`docs/topics/stores.md`).
 
-**Status**: shipped. *PRD resolved q28, q29, q65, q69, q75, q76; §2.4, §4.1,
-§7, §7.6.3, §7.8, §7.9, §8.7, §9.2, §9.3; amends D21, D52, D71, D95, D110;
-builds on D97, D103, D118, D150, D153.*
+**Status**: provisional on the end of an instance with work in flight, and
+shipped as written here. The ruling says only "innermost first when a cancel or
+failure ends several at once"; what the paragraphs above read into that is the
+implementation's, settled over seven review rounds, and awaits the owner's
+ruling: that a sibling's failure stops the other branches' instances and that an
+abandoned pause ends `failed`, both running their finally nodes; that an end
+under way inside the one ending is waited for; that nothing new begins inside an
+ended instance, an agent's further tool calls and model turns included; that a
+detached delivery is exempt; and that a finally failure past a closed record is
+said on stderr and held nowhere. Also the owner's, as marked above: the refusal
+of a fallback or `on_timeout:` target naming the node, `on_error:` refused
+rather than ignored, an input the node cannot build as `finally_error`, and the
+instance settling on the recorded end. Nothing in the PRD records those rulings
+yet. *PRD resolved q28, q29, q65, q69, q75, q76; §2.4, §4.1, §7, §7.6.3, §7.8,
+§7.9, §8.7, §9.2, §9.3; amends D21, D52, D71, D95, D110; builds on D97, D103,
+D118, D150, D153.*
 
 ## Appendix B — Editor integration
 
