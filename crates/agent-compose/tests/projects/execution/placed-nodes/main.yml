@@ -75,6 +75,13 @@
 #     root `finally:` node fails too, and runs only once the worker's result is
 #     home — innermost first — so the `finally_error` that stands, the first, is
 #     the worker's.
+#   * `flow.lapsed` is the same shape ended by the placed node's own deadline
+#     rather than by a cancel (grammar §7.9, §9.2, `docs/distributed.md` §3.2):
+#     the hub stops waiting at four seconds while the attached instance's body
+#     is still running on the worker, and tells the worker to **stop** it —
+#     never to cancel it, because nobody cancelled the execution. So that
+#     instance ends `failed`, as it does when an unplaced node runs out of time,
+#     and its finally boundary — journaled from the worker — says so.
 #
 # `agent.signer` attaches `tool.sign` and both are members of `mac`, which is
 # grammar §14.1 rule 4's second row: the same answer written twice. `tool.sign`'s
@@ -261,6 +268,16 @@ triggers:
     type: http
     flow: flow.closed
     path: /closings
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
+  # A deadline reaching a finally node on a worker — see `flow.lapsed`.
+  on_lapsed:
+    type: http
+    flow: flow.lapsed
+    path: /lapsings
     method: POST
     input:
       path: "payload.body.path"
@@ -505,6 +522,45 @@ flow.closing:
     - { from: look_long, to: end }
   finally: close_up
 
+# Placed, and what it attaches is a flow whose body outlasts the placed node's
+# own `timeout:` — see `flow.lapsed`.
+agent.lapser:
+  description: Look a release over at length, on the machine that holds it, inside a budget too short for it.
+  model: model.smart
+  prompt: |
+    Look the path you are given over, and report what you found.
+  tools: [flow.lapsing]
+  input:
+    path:
+      type: string
+  output:
+    signature:
+      type: string
+      min_length: 1
+
+# Attached, never triggered: a body that outlasts any test, and a finally node
+# that ends at once, so the outcome its boundary records is the whole of what
+# a test reads.
+flow.lapsing:
+  description: Look one release over at length, and tidy up after it.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    look_long:
+      exec:
+        command: "${OPS_BIN}/sleep"
+        args: ["600"]
+    lapse_up:
+      exec:
+        command: "${OPS_BIN}/true"
+  edges:
+    - { from: start, to: look_long }
+    - { from: look_long, to: end }
+  finally: lapse_up
+
 # Attached rather than triggered, and never reached any other way here: what it
 # is for is being **inside** a placed agent's tool loop.
 flow.escalation:
@@ -724,6 +780,32 @@ flow.closed:
     - { from: start, to: close }
     - { from: close, to: end }
   finally: noted
+
+# A placed node's deadline reaching an attached flow's finally node on a worker:
+# `lapse` is placed with four seconds, its model calls `flow.lapsing`, and the
+# hub stops waiting while that instance's body runs. The worker is told to stop
+# the dispatch — not to cancel it — so the instance ends `failed` there and its
+# finally node runs at that outcome (grammar §7.9, `docs/distributed.md` §3.2).
+flow.lapsed:
+  description: A placed agent whose own deadline runs out while its attached flow runs on the worker.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+  nodes:
+    lapse:
+      agent: agent.lapser
+      timeout: 4s
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+  edges:
+    - { from: start, to: lapse }
+    - { from: lapse, to: end }
 
 flow.release:
   description: Sign a release on a worker, and notarize it on the hub.

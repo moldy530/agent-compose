@@ -53,6 +53,8 @@ export const environmentReferences: readonly EnvironmentReference[] = [
       "flow.closing.node.look_long.exec.command",
       "flow.closing.node.close_up.exec.command",
       "flow.deadline.node.lapse.exec.command",
+      "flow.lapsing.node.look_long.exec.command",
+      "flow.lapsing.node.lapse_up.exec.command",
       "flow.tidying.node.look.exec.command",
       "flow.tidying.node.tidy_up.exec.command",
       "tool.notarize.exec.command",

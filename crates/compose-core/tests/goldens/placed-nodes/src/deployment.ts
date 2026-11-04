@@ -158,6 +158,7 @@ export const placements: readonly PlacementManifest[] = [
       "agent.escalator",
       "agent.tidier",
       "agent.closer",
+      "agent.lapser",
     ],
     maxRunning: 1,
     environment: [

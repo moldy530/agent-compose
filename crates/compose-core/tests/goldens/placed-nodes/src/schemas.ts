@@ -66,6 +66,20 @@ export const agentEscalatorOutput = z.object({
 }).strict();
 export type AgentEscalatorOutput = z.infer<typeof agentEscalatorOutput>;
 
+/** `agent.lapser` — its declared input (grammar 5.3). */
+export const agentLapserInput = z.object({
+  path: z.string(),
+}).strict();
+export type AgentLapserInput = z.infer<typeof agentLapserInput>;
+
+/**
+ * `agent.lapser` — the structured output the model is constrained to, and what routing reads (PRD 5.2, 5.3).
+ */
+export const agentLapserOutput = z.object({
+  signature: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type AgentLapserOutput = z.infer<typeof agentLapserOutput>;
+
 /** `agent.signer` — its declared input (grammar 5.3). */
 export const agentSignerInput = z.object({
   path: z.string(),
@@ -320,6 +334,50 @@ export const flowImpatientOutputs = z.object({
   approval: z.string(),
 }).strict();
 export type FlowImpatientOutputs = z.infer<typeof flowImpatientOutputs>;
+
+/** `flow.lapsed` — the module's parameters (grammar 7.5). */
+export const flowLapsedInputs = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type FlowLapsedInputs = z.infer<typeof flowLapsedInputs>;
+
+/**
+ * `flow.lapsed` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowLapsedOutputs = z.object({
+  signature: z.string(),
+}).strict();
+export type FlowLapsedOutputs = z.infer<typeof flowLapsedOutputs>;
+
+/** `flow.lapsing` — the module's parameters (grammar 7.5). */
+export const flowLapsingInputs = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type FlowLapsingInputs = z.infer<typeof flowLapsingInputs>;
+
+/**
+ * `flow.lapsing` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowLapsingOutputs = z.object({}).strict();
+export type FlowLapsingOutputs = z.infer<typeof flowLapsingOutputs>;
+
+/**
+ * `flow.lapsing` node `look_long` — what the subprocess produces (grammar 8.2), which it does not declare, so this is the kind default.
+ */
+export const flowLapsingNodeLookLongOutput = z.object({
+  exit_code: z.number().int(),
+  stdout: z.string(),
+}).strict();
+export type FlowLapsingNodeLookLongOutput = z.infer<typeof flowLapsingNodeLookLongOutput>;
+
+/**
+ * `flow.lapsing` node `lapse_up` — what the subprocess produces (grammar 8.2), which it does not declare, so this is the kind default.
+ */
+export const flowLapsingNodeLapseUpOutput = z.object({
+  exit_code: z.number().int(),
+  stdout: z.string(),
+}).strict();
+export type FlowLapsingNodeLapseUpOutput = z.infer<typeof flowLapsingNodeLapseUpOutput>;
 
 /** `flow.overdue` — the module's parameters (grammar 7.5). */
 export const flowOverdueInputs = z.object({

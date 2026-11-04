@@ -3259,9 +3259,9 @@ fn a_session_holds_up_to_its_placements_max_running_and_no_more() {
                 .to_string(),
         );
         assert_eq!(
-            dispatch["cancel"],
-            json!([]),
-            "a dispatch's poll carries an empty cancel list"
+            (&dispatch["cancel"], &dispatch["stop"]),
+            (&json!([]), &json!([])),
+            "a dispatch's poll carries an empty cancel list and an empty stop list"
         );
     }
     let at_cap = worker.poll(&hub);
@@ -3378,8 +3378,9 @@ fn a_cancel_reaches_the_worker_holding_its_dispatch_and_its_result_settles_it() 
     assert_eq!(told.status, 200, "{}", body_of(&told));
     assert_eq!(
         told.json(),
-        json!({ "cancel": [id] }),
-        "a poll that only tells of a cancel carries the list alone"
+        json!({ "cancel": [id], "stop": [] }),
+        "a poll that only tells of a cancel carries the two lists alone, and the cancel is on \
+         `cancel`"
     );
 
     // Still stopping, so still held: a second execution's item waits.
@@ -3420,14 +3421,16 @@ fn a_cancel_reaches_the_worker_holding_its_dispatch_and_its_result_settles_it() 
 ///
 /// `flow.overdue`'s `sign` has two seconds. A session at the default cap of one
 /// takes it and sits on it; at two seconds the hub gives up on it, and the
-/// session's poll is answered with the dispatch in its `cancel` list — the
+/// session's poll is answered with the dispatch in its **`stop`** list — the
 /// worker is still running it, and the hub giving up is not the worker
-/// stopping. Until the worker says it has, the dispatch still holds the
+/// stopping — and **not** in its `cancel` list: nobody cancelled the execution,
+/// and a worker told to cancel would end what the node began there `cancelled`
+/// (§3.2). Until the worker says it has stopped, the dispatch still holds the
 /// session's one slot: a second execution's dispatch is not handed over beside
 /// it, which would be two runners on a placement whose cap is one. The
-/// worker's result for the overdue dispatch is refused `409` — the execution
-/// has moved past it — and frees the slot, and the next poll hands over the
-/// second execution's work.
+/// worker's result for the overdue dispatch — the failure the stop raised in
+/// its runner — is refused `409`, because the execution has moved past it, and
+/// frees the slot, and the next poll hands over the second execution's work.
 #[test]
 fn a_dispatch_whose_node_ran_out_of_time_is_stopped_on_its_worker_and_holds_its_slot() {
     let Some(hub) = hub() else {
@@ -3457,8 +3460,9 @@ fn a_dispatch_whose_node_ran_out_of_time_is_stopped_on_its_worker_and_holds_its_
     };
     assert_eq!(
         told,
-        json!({ "cancel": [overdue] }),
-        "the hub gave up on a dispatch without telling the worker running it to stop"
+        json!({ "cancel": [], "stop": [overdue] }),
+        "the hub gave up on a dispatch without telling the worker running it to stop, or told \
+         it to cancel a dispatch nobody cancelled"
     );
     let report = hub.until(&execution, "failed on its budget", |report| {
         report["status"] == "failed"
@@ -3483,11 +3487,10 @@ fn a_dispatch_whose_node_ran_out_of_time_is_stopped_on_its_worker_and_holds_its_
         body_of(&still)
     );
 
-    let late = hub.send(
-        worker
-            .request("POST", "/workers/result")
-            .json(&json!({ "dispatch_id": overdue, "status": "cancelled" })),
-    );
+    let late = hub.send(worker.request("POST", "/workers/result").json(&json!({
+        "dispatch_id": overdue,
+        "error": { "name": "DispatchStopped", "message": "the hub stopped waiting for it" },
+    })));
     assert_eq!(late.status, 409, "{}", body_of(&late));
     let next = worker.dispatch(&hub);
     assert_eq!(next["execution_id"], waiting, "{next:#}");
@@ -3500,6 +3503,161 @@ fn a_dispatch_whose_node_ran_out_of_time_is_stopped_on_its_worker_and_holds_its_
     hub.until(&waiting, "completed", |report| {
         report["status"] == "completed"
     });
+}
+
+/// Settle one `flow.release` dispatch — whose execution nobody cancelled —
+/// with `body`, and assert §3.4's answer to a cancelled ending this hub cannot
+/// take: `204` on the wire, because the route's table is closed and a fifth
+/// status would be a refusal a worker stops for; and the **attempt failed**,
+/// under the node's own chain, with the error `named` — so the execution ends
+/// `failed`, never `cancelled`. Answers the failure the execution reported.
+fn assert_the_cancelled_ending_fails_the_attempt(
+    case: &str,
+    body: impl Fn(&str) -> Value,
+    named: &str,
+) -> Option<String> {
+    let hub = hub()?;
+    let worker = hub.worker();
+    let execution = hub.start("/releases", &json!({ "path": "release.dmg" }));
+    let dispatch = worker.dispatch(&hub);
+    let id = dispatch["dispatch_id"].as_str().expect("an id").to_string();
+
+    let taken = hub.send(worker.request("POST", "/workers/result").json(&body(&id)));
+    assert_eq!(
+        taken.status,
+        204,
+        "`{case}` was answered outside §3.4's four statuses, which this repository's own \
+         worker reads as a refusal it stops for: {}",
+        body_of(&taken)
+    );
+    let ended = hub.until(&execution, "ended", |report| {
+        report["status"] != "running" && report["status"] != "interrupted"
+    });
+    assert_eq!(
+        ended["status"], "failed",
+        "`{case}` ended a node nobody cancelled as something other than a failed attempt: \
+         {ended:#}"
+    );
+    let said = ended["error"].as_str().unwrap_or_default().to_string();
+    assert!(
+        said.contains(named),
+        "`{case}` failed as something other than `{named}`: {ended:#}"
+    );
+    Some(said)
+}
+
+/// **A cancelled result for a dispatch the hub never cancelled fails the
+/// attempt** (`DispatchCancelledUnasked`, §3.4, Decision D160).
+///
+/// `status: "cancelled"` is the worker's statement that it stopped the work
+/// the hub named in a poll's `cancel` list. A worker that stopped of its own
+/// accord has no such list to point at, and a node nobody cancelled is not one
+/// a worker may end as cancelled — which would route it past every `retry:` and
+/// `on_error:` it declares. So the attempt fails, under its own chain, and the
+/// execution — whose cancel nobody requested — ends `failed`.
+#[test]
+fn a_cancelled_result_for_a_dispatch_the_hub_never_cancelled_fails_its_attempt() {
+    let Some(said) = assert_the_cancelled_ending_fails_the_attempt(
+        "a cancelled result nobody asked for",
+        |id| json!({ "dispatch_id": id, "status": "cancelled" }),
+        "DispatchCancelledUnasked",
+    ) else {
+        return;
+    };
+    assert!(said.contains("this hub cancelled nothing"), "{said}");
+}
+
+/// **A cancelled result carrying another ending beside it is unreadable**
+/// (`CancelledResultUnreadable`, §3.4).
+///
+/// "A cancelled result is `{ dispatch_id, status: \"cancelled\" }` and nothing
+/// else": one that also carries an `output` is a body the hub cannot read as
+/// one ending — the node answered, or it was stopped — and a hub that guessed
+/// would guess the node's outcome. So it guesses neither, and the attempt
+/// fails, naming both fields.
+#[test]
+fn a_cancelled_result_beside_another_ending_is_unreadable_and_fails_its_attempt() {
+    let Some(said) = assert_the_cancelled_ending_fails_the_attempt(
+        "a cancelled result carrying an output",
+        |id| {
+            json!({
+                "dispatch_id": id,
+                "status": "cancelled",
+                "output": { "signature": "signed anyway" },
+            })
+        },
+        "CancelledResultUnreadable",
+    ) else {
+        return;
+    };
+    assert!(said.contains("beside `output`"), "{said}");
+}
+
+/// **A `status` other than `"cancelled"` is unreadable** (`CancelledResultUnreadable`,
+/// §3.4): `status` is `"cancelled"` or absent, and a hub that read another
+/// value as any ending would be reading a result no version of this protocol
+/// writes.
+#[test]
+fn a_result_whose_status_is_not_cancelled_is_unreadable_and_fails_its_attempt() {
+    let Some(said) = assert_the_cancelled_ending_fails_the_attempt(
+        "a result whose status is `stopped`",
+        |id| json!({ "dispatch_id": id, "status": "stopped" }),
+        "CancelledResultUnreadable",
+    ) else {
+        return;
+    };
+    assert!(said.contains("`status` \"stopped\""), "{said}");
+}
+
+/// **A cancelled dispatch whose session goes quiet is superseded as the cancel
+/// it was** (§3.2, §6.3; PRD resolved q75 ruling e, `docs/durability.md` §6.1).
+///
+/// The worker is told of the cancel and then makes no request at all — no
+/// result, no poll — so the liveness window closes over the session while its
+/// dispatch is still being stopped. The sweep supersedes the row, and the
+/// execution settles `cancelled`; what is asserted is **the row's own
+/// detail**, because that is all a restarted hub's replay reads. Superseded with
+/// the heartbeat's detail, the row would replay as an ordinary failed attempt —
+/// a node failed under its `retry:` and `on_error:`, which a cancelled node is
+/// never routed through — rather than as the cancel that ended it.
+#[test]
+fn a_cancelled_dispatch_whose_session_goes_quiet_is_superseded_as_the_cancel() {
+    let Some(project) = shared_project("mesh-quiet-cancel") else {
+        return;
+    };
+    {
+        let Some(hub) = hub_into(&project, &[]) else {
+            return;
+        };
+        let worker = hub.worker();
+        let execution = hub.start("/releases", &json!({ "path": "release.dmg" }));
+        let dispatch = worker.dispatch(&hub);
+        let id = dispatch["dispatch_id"].as_str().expect("an id").to_string();
+        let cancelled = hub.send(Request::post(format!("/executions/{execution}/cancel")));
+        assert_eq!(cancelled.status, 202, "{}", body_of(&cancelled));
+        let told = worker.poll(&hub);
+        assert_eq!(told.status, 200, "{}", body_of(&told));
+        assert_eq!(told.json(), json!({ "cancel": [id], "stop": [] }));
+
+        // …and the worker says nothing more, so the window closes over it.
+        hub.until(&execution, "was cancelled", |report| {
+            report["status"] == "cancelled"
+        });
+        let rows = harness::journal_rows(
+            &project,
+            &format!("SELECT status, detail FROM dispatches WHERE id = '{id}'"),
+        );
+        assert_eq!(
+            rows,
+            json!([{
+                "status": "superseded",
+                "detail": "the execution this dispatch belonged to was cancelled (docs/distributed.md §3.2)",
+            }]),
+            "the sweep superseded a cancelled dispatch as a heartbeat loss, which a replay reads \
+             as a failed attempt rather than as the cancel it was"
+        );
+    }
+    drop(harness::Scratch::at(project));
 }
 
 /// **A cancel withdraws a dispatch still parked on the board** (§6.6,

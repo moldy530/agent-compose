@@ -66,6 +66,16 @@
 //! whatever else the runner managed to say, with the `finally_error` it
 //! reported beside it.
 //!
+//! **A stop arrives on the poll too, and is not a cancel.** The answer's
+//! `stop` list names dispatches this session holds that the hub has **stopped
+//! waiting for** — the node's `timeout:` ran out on the hub, or its execution
+//! ended around it. Each one's runner is sent `SIGUSR2` instead, which the
+//! runner turns into a failure of the placed node and cancels nothing, so what
+//! the node began there ends `failed` — as it does on the hub when a node runs
+//! out of time — rather than `cancelled` in an execution nobody cancelled
+//! ([`node::Halt`]). The same grace applies, and the result posted is whatever
+//! the node ended on, which the hub refuses `409` and frees the slot by.
+//!
 //! How long a hold lasts is the **hub's**, and §10.2 makes lengthening it a
 //! change no version bump announces — "which a worker learns by waiting". So
 //! this worker waits: [`Hold`] is the ceiling a poll is given, it starts at §2's
@@ -81,7 +91,8 @@
 //! worker's session — restarted, or its liveness sweep gave up on it — and it
 //! has superseded what that session held, so the new session holds nothing by
 //! the hub's count while the old session's runners may still be running here.
-//! Those runners are stopped as a cancel stops them, and a dispatch the new
+//! Those runners are **stopped** — by the `SIGUSR2` a `stop` list's names are
+//! sent, since nobody cancelled their executions — and a dispatch the new
 //! session is handed waits until they have before its own runner starts — the
 //! slot the hub counted free is free then, and not before (§2's own reason: "a
 //! slot freed at once would be handed new work while the old process still
@@ -452,7 +463,7 @@ fn serve(
     // brought a new artifact is a hub that may have been reconfigured with it.
     let mut hold = Hold::new();
     // The dispatches this worker is running, by `dispatch_id`: what a `cancel`
-    // list is acted on through (§3.2).
+    // list and a `stop` list are acted on through (§3.2).
     let held = node::Running::default();
     // The session the dispatches in hand were taken under. A newer one is a hub
     // that ended the older — restarted, or its sweep gave up on this worker —
@@ -487,32 +498,37 @@ fn serve(
                     let answer = said.json();
                     // **The dispatch this answer hands over is on the books
                     // first**, on this thread (§3.2, PRD resolved q75): the
-                    // `cancel` list below may name it — a cancel that reached it
-                    // while the hub was assembling this very answer, which the
-                    // hub names to nobody again once it is sent — and a cancel
-                    // of a dispatch this worker does not hold yet is nothing to
-                    // stop ([`node::Running::cancel`]). Marked here, it is
-                    // settled `cancelled` without its runner ever starting. Held
-                    // by the thread that runs it instead, it would race the next
-                    // poll's list as well.
+                    // `cancel` or `stop` list below may name it — a cancel or a
+                    // stop that reached it while the hub was assembling this
+                    // very answer, which the hub names to nobody again once it
+                    // is sent — and a name this worker does not hold yet is
+                    // nothing to stop ([`node::Running::halt`]). Marked here, it
+                    // is settled without its runner ever starting. Held by the
+                    // thread that runs it instead, it would race the next poll's
+                    // lists as well.
                     let handed = answer
                         .get("dispatch_id")
                         .and_then(Value::as_str)
                         .map(|id| held.hold(id, session.generation));
-                    // **The cancel list next**: a dispatch the hub has cancelled
-                    // is stopped before anything new starts beside it.
-                    for id in answer
-                        .get("cancel")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
+                    // **The cancel list and the stop list next**: a dispatch
+                    // the hub has cancelled, or stopped waiting for, is
+                    // stopped before anything new starts beside it — each by
+                    // the signal its list names ([`node::Halt`]).
+                    for (list, how) in [("cancel", node::Halt::Cancel), ("stop", node::Halt::Stop)]
                     {
-                        held.cancel(id);
+                        for id in answer
+                            .get(list)
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                        {
+                            held.halt(id, how);
+                        }
                     }
                     // **Started now, and the poll goes on.** A `200` carries a
                     // dispatch exactly when it names a `dispatch_id`; one that
-                    // carries only a `cancel` list has nothing to start. What
+                    // carries only the lists has nothing to start. What
                     // this must not do is **wait** for the node: the poll is the
                     // heartbeat (§3.2) and §2 requires it to continue while a
                     // node runs — a thread blocked on a slow runner makes no

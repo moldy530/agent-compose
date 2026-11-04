@@ -119,6 +119,24 @@
 // result line says `status: "cancelled"`. The worker posts that result, and
 // kills what is left of this process's group if it has not exited in time.
 //
+// # A stop arrives as `SIGUSR2` (§3.2)
+//
+// The poll answer's **`stop`** list is the other way the hub ends a dispatch a
+// worker holds: it has **stopped waiting for it** — the node's `timeout:` ran
+// out on the hub, or its execution ended around it — and a worker whose session
+// the hub has ended stops what it was running under that session the same way.
+// None of that is a cancel, and it must not end like one: an instance the
+// placed node began here — an attached `flow.*` — that ended `cancelled` would
+// run its finally node reading `execution.outcome == "cancelled"` in an
+// execution nobody cancelled, and its boundary, journaled on the hub like any
+// record, would be replayed as one. So the worker sends `SIGUSR2` instead, and
+// this process stops the placed node with a [`DispatchStopped`] — a failure,
+// as the same node's own deadline is on the hub — so what it began ends
+// `failed`, its finally node run at that outcome, exactly as it does when an
+// unplaced node runs out of time (grammar §7.9, PRD resolved q76). The result
+// line is the node's own ending; the hub refuses it `409` whatever it carries,
+// and frees the slot (§3.4).
+//
 // # Finally work is reported
 //
 // A `finally:` node runs whole whatever a cancel does (grammar 7.9, Decision
@@ -147,6 +165,7 @@
 //   and this side runs the node function the graph would have run — no
 //   `StateGraph` is streamed here.
 
+import { setMaxListeners } from "node:events";
 import process from "node:process";
 
 import { placedNodes } from "./graph.ts";
@@ -179,6 +198,55 @@ import {
   releaseWorkspaces,
   remotePauseOf,
 } from "./runtime.ts";
+
+/**
+ * The signal a worker sends this process for a dispatch on a poll's `stop`
+ * list (see *A stop arrives as `SIGUSR2`*) — never `SIGTERM`, which is the
+ * execution's cancel.
+ */
+const STOP_SIGNAL = "SIGUSR2";
+
+/**
+ * What a placed node is stopped by when the hub has stopped waiting for its
+ * dispatch (§3.2's `stop` list): a **failure**, never a cancel — so the
+ * instances the node began here end `failed`, as they do on the hub when the
+ * node runs out of time there (grammar §7.9).
+ */
+class DispatchStopped extends Error {
+  constructor(dispatch: string) {
+    super(
+      `the hub stopped waiting for dispatch \`${dispatch}\` — its node's \`timeout:\` ran out on the hub, its execution ended around it, or the session it was handed under ended — so its worker stopped it (docs/distributed.md §3.2)`,
+    );
+    this.name = "DispatchStopped";
+  }
+}
+
+/**
+ * The signal the placed node runs under: the execution's `cancel`, followed —
+ * its reason carried as it is, so a cancel still reads as one — and aborted
+ * with a [`DispatchStopped`] when the worker sends [`STOP_SIGNAL`].
+ *
+ * Its listener ceiling is lifted, as `runtime.executionCancelSignal` lifts the
+ * execution's: the placed node's activities all read it at once.
+ */
+function stoppable(cancel: AbortSignal, dispatch: string): AbortSignal {
+  const stop = new AbortController();
+  try {
+    setMaxListeners(0, stop.signal);
+  } catch {
+    // A runtime without the call keeps its own default, which is a warning
+    // and never a failure.
+  }
+  const follow = (): void => {
+    if (!stop.signal.aborted) stop.abort(cancel.reason);
+  };
+  if (cancel.aborted) follow();
+  else cancel.addEventListener("abort", follow, { once: true });
+  process.on(STOP_SIGNAL, () => {
+    if (!stop.signal.aborted) stop.abort(new DispatchStopped(dispatch));
+  });
+  return stop.signal;
+}
 
 /** The dispatch this process was handed, as §3.2 puts it on the wire. */
 interface Dispatch {
@@ -681,9 +749,12 @@ async function main(): Promise<void> {
   // to (`runtime.runActivity`) and the placed node's own context reads; a
   // `SIGTERM` from the worker is the hub's cancel arriving (see *A cancel
   // arrives as `SIGTERM`*), and nothing else — so the runtime's stop sweep
-  // leaves it to the cancel (`runtime.cancelOnTerminate`).
+  // leaves it to the cancel (`runtime.cancelOnTerminate`). A `SIGUSR2` is the
+  // hub having stopped waiting, which stops the placed node with a failure
+  // and cancels nothing (see *A stop arrives as `SIGUSR2`*).
   const cancel = executionCancelSignal(dispatch.execution_id);
   cancelOnTerminate(dispatch.execution_id);
+  const placed = stoppable(cancel, dispatch.dispatch_id);
   // …and the worker is told whenever finally work starts and stops here, so a
   // cancel's grace does not cut off a `finally:` node that runs whole (see
   // *Finally work is reported*).
@@ -709,7 +780,7 @@ async function main(): Promise<void> {
       ...(dispatch.policy === undefined
         ? {}
         : { policy: dispatch.policy as runtime.InstancePolicy }),
-      signal: cancel,
+      signal: placed,
     });
     line = {
       type: "result",

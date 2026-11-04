@@ -295,6 +295,20 @@ export const httpTriggers: readonly HttpTrigger[] = [
     },
   },
   {
+    name: "on_lapsed",
+    flow: "flow.lapsed",
+    path: "/lapsings",
+    method: "POST",
+    respond: "async",
+    readsBody: true,
+    input: (payload) => {
+      const bound = roots(payload);
+      return {
+        "path": runtime.toJson(runtime.evaluate("payload.body.path", bound)),
+      };
+    },
+  },
+  {
     name: "on_overdue_release",
     flow: "flow.overdue",
     path: "/overdue-releases",
