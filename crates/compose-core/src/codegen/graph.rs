@@ -6087,6 +6087,100 @@ flow.f:
         );
     }
 
+    /// A store's `history: true` reaches its binding as `history: true`, and
+    /// its `history_retention:` as `historyRetention:` **in milliseconds** —
+    /// the unit the runtime's cut-off subtracts from its clock (PRD resolved
+    /// q74). A store that keeps no history binds neither field, and one that
+    /// keeps every row for good binds no retention, so the runtime keeps it.
+    #[test]
+    fn a_stores_history_and_its_retention_in_milliseconds_reach_its_binding() {
+        let emitted = emit(
+            r#"version: "0.1"
+
+state:
+  found: { type: boolean, default: false }
+
+store.plain:
+  kind: kv
+  scope: global
+  description: Keeps no history.
+  value_schema:
+    text: { type: string }
+
+store.forever:
+  kind: kv
+  scope: global
+  history: true
+  description: Keeps every row for good.
+  value_schema:
+    text: { type: string }
+
+store.quarter:
+  kind: kv
+  scope: global
+  history: true
+  history_retention: 2160h
+  description: Keeps a row for ninety days.
+  value_schema:
+    text: { type: string }
+
+store.brief:
+  kind: kv
+  scope: session
+  history: true
+  history_retention: 90m
+  description: Keeps a row for an hour and a half.
+  value_schema:
+    text: { type: string }
+
+flow.f:
+  inputs: {}
+  outputs: {}
+  nodes:
+    look:
+      store: store.plain
+      op: get
+      key: "'k'"
+      writes: { found: found }
+  edges:
+    - { from: start, to: look }
+    - { from: look, to: end }
+"#,
+        );
+        let binding = |name: &str| -> String {
+            emitted
+                .split(&format!("const {name}: stores.StoreBinding = {{\n"))
+                .nth(1)
+                .unwrap_or_else(|| panic!("`{name}` is emitted: {emitted}"))
+                .split("\n};")
+                .next()
+                .expect("the binding closes")
+                .to_string()
+        };
+        let plain = binding("storePlain");
+        assert!(
+            !plain.contains("\n  history"),
+            "a store without `history: true` binds neither field, as it did: {plain}"
+        );
+        let forever = binding("storeForever");
+        assert!(forever.contains("\n  history: true,\n"), "{forever}");
+        assert!(
+            !forever.contains("\n  historyRetention"),
+            "no `history_retention:` is no cut-off — every row is kept: {forever}"
+        );
+        let quarter = binding("storeQuarter");
+        assert!(quarter.contains("\n  history: true,\n"), "{quarter}");
+        assert!(
+            quarter.contains("\n  historyRetention: 7776000000,\n"),
+            "2160h is 7_776_000_000 ms: {quarter}"
+        );
+        let brief = binding("storeBrief");
+        assert!(
+            brief.contains("\n  history: true,\n  historyRetention: 5400000,\n"),
+            "90m is 5_400_000 ms: {brief}"
+        );
+    }
+
     /// An attached store synthesizes grammar 11.5's tools, narrowed by
     /// `agent_access:` (Decision D37).
     #[test]

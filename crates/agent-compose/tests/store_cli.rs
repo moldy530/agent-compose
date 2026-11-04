@@ -145,7 +145,8 @@ const MEMORY: Arm = Arm {
 /// The composition every arm is driven against, with its stores named `suffix`.
 ///
 /// One store per scope a `kv` store may declare, one more declaring a
-/// `default_ttl:`, a `blob` store the command must refuse, one flow that reads what an operator left — in the global
+/// `default_ttl:`, two keeping history — one for good, one for a
+/// `history_retention:` — a `blob` store the command must refuse, one flow that reads what an operator left — in the global
 /// store and in one session's — which is how "a flow sees the operator's values"
 /// is asked of the runtime rather than of this command, and one that writes its
 /// own execution's partition and parks there, which is how "the command reads
@@ -206,6 +207,16 @@ store.audits_{suffix}:
   scope: global
   history: true
   description: Every write to it is kept, with who made it and when.
+  backend: cli_db
+  value_schema:
+    text: {{ type: string }}
+
+store.trail_{suffix}:
+  kind: kv
+  scope: global
+  history: true
+  history_retention: 1h
+  description: Every write to it is kept for an hour, and no longer.
   backend: cli_db
   value_schema:
     text: {{ type: string }}
@@ -301,8 +312,10 @@ struct Project {
     visits: String,
     scratch: String,
     files: String,
-    /// …the one that keeps history (PRD resolved q74).
+    /// …the one that keeps history for good (PRD resolved q74).
     audits: String,
+    /// …and the one that keeps it for its `history_retention:` and no longer.
+    trail: String,
 }
 
 impl Project {
@@ -374,6 +387,7 @@ impl Project {
             scratch: format!("scratch_{suffix}"),
             files: format!("files_{suffix}"),
             audits: format!("audits_{suffix}"),
+            trail: format!("trail_{suffix}"),
         })
     }
 
@@ -630,6 +644,33 @@ impl Project {
         }
         held
     }
+
+    /// The history rows one of this project's stores holds **in storage** —
+    /// a row past its retention that no sweep has removed yet among them —
+    /// on any arm: `store_history` on a server, the store file's `history`
+    /// table under `--target local`.
+    fn history_rows(&self, store: &str) -> u64 {
+        if let Some(rows) = self.server(
+            "SELECT COUNT(*) AS n FROM store_history WHERE store = ?",
+            &json!([store]),
+        ) {
+            return count(&rows);
+        }
+        let file = self
+            .out
+            .join(".agent-compose/stores")
+            .join(format!("{store}.sqlite"));
+        assert!(
+            file.is_file(),
+            "a written store has its file: {}",
+            file.display()
+        );
+        count(&sqlite_rows(
+            &self.out,
+            &file,
+            "SELECT COUNT(*) AS n FROM history",
+        ))
+    }
 }
 
 /// Every row this project's stores wrote is gone when the case ends: the build
@@ -644,7 +685,7 @@ impl Drop for Project {
                 "store_history",
                 "store_sequences",
             ] {
-                let sql = format!("DELETE FROM {table} WHERE store IN (?, ?, ?, ?, ?)");
+                let sql = format!("DELETE FROM {table} WHERE store IN (?, ?, ?, ?, ?, ?)");
                 let mut command = bun();
                 command
                     .arg(&script)
@@ -655,7 +696,8 @@ impl Drop for Project {
                             self.leases,
                             self.visits,
                             self.scratch,
-                            self.audits
+                            self.audits,
+                            self.trail
                         ])
                         .to_string(),
                     );
@@ -1886,10 +1928,14 @@ fn drive(arm: &Arm) {
 /// the value before and after, the version it left and the actor `cli`, which
 /// names no execution. The table shows each row; `--format json` answers the
 /// `history` op's own page; `--limit` and `--after` page it as a `list` pages
-/// keys, with `next` absent on the last page; a key with no history answers an
-/// empty page and exits `0`, as a `list` of no keys does; and a store without
-/// history, a cursor that is not one and a page size out of range are usage
-/// errors, `2`.
+/// keys, with `next` absent on the last page; a store with no
+/// `history_retention:` keeps every row however far its clock moves, and one
+/// with an hour's keeps a row for that hour — compiled to the milliseconds the
+/// runtime counts — and then neither answers it nor holds it once a command's
+/// sweep has run; a key with no history answers an empty page and exits `0`,
+/// as a `list` of no keys does; and a store without history, a cursor that is
+/// not one — digits past the largest safe integer among them — and a page
+/// size out of range are usage errors, `2`.
 fn history(project: &Project, notes: &str) {
     let audits = format!("store.{}", project.audits);
     project
@@ -1936,6 +1982,23 @@ fn history(project: &Project, notes: &str) {
         rows[0]["seq"].as_u64() < rows[1]["seq"].as_u64()
             && rows[1]["seq"].as_u64() < rows[2]["seq"].as_u64(),
         "oldest first: {page}"
+    );
+    // No `history_retention:` is no cut-off: with the store's clock moved
+    // ten years on, every row is still read.
+    assert_eq!(
+        project
+            .store_with(
+                "log",
+                &[&audits, "acct", "--format", "json"],
+                Given {
+                    environment: &[(CLOCK_OFFSET, "315360000000")],
+                    ..Given::default()
+                },
+            )
+            .exits(0)
+            .json(),
+        page,
+        "a store that declares no retention keeps every row for good"
     );
     assert!(rows[0].get("old_value").is_none(), "{page}");
     assert_eq!(rows[0]["new_value"], json!({ "text": "opened" }), "{page}");
@@ -2058,6 +2121,78 @@ fn history(project: &Project, notes: &str) {
         "an import writes no history back, so its row is the key's first: {restored:?}"
     );
 
+    // A `history_retention:` keeps a row for that long by the store's clock
+    // and no longer (PRD resolved q74), and reaches the runtime in the
+    // milliseconds its clock counts. With the clock moved half an hour —
+    // inside the hour — the row is read, which a retention bound in seconds
+    // (an hour read as 3.6 s) would already have hidden; moved two hours, past
+    // it, the read answers no row, and the command's own store-wide sweep has
+    // removed it from storage by the time the command exits — that store's
+    // rows only, never another store's.
+    let trail = format!("store.{}", project.trail);
+    project
+        .store("set", &[&trail, "acct", r#"{"text":"brief"}"#])
+        .exits(0);
+    let fresh = project
+        .store("log", &[&trail, "acct", "--format", "json"])
+        .exits(0)
+        .json();
+    let fresh_rows = fresh["entries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a log answers the history op's page: {fresh}"));
+    assert_eq!(fresh_rows.len(), 1, "{fresh}");
+    assert_eq!(
+        fresh_rows[0]["new_value"],
+        json!({ "text": "brief" }),
+        "{fresh}"
+    );
+    assert_eq!(
+        project
+            .store_with(
+                "log",
+                &[&trail, "acct", "--format", "json"],
+                Given {
+                    environment: &[(CLOCK_OFFSET, "1800000")],
+                    ..Given::default()
+                },
+            )
+            .exits(0)
+            .json(),
+        fresh,
+        "half an hour on, the row is inside its hour's retention"
+    );
+    assert_eq!(
+        project.history_rows(&project.trail),
+        1,
+        "a read inside the retention sweeps nothing"
+    );
+    let audited = project.history_rows(&project.audits);
+    assert_eq!(
+        project
+            .store_with(
+                "log",
+                &[&trail, "acct", "--format", "json"],
+                Given {
+                    environment: &[(CLOCK_OFFSET, "7200000")],
+                    ..Given::default()
+                },
+            )
+            .exits(0)
+            .json(),
+        json!({ "entries": [] }),
+        "two hours on, the row is past its retention and no read answers it"
+    );
+    assert_eq!(
+        project.history_rows(&project.trail),
+        0,
+        "…and the command's sweep removed it from storage before it exited"
+    );
+    assert_eq!(
+        project.history_rows(&project.audits),
+        audited,
+        "a store with no retention loses no row to another store's sweep"
+    );
+
     // A key with no history is an empty page, not a failure.
     let none = project.store("log", &[&audits, "nobody"]);
     none.exits(0);
@@ -2082,14 +2217,35 @@ fn history(project: &Project, notes: &str) {
         "{}",
         kept_none.stderr()
     );
-    let malformed = project.store("log", &[&audits, "acct", "--after", "seven"]);
-    assert!(
-        malformed
-            .exits(2)
-            .stderr()
-            .contains("is not a history cursor"),
-        "{}",
-        malformed.stderr()
+    // A cursor is a whole number the op can hold, so digits past the largest
+    // safe integer are refused as usage before the op runs, as a word or a
+    // fraction is — never the op's own failure, which would exit `1`.
+    for cursor in ["seven", "1.5", "99999999999999999999", "9007199254740992"] {
+        let malformed = project.store("log", &[&audits, "acct", "--after", cursor]);
+        let stderr = malformed.exits(2).stderr();
+        assert!(
+            stderr.contains("is not a history cursor")
+                && stderr.contains(&format!("`--after {cursor}`")),
+            "`--after {cursor}`: {stderr}"
+        );
+    }
+    // The largest safe integer is a cursor: past every row, an empty page.
+    assert_eq!(
+        project
+            .store(
+                "log",
+                &[
+                    &audits,
+                    "acct",
+                    "--after",
+                    "9007199254740991",
+                    "--format",
+                    "json"
+                ],
+            )
+            .exits(0)
+            .json(),
+        json!({ "entries": [] })
     );
     project
         .store("log", &[&audits, "acct", "--limit", "0"])

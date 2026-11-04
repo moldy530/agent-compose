@@ -1822,10 +1822,16 @@ async function storeLog(
       `\`${target.store.address}\` keeps no history: its definition does not declare \`history: true\`, so no write to it records a row for \`store log\` to read (grammar 11.1, PRD resolved q74)`,
     );
   }
+  // The op's own cursor rule (`historyCursor`), held here so a cursor it would
+  // refuse — digits past the largest safe integer among them — is a usage
+  // error, `2`, rather than the op failing as a backend would, `1`.
   const after = single["after"];
-  if (after !== undefined && !/^[0-9]*$/.test(after)) {
+  if (
+    after !== undefined &&
+    (!/^[0-9]*$/.test(after) || !Number.isSafeInteger(Number(after)))
+  ) {
     throw new UsageError(
-      `\`--after ${after}\` is not a history cursor: it takes the \`next\` a page of \`store log\` printed — the last \`seq\` of that page, a whole number`,
+      `\`--after ${after}\` is not a history cursor: it takes the \`next\` a page of \`store log\` printed — the last \`seq\` of that page, a whole number no larger than ${Number.MAX_SAFE_INTEGER}`,
     );
   }
   const row = await runOperatorOp(target, "history", {
