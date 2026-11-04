@@ -64,14 +64,132 @@
 //! the same way, so one oversized effect would be a mesh that never runs that
 //! node again.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
 use super::wire::{Answer, Hub};
 use super::{Sessions, Stop, note};
+
+/// How long a runner is given to stop on its own after a cancel's `SIGTERM`
+/// before its whole process group is killed (§3.2, PRD resolved q75).
+///
+/// The runner turns the signal into its execution's cancel, which aborts every
+/// signal its activities read — a model call's `fetch`, a spawned command, a
+/// harness run — so an ordinary node stops in well under this. The kill is for
+/// one that does not: a host function that never reads its signal, or a child
+/// that ignores `SIGTERM`. Inside the ten seconds PRD resolved q75 sets as the
+/// bar, with room for the poll that carried the cancel.
+pub(crate) const CANCEL_GRACE: Duration = Duration::from_secs(5);
+
+/// One dispatch this worker is running, as a cancel reaches it.
+#[derive(Default)]
+struct Handle {
+    /// The runner's pid, once it has one; `0` before it is spawned.
+    pid: AtomicU32,
+    /// Whether the hub has cancelled this dispatch.
+    cancelled: AtomicBool,
+}
+
+/// The dispatches this worker is running, by `dispatch_id` — shared between the
+/// poll thread, which reads the `cancel` list, and each dispatch's own thread.
+#[derive(Clone, Default)]
+pub(crate) struct Running(Arc<Mutex<HashMap<String, Arc<Handle>>>>);
+
+impl Running {
+    /// Put one dispatch on the books, answering its handle.
+    fn hold(&self, id: &str) -> Arc<Handle> {
+        let handle = Arc::new(Handle::default());
+        self.0
+            .lock()
+            .expect("the running table is not poisoned")
+            .insert(id.to_string(), Arc::clone(&handle));
+        handle
+    }
+
+    /// Take one dispatch off the books.
+    fn release(&self, id: &str) {
+        self.0
+            .lock()
+            .expect("the running table is not poisoned")
+            .remove(id);
+    }
+
+    /// Whether `id` is still running here.
+    fn holds(&self, id: &str) -> bool {
+        self.0
+            .lock()
+            .expect("the running table is not poisoned")
+            .contains_key(id)
+    }
+
+    /// Act on the hub's cancel of `id` (§3.2): mark it, send its runner
+    /// `SIGTERM`, and kill its process group if it is still running after
+    /// [`CANCEL_GRACE`]. A dispatch this worker does not hold — already settled,
+    /// or never handed over — is nothing to stop.
+    pub(crate) fn cancel(&self, id: &str) {
+        let Some(handle) = self
+            .0
+            .lock()
+            .expect("the running table is not poisoned")
+            .get(id)
+            .cloned()
+        else {
+            return;
+        };
+        if handle.cancelled.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let pid = handle.pid.load(Ordering::SeqCst);
+        if pid != 0 {
+            terminate(pid);
+        }
+        let running = self.clone();
+        let id = id.to_string();
+        std::thread::spawn(move || {
+            std::thread::sleep(CANCEL_GRACE);
+            if running.holds(&id) {
+                kill_group(handle.pid.load(Ordering::SeqCst));
+            }
+        });
+    }
+}
+
+/// Ask a runner to stop: `SIGTERM`, which it turns into its execution's cancel.
+#[cfg(unix)]
+fn terminate(pid: u32) {
+    if let Ok(pid) = libc::pid_t::try_from(pid) {
+        // SAFETY: a pid this worker spawned and has not reaped — the handle
+        // leaves the table before the runner is waited on.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate(_pid: u32) {}
+
+/// Kill a runner and every process in its group: what a cancel does to a
+/// runner that did not stop within [`CANCEL_GRACE`].
+#[cfg(unix)]
+fn kill_group(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    if let Ok(pid) = libc::pid_t::try_from(pid) {
+        // SAFETY: the group this worker spawned the runner into, which is its
+        // own pid; `ESRCH` for a group already gone is ignored.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_group(_pid: u32) {}
 
 /// Why a `POST` this dispatch made did not go through.
 ///
@@ -106,17 +224,52 @@ pub(crate) fn execute(
     bun: &Path,
     runner: &str,
     dispatch: &Value,
+    running: &Running,
 ) -> Result<(), Stop> {
     let id = dispatch
         .get("dispatch_id")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let handle = running.hold(&id);
+    let ended = execute_held(hub, sessions, tree, bun, runner, dispatch, &id, &handle);
+    running.release(&id);
+    ended
+}
+
+/// [`execute`], with the dispatch on the books a cancel reads.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one dispatch's whole context, passed through once"
+)]
+fn execute_held(
+    hub: &Hub,
+    sessions: &Sessions,
+    tree: &Path,
+    bun: &Path,
+    runner: &str,
+    dispatch: &Value,
+    id: &str,
+    handle: &Handle,
+) -> Result<(), Stop> {
+    let id = id.to_string();
     let mut sender = Sender {
         hub,
         sessions,
         dispatch: &id,
     };
+    // **A dispatch the hub cancelled is settled `cancelled`** (§3.4, PRD
+    // resolved q75), whatever its runner managed to say on its way out: the
+    // result is the worker's statement that it stopped the work.
+    let cancelled = || {
+        json!({
+            "dispatch_id": id,
+            "status": "cancelled",
+        })
+    };
+    if handle.cancelled.load(Ordering::SeqCst) {
+        return settle(&mut sender, &cancelled());
+    }
 
     let child = spawn(bun, tree, runner, dispatch);
     let mut child = match child {
@@ -135,6 +288,12 @@ pub(crate) fn execute(
         }
     };
 
+    handle.pid.store(child.id(), Ordering::SeqCst);
+    // A cancel that arrived between the hold and the spawn found no pid to
+    // signal, so it is signalled here.
+    if handle.cancelled.load(Ordering::SeqCst) {
+        terminate(child.id());
+    }
     let stdout = child.stdout.take().expect("stdout is piped");
     let mut result: Option<Value> = None;
     let mut unreadable: Option<String> = None;
@@ -205,6 +364,9 @@ pub(crate) fn execute(
         return Err(stop);
     }
 
+    if handle.cancelled.load(Ordering::SeqCst) {
+        return settle(&mut sender, &cancelled());
+    }
     let settling = match (result, unreadable, rejected) {
         // The refusal first, and ahead of a result the runner may already have
         // written: a batch the journal never took is a frontier short of where
@@ -281,6 +443,14 @@ fn spawn(bun: &Path, tree: &Path, runner: &str, dispatch: &Value) -> Result<Chil
         // Inherited: a node's own diagnostics are this worker's, which is what
         // makes `agent-compose worker` a process an operator can read.
         .stderr(Stdio::inherit());
+    // A **process group of its own**, so a cancel the runner does not answer in
+    // time takes everything it started with it — the commands an `exec:` node
+    // spawned are in the runner's group (§3.2, PRD resolved q75).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command.spawn().map_err(|error| {
         format!(
             "cannot start `{} {runner}` in `{}`: {error}",
