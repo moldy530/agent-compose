@@ -5556,9 +5556,11 @@ const CLOSING_TURN: Turn = { role: "user", text: "Now produce the structured res
  * resolved q69, q76). So [`leaveEnded`] is read before every model call and
  * before every tool is invoked, and the node leaves on the end's own
  * [`InstanceStopped`], as a `retry:` ladder does between attempts
- * ([`runActivity`]). A call the contract refuses (D119) begins nothing and is
- * still answered; the turn it would have led to is what is refused. A finally
- * node's agent reads its own end, which comes only once it has settled
+ * ([`runActivity`]). A call naming a tool the agent does not offer (D119)
+ * begins nothing and is still answered; the turn it would lead to is what is
+ * refused — while a call to a tool it does offer is refused before its
+ * arguments are even read, since reading them is the tool's first step. A
+ * finally node's agent reads its own end, which comes only once it has settled
  * ([`endInstance`]), and a detached delivery's has none to read ([`runMap`]).
  */
 export async function callAgent(
