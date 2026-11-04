@@ -938,6 +938,13 @@ const CODEGEN: &[Criterion] = &[
                 "a_webhook_run_twice_with_one_business_key_writes_once_and_routes_on_deduped",
                 Status::Live,
             ),
+            // PRD resolved q74: a store declaring `history: true` records each
+            // write a flow makes to a key, and a `history` read of it — a read,
+            // carrying the page — is what the flow routes on.
+            (
+                "a_flow_reads_a_keys_history_and_routes_on_how_many_rows_it_read",
+                Status::Live,
+            ),
             // …and a batch's `set` entry is held to exactly what a single `set`
             // is: q68's schema check, CEL typing at `validate` and no run-time
             // Zod for a node, so one value lands by either.
@@ -1456,6 +1463,14 @@ const DURABILITY: &[Criterion] = &[
             // been answered as its duplicate by the ledger.
             (
                 "a_resumed_run_answers_a_write_under_an_authored_key_out_of_the_record",
+                Status::Live,
+            ),
+            // …and PRD resolved q74's per-key history: a resumed `history` read
+            // answers the page its first generation read though the history
+            // moved meanwhile, and the replayed writes record no row of their
+            // own.
+            (
+                "a_resumed_run_answers_a_history_read_out_of_the_record",
                 Status::Live,
             ),
         ],

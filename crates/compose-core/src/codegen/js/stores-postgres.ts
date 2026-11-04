@@ -140,6 +140,24 @@ const POSTGRES_CONCURRENT_CREATOR: readonly string[] = ["23505", "42P07", "42710
  * it handed out — and its row is also the lock every write to the partition
  * takes first (`RemoteKv`'s `#write`). `BIGINT` on both sides of it, because a
  * sequence that only counts up should not be the thing that runs out.
+ *
+ * `store_history` is the per-key history a `history: true` store records (PRD
+ * resolved q74), one row per write that landed, inserted by the write in its
+ * own transaction under the partition's sequence lock. `seq` is a `BIGSERIAL`:
+ * the server hands each row the next value of a sequence no rollback gives
+ * back, so a value is never seen twice, and one key's rows take theirs in the
+ * order their writes commit — every write to a key holds its partition's lock.
+ * The values are text for `value`'s reason, `NULL` where the key held nothing
+ * on that side of the write. Its three indexes are what reads it —
+ * `store_history_key` a page of one key's rows past a cursor,
+ * `store_history_partition_at` a write's and a sweep batch's bounded `DELETE`
+ * of a partition's rows past the store's retention, and `store_history_at` the
+ * read, locking nothing, by which a store-wide sweep finds the partition
+ * holding the oldest of them. A database from before PRD resolved q74 has no
+ * `store_history`, and `CREATE TABLE IF NOT EXISTS` is the whole of its
+ * migration — a table that is not there has no rows to bring forward — while
+ * the indexes are probed in a `DO` block as the entries' are, so an open of a
+ * database that already has them takes no lock on the table.
  */
 const POSTGRES_STORE_SCHEMA = `
 BEGIN;
@@ -207,6 +225,33 @@ CREATE TABLE IF NOT EXISTS store_sequences (
   last      BIGINT NOT NULL,
   PRIMARY KEY (store, scope_key)
 );
+CREATE TABLE IF NOT EXISTS store_history (
+  seq             BIGSERIAL PRIMARY KEY,
+  store           TEXT COLLATE "C" NOT NULL,
+  scope_key       TEXT COLLATE "C" NOT NULL,
+  "key"           TEXT COLLATE "C" NOT NULL,
+  op              TEXT NOT NULL,
+  old_value       TEXT,
+  new_value       TEXT,
+  version         BIGINT,
+  actor_kind      TEXT NOT NULL,
+  actor_execution TEXT,
+  actor_path      TEXT,
+  at              BIGINT NOT NULL
+);
+DO $migrate_history$
+BEGIN
+  IF to_regclass('store_history_key') IS NULL THEN
+    CREATE INDEX IF NOT EXISTS store_history_key ON store_history (store, scope_key, "key", seq);
+  END IF;
+  IF to_regclass('store_history_partition_at') IS NULL THEN
+    CREATE INDEX IF NOT EXISTS store_history_partition_at ON store_history (store, scope_key, at);
+  END IF;
+  IF to_regclass('store_history_at') IS NULL THEN
+    CREATE INDEX IF NOT EXISTS store_history_at ON store_history (store, at);
+  END IF;
+END
+$migrate_history$;
 COMMIT;
 `;
 
@@ -326,6 +371,20 @@ function postgresLedgerSweep(limit: number): string {
   );
 }
 
+/**
+ * …and over one partition's history: its rows at or before a retention
+ * cut-off (PRD resolved q74), through the index over `(store, scope_key, at)`.
+ *
+ * Run only under the partition's sequence lock (`StoreDialect.sweepHistory`),
+ * and `FOR UPDATE SKIP LOCKED` for [`postgresSweep`]'s reason.
+ */
+function postgresHistorySweep(limit: number): string {
+  return (
+    "DELETE FROM store_history WHERE ctid = ANY(ARRAY(SELECT ctid FROM store_history " +
+    `WHERE store = ? AND scope_key = ? AND at <= ? LIMIT ${limit} FOR UPDATE SKIP LOCKED))`
+  );
+}
+
 /** Postgres speaks the standard upsert in both of its forms. */
 const POSTGRES_STORE_DIALECT: StoreDialect = {
   bind: numberedStoreBind,
@@ -334,6 +393,7 @@ const POSTGRES_STORE_DIALECT: StoreDialect = {
   clock: POSTGRES_STORE_CLOCK,
   sweepPartition: postgresSweep,
   sweepLedger: postgresLedgerSweep,
+  sweepHistory: postgresHistorySweep,
   // A `TEXT COLLATE "C"` column holds any string a key is, so every key is
   // spelled as it is.
   ledgerKey: (idempotencyKey) => idempotencyKey,

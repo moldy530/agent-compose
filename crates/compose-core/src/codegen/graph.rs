@@ -697,6 +697,19 @@ fn stores(ir: &Ir, names: &Names, imported: &mut Vec<String>) -> String {
         if let Some(ttl) = &store.default_ttl {
             text.push_str(&format!("  defaultTtl: {},\n", ttl_millis(&ttl.value)));
         }
+        // `history: true`, and its `history_retention:` in milliseconds (PRD
+        // resolved q74): whether every write records a history row in its own
+        // transaction, and how long a row is kept — absent, for good. Written
+        // only where declared, so a store without history binds as it did.
+        if store.history {
+            text.push_str("  history: true,\n");
+            if let Some(retention) = &store.history_retention {
+                text.push_str(&format!(
+                    "  historyRetention: {},\n",
+                    ttl_millis(&retention.value)
+                ));
+            }
+        }
         if let Some(embed) = &store.embed {
             text.push_str("  embed: {\n");
             text.push_str(&format!("    store: {},\n", names::string(address)));
@@ -1354,10 +1367,14 @@ fn store_tools(
                 "      schema: {},\n",
                 json_literal(&schema::json_field_map(arguments.as_ref()), "      ")
             ));
+            // `site` is the call's place in the agent's loop: what the history
+            // row a `history: true` store records names a tool's write by — the
+            // agent execution's instance path and this call's frame (PRD
+            // resolved q74).
             text.push_str(&format!(
-                "      invoke: async (args, context) =>\n        stores.runStoreTool(\n          \
+                "      invoke: async (args, context, site) =>\n        stores.runStoreTool(\n          \
                  {},\n          {},\n          runtime.parseToolArguments({schema_name}, args, {}) as Record<string, unknown>,\n          \
-                 context,\n        ),\n",
+                 context,\n          site,\n        ),\n",
                 names.value(&address),
                 names::string(op.as_str()),
                 names::string(&format!("the arguments `{name}` was called with"))
@@ -1401,6 +1418,9 @@ fn store_tool_description(
         // Nor this one, at any level (PRD resolved q71): a `batch` is a node's
         // alone.
         crate::ast::flow::StoreOp::Batch => "Write or delete several keys at once in",
+        // Nor this one (PRD resolved q74): a key's history is not exposed to
+        // agents at any access level.
+        crate::ast::flow::StoreOp::History => "Read the history of writes to one key in",
     };
     match &store.description {
         Some(description) => format!("{what} `{address}`. {}", description.value.trim()),
@@ -2576,16 +2596,23 @@ fn activity(
         // resolved q73). `<store>` is the store's declared name, the one
         // `StoreBinding.name` carries and a dialled ledger's `store` column
         // holds, so it is one rule on every arm; the key is the string the
-        // input phase evaluated. `view` is unread on that arm, which is the
-        // point: an authored key names no instance.
+        // input phase evaluated. An authored key names no instance, so the
+        // site's `path` — the node's grammar 9.4 instance path, which the
+        // history row a `history: true` store records names its writer by
+        // (PRD resolved q74) — is carried beside it on every node, derived key
+        // or authored: one writer, one actor, whichever key its ledger holds.
         NodeKind::Store { store, op, params } => {
+            let path = format!(
+                "runtime.instancePath(view, {}).join(\"/\")",
+                names::string(id)
+            );
             let site = match &params.idempotency_key {
                 None => format!(
-                    "{{ via: \"node\", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, {})].join(\"/\") }}",
+                    "{{ via: \"node\", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, {})].join(\"/\"), path: {path} }}",
                     names::string(id)
                 ),
                 Some(_) => format!(
-                    "{{ via: \"node\", idempotencyKey: stores.authoredKey({}, (input as stores.StoreParams).idempotencyKey) }}",
+                    "{{ via: \"node\", idempotencyKey: stores.authoredKey({}, (input as stores.StoreParams).idempotencyKey), path: {path} }}",
                     names::string(store_name(&store.value.to_string()))
                 ),
             };

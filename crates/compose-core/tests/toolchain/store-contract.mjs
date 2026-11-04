@@ -416,7 +416,7 @@ if (provider !== "sqlite") {
   let opening;
   try {
     await begin(reader);
-    for (const table of ["store_entries", "store_applied", "store_sequences"]) {
+    for (const table of ["store_entries", "store_applied", "store_sequences", "store_history"]) {
       await rows(reader, `SELECT COUNT(*) AS held FROM ${table}`);
     }
     // Settled into a string the moment the promise exists: a rejection nothing
@@ -747,8 +747,8 @@ async function forget(store) {
 
 /**
  * Delete the server's rows of every store whose name stands in `relation` to
- * `operand` — in every table a store keeps rows in, entries, ledger and
- * version sequence alike — and answer whether none is left.
+ * `operand` — in every table a store keeps rows in, entries, ledger, history
+ * and version sequence alike — and answer whether none is left.
  *
  * MySQL's `REPEATABLE READ` default would have each `DELETE` take next-key
  * locks over the range it scans and the gap past it, and that gap is between
@@ -762,7 +762,7 @@ async function sweep(relation, operand) {
   try {
     if (provider === "mysql") await rows(admin, "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED");
     let left = 0;
-    for (const table of ["store_entries", "store_applied", "store_sequences"]) {
+    for (const table of ["store_entries", "store_applied", "store_history", "store_sequences"]) {
       await rows(admin, `DELETE FROM ${table} WHERE store ${relation} ${placeholder}`, [operand]);
       const [held] = await rows(admin, `SELECT COUNT(*) AS n FROM ${table} WHERE store ${relation} ${placeholder}`, [
         operand,
@@ -3301,7 +3301,8 @@ async function heldUncommitted(store, key) {
   // it once `LOCK_WAIT_MS` has passed and rolls the hot journal back, which is
   // the recovery a real crash gets.
   const name = `${RUN}_batch_killed`;
-  const store = kv("batch_killed", "global", URL_ENV, BATCHED);
+  // It keeps history, as the killed writer's binding does (PRD resolved q74).
+  const store = { ...kv("batch_killed", "global", URL_ENV, BATCHED), history: true };
   const key = `${execution("batch_killed")}/move/0`;
   const marker = path.join(data, `${RUN}-batch-crash.marker`);
   const script = path.join(path.dirname(fileURLToPath(import.meta.url)), "store-batch-crash.mjs");
@@ -3345,6 +3346,11 @@ async function heldUncommitted(store, key) {
       seeded,
       last: await sequenceLast(store),
       ledger: await ledgerRows(store, key),
+      history: {
+        first: await historyRows(store, "first"),
+        second: await historyRows(store, "second"),
+        seeded: await historyRows(store, "seeded"),
+      },
     };
     answer.batch_crash_left = left;
     answer.a_batch_killed_mid_transaction_leaves_none_of_it =
@@ -3378,6 +3384,18 @@ async function heldUncommitted(store, key) {
       again.deduped === true &&
       same(again.results, retried.results) &&
       (await get(store, "first", run)).found === true;
+    // The history the crash left (PRD resolved q74): the seed's one row and
+    // nothing of the batch — and, once the retry applied, one row per entry,
+    // the deduped second retry adding none.
+    const recorded = {
+      first: (await historyOf(store, "first", run)).entries.length,
+      second: (await historyOf(store, "second", run)).entries.length,
+      seeded: (await historyOf(store, "seeded", run)).entries.map((entry) => entry.op),
+    };
+    answer.batch_crash_history = { left: left.history, recorded };
+    answer.a_batch_killed_mid_transaction_leaves_no_history_rows =
+      same(left.history, { first: 0, second: 0, seeded: 1 }) &&
+      same(recorded, { first: 1, second: 1, seeded: ["set", "delete"] });
   } catch (error) {
     answer.batch_crash_error = String(error?.message ?? error);
   }
@@ -5886,6 +5904,710 @@ if (provider !== "sqlite") {
       (await get(store, "before", run)).value?.held === "first";
   } catch (error) {
     answer.redial_error = String(error?.message ?? error);
+  }
+}
+
+// --- Per-key history (PRD resolved q74) ---------------------------------------
+//
+// A `kv` store declaring `history: true` records every write that lands as a
+// history row in the write's own transaction, and a `history` read pages one
+// key's rows the way a `list` pages a partition's keys. Every case below is a
+// promise the ruling makes of every arm: the row is the side table's, written
+// by the same statement sequence on SQLite, Postgres and MySQL, so a server
+// whose rollback, savepoint or sequence answered differently is this list
+// failing on that arm.
+
+/** The history cases' `value_schema`, as the emitted Zod a partial update holds its result to. */
+const HISTORIED = z.object({ n: z.number().int() }).strict();
+
+/** A binding on this run's backend that keeps history, and maybe bounds it. */
+const historied = (name, retention = undefined) => ({
+  ...kv(name, "global", URL_ENV, HISTORIED),
+  history: true,
+  ...(retention === undefined ? {} : { historyRetention: retention }),
+});
+
+/** One page of a key's history, as a store-op node reads one. */
+async function historyOf(store, key, run, limit = 50, after = undefined) {
+  return await stores.runStoreOp(
+    store,
+    "history",
+    { key, limit, ...(after === undefined ? {} : { after }) },
+    run,
+    node(),
+  );
+}
+
+/**
+ * How many history rows one key of a store holds in storage — rows past their
+ * retention included — read the way an operator would look ([`storage`]).
+ */
+async function historyRows(store, key, scopeKey = "global") {
+  const column = provider === "mysql" ? "`key`" : '"key"';
+  const counted = await storage(
+    `SELECT COUNT(*) AS n FROM store_history WHERE store = ? AND scope_key = ? AND ${column} = ?`,
+    [store.name, scopeKey, key],
+    [store.name, "SELECT COUNT(*) AS n FROM history WHERE scope_key = ? AND key = ?", [scopeKey, key]],
+  );
+  return Number(counted[0]?.n);
+}
+
+/** A node site carrying an instance path, as `./graph.ts` emits one for every store node. */
+const at_ = (key, path) => ({ via: "node", ...(key === undefined ? {} : { idempotencyKey: key }), path });
+
+{
+  // **Three executions writing one key show three rows, in order, each naming
+  // its writer** — the execution's id and the node's instance path — with the
+  // value before and after and the version each write left: consecutive,
+  // since one partition's sequence numbers them.
+  const store = historied("history_three");
+  const ids = ["a", "b", "c"].map((label) => execution(`history_three_${label}`));
+  try {
+    const first = await stores.runStoreOp(
+      store,
+      "set",
+      { key: "k", value: { n: 1 } },
+      ctx(ids[0]),
+      at_(`${ids[0]}/save/0`, "save/0"),
+    );
+    const second = await stores.runStoreOp(
+      store,
+      "merge",
+      { key: "k", fields: { n: 2 } },
+      ctx(ids[1]),
+      at_(`${ids[1]}/outer/0/3/bump/0`, "outer/0/3/bump/0"),
+    );
+    const third = await stores.runStoreOp(
+      store,
+      "incr",
+      { key: "k", field: "n", by: 5 },
+      ctx(ids[2]),
+      at_(`${ids[2]}/count/1`, "count/1"),
+    );
+    const reader = ctx(execution("history_three_reader"));
+    const page = await historyOf(store, "k", reader);
+    const rows = page.entries;
+    answer.three_executions_writing_one_key_show_three_history_rows_in_seq_order =
+      rows.length === 3 &&
+      rows[0].seq < rows[1].seq &&
+      rows[1].seq < rows[2].seq &&
+      !("next" in page) &&
+      same(
+        rows.map((row) => row.op),
+        ["set", "merge", "incr"],
+      );
+    answer.each_history_row_names_its_writers_execution_and_instance_path = same(
+      rows.map((row) => row.actor),
+      [
+        { kind: "node", execution: ids[0], path: "save/0" },
+        { kind: "node", execution: ids[1], path: "outer/0/3/bump/0" },
+        { kind: "node", execution: ids[2], path: "count/1" },
+      ],
+    );
+    answer.each_history_row_holds_the_values_before_and_after_and_a_consecutive_version =
+      !("old_value" in rows[0]) &&
+      same(rows[0].new_value, { n: 1 }) &&
+      same(rows[1].old_value, { n: 1 }) &&
+      same(rows[1].new_value, { n: 2 }) &&
+      same(rows[2].old_value, { n: 2 }) &&
+      same(rows[2].new_value, { n: 7 }) &&
+      same(
+        rows.map((row) => row.version),
+        [first.version, second.version, third.version],
+      ) &&
+      second.version === first.version + 1 &&
+      third.version === second.version + 1;
+    answer.a_history_row_is_dated_by_its_writes_clock = rows.every(
+      (row, index) => Number.isSafeInteger(row.at) && row.at > 0 && (index === 0 || row.at >= rows[index - 1].at),
+    );
+    // The read is a read: recorded, with the page it answered, addressing the
+    // one key it read (`docs/trace.md` §6).
+    const [record] = reader.storeRecords;
+    answer.a_history_read_records_a_read_carrying_its_key_and_page =
+      reader.storeRecords.length === 1 &&
+      record?.op === "history" &&
+      record?.effect === "read" &&
+      record?.key === "k" &&
+      same(record?.answer, page) &&
+      record?.idempotencyKey === undefined;
+    answer.history_three_trace = page;
+  } catch (error) {
+    answer.history_three_error = String(error?.stack ?? error);
+  }
+}
+
+{
+  // **What does not land records nothing**: a write whose condition declined,
+  // a retry the ledger answered, and a partial update the schema refused —
+  // which rolled its transaction back — each leave the history as it was.
+  const store = historied("history_none");
+  const id = execution("history_none");
+  const run = ctx(id);
+  try {
+    const seeded = await write(store, "set", { key: "k", value: { n: 1 } }, run, `${id}/seed/0`);
+    const counts = [await historyRows(store, "k")];
+    const declined = await write(store, "set", { key: "k", value: { n: 9 }, condition: "absent" }, run, `${id}/claim/0`);
+    const declinedDelete = await write(
+      store,
+      "delete",
+      { key: "k", ifVersion: seeded.version + 1000 },
+      run,
+      `${id}/drop/0`,
+    );
+    counts.push(await historyRows(store, "k"));
+    const deduped = await write(store, "set", { key: "k", value: { n: 1 } }, run, `${id}/seed/0`);
+    counts.push(await historyRows(store, "k"));
+    const refused = await refusal(write(store, "merge", { key: "k", fields: { n: "two" } }, run, `${id}/bad/0`));
+    counts.push(await historyRows(store, "k"));
+    const page = await historyOf(store, "k", run);
+    answer.a_declined_conditional_write_records_no_history =
+      declined.applied === false && declinedDelete.applied === false && counts[1] === 1;
+    answer.a_deduped_retry_records_no_history = deduped.deduped === true && counts[2] === 1;
+    answer.a_schema_refused_merge_records_no_history =
+      (refused ?? "").includes("refused the `merge`") && counts[3] === 1;
+    answer.only_the_landed_write_is_in_the_history =
+      counts[0] === 1 && page.entries.length === 1 && same(page.entries[0].new_value, { n: 1 });
+    answer.history_none_trace = { counts, declined, declinedDelete, deduped, refused, page };
+  } catch (error) {
+    answer.history_none_error = String(error?.stack ?? error);
+  }
+}
+
+{
+  // **A delete records the value it removed and none after; an applied write
+  // that changed nothing records the same value on both sides.** A `delete`
+  // of a key that held something leaves no value and no version; one of a key
+  // that held nothing applied all the same and records a row with no value on
+  // either side; and an `append` with `unique: true` whose item was there
+  // already applied — it refreshed its key's expiry — so it records the value
+  // it kept and the version it kept.
+  const LISTED = z.object({ tags: z.array(z.string()) }).strict();
+  const store = { ...kv("history_edges", "global", URL_ENV, LISTED), history: true };
+  const id = execution("history_edges");
+  const run = ctx(id);
+  try {
+    const seeded = await write(store, "set", { key: "k", value: { tags: ["a"] } }, run, `${id}/seed/0`);
+    const touched = await write(
+      store,
+      "append",
+      { key: "k", field: "tags", value: "a", unique: true },
+      run,
+      `${id}/tag/0`,
+    );
+    const removed = await write(store, "delete", { key: "k" }, run, `${id}/drop/0`);
+    const nothing = await write(store, "delete", { key: "never" }, run, `${id}/drop/1`);
+    const rows = (await historyOf(store, "k", run)).entries;
+    const never = (await historyOf(store, "never", run)).entries;
+    answer.an_applied_write_that_changes_nothing_records_the_value_it_kept =
+      touched.applied === true &&
+      touched.version === seeded.version &&
+      rows[1]?.op === "append" &&
+      same(rows[1]?.old_value, { tags: ["a"] }) &&
+      same(rows[1]?.new_value, { tags: ["a"] }) &&
+      rows[1]?.version === seeded.version;
+    answer.a_delete_records_the_value_it_removed_and_none_after =
+      removed.applied === true &&
+      rows.length === 3 &&
+      rows[2].op === "delete" &&
+      same(rows[2].old_value, { tags: ["a"] }) &&
+      !("new_value" in rows[2]) &&
+      !("version" in rows[2]);
+    answer.a_delete_of_a_key_holding_nothing_records_a_row_with_no_values =
+      nothing.applied === true &&
+      nothing.deleted === false &&
+      never.length === 1 &&
+      never[0].op === "delete" &&
+      !("old_value" in never[0]) &&
+      !("new_value" in never[0]) &&
+      !("version" in never[0]);
+    answer.history_edges_trace = { rows, never };
+  } catch (error) {
+    answer.history_edges_error = String(error?.stack ?? error);
+  }
+}
+
+{
+  // **A batch records one row per entry, in its one transaction; a declined
+  // batch records none.** The three rows share the batch's one clock, each
+  // carries its entry's own op, values and version, and an entry whose
+  // condition fails takes every earlier entry's row back with the entries.
+  const store = { ...kv("history_batch", "global", URL_ENV, BATCHED), history: true };
+  const id = execution("history_batch");
+  const run = ctx(id);
+  try {
+    await write(store, "set", { key: "c", value: { n: 0 } }, run, `${id}/seed/0`);
+    const moved = await batch(
+      store,
+      [
+        { op: "set", key: "a", value: { n: 1 } },
+        { op: "set", key: "b", value: { n: 2 } },
+        { op: "delete", key: "c" },
+      ],
+      run,
+      `${id}/move/0`,
+    );
+    const [a, b, c] = await Promise.all(["a", "b", "c"].map((key) => historyOf(store, key, run)));
+    const landed = [a.entries[0], b.entries[0], c.entries[1]];
+    answer.a_batch_of_three_entries_records_three_history_rows_in_one_transaction =
+      moved.applied === true &&
+      a.entries.length === 1 &&
+      b.entries.length === 1 &&
+      c.entries.length === 2 &&
+      same(
+        landed.map((row) => row?.op),
+        ["set", "set", "delete"],
+      ) &&
+      same(a.entries[0].new_value, { n: 1 }) &&
+      a.entries[0].version === moved.results[0].version &&
+      same(b.entries[0].new_value, { n: 2 }) &&
+      b.entries[0].version === moved.results[1].version &&
+      same(c.entries[1].old_value, { n: 0 }) &&
+      !("new_value" in c.entries[1]) &&
+      landed.every((row) => row?.at === landed[0]?.at) &&
+      landed[0].seq < landed[1].seq &&
+      landed[1].seq < landed[2].seq &&
+      landed.every((row) => same(row.actor, { kind: "node", execution: id }));
+    const declined = await batch(
+      store,
+      [
+        { op: "set", key: "a", value: { n: 5 } },
+        { op: "set", key: "b", value: { n: 6 }, condition: "absent" },
+      ],
+      run,
+      `${id}/declined/0`,
+    );
+    const after = [await historyRows(store, "a"), await historyRows(store, "b")];
+    answer.a_declined_batch_records_no_history =
+      declined.applied === false && declined.failed === 1 && same(after, [1, 1]);
+    answer.history_batch_trace = { a, b, c, declined, after };
+  } catch (error) {
+    answer.history_batch_error = String(error?.stack ?? error);
+  }
+}
+
+{
+  // **A history pages exactly as a `list` does**: `limit` rows past the
+  // cursor, oldest first; `next` the page's last `seq`, present exactly when
+  // more remain — so a page that ends on the last row carries none — and the
+  // empty cursor is the first page.
+  const store = historied("history_pages");
+  const id = execution("history_pages");
+  const run = ctx(id);
+  try {
+    for (let n = 0; n < 7; n += 1) {
+      await write(store, "set", { key: "k", value: { n } }, run, `${id}/w/${n}`);
+    }
+    const pages = [];
+    let after;
+    for (;;) {
+      const page = await historyOf(store, "k", run, 3, after);
+      pages.push(page);
+      if (page.next === undefined) break;
+      after = page.next;
+      if (pages.length > 5) break;
+    }
+    const walked = pages.flatMap((page) => page.entries);
+    const exact = await historyOf(store, "k", run, 7);
+    const fromEmpty = await historyOf(store, "k", run, 3, "");
+    const tail = await historyOf(store, "k", run, 6);
+    const last = await historyOf(store, "k", run, 6, tail.next);
+    const unwritten = await historyOf(store, "unwritten", run, 3);
+    const refused = await refusal(historyOf(store, "k", run, 3, "seven"));
+    answer.a_history_pages_with_limit_and_after_like_a_list =
+      same(
+        pages.map((page) => page.entries.length),
+        [3, 3, 1],
+      ) &&
+      same(
+        walked.map((row) => row.new_value?.n),
+        [0, 1, 2, 3, 4, 5, 6],
+      ) &&
+      pages[0].next === String(pages[0].entries[2].seq) &&
+      pages[1].next === String(pages[1].entries[2].seq) &&
+      !("next" in pages[2]) &&
+      same(fromEmpty, pages[0]);
+    answer.a_history_page_that_ends_on_the_last_row_has_no_next =
+      exact.entries.length === 7 && !("next" in exact) && last.entries.length === 1 && !("next" in last);
+    answer.a_key_with_no_history_answers_an_empty_page =
+      same(unwritten, { entries: [] });
+    answer.a_history_cursor_that_is_not_one_is_refused_by_name =
+      (refused ?? "").includes("is not a history cursor");
+    answer.history_pages_trace = { pages, refused };
+  } catch (error) {
+    answer.history_pages_error = String(error?.stack ?? error);
+  }
+}
+
+{
+  // **`history_retention:` bounds the history on q69's schedule, and the
+  // entries stay.** A row older than the retention is invisible to a read at
+  // once and still in storage; the next write to its partition removes it —
+  // another key's rows of the partition included — and the entries the
+  // writes left are untouched.
+  const store = historied("history_retained", HOUR);
+  const id = execution("history_retained");
+  const run = ctx(id);
+  try {
+    await later(0, async () => {
+      await write(store, "set", { key: "k", value: { n: 1 } }, run, `${id}/w/1`);
+      await write(store, "set", { key: "k", value: { n: 2 } }, run, `${id}/w/2`);
+      await write(store, "set", { key: "other", value: { n: 9 } }, run, `${id}/o/1`);
+    });
+    const within = await later(HOUR - MINUTE, () => historyOf(store, "k", run));
+    const past = await later(HOUR + MINUTE, () => historyOf(store, "k", run));
+    const storedPast = [await historyRows(store, "k"), await historyRows(store, "other")];
+    await later(HOUR + MINUTE, () => write(store, "set", { key: "k", value: { n: 3 } }, run, `${id}/w/3`));
+    const afterWrite = [await historyRows(store, "k"), await historyRows(store, "other")];
+    const entries = [(await get(store, "k", run)).value?.n, (await get(store, "other", run)).value?.n];
+    const fresh = await later(HOUR + MINUTE, () => historyOf(store, "k", run));
+    answer.a_history_row_past_its_retention_is_invisible_at_once =
+      within.entries.length === 2 && past.entries.length === 0 && same(storedPast, [2, 1]);
+    answer.a_write_removes_its_partitions_history_past_retention_and_the_entries_stay =
+      same(afterWrite, [1, 0]) &&
+      same(entries, [3, 9]) &&
+      fresh.entries.length === 1 &&
+      same(fresh.entries[0].new_value, { n: 3 });
+    answer.history_retained_trace = { storedPast, afterWrite, entries, fresh };
+  } catch (error) {
+    answer.history_retained_error = String(error?.stack ?? error);
+  }
+}
+
+{
+  // **…and at the next process start**, which removes every row past the
+  // retention whether or not anything it does reaches the store — the same
+  // start sweep an expired key leaves by (`store-process-start.mjs`), and one
+  // whose clock has not reached the retention removes nothing.
+  // No `value`: the binding travels to the helper as JSON, and a `set` holds
+  // nothing to it.
+  const store = { ...kv("history_start", "global", FOURTH_URL_ENV), history: true, historyRetention: HOUR };
+  const id = execution("history_start");
+  const run = ctx(id);
+  try {
+    await later(0, async () => {
+      for (let n = 0; n < 3; n += 1) {
+        await write(store, "set", { key: "k", value: { n } }, run, `${id}/w/${n}`);
+      }
+    });
+    const before = await historyRows(store, "k");
+    const early = await helper("store-process-start.mjs", [project, provider, data, JSON.stringify(store)], {
+      ...process.env,
+      [CLOCK]: String(HOUR - MINUTE),
+    });
+    const beforeRetention = await historyRows(store, "k");
+    const started = await helper("store-process-start.mjs", [project, provider, data, JSON.stringify(store)], {
+      ...process.env,
+      [CLOCK]: String(HOUR + MINUTE),
+    });
+    const after = await historyRows(store, "k");
+    const kept = (await get(store, "k", run)).value?.n;
+    answer.a_history_row_past_its_retention_leaves_storage_when_a_process_starts =
+      early.answer.started === true &&
+      started.answer.started === true &&
+      before === 3 &&
+      beforeRetention === 3 &&
+      after === 0 &&
+      kept === 2;
+    answer.history_start_trace = { before, beforeRetention, after, kept };
+  } catch (error) {
+    answer.history_start_error = String(error?.stack ?? error);
+  }
+}
+
+{
+  // **A store without `history: true` records nothing** — its writes leave the
+  // side table empty — and a `history` read of it is refused by name for a
+  // caller that is not the compiler, which refuses the op at `validate`.
+  const store = kv("history_off", "global", URL_ENV, HISTORIED);
+  const id = execution("history_off");
+  const run = ctx(id);
+  try {
+    await write(store, "set", { key: "k", value: { n: 1 } }, run, `${id}/w/1`);
+    await write(store, "merge", { key: "k", fields: { n: 2 } }, run, `${id}/w/2`);
+    await write(store, "delete", { key: "k" }, run, `${id}/w/3`);
+    await batch(store, [{ op: "set", key: "k", value: { n: 4 } }], run, `${id}/w/4`);
+    const recorded = await historyRows(store, "k");
+    const refused = await refusal(historyOf(store, "k", run));
+    answer.a_store_without_history_records_nothing = recorded === 0;
+    answer.a_history_read_of_a_store_without_history_is_refused_by_name =
+      (refused ?? "").includes("keeps no history");
+    answer.history_off_trace = { recorded, refused };
+  } catch (error) {
+    answer.history_off_error = String(error?.stack ?? error);
+  }
+}
+
+{
+  // **The other writers' actors.** An operator's write at the command line is
+  // `{ kind: "cli" }`, naming no execution (PRD resolved q72); a synthesized
+  // tool's is `{ kind: "tool" }` with the agent execution's instance path and
+  // the call's frame; and a node writing under an authored key (PRD resolved
+  // q73) names the same writer its derived key would — the site carries the
+  // instance path whichever key its ledger holds.
+  const store = historied("history_actors");
+  const id = execution("history_actors");
+  try {
+    const operated = await stores.runOperatorOp({ store }, "set", { key: "k", value: { n: 1 } });
+    const tooled = await stores.runStoreTool(store, "set", { key: "k", value: { n: 2 } }, ctx(id), {
+      path: ["ask/0"],
+      ordinal: 3,
+      dispatches: [],
+      builtin: [],
+    });
+    const keyed = await stores.runStoreOp(
+      store,
+      "set",
+      { key: "k", value: { n: 3 }, idempotencyKey: "evt-1" },
+      ctx(id),
+      at_(authored(store, "evt-1"), "save/0"),
+    );
+    const read = await stores.runOperatorOp({ store }, "history", { key: "k", limit: 10 });
+    answer.an_operator_write_records_actor_cli =
+      operated.applied === true && same(read.entries[0]?.actor, { kind: "cli" });
+    answer.a_tool_write_records_its_agents_path_and_call_frame =
+      tooled.applied === true &&
+      same(read.entries[1]?.actor, { kind: "tool", execution: id, path: `ask/0/${store.name}_set/3` });
+    answer.an_authored_write_records_the_same_actor_a_derived_one_would =
+      keyed.applied === true && same(read.entries[2]?.actor, { kind: "node", execution: id, path: "save/0" });
+    answer.history_actors_trace = read;
+  } catch (error) {
+    answer.history_actors_error = String(error?.stack ?? error);
+  }
+}
+
+{
+  // **History is not replayed; the write is** (PRD resolved q29). A resumed
+  // generation answers its recorded write out of the journal and reaches no
+  // store, so it records no second row; its recorded `history` read answers
+  // the page the first generation read, though the history moved since.
+  const handle = await journal.openJournal();
+  const store = historied("history_replayed");
+  const id = execution("history_replay");
+  try {
+    await handle.begin({
+      id,
+      flow: "flow.probe",
+      trigger: "manual",
+      inputs: {},
+      sessionKey: "",
+      status: "open",
+      journalVersion: journal.JOURNAL_VERSION,
+      startedAt: new Date().toISOString(),
+    });
+    journal.openSession(id, handle, false);
+    await set(store, "k", { n: 1 }, ctx(id, "", journal.recorderFor(id, "flow.probe/0#write")), `${id}/write/0`);
+    const firstRead = await historyOf(store, "k", ctx(id, "", journal.recorderFor(id, "flow.probe/0#read")));
+    journal.closeSession(id);
+    // Out of band, with nothing recording: the history moves.
+    await set(store, "k", { n: 2 }, ctx(execution("history_replay_out")), "out/0");
+    journal.openSession(id, handle, true);
+    await set(store, "k", { n: 1 }, ctx(id, "", journal.recorderFor(id, "flow.probe/0#write")), `${id}/write/0`);
+    const replayRead = await historyOf(store, "k", ctx(id, "", journal.recorderFor(id, "flow.probe/0#read")));
+    journal.closeSession(id);
+    const stored = await historyRows(store, "k");
+    answer.a_replayed_write_records_no_second_history_row = stored === 2;
+    answer.a_replayed_history_read_answers_out_of_the_record =
+      firstRead.entries.length === 1 && same(replayRead, firstRead);
+    answer.history_replayed_trace = { firstRead, replayRead, stored };
+  } catch (error) {
+    answer.history_replayed_error = String(error?.stack ?? error);
+  } finally {
+    await journal.releaseJournal();
+  }
+}
+
+/**
+ * The schema the release before PRD resolved q74 created on each backend —
+ * this release's tables but `history`/`store_history` — copied from that
+ * release's sources rather than derived from this one's, for the earlier
+ * cases' reason: what is under test is that a store an earlier release left is
+ * brought forward, so it has to be that release's shape.
+ */
+const PRE_HISTORY_SCHEMA = {
+  sqlite: [
+    `CREATE TABLE entries (
+  scope_key  TEXT NOT NULL,
+  key        TEXT NOT NULL,
+  value      TEXT NOT NULL,
+  metadata   TEXT,
+  embedding  TEXT,
+  version    INTEGER NOT NULL DEFAULT 0,
+  expires_at INTEGER,
+  PRIMARY KEY (scope_key, key)
+)`,
+    `CREATE TABLE applied (
+  idempotency_key TEXT PRIMARY KEY,
+  op              TEXT NOT NULL,
+  result          TEXT NOT NULL,
+  expires_at      INTEGER
+)`,
+    `CREATE TABLE sequences (
+  scope_key TEXT PRIMARY KEY,
+  last      INTEGER NOT NULL
+)`,
+    "CREATE INDEX entries_partition_expiry ON entries (scope_key, expires_at) WHERE expires_at IS NOT NULL",
+    "CREATE INDEX entries_expiry ON entries (expires_at) WHERE expires_at IS NOT NULL",
+    "CREATE INDEX applied_expiry ON applied (expires_at) WHERE expires_at IS NOT NULL",
+  ],
+  postgres: [
+    `CREATE TABLE store_entries (
+  store      TEXT COLLATE "C" NOT NULL,
+  scope_key  TEXT COLLATE "C" NOT NULL,
+  "key"      TEXT COLLATE "C" NOT NULL,
+  value      TEXT NOT NULL,
+  version    BIGINT NOT NULL DEFAULT 0,
+  expires_at BIGINT,
+  PRIMARY KEY (store, scope_key, "key")
+)`,
+    "CREATE INDEX store_entries_partition_expiry ON store_entries (store, scope_key, expires_at) WHERE expires_at IS NOT NULL",
+    "CREATE INDEX store_entries_expiry ON store_entries (store, expires_at) WHERE expires_at IS NOT NULL",
+    `CREATE TABLE store_applied (
+  store           TEXT COLLATE "C" NOT NULL,
+  scope_key       TEXT COLLATE "C" NOT NULL,
+  idempotency_key TEXT COLLATE "C" NOT NULL,
+  op              TEXT NOT NULL,
+  result          TEXT NOT NULL,
+  expires_at      BIGINT,
+  PRIMARY KEY (store, idempotency_key)
+)`,
+    "CREATE INDEX store_applied_partition ON store_applied (store, scope_key)",
+    "CREATE INDEX store_applied_expiry ON store_applied (store, expires_at) WHERE expires_at IS NOT NULL",
+    `CREATE TABLE store_sequences (
+  store     TEXT COLLATE "C" NOT NULL,
+  scope_key TEXT COLLATE "C" NOT NULL,
+  last      BIGINT NOT NULL,
+  PRIMARY KEY (store, scope_key)
+)`,
+  ],
+  mysql: [
+    `CREATE TABLE store_entries (
+  store      VARCHAR(128)  CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  scope_key  VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  \`key\`      VARCHAR(2048) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL,
+  value      LONGTEXT NOT NULL,
+  version    BIGINT NOT NULL DEFAULT 0,
+  expires_at BIGINT NULL,
+  scope_hash BINARY(32) AS (UNHEX(SHA2(scope_key, 256))) STORED NOT NULL,
+  key_hash   BINARY(32) AS (UNHEX(SHA2(\`key\`, 256))) STORED NOT NULL,
+  PRIMARY KEY (store, scope_hash, key_hash),
+  KEY store_entries_partition (store, scope_key(255), \`key\`(191)),
+  KEY store_entries_partition_expiry (store, scope_hash, expires_at),
+  KEY store_entries_expiry (store, expires_at)
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE store_applied (
+  store           VARCHAR(128)  CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  scope_key       VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  idempotency_key VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  op              VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  result          LONGTEXT NOT NULL,
+  expires_at      BIGINT NULL,
+  PRIMARY KEY (store, idempotency_key),
+  KEY store_applied_partition (store, scope_key(255)),
+  KEY store_applied_expiry (store, expires_at)
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE store_sequences (
+  store      VARCHAR(128)  CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  scope_key  VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  last       BIGINT NOT NULL,
+  PRIMARY KEY (store, scope_key)
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
+  ],
+};
+
+{
+  // **A store an earlier release created gains its history at open** — on
+  // every arm, by `CREATE TABLE IF NOT EXISTS` on the open every op makes, and
+  // with two openers racing to make it. Laid down by hand holding one key at
+  // version 1 and its sequence, then written through a binding that keeps
+  // history: the key's old value is the row's `old_value`, and the version the
+  // write takes is the one past the sequence.
+  const PRE_URL_ENVS = ["AGENT_COMPOSE_STORE_URL_PRE_HISTORY", "AGENT_COMPOSE_STORE_URL_PRE_HISTORY_B"];
+  const openers = PRE_URL_ENVS.map((variable) => ({
+    ...kv("pre_history", "global", variable, HISTORIED),
+    history: true,
+  }));
+  const name = openers[0].name;
+  const database = `${RUN}_pre_history`;
+  let created = false;
+  let address;
+  try {
+    if (provider === "sqlite") {
+      const module = await import("node-sqlite3-wasm");
+      const { Database } = module.default ?? module;
+      const directory = path.join(data, "stores");
+      fs.mkdirSync(directory, { recursive: true });
+      const file = new Database(path.join(directory, `${stores.encodeKey(name)}.sqlite`));
+      try {
+        for (const statement of PRE_HISTORY_SCHEMA.sqlite) file.exec(statement);
+        file.run("INSERT INTO entries (scope_key, key, value, version) VALUES (?, ?, ?, ?)", [
+          "global",
+          "old",
+          JSON.stringify({ n: 1 }),
+          1,
+        ]);
+        file.run("INSERT INTO sequences (scope_key, last) VALUES (?, ?)", ["global", 1]);
+      } finally {
+        file.close();
+      }
+    } else {
+      const admin = await openServer(process.env[URL_ENV]);
+      try {
+        await rows(admin, `CREATE DATABASE ${database}`);
+        created = true;
+      } finally {
+        await admin.end().catch(() => undefined);
+      }
+      address = new URL(process.env[URL_ENV]);
+      address.pathname = `/${database}`;
+      for (const variable of PRE_URL_ENVS) process.env[variable] = address.href;
+      const seeder = await openServer(address.href);
+      try {
+        for (const statement of PRE_HISTORY_SCHEMA[provider]) await rows(seeder, statement);
+        const [entry, sequence] =
+          provider === "postgres"
+            ? [
+                'INSERT INTO store_entries (store, scope_key, "key", value, version) VALUES ($1, $2, $3, $4, $5)',
+                "INSERT INTO store_sequences (store, scope_key, last) VALUES ($1, $2, $3)",
+              ]
+            : [
+                "INSERT INTO store_entries (store, scope_key, `key`, value, version) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO store_sequences (store, scope_key, last) VALUES (?, ?, ?)",
+              ];
+        await rows(seeder, entry, [name, "global", "old", JSON.stringify({ n: 1 }), 1]);
+        await rows(seeder, sequence, [name, "global", 1]);
+      } finally {
+        await seeder.end().catch(() => undefined);
+      }
+    }
+    const run = ctx(execution("pre_history"));
+    const opened = await Promise.allSettled(openers.map((store) => get(store, "old", run)));
+    answer.pre_history_opening_errors = opened
+      .filter((outcome) => outcome.status === "rejected")
+      .map((outcome) => String(outcome.reason?.message ?? outcome.reason));
+    const [store, other] = openers;
+    const merged = await write(store, "merge", { key: "old", fields: { n: 2 } }, run, `${execution("pre_history")}/m/0`);
+    const page = await historyOf(other, "old", run);
+    answer.a_store_from_before_history_gains_its_history_table_on_open =
+      opened.every((outcome) => outcome.status === "fulfilled") &&
+      merged.applied === true &&
+      merged.version === 2 &&
+      page.entries.length === 1 &&
+      same(page.entries[0].old_value, { n: 1 }) &&
+      same(page.entries[0].new_value, { n: 2 }) &&
+      page.entries[0].version === 2;
+    answer.pre_history_trace = { merged, page };
+  } catch (error) {
+    answer.pre_history_error = String(error?.stack ?? error);
+  } finally {
+    await stores.releaseStores();
+    if (created) {
+      const admin = await openServer(process.env[URL_ENV]);
+      try {
+        await rows(admin, `DROP DATABASE ${database}`);
+      } finally {
+        await admin.end().catch(() => undefined);
+      }
+    }
   }
 }
 

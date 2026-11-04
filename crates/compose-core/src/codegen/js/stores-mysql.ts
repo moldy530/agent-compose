@@ -146,6 +146,29 @@ import type { Connection, ResultSetHeader, RowDataPacket } from "mysql2/promise"
  * oldest expired row. MySQL has no partial index, so a key that never expires
  * has an entry in both under `NULL`, which sorts first and which no sweep's
  * range reaches.
+ *
+ * `store_history` is the per-key history a `history: true` store records (PRD
+ * resolved q74), one row per write that landed, inserted by the write in its
+ * own transaction under the partition's sequence lock. `seq` is its primary
+ * key and an `AUTO_INCREMENT`: the server hands each row the next value and
+ * never hands one out again — a rolled-back insert's included, and, since 8.0
+ * persists the counter, across a restart — so one key's rows take theirs in
+ * the order their writes commit. The key and the partition are the entries'
+ * columns, collations and bounds; the values are `LONGTEXT` for `value`'s
+ * reason, `NULL` where the key held nothing on that side of the write; and an
+ * actor's execution and path are this compiler's strings, `TEXT`. Its indexes
+ * are what reads it: `store_history_key` a page of one key's rows past a cursor
+ * — a prefix index, as `store_entries_partition` is, so the server narrows on
+ * the key's leading characters and orders the key's rows by `seq` from there —
+ * `store_history_partition` the `DELETE` of a partition that ends with its run,
+ * `store_history_partition_at` a write's and a sweep batch's bounded `DELETE` of
+ * a partition's rows past the store's retention, by the partition's hash for
+ * the reason the entries' expiry index uses one, and `store_history_at` the
+ * read, locking nothing, by which a store-wide sweep finds the partition
+ * holding the oldest. A database from before PRD resolved q74 has no
+ * `store_history`, and `CREATE TABLE IF NOT EXISTS` — which every open already
+ * runs — is the whole of its migration: a table that is not there has no rows
+ * to bring forward and no column or index to add.
  */
 const MYSQL_STORE_SCHEMA = [
   `CREATE TABLE IF NOT EXISTS store_entries (
@@ -178,6 +201,26 @@ const MYSQL_STORE_SCHEMA = [
   scope_key  VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   last       BIGINT NOT NULL,
   PRIMARY KEY (store, scope_key)
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
+  `CREATE TABLE IF NOT EXISTS store_history (
+  seq             BIGINT NOT NULL AUTO_INCREMENT,
+  store           VARCHAR(128)  CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  scope_key       VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  \`key\`           VARCHAR(2048) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL,
+  op              VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  old_value       LONGTEXT NULL,
+  new_value       LONGTEXT NULL,
+  version         BIGINT NULL,
+  actor_kind      VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  actor_execution TEXT NULL,
+  actor_path      TEXT NULL,
+  at              BIGINT NOT NULL,
+  scope_hash      BINARY(32) AS (UNHEX(SHA2(scope_key, 256))) STORED NOT NULL,
+  PRIMARY KEY (seq),
+  KEY store_history_key (store, scope_key(255), \`key\`(191), seq),
+  KEY store_history_partition (store, scope_key(255)),
+  KEY store_history_partition_at (store, scope_hash, at),
+  KEY store_history_at (store, at)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
 ];
 
@@ -377,6 +420,12 @@ const MYSQL_STORE_DIALECT: StoreDialect = {
   // `DELETE` reaches these rows through another index while it runs.
   sweepLedger: (limit) =>
     `DELETE FROM store_applied WHERE store = ? AND expires_at <= ? ORDER BY expires_at LIMIT ${limit}`,
+  // One partition's history rows past a retention cut-off (PRD resolved
+  // q74), by the partition's hash — `store_history_partition_at` — and only
+  // ever under that partition's sequence lock, for `sweepPartition`'s reason.
+  sweepHistory: (limit) =>
+    "DELETE FROM store_history WHERE store = ? AND scope_hash = UNHEX(SHA2(?, 256)) " +
+    `AND at <= ? ORDER BY at LIMIT ${limit}`,
   ledgerKey: mysqlLedgerKey,
 };
 

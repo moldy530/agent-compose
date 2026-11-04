@@ -71,7 +71,8 @@
 //!
 //! The two suites share those servers and never share a row: the journal's
 //! tables are `executions`, `effects`, `deliveries` and `dispatches`, and a
-//! store's are `store_entries`, `store_applied` and `store_sequences`. Inside
+//! store's are `store_entries`, `store_applied`, `store_sequences` and
+//! `store_history`. Inside
 //! those, every case here keys on a store name minted per run by the runner, so
 //! two runs against one server — CI's and a developer's second `cargo test` —
 //! never read each other's rows either. The one case that needs tables of its
@@ -942,6 +943,61 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "an_authored_key_on_an_execution_scoped_store_is_refused",
     "an_execution_id_in_the_authored_namespace_is_refused_by_the_store_and_the_journal",
     "every_derived_child_execution_id_is_outside_the_authored_namespace",
+    // PRD resolved q74: a store declaring `history: true` records every write
+    // that lands as a history row in the write's own transaction. Three
+    // executions writing one key show three rows in `seq` order, each naming
+    // its writer by execution id and instance path, with the value before and
+    // after and a consecutive version; a `history` read is a read whose record
+    // carries its key and the page it answered.
+    "three_executions_writing_one_key_show_three_history_rows_in_seq_order",
+    "each_history_row_names_its_writers_execution_and_instance_path",
+    "each_history_row_holds_the_values_before_and_after_and_a_consecutive_version",
+    "a_history_row_is_dated_by_its_writes_clock",
+    "a_history_read_records_a_read_carrying_its_key_and_page",
+    // …what does not land records nothing — a declined condition, a deduped
+    // retry, a schema-refused `merge` rolled back with its transaction…
+    "a_declined_conditional_write_records_no_history",
+    "a_deduped_retry_records_no_history",
+    "a_schema_refused_merge_records_no_history",
+    "only_the_landed_write_is_in_the_history",
+    // …and every write that applied does: a `delete` with the value it removed
+    // and none after, one of a key holding nothing with no value either side,
+    // and a unique `append` that changed nothing with the value it kept.
+    "an_applied_write_that_changes_nothing_records_the_value_it_kept",
+    "a_delete_records_the_value_it_removed_and_none_after",
+    "a_delete_of_a_key_holding_nothing_records_a_row_with_no_values",
+    // A batch records one row per entry in its one transaction, and a declined
+    // batch, or one killed between two entries, records none.
+    "a_batch_of_three_entries_records_three_history_rows_in_one_transaction",
+    "a_declined_batch_records_no_history",
+    "a_batch_killed_mid_transaction_leaves_no_history_rows",
+    // `history` pages as `list` does: `limit` and `after`, `next` exactly when
+    // more remain, the empty cursor the first page, a malformed one refused.
+    "a_history_pages_with_limit_and_after_like_a_list",
+    "a_history_page_that_ends_on_the_last_row_has_no_next",
+    "a_key_with_no_history_answers_an_empty_page",
+    "a_history_cursor_that_is_not_one_is_refused_by_name",
+    // `history_retention:` on q69's schedule: invisible at once, removed by
+    // the next write to the partition or the next process start, the entries
+    // untouched.
+    "a_history_row_past_its_retention_is_invisible_at_once",
+    "a_write_removes_its_partitions_history_past_retention_and_the_entries_stay",
+    "a_history_row_past_its_retention_leaves_storage_when_a_process_starts",
+    // A store without `history: true` records nothing, and a `history` read of
+    // it is refused by name for a caller that is not the compiler.
+    "a_store_without_history_records_nothing",
+    "a_history_read_of_a_store_without_history_is_refused_by_name",
+    // The other writers: an operator is `cli`, a tool names its agent's path
+    // and call frame, and an authored write names the writer a derived one
+    // would.
+    "an_operator_write_records_actor_cli",
+    "a_tool_write_records_its_agents_path_and_call_frame",
+    "an_authored_write_records_the_same_actor_a_derived_one_would",
+    // History is not replayed; the write is (PRD resolved q29).
+    "a_replayed_write_records_no_second_history_row",
+    "a_replayed_history_read_answers_out_of_the_record",
+    // A store an earlier release created gains the side table at open.
+    "a_store_from_before_history_gains_its_history_table_on_open",
 ];
 
 /// The order every arm pages a mixed set in: UTF-8 byte order, which Rust's

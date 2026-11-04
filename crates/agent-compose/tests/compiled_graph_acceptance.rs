@@ -21039,6 +21039,265 @@ fn a_resumed_run_answers_a_write_under_an_authored_key_out_of_the_record() {
     );
 }
 
+/// The `history` read of `flow.audited`'s `page` node, off one run's trace.
+fn audited_page(trace: &[Value]) -> Value {
+    trace
+        .iter()
+        .find(|entry| entry["node"] == "page")
+        .and_then(|entry| entry["stores"].as_array())
+        .and_then(|records| records.first().cloned())
+        .unwrap_or_else(|| panic!("the `page` node's read is on its entry: {trace:#?}"))
+}
+
+/// A flow writes one key twice, reads its history and routes on how many rows
+/// it read (grammar 11.4, PRD resolved q74).
+///
+/// `flow.audited` opens `acct/<topic>` with a `set` and credits it with an
+/// `incr` — two writes to a store that declares `history: true` — then reads
+/// the key's history and routes on `size(page.output.entries)`: `two_writes`
+/// exactly when it read two rows. Its read is a **read** on the trace, carrying
+/// the key it addressed and the page it answered: two rows in `seq` order, each
+/// naming the execution and the node's instance path that wrote it, with the
+/// values before and after and consecutive versions. A second run after one more
+/// write from `flow.credited` reads five rows and takes the other branch.
+#[test]
+fn a_flow_reads_a_keys_history_and_routes_on_how_many_rows_it_read() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some((project, built)) = harness::build_under_toolchain("durability", "audited") else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the durability fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let environment = harness::environment(&provider);
+    let audit = |note: &str| {
+        provider.enqueue(Script::new(
+            SONNET,
+            Outcome::structured(json!({ "note": note })),
+        ));
+        let run = harness::run_formatted(
+            &project,
+            "durability",
+            "flow.audited",
+            &[("topic", "books")],
+            None,
+            Some("json"),
+            &environment,
+        );
+        run.succeeded();
+        run.outputs()
+    };
+
+    let first = audit("a first audit");
+    assert_eq!(first["status"], "completed", "{first}");
+    let execution = first["execution_id"]
+        .as_str()
+        .expect("the record names its execution")
+        .to_string();
+    let trace = first["trace"].as_array().expect("a trace").clone();
+    let visited: Vec<&str> = trace
+        .iter()
+        .filter_map(|entry| entry["node"].as_str())
+        .collect();
+    assert!(
+        visited.contains(&"two_writes") && !visited.contains(&"more_writes"),
+        "the run read its own two writes and routed on them: {visited:?}"
+    );
+    let page = audited_page(&trace);
+    assert_eq!(page["op"], "history", "{page}");
+    assert_eq!(page["effect"], "read", "{page}");
+    assert_eq!(
+        page["key"], "acct/books",
+        "a history read addresses one key: {page}"
+    );
+    for absent in ["idempotencyKey", "deduped", "applied", "version"] {
+        assert!(
+            page.get(absent).is_none(),
+            "a read carries no `{absent}`: {page}"
+        );
+    }
+    let rows = page["answer"]["entries"]
+        .as_array()
+        .expect("the record carries the page it read");
+    assert_eq!(rows.len(), 2, "{page}");
+    assert!(
+        page["answer"].get("next").is_none(),
+        "the one page is the last: {page}"
+    );
+    assert_eq!(rows[0]["op"], "set", "{page}");
+    assert!(rows[0].get("old_value").is_none(), "{page}");
+    assert_eq!(rows[0]["new_value"], json!({ "balance": 0 }), "{page}");
+    assert_eq!(rows[1]["op"], "incr", "{page}");
+    assert_eq!(rows[1]["old_value"], json!({ "balance": 0 }), "{page}");
+    assert_eq!(rows[1]["new_value"], json!({ "balance": 5 }), "{page}");
+    assert!(
+        rows[0]["seq"].as_u64() < rows[1]["seq"].as_u64(),
+        "oldest first: {page}"
+    );
+    assert_eq!(
+        rows[1]["version"].as_u64(),
+        rows[0]["version"].as_u64().map(|version| version + 1),
+        "two writes to one partition take consecutive versions: {page}"
+    );
+    for (row, path) in rows.iter().zip(["open/0", "credit/0"]) {
+        assert_eq!(
+            row["actor"],
+            json!({ "kind": "node", "execution": execution, "path": path }),
+            "each row names its writer — the execution and the node's instance path: {page}"
+        );
+        assert!(row["at"].as_u64().is_some_and(|at| at > 0), "{page}");
+    }
+
+    harness::run_into(
+        &project,
+        "durability",
+        "flow.credited",
+        &[("topic", "books")],
+        None,
+        &environment,
+    )
+    .succeeded();
+    let second = audit("a second audit");
+    let trace = second["trace"].as_array().expect("a trace").clone();
+    let visited: Vec<&str> = trace
+        .iter()
+        .filter_map(|entry| entry["node"].as_str())
+        .collect();
+    assert!(
+        visited.contains(&"more_writes") && !visited.contains(&"two_writes"),
+        "five rows now — two, one, and this run's two — so the other branch: {visited:?}"
+    );
+    assert_eq!(
+        audited_page(&trace)["answer"]["entries"]
+            .as_array()
+            .map(Vec::len),
+        Some(5),
+        "{second}"
+    );
+}
+
+/// A resumed generation answers a `history` read out of the record, and its
+/// replayed writes record no history row of their own (PRD resolved q74, q29).
+///
+/// `flow.audited` writes its key twice, reads the key's history and routes on
+/// its length, and then calls a model — and the run is killed during that call,
+/// so both writes and the read are behind the frontier. While the execution is
+/// down, `flow.credited` writes the key once more, so the live history holds
+/// three rows. The resumed generation answers its read with the two rows its
+/// first generation read and takes the same branch; its two writes are
+/// answered out of the journal and reach no store, which a fresh run's read
+/// then shows — five rows, not seven.
+#[test]
+fn a_resumed_run_answers_a_history_read_out_of_the_record() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "an audited note" })).after(Duration::from_secs(120)),
+    ));
+    let Some((project, built)) = harness::build_under_toolchain("durability", "resume-audited")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the durability fixture did not build:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let environment = harness::environment(&provider);
+
+    let killed = harness::crash_run(
+        &project,
+        &["run", "flow.audited", "--input", "topic=ledger"],
+        &environment,
+        |_| provider.snapshot().requests >= 1,
+    );
+
+    // The history moves while the execution is down.
+    harness::run_into(
+        &project,
+        "durability",
+        "flow.credited",
+        &[("topic", "ledger")],
+        None,
+        &environment,
+    )
+    .succeeded();
+
+    provider.reset();
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "an audited note" })),
+    ));
+    let resumed = harness::resume(
+        &project,
+        "durability",
+        &killed.execution,
+        Some("json"),
+        &environment,
+    );
+    resumed.succeeded();
+    let answered = resumed.outputs();
+    assert_eq!(answered["status"], "completed", "{answered}");
+    let trace = answered["trace"].as_array().expect("a trace").clone();
+    let visited: Vec<&str> = trace
+        .iter()
+        .filter_map(|entry| entry["node"].as_str())
+        .collect();
+    assert!(
+        visited.contains(&"two_writes") && !visited.contains(&"more_writes"),
+        "the replayed read answers the two rows the first generation read, not the live three, \
+         so the resumed run takes the same branch: {visited:?}"
+    );
+    let page = audited_page(&trace);
+    assert_eq!(page["op"], "history", "{page}");
+    assert_eq!(page["effect"], "read", "{page}");
+    let rows = page["answer"]["entries"]
+        .as_array()
+        .expect("the record carries the page it read");
+    assert_eq!(rows.len(), 2, "{page}");
+    for row in rows {
+        assert_eq!(
+            row["actor"]["execution"],
+            json!(killed.execution),
+            "every row the replayed page holds is the killed execution's own: {page}"
+        );
+    }
+    assert_eq!(
+        provider.snapshot().requests,
+        1,
+        "only the killed model call was made again"
+    );
+
+    // A fresh run reads the live history: the first generation's two writes,
+    // the out-of-band one and its own two — the resumed generation's replayed
+    // writes recorded nothing.
+    provider.reset();
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "a fresh note" })),
+    ));
+    let fresh = harness::run_formatted(
+        &project,
+        "durability",
+        "flow.audited",
+        &[("topic", "ledger")],
+        None,
+        Some("json"),
+        &environment,
+    );
+    fresh.succeeded();
+    let fresh = fresh.outputs();
+    assert_eq!(
+        audited_page(fresh["trace"].as_array().expect("a trace"))["answer"]["entries"]
+            .as_array()
+            .map(Vec::len),
+        Some(5),
+        "{fresh}"
+    );
+}
+
 /// A resumed generation answers a `batch` out of the record and applies none of
 /// it again (PRD resolved q71, q29).
 ///
