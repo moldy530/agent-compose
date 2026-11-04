@@ -3152,17 +3152,15 @@ export async function journaled<T>(
 import { Client } from "pg";
 
 /**
- * The schema, created on first open and never migrated.
+ * The schema, created on first open, and grown by the `DO` block at its end
+ * where a database an earlier build created lacks a column.
  *
  * `IF NOT EXISTS` throughout, so a second open of a journal this build already
- * created does nothing — which is the whole of what `docs/durability.md` §11.2
- * asks of a physical schema, and all it can ask of this one: a remote journal is
- * created by this release or a later one, so there is no file older than this
- * arm whose columns have to be probed for. (The SQLite arm's `PRAGMA table_info`
- * walks exist because there *are* older files.) A **table** added since is no
- * work: `lineage` (PRD resolved q65) arrived after this schema first shipped,
- * and `IF NOT EXISTS` is the whole of its migration into a database an earlier
- * build created. A **column** added since is the case §11.2 is read twice for,
+ * created does nothing. (The SQLite arm's `PRAGMA table_info` walks probe for
+ * every column grown since its first release, because files that old exist.) A
+ * **table** added since is no work: `lineage` (PRD resolved q65) arrived after
+ * this schema first shipped, and `IF NOT EXISTS` is the whole of its migration
+ * into a database an earlier build created. A **column** added since is the case §11.2 is read twice for,
  * and `finally_error` (PRD resolved q76) is the first: a database an earlier
  * build created holds `executions` without it, and `CREATE TABLE IF NOT EXISTS`
  * leaves that table as it is. So the `DO` block below probes `pg_attribute` and

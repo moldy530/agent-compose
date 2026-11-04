@@ -1802,13 +1802,21 @@ statically over the whole golden corpus, so a generated module may name neither
 `bun:sqlite` nor `node:sqlite`; the shared driver is also one fewer pinned
 dependency.
 
-**Schema creation is idempotent, and only SQLite migrates.** Every backend
-creates its tables on first open with `IF NOT EXISTS`, so a second open of a
-journal this release wrote does nothing. SQLite additionally *probes* for the
-columns §11.2 records as later arrivals, because files written by earlier
-releases exist; the two remote arms carry no such probes and need none, since no
-journal older than they are exists. A column added to a remote schema in a later
-release is the case to read §11.2 twice for, exactly as it is on the file.
+**Schema creation is idempotent, and a column grown since is probed for.** Every
+backend creates its tables on first open with `IF NOT EXISTS`, so a second open
+of a journal this release wrote does nothing, and a **table** added since —
+`lineage` (PRD resolved q65) — needs nothing more on any of them. A **column**
+added to a table that already existed is not covered by that, so it is probed
+for and added where it is missing. SQLite probes for every column §11.2 records
+as a later arrival, because files written by earlier releases exist. The two
+remote arms probe for the one column grown since they shipped, `finally_error`
+(PRD resolved q76, §11.2): `pg_attribute` on Postgres and `information_schema` on
+MySQL, then an `ALTER TABLE … ADD COLUMN` only where it is missing. So the first
+open of an existing Postgres or MySQL journal by a build that carries the column
+alters `executions` once, under the writer guard (§2.3), and every open after it
+finds the column and alters nothing. A column added to a remote schema in a later
+release joins that probe, and is the case to read §11.2 twice for, exactly as it
+is on the file.
 
 **A column holds the same values on all three.** The types differ — that is what
 a per-backend schema is for — but what fits does not. SQLite and Postgres spell
