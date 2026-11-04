@@ -134,11 +134,14 @@ control-transfer positions — `on_error: { fallback: … }` and
 `human.on_timeout:`. Guards are ignored: whether an edge fires is a runtime
 question, and this check asks whether a node is *ever* addressable. A node
 nothing addresses is `unreachable-node`; give it an inbound edge, name it as a
-fallback, or delete it.
+fallback, or delete it. A flow's `finally:` node is reachable because it is
+`finally:` (`agent-compose docs flows`).
 
 Reachability constrains *entry*; the exit rules constrain *exit*. Every node
 also needs at least one outgoing edge, including a node reached only by a
 fallback — `- { from: cleanup, to: end }` is the usual line, and retiring a
-branch is exactly what `end` is for.
+branch is exactly what `end` is for. The `finally:` node is the one exception:
+it runs once the instance has no branches left, so it has no edge at all, in or
+out.
 
 Normative source: `docs/grammar.md` §7.4, §7.8
