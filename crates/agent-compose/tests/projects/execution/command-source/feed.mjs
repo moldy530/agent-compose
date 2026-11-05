@@ -33,6 +33,19 @@
 //                    this file, ignore SIGTERM and the end of stdin — so only
 //                    the SIGKILL `serve` sends the group after its grace
 //                    ends either of them
+//   FEED_UNHANDABLE  on a run that exits part-way (FEED_EXIT_AFTER), emit
+//                    three more lines after its last event whose `cursor` no
+//                    program could be handed back — one holding a NUL, one a
+//                    lone UTF-16 surrogate, one 65537 bytes long — before the
+//                    exit: journaled, any of them would be the checkpoint the
+//                    restart is started with
+//   FEED_FRAMING     on a run that starts with no checkpoint, test the line
+//                    framing instead of emitting the stream: a stderr line of
+//                    1.5 MiB and one after it; event 1; event 2, exactly
+//                    1 MiB long; an event object of 1.5 MiB; event 3; a
+//                    stderr fragment and then event 4, neither ended by a
+//                    newline; then exit. Every event's checkpoint is its seq,
+//                    so FEED_TOTAL=4 makes the restart emit nothing
 //
 // The checkpoint is read from both places the runtime hands it back, and they
 // must agree. After the last event it emits nothing more and waits for its
@@ -87,6 +100,37 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Write `text` to `stream` as it stands, resolving once it is flushed. */
+function flushed(stream, text) {
+  return new Promise((resolve) => stream.write(text, resolve));
+}
+
+/** Event `seq`, as one line of JSON — padded out to `length` bytes when given. */
+function event(seq, length) {
+  const head = `{"seq":${seq},"cursor":"${seq}","text":"event ${seq}","pad":"`;
+  const tail = '"}';
+  const pad = length === undefined ? 0 : length - head.length - tail.length;
+  return `${head}${"x".repeat(pad)}${tail}`;
+}
+
+if (process.env.FEED_FRAMING && !resumed) {
+  const mib = 1 << 20;
+  await flushed(process.stderr, `${"e".repeat(mib + mib / 2)}\nafter the long line\n`);
+  for (const [seq, line] of [
+    [1, event(1)],
+    [2, event(2, mib)],
+    [undefined, event(99, mib + mib / 2)],
+    [3, event(3)],
+  ]) {
+    await flushed(process.stdout, `${line}\n`);
+    if (seq !== undefined && process.env.FEED_LOG) appendFileSync(process.env.FEED_LOG, `${seq}\n`);
+  }
+  await flushed(process.stderr, "the last words, unterminated");
+  await flushed(process.stdout, event(4));
+  if (process.env.FEED_LOG) appendFileSync(process.env.FEED_LOG, "4\n");
+  process.exit(0);
+}
+
 if (process.env.FEED_GARBAGE) {
   await write("this line is not JSON");
   await write("[1, 2, 3]");
@@ -106,6 +150,12 @@ if (process.env.FEED_UNBINDABLE) {
   await write("the event before this line binds no input");
 }
 if (!resumed && exitAfter !== undefined) {
+  if (process.env.FEED_UNHANDABLE) {
+    const seq = last + 1;
+    for (const cursor of [`${seq}\u0000`, `${seq}\ud800`, "9".repeat(65537)]) {
+      await write(JSON.stringify({ seq, cursor, text: `event ${seq}` }));
+    }
+  }
   await sleep(Number(process.env.FEED_RUN_MS ?? "0"));
   process.exit(0);
 }

@@ -1703,6 +1703,15 @@ pub struct Served {
     reaped: bool,
     /// Where the generated app is listening.
     pub base_url: String,
+    /// Everything the command and the app have written on stderr so far,
+    /// drained from the moment the command was spawned — for [`Running`]'s
+    /// reason: a pipe nobody reads fills at 64 KiB and holds the writer, so an
+    /// app with more than that to say (a program's stderr copied into its serve
+    /// log is one) would otherwise stall, or lose the tail it had buffered when
+    /// it was killed, before [`Served::stop_and_read_stderr`] read a byte.
+    stderr: Arc<Mutex<Vec<u8>>>,
+    /// The thread draining it, finished once every holder of the pipe is gone.
+    stderr_reader: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Served {
@@ -1757,21 +1766,17 @@ impl Served {
     /// outside the group that inherited the pipe costs a test its tail rather
     /// than its run.
     pub fn stop_and_read_stderr(&mut self) -> String {
-        let pipe = self.child.stderr.take();
         self.stop();
-        let Some(mut pipe) = pipe else {
-            return String::new();
-        };
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut said = Vec::new();
-            let _ = pipe.read_to_end(&mut said);
-            let _ = sender.send(said);
-        });
-        receiver
-            .recv_timeout(Duration::from_secs(10))
-            .map(|said| String::from_utf8_lossy(&said).into_owned())
-            .unwrap_or_default()
+        if let Some(reader) = self.stderr_reader.take() {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !reader.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if reader.is_finished() {
+                let _ = reader.join();
+            }
+        }
+        String::from_utf8_lossy(&self.stderr.lock().expect("the stderr buffer")).into_owned()
     }
 
     /// Wait for the command to exit and answer with its status.
@@ -1943,6 +1948,11 @@ pub fn serve_target_on(
     }
     seal(&mut command, environment);
     let mut child = command.spawn().expect("the command runs");
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let stderr_reader = drain(
+        child.stderr.take().expect("stderr is piped"),
+        Arc::clone(&stderr),
+    );
     let stdout = child.stdout.take().expect("stdout is piped");
     let mut line = String::new();
     BufReader::new(stdout)
@@ -1958,6 +1968,8 @@ pub fn serve_target_on(
         child,
         reaped: false,
         base_url,
+        stderr,
+        stderr_reader: Some(stderr_reader),
     })
 }
 

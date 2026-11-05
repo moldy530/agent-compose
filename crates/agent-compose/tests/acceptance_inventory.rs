@@ -2366,6 +2366,12 @@ const SOURCES: &[Criterion] = &[
                 "two_serves_on_one_postgres_journal_fire_each_tick_once",
                 Status::Live,
             ),
+            // …and a standby that takes the journal over recovers what the hub
+            // it replaces left open before it claims a tick of its own.
+            (
+                "a_standby_serve_recovers_what_the_serve_it_takes_over_from_left_open_before_it_fires",
+                Status::Live,
+            ),
             // …and once, not never, for a tick a `serve` claimed and died
             // before starting: the next start runs it under the recorded id.
             (
@@ -2388,6 +2394,16 @@ const SOURCES: &[Criterion] = &[
             // shared corpus and its daylight-saving cases.
             (
                 "the_generated_cron_evaluator_agrees_with_the_validator_on_the_conformance_corpus",
+                Status::Live,
+            ),
+            // …in a zone the runtime knows, under a clock hook that is one: each
+            // refuses `serve` at start rather than failing once it listens.
+            (
+                "serve_refuses_at_start_a_schedule_whose_timezone_the_runtime_does_not_know",
+                Status::Live,
+            ),
+            (
+                "serve_refuses_at_start_a_schedule_clock_variable_that_is_not_a_whole_number",
                 Status::Live,
             ),
             // …and by `serve` alone: `run` fires no tick and starts no program.
@@ -2429,6 +2445,18 @@ const SOURCES: &[Criterion] = &[
             // …a line that is not an object is refused and counted.
             (
                 "a_line_that_is_not_a_json_object_is_refused_counted_and_starts_nothing",
+                Status::Live,
+            ),
+            // …and so is one whose checkpoint no program could be handed back,
+            // so the restart after it still starts.
+            (
+                "a_line_whose_checkpoint_no_program_could_be_handed_is_refused_and_the_restart_still_starts",
+                Status::Live,
+            ),
+            // …lines are bounded at 1 MiB on both streams, refused or cut once,
+            // and a last line without a newline is admitted.
+            (
+                "a_programs_lines_are_bounded_at_one_mib_and_its_last_unterminated_line_is_admitted",
                 Status::Live,
             ),
             // …the checkpoint moves only for an event the intake accepted: not

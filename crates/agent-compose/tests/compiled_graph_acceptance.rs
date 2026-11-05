@@ -29470,6 +29470,219 @@ fn a_line_that_is_not_a_json_object_is_refused_counted_and_starts_nothing() {
     );
 }
 
+/// A checkpoint is handed back to every start of the program — as
+/// `AGENT_COMPOSE_CHECKPOINT` and as the `{checkpoint}` argument — so a line
+/// whose checkpoint no program could be handed back unchanged is refused before
+/// it is admitted, as one whose `checkpoint:` cannot be evaluated is (grammar
+/// 14.4, `docs/durability.md` §3.13).
+///
+/// The program emits three events and then, before it exits, three lines whose
+/// `cursor` — the fixture's `checkpoint:` — holds a NUL (no argument or
+/// environment variable carries one, so the start would throw), a lone UTF-16
+/// surrogate (it would reach the program as U+FFFD), and 65537 bytes (past the
+/// 64 KiB a checkpoint may be). Each is refused and counted, and the checkpoint
+/// stays at "3": so the restart — which, handed any of the three, would have
+/// failed every time and for good — starts the program with "3", and it goes on
+/// to emit the last two events.
+#[test]
+fn a_line_whose_checkpoint_no_program_could_be_handed_is_refused_and_the_restart_still_starts() {
+    let scratch = harness::Scratch::new("feed-unhandable");
+    let Some(project) = harness::scratch_project("feed-unhandable") else {
+        return;
+    };
+    let environment = feed_environment(
+        scratch.path(),
+        &[
+            ("FEED_TOTAL", "5"),
+            ("FEED_EXIT_AFTER", "3"),
+            ("FEED_UNHANDABLE", "1"),
+        ],
+    );
+    let Some(mut served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let status = eventually(
+        Duration::from_secs(60),
+        "the fifth event, after the restart",
+        || {
+            let status = source(&app, "feed");
+            (status["checkpoint"] == "5" && completed_of(&project, "ingest") == 5).then_some(status)
+        },
+    );
+    assert_eq!(status["refused_lines"], 3, "{status}");
+    assert_eq!(status["accepted_events"], 5, "{status}");
+    assert_eq!(
+        status["restart_count"], 1,
+        "one exit, and one start after it that did not fail: {status}"
+    );
+    let ids = ids_of(&project, "ingest");
+    assert_eq!(
+        ids.keys().cloned().collect::<BTreeSet<_>>(),
+        ids_through(5),
+        "the three refused lines started nothing"
+    );
+    assert!(
+        ids.values().all(|count| *count == 1),
+        "exactly one execution per event: {ids:?}"
+    );
+    let starts: Vec<Value> = lines_of(&scratch.path().join("starts.log"))
+        .iter()
+        .map(|line| serde_json::from_str(line).expect("a JSON start"))
+        .collect();
+    assert_eq!(
+        starts,
+        [
+            json!({ "argument": "", "variable": null }),
+            json!({ "argument": "3", "variable": "3" })
+        ],
+        "the restart was handed the last checkpoint a program can be handed"
+    );
+    assert_eq!(journaled_checkpoint(&project).as_deref(), Some("5"));
+    let said = served.stop_and_read_stderr();
+    for (line, why, count) in [
+        (
+            4,
+            "it holds a NUL character, which no program argument or environment variable can carry",
+            1,
+        ),
+        (
+            5,
+            "it holds a lone UTF-16 surrogate, which has no UTF-8 encoding to hand a program",
+            2,
+        ),
+        (
+            6,
+            "it is 65537 bytes long, and a checkpoint is at most 65536: it is handed to every start of the program as an argument and an environment variable, which a host bounds",
+            3,
+        ),
+    ] {
+        let refusal = format!(
+            "event source `feed`: line {line}'s `checkpoint` could not be handed back to the program ({why}), so it was refused and starts nothing ({count} refused so far)"
+        );
+        assert!(said.contains(&refusal), "{refusal}\n{said}");
+    }
+    assert!(
+        !said.contains("the program could not be started"),
+        "every start succeeded: {said}"
+    );
+}
+
+/// The framing of a program's two streams (grammar 14.4): a stdout line is at
+/// most 1 MiB, and one past it is refused **once** — the rest of it, up to its
+/// newline, dropped rather than read as a line of its own; a stderr line past
+/// the same bound is logged cut there, its rest dropped the same way; and a
+/// last line the program ends without a newline is admitted when its stdout
+/// closes, on either stream.
+///
+/// The program writes, on stderr, a line of 1.5 MiB and a short line after it;
+/// on stdout, event 1 (line 1), event 2 padded to exactly 1 MiB (line 2, at the
+/// bound and so admitted), an event object of 1.5 MiB (line 3, refused for its
+/// length alone), event 3 (line 4 — the line after the refused one, and not a
+/// fragment of it); then a stderr fragment and event 4 with no newline after
+/// either, and exits. Event 4 starting an execution, and the restart being
+/// handed its checkpoint, is the unterminated line's admission.
+#[test]
+fn a_programs_lines_are_bounded_at_one_mib_and_its_last_unterminated_line_is_admitted() {
+    let scratch = harness::Scratch::new("feed-framing");
+    let Some(project) = harness::scratch_project("feed-framing") else {
+        return;
+    };
+    let environment = feed_environment(
+        scratch.path(),
+        &[("FEED_TOTAL", "4"), ("FEED_FRAMING", "1")],
+    );
+    let Some(mut served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let starts_log = scratch.path().join("starts.log");
+    let status = eventually(
+        Duration::from_secs(60),
+        "the fourth event and the restart after it",
+        || {
+            let status = source(&app, "feed");
+            (status["checkpoint"] == "4"
+                && completed_of(&project, "ingest") == 4
+                && lines_of(&starts_log).len() == 2)
+                .then_some(status)
+        },
+    );
+    assert_eq!(
+        status["refused_lines"], 1,
+        "the line past the bound is refused once, and its tail is not a line: {status}"
+    );
+    assert_eq!(status["accepted_events"], 4, "{status}");
+    let ids = ids_of(&project, "ingest");
+    assert_eq!(
+        ids.keys().cloned().collect::<BTreeSet<_>>(),
+        ids_through(4),
+        "the 1 MiB event and the unterminated last one both started executions"
+    );
+    assert!(
+        ids.values().all(|count| *count == 1),
+        "exactly one execution per event: {ids:?}"
+    );
+    let starts: Vec<Value> = lines_of(&starts_log)
+        .iter()
+        .map(|line| serde_json::from_str(line).expect("a JSON start"))
+        .collect();
+    assert_eq!(
+        starts,
+        [
+            json!({ "argument": "", "variable": null }),
+            json!({ "argument": "4", "variable": "4" })
+        ],
+        "the unterminated last line was admitted before the exit, so the restart resumes after it"
+    );
+
+    let said = served.stop_and_read_stderr();
+    assert!(
+        said.contains(
+            "event source `feed`: line 3 is not a JSON object, so it was refused and starts nothing (1 refused so far)"
+        ),
+        "the over-long line is line 3, refused: {}",
+        said.lines()
+            .filter(|line| line.starts_with("event source"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert!(
+        !said.contains("(2 refused so far)"),
+        "nothing after it was refused — its tail was not read as a line"
+    );
+    for seq in 1..=4 {
+        assert!(
+            said.contains(&format!("event source `feed`: event \"{seq}\" started ")),
+            "event {seq} started an execution"
+        );
+    }
+    let cut = format!(
+        "[source feed] {} [cut: the line is longer than 1048576 bytes, and the rest of it is not logged]",
+        "e".repeat(1 << 20)
+    );
+    let long: Vec<&str> = said
+        .lines()
+        .filter(|line| line.starts_with("[source feed] e"))
+        .collect();
+    assert_eq!(
+        long.len(),
+        1,
+        "the 1.5 MiB stderr line is logged once, and its tail never as a line of its own"
+    );
+    assert!(long[0] == cut, "…cut at 1 MiB, saying so");
+    assert!(
+        said.lines()
+            .any(|line| line == "[source feed] after the long line"),
+        "the stderr line after the cut one is logged whole"
+    );
+    assert!(
+        said.lines()
+            .any(|line| line == "[source feed] the last words, unterminated"),
+        "the stderr fragment the program ended on is logged"
+    );
+}
+
 /// The checkpoint the journal holds for the `feed` source, decoded, or none.
 fn journaled_checkpoint(project: &Path) -> Option<String> {
     let rows = harness::journal_rows(
@@ -30970,6 +31183,92 @@ fn serve_refuses_a_target_declaring_a_queue_source_and_validate_and_build_accept
     }
 }
 
+/// A `timezone:` the runtime's timezone database does not know refuses `serve`
+/// **at start** — exit `2`, naming the trigger and the zone (grammar 13.4) —
+/// rather than letting the app listen and the scheduler fail inside it.
+/// `Mars/Olympus` is IANA-shaped, so `validate` accepts it: only the runtime's
+/// `Intl` can say it names no zone.
+#[test]
+fn serve_refuses_at_start_a_schedule_whose_timezone_the_runtime_does_not_know() {
+    let (_scratch, entrypoint) =
+        harness::staged_with_deploy("unknown-zone", "schedules", "local", "version: \"0.1\"\n");
+    let composition = std::fs::read_to_string(&entrypoint).expect("the staged entrypoint");
+    assert!(composition.contains("    timezone: UTC\n"));
+    std::fs::write(
+        &entrypoint,
+        composition.replace("    timezone: UTC\n", "    timezone: Mars/Olympus\n"),
+    )
+    .expect("the staged entrypoint is writable");
+    let validated = harness::validate_entrypoint(&entrypoint, "local");
+    assert!(
+        validated.status.success(),
+        "the zone is IANA-shaped, so `validate` accepts it: {}",
+        String::from_utf8_lossy(&validated.stdout)
+    );
+    let Some(out) = harness::scratch_project("unknown-zone") else {
+        return;
+    };
+    let refused = harness::serve_refused_target(&out, &entrypoint, "local", &[]);
+    let said = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(
+        refused.status.code(),
+        Some(2),
+        "serve refuses to start: {said}"
+    );
+    assert!(
+        said.contains(
+            "the schedule trigger `every_minute` names the timezone `Mars/Olympus`, which this runtime's timezone database does not know: give it an IANA name such as `UTC` or `Europe/Berlin` (grammar 13.4)"
+        ),
+        "the refusal names the trigger and the zone: {said}"
+    );
+}
+
+/// The scheduler's two clock hooks are read once, when `serve` starts, and a
+/// value that is not one refuses the start — exit `2`, naming the variable and
+/// what it was set to (`src/sources.ts`, Decision D50's posture on an
+/// environment variable): a test that believes it moved the clock and did not
+/// would pass for the wrong reason.
+#[test]
+fn serve_refuses_at_start_a_schedule_clock_variable_that_is_not_a_whole_number() {
+    for (variable, written, refusal) in [
+        (
+            "AGENT_COMPOSE_SCHEDULE_CLOCK_OFFSET_MS",
+            "soon",
+            "`AGENT_COMPOSE_SCHEDULE_CLOCK_OFFSET_MS` is set to \"soon\", which is not a whole number: it is a test's hook on the clock `serve`'s scheduler reads (PRD resolved q78), so give it an integer or unset it",
+        ),
+        (
+            "AGENT_COMPOSE_SCHEDULE_CLOCK_OFFSET_MS",
+            "1.5",
+            "`AGENT_COMPOSE_SCHEDULE_CLOCK_OFFSET_MS` is set to \"1.5\", which is not a whole number: it is a test's hook on the clock `serve`'s scheduler reads (PRD resolved q78), so give it an integer or unset it",
+        ),
+        (
+            "AGENT_COMPOSE_SCHEDULE_CLOCK_RATE",
+            "fast",
+            "`AGENT_COMPOSE_SCHEDULE_CLOCK_RATE` is set to \"fast\", which is not a whole number of at least 1: it is a test's hook on the clock `serve`'s scheduler reads (PRD resolved q78), so give it an integer or unset it",
+        ),
+        (
+            "AGENT_COMPOSE_SCHEDULE_CLOCK_RATE",
+            "0",
+            "`AGENT_COMPOSE_SCHEDULE_CLOCK_RATE` is set to \"0\", which is not a whole number of at least 1: it is a test's hook on the clock `serve`'s scheduler reads (PRD resolved q78), so give it an integer or unset it",
+        ),
+    ] {
+        let Some(refused) = harness::serve_refused_with(
+            "schedule-clock",
+            "schedules",
+            &[(variable.to_string(), written.to_string())],
+        ) else {
+            return;
+        };
+        let said = String::from_utf8_lossy(&refused.stderr);
+        assert_eq!(
+            refused.status.code(),
+            Some(2),
+            "`{variable}={written}` refuses the start: {said}"
+        );
+        assert!(said.contains(refusal), "{refusal}\n{said}");
+    }
+}
+
 /// The generated cron evaluator answers the shared corpus as the validator's
 /// does, under Bun (the Node column is gate 15 of `generated_code_gates.rs`).
 #[test]
@@ -31002,6 +31301,11 @@ fn the_generated_cron_evaluator_agrees_with_the_validator_on_the_conformance_cor
     );
 }
 
+/// The one database the dialled-journal cases serve on. Its writer guard is
+/// per database (`docs/durability.md` §2.3), so two of them running at once
+/// would make each other's hubs standbys: they take turns.
+static DIALLED_JOURNAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// PRD resolved q78 ruling b on a **dialled** journal: two `serve` processes
 /// over one Postgres journal, with the same schedule, fire one row and one
 /// execution per tick.
@@ -31023,6 +31327,9 @@ fn two_serves_on_one_postgres_journal_fire_each_tick_once() {
         );
         return;
     };
+    let _turn = DIALLED_JOURNAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let trigger = format!(
         "pg_ticks_{}_{}",
         std::process::id(),
@@ -31148,6 +31455,160 @@ fn postgres_rows(project: &Path, url: &str, sql: &str) -> Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).expect("JSON rows")
+}
+
+/// A standby takes a dialled journal over **with** what the hub it replaces
+/// left open (`docs/durability.md` §6.1, `docs/distributed.md` §8): a second
+/// `serve` on a Postgres journal another holds cannot read it at start, so it
+/// owes the recovery, and pays it before it claims a tick or admits an event
+/// once the journal opens to it.
+///
+/// The schedule's flow sleeps six seconds, so the first `serve` — ticking once
+/// a second under `AGENT_COMPOSE_SCHEDULE_CLOCK_RATE=60` — always has several
+/// executions running. A second `serve` starts over the same journal as a
+/// standby; the first is `SIGKILL`ed, and its executions are left open with
+/// nothing running them. The standby, once the server has let the first's
+/// session go, recovers every one of them before it fires a tick of its own —
+/// the serve log says so, and every `fired` line it writes follows its
+/// `recovered` lines — and each runs to `completed`. A recovery the start
+/// could not do, run nowhere, would leave them `open` for good. Skipped,
+/// with a notice, where `AGENT_COMPOSE_TEST_POSTGRES_URL` is unset.
+#[test]
+fn a_standby_serve_recovers_what_the_serve_it_takes_over_from_left_open_before_it_fires() {
+    let Ok(url) = std::env::var("AGENT_COMPOSE_TEST_POSTGRES_URL") else {
+        eprintln!(
+            "notice: skipping the standby takeover case: AGENT_COMPOSE_TEST_POSTGRES_URL is unset"
+        );
+        return;
+    };
+    let _turn = DIALLED_JOURNAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let trigger = format!(
+        "pg_takeover_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_millis()
+    );
+    let (scratch, entrypoint) = harness::staged_with_deploy(
+        "pg-takeover",
+        "schedules",
+        "pg",
+        "version: \"0.1\"\njournal:\n  provider: postgres\n  url: ${AGENT_COMPOSE_JOURNAL_URL}\n",
+    );
+    let composition = std::fs::read_to_string(&entrypoint).expect("the staged entrypoint");
+    assert!(composition.contains("      exec: { command: \"true\" }\n"));
+    std::fs::write(
+        &entrypoint,
+        composition
+            .replace("  every_minute:", &format!("  {trigger}:"))
+            .replace(
+                "      exec: { command: \"true\" }\n",
+                "      exec: { command: \"sleep\", args: [\"6\"] }\n",
+            ),
+    )
+    .expect("the staged entrypoint is writable");
+    let environment = vec![
+        ("AGENT_COMPOSE_JOURNAL_URL".to_string(), url.clone()),
+        (
+            "AGENT_COMPOSE_SCHEDULE_CLOCK_RATE".to_string(),
+            "60".to_string(),
+        ),
+    ];
+    let (Some(one), Some(two)) = (
+        harness::scratch_project("pg-takeover-one"),
+        harness::scratch_project("pg-takeover-two"),
+    ) else {
+        return;
+    };
+    let open = |sql_trigger: &str| -> BTreeSet<String> {
+        postgres_rows(
+            &one,
+            &url,
+            &format!(
+                "SELECT id FROM executions WHERE trigger_kind = '{sql_trigger}' AND status = 'open'"
+            ),
+        )
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row["id"].as_str().expect("an id").to_string())
+        .collect()
+    };
+    let Some(mut first) = harness::serve_target_into(&one, &entrypoint, "pg", &environment) else {
+        return;
+    };
+    eventually(
+        Duration::from_secs(60),
+        "three executions running under the first serve",
+        || (open(&trigger).len() >= 3).then_some(()),
+    );
+    // The standby: the first holds the writer guard, so this one's start cannot
+    // read the journal, and it serves anyway.
+    let Some(mut second) = harness::serve_target_into(&two, &entrypoint, "pg", &environment) else {
+        return;
+    };
+    let before = open(&trigger);
+    first.stop();
+    // What the first left running, and nothing else: an execution the standby
+    // started itself, once it had the journal, is not one it recovered.
+    let stranded: BTreeSet<String> = open(&trigger).intersection(&before).cloned().collect();
+    assert!(
+        !stranded.is_empty(),
+        "the first serve was stopped with executions running: {before:?}"
+    );
+    eventually(
+        Duration::from_secs(90),
+        "every execution the first serve left running to complete under the standby",
+        || {
+            let rows = postgres_rows(
+                &one,
+                &url,
+                &format!("SELECT id, status FROM executions WHERE trigger_kind = '{trigger}'"),
+            );
+            let completed: BTreeSet<String> = rows
+                .as_array()
+                .expect("rows")
+                .iter()
+                .filter(|row| row["status"] == "completed")
+                .map(|row| row["id"].as_str().expect("an id").to_string())
+                .collect();
+            stranded.is_subset(&completed).then_some(())
+        },
+    );
+    let said = second.stop_and_read_stderr();
+    assert!(
+        said.contains("this project's journal could not be read: "),
+        "the standby's start could not read the journal: {said}"
+    );
+    assert!(
+        said.contains("this project's journal can be read now, so the "),
+        "the standby names the recovery it runs late: {said}"
+    );
+    let lines: Vec<&str> = said.lines().collect();
+    let last_recovered = stranded
+        .iter()
+        .map(|id| {
+            let recovered = format!("recovered {id} (flow.tick)");
+            lines
+                .iter()
+                .position(|line| *line == recovered)
+                .unwrap_or_else(|| panic!("the standby recovered {id}: {said}"))
+        })
+        .max()
+        .expect("at least one stranded execution");
+    if let Some(first_fired) = lines
+        .iter()
+        .position(|line| line.starts_with(&format!("schedule `{trigger}`: fired the ")))
+    {
+        assert!(
+            first_fired > last_recovered,
+            "the standby fired a tick before it had recovered what the first serve left open: {said}"
+        );
+    }
+    drop(scratch);
 }
 
 /// The body of the first fenced block in `document` whose info string is
