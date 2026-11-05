@@ -159,6 +159,7 @@ BEGIN
   END IF;
 END
 $migrate$;
+CREATE INDEX IF NOT EXISTS dedupe_by_expiry ON dedupe (trigger_name, expires_at, admitted_at);
 CREATE TABLE IF NOT EXISTS intakes (
   seq          BIGSERIAL NOT NULL UNIQUE,
   id           TEXT COLLATE "C" PRIMARY KEY,

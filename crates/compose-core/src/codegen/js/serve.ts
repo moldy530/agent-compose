@@ -1261,8 +1261,13 @@ async function start(
     });
   }
   // An arrival an intake may hold is one it must be able to start later
-  // without asking anybody: a session key a flow would refuse is refused now.
-  if (concurrency !== undefined) {
+  // without asking anybody, and one a gate keeps is answered only once its
+  // lifecycle row is down — so a refusal `runFlow` would raise before that row
+  // ([`refusesSession`]) would read as the journal's failure: a `503` that says
+  // the request may be sent again, and a key every resend takes over and fails
+  // the same way. Under either, a session key the flow would refuse is the
+  // trigger's binding failing, and is refused now, as a tick's or an event's is.
+  if (concurrency !== undefined || dedupe !== undefined) {
     try {
       refusesSession(flow, sessionKey);
     } catch (error) {
@@ -1385,7 +1390,10 @@ async function answered(
  * id, the status, the status URL, the shape an `async` start has — and under
  * `respond: sync` the same `202`, because the row holds no outputs to answer
  * with (Decision D163's Status). An intake row owed a start whose execution
- * has no row yet answers as the intake it is.
+ * has no row yet answers as the intake it is, and so does one dropped with no
+ * execution to name — an admission that no longer bound when its turn came
+ * (`#stillBinds`), or a debounce whose payload did not bind at its close —
+ * whose execution never began and never will.
  */
 async function journaledAnswer(
   reply: FastifyReply,
@@ -1398,7 +1406,11 @@ async function journaledAnswer(
   } catch {
     row = undefined;
   }
-  if (row === undefined && holder !== undefined && holder.state === "started") {
+  if (
+    row === undefined &&
+    holder !== undefined &&
+    (holder.state === "started" || holder.state === "dropped")
+  ) {
     return reply.code(202).send({
       intake_id: holder.id,
       status: holder.state,
@@ -2214,6 +2226,7 @@ class IntakeLedger {
         continue;
       }
       if (row.admission === undefined) continue;
+      if (!(await this.#stillBinds(journal, trigger, row, row.admission))) continue;
       const answer = await this.#begin(journal, trigger, row.admission, row.execution, row, undefined, true);
       if (answer.outcome === "started") {
         sayIntake(
@@ -2265,9 +2278,11 @@ class IntakeLedger {
         return this.#debounce(journal, trigger, group, payload, id, pending, admission.gate);
       }
       // The queue first: a slot that freed is the oldest waiting arrival's,
-      // never a newcomer's (FIFO per group, PRD resolved q77 ruling b).
-      await this.#drain(journal, trigger);
-      return this.#place(journal, trigger, group, bound, id, gate.fired, undefined);
+      // never a newcomer's (FIFO per group, PRD resolved q77 ruling b) — and
+      // a queue that stopped short of its end keeps every slot it left free
+      // for the rows still on it, so the newcomer waits behind them.
+      const stalled = await this.#drain(journal, trigger);
+      return this.#place(journal, trigger, group, bound, id, gate.fired, undefined, stalled);
     });
   }
 
@@ -2372,9 +2387,17 @@ class IntakeLedger {
     id: string,
     fired: FiredRow | undefined,
     waiting: IntakeRow | undefined,
+    behind: boolean,
   ): Promise<AdmitAnswer> {
     const concurrency = trigger.concurrency;
     let leases = await journal.leasesOf(trigger.name);
+    // **Behind a stalled queue, an arrival queues** — whatever `on_conflict:`
+    // says, and whether or not its group has a slot: the drain before it
+    // stopped at a row the journal would not begin, or still owes a start it
+    // could not put back on the queue ([`#drain`]), so a slot it left free
+    // belongs to those older arrivals, which start first once the journal
+    // takes them.
+    if (behind) return this.#enqueue(journal, trigger, group, bound, id, waiting, leases, true);
     if (hasSlot(concurrency, leases, group)) {
       return this.#begin(journal, trigger, bound, id, waiting, fired, false, group);
     }
@@ -2424,6 +2447,25 @@ class IntakeLedger {
       sayIntake(trigger.name, `${row.id} dropped: ${detail}`);
       return { outcome: "dropped", intake: row, running };
     }
+    return this.#enqueue(journal, trigger, group, bound, id, waiting, leases, false);
+  }
+
+  /**
+   * Put one arrival on its trigger's queue — written for an arrival that
+   * never waited, moved for a debounce that closed ([`#place`]) — saying what
+   * it waits for: the execution holding its group, or, `behind` a queue that
+   * stalled, the older arrivals still on it.
+   */
+  async #enqueue(
+    journal: Journal,
+    trigger: IntakeTrigger,
+    group: string | undefined,
+    bound: IntakeAdmission,
+    id: string,
+    waiting: IntakeRow | undefined,
+    leases: readonly Lease[],
+    behind: boolean,
+  ): Promise<AdmitAnswer> {
     const row =
       waiting === undefined
         ? await journal.admitIntake({
@@ -2440,10 +2482,47 @@ class IntakeLedger {
         : await this.#moved(journal, waiting, { state: "queued", admission: bound });
     sayIntake(
       trigger.name,
-      `${row.id} queued for ${row.execution}: ${oldestOf(leases, group) ?? "its group"} holds ${group === undefined ? "the trigger's group" : `the group ${JSON.stringify(group)}`}`,
+      behind
+        ? `${row.id} queued for ${row.execution} behind the arrivals its trigger's queue has not yet started`
+        : `${row.id} queued for ${row.execution}: ${oldestOf(leases, group) ?? "its group"} holds ${group === undefined ? "the trigger's group" : `the group ${JSON.stringify(group)}`}`,
     );
     this.#redrainLater(trigger.name);
     return { outcome: "queued", intake: row };
+  }
+
+  /**
+   * Whether a waiting row's recorded admission still binds under the flow
+   * this build serves — held to its `inputs:` and its session stores, as
+   * every arrival is before it is admitted ([`bindAdmission`]) — and where it
+   * does not, the row dropped, naming why (Decision D163's Status).
+   *
+   * A row is bound when it arrives, by the build that admitted it, and may be
+   * started by another: a deploy that narrows the flow's `inputs:`, or gives
+   * it a `scope: session` store a row's empty session key cannot reach,
+   * leaves rows `runFlow` would refuse before their lifecycle row. [`#begin`]
+   * reads every start that never reached that row as the journal's failure
+   * and puts a waited row back on the queue — which, for a refusal no retry
+   * can answer, is a row tried first at every look for ever, holding every
+   * row behind it. So it is asked here, first, as a debounce's close binds its
+   * payload again ([`#close`]); a row that no longer binds is dropped as one
+   * is there, and the queue moves on past it.
+   */
+  async #stillBinds(
+    journal: Journal,
+    trigger: IntakeTrigger,
+    row: IntakeRow,
+    admission: IntakeAdmission,
+  ): Promise<boolean> {
+    try {
+      bindAdmission(trigger.flow, admission.inputs, admission.sessionKey);
+      return true;
+    } catch (error) {
+      const detail = `its admission no longer binds under this build: ${message(error)}`;
+      if (await journal.moveIntake(row.id, row.state, { state: "dropped", detail })) {
+        sayIntake(trigger.name, `${row.id} dropped: ${detail}`);
+      }
+      return false;
+    }
   }
 
   /**
@@ -2566,24 +2645,42 @@ class IntakeLedger {
    * Start what a trigger's queue holds as its lease allows, oldest first —
    * a group's rows in the order they were admitted, a row whose group is
    * full passed over for a later one whose group is not, and nothing at all
-   * while the trigger is at its `max_running:`.
+   * while the trigger is at its `max_running:` — answering whether it
+   * **stalled**: stopped at a row the journal would not begin, with the rows
+   * after it not yet looked at, or left a start this process owes and could
+   * not put back on the queue ([`#requeue`]), which is a row ahead of any
+   * newcomer too.
+   *
+   * A row whose recorded admission no longer binds under this build is
+   * dropped, naming why, and the drain goes on past it ([`#stillBinds`]):
+   * only a start the journal itself would not take stops it, since the next
+   * start would meet the same journal.
    */
-  async #drain(journal: Journal, trigger: IntakeTrigger): Promise<void> {
+  async #drain(journal: Journal, trigger: IntakeTrigger): Promise<boolean> {
     const owed = await this.#requeue(journal, trigger);
     const queued = await journal.intakesOf(trigger.name, "queued");
     let waiting = queued.length;
+    let stalled = false;
     for (const row of queued) {
-      if (this.#stopped) return;
+      if (this.#stopped) return false;
       const leases = await journal.leasesOf(trigger.name);
       const max = trigger.concurrency.maxRunning;
       if (max !== undefined && leases.length >= max) break;
       if (!hasSlot(trigger.concurrency, leases, row.group)) continue;
       if (row.admission === undefined) continue;
+      if (!(await this.#stillBinds(journal, trigger, row, row.admission))) {
+        waiting -= 1;
+        continue;
+      }
       const answer = await this.#begin(journal, trigger, row.admission, row.execution, row, undefined, false, row.group);
-      if (answer.outcome !== "started") break;
+      if (answer.outcome !== "started") {
+        stalled = true;
+        break;
+      }
       waiting -= 1;
     }
     if (waiting > 0 || owed || this.#owed.has(trigger.name)) this.#redrainLater(trigger.name);
+    return stalled || owed;
   }
 
   /** Remember a start this process owes and could not put back on the queue. */
@@ -2685,8 +2782,8 @@ class IntakeLedger {
       sayIntake(trigger.name, `${row.id} dropped: ${detail}`);
       return;
     }
-    await this.#drain(journal, trigger);
-    await this.#place(journal, trigger, row.group, bound, row.execution, undefined, row);
+    const stalled = await this.#drain(journal, trigger);
+    await this.#place(journal, trigger, row.group, bound, row.execution, undefined, row, stalled);
   }
 
   /**

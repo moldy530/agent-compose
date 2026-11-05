@@ -1977,15 +1977,16 @@ class SqlJournal implements Journal {
       // row a build before the window wrote has no `expires_at`, and is read
       // as expiring one window — this claim's — after it was admitted:
       // ISO 8601 instants in UTC are fixed width, so the comparison is the
-      // string one every backend makes the same way.
+      // string one every backend makes the same way. Each half is a range
+      // read down `dedupe_by_expiry` ([`DEDUPE_SWEEPS`]), so what the sweep
+      // costs is the rows that expired, never the trigger's live windows —
+      // which every claim of the trigger, inside the one serial chain every
+      // journal write waits on, would otherwise pay.
       if (row.expiresAt !== undefined) {
         const window = Date.parse(row.expiresAt) - Date.parse(row.admittedAt);
         const cutoff = new Date(Date.parse(row.admittedAt) - Math.max(0, window)).toISOString();
-        await this.#run(
-          `DELETE FROM dedupe WHERE trigger_name = ?
-             AND ((expires_at IS NOT NULL AND expires_at <= ?) OR (expires_at IS NULL AND admitted_at <= ?))`,
-          [row.trigger, row.admittedAt, cutoff],
-        );
+        await this.#run(DEDUPE_SWEEPS.windowed, [row.trigger, row.admittedAt]);
+        await this.#run(DEDUPE_SWEEPS.windowless, [row.trigger, cutoff]);
       }
       await this.#run(
         `INSERT INTO dedupe (trigger_name, key_hash, dedupe_key, execution, admitted_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)
@@ -2327,6 +2328,29 @@ class SqlJournal implements Journal {
     return this.#serial(() => this.#driver.close());
   }
 }
+
+/**
+ * The two statements a dedupe claim sweeps its trigger's expired rows with
+ * (`claimDedupe`, `docs/durability.md` §3.12): each a range read down
+ * `dedupe_by_expiry` — `(trigger_name, expires_at, admitted_at)`, on every
+ * backend — so a sweep that finds nothing expired reads no row, and one that
+ * does reads the rows it deletes.
+ *
+ * Two statements rather than one predicate with an `OR` between its halves:
+ * a disjunction across the index's second and third columns is read down its
+ * first alone — every live row of the trigger, on every claim — by SQLite's
+ * planner, and by the other two as their statistics please. Exported for the
+ * contract runner, which asks SQLite's planner how it reads each one.
+ */
+export const DEDUPE_SWEEPS = {
+  /** The rows whose own window the claim's instant has reached. */
+  windowed: "DELETE FROM dedupe WHERE trigger_name = ? AND expires_at <= ?",
+  /**
+   * The rows a build before the window wrote, which have none, read as
+   * expiring one window — the claim's — after they were admitted.
+   */
+  windowless: "DELETE FROM dedupe WHERE trigger_name = ? AND expires_at IS NULL AND admitted_at <= ?",
+} as const;
 
 /**
  * The column a dedupe key is keyed by: its SHA-256, in lowercase hex.
@@ -2766,6 +2790,12 @@ async function migrated(
       if (!dedupe.some((column) => column["name"] === "expires_at")) {
         database.exec("ALTER TABLE dedupe ADD COLUMN expires_at TEXT;");
       }
+      // …and the index a claim's sweep reads down ([`DEDUPE_SWEEPS`]), made
+      // here rather than in the schema above for `intakes_by_joined`'s reason:
+      // the schema runs before a table it finds already there has the column.
+      database.exec(
+        "CREATE INDEX IF NOT EXISTS dedupe_by_expiry ON dedupe (trigger_name, expires_at, admitted_at);",
+      );
       // A pending row's newest counted arrival (`docs/durability.md` §3.15),
       // added to the intake ledger after an earlier build of it created the
       // table: nullable, because a row with none is a row no gated arrival
@@ -4455,6 +4485,7 @@ BEGIN
   END IF;
 END
 $migrate$;
+CREATE INDEX IF NOT EXISTS dedupe_by_expiry ON dedupe (trigger_name, expires_at, admitted_at);
 CREATE TABLE IF NOT EXISTS intakes (
   seq          BIGSERIAL NOT NULL UNIQUE,
   id           TEXT COLLATE "C" PRIMARY KEY,

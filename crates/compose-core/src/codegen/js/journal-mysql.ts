@@ -202,7 +202,8 @@ const MYSQL_SCHEMA = [
   execution    VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   admitted_at  VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   expires_at   VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NULL,
-  PRIMARY KEY (trigger_name, key_hash)
+  PRIMARY KEY (trigger_name, key_hash),
+  KEY dedupe_by_expiry (trigger_name, expires_at, admitted_at)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
   // The intake ledger (PRD resolved q77, Decision D163, `docs/durability.md`
   // §3.15): a table of its own, so `IF NOT EXISTS` is its whole migration.
@@ -281,6 +282,16 @@ const MYSQL_MIGRATIONS: readonly { readonly probe: string; readonly add: string 
       "AND TABLE_NAME = 'dedupe' AND COLUMN_NAME = 'expires_at'",
     add:
       "ALTER TABLE dedupe ADD COLUMN expires_at VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NULL AFTER admitted_at",
+  },
+  // …and the index a dedupe claim's sweep reads down (`DEDUPE_SWEEPS` in
+  // `./journal.ts`), which a table that gained the column above lacks: an
+  // index is not a column, so it is asked after in `information_schema`'s
+  // own list of them.
+  {
+    probe:
+      "SELECT COUNT(*) AS held FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() " +
+      "AND TABLE_NAME = 'dedupe' AND INDEX_NAME = 'dedupe_by_expiry'",
+    add: "ALTER TABLE dedupe ADD KEY dedupe_by_expiry (trigger_name, expires_at, admitted_at)",
   },
   // A pending intake row's newest counted arrival (`docs/durability.md`
   // §3.15), added after an earlier build of the ledger created the table:
