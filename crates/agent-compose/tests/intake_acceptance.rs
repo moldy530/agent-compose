@@ -52,6 +52,14 @@
 //!   [`under_respond_sync_an_intake_answers_at_once_and_a_repeat_with_the_first`];
 //! * deliveries racing for the last slot —
 //!   [`deliveries_racing_for_one_slot_start_one_and_queue_or_drop_the_rest`];
+//! * an empty `session_key:` a flow needs, refused before a dedupe key is
+//!   claimed as before a group is asked —
+//!   [`an_empty_session_key_is_refused_before_a_dedupe_key_or_a_group_is_claimed`];
+//! * a queued arrival a new build no longer binds, dropped while the queue
+//!   moves on past it —
+//!   [`a_queued_arrival_the_new_build_no_longer_binds_is_dropped_and_the_queue_moves_on`];
+//! * a start the journal refused, owed, and the arrival queued behind it —
+//!   [`a_start_the_journal_refused_twice_is_owed_and_started_once_it_recovers`];
 //! * the serve log's lines — [`the_serve_log_names_each_intake_decision`], and
 //!   the supersede line in (3).
 
@@ -1973,6 +1981,13 @@ fn a_run_is_refused_by_its_triggers_max_running_below_its_groups_limit() {
 /// left `started`, naming an execution that never began, which no drain of the
 /// queue reads. The process remembers it owes the start: once the refusals are
 /// lifted the row goes back on the queue and starts, in this same `serve`.
+///
+/// The refusals are lifted one at a time. With the move onto the queue taken
+/// again and the lifecycle row still refused, each look at the queue puts the
+/// owed row back and fails its start once more — and an arrival then finds
+/// the group's slot free and is queued **behind** it all the same: the slot is
+/// the older arrival's (FIFO per group, PRD resolved q77 ruling b), so the
+/// newcomer starts only once the owed one has run.
 #[test]
 fn a_start_the_journal_refused_twice_is_owed_and_started_once_it_recovers() {
     let provider = MockProvider::start().expect("a loopback port");
@@ -2030,11 +2045,22 @@ fn a_start_the_journal_refused_twice_is_owed_and_started_once_it_recovers() {
         stranded(),
         "the refusals hold the row where the failed start left it"
     );
-
-    let lift = harness::journal_sql(
-        &project,
-        "DROP TRIGGER refuse_the_owed_begin;\nDROP TRIGGER refuse_the_requeue;\n",
+    let half = harness::journal_sql(&project, "DROP TRIGGER refuse_the_requeue;\n");
+    assert!(
+        half.status.success(),
+        "{}",
+        String::from_utf8_lossy(&half.stderr)
     );
+    let behind = post(&app, "/serial", &json!({ "tag": "behind", "linger": "0" }));
+    assert_eq!(
+        behind.json()["status"],
+        "queued",
+        "a free slot is the older arrival's, never a newcomer's: {}",
+        behind.text()
+    );
+    let behind = intake_id_of(&behind);
+
+    let lift = harness::journal_sql(&project, "DROP TRIGGER refuse_the_owed_begin;\n");
     assert!(
         lift.status.success(),
         "{}",
@@ -2053,7 +2079,18 @@ fn a_start_the_journal_refused_twice_is_owed_and_started_once_it_recovers() {
         },
     );
     assert_eq!(report["state"], "started", "{report}");
-    let rows = executions_of(&project, "serial");
+    let rows = eventually(
+        Duration::from_secs(30),
+        "the arrival queued behind it to start and complete",
+        || {
+            let report = get(&app, &format!("/intakes/{behind}")).json();
+            let started = report["execution_id"].as_str()?.to_string();
+            let rows = executions_of(&project, "serial");
+            rows.iter()
+                .any(|row| row.id == started && row.status == "completed")
+                .then_some(rows)
+        },
+    );
     assert_eq!(
         rows.iter()
             .filter(|row| row.inputs["tag"] == "owed")
@@ -2061,9 +2098,363 @@ fn a_start_the_journal_refused_twice_is_owed_and_started_once_it_recovers() {
         1,
         "started once: {rows:#?}"
     );
+    let order: Vec<&str> = rows
+        .iter()
+        .map(|row| row.inputs["tag"].as_str().expect("a tag"))
+        .collect();
+    assert_eq!(
+        order,
+        ["first", "owed", "behind"],
+        "the owed arrival ran before the one queued behind it"
+    );
+    never_overlapping(&rows);
     assert!(
         tally(&log).iter().any(|line| line == "owed end"),
         "{:?}",
         tally(&log)
+    );
+}
+
+/// The composition [`an_empty_session_key_is_refused_before_a_dedupe_key_or_a_group_is_claimed`]
+/// serves: one flow that writes a `scope: session` store, so no run of it
+/// starts without a session identity, behind two `http` triggers whose
+/// `session_key:` is the body's `project` — `deduped` with a `dedupe_key:` and
+/// no block, and `grouped` with a `concurrency:` block and no key.
+const SESSION_SCOPED: &str = r#"version: "0.1"
+
+store.memory:
+  kind: kv
+  scope: session
+  description: What each project was last started for.
+  value_schema:
+    id: { type: string }
+
+flow.ingest:
+  inputs:
+    id: { type: string }
+  outputs: {}
+  nodes:
+    note:
+      store: store.memory
+      op: set
+      key: "execution.session_key"
+      value:
+        id: "input.id"
+  edges:
+    - { from: start, to: note }
+    - { from: note, to: end }
+
+triggers:
+  deduped:
+    type: http
+    path: /deduped
+    flow: flow.ingest
+    session_key: "payload.body.project"
+    input:
+      id: "payload.body.id"
+    dedupe_key: "payload.body.id"
+  grouped:
+    type: http
+    path: /grouped
+    flow: flow.ingest
+    session_key: "payload.body.project"
+    input:
+      id: "payload.body.id"
+    concurrency:
+      limit: 1
+"#;
+
+/// **An empty `session_key:` a flow needs is refused before anything is
+/// claimed — beside a `dedupe_key:` as beside a `concurrency:` block**
+/// (grammar 11.3, 13.3, Decision D163's Status).
+///
+/// The run would refuse it before its lifecycle row, and an admission a gate
+/// keeps is answered only once that row is down — so, asked no earlier, it
+/// reads as the journal's failure: a `503` saying the request may be sent
+/// again, and a key every resend takes over and fails the same way. So it is
+/// the trigger's binding that failed, and both triggers answer `400`, twice
+/// alike, naming the store — no dedupe row claimed, no intake row written,
+/// nothing started. A request whose key answers starts, and its repeat is a
+/// repeat.
+#[test]
+fn an_empty_session_key_is_refused_before_a_dedupe_key_or_a_group_is_claimed() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("intake-empty-session");
+    let (environment, _log) = environment(&provider, &scratch, &[]);
+    let entrypoint = scratch.path().join("main.yml");
+    std::fs::write(&entrypoint, SESSION_SCOPED).expect("the scratch area is writable");
+    let Some(project) = harness::scratch_project("intake-empty-session") else {
+        return;
+    };
+    let Some(served) = harness::serve_entrypoint_into(&project, &entrypoint, &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client");
+    let refusal = "`flow.ingest` reaches `store.memory`, which is `scope: session`, so this run \
+                   needs a session identity and arrived with none: pass `--session <key>` to \
+                   `agent-compose run`, or declare `session_key:` on the trigger that starts it \
+                   — and where one is declared, it answered the empty string for this \
+                   invocation (grammar 11.3, 13.2)";
+    for (trigger, route) in [("deduped", "/deduped"), ("grouped", "/grouped")] {
+        for attempt in 0..2 {
+            let answered = post(&app, route, &json!({ "id": "d1", "project": "" }));
+            assert_eq!(
+                answered.status,
+                400,
+                "attempt {attempt} at `{trigger}`: {}",
+                answered.text()
+            );
+            assert_eq!(
+                answered.json(),
+                json!({
+                    "error": format!(
+                        "the trigger `{trigger}` could not admit this request: {refusal}"
+                    )
+                }),
+                "attempt {attempt} at `{trigger}`"
+            );
+            assert_eq!(deduped(&answered), None, "{answered:?}");
+        }
+    }
+    assert!(
+        dedupe_of(&project, "deduped").is_empty(),
+        "no key was claimed"
+    );
+    assert!(
+        intakes_of(&project, "grouped").is_empty(),
+        "no intake row was written"
+    );
+    assert!(
+        executions_of(&project, "deduped").is_empty()
+            && executions_of(&project, "grouped").is_empty(),
+        "nothing started"
+    );
+
+    let first = execution_of(&post(
+        &app,
+        "/deduped",
+        &json!({ "id": "d1", "project": "alpha" }),
+    ));
+    eventually(
+        Duration::from_secs(30),
+        "the keyed request to complete",
+        || {
+            executions_of(&project, "deduped")
+                .iter()
+                .any(|row| row.id == first && row.status == "completed")
+                .then_some(())
+        },
+    );
+    let repeat = post(&app, "/deduped", &json!({ "id": "d1", "project": "alpha" }));
+    assert_eq!(deduped(&repeat), Some("true"), "{repeat:?}");
+    assert_eq!(execution_of(&repeat), first);
+    assert_eq!(
+        dedupe_of(&project, "deduped"),
+        BTreeMap::from([("d1".to_string(), first.clone())]),
+        "the key names the one execution"
+    );
+    assert_eq!(executions_of(&project, "deduped").len(), 1);
+}
+
+/// The composition [`a_queued_arrival_the_new_build_no_longer_binds_is_dropped_and_the_queue_moves_on`]
+/// serves, under the schema of the flow's `tag` it is built with: one keyed
+/// group of one over a flow whose execution ends when the file its `hold`
+/// names appears.
+fn rebuilt(tag: &str) -> String {
+    format!(
+        r#"version: "0.1"
+
+triggers:
+  serial:
+    type: http
+    path: /serial
+    flow: flow.held
+    input:
+      tag: "payload.body.tag"
+      hold: "payload.body.hold"
+    dedupe_key: "payload.body.id"
+    concurrency:
+      limit: 1
+
+flow.held:
+  description: One tagged piece of work that ends when a file appears.
+  inputs:
+    tag: {tag}
+    hold: {{ type: string }}
+  outputs: {{}}
+  nodes:
+    wait:
+      exec:
+        command: "${{TALLY_BIN}}/hold"
+      input:
+        tag: "input.tag"
+        hold: "input.hold"
+  edges:
+    - {{ from: start, to: wait }}
+    - {{ from: wait, to: end }}
+"#
+    )
+}
+
+/// **A queued arrival the new build no longer binds is dropped, naming why,
+/// and the queue moves on past it** (PRD resolved q77 ruling f, Decision
+/// D163's Status, `docs/durability.md` §3.15).
+///
+/// A queued row holds the admission the build that took it bound, and is
+/// started by whichever build is serving when its slot frees. Here `serial`
+/// holds `first` and queues `second` and `third`; `serve` is killed and
+/// started again over the same journal under a build whose flow narrows `tag`
+/// to `first`, `third` or `fourth`. `fourth` arrives and queues behind them.
+/// When `first` ends, `second`'s admission no longer fits the flow: it is
+/// dropped — `GET /intakes/:id` says so, with the reason `serve` gives the same
+/// request sent now — and logged, never tried again as a start the journal
+/// would not begin; `third` starts in the slot, and `fourth` after it. A repeat
+/// of `second`'s key is answered with its intake, which started nothing.
+#[test]
+fn a_queued_arrival_the_new_build_no_longer_binds_is_dropped_and_the_queue_moves_on() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("intake-rebuilt");
+    let (environment, _log) = environment(&provider, &scratch, &[]);
+    let release = scratch.path().join("release-first");
+    let released = scratch.path().join("released");
+    std::fs::write(&released, "").expect("the scratch area is writable");
+    let hold = |file: &Path| file.display().to_string();
+    let before = scratch.path().join("before");
+    let after = scratch.path().join("after");
+    for (directory, tag) in [
+        (&before, "{ type: string }".to_string()),
+        (
+            &after,
+            r#"{ type: string, pattern: "^(first|third|fourth)$" }"#.to_string(),
+        ),
+    ] {
+        std::fs::create_dir_all(directory).expect("the scratch area is writable");
+        std::fs::write(directory.join("main.yml"), rebuilt(&tag))
+            .expect("the scratch area is writable");
+    }
+    let Some(project) = harness::scratch_project("intake-rebuilt") else {
+        return;
+    };
+    let (first, second, third) = {
+        let Some(served) =
+            harness::serve_entrypoint_into(&project, &before.join("main.yml"), &environment)
+        else {
+            return;
+        };
+        let app = Client::new(&served.base_url).expect("a client");
+        let first = execution_of(&post(
+            &app,
+            "/serial",
+            &json!({ "id": "first", "tag": "first", "hold": hold(&release) }),
+        ));
+        let queued: Vec<String> = ["second", "third"]
+            .iter()
+            .map(|tag| {
+                let answered = post(
+                    &app,
+                    "/serial",
+                    &json!({ "id": tag, "tag": tag, "hold": hold(&released) }),
+                );
+                assert_eq!(answered.json()["status"], "queued", "{}", answered.text());
+                intake_id_of(&answered)
+            })
+            .collect();
+        (first, queued[0].clone(), queued[1].clone())
+    };
+
+    let Some(mut served) =
+        harness::serve_entrypoint_into(&project, &after.join("main.yml"), &environment)
+    else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client");
+    // What this build answers `second`'s request with, sent now.
+    let refused = post(
+        &app,
+        "/serial",
+        &json!({ "id": "second-again", "tag": "second", "hold": hold(&released) }),
+    );
+    assert_eq!(refused.status, 400, "{}", refused.text());
+    let reason = refused.json()["error"]
+        .as_str()
+        .and_then(|error| error.strip_prefix("the request does not fit "))
+        .unwrap_or_else(|| panic!("a refusal naming the flow's inputs: {}", refused.text()))
+        .to_string();
+    let fourth = post(
+        &app,
+        "/serial",
+        &json!({ "id": "fourth", "tag": "fourth", "hold": hold(&released) }),
+    );
+    assert_eq!(fourth.json()["status"], "queued", "{}", fourth.text());
+    let fourth = intake_id_of(&fourth);
+
+    std::fs::write(&release, "").expect("the release file");
+    let rows = eventually(
+        Duration::from_secs(60),
+        "first, third and fourth to complete",
+        || {
+            let rows = executions_of(&project, "serial");
+            (rows.len() == 3 && rows.iter().all(|row| row.status == "completed")).then_some(rows)
+        },
+    );
+    never_overlapping(&rows);
+    let order: Vec<&str> = rows
+        .iter()
+        .map(|row| row.inputs["tag"].as_str().expect("a tag"))
+        .collect();
+    assert_eq!(
+        order,
+        ["first", "third", "fourth"],
+        "the queue moved on past the row it dropped, in its order"
+    );
+    assert_eq!(rows[0].id, first);
+    for (id, expected) in [(&third, &rows[1]), (&fourth, &rows[2])] {
+        let report = get(&app, &format!("/intakes/{id}")).json();
+        assert_eq!(report["state"], "started", "{report}");
+        assert_eq!(report["execution_id"], expected.id.as_str(), "{report}");
+    }
+    let detail = format!("its admission no longer binds under this build: {reason}");
+    let report = get(&app, &format!("/intakes/{second}")).json();
+    assert_eq!(report["state"], "dropped", "{report}");
+    assert_eq!(report["detail"], detail.as_str(), "{report}");
+    assert!(
+        report.get("execution_id").is_none() && report.get("running_execution_id").is_none(),
+        "a row dropped for its binding names no execution: {report}"
+    );
+
+    // A repeat of the dropped arrival's key, in a request this build binds,
+    // is a repeat: answered with the intake that started nothing.
+    let repeat = post(
+        &app,
+        "/serial",
+        &json!({ "id": "second", "tag": "fourth", "hold": hold(&released) }),
+    );
+    assert_eq!(deduped(&repeat), Some("true"), "{repeat:?}");
+    assert_eq!(repeat.status, 202, "{}", repeat.text());
+    assert_eq!(
+        repeat.json(),
+        json!({
+            "intake_id": second,
+            "status": "dropped",
+            "status_url": format!("/intakes/{second}"),
+        })
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        executions_of(&project, "serial").len(),
+        3,
+        "nothing more started"
+    );
+
+    let said = served.stop_and_read_stderr();
+    let dropped = format!("intake `serial`: {second} dropped: {detail}");
+    assert_eq!(
+        said.lines().filter(|line| *line == dropped).count(),
+        1,
+        "the drop is logged once: `{dropped}`\n{said}"
+    );
+    assert!(
+        !said.contains("could not be journaled"),
+        "the row was never tried as a start the journal would not begin: {said}"
     );
 }

@@ -1006,7 +1006,7 @@ async function outside(provider, url, statement, parameters = []) {
     const { Database } = await import("node-sqlite3-wasm");
     const database = new Database(journal.journalPath());
     try {
-      if (/^\s*select/i.test(statement)) return database.all(statement, parameters);
+      if (/^\s*(select|explain)/i.test(statement)) return database.all(statement, parameters);
       database.run(statement, parameters);
       return [];
     } finally {
@@ -1035,6 +1035,29 @@ async function outside(provider, url, statement, parameters = []) {
   }
 }
 
+/**
+ * The columns of the index a dedupe claim's sweep reads down
+ * (`DEDUPE_SWEEPS`, `docs/durability.md` §3.12), in index order, as the
+ * bound backend's own catalogue lists them — none where it has no such index.
+ */
+async function sweepIndexColumns(provider, url) {
+  const statement =
+    provider === "sqlite"
+      ? "SELECT name FROM pragma_index_info('dedupe_by_expiry') ORDER BY seqno"
+      : provider === "postgres"
+        ? "SELECT a.attname AS name FROM pg_index i " +
+          "JOIN pg_class c ON c.oid = i.indexrelid " +
+          "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey) " +
+          "WHERE c.relname = 'dedupe_by_expiry' AND pg_table_is_visible(c.oid) " +
+          "ORDER BY array_position(i.indkey::int2[], a.attnum)"
+        : "SELECT COLUMN_NAME AS name FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() " +
+          "AND TABLE_NAME = 'dedupe' AND INDEX_NAME = 'dedupe_by_expiry' ORDER BY SEQ_IN_INDEX";
+  return (await outside(provider, url, statement)).map((row) => String(row["name"]));
+}
+
+/** The one shape of that index: the trigger, then the window, then the admission. */
+const SWEEP_INDEX = ["trigger_name", "expires_at", "admitted_at"];
+
 // 8d. **A journal written before the intake ledger opens, and takes it**
 //     (§3.12, §3.15, §11.2, PRD resolved q77). The dedupe row grew a column —
 //     its window's end — which each backend's probe adds on open, and the
@@ -1048,6 +1071,16 @@ async function outside(provider, url, statement, parameters = []) {
   const older = `older_ledger_${suffix}`;
   const dropped = await (async () => {
     await outside(provider, url, "DROP TABLE IF EXISTS intakes");
+    // The sweep's index goes first: it names the column, which SQLite will
+    // not drop while an index holds it, and MySQL would drop from the index
+    // and keep the index under its name — a shape no older build left.
+    await outside(
+      provider,
+      url,
+      provider === "mysql"
+        ? "ALTER TABLE dedupe DROP INDEX dedupe_by_expiry"
+        : "DROP INDEX IF EXISTS dedupe_by_expiry",
+    );
     await outside(provider, url, "ALTER TABLE dedupe DROP COLUMN expires_at");
     // A row as the build before the window wrote it: no `expires_at`, admitted
     // two days ago — so a day's window has long passed over it.
@@ -1102,11 +1135,13 @@ async function outside(provider, url, statement, parameters = []) {
       "SELECT execution FROM dedupe WHERE trigger_name = ? AND execution = ?",
       [older, "exec_before_the_window"],
     );
+    const indexed = await sweepIndexColumns(provider, url);
     results.a_journal_written_before_the_intake_ledger_gains_it_on_open =
       dropped === true &&
       row.id === `int_older_${suffix}` &&
       row.state === "queued" &&
       columns.length >= 1 &&
+      JSON.stringify(indexed) === JSON.stringify(SWEEP_INDEX) &&
       left.length === 0;
   } finally {
     await journal.releaseJournal().catch(() => undefined);
@@ -1153,6 +1188,28 @@ try {
     after.execution === "exec_w3" &&
     after.expiresAt === at(20);
   results.a_dedupe_claim_sweeps_the_triggers_expired_rows = swept.length === 0;
+
+  // The sweep costs what expired, never what is live: every backend holds the
+  // index it reads down, in its one shape, and SQLite's planner — the one
+  // whose choice is a rule rather than a statistic — reads each half of it
+  // as a range over the window's column, not a walk of the trigger's rows.
+  const sweepIndex = await sweepIndexColumns(provider, url);
+  let sweepPlans = true;
+  if (provider === "sqlite") {
+    for (const [statement, parameters] of [
+      [journal.DEDUPE_SWEEPS.windowed, [hooks, at(0)]],
+      [journal.DEDUPE_SWEEPS.windowless, [hooks, at(0)]],
+    ]) {
+      const plan = (await outside(provider, url, `EXPLAIN QUERY PLAN ${statement}`, parameters))
+        .map((step) => String(step["detail"]))
+        .join(" | ");
+      sweepPlans &&= plan.includes("USING INDEX dedupe_by_expiry (trigger_name=? AND expires_at");
+    }
+  }
+  results.a_dedupe_sweep_reads_only_expired_rows_down_its_index =
+    JSON.stringify(sweepIndex) === JSON.stringify(SWEEP_INDEX) &&
+    typeof journal.DEDUPE_SWEEPS?.windowed === "string" &&
+    sweepPlans;
 
   // A takeover restarts the window it moves.
   const retaken = await handle.retakeDedupe(hooks, UNICODE, "exec_w3", "exec_w4", at(99));

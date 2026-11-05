@@ -737,12 +737,16 @@ const TRUE_EVERYWHERE: &[&str] = &[
     // lease is the open, uncancelled executions the rows name — read off the
     // rows, never counted; a start nobody was told of is found and taken back,
     // and one that waited is kept for its repair. And a journal a build before
-    // the ledger wrote gains the dedupe row's window column and the intake
-    // table on open, its window-less rows expiring one window after they were
-    // admitted (§11.2).
+    // the ledger wrote gains the dedupe row's window column, the index its
+    // sweep reads down, and the intake table on open, its window-less rows
+    // expiring one window after they were admitted (§11.2). The sweep reads
+    // only what expired: the index is there in its one shape on every
+    // backend, and SQLite's planner reads each half of the sweep as a range
+    // over the window.
     "a_journal_written_before_the_intake_ledger_gains_it_on_open",
     "a_dedupe_key_is_held_for_its_window_and_claimed_again_after_it",
     "a_dedupe_claim_sweeps_the_triggers_expired_rows",
+    "a_dedupe_sweep_reads_only_expired_rows_down_its_index",
     "a_dedupe_takeover_carries_its_new_window",
     "an_intake_row_round_trips_and_is_admitted_once",
     "a_triggers_queue_reads_in_admission_order",
