@@ -13567,8 +13567,17 @@ takeover do assume one writer, held by the writer guard, and that conflict is
 recorded in the Status below for the owner rather than resolved here.
 
 **Status**: shipped as written here. The ruling fixes the keys, the payloads,
-the fired-row identity, the skip, the checkpoint hand-back and the refusals; the
-following are the implementation's own readings and await the owner's ruling:
+the fired-row identity, the skip, the checkpoint hand-back and the refusals.
+**Provisional, as a whole, on how a `kind: command` program's run ends and on
+what a stop or a restart reaps** — that a run ends at the program's exit and
+not when its pipes close, what is done about a helper left in the program's
+process group and about a descendant that left it, the stop's grace for the
+group, and what is read from the pipes after the group has gone: the ruling
+says only that an exit restarts the program with backoff, and the campaign's
+seven review rounds each found a new defect in that one seam (rounds five,
+six and seven in succession). It stands as shipped and tested below, and
+awaits the owner's ruling before it is treated as settled. The following are
+the implementation's own readings and await the owner's ruling:
 
 - `payload.scheduled_at` is the tick's nominal instant in the trigger's zone
   with a numeric offset (`+00:00` for UTC, never `Z`); the fired row keys the
