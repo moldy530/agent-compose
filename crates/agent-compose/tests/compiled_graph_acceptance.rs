@@ -30379,6 +30379,101 @@ fn stopping_serve_ends_its_programs_whole_process_group_even_one_that_ignores_si
     assert!(still.is_empty());
 }
 
+/// What a run of a program leaves in its process group is ended when the run
+/// ends, and what the newest run left is ended by the stop even while the
+/// source is backing off (grammar 14.4, PRD resolved q78 ruling c, Decision
+/// D162).
+///
+/// The fixture's `FEED_HELPER` starts a helper beside the program on every run
+/// — a `sleep` in the program's own group that ignores `SIGTERM` and holds none
+/// of its pipes — and `FEED_EXIT_CODE` makes every run exit once it has emitted
+/// its events, so the source crash-loops under `restart: { backoff: 200ms,
+/// max: 2s }` and every run ends with its helper still running. Each earlier
+/// run's helper is gone within the grace of its run's end while `serve` keeps
+/// restarting the program — `SIGTERM` to the group and then `SIGKILL`, the
+/// stop's sequence — rather than living on beside the restart; and once `serve`
+/// has been stopped while the source backs off, with no run to stop, no helper
+/// any run started is alive.
+#[test]
+fn what_a_run_leaves_in_its_process_group_is_ended_with_it_and_by_a_stop_while_backing_off() {
+    let scratch = harness::Scratch::new("feed-helpers");
+    let Some(project) = harness::scratch_project("feed-helpers") else {
+        return;
+    };
+    let helpers = scratch.path().join("helpers.pids");
+    let environment = feed_environment(
+        scratch.path(),
+        &[
+            ("FEED_TOTAL", "1"),
+            ("FEED_EXIT_CODE", "3"),
+            ("FEED_HELPER", &helpers.display().to_string()),
+        ],
+    );
+    let Some(mut served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let started = |path: &Path| -> Vec<i32> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect()
+    };
+    // Alive, and not a zombie waiting for whoever adopted it to reap it.
+    let alive = |pid: i32| -> bool {
+        // SAFETY: signal 0 delivers nothing; it asks whether `pid` exists.
+        let exists = unsafe { libc::kill(pid, 0) == 0 };
+        let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(") ")
+                    .map(|(_, rest)| rest.starts_with('Z'))
+            })
+            .unwrap_or(false);
+        exists && !zombie
+    };
+    let four = eventually(
+        Duration::from_secs(60),
+        "four runs, each with its helper",
+        || {
+            let held = started(&helpers);
+            (held.len() >= 4).then_some(held)
+        },
+    );
+    let earlier = &four[..3];
+    eventually(
+        Duration::from_secs(20),
+        "the helpers of the runs that ended and were restarted to be gone",
+        || earlier.iter().all(|pid| !alive(*pid)).then_some(()),
+    );
+    let status = source(&app, "feed");
+    assert_ne!(
+        status["state"], "stopped",
+        "serve is still restarting the program: {status}"
+    );
+
+    eventually(Duration::from_secs(30), "the source backing off", || {
+        (source(&app, "feed")["state"] == "backing_off").then_some(())
+    });
+    served.signal(libc::SIGTERM);
+    let exit = served.wait();
+    assert_eq!(
+        exit.code(),
+        Some(0),
+        "a stop that was asked for is not a failure: {exit:?}"
+    );
+    // The stop sent the last group its `SIGKILL` before `serve` exited; the
+    // helpers' own exits may still be under way, and a helper nothing ended
+    // would live for ten minutes.
+    let every = started(&helpers);
+    eventually(
+        Duration::from_secs(10),
+        "every helper any run started to be gone",
+        || every.iter().all(|pid| !alive(*pid)).then_some(()),
+    );
+}
+
 /// `GET /sources/:name` under the `auth:` of the `event` triggers bound to the
 /// source, and each execution's own routes under its own trigger's (grammar
 /// 13.5, 14.4, PRD resolved q32 one level up, Decision D162).
@@ -31141,6 +31236,101 @@ fn a_tick_whose_execution_the_journal_will_not_begin_holds_the_schedule_until_it
     );
 }
 
+/// A schedule claims no tick while its look at the newest claim cannot reach
+/// the journal, and takes the look again on its own backoff
+/// (`docs/durability.md` §3.11, PRD resolved q78 ruling b, Decision D162).
+///
+/// The look reads only the newest `fired` row, so a tick claimed before it
+/// would bury a claim whose execution never began under a row of its own, and
+/// that tick would fire zero times. Nothing a test can do to a real journal
+/// refuses that one read and admits the claim after it, so
+/// `schedule-look.mjs` holds the journal's `lastFired` and stands in for the
+/// admission, recording every call it receives:
+///
+/// * **bypass** — ticking once a second, with the newest row a claim nothing
+///   started and the first two looks refused: the claim is handed back for its
+///   start before any tick is claimed, and the schedule goes on after it.
+/// * **standby** — at the clock's own rate, with the newest row a claim a dead
+///   `serve` made and the first two looks refused as a standby's are: the
+///   claim starts on the look's backoff, seconds in, with no tick claimed — not
+///   at the next tick's look, a schedule's period later.
+#[test]
+fn a_schedule_claims_no_tick_until_its_look_at_the_newest_claim_reaches_the_journal() {
+    let Some((project, built)) = harness::build_under_toolchain("schedules", "schedule-look")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the schedules fixture builds: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let mut runner = harness::toolchain::runner("schedule-look.mjs");
+    runner.arg(&project).current_dir(&project);
+    let output =
+        harness::toolchain::output_within(&mut runner, Duration::from_secs(90), "schedule-look");
+    let said = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(output.status.success(), "the runner failed: {said}");
+    let calls: Value = serde_json::from_slice(&output.stdout).expect("one JSON object");
+    let refused = json!([{ "look": 1, "refused": true }, { "look": 2, "refused": true }]);
+
+    let bypass = calls["bypass"].as_array().expect("the bypass case's calls");
+    assert_eq!(
+        json!(bypass[..2]),
+        refused,
+        "the start's look and its first retry are refused: {bypass:?}"
+    );
+    assert_eq!(
+        bypass[2],
+        json!({ "look": 3, "refused": false }),
+        "nothing is asked of the admission between the refused looks and the one that reads: {bypass:?}"
+    );
+    assert_eq!(
+        bypass[3]["unbegun"], "exec_stranded_by_a_stopped_serve",
+        "the first thing the admission is asked is the stranded claim's start: {bypass:?}"
+    );
+    assert_eq!(bypass[3]["begun"], false, "{bypass:?}");
+    assert!(
+        bypass[4]["tick"].is_string(),
+        "…and the schedule goes on after it: {bypass:?}"
+    );
+    assert!(
+        said.contains("schedule `every_minute`: the journal still could not say whether the tick it last claimed was ever started (this journal refuses look 2), so no tick is claimed yet; looking again in 2000ms"),
+        "the serve log says the schedule is held for the look: {said}"
+    );
+    assert!(
+        said.contains("was claimed as exec_stranded_by_a_stopped_serve and was never started, so it starts now"),
+        "…and names the claim it starts: {said}"
+    );
+    assert!(
+        said.contains("which fell while this scheduler was holding the schedule until the journal could say whether the tick it last claimed was ever started"),
+        "…and the ticks the hold skipped: {said}"
+    );
+
+    let standby = calls["standby"]
+        .as_array()
+        .expect("the standby case's calls");
+    assert_eq!(json!(standby[..2]), refused, "{standby:?}");
+    assert_eq!(
+        json!(standby[2..]),
+        json!([
+            { "look": 3, "refused": false },
+            {
+                "unbegun": "exec_claimed_by_a_dead_primary",
+                "begun": false,
+                "scheduled_at": standby[3]["scheduled_at"],
+            },
+        ]),
+        "the dead serve's claim starts on the look's own backoff, and no tick is claimed: {standby:?}"
+    );
+    assert!(
+        said.contains(
+            "was claimed as exec_claimed_by_a_dead_primary and was never started, so it starts now"
+        ),
+        "the serve log names it: {said}"
+    );
+}
+
 /// A `restart.backoff:` longer than a timer can hold is waited out, not fired
 /// at once (grammar 14.4, PRD resolved q78 ruling c).
 ///
@@ -31633,9 +31823,9 @@ static DIALLED_JOURNAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// What holds it today is two things, and the test is about the outcome rather
 /// than which: the journal's writer guard admits one hub at a time to a dialled
 /// journal (`docs/durability.md` §2.3), so the second `serve` is a standby whose
-/// ticks are refused at the journal and logged; and the `fired` row's identity
-/// — `(trigger, scheduled_at)`, the insert that wins fires — is what keeps a
-/// tick once when hubs share a journal without that guard
+/// schedulers claim no tick while the journal refuses them; and the `fired`
+/// row's identity — `(trigger, scheduled_at)`, the insert that wins fires — is
+/// what keeps a tick once when hubs share a journal without that guard
 /// (`docs/distributed.md` §8). Skipped, with a notice, where
 /// `AGENT_COMPOSE_TEST_POSTGRES_URL` is unset — like the journal conformance
 /// suite's remote arms.

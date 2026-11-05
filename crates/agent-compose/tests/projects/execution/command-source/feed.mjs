@@ -38,6 +38,15 @@
 //                    this file, ignore SIGTERM and the end of stdin — so only
 //                    the SIGKILL `serve` sends the group after its grace
 //                    ends either of them
+//   FEED_HELPER      on every run, start a helper beside itself — a `sleep`
+//                    that ignores SIGTERM, in the group `serve` started this
+//                    program in, holding none of its pipes — and append the
+//                    helper's pid to this file: what a run leaves in its group
+//                    when it ends, unless something ends the group
+//   FEED_EXIT_CODE   after the last event, exit with this code rather than
+//                    wait for stdin to end — on every run, so a restart whose
+//                    checkpoint is already the last event exits as soon as it
+//                    starts: a program that keeps crashing
 //   FEED_UNHANDABLE  on a run that exits part-way (FEED_EXIT_AFTER), emit
 //                    three more lines after its last event whose `cursor` no
 //                    program could be handed back — one holding a NUL, one a
@@ -85,6 +94,16 @@ if (linger) {
   const child = spawn("sleep", ["600"], { stdio: "ignore" });
   writeFileSync(linger, `${process.pid}\n${child.pid}\n`);
   process.on("SIGTERM", () => {});
+}
+const helper = process.env.FEED_HELPER;
+if (helper) {
+  // Not detached, and its stdio closed: a member of this program's group that
+  // keeps none of its pipes open, so the run ends when this process exits and
+  // the helper is still running. `trap '' TERM` survives the `exec`: an
+  // ignored signal stays ignored across one.
+  const child = spawn("sh", ["-c", "trap '' TERM; exec sleep 600"], { stdio: "ignore" });
+  appendFileSync(helper, `${child.pid}\n`);
+  child.unref();
 }
 process.stdin.on("data", () => {});
 process.stdin.on("end", () => {
@@ -171,5 +190,6 @@ if (!resumed && exitAfter !== undefined) {
   await sleep(Number(process.env.FEED_RUN_MS ?? "0"));
   process.exit(0);
 }
+if (process.env.FEED_EXIT_CODE) process.exit(Number(process.env.FEED_EXIT_CODE));
 // Nothing more to say: wait for stdin to end.
 setInterval(() => {}, 1 << 30);

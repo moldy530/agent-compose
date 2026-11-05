@@ -2384,6 +2384,13 @@ const SOURCES: &[Criterion] = &[
                 "a_tick_whose_execution_the_journal_will_not_begin_holds_the_schedule_until_it_starts_under_its_claim",
                 Status::Live,
             ),
+            // …and no tick is claimed past a newest claim nobody has looked
+            // at: the look is retried on its own backoff, so a claim a dead
+            // `serve` left starts as the journal opens, not a period later.
+            (
+                "a_schedule_claims_no_tick_until_its_look_at_the_newest_claim_reaches_the_journal",
+                Status::Live,
+            ),
             // …with a skipped span past the counted ticks still named through
             // the last tick before the start.
             (
@@ -2516,6 +2523,12 @@ const SOURCES: &[Criterion] = &[
             // that ignores `SIGTERM` included.
             (
                 "stopping_serve_ends_its_programs_whole_process_group_even_one_that_ignores_sigterm",
+                Status::Live,
+            ),
+            // …and what each run leaves in its group is ended with the run, and
+            // by a stop that finds the source backing off.
+            (
+                "what_a_run_leaves_in_its_process_group_is_ended_with_it_and_by_a_stop_while_backing_off",
                 Status::Live,
             ),
             // …the `sh` program `docs triggers` writes out runs as written.
