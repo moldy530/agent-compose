@@ -215,7 +215,10 @@ target's own backend, with no flow written: `get <key>`, `set <key> <json>`
 `{ key, value, version, expires_at }` on stdout — and `import`, which reads the
 same from standard input or `--file`, writes each line at a fresh version,
 honours a remaining `expires_at` as a `ttl`, skips a line already expired, and
-with `--if-absent` keeps a key the store already holds. The partition is the one
+with `--if-absent` keeps a key the store already holds — and `log <key>`
+(`--limit`, `--after`), one page of the key's history, oldest first, on a store
+that declares `history: true`: each write's `seq`, time, op, version, actor and
+the value before and after. The partition is the one
 the store's scope names: `--session` for `scope: session`, `--execution` for
 `scope: execution`, neither for `scope: global`. A value is held to the store's
 `value_schema` before it is written. The answer is a table, or one JSON document
@@ -224,8 +227,9 @@ under `--format json`; the exit code is `0` for a key found or a write applied,
 failed, and `2` for a command line it does not take — a value `value_schema`
 refuses among it, since nothing was written and the value is what is to fix.
 **An operator's write is not an effect**: it belongs to no execution, carries no
-idempotency key, and writes no journal row, no ledger row and no trace record,
-so it is recorded nowhere.
+idempotency key, and writes no journal row, no ledger row and no trace record.
+On a store that declares `history: true` it is recorded in one place, its
+history row, as actor `cli`; on any other it is recorded nowhere.
 
 `serve` starts the app over the composition's declared `http` triggers and
 announces where it is listening as one JSON line on stdout. Beside them it
