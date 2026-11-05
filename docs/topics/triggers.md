@@ -393,6 +393,7 @@ line**. Each line is an event, offered to every `event` trigger bound to the
 source, one at a time and in order.
 
 ```yaml spec
+# main.yml
 version: "0.1"
 
 flow.file_report:
