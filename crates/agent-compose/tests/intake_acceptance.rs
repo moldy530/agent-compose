@@ -64,7 +64,9 @@
 //! * an arrival that finds its debounce past the deadline —
 //!   [`an_arrival_past_its_debounces_deadline_closes_it_and_opens_its_own`];
 //! * `supersede` replacing its group's queued arrivals —
-//!   [`a_superseding_arrival_drops_its_groups_queued_arrivals`];
+//!   [`a_superseding_arrival_drops_its_groups_queued_arrivals`] — and starting
+//!   at its predecessor's cancel, while that execution is still unwinding —
+//!   [`a_superseding_arrival_starts_while_the_execution_it_cancelled_unwinds`];
 //! * what a burst behind a full group costs each arrival —
 //!   [`arrivals_behind_a_full_group_never_read_its_queue`];
 //! * an empty `session_key:` a flow needs, refused before a dedupe key is
@@ -3414,6 +3416,187 @@ fn a_superseding_arrival_drops_its_groups_queued_arrivals() {
         said.lines().filter(|line| *line == dropped).count(),
         1,
         "`{dropped}`\n{said}"
+    );
+}
+
+/// The composition
+/// [`a_superseding_arrival_starts_while_the_execution_it_cancelled_unwinds`]
+/// serves: one key-less group of one slot, superseding, over a flow whose work
+/// ends when the file its `hold` names appears and whose `finally:` node ends
+/// when the file its `unwind` names does — so a superseded execution stays
+/// open, unwinding, for exactly as long as the test leaves that file absent.
+const UNWINDING: &str = r#"version: "0.1"
+
+triggers:
+  newest_now:
+    type: http
+    path: /newest-now
+    flow: flow.unwinding
+    input:
+      tag: "payload.body.tag"
+      hold: "payload.body.hold"
+      unwind: "payload.body.unwind"
+    concurrency:
+      on_conflict: supersede
+
+flow.unwinding:
+  description: Work that ends when a file appears, and a finally node that ends when another does.
+  inputs:
+    tag: { type: string }
+    hold: { type: string }
+    unwind: { type: string }
+  outputs: {}
+  nodes:
+    wait:
+      exec:
+        command: "${TALLY_BIN}/hold"
+      input:
+        tag: "input.tag"
+        hold: "input.hold"
+    unwinding:
+      exec:
+        command: "${TALLY_BIN}/hold"
+      input:
+        tag: "input.tag"
+        hold: "input.unwind"
+  edges:
+    - { from: start, to: wait }
+    - { from: wait, to: end }
+  finally: unwinding
+"#;
+
+/// **A superseding arrival starts when its predecessor's cancel is recorded,
+/// not when that execution settles** (PRD resolved q77 ruling b, grammar 13.1
+/// "starts the arrival in the slot that frees", Decision D163's Status: "The
+/// lease frees at the cancel, not the settle").
+///
+/// `newest_now` holds one slot and supersedes. `first` takes it, its work
+/// waiting on a file that never appears and its `finally:` node on a file the
+/// test writes last. `second` arrives: it cancels `first` and is answered as an
+/// arrival that **started** — an `execution_id`, no `intake_id`, which is what
+/// a queued arrival would have been given instead. While `first` is still
+/// open, its cancel recorded and its finally node holding it there, `second`
+/// runs to completion beside it: the lease no longer counted `first` once its
+/// cancel was in the journal. Only then is `first`'s finally node released,
+/// and `first` settles `cancelled` — after `second` both started and ended.
+///
+/// The test is deterministic rather than timed: a supersede that waited for
+/// the settle would leave `second` queued behind an execution that cannot
+/// settle until `second` has been seen to finish.
+#[test]
+fn a_superseding_arrival_starts_while_the_execution_it_cancelled_unwinds() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("intake-supersede-unwinding");
+    let (environment, _log) = environment(&provider, &scratch, &[]);
+    let never = scratch.path().join("never");
+    let unwound = scratch.path().join("unwound");
+    let present = scratch.path().join("present");
+    std::fs::write(&present, "").expect("the scratch area is writable");
+    let hold = |file: &Path| file.display().to_string();
+    let entrypoint = scratch.path().join("main.yml");
+    std::fs::write(&entrypoint, UNWINDING).expect("the scratch area is writable");
+    let Some(project) = harness::scratch_project("intake-supersede-unwinding") else {
+        return;
+    };
+    let Some(mut served) = harness::serve_entrypoint_into(&project, &entrypoint, &environment)
+    else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client");
+
+    let answered = post(
+        &app,
+        "/newest-now",
+        &json!({ "tag": "first", "hold": hold(&never), "unwind": hold(&unwound) }),
+    );
+    let first = execution_of(&answered);
+    assert!(
+        answered.json().get("intake_id").is_none(),
+        "an arrival its free slot starts at once has no intake id: {}",
+        answered.text()
+    );
+    eventually(Duration::from_secs(30), "first's lifecycle row", || {
+        executions_of(&project, "newest_now")
+            .iter()
+            .any(|row| row.id == first && row.status == "open")
+            .then_some(())
+    });
+
+    let answered = post(
+        &app,
+        "/newest-now",
+        &json!({ "tag": "second", "hold": hold(&present), "unwind": hold(&present) }),
+    );
+    let second = execution_of(&answered);
+    assert!(
+        answered.json().get("intake_id").is_none() && answered.json()["status"] == "running",
+        "the superseding arrival started at once, into the slot the cancel freed, \
+         rather than queueing behind the execution it cancelled: {}",
+        answered.text()
+    );
+    assert_ne!(second, first);
+
+    // `second` runs whole while `first` is still open, unwinding through the
+    // finally node that waits on a file nothing has written yet.
+    let rows = eventually(
+        Duration::from_secs(60),
+        "second to complete while first unwinds",
+        || {
+            let rows = executions_of(&project, "newest_now");
+            rows.iter()
+                .any(|row| row.id == second && row.status == "completed")
+                .then_some(rows)
+        },
+    );
+    let unwinding = rows
+        .iter()
+        .find(|row| row.id == first)
+        .expect("first's lifecycle row");
+    assert_eq!(
+        (unwinding.status.as_str(), unwinding.ended_at.as_deref()),
+        ("open", None),
+        "first had not settled when second finished: its finally node still holds it"
+    );
+    let cancels = harness::journal_rows(
+        &project,
+        &format!("SELECT COUNT(*) AS n FROM cancellations WHERE execution = '{first}'"),
+    );
+    assert_eq!(
+        cancels[0]["n"], 1,
+        "first's cancel was recorded before second began: {cancels}"
+    );
+    let started: Vec<Value> = intakes_of(&project, "newest_now")
+        .into_iter()
+        .filter(|row| row["execution"] == second.as_str())
+        .collect();
+    assert_eq!(started.len(), 1, "{started:?}");
+    assert_eq!(started[0]["state"], "started", "{started:?}");
+    assert_eq!(started[0]["waited"], 0, "second never waited: {started:?}");
+
+    std::fs::write(&unwound, "").expect("the unwind file");
+    let rows = eventually(Duration::from_secs(60), "first to settle", || {
+        let rows = executions_of(&project, "newest_now");
+        rows.iter()
+            .any(|row| row.id == first && row.status != "open")
+            .then_some(rows)
+    });
+    let first_row = rows.iter().find(|row| row.id == first).expect("first");
+    let second_row = rows.iter().find(|row| row.id == second).expect("second");
+    assert_eq!(first_row.status, "cancelled", "{rows:#?}");
+    let first_ended = first_row.ended_at.as_deref().expect("first ended");
+    let second_ended = second_row.ended_at.as_deref().expect("second ended");
+    assert!(
+        second_row.started_at.as_str() < first_ended && second_ended < first_ended,
+        "second began at {} and ended at {second_ended}, both before first settled at \
+         {first_ended}: the slot freed at the cancel, not the settle",
+        second_row.started_at
+    );
+
+    let said = served.stop_and_read_stderr();
+    let superseded = format!("intake `newest_now`: superseded {first} for {second}");
+    assert!(
+        said.lines().any(|line| line == superseded),
+        "the serve log says `{superseded}`:\n{said}"
     );
 }
 
