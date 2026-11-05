@@ -652,11 +652,13 @@ mod tests {
     #[test]
     fn every_execution_id_this_runtime_mints_is_outside_the_authored_namespace() {
         /// The one execution-id spelling, and the ids minted that are not an
-        /// execution's: a dispatch's, a worker's, and a command's output marker.
+        /// execution's: a dispatch's, a worker's, an intake's (PRD resolved
+        /// q77), and a command's output marker.
         const EXECUTION: &str = "`exec_${globalThis.crypto.randomUUID()}`";
         const NOT_AN_EXECUTION: &[&str] = &[
             "`dsp_${globalThis.crypto.randomUUID()}`",
             "`wrk_${globalThis.crypto.randomUUID()}`",
+            "`int_${globalThis.crypto.randomUUID()}`",
             "`__agent_compose_${globalThis.crypto.randomUUID().replace(/-/g, \"\")}`",
         ];
         let sources = [
