@@ -1725,8 +1725,12 @@ many consumers see its event. Today the journal's writer guard
 (`docs/durability.md` §2.3) is the stronger rule on a dialled journal: one
 `serve` holds it, and a second over the same journal is a standby whose claims
 the journal refuses — it logs each tick as not fired, and takes the schedule
-over when the first goes, starting first a tick the first claimed and died
-before starting (`docs/durability.md` §3.11). A consumer's checkpoint is the
+over when the first goes. Before it claims a tick or admits an event there it
+recovers what the first left open — the recovery its own start could not do,
+owed until the journal opens to it (`docs/durability.md` §6.1) — so a dead
+hub's executions are resumed rather than stranded, and a tick or an event is
+never answered by one of them that nothing runs; then it starts a tick the
+first claimed and died before starting (§3.11 there). A consumer's checkpoint is the
 same shape at a source's granularity: one row per source, written by whichever
 hub admitted the event it names — and a standby's consumer, which cannot read
 it, holds its program back until it can rather than starting it from no

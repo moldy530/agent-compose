@@ -1362,6 +1362,17 @@ inputs did not bind — moves nothing, and neither does one the journal would no
 admit, whether it refused the event's claim or its execution's lifecycle row:
 that event is retried and holds the stream until it is admitted.
 
+**Only a checkpoint a program can be handed is ever written.** The row is handed
+back to every later start, as an environment variable and as each
+`{checkpoint}` argument, so a value no process could be started with — one
+holding a NUL, which no argument or variable carries, or a lone UTF-16
+surrogate, which has no UTF-8 to hand over unchanged, or one longer than 64 KiB,
+against a host's bound on a single argument (128 KiB on Linux) — would refuse
+every start after it for as long as the row stood, and a `serve` restart would
+hand it back again. Such a line is refused before it is admitted, as one whose
+`checkpoint:` cannot be evaluated is (`docs/grammar.md` §14.4), so it never
+reaches this row.
+
 **A start that cannot read the row does not start the program.** No row means
 the source has never had an event accepted, and a program started that way may
 begin at its tip — skipping everything after the journaled position — or at its
@@ -1654,6 +1665,27 @@ declares is reported on stderr and left open for the same reason.
 Because recovery takes every open execution, an execution worth resuming by hand
 is one no `serve` is running — see §2 on what is outside the promise.
 
+**A start that cannot read the journal owes the recovery.** The app still
+serves — the start's failure is written on stderr — and the walk that could not
+read what it walks, the open executions or the owed deliveries, is taken again
+with backoff for as long as the process runs, and the executions' walk again
+before **every tick and every event** the process admits (PRD resolved q78):
+one of those is refused, as one the journal could not record is, while the open
+executions cannot be read, and waits for their walk once they can. The case that makes this more than a transient is a
+**standby**: a second `serve` on a dialled journal, refused it by the writer
+guard for as long as the first holds it (§2.3). When the first goes, the
+standby's scheduler and consumers start succeeding at the journal
+(`docs/distributed.md` §8), and the first thing they meet is this walk — so the
+executions the first left open, a tick's or an event's half-run execution
+among them, are resumed in the standby before it claims a tick or matches an
+event against them, rather than answering a repeat `held` by an execution
+nothing runs. The serve log says when it happens: `this project's journal can
+be read now, so the <n> executions it holds open are recovered now, before any
+tick or event is admitted`, and then one `recovered` line per execution as at a
+start. An execution this process already holds — one it started since — is
+never recovered beside itself, and a delivery it already has on its schedule
+is never put on a second one.
+
 **A stop leaves every execution where it was**, child executions included. A
 `serve` that receives `SIGINT` or `SIGTERM` closes and exits without waiting for
 the executions in flight — a parent's or a child's, running or still queued for a
@@ -1813,7 +1845,8 @@ restarted from its journaled checkpoint (§3.13), so what its program emits agai
 after a restart is answered by the rows the first admissions wrote. Recovery
 runs **first**: `serve` starts its schedulers and its sources' programs only
 after every open execution has been taken back, so a tick or an event never
-races a replay.
+races a replay — and where the start could not take them back, no tick or
+event is admitted until they have been (§6.1).
 
 ## 7. Divergence
 

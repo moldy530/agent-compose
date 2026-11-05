@@ -6494,8 +6494,12 @@ What `serve` does with one:
 - **Lines.** Each line of stdout is one event; it becomes `payload.body` when it
   is a JSON object. Anything else — not JSON, JSON that is not an object, a line
   longer than 1 MiB — is **refused**: logged with the source and the line's
-  number, counted on the status route, and never an execution. stderr is copied
-  into the serve log, each line tagged `[source <name>]`.
+  number, counted on the status route, and never an execution; a line past the
+  bound is refused once, and the rest of it up to its newline is dropped rather
+  than read as a line of its own. A last line the program ends without a
+  newline — its stdout closing on it — is a line like any other. stderr is
+  copied into the serve log, each line tagged `[source <name>]`, a line longer
+  than 1 MiB cut there and the rest of it dropped.
 - **Backpressure.** Lines are admitted one at a time, in order, each to every
   bound trigger before the next is read; reading pauses while one is admitted,
   so a program writing faster than `serve` admits blocks on its own pipe rather
@@ -6506,8 +6510,11 @@ What `serve` does with one:
   never before (`docs/durability.md` §3.13). Every start hands the newest one
   back, as `AGENT_COMPOSE_CHECKPOINT` in the environment and in place of a
   literal `{checkpoint}` argument; before there is one the variable is unset and
-  the argument is the empty string. A program resumes **after** the checkpoint
-  it is handed. Whatever it emitted past the last accepted one before a crash is
+  the argument is the empty string. A line whose checkpoint no program could be
+  handed back unchanged — one holding a NUL or a lone UTF-16 surrogate, or
+  longer than 64 KiB — is refused like a line that is not a JSON object, since
+  journaled it would be what every later start was handed. A program resumes
+  **after** the checkpoint it is handed. Whatever it emitted past the last accepted one before a crash is
   emitted again and deduplicated on `payload.id` (§13.5).
 - **Restarts.** An exit — any code, any signal — is journaled as a `restarts`
   row (`docs/durability.md` §3.14) and the program is started again after
@@ -13610,7 +13617,13 @@ following are the implementation's own readings and await the owner's ruling:
 - `cron:` fields are separated by ASCII whitespace only, in the validator, the
   emitted evaluator and the schema alike.
 - A line whose `checkpoint:` cannot be evaluated is refused like a line that
-  is not an object: counted, logged, and never an execution. One whose
+  is not an object: counted, logged, and never an execution — and so is one
+  whose checkpoint could not be handed back to the program as it would be
+  journaled: a NUL in it (no argument or environment variable carries one), a
+  lone UTF-16 surrogate (it has no UTF-8 encoding), or more than 64 KiB of
+  UTF-8 (half Linux's 128 KiB bound on one argument or environment string).
+  Journaled, it would be handed to every later start and refuse each one —
+  across `serve` restarts too. One whose
   `input:`, `session_key:` or `dedupe_key:` a trigger cannot evaluate starts
   nothing for that trigger and is logged naming it, and the others bound to the
   source are offered it as usual.
@@ -13651,7 +13664,12 @@ following are the implementation's own readings and await the owner's ruling:
   is exactly `*`.
 - The two-hub case on a dialled journal is held in practice by the journal's
   writer guard (`docs/durability.md` §2.3) — the second `serve` is a standby
-  whose ticks are refused at the journal. Without the guard the fired row's
+  whose ticks are refused at the journal. A start that could not read the
+  journal, a standby's among them, owes the recovery: it is retried with
+  backoff and taken again before every tick and event the process admits, so
+  when the standby takes over, the executions the first `serve` left open are
+  resumed before any tick is claimed or event admitted
+  (`docs/durability.md` §6.1). Without the guard the fired row's
   identity still keeps a tick's claim once across hubs, and the dedupe row an
   event's; what it does not keep is the repair and the takeover above, which
   is the rule-3 conflict recorded there.

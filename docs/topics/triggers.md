@@ -474,7 +474,8 @@ What the runtime does around it:
   unset and the argument is the empty string — and a journal that cannot say
   which holds the program back until it can, rather than starting it from no
   position. An event the trigger refuses, or the journal will not yet admit,
-  moves nothing. `checkpoint:` reads the line —
+  moves nothing. A checkpoint is handed to a process, so one holding a NUL or a
+  lone surrogate, or longer than 64 KiB, refuses its line. `checkpoint:` reads the line —
   `payload.body`, `payload.source`, `payload.attributes` — and never
   `payload.id`, which is its own answer (`circular-checkpoint`).
 - **Dedupe.** `dedupe_key:` defaults to `payload.id`, so an event the program
