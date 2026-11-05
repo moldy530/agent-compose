@@ -201,7 +201,35 @@ const MYSQL_SCHEMA = [
   dedupe_key   LONGTEXT NOT NULL,
   execution    VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   admitted_at  VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  expires_at   VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NULL,
   PRIMARY KEY (trigger_name, key_hash)
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
+  // The intake ledger (PRD resolved q77, Decision D163, `docs/durability.md`
+  // §3.15): a table of its own, so `IF NOT EXISTS` is its whole migration.
+  // Every column a statement compares is ASCII byte-wise, by the rule above;
+  // a group key is the caller's, so it is keyed by its SHA-256 and kept whole
+  // beside it, as a dedupe key is.
+  `CREATE TABLE IF NOT EXISTS intakes (
+  seq          BIGINT NOT NULL AUTO_INCREMENT,
+  id           VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  trigger_name VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  group_hash   VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  group_key    LONGTEXT,
+  state        VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  execution    VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  waited       INT NOT NULL,
+  held_by      VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NULL,
+  payload      LONGTEXT,
+  admission    LONGTEXT,
+  coalesced    INT NOT NULL,
+  admitted_at  VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  deadline     VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NULL,
+  started_at   VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NULL,
+  detail       LONGTEXT,
+  PRIMARY KEY (id),
+  UNIQUE KEY intakes_seq (seq),
+  KEY intakes_by_trigger (trigger_name, state, group_hash),
+  KEY intakes_by_execution (execution)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
   `CREATE TABLE IF NOT EXISTS checkpoints (
   source           VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
@@ -240,6 +268,16 @@ const MYSQL_MIGRATIONS: readonly { readonly probe: string; readonly add: string 
       "SELECT COUNT(*) AS held FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() " +
       "AND TABLE_NAME = 'executions' AND COLUMN_NAME = 'finally_error'",
     add: "ALTER TABLE executions ADD COLUMN finally_error LONGTEXT NULL AFTER error",
+  },
+  // A dedupe key's window (PRD resolved q77 ruling a): nullable, because a row
+  // written before it was held for ever, and a null is read as expiring one
+  // window after it was admitted.
+  {
+    probe:
+      "SELECT COUNT(*) AS held FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() " +
+      "AND TABLE_NAME = 'dedupe' AND COLUMN_NAME = 'expires_at'",
+    add:
+      "ALTER TABLE dedupe ADD COLUMN expires_at VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NULL AFTER admitted_at",
   },
 ];
 

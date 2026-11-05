@@ -19,6 +19,10 @@
 // (`./serve.ts`'s `admit`). `eventSources` is the active target's
 // `event_sources:`, every entry with its kind — a kind this release does not
 // implement is refused by name when `serve` starts (grammar 14.4).
+//
+// A trigger's `dedupe_window:` and `concurrency:` block — defaults applied —
+// are what that admission's intake ledger decides under (PRD resolved q77): a
+// dedupe key's TTL, and the groups a trigger's arrivals are leased slots of.
 
 import * as runtime from "./runtime.ts";
 
@@ -35,6 +39,9 @@ const httpPayload: runtime.Shape = {
     headers: { properties: {}, rest: "string" },
     path: "string",
     method: "string",
+    // Present only where the trigger's `concurrency:` declares `debounce:`,
+    // on the payload the debounced execution starts with (PRD resolved q77).
+    coalesced: "int",
   },
 };
 
@@ -85,6 +92,40 @@ export interface HttpTrigger {
    * payload and is attacker-controlled by construction (Decision D110, D127).
    */
   readonly callbackAllow?: readonly string[];
+  /**
+   * `dedupe_key:` — the key a repeat delivery is recognised by (grammar 13.3,
+   * PRD resolved q77 ruling a). No default: absent, nothing is deduplicated.
+   */
+  dedupeKey?(payload: unknown): string;
+  /** `dedupe_window:` — how long a key is held, in milliseconds; beside `dedupeKey`. */
+  readonly dedupeWindowMs?: number;
+  /** `concurrency:` — the intake groups this trigger's requests are admitted under. */
+  readonly concurrency?: Concurrency<unknown>;
+}
+
+/**
+ * A trigger's `concurrency:` block, defaults applied (grammar 13.1, PRD
+ * resolved q77 ruling b, c, Decision D163).
+ *
+ * A group is a **lease** held by its running executions, which `./serve.ts`
+ * computes from the journal's rows at every admission: the arrivals whose `key`
+ * answers one value share one, `limit` of them hold it at once, and
+ * `maxRunning` bounds the trigger's executions across every group.
+ */
+export interface Concurrency<P> {
+  /** `key:` — the group an arrival belongs to; absent, one group for the trigger. */
+  key?(payload: P): string;
+  /** `limit:` — defaulting to `1`. */
+  readonly limit: number;
+  /** `on_conflict:` — defaulting to `queue`. */
+  readonly onConflict: "queue" | "drop" | "supersede";
+  /** `debounce:`, in milliseconds: the arrivals for a key coalesce into one execution. */
+  readonly debounceMs?: number;
+  /**
+   * `max_running:` — **the trigger's** total across all its groups. Not a
+   * placement's `max_running:` (grammar 14.1), which a worker session holds.
+   */
+  readonly maxRunning?: number;
 }
 
 /**
@@ -152,7 +193,7 @@ function roots(payload: unknown): runtime.Roots {
  * nominal instant in the trigger's zone (RFC 3339), and the trigger's name.
  */
 const schedulePayload: runtime.Shape = {
-  properties: { scheduled_at: "string", trigger: "string" },
+  properties: { scheduled_at: "string", trigger: "string", coalesced: "int" },
 };
 
 /**
@@ -167,6 +208,7 @@ const eventPayload: runtime.Shape = {
     body: { properties: {}, rest: "any" },
     attributes: { properties: {}, rest: "string" },
     source: "string",
+    coalesced: "int",
   },
 };
 
@@ -234,6 +276,8 @@ export interface ManualTrigger {
 export interface SchedulePayload {
   readonly scheduled_at: string;
   readonly trigger: string;
+  /** The arrivals a debounce coalesced into this execution (PRD resolved q77 ruling c). */
+  readonly coalesced?: number;
 }
 
 /** One event's payload (grammar 13.5, 14.4). */
@@ -242,6 +286,8 @@ export interface EventPayload {
   readonly body: Readonly<Record<string, unknown>>;
   readonly attributes: Readonly<Record<string, string>>;
   readonly source: string;
+  /** The arrivals a debounce coalesced into this execution (PRD resolved q77 ruling c). */
+  readonly coalesced?: number;
 }
 
 /** One line of a command source, decoded, before it has an id (grammar 14.4). */
@@ -266,6 +312,8 @@ export interface ScheduleTrigger {
   input(payload: SchedulePayload): Record<string, unknown>;
   /** `session_key:` — the session identity for session-scoped stores. */
   sessionKey?(payload: SchedulePayload): string;
+  /** `concurrency:` — the intake groups this trigger's ticks are admitted under. */
+  readonly concurrency?: Concurrency<SchedulePayload>;
 }
 
 /**
@@ -283,6 +331,10 @@ export interface EventTrigger {
   sessionKey?(payload: EventPayload): string;
   /** `dedupe_key:` — defaulting to `payload.id`. */
   dedupeKey(payload: EventPayload): string;
+  /** `dedupe_window:` — how long a key is held, in milliseconds; defaulting to 24h. */
+  readonly dedupeWindowMs: number;
+  /** `concurrency:` — the intake groups this trigger's events are admitted under. */
+  readonly concurrency?: Concurrency<EventPayload>;
   /**
    * `auth:` — what the status, resume and cancel routes of every execution
    * this trigger starts enforce, and what its source's `GET /sources/:name`

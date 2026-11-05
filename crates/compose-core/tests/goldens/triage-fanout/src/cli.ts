@@ -26,16 +26,13 @@
 // # Reading and writing a store with no flow
 //
 // `store` is the operator's surface onto one `kv` store (PRD resolved q72):
-// `get`, `set`, `delete`, `list`, `count`, `export` and `import`, and `log` —
-// one key's history (PRD resolved q74) — run against this target's own
-// backend through `./stores.ts`'s operator entry points.
+// `get`, `set`, `delete`, `list`, `count`, `export` and `import`, run against
+// this target's own backend through `./stores.ts`'s operator entry points.
 // The binary carries no database driver (PRD 5.12), which is why the compiler
 // launches this rather than opening a store itself — the same split `run` is.
 // An operator's write is **not an effect**: it belongs to no execution, so it
 // carries no idempotency key and leaves no journal row, no ledger row and no
-// trace record. On a store that declares `history: true` it is recorded in one
-// place, its history row, as actor `cli`; on any other, nowhere. See
-// [`storeVerb`].
+// trace record — it is recorded nowhere. See [`storeVerb`].
 //
 // # What `run` prints
 //
@@ -188,6 +185,7 @@ import {
   journalExists,
   journalLocation,
   journaledExecution,
+  leasesOf,
   openExecutions,
   releaseJournal,
   traceDocument,
@@ -205,7 +203,7 @@ import {
   runOperatorOp,
   sweepBoundStores,
 } from "./stores.ts";
-import type { HistoryEntry, OperatorTarget, StoreBinding, StoreParams } from "./stores.ts";
+import type { OperatorTarget, StoreBinding, StoreParams } from "./stores.ts";
 import { publicUrl } from "./deployment.ts";
 import { eventTriggers, httpTriggers, manualTriggers, scheduleTriggers } from "./triggers.ts";
 
@@ -385,12 +383,59 @@ async function run(argv: readonly string[]): Promise<number> {
   const session = sessionOf(flow, options.single["session"] ?? "");
   const format = formatOf(options.single["format"]);
   requireSession(address, flow, session);
+  await refuseCovered(address);
 
   // Minted here rather than left to `runFlow`, because this command needs it on
   // both of its ways out: it is what makes the trace file's name unique (see
   // [`writeTrace`]), and a failed run has no `FlowRun` to read one back off.
   const execution = `exec_${globalThis.crypto.randomUUID()}`;
   return await execute({ address, inputs, session, format, execution, resuming: false });
+}
+
+/**
+ * Refuse a `run` of a flow a trigger's `concurrency:` covers while that group
+ * has no free slot (PRD resolved q77 ruling e, Decision D163).
+ *
+ * A run shares the journal, so it sees the lease the serving process holds —
+ * read off the same rows, never counted here — and it **never queues**,
+ * because a terminal is not a queue: it is refused at start, naming the
+ * execution holding the slot, and journals nothing. A command that could not
+ * run at all, so exit `2`.
+ *
+ * **Which group a run is in** is the implementation's reading, flagged for the
+ * owner in D163's Status: a run is in a trigger's group only where the
+ * trigger declares no `concurrency.key` — the key-less group, one per trigger.
+ * A keyed group's key is CEL over a payload a run does not have, so no keyed
+ * group covers one. A run that starts holds no slot of its own: the lease is
+ * the trigger's executions, and a run is not one of them.
+ *
+ * A journal this command cannot read for the question says nothing about the
+ * lease, and the run goes on to meet the same journal itself, which reports
+ * what is wrong with it.
+ */
+async function refuseCovered(address: string): Promise<void> {
+  const covering = [...httpTriggers, ...scheduleTriggers, ...eventTriggers].filter(
+    (trigger) =>
+      trigger.flow === address &&
+      trigger.concurrency !== undefined &&
+      trigger.concurrency.key === undefined,
+  );
+  for (const trigger of covering) {
+    const concurrency = trigger.concurrency;
+    if (concurrency === undefined) continue;
+    let leases: readonly runtime.Lease[];
+    try {
+      leases = await leasesOf(trigger.name);
+    } catch {
+      return;
+    }
+    const slots = Math.min(concurrency.limit, concurrency.maxRunning ?? concurrency.limit);
+    if (leases.length < slots) continue;
+    const running = leases[0]?.execution ?? "";
+    throw new UsageError(
+      `\`${address}\` is covered by the \`concurrency:\` of the trigger \`${trigger.name}\`, and its group has no free slot: ${running} holds it (${leases.length} of ${slots} running). A run is refused rather than queued — a terminal is not a queue — so nothing was started or journaled: run it again once that execution settles (grammar 13.2, PRD resolved q77)`,
+    );
+  }
 }
 
 /**
@@ -1613,8 +1658,7 @@ interface StoreSubverb {
  * does ([`STORE_PARTITION_OPTIONS`]). The options mirror the op parameters of
  * grammar 11.4 they set: `--if` and `--if-version` are `if:` and
  * `if_version:`, `--ttl` is `ttl:`, and `--after` and `--values` are a `list`'s
- * `after:` and `include_values:` — and `log`'s `--limit` and `--after` are the
- * `history` op's `limit:` and `after:` (PRD resolved q74).
+ * `after:` and `include_values:`.
  */
 const STORE_SUBVERBS: Readonly<Record<string, StoreSubverb>> = {
   get: { operands: ["key"], options: {} },
@@ -1627,7 +1671,6 @@ const STORE_SUBVERBS: Readonly<Record<string, StoreSubverb>> = {
   count: { operands: [], options: { prefix: "single" } },
   export: { operands: [], options: { prefix: "single" } },
   import: { operands: [], options: { "if-absent": "flag", file: "single" } },
-  log: { operands: ["key"], options: { limit: "single", after: "single" } },
 };
 
 /** What every `store` sub-verb takes: the partition, and the format. */
@@ -1667,8 +1710,7 @@ const LAST_INSTANT = 8.64e15;
  * operator entry points, which run the same ops a store-op node runs and
  * bypass exactly the effect machinery: **an operator's write is not an
  * effect** — it belongs to no execution, carries no idempotency key, writes no
- * journal row and no ledger row, and is recorded only in the history of a
- * store that declares `history: true`, as actor `cli` (PRD resolved q74).
+ * journal row and no ledger row, and is recorded nowhere.
  *
  * The exit codes are the project's, read for a store: `0` found or applied;
  * `1` the answer is no — a `get` that found nothing, a condition that did not
@@ -1787,8 +1829,6 @@ async function storeSubverb(
       return await storeExport(target, prefix, format);
     case "import":
       return await storeImport(target, options.single["file"], options.flags.has("if-absent"), format);
-    case "log":
-      return await storeLog(target, operands[0]!, options.single, format);
     default:
       throw new UsageError(
         `\`store ${name}\` is not a sub-verb of \`store\`: it takes ${Object.keys(STORE_SUBVERBS).map((held) => `\`${held}\``).join(", ")}`,
@@ -1936,83 +1976,6 @@ async function storeDelete(
     ...conditionOf(undefined, ifVersion),
   });
   return wrote(target, key, row, format, ["key", "deleted", "applied", "version"]);
-}
-
-/**
- * `store log <store> <key> [--limit <n>] [--after <seq>]` — one page of the
- * key's history, oldest first, on a store whose definition declares
- * `history: true` (PRD resolved q74): the `history` op, read through the same
- * statement a store-op node's runs.
- *
- * A read, so it answers `0` whether the key has a history or none — an empty
- * page is said on stderr, as a `list` of no keys is — and `1` only where the
- * backend failed. A store that keeps no history is a usage error, `2`: nothing
- * it could read is there, and what is to fix is which store the command names.
- * The table shows each row's `seq`, the instant it was written (UTC, by the
- * store's clock), the op, the version the write left, who wrote it — `node` or
- * `tool` with the execution id and instance path, or `cli` — and the value
- * before and after, `—` where the key held nothing on that side; `--format
- * json` answers the page as the op does, `{ entries, next }`. Where more rows
- * remain the `next` cursor is printed, which `--after` takes.
- */
-async function storeLog(
-  target: OperatorTarget,
-  key: string,
-  single: Readonly<Record<string, string>>,
-  format: Format,
-): Promise<number> {
-  if (target.store.history !== true) {
-    throw new UsageError(
-      `\`${target.store.address}\` keeps no history: its definition does not declare \`history: true\`, so no write to it records a row for \`store log\` to read (grammar 11.1, PRD resolved q74)`,
-    );
-  }
-  // The op's own cursor rule (`historyCursor`), held here so a cursor it would
-  // refuse — digits past the largest safe integer among them — is a usage
-  // error, `2`, rather than the op failing as a backend would, `1`.
-  const after = single["after"];
-  if (
-    after !== undefined &&
-    (!/^[0-9]*$/.test(after) || !Number.isSafeInteger(Number(after)))
-  ) {
-    throw new UsageError(
-      `\`--after ${after}\` is not a history cursor: it takes the \`next\` a page of \`store log\` printed — the last \`seq\` of that page, a whole number no larger than ${Number.MAX_SAFE_INTEGER}`,
-    );
-  }
-  const row = await runOperatorOp(target, "history", {
-    key,
-    limit: limitOf(single["limit"], "`log` reads 1 to 1000 history rows at a time"),
-    ...(after === undefined ? {} : { after }),
-  });
-  if (format === "json") return answered(row, 0);
-  const entries = row["entries"] as readonly HistoryEntry[];
-  if (entries.length === 0) {
-    process.stderr.write(
-      `${JSON.stringify(key)} has no history in ${where(target)}${after === undefined ? "" : ` after ${after}`}\n`,
-    );
-    return 0;
-  }
-  const absent = "—";
-  out(
-    table(
-      ["seq", "at", "op", "version", "actor", "old_value", "new_value"],
-      entries.map((entry) => [
-        String(entry.seq),
-        new Date(Math.min(entry.at, LAST_INSTANT)).toISOString(),
-        entry.op,
-        entry.version === undefined ? absent : String(entry.version),
-        [entry.actor.kind, entry.actor.execution, entry.actor.path]
-          .filter((part): part is string => part !== undefined)
-          .join(" "),
-        "old_value" in entry ? compact(entry.old_value) : absent,
-        "new_value" in entry ? compact(entry.new_value) : absent,
-      ]),
-    ),
-  );
-  const next = row["next"];
-  if (typeof next === "string") {
-    out(`next: ${next}  (\`--after ${next}\` reads the page after this one)\n`);
-  }
-  return 0;
 }
 
 /**
@@ -2342,18 +2305,12 @@ function ttlOf(written: string | undefined): Pick<StoreParams, "ttl"> {
   return { ttl: amount * unit };
 }
 
-/**
- * `--limit <n>`, held to a page's 1..1000 (grammar 11.4) — a `list`'s page of
- * keys, or, with `rule` saying so, a `log`'s page of history rows.
- */
-function limitOf(
-  written: string | undefined,
-  rule = `a \`list\` reads 1 to ${STORE_LIST_MAX} keys at a time`,
-): number {
+/** `--limit <n>`, held to a page's 1..1000 (grammar 11.4). */
+function limitOf(written: string | undefined): number {
   if (written === undefined) return STORE_LIST_DEFAULT;
   const limit = /^[0-9]+$/.test(written) ? Number(written) : Number.NaN;
   if (!Number.isInteger(limit) || limit < 1 || limit > STORE_LIST_MAX) {
-    throw new UsageError(`\`--limit ${written}\` is not a page size: ${rule}`);
+    throw new UsageError(`\`--limit ${written}\` is not a page size: a \`list\` reads 1 to ${STORE_LIST_MAX} keys at a time`);
   }
   return limit;
 }

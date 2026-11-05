@@ -145,8 +145,37 @@ CREATE TABLE IF NOT EXISTS dedupe (
   key_hash     TEXT COLLATE "C" NOT NULL,
   dedupe_key   TEXT NOT NULL,
   execution    TEXT COLLATE "C" NOT NULL,
-  admitted_at  TEXT NOT NULL,
+  admitted_at  TEXT COLLATE "C" NOT NULL,
+  expires_at   TEXT COLLATE "C",
   PRIMARY KEY (trigger_name, key_hash)
+);
+DO $migrate$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_attribute
+    WHERE attrelid = 'dedupe'::regclass AND attname = 'expires_at' AND NOT attisdropped
+  ) THEN
+    ALTER TABLE dedupe ADD COLUMN IF NOT EXISTS expires_at TEXT COLLATE "C";
+  END IF;
+END
+$migrate$;
+CREATE TABLE IF NOT EXISTS intakes (
+  seq          BIGSERIAL NOT NULL UNIQUE,
+  id           TEXT COLLATE "C" PRIMARY KEY,
+  trigger_name TEXT COLLATE "C" NOT NULL,
+  group_hash   TEXT COLLATE "C" NOT NULL,
+  group_key    TEXT,
+  state        TEXT COLLATE "C" NOT NULL,
+  execution    TEXT COLLATE "C" NOT NULL,
+  waited       INTEGER NOT NULL,
+  held_by      TEXT COLLATE "C",
+  payload      TEXT,
+  admission    TEXT,
+  coalesced    INTEGER NOT NULL,
+  admitted_at  TEXT COLLATE "C" NOT NULL,
+  deadline     TEXT COLLATE "C",
+  started_at   TEXT COLLATE "C",
+  detail       TEXT
 );
 CREATE TABLE IF NOT EXISTS checkpoints (
   source           TEXT COLLATE "C" PRIMARY KEY,
@@ -168,6 +197,8 @@ CREATE INDEX IF NOT EXISTS executions_by_status ON executions (status, started_a
 CREATE INDEX IF NOT EXISTS deliveries_by_status ON deliveries (status, intended_at);
 CREATE INDEX IF NOT EXISTS dispatches_by_id ON dispatches (id);
 CREATE INDEX IF NOT EXISTS dispatches_by_status ON dispatches (status, parked_at);
+CREATE INDEX IF NOT EXISTS intakes_by_trigger ON intakes (trigger_name, state, group_hash);
+CREATE INDEX IF NOT EXISTS intakes_by_execution ON intakes (execution);
 `;
 
 /**

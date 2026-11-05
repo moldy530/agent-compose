@@ -182,6 +182,7 @@ import {
   journalExists,
   journalLocation,
   journaledExecution,
+  leasesOf,
   openExecutions,
   releaseJournal,
   traceDocument,
@@ -379,12 +380,59 @@ async function run(argv: readonly string[]): Promise<number> {
   const session = sessionOf(flow, options.single["session"] ?? "");
   const format = formatOf(options.single["format"]);
   requireSession(address, flow, session);
+  await refuseCovered(address);
 
   // Minted here rather than left to `runFlow`, because this command needs it on
   // both of its ways out: it is what makes the trace file's name unique (see
   // [`writeTrace`]), and a failed run has no `FlowRun` to read one back off.
   const execution = `exec_${globalThis.crypto.randomUUID()}`;
   return await execute({ address, inputs, session, format, execution, resuming: false });
+}
+
+/**
+ * Refuse a `run` of a flow a trigger's `concurrency:` covers while that group
+ * has no free slot (PRD resolved q77 ruling e, Decision D163).
+ *
+ * A run shares the journal, so it sees the lease the serving process holds —
+ * read off the same rows, never counted here — and it **never queues**,
+ * because a terminal is not a queue: it is refused at start, naming the
+ * execution holding the slot, and journals nothing. A command that could not
+ * run at all, so exit `2`.
+ *
+ * **Which group a run is in** is the implementation's reading, flagged for the
+ * owner in D163's Status: a run is in a trigger's group only where the
+ * trigger declares no `concurrency.key` — the key-less group, one per trigger.
+ * A keyed group's key is CEL over a payload a run does not have, so no keyed
+ * group covers one. A run that starts holds no slot of its own: the lease is
+ * the trigger's executions, and a run is not one of them.
+ *
+ * A journal this command cannot read for the question says nothing about the
+ * lease, and the run goes on to meet the same journal itself, which reports
+ * what is wrong with it.
+ */
+async function refuseCovered(address: string): Promise<void> {
+  const covering = [...httpTriggers, ...scheduleTriggers, ...eventTriggers].filter(
+    (trigger) =>
+      trigger.flow === address &&
+      trigger.concurrency !== undefined &&
+      trigger.concurrency.key === undefined,
+  );
+  for (const trigger of covering) {
+    const concurrency = trigger.concurrency;
+    if (concurrency === undefined) continue;
+    let leases: readonly runtime.Lease[];
+    try {
+      leases = await leasesOf(trigger.name);
+    } catch {
+      return;
+    }
+    const slots = Math.min(concurrency.limit, concurrency.maxRunning ?? concurrency.limit);
+    if (leases.length < slots) continue;
+    const running = leases[0]?.execution ?? "";
+    throw new UsageError(
+      `\`${address}\` is covered by the \`concurrency:\` of the trigger \`${trigger.name}\`, and its group has no free slot: ${running} holds it (${leases.length} of ${slots} running). A run is refused rather than queued — a terminal is not a queue — so nothing was started or journaled: run it again once that execution settles (grammar 13.2, PRD resolved q77)`,
+    );
+  }
 }
 
 /**

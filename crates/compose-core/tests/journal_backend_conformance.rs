@@ -727,6 +727,29 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "a_checkpoint_is_absent_until_written_and_then_the_newest",
     "restart_rows_are_paged_newest_first_with_their_total",
     "a_journal_without_the_intake_tables_gains_them_on_open",
+    // §3.12, §3.15 — the intake ledger (PRD resolved q77): a dedupe key is held
+    // for its window, claimed again after it, and the claim sweeps every row of
+    // the trigger whose window has passed; a takeover carries its new window.
+    // An intake row round-trips and is admitted once under its id; a trigger's
+    // queue reads in admission order; a move out of a state is won once, which
+    // is what makes a queued or pending arrival start once; a debounce's row is
+    // its group's one pending row, extended in place and started once; the
+    // lease is the open, uncancelled executions the rows name — read off the
+    // rows, never counted; a start nobody was told of is found and taken back,
+    // and one that waited is kept for its repair. And a journal a build before
+    // the ledger wrote gains the dedupe row's window column and the intake
+    // table on open, its window-less rows expiring one window after they were
+    // admitted (§11.2).
+    "a_journal_written_before_the_intake_ledger_gains_it_on_open",
+    "a_dedupe_key_is_held_for_its_window_and_claimed_again_after_it",
+    "a_dedupe_claim_sweeps_the_triggers_expired_rows",
+    "a_dedupe_takeover_carries_its_new_window",
+    "an_intake_row_round_trips_and_is_admitted_once",
+    "a_triggers_queue_reads_in_admission_order",
+    "an_intake_move_is_won_once",
+    "a_pending_intake_is_extended_and_started_once",
+    "a_lease_is_the_open_uncancelled_executions_of_the_rows",
+    "an_unbegun_start_is_found_and_only_an_untold_one_taken_back",
     // …and the dispatch board's half of the same field: a placed node's settled
     // failure keeps what a finally node raised on the worker beside it
     // (`docs/distributed.md` §3.4, §3.8).

@@ -114,8 +114,40 @@ export type Admitted =
   | { readonly outcome: "started"; readonly execution: string }
   /** The tick was already fired, or the event's key already admitted, by `execution`. */
   | { readonly outcome: "held"; readonly execution: string }
+  /**
+   * The trigger's `concurrency:` group had no free slot, and the arrival waits
+   * on its queue as intake row `intake`, to start `execution` when one frees
+   * (PRD resolved q77 ruling b). Accepted: the row is the journal's.
+   */
+  | { readonly outcome: "queued"; readonly intake: string; readonly execution: string }
+  /** A debounce is open over the arrival, until `deadline` (PRD resolved q77 ruling c). */
+  | {
+      readonly outcome: "pending";
+      readonly intake: string;
+      readonly coalesced: number;
+      readonly deadline: string;
+    }
+  /** The group had no free slot, and `on_conflict: drop` answered `running`. */
+  | { readonly outcome: "dropped"; readonly intake: string; readonly running: string }
   /** Nothing started, for a reason the trigger's own expressions or flow gave. */
   | { readonly outcome: "refused"; readonly reason: string };
+
+/**
+ * What the serve log says of an arrival the intake holds rather than started
+ * (PRD resolved q77), or `undefined` for every other answer.
+ */
+export function heldByIntake(admitted: Admitted): string | undefined {
+  if (admitted.outcome === "queued") {
+    return `was queued as ${admitted.intake}, to start ${admitted.execution} when its group has a free slot`;
+  }
+  if (admitted.outcome === "pending") {
+    return `joined the debounce ${admitted.intake} (${admitted.coalesced} coalesced so far, closing at ${admitted.deadline})`;
+  }
+  if (admitted.outcome === "dropped") {
+    return `was dropped as ${admitted.intake}: its group is full, and ${admitted.running} is running it`;
+  }
+  return undefined;
+}
 
 /**
  * What a tick's admission did: one of [`Admitted`]'s, or **`unbegun`** — the
@@ -581,7 +613,9 @@ class Scheduler {
         say(
           `${this.#named}: ${tick}, claimed as ${fired.execution}, still could not be started: its execution could not be journaled (${admitted.reason}); no later tick is claimed until it starts`,
         );
-      } else say(`${this.#named}: ${named}, and starts nothing: ${admitted.reason}`);
+      } else if (admitted.outcome === "refused") {
+        say(`${this.#named}: ${named}, and starts nothing: ${admitted.reason}`);
+      } else say(`${this.#named}: ${named}, and ${heldByIntake(admitted) ?? "is held"}`);
     } catch (error) {
       this.#owed = fired;
       this.#owedBy = claimed;
@@ -780,7 +814,9 @@ class Scheduler {
         say(
           `${this.#named}: ${tick} was claimed as ${admitted.fired.execution}, whose execution could not be journaled (${admitted.reason}): no later tick is claimed until it starts`,
         );
-      } else say(`${this.#named}: ${tick} started nothing: ${admitted.reason}`);
+      } else if (admitted.outcome === "refused") {
+        say(`${this.#named}: ${tick} started nothing: ${admitted.reason}`);
+      } else say(`${this.#named}: ${tick} ${heldByIntake(admitted) ?? "is held"}`);
     } catch (error) {
       // A claim that failed may still have landed — a dialled journal can
       // commit an insert whose answer never arrives — so the newest row is
@@ -1261,6 +1297,12 @@ class Consumer {
         say(
           `${this.#named}: event ${JSON.stringify(id)} repeats one \`${trigger.name}\` already admitted as ${admitted.execution}, so it started nothing`,
         );
+      } else if (admitted.outcome !== "refused") {
+        // Held by the trigger's intake (PRD resolved q77): accepted, so the
+        // checkpoint moves past it — the intake row is the journal's, and the
+        // intake starts it (or, dropped, has answered it).
+        accepted = true;
+        say(`${this.#named}: event ${JSON.stringify(id)} ${heldByIntake(admitted) ?? "is held"} for \`${trigger.name}\``);
       } else {
         say(`${this.#named}: event ${JSON.stringify(id)} started nothing for \`${trigger.name}\`: ${admitted.reason}`);
       }

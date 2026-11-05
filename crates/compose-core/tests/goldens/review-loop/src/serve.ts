@@ -19,6 +19,7 @@
 // | resume | `POST /executions/:id/resume` | delivers a human's answer to an interrupted execution |
 // | cancel | `POST /executions/:id/cancel` | cancels an open execution, and every open child execution in its lineage |
 // | source status | `GET /sources/:name` | a `kind: command` event source's program, checkpoint, restarts and refused lines |
+// | intake status | `GET /intakes/:id` | an arrival a trigger's `concurrency:` queued, debounced, started or dropped |
 //
 // It is byte-identical in every project this compiler release builds, like
 // `./runtime.ts`: what differs between two projects is `./triggers.ts`.
@@ -33,7 +34,22 @@
 // `fired` row, claimed before the execution starts so a tick fires once across
 // restarts and hubs; an event's dedupe key, claimed when the execution is
 // registered so a repeat starts nothing (`docs/durability.md` §3.11, §3.12).
-// PRD resolved q77's intake ledger lands on the same seam.
+//
+// # The intake ledger (PRD resolved q77, Decision D163)
+//
+// PRD resolved q77's intake lands on the same seam, extended rather than
+// forked. A trigger may declare a `dedupe_key:` (`http`, beside the one an
+// `event` trigger always has) and a `dedupe_window:` — the TTL of the key's
+// row — and a `concurrency:` block: its arrivals are admitted into **groups**,
+// each a lease held by its running executions and read off the journal's rows
+// at every decision, never counted in this process ([`IntakeLedger`]). An
+// arrival that finds no free slot is queued, dropped or supersedes what is
+// running; one under a `debounce:` is coalesced into the group's one pending
+// row. A queued or pending arrival has no execution yet, so it is answered with
+// an intake id of its own, which `GET /intakes/:id` reports on. The order every
+// admission keeps: the trigger's `auth:`, the payload decoded and the keys
+// evaluated, the gate claimed (a tick's `fired` row, the dedupe key), the
+// group asked — and nothing registered before the gate is claimed.
 //
 // # Why Fastify
 //
@@ -198,7 +214,16 @@ import {
   workDelivery,
 } from "./delivery.ts";
 import { type CompiledFlow, type FlowRun, flows, runChildFlow, runFlow, sessionRefusal } from "./graph.ts";
-import { type FiredRow, type Journal, openJournal } from "./journal.ts";
+import {
+  type DedupeRow,
+  type FiredRow,
+  type IntakeAdmission,
+  type IntakeChange,
+  type IntakeRow,
+  type Journal,
+  type Lease,
+  openJournal,
+} from "./journal.ts";
 import { mountWorkerRoutes, placementWaits, watchPlacementWaits } from "./mesh.ts";
 import {
   type Admitted,
@@ -236,6 +261,7 @@ import {
 } from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
 import {
+  type Concurrency,
   type EventPayload,
   type EventTrigger,
   type HttpTrigger,
@@ -410,6 +436,12 @@ export interface Payload {
   readonly headers: Readonly<Record<string, string>>;
   readonly path: string;
   readonly method: string;
+  /**
+   * The arrivals a debounce coalesced into the execution this payload starts
+   * (PRD resolved q77 ruling c): present only on a trigger whose `concurrency:`
+   * declares `debounce:`, and `1` for a lone arrival.
+   */
+  readonly coalesced?: number;
 }
 
 /** How the app is built and what it is told about itself. */
@@ -427,6 +459,11 @@ export interface ServeOptions {
 export function createApp(): FastifyInstance {
   const app = Fastify({ logger: false });
   const executions = new Map<string, Execution>();
+  // The intake every trigger declaring `concurrency:` admits through (PRD
+  // resolved q77): one per app, found from the map [`admit`] is handed.
+  const ledger = new IntakeLedger(executions);
+  ledgers.set(executions, ledger);
+  liveLedgers.add(ledger);
   // Read here, before a route exists, so an unreadable override is a command
   // that could not be run rather than a schedule nobody notices until the first
   // delivery is already late (Decision D50, `docs/durability.md` §3.7).
@@ -482,6 +519,11 @@ export function createApp(): FastifyInstance {
   const recovery = new Recovery(executions);
   app.addHook("onReady", async () => {
     await recovery.atStart();
+    // **After** recovery and before any arrival (PRD resolved q77 ruling f):
+    // the intake rows a dead process left — a start it claimed and never
+    // journaled, its queues, its open debounces — are taken up once the open
+    // executions holding their groups' leases are back on the board.
+    await ledger.atStart();
     // **After** recovery (PRD resolved q78 ruling c): the schedules start
     // taking ticks and each `kind: command` source's program starts with the
     // newest checkpoint the process that died had accepted — and no execution
@@ -496,6 +538,8 @@ export function createApp(): FastifyInstance {
   // a recovery retry.
   app.addHook("onClose", async () => {
     recovery.stop();
+    ledger.stop();
+    liveLedgers.delete(ledger);
     await stopSources();
   });
 
@@ -660,6 +704,10 @@ export function createApp(): FastifyInstance {
       if (!cancelFired(id)) execution.cancelling = was;
       throw error;
     }
+    // A recorded cancel releases the execution's slot of its trigger's lease
+    // (PRD resolved q77, Decision D163), so the queue it was holding back is
+    // looked at now rather than when the run settles.
+    released(execution.trigger);
     return reply.code(202).send({
       execution_id: id,
       status: statusOf(execution),
@@ -699,6 +747,20 @@ export function createApp(): FastifyInstance {
       });
     }
     return reply.code(200).send(status);
+  });
+
+  app.get("/intakes/:id", async (request, reply) => {
+    const id = (request.params as { id: string }).id;
+    // The order the execution routes keep: the existence check first, then
+    // the guard of the trigger whose arrival this is (PRD resolved q77 ruling
+    // d, q32), and only then anything about the row.
+    const row = await (await openJournal()).intake(id);
+    if (row === undefined) {
+      return reply.code(404).send({ error: `no intake \`${id}\` is held in this project's journal` });
+    }
+    const refusal = intakeGuard(row, request);
+    if (refusal !== undefined) return refuse(reply, row.trigger, refusal);
+    return reply.code(200).send(intakeReport(row));
   });
 
   return app;
@@ -896,6 +958,15 @@ export class BlankCredentialError extends Error {
  * back.
  */
 function guarded(execution: Execution, request: FastifyRequest): Refusal | undefined {
+  return guardedBy(execution.trigger, request);
+}
+
+/**
+ * [`guarded`]'s rule, for whatever the trigger called `name` began — an
+ * execution, or an arrival its intake holds (`GET /intakes/:id`).
+ */
+function guardedBy(name: string, request: FastifyRequest): Refusal | undefined {
+  const execution = { trigger: name };
   const trigger = httpTriggers.find((one) => one.name === execution.trigger);
   if (trigger !== undefined) return verified(trigger, request);
   // An `event` trigger enforces its own `auth:` on the routes of the
@@ -1145,11 +1216,26 @@ async function start(
     method: request.method,
   };
 
+  // Under a debounce an arrival is bound as the lone arrival it would be —
+  // `payload.coalesced` is `1` — which is what holds a request the trigger
+  // could never start to a `400` now rather than at its deadline; the one
+  // execution is bound again when the debounce closes, with the count it closed
+  // over (PRD resolved q77 ruling c, Decision D163).
+  const concurrency = trigger.concurrency;
+  const bound: Payload =
+    concurrency?.debounceMs === undefined ? payload : { ...payload, coalesced: 1 };
   let inputs: Record<string, unknown>;
   let sessionKey = "";
+  let dedupe: string | undefined;
+  let group: string | undefined;
   try {
-    inputs = trigger.input(payload);
-    if (trigger.sessionKey !== undefined) sessionKey = trigger.sessionKey(payload);
+    // The two keys an intake decides on, over the payload as it arrived —
+    // after the trigger's `auth:` above, before anything exists (PRD resolved
+    // q77 ruling a, b).
+    if (trigger.dedupeKey !== undefined) dedupe = trigger.dedupeKey(payload);
+    if (concurrency?.key !== undefined) group = concurrency.key(payload);
+    inputs = trigger.input(bound);
+    if (trigger.sessionKey !== undefined) sessionKey = trigger.sessionKey(bound);
   } catch (error) {
     return reply.code(400).send({
       error: `the trigger \`${trigger.name}\` could not read this request: ${message(error)}`,
@@ -1169,6 +1255,17 @@ async function start(
       error: `the request does not fit ${message(error)}`,
     });
   }
+  // An arrival an intake may hold is one it must be able to start later
+  // without asking anybody: a session key a flow would refuse is refused now.
+  if (concurrency !== undefined) {
+    try {
+      refusesSession(flow, sessionKey);
+    } catch (error) {
+      return reply.code(400).send({
+        error: `the trigger \`${trigger.name}\` could not admit this request: ${message(error)}`,
+      });
+    }
+  }
 
   // The caller's own trace, where the caller named one (PRD resolved q51), and
   // the completion webhook this request asked for — both read here, when the
@@ -1176,27 +1273,112 @@ async function start(
   // the trace and the delivery that calls back happen at settle, which may be
   // in another process. Header names are case-insensitive and this framework
   // lowercases them, so the lookup is the lowercase spelling W3C writes anyway.
-  const callback = callbackOf(trigger, payload);
+  const callback = callbackOf(trigger, bound);
   const traceparent = (payload.headers["traceparent"] ?? "").trim();
-  const admitted = await admit(executions, {
+  const intaking = concurrency === undefined ? undefined : httpIntake(trigger);
+  // A gate or an intake decides against the journal, and one that cannot be
+  // read decides nothing: the request was not admitted, nothing started, and
+  // it may be sent again — said as such rather than as the framework's `500`.
+  const gated = dedupe !== undefined || intaking !== undefined;
+  let admitted: AdmitAnswer;
+  try {
+    admitted = await admit(executions, {
     trigger: trigger.name,
     flow,
     inputs,
     sessionKey,
     ...(callback === undefined ? {} : { callback }),
     ...(traceparent === "" ? {} : { traceparent }),
-  });
-  // An `http` admission keeps no gate in this release, so nothing can already
-  // hold it; PRD resolved q77's `dedupe_key:` is what will make this branch
-  // reachable, answering the first execution's id.
-  if (admitted.outcome !== "started") {
-    return reply.code(202).send({
-      execution_id: admitted.execution,
-      status_url: `/executions/${admitted.execution}`,
+    ...(dedupe === undefined
+      ? {}
+      : {
+          gate: {
+            kind: "dedupe",
+            key: dedupe,
+            windowMs: trigger.dedupeWindowMs ?? DEFAULT_DEDUPE_WINDOW_MS,
+          },
+        }),
+    ...(intaking === undefined
+      ? {}
+      : {
+          intake: {
+            trigger: intaking,
+            ...(group === undefined ? {} : { group }),
+            payload: withoutCredential(trigger, payload),
+          },
+        }),
+    });
+  } catch (error) {
+    if (!gated) throw error;
+    return reply.code(503).send({
+      error: `the trigger \`${trigger.name}\` could not admit this request (${message(error)}): nothing started, so the request may be sent again`,
     });
   }
-  const execution = admitted.record;
+  return answered(executions, trigger, reply, admitted);
+}
 
+/**
+ * Answer one `http` admission (grammar 13.3, PRD resolved q77 ruling a, b, d).
+ *
+ * The same shape a fresh start has wherever there is an execution to name —
+ * `202` with its id and status URL, or under `sync` the outputs within the
+ * budget — and `202` with an `intake_id` and the intake's status URL where
+ * there is none yet. A repeat inside its dedupe window carries
+ * `X-AgentCompose-Deduped: true` and names what the first delivery got; an
+ * arrival its full group dropped carries `X-AgentCompose-Dropped: true` and
+ * names the execution running it.
+ */
+async function answered(
+  executions: Map<string, Execution>,
+  trigger: HttpTrigger,
+  reply: FastifyReply,
+  admitted: AdmitAnswer,
+): Promise<unknown> {
+  switch (admitted.outcome) {
+    case "started":
+      return responded(trigger, reply, admitted.record);
+    case "held": {
+      reply.header(DEDUPED_HEADER, "true");
+      const holder = admitted.intake;
+      if (holder !== undefined && (holder.state === "queued" || holder.state === "pending")) {
+        return intakeAccepted(reply, holder);
+      }
+      const running =
+        holder?.state === "dropped" && holder.heldBy !== undefined && holder.heldBy !== ""
+          ? holder.heldBy
+          : admitted.execution;
+      const record = executions.get(running);
+      // Under `sync`, a repeat waits on the execution the first delivery
+      // started, up to the budget, as the first did (Decision D163's Status).
+      if (record !== undefined) return responded(trigger, reply, record);
+      return reply.code(202).send({ execution_id: running, status_url: `/executions/${running}` });
+    }
+    case "queued":
+    case "pending":
+      return intakeAccepted(reply, admitted.intake);
+    case "dropped":
+      reply.header(DROPPED_HEADER, "true");
+      return reply.code(202).send({
+        execution_id: admitted.running,
+        status_url: `/executions/${admitted.running}`,
+        intake_id: admitted.intake.id,
+      });
+    case "unbegun":
+      // Nothing started and nothing was answered: the gate this request claimed
+      // names an execution that exists nowhere, so the same request sent again
+      // takes it over rather than being told it is a repeat.
+      return reply.code(503).send({
+        error: `the trigger \`${trigger.name}\` admitted this request, but its execution could not be journaled (${admitted.reason}): nothing started, so the request may be sent again`,
+      });
+  }
+}
+
+/** What a started execution answers, per `respond:` (grammar 13.3). */
+async function responded(
+  trigger: HttpTrigger,
+  reply: FastifyReply,
+  execution: Execution,
+): Promise<unknown> {
   if (trigger.respond === "sync") {
     const budget = trigger.timeoutMs ?? DEFAULT_SYNC_TIMEOUT_MS;
     const finished = await within(execution.settled, budget);
@@ -1245,13 +1427,23 @@ interface Admission {
    */
   readonly gate?:
     | { readonly kind: "tick"; readonly scheduledAt: string }
-    | { readonly kind: "dedupe"; readonly key: string };
+    | {
+        readonly kind: "dedupe";
+        readonly key: string;
+        /** `dedupe_window:` — the TTL of the key's row (PRD resolved q77 ruling a). */
+        readonly windowMs: number;
+      };
   /**
    * The id a gate's row already names for this execution, where a process
    * died holding the row: a tick's `fired` row whose execution never began
    * ([`admitUnbegun`]). Absent, a fresh id is allocated.
    */
   readonly execution?: string;
+  /**
+   * The intake the arrival is admitted under, where its trigger declares
+   * `concurrency:` (PRD resolved q77, [`IntakeLedger`]).
+   */
+  readonly intake?: AdmissionIntake;
 }
 
 /**
@@ -1261,7 +1453,18 @@ interface Admission {
  */
 type AdmitAnswer =
   | { readonly outcome: "started"; readonly record: Execution }
-  | { readonly outcome: "held"; readonly execution: string }
+  /**
+   * The gate already held: the tick fired, or the key admitted, as
+   * `execution` — and `intake`, where an intake row holds that execution and
+   * it has not started (or never will: a dropped arrival).
+   */
+  | { readonly outcome: "held"; readonly execution: string; readonly intake?: IntakeRow }
+  /** Its group had no free slot, and `on_conflict: queue` waits for one. */
+  | { readonly outcome: "queued"; readonly intake: IntakeRow }
+  /** A debounce opened or extended over it (PRD resolved q77 ruling c). */
+  | { readonly outcome: "pending"; readonly intake: IntakeRow }
+  /** Its group had no free slot, and `on_conflict: drop` answered `running`. */
+  | { readonly outcome: "dropped"; readonly intake: IntakeRow; readonly running: string }
   | {
       readonly outcome: "unbegun";
       readonly execution: string;
@@ -1309,48 +1512,22 @@ async function admit(
   executions: Map<string, Execution>,
   admission: Admission,
 ): Promise<AdmitAnswer> {
-  const id = admission.execution ?? `exec_${globalThis.crypto.randomUUID()}`;
-  const gate = admission.gate;
-  let claim: FiredRow | undefined;
-  if (gate?.kind === "tick") {
-    const journal = await openJournal();
-    const held = await journal.fire({
-      trigger: admission.trigger,
-      scheduledAt: gate.scheduledAt,
-      execution: id,
-      firedAt: new Date().toISOString(),
-    });
-    if (held.execution !== id) return { outcome: "held", execution: held.execution };
-    if (admission.execution !== undefined && (await begun(executions, journal, id))) {
-      return { outcome: "held", execution: id };
-    }
-    claim = held;
+  // An arrival under a `concurrency:` block is the intake's to decide (PRD
+  // resolved q77), on this same seam: the gate below, then the group.
+  if (admission.intake !== undefined) {
+    const ledger = ledgers.get(executions);
+    if (ledger === undefined) throw new Error("no intake ledger is attached to this app");
+    return ledger.admit({ ...admission, intake: admission.intake });
   }
-  if (gate?.kind === "dedupe") {
-    const journal = await openJournal();
-    const held = await journal.claimDedupe({
-      trigger: admission.trigger,
-      key: gate.key,
-      execution: id,
-      admittedAt: new Date().toISOString(),
-    });
-    if (held.execution !== id) {
-      if (await begun(executions, journal, held.execution)) {
-        return { outcome: "held", execution: held.execution };
-      }
-      if (!(await journal.retakeDedupe(admission.trigger, gate.key, held.execution, id))) {
-        const now = await journal.claimDedupe({
-          trigger: admission.trigger,
-          key: gate.key,
-          execution: id,
-          admittedAt: new Date().toISOString(),
-        });
-        if (now.execution !== id) return { outcome: "held", execution: now.execution };
-      }
-    }
+  const id = admission.execution ?? newExecutionId();
+  let claim: FiredRow | undefined;
+  if (admission.gate !== undefined) {
+    const gate = await claimGate(executions, await openJournal(), admission, id);
+    if (gate.outcome === "held") return gate;
+    claim = gate.fired;
   }
   const { record, begun: lifecycle } = register(executions, admission, id);
-  if (gate === undefined) return { outcome: "started", record };
+  if (admission.gate === undefined) return { outcome: "started", record };
   try {
     await lifecycle;
   } catch (error) {
@@ -1370,6 +1547,81 @@ async function admit(
 }
 
 /**
+ * Claim the gate an admission's kind keeps, for the execution `id` — before
+ * anything is registered (PRD resolved q78 ruling e, q77 ruling a).
+ *
+ *  * **A tick's `fired` row**: the insert that wins fires; the row it is
+ *    handed back for a claim no execution began under is the tick's repair.
+ *  * **A dedupe key**, held for its window: a key already held by an
+ *    admission that began — an execution this process or the journal holds,
+ *    or one an intake row holds and will start — is a repeat and is answered
+ *    with it. A key held by one that **never began** is taken over: honoured,
+ *    the arrival would be lost (`docs/durability.md` §3.12).
+ */
+async function claimGate(
+  executions: Map<string, Execution>,
+  journal: Journal,
+  admission: Admission,
+  id: string,
+): Promise<
+  | { readonly outcome: "claimed"; readonly fired?: FiredRow }
+  | { readonly outcome: "held"; readonly execution: string; readonly intake?: IntakeRow }
+> {
+  const gate = admission.gate;
+  if (gate?.kind === "tick") {
+    const held = await journal.fire({
+      trigger: admission.trigger,
+      scheduledAt: gate.scheduledAt,
+      execution: id,
+      firedAt: new Date().toISOString(),
+    });
+    if (held.execution !== id) return { outcome: "held", execution: held.execution };
+    if (admission.execution !== undefined && (await begun(executions, journal, id))) {
+      return { outcome: "held", execution: id };
+    }
+    return { outcome: "claimed", fired: held };
+  }
+  if (gate?.kind === "dedupe") {
+    const claim = (): DedupeRow => {
+      const at = Date.now();
+      return {
+        trigger: admission.trigger,
+        key: gate.key,
+        execution: id,
+        admittedAt: new Date(at).toISOString(),
+        expiresAt: new Date(at + gate.windowMs).toISOString(),
+      };
+    };
+    const repeat = async (holder: string) => {
+      const intake = await journal.intakeOf(holder);
+      return {
+        outcome: "held" as const,
+        execution: holder,
+        ...(intake === undefined ? {} : { intake }),
+      };
+    };
+    const held = await journal.claimDedupe(claim());
+    if (held.execution !== id) {
+      if (await begun(executions, journal, held.execution)) return repeat(held.execution);
+      const retaken = claim();
+      if (
+        !(await journal.retakeDedupe(
+          admission.trigger,
+          gate.key,
+          held.execution,
+          id,
+          retaken.expiresAt,
+        ))
+      ) {
+        const now = await journal.claimDedupe(claim());
+        if (now.execution !== id) return repeat(now.execution);
+      }
+    }
+  }
+  return { outcome: "claimed" };
+}
+
+/**
  * Whether `id` names an execution that began: one this process holds — its
  * lifecycle row may still be in flight, and a gated admission whose row the
  * journal refused is taken off the map ([`admit`]) — or one the journal has a
@@ -1382,7 +1634,13 @@ async function begun(
   journal: Journal,
   id: string,
 ): Promise<boolean> {
-  return executions.has(id) || (await journal.execution(id)) !== undefined;
+  if (executions.has(id) || (await journal.execution(id)) !== undefined) return true;
+  // …or one an intake accepted (PRD resolved q77): queued, pending, dropped,
+  // or started after it waited — which the intake starts, or repairs at its
+  // next start ([`IntakeLedger`]). A `started` row that never waited and whose
+  // execution never began was answered to nobody, and is no admission.
+  const intake = await journal.intakeOf(id);
+  return intake !== undefined && (intake.state !== "started" || intake.waited);
 }
 
 /**
@@ -1465,16 +1723,23 @@ async function admitTickAs(
   if (flow === undefined) {
     return { outcome: "refused", reason: `\`${trigger.flow}\` is not a flow of this composition` };
   }
+  const concurrency = trigger.concurrency;
+  // Bound as a lone arrival under a debounce, for [`start`]'s reason.
+  const bound: SchedulePayload =
+    concurrency?.debounceMs === undefined ? payload : { ...payload, coalesced: 1 };
   let inputs: Record<string, unknown>;
   let sessionKey = "";
+  let group: string | undefined;
   try {
-    inputs = trigger.input(payload);
-    if (trigger.sessionKey !== undefined) sessionKey = trigger.sessionKey(payload);
+    if (concurrency?.key !== undefined) group = concurrency.key(payload);
+    inputs = trigger.input(bound);
+    if (trigger.sessionKey !== undefined) sessionKey = trigger.sessionKey(bound);
     flow.parse(inputs);
     refusesSession(flow, sessionKey);
   } catch (error) {
     return { outcome: "refused", reason: `the trigger \`${trigger.name}\` could not bind this tick: ${message(error)}` };
   }
+  const intaking = concurrency === undefined ? undefined : scheduleIntake(trigger);
   const admitted = await admit(executions, {
     trigger: trigger.name,
     flow,
@@ -1482,9 +1747,13 @@ async function admitTickAs(
     sessionKey,
     gate: { kind: "tick", scheduledAt },
     ...(execution === undefined ? {} : { execution }),
+    ...(intaking === undefined
+      ? {}
+      : { intake: { trigger: intaking, ...(group === undefined ? {} : { group }), payload } }),
   });
   if (admitted.outcome === "started") return { outcome: "started", execution: admitted.record.id };
-  if (admitted.outcome === "held") return admitted;
+  if (admitted.outcome === "held") return { outcome: "held", execution: admitted.execution };
+  if (admitted.outcome !== "unbegun") return intaken(admitted);
   // A tick's gate is its `fired` row, and [`admit`] carries it back with the
   // failure. Were it ever missing, a rejection is still the safe answer: the
   // scheduler looks at the newest row again before it claims another tick.
@@ -1512,31 +1781,834 @@ async function admitEvent(
   if (flow === undefined) {
     return { outcome: "refused", reason: `\`${trigger.flow}\` is not a flow of this composition` };
   }
+  const concurrency = trigger.concurrency;
+  // Bound as a lone arrival under a debounce, for [`start`]'s reason.
+  const bound: EventPayload =
+    concurrency?.debounceMs === undefined ? payload : { ...payload, coalesced: 1 };
   let inputs: Record<string, unknown>;
   let sessionKey = "";
   let key: string;
+  let group: string | undefined;
   try {
     key = trigger.dedupeKey(payload);
-    inputs = trigger.input(payload);
-    if (trigger.sessionKey !== undefined) sessionKey = trigger.sessionKey(payload);
+    if (concurrency?.key !== undefined) group = concurrency.key(payload);
+    inputs = trigger.input(bound);
+    if (trigger.sessionKey !== undefined) sessionKey = trigger.sessionKey(bound);
     flow.parse(inputs);
     refusesSession(flow, sessionKey);
   } catch (error) {
     return { outcome: "refused", reason: `the trigger \`${trigger.name}\` could not bind this event: ${message(error)}` };
   }
+  const intaking = concurrency === undefined ? undefined : eventIntake(trigger);
   const admitted = await admit(executions, {
     trigger: trigger.name,
     flow,
     inputs,
     sessionKey,
-    gate: { kind: "dedupe", key },
+    gate: { kind: "dedupe", key, windowMs: trigger.dedupeWindowMs },
+    ...(intaking === undefined
+      ? {}
+      : { intake: { trigger: intaking, ...(group === undefined ? {} : { group }), payload } }),
   });
   if (admitted.outcome === "unbegun") {
     throw new Error(`its execution ${admitted.execution} could not be journaled: ${admitted.reason}`);
   }
-  return admitted.outcome === "started"
-    ? { outcome: "started", execution: admitted.record.id }
-    : admitted;
+  if (admitted.outcome === "started") return { outcome: "started", execution: admitted.record.id };
+  if (admitted.outcome === "held") return { outcome: "held", execution: admitted.execution };
+  return intaken(admitted);
+}
+
+/**
+ * A tick's or an event's answer where its intake holds it rather than having
+ * started it (PRD resolved q77): accepted all the same — a consumer journals
+ * its checkpoint past it, a scheduler claims its next tick — because the row
+ * is the journal's, and the intake starts it.
+ */
+function intaken(
+  admitted: Extract<AdmitAnswer, { readonly outcome: "queued" | "pending" | "dropped" }>,
+): Admitted {
+  if (admitted.outcome === "dropped") {
+    return { outcome: "dropped", intake: admitted.intake.id, running: admitted.running };
+  }
+  if (admitted.outcome === "pending") {
+    return {
+      outcome: "pending",
+      intake: admitted.intake.id,
+      coalesced: admitted.intake.coalesced,
+      deadline: admitted.intake.deadline ?? "",
+    };
+  }
+  return { outcome: "queued", intake: admitted.intake.id, execution: admitted.intake.execution };
+}
+
+// ---------------------------------------------------------------------------
+// The intake ledger (PRD resolved q77, Decision D163)
+// ---------------------------------------------------------------------------
+
+/** What a repeat inside its dedupe window is answered with (grammar 13.3). */
+const DEDUPED_HEADER = "X-AgentCompose-Deduped";
+
+/** …and an arrival its full group dropped (grammar 13.3). */
+const DROPPED_HEADER = "X-AgentCompose-Dropped";
+
+/** The `24h` a dedupe key is held for where a trigger declares no window. */
+const DEFAULT_DEDUPE_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * How soon a trigger whose queue still holds rows is looked at again.
+ *
+ * A slot frees when an execution of the group settles or its cancel is
+ * recorded, and both are seen here — but a settle another process wrote (a
+ * `resume` finishing one), or a start the journal refused, is seen by nothing
+ * in this process, so a queue that did not drain is read again on this period
+ * until it does.
+ */
+const DRAIN_RETRY_MS = 2_000;
+
+/**
+ * The longest a debounce timer is armed for at once.
+ *
+ * Nothing bounds `debounce:`, and a runtime timer holds 2³¹−1 ms; a longer
+ * wait is stepped, re-reading the row's deadline at each step — which is also
+ * what keeps a deadline another arrival moved from firing on the old one.
+ */
+const LONGEST_TIMER_MS = 60_000;
+
+/** What the ledger needs of a trigger whose `concurrency:` it admits under. */
+interface IntakeTrigger {
+  readonly name: string;
+  readonly flow: CompiledFlow;
+  readonly concurrency: Pick<
+    Concurrency<unknown>,
+    "limit" | "onConflict" | "debounceMs" | "maxRunning"
+  >;
+  /**
+   * Bind one payload into the invocation it starts, throwing where the
+   * trigger refuses it — the same `input:`, `session_key:` and `callback:`
+   * every admission of the kind binds, held to the flow's `inputs:`.
+   */
+  bind(payload: unknown): IntakeAdmission;
+}
+
+/** The trigger called `name`, where it declares `concurrency:`. */
+function intakeTrigger(name: string): IntakeTrigger | undefined {
+  const http = httpTriggers.find((one) => one.name === name);
+  if (http !== undefined) return httpIntake(http);
+  const schedule = scheduleTriggers.find((one) => one.name === name);
+  if (schedule !== undefined) return scheduleIntake(schedule);
+  const event = eventTriggers.find((one) => one.name === name);
+  if (event !== undefined) return eventIntake(event);
+  return undefined;
+}
+
+/** Every trigger this build declares `concurrency:` on. */
+function intakeTriggers(): readonly IntakeTrigger[] {
+  return [
+    ...httpTriggers.map(httpIntake),
+    ...scheduleTriggers.map(scheduleIntake),
+    ...eventTriggers.map(eventIntake),
+  ].filter((trigger): trigger is IntakeTrigger => trigger !== undefined);
+}
+
+/** The bound invocation, held to the flow's `inputs:` and its session stores. */
+function bindAdmission(
+  flow: CompiledFlow,
+  inputs: Record<string, unknown>,
+  sessionKey: string,
+  extra: { readonly callback?: string; readonly traceparent?: string } = {},
+): IntakeAdmission {
+  flow.parse(inputs);
+  refusesSession(flow, sessionKey);
+  return { inputs, sessionKey, ...extra };
+}
+
+function httpIntake(trigger: HttpTrigger): IntakeTrigger | undefined {
+  const concurrency = trigger.concurrency;
+  const flow = flows[trigger.flow];
+  if (concurrency === undefined || flow === undefined) return undefined;
+  return {
+    name: trigger.name,
+    flow,
+    concurrency,
+    bind: (payload) => {
+      const arrived = payload as Payload;
+      const inputs = trigger.input(arrived);
+      const sessionKey = trigger.sessionKey === undefined ? "" : trigger.sessionKey(arrived);
+      const callback = callbackOf(trigger, arrived);
+      const traceparent = (arrived.headers?.["traceparent"] ?? "").trim();
+      return bindAdmission(flow, inputs, sessionKey, {
+        ...(callback === undefined ? {} : { callback }),
+        ...(traceparent === "" ? {} : { traceparent }),
+      });
+    },
+  };
+}
+
+function scheduleIntake(trigger: ScheduleTrigger): IntakeTrigger | undefined {
+  const concurrency = trigger.concurrency;
+  const flow = flows[trigger.flow];
+  if (concurrency === undefined || flow === undefined) return undefined;
+  return {
+    name: trigger.name,
+    flow,
+    concurrency,
+    bind: (payload) => {
+      const tick = payload as SchedulePayload;
+      const inputs = trigger.input(tick);
+      const sessionKey = trigger.sessionKey === undefined ? "" : trigger.sessionKey(tick);
+      return bindAdmission(flow, inputs, sessionKey);
+    },
+  };
+}
+
+function eventIntake(trigger: EventTrigger): IntakeTrigger | undefined {
+  const concurrency = trigger.concurrency;
+  const flow = flows[trigger.flow];
+  if (concurrency === undefined || flow === undefined) return undefined;
+  return {
+    name: trigger.name,
+    flow,
+    concurrency,
+    bind: (payload) => {
+      const event = payload as EventPayload;
+      const inputs = trigger.input(event);
+      const sessionKey = trigger.sessionKey === undefined ? "" : trigger.sessionKey(event);
+      return bindAdmission(flow, inputs, sessionKey);
+    },
+  };
+}
+
+/** A fresh execution id — the one spelling every start uses. */
+function newExecutionId(): string {
+  return `exec_${globalThis.crypto.randomUUID()}`;
+}
+
+/** A fresh intake id: an identity of its own, for an arrival with no execution yet. */
+function newIntakeId(): string {
+  return `int_${globalThis.crypto.randomUUID()}`;
+}
+
+/** One line of the serve log about a trigger's intake. */
+function sayIntake(trigger: string, line: string): void {
+  process.stderr.write(`intake \`${trigger}\`: ${line}\n`);
+}
+
+/** How many of a lease's slots one group holds. */
+function heldBy(leases: readonly Lease[], group: string | undefined): readonly Lease[] {
+  return leases.filter((lease) => lease.group === group);
+}
+
+/**
+ * Whether a group has a free slot: fewer of its executions hold the lease than
+ * its `limit:`, and fewer of the trigger's than its `max_running:` (PRD
+ * resolved q77 ruling b). Both counts are of rows ([`Journal.leasesOf`]).
+ */
+function hasSlot(
+  concurrency: IntakeTrigger["concurrency"],
+  leases: readonly Lease[],
+  group: string | undefined,
+): boolean {
+  if (heldBy(leases, group).length >= concurrency.limit) return false;
+  return concurrency.maxRunning === undefined || leases.length < concurrency.maxRunning;
+}
+
+/** What a group at its limit is answered with: its oldest running execution. */
+function oldestOf(leases: readonly Lease[], group: string | undefined): string | undefined {
+  return (heldBy(leases, group)[0] ?? leases[0])?.execution;
+}
+
+/** Every app's ledger, so a run's settle anywhere frees its trigger's slot. */
+const liveLedgers = new Set<IntakeLedger>();
+
+/** The ledger of the app whose executions map this is. */
+const ledgers = new WeakMap<Map<string, Execution>, IntakeLedger>();
+
+/**
+ * A slot of `trigger`'s lease may have freed: an execution it started
+ * settled, or its cancel was recorded. Every live app's ledger looks at its
+ * queue — after, never inside, the work that freed it.
+ */
+function released(trigger: string): void {
+  for (const ledger of liveLedgers) ledger.kick(trigger);
+}
+
+/**
+ * The intake: what admits an arrival under its trigger's `concurrency:` block
+ * (PRD resolved q77, Decision D163, `docs/durability.md` §3.15).
+ *
+ * **A group is a lease held by its running executions**, read off the journal's
+ * rows at every decision ([`Journal.leasesOf`]) and never kept as a count: a
+ * slot is an execution the trigger started under the block whose lifecycle row
+ * is open and whose cancel nobody has requested. So a restart finds the lease
+ * the rows hold, and the queue a dead process left starts as those rows free.
+ *
+ * **One trigger's decisions run one at a time** in this process ([`#locked`]),
+ * and each start waits for its lifecycle row before the next decision reads
+ * the lease — so two arrivals can never both read a slot free. That is a
+ * serialization, not a counter: what is counted is still the rows.
+ *
+ * Every decision lands on [`admit`]'s seam: the gate a kind keeps — a tick's
+ * `fired` row, a dedupe key — is claimed first, under the execution id the
+ * arrival will start (or, under a debounce, the id of the open row it joins),
+ * and only then is the group asked.
+ */
+class IntakeLedger {
+  readonly #executions: Map<string, Execution>;
+  /** The tail of each trigger's chain of decisions. */
+  readonly #locks = new Map<string, Promise<void>>();
+  /** The triggers whose rows a dead process left have been looked at. */
+  readonly #prepared = new Set<string>();
+  /** The armed debounce timers, by intake id. */
+  readonly #timers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** The armed re-drains, by trigger. */
+  readonly #drains = new Map<string, ReturnType<typeof setTimeout>>();
+  #stopped = false;
+
+  constructor(executions: Map<string, Execution>) {
+    this.#executions = executions;
+  }
+
+  /**
+   * Run one trigger's decision with no other decision of that trigger's
+   * between its reads and its writes. A decision that threw is one decision
+   * failing, and the chain goes on past it.
+   */
+  #locked<T>(trigger: string, work: () => Promise<T>): Promise<T> {
+    const prior = this.#locks.get(trigger) ?? Promise.resolve();
+    const next = prior.then(work, work);
+    this.#locks.set(
+      trigger,
+      next.then(
+        () => undefined,
+        () => undefined,
+      ),
+    );
+    return next;
+  }
+
+  /**
+   * After recovery and before anything is admitted (PRD resolved q77 ruling
+   * f): every trigger's rows a dead process left are looked at — a start it
+   * claimed and never journaled, its queue, its open debounces.
+   */
+  async atStart(): Promise<void> {
+    for (const trigger of intakeTriggers()) {
+      await this.#locked(trigger.name, () => this.#prepare(trigger)).catch((error: unknown) => {
+        sayIntake(
+          trigger.name,
+          `its intake rows could not be read (${message(error)}); they are looked at again before its next admission`,
+        );
+        this.#redrainLater(trigger.name);
+      });
+    }
+  }
+
+  /** No timer is armed and no decision begun after this: the app is closing. */
+  stop(): void {
+    this.#stopped = true;
+    for (const timer of this.#timers.values()) clearTimeout(timer);
+    for (const timer of this.#drains.values()) clearTimeout(timer);
+    this.#timers.clear();
+    this.#drains.clear();
+  }
+
+  /**
+   * Look at a trigger's queue again: one of its slots may have freed. Never
+   * awaited by what freed it, which may be running under the lock itself.
+   */
+  kick(name: string): void {
+    if (this.#stopped) return;
+    const trigger = intakeTrigger(name);
+    if (trigger === undefined) return;
+    void this.#locked(name, async () => {
+      if (this.#stopped) return;
+      const journal = await openJournal();
+      if (!this.#prepared.has(name)) {
+        await this.#prepare(trigger);
+        return;
+      }
+      await this.#drain(journal, trigger);
+    }).catch((error: unknown) => {
+      sayIntake(name, `its queue could not be read (${message(error)}); it is read again shortly`);
+      this.#redrainLater(name);
+    });
+  }
+
+  /**
+   * The rows a dead process left, for one trigger (PRD resolved q77 ruling f,
+   * `docs/durability.md` §3.15, §6.3), under its lock:
+   *
+   *  * a `started` row that **waited** — it was answered with its intake id,
+   *    so the intake owes its start — whose execution has no lifecycle row is
+   *    a start the process died between claiming and journaling: it starts
+   *    now under the execution id the row recorded, once. A row that did not
+   *    wait was answered only once its lifecycle row was down, so a row whose
+   *    execution never began is a claim nobody was told of, and is taken back
+   *    — its arrival's own source re-delivers it;
+   *  * the queue drains as the lease the rows hold allows;
+   *  * each open debounce is armed at its deadline, re-derived from the row —
+   *    one already past fires at once.
+   */
+  async #prepare(trigger: IntakeTrigger): Promise<void> {
+    const journal = await openJournal();
+    for (const row of await journal.unbegunIntakes(trigger.name)) {
+      if (this.#executions.has(row.execution)) continue;
+      if (!row.waited) {
+        await journal.abandonIntake(row.id);
+        continue;
+      }
+      if (row.admission === undefined) continue;
+      const answer = await this.#begin(journal, trigger, row.admission, row.execution, row, undefined, true);
+      if (answer.outcome === "started") {
+        sayIntake(
+          trigger.name,
+          `${row.id} started ${row.execution}, whose start a stopped serve had claimed and not journaled`,
+        );
+      }
+    }
+    this.#prepared.add(trigger.name);
+    await this.#drain(journal, trigger);
+    for (const row of await journal.intakesOf(trigger.name, "pending")) this.#arm(row);
+  }
+
+  /**
+   * Admit one arrival under its trigger's `concurrency:` block — [`admit`]'s
+   * branch for such a trigger, run under the trigger's lock.
+   */
+  admit(admission: Admission & { readonly intake: AdmissionIntake }): Promise<AdmitAnswer> {
+    const trigger = admission.intake.trigger;
+    return this.#locked(trigger.name, async () => {
+      const journal = await openJournal();
+      if (!this.#prepared.has(trigger.name)) await this.#prepare(trigger);
+      const { group, payload } = admission.intake;
+      const concurrency = trigger.concurrency;
+      // **A debounce joins its group's open row** (PRD resolved q77 ruling
+      // c): the arrival's gate is claimed under the execution that row will
+      // start, so a tick's `fired` row and a dedupe row name an execution the
+      // intake holds — never one nothing will ever begin.
+      const pending =
+        concurrency.debounceMs === undefined
+          ? undefined
+          : await journal.pendingIntake(trigger.name, group);
+      const id = admission.execution ?? pending?.execution ?? newExecutionId();
+      const gate = await claimGate(this.#executions, journal, admission, id);
+      if (gate.outcome === "held") return gate;
+      const bound: IntakeAdmission = {
+        inputs: admission.inputs,
+        sessionKey: admission.sessionKey,
+        ...(admission.callback === undefined ? {} : { callback: admission.callback }),
+        ...(admission.traceparent === undefined ? {} : { traceparent: admission.traceparent }),
+      };
+      if (concurrency.debounceMs !== undefined) {
+        return this.#debounce(journal, trigger, group, payload, id, pending, admission.execution);
+      }
+      // The queue first: a slot that freed is the oldest waiting arrival's,
+      // never a newcomer's (FIFO per group, PRD resolved q77 ruling b).
+      await this.#drain(journal, trigger);
+      return this.#place(journal, trigger, group, bound, id, gate.fired, undefined);
+    });
+  }
+
+  /**
+   * Open the group's debounce, or extend the one it has: the newest payload,
+   * a deadline `debounce:` from now, one more arrival coalesced (PRD resolved
+   * q77 ruling c).
+   */
+  async #debounce(
+    journal: Journal,
+    trigger: IntakeTrigger,
+    group: string | undefined,
+    payload: unknown,
+    id: string,
+    pending: IntakeRow | undefined,
+    repairing: string | undefined,
+  ): Promise<AdmitAnswer> {
+    const debounce = trigger.concurrency.debounceMs ?? 0;
+    const now = Date.now();
+    const deadline = new Date(now + debounce).toISOString();
+    if (pending !== undefined) {
+      const moved = await journal.moveIntake(pending.id, "pending", {
+        state: "pending",
+        payload,
+        coalesced: pending.coalesced + 1,
+        deadline,
+        // A tick a dead process claimed and never admitted, coalesced here on
+        // its repair: the row starts under the id that tick's `fired` row
+        // names, so the newest claim names an execution the intake holds.
+        ...(repairing !== undefined && repairing !== pending.execution
+          ? { execution: repairing }
+          : {}),
+      });
+      const row = moved ? await journal.intake(pending.id) : undefined;
+      if (row !== undefined) {
+        this.#arm(row);
+        return { outcome: "pending", intake: row };
+      }
+    }
+    const row = await journal.admitIntake({
+      id: newIntakeId(),
+      trigger: trigger.name,
+      ...(group === undefined ? {} : { group }),
+      state: "pending",
+      execution: id,
+      waited: true,
+      payload,
+      coalesced: 1,
+      admittedAt: new Date(now).toISOString(),
+      deadline,
+    });
+    this.#arm(row);
+    return { outcome: "pending", intake: row };
+  }
+
+  /**
+   * Decide one arrival against the lease, or one debounce at its deadline
+   * (`waiting`): start it where its group has a free slot, else do what
+   * `on_conflict:` says (PRD resolved q77 ruling b).
+   */
+  async #place(
+    journal: Journal,
+    trigger: IntakeTrigger,
+    group: string | undefined,
+    bound: IntakeAdmission,
+    id: string,
+    fired: FiredRow | undefined,
+    waiting: IntakeRow | undefined,
+  ): Promise<AdmitAnswer> {
+    const concurrency = trigger.concurrency;
+    let leases = await journal.leasesOf(trigger.name);
+    if (hasSlot(concurrency, leases, group)) {
+      return this.#begin(journal, trigger, bound, id, waiting, fired, false, group);
+    }
+    if (concurrency.onConflict === "supersede") {
+      // **The group's running executions are cancelled, through the cancel
+      // every execution has** (PRD resolved q75): the request is recorded, the
+      // controller fires, and the cascade reaches their children. Each one's
+      // slot is released the moment its cancel is recorded — the lease is of
+      // executions nobody has asked to cancel — so the newest arrival starts
+      // without waiting for them to settle (Decision D163's Status).
+      for (const lease of heldBy(leases, group)) {
+        await this.#cancel(lease.execution);
+        sayIntake(trigger.name, `superseded ${lease.execution} for ${id}`);
+      }
+      leases = await journal.leasesOf(trigger.name);
+      if (hasSlot(concurrency, leases, group)) {
+        return this.#begin(journal, trigger, bound, id, waiting, fired, false, group);
+      }
+      // Still no slot: the group had none of its own to give, and the
+      // trigger's `max_running:` is held by its other groups' executions,
+      // which a supersede never cancels. The arrival waits for one.
+    }
+    if (concurrency.onConflict === "drop") {
+      const running = oldestOf(leases, group) ?? "";
+      const detail = `its group had no free slot: ${running} is running it`;
+      const row =
+        waiting === undefined
+          ? await journal.admitIntake({
+              id: newIntakeId(),
+              trigger: trigger.name,
+              ...(group === undefined ? {} : { group }),
+              state: "dropped",
+              execution: id,
+              waited: true,
+              heldBy: running,
+              admission: bound,
+              coalesced: 1,
+              admittedAt: new Date().toISOString(),
+              detail,
+            })
+          : await this.#moved(journal, waiting, {
+              state: "dropped",
+              heldBy: running,
+              admission: bound,
+              detail,
+            });
+      sayIntake(trigger.name, `${row.id} dropped: ${detail}`);
+      return { outcome: "dropped", intake: row, running };
+    }
+    const row =
+      waiting === undefined
+        ? await journal.admitIntake({
+            id: newIntakeId(),
+            trigger: trigger.name,
+            ...(group === undefined ? {} : { group }),
+            state: "queued",
+            execution: id,
+            waited: true,
+            admission: bound,
+            coalesced: 1,
+            admittedAt: new Date().toISOString(),
+          })
+        : await this.#moved(journal, waiting, { state: "queued", admission: bound });
+    sayIntake(
+      trigger.name,
+      `${row.id} queued for ${row.execution}: ${oldestOf(leases, group) ?? "its group"} holds ${group === undefined ? "the trigger's group" : `the group ${JSON.stringify(group)}`}`,
+    );
+    this.#redrainLater(trigger.name);
+    return { outcome: "queued", intake: row };
+  }
+
+  /** Move a waiting row on, answering what it became. */
+  async #moved(journal: Journal, row: IntakeRow, change: IntakeChange): Promise<IntakeRow> {
+    if (!(await journal.moveIntake(row.id, row.state, change))) {
+      throw new Error(`the intake row ${row.id} moved under this decision`);
+    }
+    return (await journal.intake(row.id)) ?? row;
+  }
+
+  /**
+   * Start one execution under the lease: claim it on its intake row —
+   * inserted for an arrival that never waited, moved for one that did — then
+   * register it and wait for its lifecycle row, which is what makes the slot
+   * one the next decision reads as held.
+   *
+   * **The order, and what a crash leaves** (Decision D163): the row says
+   * `started` before the execution is registered, exactly as a tick's `fired`
+   * row is claimed first (D162). A process that dies between the two leaves a
+   * row naming an execution with no lifecycle row — which holds no slot, since
+   * a slot is an open lifecycle row — and the next start repairs it once
+   * ([`#prepare`]): a row that waited starts under the id it recorded, a row
+   * that did not is taken back. A start the journal would not begin is
+   * undone the same two ways here and now.
+   */
+  async #begin(
+    journal: Journal,
+    trigger: IntakeTrigger,
+    bound: IntakeAdmission,
+    id: string,
+    waiting: IntakeRow | undefined,
+    fired: FiredRow | undefined,
+    repairing: boolean,
+    group?: string,
+  ): Promise<AdmitAnswer> {
+    const startedAt = new Date().toISOString();
+    let row: IntakeRow;
+    if (repairing && waiting !== undefined) {
+      row = waiting;
+    } else if (waiting !== undefined) {
+      row = await this.#moved(journal, waiting, { state: "started", admission: bound, startedAt });
+    } else {
+      row = await journal.admitIntake({
+        id: newIntakeId(),
+        trigger: trigger.name,
+        ...(group === undefined ? {} : { group }),
+        state: "started",
+        execution: id,
+        waited: false,
+        admission: bound,
+        coalesced: 1,
+        admittedAt: startedAt,
+        startedAt,
+      });
+    }
+    const { record, begun } = register(
+      this.#executions,
+      {
+        trigger: trigger.name,
+        flow: trigger.flow,
+        inputs: bound.inputs,
+        sessionKey: bound.sessionKey,
+        ...(bound.callback === undefined ? {} : { callback: bound.callback }),
+        ...(bound.traceparent === undefined ? {} : { traceparent: bound.traceparent }),
+      },
+      id,
+    );
+    try {
+      await begun;
+    } catch (error) {
+      if (this.#executions.get(id) === record) this.#executions.delete(id);
+      const reason = message(error);
+      if (row.waited) {
+        // Owed: the arrival was answered with its intake id, so the row goes
+        // back on the queue and is started again as a slot allows.
+        await journal
+          .moveIntake(row.id, "started", {
+            state: "queued",
+            detail: `its execution could not be journaled: ${reason}`,
+          })
+          .catch(() => undefined);
+        sayIntake(
+          trigger.name,
+          `${row.id}'s execution ${id} could not be journaled (${reason}); it waits on the queue again`,
+        );
+        this.#redrainLater(trigger.name);
+      } else {
+        await journal.abandonIntake(row.id).catch(() => undefined);
+      }
+      return { outcome: "unbegun", execution: id, ...(fired === undefined ? {} : { fired }), reason };
+    }
+    if (row.waited && !repairing) {
+      sayIntake(
+        trigger.name,
+        waiting?.state === "pending"
+          ? `${row.id} closed over ${row.coalesced} arrival${row.coalesced === 1 ? "" : "s"} and started ${id}`
+          : `${row.id} started ${id}`,
+      );
+    }
+    return { outcome: "started", record };
+  }
+
+  /**
+   * Start what a trigger's queue holds as its lease allows, oldest first —
+   * a group's rows in the order they were admitted, a row whose group is
+   * full passed over for a later one whose group is not, and nothing at all
+   * while the trigger is at its `max_running:`.
+   */
+  async #drain(journal: Journal, trigger: IntakeTrigger): Promise<void> {
+    const queued = await journal.intakesOf(trigger.name, "queued");
+    let waiting = queued.length;
+    for (const row of queued) {
+      if (this.#stopped) return;
+      const leases = await journal.leasesOf(trigger.name);
+      const max = trigger.concurrency.maxRunning;
+      if (max !== undefined && leases.length >= max) break;
+      if (!hasSlot(trigger.concurrency, leases, row.group)) continue;
+      if (row.admission === undefined) continue;
+      const answer = await this.#begin(journal, trigger, row.admission, row.execution, row, undefined, false, row.group);
+      if (answer.outcome !== "started") break;
+      waiting -= 1;
+    }
+    if (waiting > 0) this.#redrainLater(trigger.name);
+  }
+
+  /** Look at a trigger's queue again in [`DRAIN_RETRY_MS`], once. */
+  #redrainLater(name: string): void {
+    if (this.#stopped || this.#drains.has(name)) return;
+    const timer = setTimeout(() => {
+      this.#drains.delete(name);
+      this.kick(name);
+    }, DRAIN_RETRY_MS);
+    timer.unref?.();
+    this.#drains.set(name, timer);
+  }
+
+  /** Arm one open debounce at its deadline, re-read when it falls due. */
+  #arm(row: IntakeRow): void {
+    if (this.#stopped || row.deadline === undefined) return;
+    const held = this.#timers.get(row.id);
+    if (held !== undefined) clearTimeout(held);
+    const wait = Math.max(0, Math.min(Date.parse(row.deadline) - Date.now(), LONGEST_TIMER_MS));
+    const timer = setTimeout(() => {
+      this.#timers.delete(row.id);
+      void this.#locked(row.trigger, () => this.#close(row.id)).catch((error: unknown) => {
+        sayIntake(row.trigger, `${row.id}'s debounce could not be closed (${message(error)}); it is tried again`);
+        if (!this.#stopped) {
+          const retry = setTimeout(() => this.#arm(row), 1_000);
+          retry.unref?.();
+        }
+      });
+    }, wait);
+    timer.unref?.();
+    this.#timers.set(row.id, timer);
+  }
+
+  /**
+   * Close one debounce at its deadline (PRD resolved q77 ruling c): bind its
+   * newest payload with `payload.coalesced` — the arrivals it closed over —
+   * and decide that one execution against the lease, as any arrival is.
+   */
+  async #close(id: string): Promise<void> {
+    if (this.#stopped) return;
+    const journal = await openJournal();
+    const row = await journal.intake(id);
+    if (row === undefined || row.state !== "pending" || row.deadline === undefined) return;
+    if (Date.parse(row.deadline) > Date.now()) {
+      this.#arm(row);
+      return;
+    }
+    const trigger = intakeTrigger(row.trigger);
+    if (trigger === undefined) {
+      sayIntake(row.trigger, `${row.id} stays pending: this build declares no \`concurrency:\` on the trigger`);
+      return;
+    }
+    let bound: IntakeAdmission;
+    try {
+      bound = trigger.bind({ ...(row.payload as Record<string, unknown>), coalesced: row.coalesced });
+    } catch (error) {
+      const detail = `its payload could not be bound when the debounce closed: ${message(error)}`;
+      await journal.moveIntake(row.id, "pending", { state: "dropped", detail });
+      sayIntake(trigger.name, `${row.id} dropped: ${detail}`);
+      return;
+    }
+    await this.#drain(journal, trigger);
+    await this.#place(journal, trigger, row.group, bound, row.execution, undefined, row);
+  }
+
+  /**
+   * Cancel one running execution of a group being superseded, through the
+   * cancel route's own steps: marked first, recorded, fired, cascaded
+   * (`runtime.cancelExecution`, Decision D160).
+   */
+  async #cancel(execution: string): Promise<void> {
+    const record = this.#executions.get(execution);
+    const was = record?.cancelling ?? false;
+    if (record !== undefined) record.cancelling = true;
+    try {
+      await cancelExecution(execution);
+    } catch (error) {
+      if (record !== undefined && !cancelFired(execution)) record.cancelling = was;
+      throw error;
+    }
+  }
+}
+
+/** The intake an admission arrives with (see [`Admission.intake`]). */
+interface AdmissionIntake {
+  readonly trigger: IntakeTrigger;
+  /** `concurrency.key`'s answer; absent for the key-less group. */
+  readonly group?: string;
+  /** The payload as it arrived — what a debounce holds and binds again. */
+  readonly payload: unknown;
+}
+
+/**
+ * What `GET /intakes/:id` answers (PRD resolved q77 ruling d): the row's state
+ * and, per state, what a caller holding the id needs next.
+ */
+function intakeReport(row: IntakeRow): Record<string, unknown> {
+  return {
+    intake_id: row.id,
+    trigger: row.trigger,
+    state: row.state,
+    admitted_at: row.admittedAt,
+    coalesced: row.coalesced,
+    ...(row.group === undefined ? {} : { group: row.group }),
+    ...(row.state === "pending" && row.deadline !== undefined ? { deadline: row.deadline } : {}),
+    ...(row.state === "started"
+      ? {
+          execution_id: row.execution,
+          status_url: `/executions/${row.execution}`,
+          ...(row.startedAt === undefined ? {} : { started_at: row.startedAt }),
+        }
+      : {}),
+    ...(row.state === "dropped"
+      ? {
+          ...(row.heldBy === undefined || row.heldBy === "" ? {} : { running_execution_id: row.heldBy }),
+          ...(row.detail === undefined ? {} : { detail: row.detail }),
+        }
+      : {}),
+  };
+}
+
+/** A queued or pending arrival, answered with its own id (PRD resolved q77 ruling d). */
+function intakeAccepted(reply: FastifyReply, row: IntakeRow): unknown {
+  return reply.code(202).send({
+    intake_id: row.id,
+    status: row.state,
+    ...(row.state === "pending" && row.deadline !== undefined
+      ? { deadline: row.deadline, coalesced: row.coalesced }
+      : {}),
+    status_url: `/intakes/${row.id}`,
+  });
+}
+
+/**
+ * The refusal `GET /intakes/:id` has for this request: the `auth:` of the
+ * trigger whose arrival the row is, exactly as an execution's routes enforce
+ * the trigger that started it ([`guarded`], grammar 13.3, PRD resolved q32).
+ */
+function intakeGuard(row: IntakeRow, request: FastifyRequest): Refusal | undefined {
+  return guardedBy(row.trigger, request);
 }
 
 /**
@@ -2007,6 +3079,25 @@ function register(
  * so the URL is the same either way; what differs is that a run finishing in
  * another process can still deliver it (`docs/durability.md` §6.1).
  */
+/**
+ * The request as an intake row may hold it (`docs/durability.md` §3.15, §8):
+ * without the header the trigger's `auth:` verified, which carries a
+ * credential — a token, or a signature over this request — and is never
+ * written to the journal. A debounce binds its newest payload again when it
+ * closes, so an `input:` reading that header reads it absent there (Decision
+ * D163's Status); nothing else of the request is changed.
+ */
+function withoutCredential(trigger: HttpTrigger, payload: Payload): Payload {
+  const auth = trigger.auth;
+  if (auth === undefined) return payload;
+  const credential = auth.header.toLowerCase();
+  const headers: Record<string, string> = {};
+  for (const [name, value] of Object.entries(payload.headers)) {
+    if (name.toLowerCase() !== credential) headers[name] = value;
+  }
+  return { ...payload, headers };
+}
+
 function callbackOf(trigger: HttpTrigger, payload: Payload): string | undefined {
   if (trigger.callback === undefined) return undefined;
   try {
@@ -2066,6 +3157,12 @@ function settling(execution: Execution, run: Promise<FlowRun>): Promise<void> {
       // means no start will ever recover it, so the caller holding a `202` is
       // owed the failure now and this process is the only one that can push it.
       if (await unjournaled(execution.id)) void deliver(execution, "settled", []);
+    })
+    .finally(() => {
+      // The run has stopped and its lifecycle row has closed (or stayed open,
+      // which frees nothing): a slot of its trigger's lease may be free, and
+      // the queue it held back is looked at (PRD resolved q77 ruling b).
+      released(execution.trigger);
     });
 }
 

@@ -34,8 +34,8 @@ The LangGraph TypeScript project `agent-compose build` produced from `main.yml`,
 | `src/state.ts` | the graph's state model: one channel per `state:` channel, the implicit conversation history, and `$run` — what the runtime keeps beside them |
 | `src/graph.ts` | the compiled graph: one node per flow node, the `flows` registry, and `runFlow` |
 | `src/harness.ts` | the coding-harness drivers a `coder:` node reaches its SDK through, one per harness this composition binds, plus a scripted driver for tests. The one generated module whose *imports* depend on the composition (grammar 8.9) |
-| `src/triggers.ts` | the composition's declared triggers: each `http` trigger's route, its response mode and the CEL that reads a request payload; each `schedule` trigger's `cron:`; each `event` trigger's source and `dedupe_key:`; and the target's `event_sources:` |
-| `src/serve.ts` | the app over those triggers: start, status, resume and cancel (PRD 5.11), the one admission every trigger kind's start passes through, and `GET /sources/:name` |
+| `src/triggers.ts` | the composition's declared triggers: each `http` trigger's route, its response mode and the CEL that reads a request payload; each `schedule` trigger's `cron:`; each `event` trigger's source and `dedupe_key:`; every trigger's `dedupe_window:` and `concurrency:`; and the target's `event_sources:` |
+| `src/serve.ts` | the app over those triggers: start, status, resume and cancel (PRD 5.11), the one admission every trigger kind's start passes through — with the intake ledger a trigger's `dedupe_key:` and `concurrency:` decide under — `GET /sources/:name` and `GET /intakes/:id` |
 | `src/sources.ts` | what `serve` runs beside its routes: the scheduler that fires every `schedule` trigger's ticks, and the consumer that runs each `kind: command` source's program and admits what it prints (PRD resolved q78) |
 | `src/cli.ts` | this project's own command line, which `agent-compose run`, `agent-compose resume` and `agent-compose serve` launch |
 | `src/index.ts` | the project's public surface, the one caller of `readEnvironment()`, and the entry point the command line hangs off |
@@ -217,10 +217,7 @@ target's own backend, with no flow written: `get <key>`, `set <key> <json>`
 `{ key, value, version, expires_at }` on stdout — and `import`, which reads the
 same from standard input or `--file`, writes each line at a fresh version,
 honours a remaining `expires_at` as a `ttl`, skips a line already expired, and
-with `--if-absent` keeps a key the store already holds — and `log <key>`
-(`--limit`, `--after`), one page of the key's history, oldest first, on a store
-that declares `history: true`: each write's `seq`, time, op, version, actor and
-the value before and after. The partition is the one
+with `--if-absent` keeps a key the store already holds. The partition is the one
 the store's scope names: `--session` for `scope: session`, `--execution` for
 `scope: execution`, neither for `scope: global`. A value is held to the store's
 `value_schema` before it is written. The answer is a table, or one JSON document
@@ -229,15 +226,15 @@ under `--format json`; the exit code is `0` for a key found or a write applied,
 failed, and `2` for a command line it does not take — a value `value_schema`
 refuses among it, since nothing was written and the value is what is to fix.
 **An operator's write is not an effect**: it belongs to no execution, carries no
-idempotency key, and writes no journal row, no ledger row and no trace record.
-On a store that declares `history: true` it is recorded in one place, its
-history row, as actor `cli`; on any other it is recorded nowhere.
+idempotency key, and writes no journal row, no ledger row and no trace record,
+so it is recorded nowhere.
 
 `serve` starts the app over the composition's declared `http` triggers and
 announces where it is listening as one JSON line on stdout. Beside them it
-mounts four routes of its own — `GET /executions/:id` for an execution's
-status, `POST /executions/:id/resume`, `POST /executions/:id/cancel` and
-`GET /sources/:name` — so those are the app's and a trigger cannot declare one:
+mounts five routes of its own — `GET /executions/:id` for an execution's
+status, `POST /executions/:id/resume`, `POST /executions/:id/cancel`,
+`GET /sources/:name` and `GET /intakes/:id` — so those are the app's and a
+trigger cannot declare one:
 the compiler refuses one that does. On start it
 **recovers** every execution the journal holds open, before it accepts a
 connection, so a pause comes back under the same wait id and a resume URL
@@ -270,6 +267,31 @@ route rather than failing the run. `AGENT_COMPOSE_CALLBACK_RETRY` shortens that
 schedule for a diagnostic run: a comma-separated list of durations
 (`0s,1s,2s`), refused at launch if it is not one.
 
+**A trigger's intake.** An `http` trigger's `dedupe_key:` — and an `event`
+trigger's, which defaults to `payload.id` — holds each key for its
+`dedupe_window:` (`24h` by default): a repeat inside it starts nothing and is
+answered with what the first delivery got, under `X-AgentCompose-Deduped: true`;
+the same key after the window starts again. A trigger's `concurrency:` block
+admits its arrivals into **groups** — one per `key:` value, one for the whole
+trigger without one — each a lease of `limit:` slots (`1` by default) held by its
+running executions and read off the journal at every arrival, with the
+trigger's own `max_running:` across them. An arrival that finds no free slot is
+**queued** (the default) and started first in first out as a slot frees, is
+**dropped** — answered with the running execution's id under
+`X-AgentCompose-Dropped: true` — or **supersedes** the group's running
+executions, which are cancelled, children included. Under `debounce:` the
+arrivals for a group coalesce into one pending row holding the newest payload;
+when the debounce closes, one execution starts with it and `payload.coalesced`,
+the count. A queued or pending arrival has no execution yet, so it is answered
+`202` with an `intake_id` of its own; every intake row is the journal's, so a
+restart starts what was queued and fires what was pending. A
+`run` of a flow a trigger's key-less group covers is refused while that group
+is full, naming the execution holding it.
+
+| route | answers |
+|---|---|
+| `GET /intakes/:id` | one arrival a trigger's `concurrency:` admitted: its `intake_id`, `trigger`, `state` (`queued`, `pending`, `started`, `dropped`), `admitted_at`, `coalesced` and `group`; a `pending` one's `deadline`; a `started` one's `execution_id`, `status_url` and `started_at` — kept after the execution settles; a `dropped` one's `running_execution_id` and `detail`. `404` for an id the journal does not hold. Guarded by the `auth:` of the arrival's trigger, as an execution's routes are |
+
 **Schedules and event sources run here, and only here.** After recovery,
 `serve` starts a scheduler for every `schedule` trigger — five-field cron, in
 the trigger's `timezone:` (`UTC` by default) — and, for every `kind: command`
@@ -290,7 +312,8 @@ a start is the first one after now, and a job catches itself up from
 line — each event is admitted before the next line is read, so a slow start
 holds the program at its own write — and a line that is not a JSON object is
 refused and counted, never an execution. An `event` trigger's `dedupe_key:`
-(default `payload.id`) is enforced: a repeat starts nothing. The newest
+(default `payload.id`) is enforced for its `dedupe_window:`: a repeat inside it
+starts nothing. The newest
 checkpoint the intake accepted is handed back on every restart of the program —
 `AGENT_COMPOSE_CHECKPOINT` in its environment, and in place of an argument
 written `{checkpoint}` — and an exit restarts it after a backoff that doubles up
@@ -332,6 +355,15 @@ What `serve` writes about them goes to **stderr**, one line each:
 | ``[source <s>] <line>`` | the program writes a line to its stderr; one longer than 1 MiB is logged cut there, ending `[cut: …]` |
 | ``event trigger `<t>`: no event source `<s>` is bound under this target, so nothing consumes for it`` | a trigger's source is unbound under `local` |
 | ``this project's journal can be read now, so the <n> executions it holds open are recovered now, before any tick or event is admitted`` | a `serve` whose start could not read the journal — a standby, while another held it — can read it: what it holds open is recovered before any tick fires or event is admitted |
+| ``intake `<t>`: <intake> queued for <execution>: <running> holds <group>`` | an arrival finds its group full under `on_conflict: queue` |
+| ``intake `<t>`: <intake> started <execution>`` | a queued arrival starts, as a slot of its group frees |
+| ``intake `<t>`: <intake> closed over <n> arrivals and started <execution>`` | a debounce closes and its one execution starts |
+| ``intake `<t>`: <intake> dropped: <why>`` | an arrival finds its group full under `on_conflict: drop`, or a debounce's payload no longer binds when it closes |
+| ``intake `<t>`: superseded <running> for <execution>`` | an arrival cancels a running execution of its group under `on_conflict: supersede` |
+| ``intake `<t>`: <intake> started <execution>, whose start a stopped serve had claimed and not journaled`` | a start finds a queued or pending arrival a dead `serve` had claimed and never journaled, and starts it under the id its row recorded |
+| ``intake `<t>`: <intake>'s execution <execution> could not be journaled (<why>); it waits on the queue again`` | the journal would not begin a waiting arrival's execution: the row goes back on the queue, which is read again shortly |
+| ``event source `<s>`: event "<id>" was queued as <intake>, to start <execution> when its group has a free slot for `<t>` `` | an event is queued — accepted, so the checkpoint moves past it; `joined the debounce …` and `was dropped as …` are the other two |
+| ``schedule `<t>`: the <scheduled_at> tick was queued as <intake>, …`` | a tick is queued, joins a debounce or is dropped, the same three ways |
 
 Stopping it stops the graph: `agent-compose serve` passes `SIGINT` and `SIGTERM`
 on to this project, which closes the app, stops every schedule and every

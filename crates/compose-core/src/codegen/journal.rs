@@ -932,14 +932,15 @@ mod tests {
                 "effects",
                 "executions",
                 "fired",
+                "intakes",
                 "lineage",
                 "restarts"
             ],
             "the SQLite schema is the inventory every other backend is held to, and it no \
-             longer holds the ten tables `docs/durability.md` §3 describes — a child \
+             longer holds the eleven tables `docs/durability.md` §3 describes — a child \
              execution's cause (§3.5, PRD resolved q65) and a cancel's request (§3.5, PRD \
-             resolved q75) beside the lifecycle row, and the intake's four (§3.11-§3.14, \
-             PRD resolved q78)"
+             resolved q75) beside the lifecycle row, the intake's four (§3.11-§3.14, PRD \
+             resolved q78), and the intake ledger's rows (§3.15, PRD resolved q77)"
         );
         for (arm, name) in [
             (POSTGRES, "journal-postgres.ts"),
@@ -964,6 +965,12 @@ mod tests {
             // …and `seq`, which only a backend without SQLite's implicit `rowid`
             // needs, and which park order is derived from
             // (`docs/distributed.md` §6.2).
+            assert!(
+                held.get("intakes")
+                    .is_some_and(|found| found.contains(&"seq".to_string())),
+                "`{name}`'s `intakes` declares no `seq`: a group's queue drains in insertion \
+                 order, which a backend with no implicit rowid has to carry as a column"
+            );
             assert!(
                 held.get("dispatches")
                     .is_some_and(|found| found.contains(&"seq".to_string())),
