@@ -5660,7 +5660,11 @@ may hold admits nothing.
 - **Every intake row is the journal's.** A restarted `serve` starts what was
   queued, in its order, as the lease allows, and arms each pending row at the
   deadline the row records — one that passed while nothing ran closes at once
-  (`docs/durability.md` §6.3). Starting an arrival the intake already accepted
+  (`docs/durability.md` §6.3). A trigger the restarted build declares without
+  the block its rows were accepted under starts them with no bound, since that
+  build bounds its executions by nothing
+  ([D163](#d163-a-triggers-intake-a-dedupe-window-and-groups-leased-off-the-journal)'s
+  Status). Starting an arrival the intake already accepted
   is not a re-fire: PRD resolved q28's "triggers fire once" is amended by that
   one sentence, by q77 ruling f.
 - **The group a `run` is in.** A `run` is no arrival and is never admitted, and
@@ -5805,7 +5809,11 @@ block, and the answer says which of them decided:
 
 Every arrival under one debounce is answered with the one `intake_id`, and a
 repeat of an arrival still queued or pending is answered with that arrival's.
-`status_url` is `/intakes/<intake_id>` where there is no execution yet.
+A repeat of a dropped arrival is the drop again, under both headers — `202`,
+the running execution's id and the dropped arrival's `intake_id`, under
+`respond: sync` too — and never the running execution's answer, since the
+arrival it repeats never ran. `status_url` is `/intakes/<intake_id>` where
+there is no execution yet.
 
 **`GET /intakes/:id`** reports one arrival a trigger's intake admitted: its
 `intake_id`, `trigger`, `state` — `queued`, `pending`, `started` or `dropped` —
@@ -14001,7 +14009,8 @@ The lease is one read — `leasesOf(trigger)`: the trigger's open lifecycle
 rows joined to their `started` intake rows, less those with a `cancellations`
 row — driven from the open rows down `executions_by_status`, never from the
 intake's, which are kept and so are the trigger's whole history: what one
-admission costs is what is running, not what ever ran. It is rows, not a
+admission costs is what is running, not what ever ran — one slot per
+execution, however many `started` rows name it. It is rows, not a
 counter, and `docs/distributed.md` §8 rule 2's list of exceptions names the
 `intakes` table beside the other intake tables.
 
@@ -14044,8 +14053,11 @@ ruling:
   delivery's answer as it stands now: the execution's id and status URL, or —
   under `respond: sync` — the execution's outputs, the repeat waiting on it up
   to the trigger's budget as the first did; where the first is still queued or
-  pending, that arrival's intake answer; where it was dropped, the execution it
-  was dropped for. An execution that settled before this `serve` started is not
+  pending, that arrival's intake answer; where it was dropped, the drop again —
+  `202`, the execution it was dropped for and its own `intake_id`, under
+  `X-AgentCompose-Dropped: true` beside the dedupe header — at once and under
+  `sync` too, never a wait on that execution, whose outputs are another
+  payload's. An execution that settled before this `serve` started is not
   on its board — recovery puts back only what is open — so a repeat of it is
   answered off its lifecycle row: `202` with the id, the status and the status
   URL, under `sync` too, because the row holds no outputs. One delivery is so
@@ -14124,8 +14136,12 @@ ruling:
   written before its execution is registered, as a tick's `fired` row is. At
   the next start, a row that **waited** — its arrival was answered with its
   intake id — and whose execution has no lifecycle row starts under the id it
-  recorded, once; a row that did not wait was answered with nothing yet, so it
-  is taken back and its arrival's source re-delivers it. A start the journal
+  recorded, once, **as the lease allows**: where its group has no free slot —
+  the execution the dead process was running is recovered and holds it — the
+  row goes back on the queue at the place it was admitted in, and starts when a
+  slot frees, never beside what holds it. A row that did not wait was answered
+  with nothing yet, so it is taken back and its arrival's source re-delivers
+  it. A start the journal
   would not begin is undone the same two ways at once: a waited row goes back on
   the queue, and an unwaited one is taken back and its arrival refused — a
   `503` on `http` — as any admission the journal would not take is. A journal
@@ -14133,7 +14149,28 @@ ruling:
   `started`, naming an execution that never began, which no drain of the queue
   reads; the process keeps the start owed and tries the move again at every look
   at the trigger's queue until it lands, and the next start finds the row either
-  way.
+  way. **An owed start holds its group's slot** meanwhile: every look at the
+  queue reads it as a lease, so no later row of its group — nor one that would
+  take the trigger's last `max_running:` — starts into the slot its arrival was
+  answered for. And the unwaited row such a refusal leaves behind where it
+  cannot be taken back either is one more `started` row naming an execution its
+  source admits again under the same id: the lease is one slot per execution,
+  however many rows name it. A trigger counts as looked at after a start only
+  once the whole look is done — repairs, every pending row armed, the queue
+  drained — so a look the journal cut short is made again, whole, before the
+  trigger's next decision, and a pending row a dead process left is never left
+  unarmed.
+- **A deploy that removes a trigger's `concurrency:` block.** The rows an
+  earlier build's intake accepted under it — queued and pending arrivals,
+  answered `202` with an intake id — are owed a start all the same (ruling f),
+  and the serving build bounds the trigger's executions by nothing: at the next
+  start each queued row starts as it is looked at, and each pending row closes
+  at the deadline it records, with no lease to wait for, the serve log saying
+  so. A trigger the serving build does not declare at all — renamed or removed
+  — has nothing to bind its rows with: they are left as they are, served by
+  nothing until a build declares the trigger again, and `GET /intakes/:id`
+  refuses them as an execution's routes refuse one whose trigger the build
+  cannot read the `auth:` of.
 - **Intake rows are kept.** A started row is kept after its execution settles,
   so an `intake_id` keeps answering; a dropped row is kept too. Nothing prunes
   them, as nothing prunes `fired` rows.
@@ -14170,8 +14207,10 @@ ruling:
   to fail the same way.
 - **The serve log** names every decision under ``intake `<trigger>` ``: queued
   and for which execution, started, a debounce closed and over how many
-  arrivals, dropped and why, superseded, a repaired start, and a start the
-  journal would not begin.
+  arrivals, dropped and why, superseded, a repaired start — or one owed back
+  onto the queue for want of a slot — a start the journal would not begin,
+  and a trigger whose rows start with no bound because the serving build
+  declares no block on it.
 
 *PRD resolved q28, q32, q35, q36, q65, q75, q77, q78, q79; §4.1, §13.1–§13.5;
 `docs/durability.md` §3.12, §3.15, §6.3, §8, §11.2; `docs/distributed.md` §8;

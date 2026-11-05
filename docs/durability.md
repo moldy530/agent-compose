@@ -1354,7 +1354,10 @@ window closes. Written by `claimDedupe`, called through `admit` in
 * **A repeat is answered with what the first delivery got.** On `http`, under
   `X-AgentCompose-Deduped: true`: the execution's id, or — where the first
   arrival is still `queued` or `pending` in the intake (§3.15) — that arrival's
-  `intake_id`. Under a `concurrency:` block the row names the execution the
+  `intake_id`, or — where it was `dropped` — the drop again, its own
+  `intake_id` beside the running execution's id under
+  `X-AgentCompose-Dropped: true`, never that execution's outputs.
+  Under a `concurrency:` block the row names the execution the
   intake will start, so a repeat of a queued arrival is the queued arrival —
   under a debounce once the arrival has been counted (§3.15), so a repeat of a
   counted arrival counts nothing. A key that answers the empty string is
@@ -1471,22 +1474,31 @@ decisions about one row agree on one.
   cancel of it is recorded. The join is driven from the open lifecycle rows,
   down `executions_by_status`, and matches the trigger on the lifecycle row's
   own trigger — never from the intake rows, which are kept: what the read costs
-  is what is running, not the trigger's history.
+  is what is running, not the trigger's history. It is one slot per execution,
+  however many `started` rows name it: a never-waited start the journal would
+  not begin, whose row could not be taken back either, is admitted again by its
+  source under the same execution id and a second row.
 * **A started row is written before its execution is registered**, as a tick's
   `fired` row is (§3.11), and the start waits for the lifecycle row before the
   next decision reads the lease. A crash between the two leaves a `started` row
   naming an execution with no lifecycle row — which holds no slot — and the
   next start of `serve` repairs it once: a row that **waited** was owed a start,
-  and starts under the id it recorded; a row that did not was never answered,
-  and is taken back (`abandonIntake`) for its arrival's source to re-deliver. A
+  and starts under the id it recorded **as the lease allows** — where its group
+  has no free slot (the execution the dead process was running is recovered and
+  holds it), it goes back to `queued` at the place it was admitted in, and
+  starts when a slot frees; a row that did not wait was never answered, and is
+  taken back (`abandonIntake`) for its arrival's source to re-deliver. A
   start the journal would not begin is undone the same two ways at once — a
   waited row goes back to `queued`, naming why in `detail`. Where the journal
   refuses that move too, the row stays `started` with no lifecycle row, which no
   drain of the queue reads; the process keeps the start owed and makes the move
-  at its next look at the queue that the journal takes. A look at the queue
-  that stops at such a start, or still owes one, leaves the slots it freed to
-  the rows waiting: an arrival behind it is queued after them, never started
-  ahead of them.
+  at its next look at the queue that the journal takes. **An owed start holds
+  its group's slot** while it waits for that move: a look at the queue reads it
+  as a lease, so no later row of its group — nor one that would take the
+  trigger's last `max_running:` — starts into the slot it was answered for. A
+  look at the queue that stops at such a start, or still owes one, leaves the
+  slots it freed to the rows waiting: an arrival behind it is queued after
+  them, never started ahead of them.
 * **A queued row is held to the serving build before it starts.** The
   `admission` was bound by the build that took the arrival, and the build
   serving when its slot frees — after a restart onto a new deploy — may refuse
@@ -1973,7 +1985,18 @@ and a start a dead process claimed and never journaled is repaired once
 (§3.15). None of that starts anything twice: each is an arrival the intake
 accepted and owed, started under the execution id its row recorded, and an
 arrival whose execution already began is never started again. The intake is
-looked at after recovery and before the first admission.
+looked at after recovery and before the first admission, and a trigger counts
+as looked at only once its whole look — the repairs, every pending row armed,
+the queue drained — is done: a look the journal cut short is made again, whole,
+before the trigger's next decision. A trigger the serving build declares with
+**no** `concurrency:` block is looked at too, where an earlier build's intake
+left rows for it — a deploy that removed the block: its queued rows start with
+no bound and each pending row closes at the deadline it records, since the
+serving build bounds the trigger's executions by nothing. Rows of a trigger the
+serving build does not declare at all are left as they are, served by nothing
+until a build declares the trigger again — and `GET /intakes/:id` refuses
+them, as an execution's routes refuse one whose trigger the build cannot read
+the `auth:` of.
 
 For the two triggers `serve` fires itself (PRD resolved q78) the rule is made
 of rows rather than of restraint. A `schedule`
