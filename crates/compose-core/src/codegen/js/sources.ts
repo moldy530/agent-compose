@@ -33,7 +33,12 @@
 // down, the execution it names never journaled — is the one the next start
 // owes: before it arms its first tick, the scheduler hands the newest row back
 // to the admission, which starts that execution under the id the row recorded
-// where no lifecycle row has it, and the serve log names the tick.
+// where no lifecycle row has it, and the serve log names the tick. A claim this
+// scheduler won whose execution the journal would not begin is owed the same
+// way, and sooner: the admission answers `started` only once the lifecycle row
+// is down, so the scheduler knows, and it claims no later tick until that
+// execution has started under the claim — retried with backoff, logged, never
+// counted as fired.
 //
 // # Command sources
 //
@@ -92,7 +97,10 @@ import {
 
 /** What `./serve.ts`'s admission did with one tick or one event. */
 export type Admitted =
-  /** An execution started. */
+  /**
+   * An execution started: its lifecycle row is journaled, so it is one a
+   * restart recovers (`docs/durability.md` §3.5).
+   */
   | { readonly outcome: "started"; readonly execution: string }
   /** The tick was already fired, or the event's key already admitted, by `execution`. */
   | { readonly outcome: "held"; readonly execution: string }
@@ -100,23 +108,46 @@ export type Admitted =
   | { readonly outcome: "refused"; readonly reason: string };
 
 /**
+ * What a tick's admission did: one of [`Admitted`]'s, or **`unbegun`** — the
+ * tick's `fired` row is down, naming an execution the journal would not begin.
+ * The tick is claimed, so the row wins every later claim of it, and nothing
+ * will ever recover the execution it names: the scheduler owes it a start
+ * under that claim and claims no later tick until it has one
+ * (`docs/durability.md` §3.11).
+ *
+ * Only a tick is answered this way. An event whose execution the journal would
+ * not begin is a **rejection** of [`Intake.event`], retried and holding the
+ * stream like any the journal refused, and the retry takes the claim over
+ * (§3.12).
+ */
+export type TickAdmitted =
+  | Admitted
+  | { readonly outcome: "unbegun"; readonly fired: FiredRow; readonly reason: string };
+
+/**
  * The admission this module hands its ticks and events to — `./serve.ts`'s,
  * which is the one every trigger kind's start passes through.
+ *
+ * It answers `started` only once the execution's lifecycle row is journaled,
+ * never as soon as the run is set going: a checkpoint journaled past an event,
+ * or a schedule armed past a tick, whose execution the journal never held
+ * would lose that event or that tick for good.
  *
  * A promise that **rejects** is a journal that could not be written: the tick
  * did not fire, or the event was not admitted, and the caller says so rather
  * than counting it either way.
  */
 export interface Intake {
-  tick(trigger: ScheduleTrigger, at: number, payload: SchedulePayload): Promise<Admitted>;
+  tick(trigger: ScheduleTrigger, at: number, payload: SchedulePayload): Promise<TickAdmitted>;
   /**
    * Start the execution a tick's `fired` row already names, where that
    * execution **never began** — a `serve` that stopped between claiming the
-   * tick and journaling the execution it claimed it for
-   * (`docs/durability.md` §3.11). `undefined` where it did begin, which is
-   * every row but that one: nothing is owed for it.
+   * tick and journaling the execution it claimed it for, or a claim whose
+   * execution the journal would not begin (`docs/durability.md` §3.11).
+   * `undefined` where it did begin, which is every row but that one: nothing
+   * is owed for it.
    */
-  unbegun(trigger: ScheduleTrigger, fired: FiredRow, payload: SchedulePayload): Promise<Admitted | undefined>;
+  unbegun(trigger: ScheduleTrigger, fired: FiredRow, payload: SchedulePayload): Promise<TickAdmitted | undefined>;
   event(trigger: EventTrigger, payload: EventPayload): Promise<Admitted>;
 }
 
@@ -370,6 +401,21 @@ const LONGEST_SLEEP_MS = 60_000;
 /** How many skipped ticks the serve log counts before saying "at least". */
 const SKIPPED_COUNTED = 10_000;
 
+/**
+ * The longest a scheduler holding a claimed tick's start, or a consumer
+ * holding an event the journal refused, waits between attempts.
+ */
+const LONGEST_INTAKE_RETRY_MS = 30_000;
+
+/** Who claimed a tick a starting scheduler finds unbegun, for the serve log. */
+const STOPPED_BEFORE_STARTING = "by a serve that stopped before starting it";
+
+/** Who claimed a tick this scheduler owes a start, for the serve log. */
+const OWED_BY_THIS_SCHEDULER = "by this scheduler, and could not be started then";
+
+/** What the ticks a held schedule skipped fell during, for the serve log. */
+const HELD_FOR_A_CLAIM = "this scheduler was holding the schedule for a claimed tick's start";
+
 class Scheduler {
   readonly #trigger: ScheduleTrigger;
   readonly #intake: Intake;
@@ -377,15 +423,26 @@ class Scheduler {
   readonly #cron: Cron;
   readonly #zone: Zone;
   #timer: ReturnType<typeof setTimeout> | undefined;
+  /** Ends the wait [`#rest`] is in, where it is in one, so a stop is not held by it. */
+  #wake: (() => void) | undefined;
   #stopped = false;
   /**
    * Whether this scheduler has looked at the newest `fired` row for a claim
    * whose execution never began ([`#repair`]): at start, and — where the
    * journal could not be read then, as a standby's cannot until the `serve`
-   * holding it goes (`docs/distributed.md` §8) — before each tick, until a
-   * look reaches the journal.
+   * holding it goes (`docs/distributed.md` §8), or where a tick's claim failed
+   * in a way that may still have landed — before the next tick, until a look
+   * reaches the journal.
    */
   #repaired = false;
+  /**
+   * The newest `fired` row, where it is a claim **this scheduler owes a start**:
+   * its execution could not be journaled, or the journal could not say whether
+   * it had been. No later tick is claimed while one is owed ([`#discharge`]),
+   * which is what keeps the owed claim the newest row — the one row the repair
+   * looks at (`docs/durability.md` §3.11).
+   */
+  #owed: FiredRow | undefined;
 
   constructor(trigger: ScheduleTrigger, intake: Intake, clock: Clock) {
     this.#trigger = trigger;
@@ -400,13 +457,18 @@ class Scheduler {
     return `schedule \`${this.#trigger.name}\``;
   }
 
+  /** The payload of the tick at `at`. */
+  #payloadOf(at: number): SchedulePayload {
+    return { scheduled_at: render(at, this.#zone), trigger: this.#trigger.name };
+  }
+
   async start(): Promise<void> {
     const now = this.#clock.now();
     let last: number | undefined;
     try {
       const fired = await (await openJournal()).lastFired(this.#trigger.name);
       if (fired !== undefined) last = Date.parse(fired.scheduledAt);
-      await this.#repair(fired);
+      await this.#repair(fired, STOPPED_BEFORE_STARTING);
     } catch (error) {
       say(`${this.#named}: the journal could not say when it last fired (${messageOf(error)}), so no skipped span is reported, and the tick it last claimed is looked at again before the next one fires`);
     }
@@ -418,6 +480,13 @@ class Scheduler {
     say(
       `${this.#named} (\`${this.#trigger.cron}\` in ${this.#trigger.timezone}): last fired ${last === undefined ? "never" : render(last, this.#zone)}, next tick ${next === undefined ? "none" : render(next, this.#zone)}`,
     );
+    if (this.#owed !== undefined) {
+      // The claim the repair could not start holds the schedule, as one this
+      // scheduler made would ([`#due`]). Not awaited, so a journal that keeps
+      // refusing it holds this trigger and not the app.
+      void this.#dischargeThenArm(now);
+      return;
+    }
     if (next !== undefined) this.#arm(next);
   }
 
@@ -425,46 +494,94 @@ class Scheduler {
     this.#stopped = true;
     if (this.#timer !== undefined) clearTimeout(this.#timer);
     this.#timer = undefined;
+    this.#wake?.();
   }
 
   /**
-   * Start the execution the newest `fired` row names, where it never began
-   * (`docs/durability.md` §3.11).
+   * Start the execution `fired` names, where it never began
+   * (`docs/durability.md` §3.11) — `claimed` saying, for the serve log, who
+   * claimed it and why its execution was not started then.
    *
    * A `serve` that stops between claiming a tick and journaling the execution
    * it claimed it for leaves a row that wins every later claim of that tick
    * and names an execution nothing will ever recover: honoured, the tick would
-   * fire zero times. Only the newest row can be that claim — a scheduler arms
-   * its next tick only after the one before was admitted — and only the
-   * admission can say whether its execution began, so the row is handed back to
-   * it, which starts the execution under the id the row recorded and with the
-   * payload the tick would have had. One process at a time writes a project's
-   * journal (`docs/durability.md` §2.1), and this one has not yet fired a tick
-   * of its own, so nothing is admitting that claim beside this.
+   * fire zero times. So does a claim whose execution the journal would not
+   * begin. Only the newest row can be that claim — a scheduler claims its next
+   * tick only after the one before was admitted, and holds while one is owed
+   * ([`#discharge`]) — and only the admission can say whether its execution
+   * began, so the row is handed back to it, which starts the execution under
+   * the id the row recorded and with the payload the tick would have had. One
+   * process at a time writes a project's journal (`docs/durability.md` §2.1),
+   * and this one has claimed no tick past this row, so nothing is admitting
+   * that claim beside this.
+   *
+   * Leaves [`#owed`] set where the start is still owed: the execution could
+   * not be journaled again, or the journal could not say whether it began.
    */
-  async #repair(fired: FiredRow | undefined): Promise<void> {
+  async #repair(fired: FiredRow | undefined, claimed: string): Promise<void> {
+    this.#repaired = true;
     if (fired === undefined) {
-      this.#repaired = true;
+      this.#owed = undefined;
       return;
     }
-    const payload: SchedulePayload = {
-      scheduled_at: render(Date.parse(fired.scheduledAt), this.#zone),
-      trigger: this.#trigger.name,
-    };
+    const payload = this.#payloadOf(Date.parse(fired.scheduledAt));
     const tick = `the ${payload.scheduled_at} tick`;
-    const claimed = `${tick} was claimed as ${fired.execution} by a serve that stopped before starting it`;
+    const named = `${tick} was claimed as ${fired.execution} ${claimed}`;
     try {
       const admitted = await this.#intake.unbegun(this.#trigger, fired, payload);
-      this.#repaired = true;
+      this.#owed = admitted?.outcome === "unbegun" ? fired : undefined;
       if (admitted === undefined) return;
-      if (admitted.outcome === "started") say(`${this.#named}: ${claimed}, so it starts now`);
+      if (admitted.outcome === "started") say(`${this.#named}: ${named}, so it starts now`);
       else if (admitted.outcome === "held") say(`${this.#named}: ${tick} was already fired, as ${admitted.execution}`);
-      else say(`${this.#named}: ${claimed}, and starts nothing: ${admitted.reason}`);
+      else if (admitted.outcome === "unbegun") {
+        say(
+          `${this.#named}: ${tick}, claimed as ${fired.execution}, still could not be started: its execution could not be journaled (${admitted.reason}); no later tick is claimed until it starts`,
+        );
+      } else say(`${this.#named}: ${named}, and starts nothing: ${admitted.reason}`);
     } catch (error) {
+      this.#owed = fired;
       say(
-        `${this.#named}: whether ${tick}, claimed as ${fired.execution}, was ever started could not be read (${messageOf(error)}); it is looked at again before the next tick fires`,
+        `${this.#named}: whether ${tick}, claimed as ${fired.execution}, was ever started could not be read (${messageOf(error)}); no later tick is claimed until it is`,
       );
     }
+  }
+
+  /**
+   * Start the claim this scheduler owes ([`#owed`]), retried with backoff until
+   * its execution has started or the journal says it began. `false` where the
+   * scheduler was stopped first; `true` at once where nothing is owed.
+   */
+  async #discharge(): Promise<boolean> {
+    let delay = 1_000;
+    while (this.#owed !== undefined) {
+      if (!(await this.#rest(delay))) return false;
+      await this.#repair(this.#owed, OWED_BY_THIS_SCHEDULER);
+      delay = Math.min(delay * 2, LONGEST_INTAKE_RETRY_MS);
+    }
+    return !this.#stopped;
+  }
+
+  /** [`#discharge`], then arm the first tick after `from`, naming any the hold skipped. */
+  async #dischargeThenArm(from: number): Promise<void> {
+    if (!(await this.#discharge())) return;
+    this.#armAfter(from, HELD_FOR_A_CLAIM);
+  }
+
+  /** Wait `ms` real milliseconds, or until a stop: `false` for a stop. */
+  #rest(ms: number): Promise<boolean> {
+    if (this.#stopped) return Promise.resolve(false);
+    return new Promise<boolean>((resolve) => {
+      this.#wake = () => {
+        this.#wake = undefined;
+        resolve(false);
+      };
+      this.#timer = setTimeout(() => {
+        this.#timer = undefined;
+        this.#wake = undefined;
+        resolve(!this.#stopped);
+      }, ms);
+      this.#timer.unref?.();
+    });
   }
 
   /** Say which ticks fell between `first` and `now` without firing. */
@@ -516,6 +633,22 @@ class Scheduler {
     this.#timer.unref?.();
   }
 
+  /**
+   * Arm the first tick after `at` — or, where that one is already past, name
+   * the ticks that fell since (`why` says while what) and arm the first after
+   * now.
+   */
+  #armAfter(at: number, why: string): void {
+    if (this.#stopped) return;
+    const now = this.#clock.now();
+    let next = nextAfter(this.#cron, at, this.#zone);
+    if (next !== undefined && next <= now) {
+      this.#skipped(next, now, why);
+      next = nextAfter(this.#cron, now, this.#zone);
+    }
+    if (next !== undefined) this.#arm(next);
+  }
+
   async #due(at: number): Promise<void> {
     if (this.#stopped) return;
     if (this.#clock.now() < at) {
@@ -533,31 +666,42 @@ class Scheduler {
       } catch {
         // Looked at again before the next tick.
       }
-      if (read) await this.#repair(fired);
+      if (read) await this.#repair(fired, STOPPED_BEFORE_STARTING);
     }
+    // A claim still owed is started before this tick is claimed, and so is one
+    // this tick's own claim leaves owed: the newest row stays the one the
+    // repair looks at, and no tick is claimed past a claim nothing started.
+    let held = this.#owed !== undefined;
+    if (!(await this.#discharge())) return;
     await this.#fire(at);
-    if (this.#stopped) return;
-    const now = this.#clock.now();
-    let next = nextAfter(this.#cron, at, this.#zone);
-    if (next !== undefined && next <= now) {
-      this.#skipped(next, now, "this scheduler could not see them (the process stalled or the machine slept)");
-      next = nextAfter(this.#cron, now, this.#zone);
-    }
-    if (next !== undefined) this.#arm(next);
+    held ||= this.#owed !== undefined;
+    if (!(await this.#discharge())) return;
+    this.#armAfter(
+      at,
+      held ? HELD_FOR_A_CLAIM : "this scheduler could not see them (the process stalled or the machine slept)",
+    );
   }
 
   async #fire(at: number): Promise<void> {
-    const payload: SchedulePayload = {
-      scheduled_at: render(at, this.#zone),
-      trigger: this.#trigger.name,
-    };
+    const payload = this.#payloadOf(at);
     const tick = `the ${payload.scheduled_at} tick`;
     try {
       const admitted = await this.#intake.tick(this.#trigger, at, payload);
       if (admitted.outcome === "started") say(`${this.#named}: fired ${tick} as ${admitted.execution}`);
       else if (admitted.outcome === "held") say(`${this.#named}: ${tick} was already fired, as ${admitted.execution}`);
-      else say(`${this.#named}: ${tick} started nothing: ${admitted.reason}`);
+      else if (admitted.outcome === "unbegun") {
+        // Claimed, so owed: the row is down and wins every later claim of this
+        // tick, and nothing will ever recover the execution it names.
+        this.#owed = admitted.fired;
+        say(
+          `${this.#named}: ${tick} was claimed as ${admitted.fired.execution}, whose execution could not be journaled (${admitted.reason}): no later tick is claimed until it starts`,
+        );
+      } else say(`${this.#named}: ${tick} started nothing: ${admitted.reason}`);
     } catch (error) {
+      // A claim that failed may still have landed — a dialled journal can
+      // commit an insert whose answer never arrives — so the newest row is
+      // looked at again before the next tick is claimed.
+      this.#repaired = false;
       say(`${this.#named}: ${tick} could not be journaled, so it did not fire: ${messageOf(error)}`);
     }
   }
@@ -580,9 +724,6 @@ const STOP_GRACE_MS = 2_000;
  * line that is not a JSON object, and a stderr line past it is logged cut here.
  */
 const LONGEST_LINE_BYTES = 1 << 20;
-
-/** The longest the consumer waits between attempts to admit one event the journal refused. */
-const LONGEST_INTAKE_RETRY_MS = 30_000;
 
 class Consumer {
   readonly #source: EventSource;
@@ -885,9 +1026,12 @@ class Consumer {
     if (!accepted) return;
     this.accepted += 1;
     if (this.#command.checkpoint === undefined) return;
-    // **After** the intake accepted the event — started an execution or found
-    // the one it already had — so a checkpoint handed back on restart is never
-    // ahead of what was admitted (PRD resolved q78 ruling c).
+    // **After** the intake accepted the event — started an execution, whose
+    // lifecycle row is journaled by the time it says so, or found the one it
+    // already had — so a checkpoint handed back on restart is never ahead of
+    // what was admitted (PRD resolved q78 ruling c). An event whose execution
+    // the journal would not begin is a rejection, retried above and holding
+    // the stream, and never reaches this line until it has begun.
     this.checkpoint = id;
     try {
       await (await openJournal()).recordCheckpoint(this.#source.name, id);
@@ -956,10 +1100,26 @@ class Consumer {
       });
     this.state = "backing_off";
     this.backingOffUntil = new Date(endedAt + backoff).toISOString();
+    this.#restartAt(endedAt + backoff);
+  }
+
+  /**
+   * Start the program again at `at`, in epoch milliseconds — armed in steps no
+   * longer than [`LONGEST_SLEEP_MS`], as the scheduler's ticks are.
+   *
+   * A timer's delay is a signed 32-bit count of milliseconds in Node and Bun
+   * alike, and one past it — some 24.8 days, which nothing bounds `restart:` to
+   * (grammar 14.4) — is clamped to one millisecond: armed whole, the doubling
+   * up to `restart.max` would turn into a restart every millisecond, each one a
+   * journaled row and a line of the serve log.
+   */
+  #restartAt(at: number): void {
+    const wait = Math.max(0, at - Date.now());
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
-      this.#spawn();
-    }, backoff);
+      if (Date.now() < at) this.#restartAt(at);
+      else this.#spawn();
+    }, Math.min(wait, LONGEST_SLEEP_MS));
     this.#timer.unref?.();
   }
 

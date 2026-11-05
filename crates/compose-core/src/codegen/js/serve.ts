@@ -191,12 +191,13 @@ import {
   sinkConfigured,
   workDelivery,
 } from "./delivery.ts";
-import { type CompiledFlow, type FlowRun, flows, runChildFlow, runFlow } from "./graph.ts";
+import { type CompiledFlow, type FlowRun, flows, runChildFlow, runFlow, sessionRefusal } from "./graph.ts";
 import { type FiredRow, type Journal, openJournal } from "./journal.ts";
 import { mountWorkerRoutes, placementWaits, watchPlacementWaits } from "./mesh.ts";
 import {
   type Admitted,
   type Intake,
+  type TickAdmitted,
   declaresSource,
   preflightSources,
   sourceStatus,
@@ -1241,10 +1242,21 @@ interface Admission {
   readonly execution?: string;
 }
 
-/** What [`admit`] did: the execution it started, or the one its gate already held. */
+/**
+ * What [`admit`] did: the execution it started, the one its gate already held,
+ * or — for a gated admission only — a gate it claimed for an execution the
+ * journal would not begin.
+ */
 type AdmitAnswer =
   | { readonly outcome: "started"; readonly record: Execution }
-  | { readonly outcome: "held"; readonly execution: string };
+  | { readonly outcome: "held"; readonly execution: string }
+  | {
+      readonly outcome: "unbegun";
+      readonly execution: string;
+      /** The tick's `fired` row, where the gate was a tick's. */
+      readonly fired?: FiredRow;
+      readonly reason: string;
+    };
 
 /**
  * Start one execution — **the** start, for every trigger kind (PRD resolved
@@ -1256,18 +1268,30 @@ type AdmitAnswer =
  *    that wins fires; a tick some earlier generation of this process or another
  *    hub sharing the journal already fired is answered with that execution and
  *    starts nothing (`docs/durability.md` §3.11). The one row it is handed
- *    back is a claim a process died holding — `admission.execution` names the
- *    id it recorded — and that starts under the id only where no execution of
- *    it began, which is the tick's repair: honoured, the tick would never fire.
+ *    back is a claim no execution began under — `admission.execution` names
+ *    the id it recorded — and that starts under the id only where no execution
+ *    of it began, which is the tick's repair: honoured, the tick would never
+ *    fire.
  *  * **an event's dedupe key**, claimed as the execution is registered. A key
  *    already held by an execution that exists — in this process, or anywhere in
  *    the journal — is a repeat and starts nothing. A key held by one that
- *    **never began** is a claim a process died holding between this line and
- *    the lifecycle row, and is taken over rather than honoured: honoured, the
- *    event would be lost (§3.12).
+ *    **never began** is a claim no execution began under, and is taken over
+ *    rather than honoured: honoured, the event would be lost (§3.12).
  *
- * An `http` request keeps no gate in this release; PRD resolved q77 gives it
- * `dedupe_key:` on this same seam.
+ * **A gated admission answers `started` only once the lifecycle row is down**
+ * — `runFlow`'s `opened` hook, [`register`]'s `begun` — and never as soon as
+ * the run is set going. What its caller does next is only safe for an
+ * execution the journal holds: a consumer journals the event's checkpoint, a
+ * scheduler claims its next tick. A run the journal would not begin is
+ * answered `unbegun` instead, and taken off this process's map, so the claim
+ * it leaves names an execution that exists nowhere: the scheduler holds its
+ * schedule and starts it under the claim ([`admitUnbegun`]), and an event's
+ * retry takes the key over.
+ *
+ * An `http` request keeps no gate in this release, and is answered as soon as
+ * its run is set going, as it always was: a run that fails before its row is
+ * reported by the status route and the completion webhook ([`settling`]).
+ * PRD resolved q77 gives it `dedupe_key:` on this same seam.
  */
 async function admit(
   executions: Map<string, Execution>,
@@ -1275,6 +1299,7 @@ async function admit(
 ): Promise<AdmitAnswer> {
   const id = admission.execution ?? `exec_${globalThis.crypto.randomUUID()}`;
   const gate = admission.gate;
+  let claim: FiredRow | undefined;
   if (gate?.kind === "tick") {
     const journal = await openJournal();
     const held = await journal.fire({
@@ -1287,6 +1312,7 @@ async function admit(
     if (admission.execution !== undefined && (await begun(executions, journal, id))) {
       return { outcome: "held", execution: id };
     }
+    claim = held;
   }
   if (gate?.kind === "dedupe") {
     const journal = await openJournal();
@@ -1311,15 +1337,33 @@ async function admit(
       }
     }
   }
-  const record = register(executions, admission, id);
+  const { record, begun: lifecycle } = register(executions, admission, id);
+  if (gate === undefined) return { outcome: "started", record };
+  try {
+    await lifecycle;
+  } catch (error) {
+    // Never begun, so never this process's either: off the map, the claim
+    // names an execution [`begun`] finds nowhere, which is what the repair and
+    // the takeover look for — and a repeat of this event in this process is
+    // not answered with an execution that does not exist.
+    if (executions.get(id) === record) executions.delete(id);
+    return {
+      outcome: "unbegun",
+      execution: id,
+      ...(claim === undefined ? {} : { fired: claim }),
+      reason: message(error),
+    };
+  }
   return { outcome: "started", record };
 }
 
 /**
  * Whether `id` names an execution that began: one this process holds — its
- * lifecycle row may still be in flight — or one the journal has a lifecycle
- * row for. What a gate's row names and this answers `false` for is a claim a
- * process died holding before it journaled the execution.
+ * lifecycle row may still be in flight, and a gated admission whose row the
+ * journal refused is taken off the map ([`admit`]) — or one the journal has a
+ * lifecycle row for. What a gate's row names and this answers `false` for is
+ * a claim no execution began under: a process died holding it, or the journal
+ * would not begin its execution.
  */
 async function begun(
   executions: Map<string, Execution>,
@@ -1347,13 +1391,14 @@ async function admitTick(
   trigger: ScheduleTrigger,
   at: number,
   payload: SchedulePayload,
-): Promise<Admitted> {
+): Promise<TickAdmitted> {
   return admitTickAs(executions, trigger, new Date(at).toISOString(), payload, undefined);
 }
 
 /**
  * Start the execution a tick's `fired` row names, where it never began — the
- * repair `./sources.ts`'s scheduler asks for at start (`docs/durability.md`
+ * repair `./sources.ts`'s scheduler asks for at start, and for a claim of its
+ * own whose execution the journal would not begin (`docs/durability.md`
  * §3.11). `undefined`, and nothing bound, where the execution did begin: that
  * is every row a `serve` that stopped cleanly leaves.
  */
@@ -1362,9 +1407,27 @@ async function admitUnbegun(
   trigger: ScheduleTrigger,
   fired: FiredRow,
   payload: SchedulePayload,
-): Promise<Admitted | undefined> {
+): Promise<TickAdmitted | undefined> {
   if (await begun(executions, await openJournal(), fired.execution)) return undefined;
   return admitTickAs(executions, trigger, fired.scheduledAt, payload, fired.execution);
+}
+
+/**
+ * The refusal `runFlow` would raise before journaling anything for a run with
+ * no session identity whose flow reaches a `scope: session` store (grammar
+ * 11.3), asked here first.
+ *
+ * A gated admission waits for the lifecycle row and treats a run that never
+ * reached it as the journal's failure — retried, holding the schedule or the
+ * stream — so nothing the run refuses on its own account may be left to
+ * refuse it there: a tick or an event whose `session_key:` answered the empty
+ * string would be retried for ever. It is the trigger's binding that failed,
+ * and it is refused as one.
+ */
+function refusesSession(flow: CompiledFlow, sessionKey: string): void {
+  if (sessionKey === "" && flow.sessionStores.length > 0) {
+    throw new Error(sessionRefusal(flow.address, flow.sessionStores));
+  }
 }
 
 /** Bind one tick and admit it under the `fired` row for `scheduledAt`. */
@@ -1374,7 +1437,7 @@ async function admitTickAs(
   scheduledAt: string,
   payload: SchedulePayload,
   execution: string | undefined,
-): Promise<Admitted> {
+): Promise<TickAdmitted> {
   const flow = flows[trigger.flow];
   if (flow === undefined) {
     return { outcome: "refused", reason: `\`${trigger.flow}\` is not a flow of this composition` };
@@ -1385,6 +1448,7 @@ async function admitTickAs(
     inputs = trigger.input(payload);
     if (trigger.sessionKey !== undefined) sessionKey = trigger.sessionKey(payload);
     flow.parse(inputs);
+    refusesSession(flow, sessionKey);
   } catch (error) {
     return { outcome: "refused", reason: `the trigger \`${trigger.name}\` could not bind this tick: ${message(error)}` };
   }
@@ -1396,12 +1460,26 @@ async function admitTickAs(
     gate: { kind: "tick", scheduledAt },
     ...(execution === undefined ? {} : { execution }),
   });
-  return admitted.outcome === "started"
-    ? { outcome: "started", execution: admitted.record.id }
-    : admitted;
+  if (admitted.outcome === "started") return { outcome: "started", execution: admitted.record.id };
+  if (admitted.outcome === "held") return admitted;
+  // A tick's gate is its `fired` row, and [`admit`] carries it back with the
+  // failure. Were it ever missing, a rejection is still the safe answer: the
+  // scheduler looks at the newest row again before it claims another tick.
+  if (admitted.fired === undefined) {
+    throw new Error(`its execution ${admitted.execution} could not be journaled: ${admitted.reason}`);
+  }
+  return { outcome: "unbegun", fired: admitted.fired, reason: admitted.reason };
 }
 
-/** Bind one event and admit it under its trigger's dedupe key. */
+/**
+ * Bind one event and admit it under its trigger's dedupe key.
+ *
+ * An event whose execution the journal would not begin **rejects**: the
+ * consumer retries it with backoff and reads no further line until it is
+ * admitted, so the source's checkpoint never moves past it, and the retry
+ * finds the key naming an execution that exists nowhere and takes it over
+ * (`docs/durability.md` §3.12, §3.13).
+ */
 async function admitEvent(
   executions: Map<string, Execution>,
   trigger: EventTrigger,
@@ -1419,6 +1497,7 @@ async function admitEvent(
     inputs = trigger.input(payload);
     if (trigger.sessionKey !== undefined) sessionKey = trigger.sessionKey(payload);
     flow.parse(inputs);
+    refusesSession(flow, sessionKey);
   } catch (error) {
     return { outcome: "refused", reason: `the trigger \`${trigger.name}\` could not bind this event: ${message(error)}` };
   }
@@ -1429,6 +1508,9 @@ async function admitEvent(
     sessionKey,
     gate: { kind: "dedupe", key },
   });
+  if (admitted.outcome === "unbegun") {
+    throw new Error(`its execution ${admitted.execution} could not be journaled: ${admitted.reason}`);
+  }
   return admitted.outcome === "started"
     ? { outcome: "started", execution: admitted.record.id }
     : admitted;
@@ -1675,12 +1757,19 @@ function trackChild(
   return run;
 }
 
-/** Start the run, and record what it does when it stops. */
+/**
+ * Start the run, and record what it does when it stops.
+ *
+ * Answers the execution's record and **`begun`**: resolved once the run's
+ * lifecycle row is journaled — `runFlow`'s `opened` hook — and rejected with
+ * whatever stopped the run before it was. What a gated [`admit`] waits for
+ * before it says the execution started.
+ */
 function register(
   executions: Map<string, Execution>,
   admission: Admission,
   id: string,
-): Execution {
+): { readonly record: Execution; readonly begun: Promise<void> } {
   const { flow, inputs, sessionKey, callback, traceparent } = admission;
   const execution: Execution = {
     id,
@@ -1704,36 +1793,46 @@ function register(
     settled: Promise.resolve(),
   };
   const unwatch = watchPauses(execution);
+  let opened: () => void = () => {};
+  const journaled = new Promise<void>((resolve) => {
+    opened = resolve;
+  });
   // `resumable: true` is what makes a `human` node a *pause* rather than the end
   // of the run: this app mounts the route that answers one (grammar 8.7,
   // PRD 5.11), which `agent-compose run` does not.
-  execution.settled = settling(
-    execution,
-    runFlow(flow.address, inputs, {
-      executionId: id,
-      sessionKey,
-      resumable: true,
-      // Which trigger started it, for the journal's lifecycle row. Recorded so a
-      // reader of the journal can tell an `http` execution from a `run`, and so
-      // the resume and status routes of this execution can enforce the auth of
-      // the trigger that started it after a restart (grammar 13.3); never
-      // re-fired on recovery (PRD resolved q28).
-      trigger: admission.trigger,
-      // And where its lifecycle webhooks go, on the same row and for the
-      // reason [`resumeInto`] reads it back: the process that finishes this
-      // execution may not be this one.
-      ...(callback === undefined ? {} : { callback }),
-      // …and the caller's trace, on the row for the same reason. Carried as it
-      // arrived and validated where it is read (`./otlp.ts`'s
-      // `parseTraceparent`), so a malformed header costs the execution nothing
-      // — which is the W3C trace-context behaviour and PRD resolved q51's.
-      ...(traceparent === undefined ? {} : { traceparent }),
-      // The `settled` webhook, journaled before the row closes — see [`closed`].
-      closing: (produced, error) => closed(execution, produced, error),
-    }),
-  ).finally(unwatch);
+  const run = runFlow(flow.address, inputs, {
+    executionId: id,
+    sessionKey,
+    resumable: true,
+    // Which trigger started it, for the journal's lifecycle row. Recorded so a
+    // reader of the journal can tell an `http` execution from a `run`, and so
+    // the resume and status routes of this execution can enforce the auth of
+    // the trigger that started it after a restart (grammar 13.3); never
+    // re-fired on recovery (PRD resolved q28).
+    trigger: admission.trigger,
+    // And where its lifecycle webhooks go, on the same row and for the
+    // reason [`resumeInto`] reads it back: the process that finishes this
+    // execution may not be this one.
+    ...(callback === undefined ? {} : { callback }),
+    // …and the caller's trace, on the row for the same reason. Carried as it
+    // arrived and validated where it is read (`./otlp.ts`'s
+    // `parseTraceparent`), so a malformed header costs the execution nothing
+    // — which is the W3C trace-context behaviour and PRD resolved q51's.
+    ...(traceparent === undefined ? {} : { traceparent }),
+    // The `settled` webhook, journaled before the row closes — see [`closed`].
+    closing: (produced, error) => closed(execution, produced, error),
+    // The lifecycle row is down: what a gated admission waits for.
+    opened,
+  });
+  execution.settled = settling(execution, run).finally(unwatch);
   executions.set(id, execution);
-  return execution;
+  // A run resolves only after its row opened, so the race is decided by the
+  // hook — or by the run's own rejection, where it stopped before the row.
+  const lifecycle = Promise.race([journaled, run.then(() => undefined)]);
+  // Nobody waits on it for an `http` start: a run that fails before its row is
+  // the status route's and the webhook's to report ([`settling`]).
+  lifecycle.catch(() => {});
+  return { record: execution, begun: lifecycle };
 }
 
 /**

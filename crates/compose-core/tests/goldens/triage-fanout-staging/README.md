@@ -306,10 +306,13 @@ What `serve` writes about them goes to **stderr**, one line each:
 | ``schedule `<t>`: fired the <scheduled_at> tick as <execution>`` | a tick fires |
 | ``schedule `<t>`: the <scheduled_at> tick was already fired, as <execution>`` | another generation, or a hub sharing the journal, fired it first |
 | ``schedule `<t>`: the <scheduled_at> tick was claimed as <execution> by a serve that stopped before starting it, so it starts now`` | a scheduler starts and finds the tick a stopped `serve` claimed and never started |
+| ``schedule `<t>`: the <scheduled_at> tick was claimed as <execution>, whose execution could not be journaled (<why>): no later tick is claimed until it starts`` | the tick is claimed and the journal would not begin its execution: the schedule holds, retrying with backoff |
+| ``schedule `<t>`: the <scheduled_at> tick was claimed as <execution> by this scheduler, and could not be started then, so it starts now`` | the held tick's execution starts under its claim, and the schedule goes on |
 | ``event source `<s>`: started `<command>` (pid <pid>) with checkpoint "<c>"`` | the program starts (or `with no checkpoint`) |
 | ``event source `<s>`: the journal could not say its checkpoint (<why>), so the program is not started yet; trying again in <ms>ms`` | the program waits for the journal rather than starting from no position |
 | ``event source `<s>`: event "<id>" started <execution> for `<t>` `` | an event is admitted |
 | ``event source `<s>`: event "<id>" repeats one `<t>` already admitted as <execution>, so it started nothing`` | a repeat is deduplicated |
+| ``event source `<s>`: event "<id>" could not be admitted to `<t>` (<why>); trying it again in <ms>ms, and reading no further line until it is`` | the journal refused the event's claim or its execution: the stream holds, and the checkpoint does not move |
 | ``event source `<s>`: line <n> is not a JSON object, so it was refused and starts nothing (<n> refused so far)`` | a line is refused |
 | ``event source `<s>`: the program exited with code <c> after <seconds>s; restarting it in <ms>ms (restart <n> in a row)`` | the program ends, by an exit or a signal |
 | ``[source <s>] <line>`` | the program writes a line to its stderr; one longer than 1 MiB is logged cut there, ending `[cut: …]` |

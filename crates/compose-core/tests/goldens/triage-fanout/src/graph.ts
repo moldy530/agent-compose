@@ -642,13 +642,12 @@ const agentTriage: runtime.AgentBinding = {
         ],
         "type": "object"
       },
-      invoke: async (args, context, site) =>
+      invoke: async (args, context) =>
         stores.runStoreTool(
           storeDocs,
           "search",
           runtime.parseToolArguments(storeDocsToolSearchInput, args, "the arguments `docs_search` was called with") as Record<string, unknown>,
           context,
-          site,
         ),
     },
   ],
@@ -1175,7 +1174,7 @@ const flowTriageNodeRemember: runtime.NodeDescriptor = {
       "set",
       input as stores.StoreParams,
       context,
-      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "remember")].join("/"), path: runtime.instancePath(view, "remember").join("/") },
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "remember")].join("/") },
     ),
   }),
   writes: [],
@@ -1634,6 +1633,19 @@ export async function runFlow(
      * really did with what a receiver's ledger could not hold.
      */
     readonly closing?: (produced: FlowRun | undefined, error: unknown) => Promise<void>;
+    /**
+     * Called once, **as soon as this run's lifecycle row is journaled** —
+     * before the graph is streamed — and never for a run refused or failed
+     * before it: an execution that is not in the journal has not begun.
+     *
+     * The one caller is `src/serve.ts`, for a `schedule` tick and an `event`,
+     * whose admission answers that an execution started only once this is
+     * called (`docs/durability.md` §3.11–§3.13). A tick's `fired` row or an
+     * event's dedupe claim naming an execution the journal has no row for is
+     * a claim nothing recovers, and a source checkpointed past such an event
+     * hands its program a position after an event that never ran.
+     */
+    readonly opened?: () => void;
   } = {},
 ): Promise<FlowRun> {
   // **A child execution is not an invocation**, and two things below follow
@@ -1697,6 +1709,9 @@ export async function runFlow(
     ...(options.resume === true ? { resuming: true } : {}),
     ...(options.lineage === undefined ? {} : { lineage: options.lineage }),
   });
+  // The row is down: whoever was waiting for this execution to exist in the
+  // journal may say it started (see the option's own comment).
+  options.opened?.();
   try {
     // A child's refusals, now that it has a row to close `failed` over — see
     // the note at the top of this function.
