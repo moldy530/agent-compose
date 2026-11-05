@@ -794,6 +794,7 @@ What `serve` writes about them goes to **stderr**, one line each:
 | ``schedule `<t>`: fired the <scheduled_at> tick as <execution>`` | a tick fires |
 | ``schedule `<t>`: the <scheduled_at> tick was already fired, as <execution>`` | another generation, or a hub sharing the journal, fired it first |
 | ``schedule `<t>`: the <scheduled_at> tick was claimed as <execution> by a serve that stopped before starting it, so it starts now`` | a scheduler starts and finds the tick a stopped `serve` claimed and never started |
+| ``schedule `<t>`: the <scheduled_at> tick was claimed as <execution> and was never started, so it starts now`` | the look a scheduler takes before a tick — a standby's first once the journal reads, or one after a claim that failed — finds a claim whose execution never began |
 | ``schedule `<t>`: the <scheduled_at> tick was claimed as <execution>, whose execution could not be journaled (<why>): no later tick is claimed until it starts`` | the tick is claimed and the journal would not begin its execution: the schedule holds, retrying with backoff |
 | ``schedule `<t>`: the <scheduled_at> tick was claimed as <execution> by this scheduler, and could not be started then, so it starts now`` | the held tick's execution starts under its claim, and the schedule goes on |
 | ``event source `<s>`: started `<command>` (pid <pid>) with checkpoint "<c>"`` | the program starts (or `with no checkpoint`) |

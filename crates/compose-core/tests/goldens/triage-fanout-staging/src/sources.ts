@@ -416,6 +416,13 @@ const LONGEST_INTAKE_RETRY_MS = 30_000;
 /** Who claimed a tick a starting scheduler finds unbegun, for the serve log. */
 const STOPPED_BEFORE_STARTING = "by a serve that stopped before starting it";
 
+/**
+ * The same, for the look a scheduler takes before a tick — a standby's first
+ * once the journal reads, or one after a claim that failed — where the claimer
+ * may be another `serve` or this one.
+ */
+const NEVER_STARTED = "and was never started";
+
 /** Who claimed a tick this scheduler owes a start, for the serve log. */
 const OWED_BY_THIS_SCHEDULER = "by this scheduler, and could not be started then";
 
@@ -449,6 +456,8 @@ class Scheduler {
    * looks at (`docs/durability.md` §3.11).
    */
   #owed: FiredRow | undefined;
+  /** Who claimed [`#owed`] and why it was not started then, for the serve log. */
+  #owedBy = OWED_BY_THIS_SCHEDULER;
 
   constructor(trigger: ScheduleTrigger, intake: Intake, clock: Clock) {
     this.#trigger = trigger;
@@ -536,6 +545,7 @@ class Scheduler {
     try {
       const admitted = await this.#intake.unbegun(this.#trigger, fired, payload);
       this.#owed = admitted?.outcome === "unbegun" ? fired : undefined;
+      this.#owedBy = claimed;
       if (admitted === undefined) return;
       if (admitted.outcome === "started") say(`${this.#named}: ${named}, so it starts now`);
       else if (admitted.outcome === "held") say(`${this.#named}: ${tick} was already fired, as ${admitted.execution}`);
@@ -546,6 +556,7 @@ class Scheduler {
       } else say(`${this.#named}: ${named}, and starts nothing: ${admitted.reason}`);
     } catch (error) {
       this.#owed = fired;
+      this.#owedBy = claimed;
       say(
         `${this.#named}: whether ${tick}, claimed as ${fired.execution}, was ever started could not be read (${messageOf(error)}); no later tick is claimed until it is`,
       );
@@ -561,7 +572,7 @@ class Scheduler {
     let delay = 1_000;
     while (this.#owed !== undefined) {
       if (!(await this.#rest(delay))) return false;
-      await this.#repair(this.#owed, OWED_BY_THIS_SCHEDULER);
+      await this.#repair(this.#owed, this.#owedBy);
       delay = Math.min(delay * 2, LONGEST_INTAKE_RETRY_MS);
     }
     return !this.#stopped;
@@ -672,7 +683,7 @@ class Scheduler {
       } catch {
         // Looked at again before the next tick.
       }
-      if (read) await this.#repair(fired, STOPPED_BEFORE_STARTING);
+      if (read) await this.#repair(fired, NEVER_STARTED);
     }
     // A claim still owed is started before this tick is claimed, and so is one
     // this tick's own claim leaves owed: the newest row stays the one the
@@ -699,6 +710,7 @@ class Scheduler {
         // Claimed, so owed: the row is down and wins every later claim of this
         // tick, and nothing will ever recover the execution it names.
         this.#owed = admitted.fired;
+        this.#owedBy = OWED_BY_THIS_SCHEDULER;
         say(
           `${this.#named}: ${tick} was claimed as ${admitted.fired.execution}, whose execution could not be journaled (${admitted.reason}): no later tick is claimed until it starts`,
         );
