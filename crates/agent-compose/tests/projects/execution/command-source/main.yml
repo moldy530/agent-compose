@@ -1,0 +1,41 @@
+# Acceptance fixture: a `kind: command` event source that `serve` runs, and the
+# `event` trigger that admits what it prints (grammar 13.5, 14.4, PRD resolved
+# q78).
+#
+# The program is `feed.mjs`, beside this file, named by `${FEED_PROGRAM}` so a
+# test points the source at it wherever the fixture was staged — and steered by
+# variables of its own (`FEED_*`, read by the program and never by the
+# composition) through what PRD resolved q78's verification asks of it: emit
+# events up to a count, exit part-way, re-emit a window after a restart,
+# write a line that is not JSON. It writes every event it emits to an emission
+# log, which is the oracle a test counts executions against.
+#
+# `checkpoint:` is the event's `cursor` — its `seq`, written as a string — so
+# `payload.id`, the default `dedupe_key:`, is the sequence number, and a
+# restarted program is handed the newest one the intake accepted. The flow binds both, so an execution's
+# lifecycle row says which event it was started for.
+#
+# `deploy/local.yml` declares the source: `kind: command` is the one kind the
+# zero-infra target may declare (Decision D87 as amended by D162).
+version: "0.1"
+
+flow.ingest:
+  inputs:
+    id: { type: string }
+    seq: { type: integer }
+  outputs: {}
+  nodes:
+    note:
+      exec: { command: "true" }
+  edges:
+    - { from: start, to: note }
+    - { from: note, to: end }
+
+triggers:
+  ingest:
+    type: event
+    flow: flow.ingest
+    source: feed
+    input:
+      id: "payload.id"
+      seq: "payload.body.seq"
