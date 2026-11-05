@@ -596,8 +596,10 @@ default — a request body has no id of its own — so a trigger deduplicates on
 when it declares one; an `event` trigger's defaults to `payload.id`. The key is
 evaluated after the trigger's `auth:` and held for `dedupe_window:`, `24h` by
 default: a repeat inside the window starts nothing and is answered with what the
-first delivery got, under `X-AgentCompose-Deduped: true`. After the window the
-same key starts again.
+first delivery got, under `X-AgentCompose-Deduped: true` — beside a debounce,
+the intake it joined, without counting it again. After the window the same key
+starts again. A key that answers the empty string is refused with a `400`: it
+names nothing to tell a repeat by.
 
 **`concurrency:`** admits arrivals into **groups** — one per `key:` value, or one
 for the whole trigger without a `key:` — each with `limit:` slots (default `1`).

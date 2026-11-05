@@ -1351,7 +1351,11 @@ window closes. Written by `claimDedupe`, called through `admit` in
   `X-AgentCompose-Deduped: true`: the execution's id, or — where the first
   arrival is still `queued` or `pending` in the intake (§3.15) — that arrival's
   `intake_id`. Under a `concurrency:` block the row names the execution the
-  intake will start, so a repeat of a queued arrival is the queued arrival.
+  intake will start, so a repeat of a queued arrival is the queued arrival —
+  under a debounce once the arrival has been counted (§3.15), so a repeat of a
+  counted arrival counts nothing. A key that answers the empty string is
+  refused before anything is claimed: it names nothing a repeat could be told
+  by.
 * **An event starts an execution only once its lifecycle row is down.** The
   admission waits for the row (§3.5) before it answers the consumer, so the
   checkpoint (§3.13) never moves past an event whose execution the journal does
@@ -1440,9 +1444,13 @@ table:
 | `coalesced` | the arrivals a debounce closed over; `1` otherwise |
 | `admitted_at`, `deadline`, `started_at` | when it arrived, when a pending row's debounce closes, when it started |
 | `detail` | why a row was dropped, or put back on the queue |
+| `joined_execution`, `joined_gate` | a pending row's newest counted arrival: the id its gate was claimed under, and the gate — a dedupe key or a tick |
 
-Indexed by `(trigger_name, state, group_hash)` and by `execution`; on Postgres
-and MySQL a `seq` column orders a trigger's queue, where SQLite reads `rowid`.
+Indexed by `(trigger_name, state, group_hash)`, by `execution` and by
+`joined_execution`; on Postgres and MySQL a `seq` column orders a trigger's
+queue, where SQLite reads `rowid`. A table an earlier build of this release
+created gains the two `joined_` columns on open, probed as `dedupe.expires_at`
+is.
 Written by `admitIntake` and moved by `moveIntake`, a conditional update that
 moves a row only from the state it still holds and reads the row back — so two
 decisions about one row agree on one.
@@ -1453,7 +1461,10 @@ decisions about one row agree on one.
   decision — never a count kept in a process, which is what lets a restarted
   `serve`, and a `run` asking whether its flow's group is full, see the lease
   the rows hold. A slot frees when its execution settles, or the moment a
-  cancel of it is recorded.
+  cancel of it is recorded. The join is driven from the open lifecycle rows,
+  down `executions_by_status`, and matches the trigger on the lifecycle row's
+  own trigger — never from the intake rows, which are kept: what the read costs
+  is what is running, not the trigger's history.
 * **A started row is written before its execution is registered**, as a tick's
   `fired` row is (§3.11), and the start waits for the lifecycle row before the
   next decision reads the lease. A crash between the two leaves a `started` row
@@ -1462,12 +1473,29 @@ decisions about one row agree on one.
   and starts under the id it recorded; a row that did not was never answered,
   and is taken back (`abandonIntake`) for its arrival's source to re-deliver. A
   start the journal would not begin is undone the same two ways at once — a
-  waited row goes back to `queued`, naming why in `detail`.
+  waited row goes back to `queued`, naming why in `detail`. Where the journal
+  refuses that move too, the row stays `started` with no lifecycle row, which no
+  drain of the queue reads; the process keeps the start owed and makes the move
+  at its next look at the queue that the journal takes.
 * **A pending row is one per group.** `pendingIntake` finds the group's open
   debounce, and an arrival moves it — newest payload, one more `coalesced`, a
   deadline `debounce:` after now — or, finding none, writes one. The deadline is
   the row's, so a restarted `serve` re-arms each pending row from it, and one
   that passed while nothing ran closes at once.
+* **An arrival is counted in the move that records it.** Every arrival claims
+  its gate — its dedupe key (§3.12), its tick's `fired` row (§3.11) — under an id
+  of its own. An arrival that opens a pending row starts it under that id; one
+  that joins an open row is counted by the move that names its id and gate in
+  `joined_execution` and `joined_gate`, one statement, and its gate's row is
+  then re-pointed at the row's execution (`foldGate`, conditional on the row
+  still naming the arrival's id, and keeping its window). The next arrival's
+  move, the close and the next start of `serve` fold the row's newest arrival
+  first, so a crash between the move and the fold is finished later; and
+  `intakeOf` finds a row by its newest arrival's id too, so that arrival's
+  repeat is a repeat meanwhile. A gate a crash left before the move names an id
+  no row records: it holds no admission, so the arrival's repeat takes the key
+  over and is counted, and a tick's repair counts the tick — never lost, never
+  counted twice.
 * **Rows are kept.** A started row answers `GET /intakes/:id` after its
   execution has settled; nothing prunes the table, as nothing prunes `fired`
   rows. None holds a §4 key or is consumed by a replay.

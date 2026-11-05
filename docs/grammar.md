@@ -5786,8 +5786,11 @@ and claims the key in the journal's `dedupe` table, keyed `(trigger, key)`
 default, which is its TTL: a repeat inside the window starts nothing and is
 answered with what the first delivery got, under `X-AgentCompose-Deduped: true`;
 the same key after the window is a new claim and starts again. Expired rows are
-swept by the claim that finds them. `dedupe_window:` without a `dedupe_key:` is
-a compile error (`conflicting-keys`): there is no key for it to be the window of.
+swept by the claim that finds them. A key that answers the empty string names
+nothing a repeat could be told by, and refuses the request with a `400`, as a
+key that cannot be evaluated does — it claims nothing and starts nothing.
+`dedupe_window:` without a `dedupe_key:` is a compile error (`conflicting-keys`):
+there is no key for it to be the window of.
 
 **What an arrival is answered.** One trigger may declare both a key and a
 block, and the answer says which of them decided:
@@ -5795,7 +5798,7 @@ block, and the answer says which of them decided:
 | What happened | Status | Body | Header |
 |---|---|---|---|
 | started | `202` (`async`), or the sync answer (§13.3) | `{ execution_id, status_url }` | — |
-| a repeat inside the window | the first delivery's answer, re-read now: under `sync` the repeat waits on the first's execution up to the budget, as the first did | the first delivery's | `X-AgentCompose-Deduped: true` |
+| a repeat inside the window | the first delivery's answer, re-read now: under `sync` the repeat waits on the first's execution up to the budget, as the first did; an execution that settled before this `serve` started answers `202` with its `execution_id`, `status` and `status_url`, since its lifecycle row holds no outputs | the first delivery's | `X-AgentCompose-Deduped: true` |
 | queued | `202` | `{ intake_id, status: "queued", status_url }` | — |
 | pending — a debounce opened or joined | `202` | `{ intake_id, status: "pending", deadline, coalesced, status_url }` | — |
 | dropped | `202` | `{ execution_id, status_url, intake_id }` — the running execution's | `X-AgentCompose-Dropped: true` |
@@ -6154,8 +6157,10 @@ what fell after it on the same rule. A job catches itself up from
 `fired` row is claimed, and the row names the execution the intake will start:
 a tick that finds its group full is queued behind the run that holds it,
 dropped, or supersedes it, and still fires once. Under `debounce:` the ticks of
-one group coalesce into one pending row, and the claim of each names the
-execution that row will start ([D163](#d163-a-triggers-intake-a-dedupe-window-and-groups-leased-off-the-journal)).
+one group coalesce into one pending row: each tick's claim is made under an id
+of its own, recorded by the move that counts the tick and then pointed at the
+execution that row will start, so a tick a crash claimed and never counted is
+repaired into the row rather than lost ([D163](#d163-a-triggers-intake-a-dedupe-window-and-groups-leased-off-the-journal)).
 
 **Payload.** `payload.scheduled_at` is the tick's **nominal** instant, written in
 the trigger's zone with a numeric offset (`2026-11-04T03:00:00+01:00`;
@@ -6214,10 +6219,11 @@ the key in the journal's `dedupe` table, keyed `(trigger, key)`
 (`docs/durability.md` §3.12). The first claim is admitted — it starts an
 execution, or, under a `concurrency:` block, is queued, joins a debounce or is
 dropped (§13.1); a **repeat starts nothing** and is logged naming the execution
-that holds the key. A row is held for the trigger's `dedupe_window:`, `24h` by
-default, and expires then: the next event carrying the key after it starts
-again (PRD resolved q77 ruling a, which amends the "rows do not expire" this
-paragraph said under [D162](#d162-serve-fires-schedules-and-runs-a-kind-command-source-through-one-admission-function)). A claim whose execution was never
+that holds the key. A key that answers the empty string is refused for that
+trigger, logged, as one that cannot be evaluated is. A row is held for the
+trigger's `dedupe_window:`, `24h` by default, and expires then: the next event
+carrying the key after it starts again (PRD resolved q77 ruling a, which amends
+the "rows do not expire" this paragraph said under [D162](#d162-serve-fires-schedules-and-runs-a-kind-command-source-through-one-admission-function)). A claim whose execution was never
 journaled — `serve` died between the two — is taken over by the next event
 carrying the key, so a crash there cannot strand an event for good. An event the
 intake accepted — started, queued, pending, dropped or a repeat — moves its
@@ -13960,10 +13966,13 @@ every backend — no `JOURNAL_VERSION` bump (`docs/durability.md` §11.2):
   with its intake id), `held_by` (a dropped arrival's running execution),
   `payload` (a pending row's newest payload), `admission` (the bound inputs,
   session key, callback and traceparent a queued row starts with), `coalesced`,
-  `admitted_at`, `deadline`, `started_at` and `detail`; indexed by
-  `(trigger_name, state, group_hash)` and by `execution`, and on Postgres and
-  MySQL carrying a `seq` the queue is ordered by, where SQLite orders by
-  `rowid`. Created by `CREATE TABLE IF NOT EXISTS` on open.
+  `admitted_at`, `deadline`, `started_at`, `detail`, and `joined_execution` and
+  `joined_gate` (a pending row's newest counted arrival: the id its gate was
+  claimed under, and the gate); indexed by `(trigger_name, state, group_hash)`,
+  by `execution` and by `joined_execution`, and on Postgres and MySQL carrying a
+  `seq` the queue is ordered by, where SQLite orders by `rowid`. Created by
+  `CREATE TABLE IF NOT EXISTS` on open; a table an earlier build of this release
+  created gains the two `joined_` columns the way `dedupe.expires_at` is added.
 - **`dedupe.expires_at`** — the instant a dedupe row's window closes. Added on
   open where it is missing: SQLite probes `PRAGMA table_info`, Postgres
   `pg_attribute` in a `DO` block, MySQL `information_schema.columns`, each
@@ -13971,10 +13980,13 @@ every backend — no `JOURNAL_VERSION` bump (`docs/durability.md` §11.2):
   build wrote has none, and is read as expiring one window after it was
   admitted.
 
-The lease is one read — `leasesOf(trigger)`: the trigger's `started` intake
-rows joined to their open lifecycle rows, less those with a `cancellations`
-row. It is rows, not a counter, and `docs/distributed.md` §8 rule 2's list of
-exceptions names the `intakes` table beside the other intake tables.
+The lease is one read — `leasesOf(trigger)`: the trigger's open lifecycle
+rows joined to their `started` intake rows, less those with a `cancellations`
+row — driven from the open rows down `executions_by_status`, never from the
+intake's, which are kept and so are the trigger's whole history: what one
+admission costs is what is running, not what ever ran. It is rows, not a
+counter, and `docs/distributed.md` §8 rule 2's list of exceptions names the
+`intakes` table beside the other intake tables.
 
 **Collision review.** PRD resolved **q28** ("triggers fire once"): **amended**,
 by the one sentence q77 ruling f states — an admission the hub already accepted
@@ -14016,7 +14028,12 @@ ruling:
   under `respond: sync` — the execution's outputs, the repeat waiting on it up
   to the trigger's budget as the first did; where the first is still queued or
   pending, that arrival's intake answer; where it was dropped, the execution it
-  was dropped for.
+  was dropped for. An execution that settled before this `serve` started is not
+  on its board — recovery puts back only what is open — so a repeat of it is
+  answered off its lifecycle row: `202` with the id, the status and the status
+  URL, under `sync` too, because the row holds no outputs. One delivery is so
+  answered two ways across a restart; journaling outputs to answer it the same
+  is not done here.
 - **The window counts from the claim.** `expires_at` is the claim's admission
   plus the window, whether or not the execution it names is still running: a
   repeat after the window starts a second execution beside a first that has
@@ -14057,11 +14074,19 @@ ruling:
   (`docs/durability.md` §8). A debounced trigger's `input:` reading that header
   reads it absent when the debounce closes. A queued row holds the bound
   admission — inputs, session key, callback and traceparent — and no request.
-- **The gate names the intake's execution.** A tick's `fired` row and a dedupe
-  row are claimed under the id of the execution the arrival will start — under
-  a debounce, the id the open pending row will start — so every claim names an
-  execution the intake holds. A tick a dead process claimed, repaired into an
-  open debounce, moves that row onto the tick's id.
+- **Every gate is claimed under the arrival's own id.** A tick's `fired` row
+  and a dedupe row name the id of the execution the arrival starts. Under a
+  debounce, the arrival's id is not the execution's: the move that counts the
+  arrival into its group's pending row — one more `coalesced`, the newest
+  payload — records that id and the gate as the row's newest arrival in the
+  same statement, and the gate's row is then re-pointed at the execution the
+  pending row will start (`foldGate`), as the next arrival's move, the close and
+  the next start of `serve` also do first. So a gate naming the row's execution,
+  or the id the row records, is a counted arrival, and its repeat is answered
+  with the intake and counted nothing; a gate naming an id nothing records is a
+  claim a crash left before the count, and is taken over — a dedupe key — or
+  repaired — a tick — like any claim no admission began under, so the arrival
+  is counted when it comes again rather than lost.
 - **What a crash between a row and its execution leaves.** A `started` row is
   written before its execution is registered, as a tick's `fired` row is. At
   the next start, a row that **waited** — its arrival was answered with its
@@ -14070,7 +14095,12 @@ ruling:
   is taken back and its arrival's source re-delivers it. A start the journal
   would not begin is undone the same two ways at once: a waited row goes back on
   the queue, and an unwaited one is taken back and its arrival refused — a
-  `503` on `http` — as any admission the journal would not take is.
+  `503` on `http` — as any admission the journal would not take is. A journal
+  that refuses the move back onto the queue too leaves the waited row
+  `started`, naming an execution that never began, which no drain of the queue
+  reads; the process keeps the start owed and tries the move again at every look
+  at the trigger's queue until it lands, and the next start finds the row either
+  way.
 - **Intake rows are kept.** A started row is kept after its execution settles,
   so an `intake_id` keeps answering; a dropped row is kept too. Nothing prunes
   them, as nothing prunes `fired` rows.
@@ -14095,7 +14125,10 @@ ruling:
   `payload.coalesced`; two arrivals whose `concurrency.key` answers are equal
   strings are one group, and the key itself is kept beside its hash. A key that
   throws refuses the arrival — a `400` on `http`, a refusal for that trigger,
-  logged, for an event or a tick — like an input that does not bind.
+  logged, for an event or a tick — like an input that does not bind; so does a
+  `dedupe_key:` that answers the empty string, which names nothing a repeat
+  could be told by and would otherwise make every such delivery one for the
+  whole window, as an empty `session_key:` a flow needs is refused (D162).
 - **The serve log** names every decision under ``intake `<trigger>` ``: queued
   and for which execution, started, a debounce closed and over how many
   arrivals, dropped and why, superseded, a repaired start, and a start the
