@@ -601,7 +601,9 @@ evaluated after the trigger's `auth:` and held for `dedupe_window:`, `24h` by
 default: a repeat inside the window starts nothing and is answered with what the
 first delivery got, under `X-AgentCompose-Deduped: true` — beside a debounce,
 the intake it joined, without counting it again. After the window the same key
-starts again. A key that answers the empty string is refused with a `400`: it
+starts again. A window has no ceiling, and one that would end past the year 9999
+ends at its last instant, the latest the journal can write — as long as a key
+can be held. A key that answers the empty string is refused with a `400`: it
 names nothing to tell a repeat by. So is a `session_key:` that answers it for a
 flow that reaches a `scope: session` store — before the key is claimed, so the
 request is never answered as one that may be sent again.
@@ -638,7 +640,10 @@ ten pushes in quick succession into one build whose `pushes` is `10`.
 each arrival lands, before there is a count (`coalesced-in-key`).
 
 **What a caller is answered.** A request that starts an execution is answered as
-always. One that is queued or joins a debounce has no execution yet, so it gets
+always — under a `dedupe_key:` or `concurrency:`, once its execution is
+journaled, so one the journal will not begin is answered `503`, saying nothing
+started and the request may be sent again, and no `settled` webhook follows for
+it. One that is queued or joins a debounce has no execution yet, so it gets
 `202` with an `intake_id` of its own:
 
 ```json

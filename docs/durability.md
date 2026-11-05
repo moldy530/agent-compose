@@ -1343,7 +1343,10 @@ window closes. Written by `claimDedupe`, called through `admit` in
   `dedupe_window:` — `24h` by default — and a claim first deletes every row of
   its trigger whose `expires_at` has passed, in the same step, so a key seen
   again after its window is a new claim and the table holds no more than the
-  trigger's live windows. A row an older build wrote has no `expires_at`, and
+  trigger's live windows. The instants are compared as the fixed-width strings
+  they are, so an expiry past the last instant a four-digit year names,
+  `9999-12-31T23:59:59.999Z`, is written as that instant — the same holds for
+  a pending intake row's `deadline` (§3.15). A row an older build wrote has no `expires_at`, and
   is read as expiring one window — the claiming trigger's — after it was
   admitted. The sweep is two range reads down the index `dedupe_by_expiry`,
   `(trigger_name, expires_at, admitted_at)` — one for the rows whose window
@@ -1513,7 +1516,23 @@ decisions about one row agree on one.
   trigger's last `max_running:` — starts into the slot it was answered for. A
   look at the queue that stops at such a start, or still owes one, leaves the
   slots it freed to the rows waiting: an arrival behind it is queued after
-  them, never started ahead of them.
+  them, never started ahead of them. A refused start of a row that never
+  waited journals no `settled` delivery either: its arrival is refused — a
+  `503` on `http` — and its caller holds no `202` naming the execution, as for
+  any start a gate keeps (§3.11, §3.12).
+* **A start whose lifecycle row landed has begun, whatever the journal
+  answered.** A dialled journal can commit the `begin` insert and lose its
+  answer, so before a refused start is undone its lifecycle row is read: where
+  it is there the intake row stays `started`, holding the slot as the open
+  row's, and the execution runs at once in this process, resumed from its row
+  as recovery resumes one (§6.1) — nothing was recorded under it, so the
+  replay is its first run. A start a gate keeps reads it the same way, so a
+  tick's claim or an event's key never names an execution that began while
+  nothing runs it. And a waited row is never begun twice: before it is started
+  its execution is looked for — on this process's board, where a recovery put
+  it, or in the journal, where a start whose read of its own row missed the
+  commit left it — and a row whose execution exists is moved to `started` and
+  begun no further.
 * **A queued row is held to the serving build before it starts.** The
   `admission` was bound by the build that took the arrival, and the build
   serving when its slot frees — after a restart onto a new deploy — may refuse

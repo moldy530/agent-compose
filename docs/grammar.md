@@ -14122,6 +14122,15 @@ ruling:
   whose execution never began carries a fresh window. Expired rows are swept by
   the trigger's next claim, not by a timer, so a trigger nothing arrives for
   keeps its last rows until something does.
+- **A window or a debounce is held to the last instant the journal can
+  write**, `9999-12-31T23:59:59.999Z`. Neither duration has a ceiling (§4.4),
+  and the journal compares the instants it holds as strings: an expiry past
+  the year 9999 would be written with a signed six-digit year, which sorts
+  below every instant of this millennium — a row the trigger's next claim
+  sweeps as expired, so a window asked to hold for ever would hold for no
+  time at all — and one past the last instant a JavaScript `Date` names would
+  refuse every arrival. An expiry or a deadline later than that instant is
+  written as it: held for as long as asked, as far as the journal can say.
 - **The lease frees at the cancel, not the settle.** A slot is held by an
   execution whose cancel nobody has requested, so a superseding arrival starts
   the moment its predecessors' cancels are recorded, while they unwind and run
@@ -14266,7 +14275,29 @@ ruling:
   row closes it, as for any run (a debounce's close and a restart's repair
   alike). An arrival that waited and is then dropped — superseded, or no
   longer bound by the serving build — never began, and is pushed nothing;
-  its intake answers it. A journal
+  its intake answers it. **Nor is a refused start of an unwaited row**, nor
+  of any arrival a gate keeps — a dedupe key's, a tick's: each is answered
+  only once its lifecycle row is down, so its caller is told nothing started
+  (on `http` the `503` that says the request may be sent again) and holds no
+  `202` naming the execution; a `failed` push for it would be a settle of an
+  execution nobody was told of, beside the one the resend starts. Only a start
+  no gate keeps — an `http` request with no `dedupe_key:` and no
+  `concurrency:`, answered `202` as it is set going — is pushed the failure of
+  a run that stopped before its row. **A start whose lifecycle row is down
+  although the journal answered a failure has begun**: a dialled journal can
+  commit an insert and lose the answer. Undone, its arrival would start twice
+  — a waited row begun again under its id beside the execution the next start
+  recovers, an unwaited one refused while that execution runs anyway — so its
+  row stays `started`, holding its slot as the open execution's, and the
+  execution runs at once in this process as a recovery would run it, from its
+  row: its generation recorded nothing, so the replay is its first run, and
+  the start is answered as the start it was. A start a gate keeps reads its
+  row the same way. **A waited row whose execution has begun already** —
+  this process runs it, after a recovery, or the journal holds its row, which
+  a start whose read of its own row missed the commit leaves — is moved to
+  `started` and never begun again: begun again it would be refused beside the
+  recovered generation, taking that one's place on the board as it went, and
+  run whole a second time once that one settled. A journal
   that refuses the move back onto the queue too leaves the waited row
   `started`, naming an execution that never began, which no drain of the queue
   reads; the process keeps the start owed and tries the move again at every look
