@@ -637,7 +637,7 @@ Referencing anything else is a compile error.
 | inline `http` node `query` / `body` values | `input`, `state`, `execution` | field-typed |
 | `tool.<t>` `http:` binding `query` / `body` values | `input` **only** (the tool's own input object) | field-typed |
 | trigger `input:` values | `payload` | field-typed |
-| trigger `session_key`, `callback`, `dedupe_key` | `payload` | string |
+| trigger `session_key`, `callback`, `dedupe_key`, `concurrency.key` | `payload` — never `payload.coalesced` in `dedupe_key` or `concurrency.key`, which are evaluated before a debounce has counted anything (§13.1) | string |
 
 Root identifier meanings:
 
@@ -5577,6 +5577,7 @@ Every trigger has `type` and `flow`.
 | `flow` | `flow.*` ref | yes | the execution's entry module |
 | `input` | map flow-input-field→CEL over `payload` | `http`/`schedule`/`event` only | ILLEGAL on `manual` (§13.2); compile-checked against the flow's `inputs` |
 | `session_key` | CEL over `payload` → string | no (on `manual`, defaults to `"payload.session"`) | supplies session identity for session-scoped stores and history (PRD 5.8) |
+| `concurrency` | block (below) | no | `http`/`schedule`/`event` only; ILLEGAL on `manual` (§13.2, `concurrency-on-manual`); how the trigger's arrivals are admitted — groups, a limit per group, what a full group does, a debounce |
 | `description` | string | no | |
 
 **Input binding.** `input:` is legal on `http`, `schedule`, and `event` triggers
@@ -5594,6 +5595,77 @@ The identical check runs against the `--input k=v` arguments at run start,
 against the same flow input schema (§13.2) — the one place this check is
 deferred, for the same reason env-ref presence is (§4.3): the values do not exist
 until the command runs.
+
+**The intake: `concurrency:`** (PRD resolved q77 rulings b, c, d, f, Decision
+[D163](#d163-a-triggers-intake-a-dedupe-window-and-groups-leased-off-the-journal)). Every arrival a trigger receives — a request on an `http`
+route, a `schedule` tick, an event its source produced — is admitted through the
+one admission function a served app has ([D162](#d162-serve-fires-schedules-and-runs-a-kind-command-source-through-one-admission-function)), and a
+`concurrency:` block says how many of the executions arrivals start may run at
+once, and what an arrival that finds no room does:
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `key` | CEL over `payload` → string | — (one group for the whole trigger) | the **group** an arrival is admitted into; it may not read `payload.coalesced` (`coalesced-in-key`) |
+| `limit` | integer ≥ 1 | `1` | how many of one group's executions may run at once |
+| `on_conflict` | `queue` \| `drop` \| `supersede` | `queue` | what an arrival that finds its group full does |
+| `debounce` | duration (§4.4) | — | coalesce a group's arrivals into one execution, started once none has arrived for this long |
+| `max_running` | integer ≥ 1 | — (no bound past the groups') | the **trigger's** total across every group its `key:` makes — not a placement's `max_running:` (§14.1, PRD resolved q79), which is how many dispatches one worker session holds |
+
+`concurrency: {}` is every default: one group of one, which queues. The block is
+closed, and `limit:` and `max_running:` of `0` are refused — a group no execution
+may hold admits nothing.
+
+- **A group is a lease, and the lease is rows** (`docs/distributed.md` §8). A
+  slot is held by an execution the trigger started under the block whose
+  lifecycle row is open and whose cancel nobody has requested
+  (`docs/durability.md` §3.15). The lease is read off the journal at every
+  decision, never counted in a process, so a restarted `serve` finds exactly the
+  lease its predecessor's rows hold. A slot frees when its execution settles —
+  completed, failed or cancelled — or the moment its cancel is recorded.
+- **`queue`** journals the arrival as a `queued` intake row and starts it when
+  its group has a free slot: first in, first out within a group, a row whose
+  group is full passed over for a later one whose group has room, and nothing
+  started while the trigger is at its `max_running:`.
+- **`drop`** starts nothing. The arrival is answered with the group's running
+  execution and leaves a `dropped` intake row naming it.
+- **`supersede`** cancels the group's running executions — through the cancel
+  every execution has (§13.3, PRD resolved q75), so each one's open child
+  executions are cancelled with it — and starts the arrival in the slot that
+  frees. It never reaches another group: an arrival whose own group it emptied,
+  but whose trigger is at `max_running:` by other groups' executions, waits as
+  `queue` would.
+- **`debounce:`** coalesces a group's arrivals into one **pending** intake row
+  holding the newest payload. Each arrival moves the row's deadline to
+  `debounce:` after it; once the deadline passes with nothing new, one
+  execution is admitted with that payload — against the lease and its
+  `on_conflict:`, as any arrival is — and **`payload.coalesced`**, the number of
+  arrivals the debounce closed over, is a member of it. Carrying every
+  coalesced payload rather than the newest is deferred (PRD resolved q77 ruling
+  c).
+- **`payload.coalesced`** is an integer, and a member of the payload only on a
+  trigger whose block declares `debounce:` — read anywhere else it is an unknown
+  field, whose help says so. It is readable in `input:` and `session_key:`,
+  which bind when the execution starts. `dedupe_key:` and `concurrency.key` are
+  evaluated as each arrival lands — the one to decide whether it is a repeat,
+  the other which debounce it joins — before the count exists, so neither may
+  read it (`coalesced-in-key`). An arrival under a debounce is bound as it
+  lands too, with `payload.coalesced` `1`, so one the trigger could never start
+  is refused then rather than at the deadline.
+- **An arrival with no execution yet is answered with an id of its own.** A
+  queued or pending arrival is an `intake_id`, which `GET /intakes/:id` reports
+  on (§13.3); once it starts, the report names its execution. The other kinds
+  have no caller to answer, and their arrival is accepted all the same: a queued,
+  pending or dropped event moves its source's checkpoint (§14.4), and a tick's
+  `fired` row names the execution the intake will start (§13.4).
+- **Every intake row is the journal's.** A restarted `serve` starts what was
+  queued, in its order, as the lease allows, and arms each pending row at the
+  deadline the row records — one that passed while nothing ran closes at once
+  (`docs/durability.md` §6.3). Starting an arrival the intake already accepted
+  is not a re-fire: PRD resolved q28's "triggers fire once" is amended by that
+  one sentence, by q77 ruling f.
+- **The group a `run` is in.** A `run` is no arrival and is never admitted, and
+  a run of a flow that a trigger's **key-less** group covers is refused at start
+  while that group is full (§13.2).
 
 ### 13.2 `manual` (active in v0)
 
@@ -5621,6 +5693,20 @@ reaches a session-scoped store, and omitting it fails at start naming the store.
 Declaring a manual trigger is optional: the same CLI entry, with the same
 defaulted `session_key:`, exists implicitly for every flow (§13 preamble).
 
+**`concurrency:` is illegal here, and a run is refused rather than queued**
+(PRD resolved q77 ruling e, [D163](#d163-a-triggers-intake-a-dedupe-window-and-groups-leased-off-the-journal)). A manual trigger has no
+arrivals — it describes a command somebody typed — so a `concurrency:` block on
+one is a compile error, `concurrency-on-manual`, rather than a bound nothing
+enforces. What a run does respect is the groups other triggers declare: a run
+shares the project's journal, so it reads the lease the serving process holds,
+and a run of a flow that some `http`, `schedule` or `event` trigger's
+**key-less** group covers is refused at start while that group has no free slot
+— counting the trigger's `max_running:` — exit `2`, naming the execution that
+holds it, with nothing started or journaled. It never waits for a slot: a
+terminal is not a queue. A keyed group's `key:` is CEL over a payload a run does
+not have, so no keyed group covers a run; and a run that starts holds no slot,
+because the lease is the trigger's executions and a run is not one of them.
+
 ### 13.3 `http` (active in v0)
 
 | Key | Type | Required | Default | Notes |
@@ -5634,6 +5720,8 @@ defaulted `session_key:`, exists implicitly for every flow (§13 preamble).
 | `auth` | block; exactly one of `bearer:`/`hmac:` | no | — | how an inbound call is authenticated; absent leaves the route open |
 | `callback_auth` | block; at least one of `bearer:`/`hmac:`, both legal | no | — | how a delivery identifies itself; requires `callback:`, and makes `callback_allow:` MANDATORY |
 | `callback_allow` | non-empty list of URL patterns, each naming a scheme and a host | with `callback_auth` | — | where a callback may point; requires `callback:` |
+| `dedupe_key` | CEL over `payload` → string | no | — | how a repeat delivery is recognised; no default — a request body has no id of its own — so without it nothing is deduplicated; may not read `payload.coalesced` |
+| `dedupe_window` | duration | no | `24h` | how long a key is held; requires `dedupe_key:` |
 
 `payload` shape: `payload.body` (decoded JSON object), `payload.query` (map of
 string), `payload.headers` (map of string, lowercase names), `payload.path`
@@ -5686,7 +5774,44 @@ a flow input field can accept it.
   completed, failed or been cancelled, and `404` for an id the process does not
   know. Like the other two it is the app's own, so a trigger cannot declare it.
   A fifth, `GET /sources/:name`, reports an event source's consumer (§14.4,
-  PRD resolved q78) and is reserved the same way.
+  PRD resolved q78), and a sixth, `GET /intakes/:id`, an arrival a trigger's
+  intake admitted (below, PRD resolved q77); both are reserved the same way.
+
+**Recognising a repeat: `dedupe_key:` and `dedupe_window:`** (PRD resolved q77
+ruling a, [D163](#d163-a-triggers-intake-a-dedupe-window-and-groups-leased-off-the-journal)). An `http` trigger declaring a `dedupe_key:`
+evaluates it over the payload after its `auth:` has verified the caller and
+before anything else — before an execution, an intake row or a group exists —
+and claims the key in the journal's `dedupe` table, keyed `(trigger, key)`
+(`docs/durability.md` §3.12). The row is held for `dedupe_window:`, `24h` by
+default, which is its TTL: a repeat inside the window starts nothing and is
+answered with what the first delivery got, under `X-AgentCompose-Deduped: true`;
+the same key after the window is a new claim and starts again. Expired rows are
+swept by the claim that finds them. `dedupe_window:` without a `dedupe_key:` is
+a compile error (`conflicting-keys`): there is no key for it to be the window of.
+
+**What an arrival is answered.** One trigger may declare both a key and a
+block, and the answer says which of them decided:
+
+| What happened | Status | Body | Header |
+|---|---|---|---|
+| started | `202` (`async`), or the sync answer (§13.3) | `{ execution_id, status_url }` | — |
+| a repeat inside the window | the first delivery's answer, re-read now: under `sync` the repeat waits on the first's execution up to the budget, as the first did | the first delivery's | `X-AgentCompose-Deduped: true` |
+| queued | `202` | `{ intake_id, status: "queued", status_url }` | — |
+| pending — a debounce opened or joined | `202` | `{ intake_id, status: "pending", deadline, coalesced, status_url }` | — |
+| dropped | `202` | `{ execution_id, status_url, intake_id }` — the running execution's | `X-AgentCompose-Dropped: true` |
+
+Every arrival under one debounce is answered with the one `intake_id`, and a
+repeat of an arrival still queued or pending is answered with that arrival's.
+`status_url` is `/intakes/<intake_id>` where there is no execution yet.
+
+**`GET /intakes/:id`** reports one arrival a trigger's intake admitted: its
+`intake_id`, `trigger`, `state` — `queued`, `pending`, `started` or `dropped` —
+`admitted_at`, `coalesced` and, for a keyed group, `group`; a `pending` one's
+`deadline`; a `started` one's `execution_id`, `status_url` and `started_at`; a
+`dropped` one's `running_execution_id` and `detail`. A started row is kept after
+its execution settles, so an id handed out once keeps answering. `404` for an id
+the journal does not hold. It enforces the `auth:` of the trigger whose arrival
+the row is, as an execution's routes do (below).
 
 **`auth:`, `callback_auth:` and `callback_allow:` are enforced by the generated
 app.** A served trigger declaring `auth:` verifies its caller before it reads a
@@ -5787,7 +5912,10 @@ the auth of **the trigger that started that execution**, checked before anything
 about the execution is said: an execution an authenticated trigger began never
 answers an unauthenticated poll or resume, and an execution a no-auth trigger
 began keeps open routes (PRD resolved q32). `run` is untouched — no server, no
-caller to verify.
+caller to verify. `GET /intakes/:id` is guarded the same way, by the `auth:`
+of the trigger whose arrival the intake row is: an arrival is that trigger's
+work before it has an execution
+([D163](#d163-a-triggers-intake-a-dedupe-window-and-groups-leased-off-the-journal)).
 
 **What an `hmac` trigger asks of those two routes** is worth spelling out,
 because the two schemes do not cost a client the same thing. A `bearer`
@@ -6022,12 +6150,20 @@ process stalled, the machine slept — fires the tick it was waiting for and ski
 what fell after it on the same rule. A job catches itself up from
 `payload.scheduled_at`.
 
+**A tick under `concurrency:`** is admitted like any arrival (§13.1), after its
+`fired` row is claimed, and the row names the execution the intake will start:
+a tick that finds its group full is queued behind the run that holds it,
+dropped, or supersedes it, and still fires once. Under `debounce:` the ticks of
+one group coalesce into one pending row, and the claim of each names the
+execution that row will start ([D163](#d163-a-triggers-intake-a-dedupe-window-and-groups-leased-off-the-journal)).
+
 **Payload.** `payload.scheduled_at` is the tick's **nominal** instant, written in
 the trigger's zone with a numeric offset (`2026-11-04T03:00:00+01:00`;
 `+00:00` under `UTC`) — when the tick was due, not when it ran.
-`payload.trigger` is the trigger's name. `session_key:` reads the same payload;
-`auth:`, `respond:`, `callback:` and the rest of §13.3's surface are `http`'s
-alone.
+`payload.trigger` is the trigger's name; under a `debounce:`,
+`payload.coalesced` is a member too (§13.1). `session_key:` reads the same
+payload; `auth:`, `respond:`, `callback:`, `dedupe_key:` and the rest of §13.3's
+surface are `http`'s alone — a tick is deduplicated by its own `fired` row.
 
 ### 13.5 `event` (active: `serve` runs its source's consumer)
 
@@ -6045,7 +6181,8 @@ ingest:
 |---|---|---|---|
 | `source` | identifier | yes | logical name; bound to what feeds it by `event_sources:` (§14.4) |
 | `input` | map field→CEL over `payload` | no | `payload.id`, `payload.body`, `payload.attributes`, `payload.source` |
-| `dedupe_key` | CEL over `payload` → string | no (default `payload.id`) | inbound at-least-once dedupe (PRD 5.11) |
+| `dedupe_key` | CEL over `payload` → string | no (default `payload.id`) | inbound at-least-once dedupe (PRD 5.11); may not read `payload.coalesced` |
+| `dedupe_window` | duration | no (default `24h`) | how long a key is held, the TTL of its row (PRD resolved q77 ruling a) |
 | `auth` | §13.3's `auth:` block, `bearer:` or `hmac:` | no | guards the routes about this trigger's work — the status, resume and cancel routes of every execution it starts, and its source's `GET /sources/:name` (§14.4); nobody calls an `event` trigger, so it authenticates no start |
 
 **Who feeds it.** `serve` runs one consumer per declared source that some
@@ -6074,11 +6211,17 @@ rest of §13.3's surface stay `http`'s alone.
 function a served app has — the same one an `http` start goes through (§13.3)
 — which binds `input:` and `session_key:`, evaluates `dedupe_key:` and claims
 the key in the journal's `dedupe` table, keyed `(trigger, key)`
-(`docs/durability.md` §3.12). The first claim starts an execution; a **repeat
-starts nothing** and is logged naming the execution that holds the key. Rows do
-not expire. A claim whose execution was never journaled — `serve` died between
-the two — is taken over by the next event carrying the key, so a crash there
-cannot strand an event for good.
+(`docs/durability.md` §3.12). The first claim is admitted — it starts an
+execution, or, under a `concurrency:` block, is queued, joins a debounce or is
+dropped (§13.1); a **repeat starts nothing** and is logged naming the execution
+that holds the key. A row is held for the trigger's `dedupe_window:`, `24h` by
+default, and expires then: the next event carrying the key after it starts
+again (PRD resolved q77 ruling a, which amends the "rows do not expire" this
+paragraph said under [D162](#d162-serve-fires-schedules-and-runs-a-kind-command-source-through-one-admission-function)). A claim whose execution was never
+journaled — `serve` died between the two — is taken over by the next event
+carrying the key, so a crash there cannot strand an event for good. An event the
+intake accepted — started, queued, pending, dropped or a repeat — moves its
+source's checkpoint; one it refused moves nothing (§14.4).
 
 A `source:` not defined in the active target's `event_sources:` is a compile
 error naming the target — target-dependent, like backend alias resolution
@@ -13505,7 +13648,9 @@ where to resume.
   execution. `http`'s `start()` is refactored onto it with its behaviour
   unchanged. An `event` trigger's `dedupe_key:` — default `payload.id` — is
   enforced through a `dedupe` table keyed `(trigger, key)` whose rows do not
-  expire; a repeat starts nothing and is logged.
+  expire; a repeat starts nothing and is logged. (*Amended by [D163](#d163-a-triggers-intake-a-dedupe-window-and-groups-leased-off-the-journal):
+  rows expire after the trigger's `dedupe_window:`, `24h` by default — the note
+  below.*)
 
 **Typing.** The `checkpoint:` expression is typed over `{body, source,
 attributes}` — the event payload without `id`, because the checkpoint *is* the
@@ -13726,8 +13871,239 @@ the implementation's own readings and await the owner's ruling:
   event's; what it does not keep is the repair and the takeover above, which
   is the rule-3 conflict recorded there.
 
+**Amended by [D163](#d163-a-triggers-intake-a-dedupe-window-and-groups-leased-off-the-journal)** (PRD resolved q77), by two clauses. The
+`dedupe` table's rows **expire**: each is held for its trigger's
+`dedupe_window:`, `24h` by default, and a key seen again after it starts again —
+so ruling e's "rows do not expire", and the collision review's "until it lands,
+rows do not expire and no group is enforced", describe the release before
+q77's. And `admit()` is the seam q77 lands on, extended rather than forked: the
+gate it claims — the tick's `fired` row, the dedupe key — is claimed first,
+under the execution id the intake will start, and only then is the trigger's
+group asked. The fired row is untouched: a tick is still claimed once, and its
+row now may name an execution a queue or a debounce starts later.
+
 *PRD resolved q7, q28, q32, q36, q37, q63, q77, q78; PRD 5.11, §7 M3; §13.4,
 §13.5, §14.4, §15; amends D46 and D87.*
+
+### D163. A trigger's intake: a dedupe window, and groups leased off the journal
+
+Every arrival a served trigger receives — an `http` request, a `schedule` tick,
+an `event` — passes one intake (PRD resolved q77). An `http` trigger may declare
+a `dedupe_key:` and every `http` or `event` trigger a `dedupe_window:`, the TTL
+of the key's row; and an `http`, `schedule` or `event` trigger may declare a
+`concurrency:` block — `key`, `limit`, `on_conflict: queue | drop | supersede`,
+`debounce`, `max_running` — which admits its arrivals into **groups**, each a
+lease held by its running executions and read off the journal's rows. An arrival
+with no execution yet is answered with an `intake_id`, which `GET /intakes/:id`
+reports on. §13.1, §13.2, §13.3 and §13.5 state the surface; this entry records
+why it is that shape and what it reads into the ruling.
+
+**Rationale.** What was: `serve` started an execution for every arrival — a
+burst of webhook redeliveries was as many runs, a push storm on one branch as
+many builds of it, and an `event` trigger's dedupe row held a key for the life
+of the journal ([D162](#d162-serve-fires-schedules-and-runs-a-kind-command-source-through-one-admission-function)). What is: the owner ruled an intake ledger in the
+journal, every row of it durable, every group a lease over a set of executions —
+`docs/distributed.md` §8's invariant, never a journal-global counter. The lease
+is the rows because a count kept anywhere else is one a crash forgets or a
+second process does not see: a slot is an execution the trigger started under
+its block whose lifecycle row is open and whose cancel nobody requested, so what
+holds a slot is exactly what the journal says is running, and a restarted
+`serve` finds the lease its predecessor left without having to have been told.
+
+**The rulings, as built.**
+
+- **(a) Dedupe.** `dedupe_key:` on `http` (CEL over `payload`, no default) and
+  `dedupe_window:` on `http` and `event` (a literal duration, default `24h`;
+  on `http` only beside a key, `conflicting-keys` otherwise). The key is
+  evaluated after the trigger's `auth:` and before anything exists, and claimed
+  in the `dedupe` table; a repeat inside the window starts nothing and is
+  answered with the first delivery's answer under `X-AgentCompose-Deduped:
+  true`. The row's `expires_at` is its admission plus the window, and the next
+  claim of the trigger sweeps what has expired.
+- **(b) Groups.** `concurrency:` is closed, legal on `http`, `schedule` and
+  `event` and refused on `manual` (`concurrency-on-manual`, with its explain
+  page); `limit:` defaults to `1` and, with `max_running:`, is at least `1`.
+  `queue` journals a `queued` row started first in first out per group as a
+  slot frees; `drop` answers the running execution's id under
+  `X-AgentCompose-Dropped: true` and journals a `dropped` row; `supersede`
+  cancels the group's running executions through [D160](#d160-a-cancel-ends-an-execution-cancelled-through-one-controller-every-node-chains-to)'s cancel — the
+  cascade reaches their children (PRD resolved q65, q75) — and starts.
+  `max_running:` is the trigger's total across its groups.
+- **(c) Debounce.** An arrival opens or extends its group's one `pending` row —
+  the newest payload, a deadline `debounce:` after the arrival, the count —
+  and at the deadline one execution is admitted with that payload and
+  `payload.coalesced`. `payload.coalesced` is typed `int` and is a member of the
+  payload only on a debounced trigger; `dedupe_key:` and `concurrency.key` may
+  not read it (`coalesced-in-key`, with its explain page), since both are
+  evaluated before it exists. Carrying every coalesced payload is deferred.
+- **(d) Addressing.** A queued or pending arrival is answered `202` with
+  `{ intake_id, status, status_url }` — a pending one with its `deadline` and
+  `coalesced` too — and `GET /intakes/:id` answers `queued | pending | started
+  { execution_id } | dropped`, under the trigger's `auth:` (PRD resolved q32).
+  It is the app's sixth reserved route, so a trigger cannot declare it.
+- **(e) `run`.** A run of a flow a trigger's group covers is refused at start
+  while the group has no free slot, naming the execution holding it — exit `2`,
+  nothing started or journaled — and never queues.
+- **(f) Restart.** After recovery and before any admission, each trigger's rows
+  are looked at: what was queued starts in its order as the lease allows, each
+  pending row is armed at the deadline it records, and a start a dead process
+  claimed and never journaled is repaired once.
+
+**The journal.** One new table and one new column, each migrated on open on
+every backend — no `JOURNAL_VERSION` bump (`docs/durability.md` §11.2):
+
+- **`intakes`** — one row per arrival the intake held or started:
+  `id` (the `intake_id`, `int_<uuid>`), `trigger_name`, `group_hash` (the
+  SHA-256 of the group's key, the empty string for the key-less group) and
+  `group_key`, `state` (`queued`, `pending`, `started`, `dropped`), `execution`
+  (the id it starts or started), `waited` (whether the arrival was answered
+  with its intake id), `held_by` (a dropped arrival's running execution),
+  `payload` (a pending row's newest payload), `admission` (the bound inputs,
+  session key, callback and traceparent a queued row starts with), `coalesced`,
+  `admitted_at`, `deadline`, `started_at` and `detail`; indexed by
+  `(trigger_name, state, group_hash)` and by `execution`, and on Postgres and
+  MySQL carrying a `seq` the queue is ordered by, where SQLite orders by
+  `rowid`. Created by `CREATE TABLE IF NOT EXISTS` on open.
+- **`dedupe.expires_at`** — the instant a dedupe row's window closes. Added on
+  open where it is missing: SQLite probes `PRAGMA table_info`, Postgres
+  `pg_attribute` in a `DO` block, MySQL `information_schema.columns`, each
+  followed by `ADD COLUMN`. A row an older
+  build wrote has none, and is read as expiring one window after it was
+  admitted.
+
+The lease is one read — `leasesOf(trigger)`: the trigger's `started` intake
+rows joined to their open lifecycle rows, less those with a `cancellations`
+row. It is rows, not a counter, and `docs/distributed.md` §8 rule 2's list of
+exceptions names the `intakes` table beside the other intake tables.
+
+**Collision review.** PRD resolved **q28** ("triggers fire once"): **amended**,
+by the one sentence q77 ruling f states — an admission the hub already accepted
+is not a re-fire — so a restarted `serve` starting a queued arrival or closing a
+pending debounce is the intake paying what it owes, and recovery still re-fires
+nothing (`docs/durability.md` §6.3 carries the amended rule). **q32** (inbound
+auth): the dedupe key is evaluated after the trigger's `auth:`, and the intake
+route enforces the trigger's `auth:` as an execution's routes do. **q35** (the
+outbound delivery ledger): mirrored, not touched — the intake is the inbound
+ledger, journaled the same way. **q36** (`http` is the webhook): stands; no
+trigger kind is added. **q65** and **q75**: `supersede` is q75's cancel, so it
+cascades to q65's child executions, and the slot frees when the cancel is
+recorded. **q79**: a placement's `max_running:` ([D161](#d161-max_running-is-how-many-dispatches-one-worker-session-holds-for-a-placement)) is a different
+key with the same name — how many dispatches one worker session holds — and
+the trigger's `concurrency.max_running:` bounds its own executions across its
+groups; each is documented naming the other. [D28](#d28-max_concurrency-is-required-on-the-map-node-routes-may-only-tighten-it) (map admission):
+untouched — `max_concurrency:` bounds a map's items inside one execution, the
+intake bounds executions. [D162](#d162-serve-fires-schedules-and-runs-a-kind-command-source-through-one-admission-function): its admission seam is the one this lands
+on, and its "rows do not expire" is amended, with a note on it. **§13.5**:
+`dedupe_key:` keeps executing, under q78, now with a window. `docs/distributed.md`
+**§8**: rule 2's exception list gains the `intakes` table; rule 3 is **not**
+amended, and the conflict below is recorded for the owner.
+
+**Status**: shipped as written here. The ruling fixes the keys, their defaults,
+the headers, the `intake_id` and its route, the refused `run` and the restart.
+The following are the implementation's own readings and await the owner's
+ruling:
+
+- **Which groups cover a `run`.** A run is in a trigger's group only where the
+  trigger declares no `concurrency.key`: the key is CEL over a payload a run
+  does not have, so no keyed group covers one. A key-less group covers a run of
+  its trigger's flow, counting the trigger's `max_running:`. A run that starts
+  holds no slot — the lease is the trigger's executions, and a run is not one
+  of them — so arrivals are not held back by runs. This is the reading most
+  worth the owner's eye: ruling e says "a flow some trigger's group covers"
+  without saying which.
+- **A repeat's answer.** A repeat inside the window is answered with the first
+  delivery's answer as it stands now: the execution's id and status URL, or —
+  under `respond: sync` — the execution's outputs, the repeat waiting on it up
+  to the trigger's budget as the first did; where the first is still queued or
+  pending, that arrival's intake answer; where it was dropped, the execution it
+  was dropped for.
+- **The window counts from the claim.** `expires_at` is the claim's admission
+  plus the window, whether or not the execution it names is still running: a
+  repeat after the window starts a second execution beside a first that has
+  not finished (the window is the row's TTL, ruling a). A takeover of a claim
+  whose execution never began carries a fresh window. Expired rows are swept by
+  the trigger's next claim, not by a timer, so a trigger nothing arrives for
+  keeps its last rows until something does.
+- **The lease frees at the cancel, not the settle.** A slot is held by an
+  execution whose cancel nobody has requested, so a superseding arrival starts
+  the moment its predecessors' cancels are recorded, while they unwind and run
+  their `finally:` nodes beside it.
+- **`supersede` cancels every running execution of the group**, not only the
+  oldest; and where the trigger's `max_running:` is held by other groups'
+  executions, which a supersede never cancels, the arrival waits as `queue`
+  would.
+- **What `drop` answers.** `202`, the group's oldest running execution — or the
+  trigger's, where it is `max_running:` that is full — its status URL, and the
+  dropped row's `intake_id`; never a `409` or `429`, since the ruling answers a
+  dropped arrival with an execution rather than refusing it.
+- **Queue order and progress.** First in, first out per group by journal order
+  (`seq`, or `rowid` on SQLite); a row whose group is full is passed over for a
+  later row of a group with room; nothing starts while the trigger is at its
+  `max_running:`. A queue is looked at again when an execution of its trigger
+  settles or is cancelled in this process, and every two seconds while it holds
+  rows — a settle another process wrote, such as a `resume` that finished one,
+  is seen by nothing else.
+- **A debounce is trailing and unbounded.** Each arrival moves the deadline to
+  `debounce:` after itself, with no longest wait, so arrivals that never pause
+  never start. At the deadline the one execution is decided against the lease
+  and `on_conflict:` as any arrival is — a debounce under `drop` whose group is
+  busy is dropped, one under `queue` is queued. Each arrival is bound as it
+  lands, with `payload.coalesced` `1`, so a request the trigger could never
+  start is a `400` then; the close binds the newest payload again, and one that
+  no longer binds is dropped, naming why.
+- **What a pending row holds of a request.** The decoded request — body,
+  query, headers, path, method — without the header the trigger's `auth:`
+  verified, which carries a credential and is never journaled
+  (`docs/durability.md` §8). A debounced trigger's `input:` reading that header
+  reads it absent when the debounce closes. A queued row holds the bound
+  admission — inputs, session key, callback and traceparent — and no request.
+- **The gate names the intake's execution.** A tick's `fired` row and a dedupe
+  row are claimed under the id of the execution the arrival will start — under
+  a debounce, the id the open pending row will start — so every claim names an
+  execution the intake holds. A tick a dead process claimed, repaired into an
+  open debounce, moves that row onto the tick's id.
+- **What a crash between a row and its execution leaves.** A `started` row is
+  written before its execution is registered, as a tick's `fired` row is. At
+  the next start, a row that **waited** — its arrival was answered with its
+  intake id — and whose execution has no lifecycle row starts under the id it
+  recorded, once; a row that did not wait was answered with nothing yet, so it
+  is taken back and its arrival's source re-delivers it. A start the journal
+  would not begin is undone the same two ways at once: a waited row goes back on
+  the queue, and an unwaited one is taken back and its arrival refused — a
+  `503` on `http` — as any admission the journal would not take is.
+- **Intake rows are kept.** A started row is kept after its execution settles,
+  so an `intake_id` keeps answering; a dropped row is kept too. Nothing prunes
+  them, as nothing prunes `fired` rows.
+- **An event the intake accepted moves the checkpoint** — started, queued,
+  pending, dropped or a repeat — so a dropped event is gone by design; one the
+  intake refused moves nothing.
+- **One trigger's decisions run one at a time in this process**, and each start
+  waits for its lifecycle row before the next decision reads the lease, so two
+  arrivals can never both read one slot free. That is a serialization, not a
+  counter — what is counted is still rows — and it holds while **one process
+  writes the journal**: `docs/durability.md` §2.1's rule, which the writer guard
+  enforces today (§2.3). Two hubs over one journal without the guard would each
+  read a slot free and both start; and a `run` refused by the lease reads it
+  without the serving process's lock, so on SQLite a run and an arrival
+  deciding together can both see the last slot free. `docs/distributed.md` §8
+  rule 3 forbids a protocol assuming one writer, and this release does not amend
+  it: whether the intake stands as a named exception, or moves its decision
+  under the execution-set lease rule 1 requires, is the owner's call, owed
+  before the writer guard is lifted for multi-hub — the same call D162's Status
+  records for the tick repair and the dedupe takeover.
+- **The keys.** Both are evaluated over the payload as it arrived, without
+  `payload.coalesced`; two arrivals whose `concurrency.key` answers are equal
+  strings are one group, and the key itself is kept beside its hash. A key that
+  throws refuses the arrival — a `400` on `http`, a refusal for that trigger,
+  logged, for an event or a tick — like an input that does not bind.
+- **The serve log** names every decision under ``intake `<trigger>` ``: queued
+  and for which execution, started, a debounce closed and over how many
+  arrivals, dropped and why, superseded, a repaired start, and a start the
+  journal would not begin.
+
+*PRD resolved q28, q32, q35, q36, q65, q75, q77, q78, q79; §4.1, §13.1–§13.5;
+`docs/durability.md` §3.12, §3.15, §6.3, §8, §11.2; `docs/distributed.md` §8;
+amends D162.*
 
 ## Appendix B — Editor integration
 

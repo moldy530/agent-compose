@@ -75,6 +75,7 @@ definition.
 | `flow` | yes | a `flow.*` reference; the execution's entry module |
 | `input` | `http`/`schedule`/`event` only | flow-input field → CEL over `payload`; **illegal on `manual`** |
 | `session_key` | no | CEL over `payload` → string |
+| `concurrency` | no | `http`/`schedule`/`event` only; **illegal on `manual`** — how arrivals are admitted (below) |
 | `description` | no | |
 
 Where `input:` is legal it is compile-checked against the target flow's
@@ -102,6 +103,10 @@ a session identity available, which is what makes the session-coherence check
 satisfiable with no binding. Supplying the value is a run-time requirement:
 `--session` is mandatory for a run whose flow reaches a session-scoped store.
 
+A manual trigger takes no `concurrency:` block (`concurrency-on-manual`): a run
+is a command at a terminal, and a terminal is not a queue. A `run` does respect
+the groups other triggers declare — see "A run is refused, never queued", below.
+
 ## `http`
 
 | Key | Required | Default | Notes |
@@ -115,6 +120,8 @@ satisfiable with no binding. Supplying the value is a run-time requirement:
 | `auth` | no | — | how an inbound call is authenticated; exactly one of `bearer:`/`hmac:` |
 | `callback_auth` | no | — | how a delivery identifies itself; `bearer:`, `hmac:`, or both |
 | `callback_allow` | with `callback_auth` | — | where a callback may point |
+| `dedupe_key` | no | — | CEL over `payload` → string; how a repeat delivery is recognised |
+| `dedupe_window` | with `dedupe_key` | `24h` | how long a key is held |
 
 `payload` is `payload.body` (a decoded JSON object), `payload.query`,
 `payload.headers` (lowercase names), `payload.path`, `payload.method`.
@@ -481,6 +488,8 @@ What the runtime does around it:
 - **Dedupe.** `dedupe_key:` defaults to `payload.id`, so an event the program
   emits twice — the lines after its last accepted checkpoint, when it is
   restarted — starts one execution; the repeat is logged and starts nothing.
+  The key is held for `dedupe_window:` (default `24h`), and the same key after
+  that starts again.
 - **A line that is not a JSON object** is refused, logged with its line number
   and counted; it starts nothing. stderr goes to the serve log, tagged
   `[source reports]`, a line longer than 1 MiB cut there.
@@ -511,6 +520,130 @@ why the script above waits on it: a `serve` killed outright sends nothing, and
 the end of that pipe is how its program learns it has gone. `redis_streams`,
 `sqs` and `nats` keep their vocabulary and `validate` accepts them, but `serve`
 refuses a target that declares one, naming the source.
+
+## The intake: deduplicating, bounding and debouncing arrivals
+
+Every arrival — a request, a tick, an event — passes one intake before it
+starts anything. Two things can be declared about it: **how a repeat is
+recognised**, and **how many executions may run at once**.
+
+```yaml spec
+version: "0.1"
+
+flow.build:
+  inputs:
+    repo: { type: string }
+    pushes: { type: integer, default: 1 }
+  outputs: {}
+  nodes:
+    build:
+      exec: { command: "true" }   # stands in for the real work
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }
+
+triggers:
+  # One build per repository at a time; later pushes wait their turn.
+  pushed:
+    type: http
+    flow: flow.build
+    path: /pushes
+    dedupe_key: "payload.headers['x-delivery-id']"   # the provider's redelivery id
+    dedupe_window: 6h
+    input: { repo: "payload.body.repo" }
+    concurrency:
+      key: "payload.body.repo"
+      limit: 1
+      on_conflict: queue
+
+  # A nightly sweep that never overlaps itself: a tick that finds the last
+  # one still running is dropped, not stacked.
+  nightly:
+    type: schedule
+    flow: flow.build
+    cron: "0 3 * * *"
+    input: { repo: "'all'" }
+    concurrency:
+      on_conflict: drop
+
+  # Only the newest change matters: a new one cancels the build in flight.
+  latest:
+    type: event
+    flow: flow.build
+    source: changes
+    input: { repo: "payload.body.repo" }
+    concurrency:
+      key: "payload.body.repo"
+      on_conflict: supersede
+
+  # A burst of pushes is one build, started once the burst goes quiet.
+  burst:
+    type: http
+    flow: flow.build
+    path: /bursts
+    input:
+      repo: "payload.body.repo"
+      pushes: "payload.coalesced"
+    concurrency:
+      key: "payload.body.repo"
+      debounce: 30s
+      max_running: 4
+```
+
+**`dedupe_key:` and `dedupe_window:`.** An `http` trigger's `dedupe_key:` has no
+default — a request body has no id of its own — so a trigger deduplicates only
+when it declares one; an `event` trigger's defaults to `payload.id`. The key is
+evaluated after the trigger's `auth:` and held for `dedupe_window:`, `24h` by
+default: a repeat inside the window starts nothing and is answered with what the
+first delivery got, under `X-AgentCompose-Deduped: true`. After the window the
+same key starts again.
+
+**`concurrency:`** admits arrivals into **groups** — one per `key:` value, or one
+for the whole trigger without a `key:` — each with `limit:` slots (default `1`).
+A slot is held by a running execution the trigger started, and the journal's
+rows are the count: a restarted `serve` sees exactly what is still running.
+`max_running:` is the trigger's total across all its groups — not a placement's
+`max_running:`, which bounds one worker session's dispatches. An arrival that
+finds its group full does what `on_conflict:` says:
+
+- **`queue`** (the default) waits, and starts first in first out as its group's
+  slots free. `pushed` above builds each repository's pushes one at a time, in
+  order, and two repositories build side by side.
+- **`drop`** starts nothing and is answered with the running execution, under
+  `X-AgentCompose-Dropped: true`. `nightly`'s tick finds last night's sweep
+  still going and lets it finish.
+- **`supersede`** cancels the group's running executions — and the child
+  executions they started — and starts the newcomer. `latest` always builds
+  the newest change.
+
+**`debounce:`** coalesces a group's arrivals into one execution, started once no
+arrival has come for that long, with the newest payload and
+**`payload.coalesced`** — how many arrivals it closed over. `burst` above turns
+ten pushes in quick succession into one build whose `pushes` is `10`.
+`payload.coalesced` exists only on a debounced trigger, and only `input:` and
+`session_key:` may read it: `dedupe_key:` and `concurrency.key` are evaluated as
+each arrival lands, before there is a count (`coalesced-in-key`).
+
+**What a caller is answered.** A request that starts an execution is answered as
+always. One that is queued or joins a debounce has no execution yet, so it gets
+`202` with an `intake_id` of its own:
+
+```json
+{ "intake_id": "int_5d0c…", "status": "queued", "status_url": "/intakes/int_5d0c…" }
+```
+
+`GET /intakes/:id` follows it — `queued`, `pending` (with its `deadline`),
+`started` (with its `execution_id` and `status_url`) or `dropped` — under the
+trigger's `auth:`, and keeps answering after the execution has settled. Every
+intake row is journaled: a restarted `serve` starts what was queued, in order,
+and closes each debounce at its recorded deadline. Starting an arrival the
+intake already accepted is not a re-fire, so nothing starts twice.
+
+**A run is refused, never queued.** `run` shares the project's journal, so it
+sees the slots the serving process holds: a run of a flow that a trigger's
+**key-less** group covers is refused at start while that group is full, exit
+`2`, naming the execution that holds it, with nothing started or journaled.
+Run it again once that execution settles (`agent-compose docs cli`).
 
 ## Idempotency keys
 
@@ -562,4 +695,4 @@ every caller and look exactly like a guarded route — which is why nothing in
 this topic says so any more. `human` nodes left the same way, one milestone
 earlier.
 
-Normative source: `docs/durability.md`, `docs/grammar.md` §9.4, §13, §13.1–13.5, §14.4, §15
+Normative source: `docs/durability.md`, `docs/grammar.md` §9.4, §13, §13.1–13.5, §14.4, §15, Decisions D162 and D163

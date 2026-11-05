@@ -1528,6 +1528,18 @@ event's payload reach a run only as the flow's inputs, which `docs/grammar.md`
 §13.1 binds as it binds an `http` body. §10.3's test finds nothing to bump, so
 `trace_version` stays `7`.
 
+**PRD resolved q77 changes nothing here either.** A trigger's intake decides
+*whether and when* an execution starts — a repeat inside its dedupe window
+starts none, a queued or debounced arrival starts later, a superseding one
+cancels what was running — and every one of those is outside a trace: an
+arrival with no execution has no trace to be in, and the intake row that
+reports it is the journal's (`docs/durability.md` §3.15, grammar Decision
+D163), answered by `GET /intakes/:id` rather than by any record here. An
+execution the intake starts is traced as any other, from its own start; one a
+supersede cancels ends `cancelled` through the cancel §1.3 already reports; and
+`payload.coalesced` reaches a run only as a flow input a trigger bound. §10.3's
+test finds nothing to bump, so `trace_version` stays `7`.
+
 ### 10.3 What requires a version bump
 
 `trace_version` MUST be incremented for any change that would make a reader

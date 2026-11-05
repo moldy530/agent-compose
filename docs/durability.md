@@ -53,11 +53,12 @@ target binds a remote provider carries that arm appended to it and no other
    [callback deliveries](#37-a-callback-delivery),
    [placement dispatches](#38-a-placement-dispatch),
    [coding-harness runs](#39-a-coding-harness-run),
-   [the finally boundary](#310-the-finally-boundary), and the intake's four
+   [the finally boundary](#310-the-finally-boundary), and the intake's five
    ledgers: [fired ticks](#311-a-fired-tick),
    [dedupe claims](#312-a-dedupe-claim),
-   [checkpoints](#313-a-source-checkpoint) and
-   [restarts](#314-a-source-restart)
+   [checkpoints](#313-a-source-checkpoint),
+   [restarts](#314-a-source-restart) and
+   [intake rows](#315-an-intake-row)
 4. [Keys](#4-keys)
 5. [Replay, and the frontier](#5-replay-and-the-frontier)
 6. [Recovery: `serve` and `resume`](#6-recovery-serve-and-resume)
@@ -1322,21 +1323,35 @@ exception it is.
 
 ### 3.12 A dedupe claim
 
-One row per `(trigger, key)` an `event` trigger admitted (`docs/grammar.md`
-§13.5), in the `dedupe` table: the trigger's name, the SHA-256 of the key (the
-primary key's second column, so a key of any length or character is one
-bounded row), the key itself — stored JSON-encoded, so a key carrying a NUL
-comes back whole on SQLite too — the execution it started, and when it was
-admitted. Written by `claimDedupe`, called from `admitEvent` in `src/serve.ts`
-before the execution is registered.
+One row per `(trigger, key)` an `event` trigger, or an `http` trigger
+declaring a `dedupe_key:`, admitted (`docs/grammar.md` §13.3, §13.5), in the
+`dedupe` table: the trigger's name, the SHA-256 of the key (the primary key's
+second column, so a key of any length or character is one bounded row), the key
+itself — stored JSON-encoded, so a key carrying a NUL comes back whole on SQLite
+too — the execution it names, when it was admitted, and `expires_at`, when its
+window closes. Written by `claimDedupe`, called through `admit` in
+`src/serve.ts` — from an `http` start after the trigger's `auth:`, and from
+`admitEvent` — before the execution is registered or an intake row exists.
 
 * **The first claim starts an execution, and a repeat is answered with it.**
   The key is evaluated from the trigger's `dedupe_key:` (default `payload.id`)
   over the payload, and a second event with the same key starts nothing; the
   serve log names the execution that holds it. Two keys that differ in case are
   two keys, and a key is scoped to its trigger.
-* **Rows do not expire.** PRD resolved q77's `dedupe_window:` is what will give
-  them a TTL; until it lands a key is admitted once for the life of the journal.
+* **A row expires after its window** (PRD resolved q77 ruling a, grammar
+  Decision D163). `expires_at` is the claim's admission plus the trigger's
+  `dedupe_window:` — `24h` by default — and a claim first deletes every row of
+  its trigger whose `expires_at` has passed, in the same step, so a key seen
+  again after its window is a new claim and the table holds no more than the
+  trigger's live windows. A row an older build wrote has no `expires_at`, and
+  is read as expiring one window — the claiming trigger's — after it was
+  admitted. This amends what this bullet said under D162: that rows did not
+  expire.
+* **A repeat is answered with what the first delivery got.** On `http`, under
+  `X-AgentCompose-Deduped: true`: the execution's id, or — where the first
+  arrival is still `queued` or `pending` in the intake (§3.15) — that arrival's
+  `intake_id`. Under a `concurrency:` block the row names the execution the
+  intake will start, so a repeat of a queued arrival is the queued arrival.
 * **An event starts an execution only once its lifecycle row is down.** The
   admission waits for the row (§3.5) before it answers the consumer, so the
   checkpoint (§3.13) never moves past an event whose execution the journal does
@@ -1404,6 +1419,63 @@ start. Written by `recordRestart`; `restartsOf` pages them newest first with
 their total, which is what `GET /sources/:name` answers (`restart_count` and the
 newest twenty). Rows are kept; nothing reads them to decide anything, so they
 are a history rather than a counter.
+
+### 3.15 An intake row
+
+One row per arrival a trigger's `concurrency:` block admitted
+(`docs/grammar.md` §13.1, PRD resolved q77, Decision D163), in the `intakes`
+table:
+
+| Column | Holds |
+|---|---|
+| `id` | the arrival's `intake_id`, `int_<uuid>` — the primary key |
+| `trigger_name` | the trigger it arrived at |
+| `group_hash`, `group_key` | the SHA-256 of its `concurrency.key` answer and the answer itself; the empty string and no key for the key-less group |
+| `state` | `queued`, `pending`, `started` or `dropped` |
+| `execution` | the execution it starts or started — fixed when the row is written, so a tick's `fired` row and a dedupe row can name it first |
+| `waited` | whether the arrival was answered with its `intake_id` (queued or pending) rather than only once its execution's lifecycle row was down |
+| `held_by` | a dropped arrival's running execution |
+| `payload` | a pending row's newest payload, which the debounce binds again when it closes |
+| `admission` | the bound invocation a queued row starts with: inputs, session key, callback, traceparent |
+| `coalesced` | the arrivals a debounce closed over; `1` otherwise |
+| `admitted_at`, `deadline`, `started_at` | when it arrived, when a pending row's debounce closes, when it started |
+| `detail` | why a row was dropped, or put back on the queue |
+
+Indexed by `(trigger_name, state, group_hash)` and by `execution`; on Postgres
+and MySQL a `seq` column orders a trigger's queue, where SQLite reads `rowid`.
+Written by `admitIntake` and moved by `moveIntake`, a conditional update that
+moves a row only from the state it still holds and reads the row back — so two
+decisions about one row agree on one.
+
+* **The lease is these rows.** A group's slots are held by the trigger's
+  `started` rows whose execution has an open lifecycle row (§3.5) and no
+  `cancellations` row: `leasesOf` is that one join, and it is read at every
+  decision — never a count kept in a process, which is what lets a restarted
+  `serve`, and a `run` asking whether its flow's group is full, see the lease
+  the rows hold. A slot frees when its execution settles, or the moment a
+  cancel of it is recorded.
+* **A started row is written before its execution is registered**, as a tick's
+  `fired` row is (§3.11), and the start waits for the lifecycle row before the
+  next decision reads the lease. A crash between the two leaves a `started` row
+  naming an execution with no lifecycle row — which holds no slot — and the
+  next start of `serve` repairs it once: a row that **waited** was owed a start,
+  and starts under the id it recorded; a row that did not was never answered,
+  and is taken back (`abandonIntake`) for its arrival's source to re-deliver. A
+  start the journal would not begin is undone the same two ways at once — a
+  waited row goes back to `queued`, naming why in `detail`.
+* **A pending row is one per group.** `pendingIntake` finds the group's open
+  debounce, and an arrival moves it — newest payload, one more `coalesced`, a
+  deadline `debounce:` after now — or, finding none, writes one. The deadline is
+  the row's, so a restarted `serve` re-arms each pending row from it, and one
+  that passed while nothing ran closes at once.
+* **Rows are kept.** A started row answers `GET /intakes/:id` after its
+  execution has settled; nothing prunes the table, as nothing prunes `fired`
+  rows. None holds a §4 key or is consumed by a replay.
+* **One writer decides.** One trigger's decisions run one at a time in the
+  process that serves it, and the rows are what they decide over. That rests on
+  §2.1's one-writer rule, which the writer guard enforces (§2.3); Decision
+  D163's Status records it against `docs/distributed.md` §8 rule 3, for the
+  owner, beside D162's tick repair and dedupe takeover.
 
 ## 4. Keys
 
@@ -1844,8 +1916,19 @@ Nothing in recovery reads the lifecycle row's `trigger` as an instruction. A
 recovered execution is the one that existed; no request is re-delivered, no
 tick is re-fired and no event is re-admitted.
 
-That is PRD resolved q28's rule, and for the two triggers `serve` fires itself
-(PRD resolved q78) it is made of rows rather than of restraint. A `schedule`
+That is PRD resolved q28's rule, **as amended by PRD resolved q77 ruling f**
+by one sentence: *an admission the hub already accepted is not a re-fire.* So a
+restarted `serve` starts every arrival a trigger's intake had queued, in its
+order and as the lease the rows hold allows, and closes every pending debounce
+at the deadline its row records — one that passed while nothing ran at once —
+and a start a dead process claimed and never journaled is repaired once
+(§3.15). None of that starts anything twice: each is an arrival the intake
+accepted and owed, started under the execution id its row recorded, and an
+arrival whose execution already began is never started again. The intake is
+looked at after recovery and before the first admission.
+
+For the two triggers `serve` fires itself (PRD resolved q78) the rule is made
+of rows rather than of restraint. A `schedule`
 trigger's tick is a `fired` row written before its execution starts (§3.11), so
 a restarted scheduler that meets a tick it already fired is answered with the
 execution that has it; ticks that fell while nothing ran are skipped. An
@@ -1978,7 +2061,13 @@ project's stores.** It holds, by construction:
   because a retry must send the bytes the first attempt signed, and no longer:
   what `callback_auth:` resolved — the token a delivery carried, the key it was
   signed with — is never written down, and neither is the request the callback
-  URL was read out of.
+  URL was read out of;
+* **the request a debounce is holding** (§3.15): a pending intake row keeps its
+  newest arrival's payload — for an `http` trigger the decoded body, query,
+  headers, path and method — because the debounce binds it again when it
+  closes. The header the trigger's `auth:` verified is not kept: it carries a
+  credential, and is removed before the row is written. A queued row keeps the
+  bound inputs, not the request.
 
 `docs/trace.md` §11 keeps every one of those out of the trace, and this document
 does not weaken that rule by a word: the two artifacts are separate files with
@@ -2403,6 +2492,26 @@ on it (`a_journal_without_the_intake_tables_gains_them_on_open`), beside every
 verb's contract — a tick claimed once and agreed on by claims made together, a
 dedupe key of any length claimed once and taken over only from its holder, the
 newest checkpoint, and restart rows paged newest first.
+
+**The intake ledger arrived under the physical-schema clause too** (§3.12,
+§3.15, PRD resolved q77): a whole table, `intakes`, and a nullable column on an
+existing one, `dedupe.expires_at`. The table is `cancellations`' case — `CREATE
+TABLE IF NOT EXISTS` adds it on every backend, and a journal an older build
+wrote holds no intake rows, which is exactly what a build with no
+`concurrency:` block would leave. The column is `finally_error`'s case, probed
+on all three backends — `PRAGMA table_info`, `pg_attribute`, `information_schema`
+— and nullable for every column's reason: a row written before it had no
+window, and is read as expiring one window after it was admitted. Neither holds
+a §4 key or is consumed by a replay, so an execution open in an older journal
+replays identically. Executed: `journal_backend_conformance` removes the table
+and the column from a journal on each of the three arms and writes a dedupe row
+as an older build did, with no window, two days old; re-opens it, writes an
+intake row, finds the column grown back, and has a claim of a fresh key with a
+day's window sweep the old row
+(`a_journal_written_before_the_intake_ledger_gains_it_on_open`), beside the
+window's expiry and sweep, an intake row's round trip, a queue's order, a move
+won once, a debounce extended and started once, the lease's join, and the
+repair's two cases.
 
 ### 11.3 What requires a version bump
 
