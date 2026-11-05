@@ -784,7 +784,9 @@ to `restart.max:`. The program runs in a process group of its own, its stdin is
 a pipe that ends when `serve` does, and a stop sends the group `SIGTERM` and,
 after two seconds, `SIGKILL` — as does the program's exit, to whatever it left
 in its group, so a helper holding its output cannot keep the run from ending
-and restarting. A target declaring a `redis_streams`, `sqs` or
+and restarting. Nor can a process that left the group (`setsid`, a daemon): it
+is not the program's and is left running, and the pipes it holds are let go two
+seconds after the group has gone. A target declaring a `redis_streams`, `sqs` or
 `nats` source is refused at start, naming it.
 
 What `serve` writes about them goes to **stderr**, one line each:
@@ -811,6 +813,7 @@ What `serve` writes about them goes to **stderr**, one line each:
 | ``event source `<s>`: line <n> is not a JSON object, so it was refused and starts nothing (<n> refused so far)`` | a line is refused — one longer than 1 MiB among them, once: the rest of it is dropped |
 | ``event source `<s>`: line <n>'s `checkpoint` could not be read (<why>), so it was refused and starts nothing (<n> refused so far)`` | the source's `checkpoint:` could not be evaluated against the line, or answered something other than a string |
 | ``event source `<s>`: line <n>'s `checkpoint` could not be handed back to the program (<why>), so it was refused and starts nothing (<n> refused so far)`` | a line's checkpoint holds a NUL or a lone surrogate, or is longer than 64 KiB: journaled, every later start would be handed it |
+| ``event source `<s>`: the program has exited and its process group has gone, and a process outside the group still holds its stdout or stderr open: …`` | a process that left the program's group — `setsid`, a daemon — still holds its output two seconds after the group has gone: the pipes are let go, and the run ends with the exit's code or signal |
 | ``event source `<s>`: the program exited with code <c> after <seconds>s; restarting it in <ms>ms (restart <n> in a row)`` | the program ends, by an exit or a signal |
 | ``[source <s>] <line>`` | the program writes a line to its stderr; one longer than 1 MiB is logged cut there, ending `[cut: …]` |
 | ``event trigger `<t>`: no event source `<s>` is bound under this target, so nothing consumes for it`` | a trigger's source is unbound under `local` |

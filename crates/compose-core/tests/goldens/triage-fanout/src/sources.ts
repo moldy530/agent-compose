@@ -802,6 +802,32 @@ export const CHECKPOINT_VARIABLE = "AGENT_COMPOSE_CHECKPOINT";
 const STOP_GRACE_MS = 2_000;
 
 /**
+ * How long a run's pipes are read on, once its program has exited and its
+ * group has gone, before they are let go where they have still not closed:
+ * nothing of the program's is left to write to them by then, and whatever
+ * holds them open left the group — `setsid`, a daemon — and is not the
+ * program's (grammar 14.4). Counted only while reading is not held for an
+ * admission ([`Consumer.#letGoAfter`]), so a slow intake drops nothing the
+ * program wrote.
+ */
+const LET_GO_MS = STOP_GRACE_MS;
+
+/** One of a run's output streams, as it is read. */
+interface Reading {
+  /** Whether reading is held while lines already read are admitted. */
+  holding(): boolean;
+  /**
+   * Stop reading for good, as if the stream had ended: what it was in the
+   * middle of — a line no newline has ended yet — is taken as its last line,
+   * and the stream is destroyed.
+   */
+  letGo(): void;
+}
+
+/** A stream the runtime gave the run none of. */
+const NOT_READ: Reading = { holding: () => false, letGo: () => {} };
+
+/**
  * The longest a line may be, on either of the program's output streams. A
  * program that writes without a newline would otherwise grow this process's
  * buffer for as long as it wrote: a stdout line past this is refused like any
@@ -972,7 +998,9 @@ class Consumer {
     // One end per run, whichever way the runtime reports it: a program that
     // could not be started is an `error` with no pid, which some runtimes
     // follow with a `close` and some do not, and one that ran ends at `close`
-    // — once its stdio has drained and every line it wrote has been admitted.
+    // — once its stdio has drained and every line it wrote has been admitted —
+    // or, where something outside its group holds that stdio open, when the
+    // pipes are let go ([`#letGoAfter`]).
     let over = false;
     // When the program exited, where it has: the instant its run ended, which
     // the `close` after it can trail by as long as its group takes to go.
@@ -996,10 +1024,25 @@ class Consumer {
     // an exit, any code, is restarted, and it never gives up). Ended, the
     // group lets go of the pipes, what is left in them is read and admitted,
     // and `close` ends the run. During a stop, [`#stopRun`] is already ending
-    // the group, and this is the same reap.
-    child.on("exit", () => {
+    // the group, and this is the same reap. A process that left the group —
+    // `setsid`, a daemon — is not reached by it and can hold the pipes past
+    // it, so once the group has gone they are read on for a bound and then
+    // let go, and the run ends with the exit's code or signal.
+    const stderr = this.#tagStderr(child);
+    const stdout = this.#readStdout(child);
+    child.on("exit", (code, signal) => {
       exitedAt = Date.now();
-      if (child.pid !== undefined) void this.#reap(child.pid);
+      const reaped = child.pid === undefined ? undefined : this.#reap(child.pid);
+      void this.#letGoAfter(reaped, stdout, () => over, () => {
+        if (!this.#stopping) {
+          say(
+            `${this.#named}: the program has exited and its process group has gone, and a process outside the group still holds its stdout or stderr open: one that left the group is not the program's, so the pipes are let go and the run ends`,
+          );
+        }
+        stdout.letGo();
+        stderr.letGo();
+        end(code ?? undefined, signal ?? undefined);
+      });
     });
     child.on("error", (error) => {
       if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
@@ -1019,8 +1062,6 @@ class Consumer {
     // The pipe this process holds and never writes: a program that has gone
     // makes it `EPIPE` on the stop that ends it, which is not news.
     child.stdin?.on("error", () => {});
-    this.#tagStderr(child);
-    this.#readStdout(child);
   }
 
   /** The chain every line of the current run is admitted on, in order. */
@@ -1033,15 +1074,18 @@ class Consumer {
    * blob, a diagnostic it never ends) would otherwise grow this process's
    * buffer for as long as it wrote. A line past [`LONGEST_LINE_BYTES`] is
    * logged cut there, saying so, and the rest of it is dropped up to its
-   * newline.
+   * newline. Never held: the log takes a line as it comes.
    */
-  #tagStderr(child: ChildProcess): void {
+  #tagStderr(child: ChildProcess): Reading {
     const stderr = child.stderr;
-    if (stderr === null) return;
+    if (stderr === null) return NOT_READ;
     const tag = `[source ${this.#source.name}]`;
     let held = Buffer.alloc(0);
     // Set while the rest of a line already cut for its length is arriving.
     let skipping = false;
+    // Set once the stream has ended or been let go, so its last line is
+    // logged once.
+    let done = false;
     // One line of the log for one line of stderr — cut at the bound wherever
     // its newline fell: one that arrives in the chunk that took it past the
     // bound is as long as one that has not ended yet.
@@ -1069,9 +1113,19 @@ class Consumer {
         skipping = true;
       }
     });
-    stderr.on("end", () => {
+    const last = (): void => {
+      if (done) return;
+      done = true;
       if (held.length > 0 && !skipping) log(held);
-    });
+    };
+    stderr.on("end", last);
+    return {
+      holding: () => false,
+      letGo: () => {
+        last();
+        stderr.destroy();
+      },
+    };
   }
 
   /**
@@ -1080,15 +1134,21 @@ class Consumer {
    * whose events start slowly is held at its own `write` rather than queued
    * here (PRD resolved q78 ruling c's backpressure).
    */
-  #readStdout(child: ChildProcess): void {
+  #readStdout(child: ChildProcess): Reading {
     const stdout = child.stdout;
-    if (stdout === null) return;
+    if (stdout === null) return NOT_READ;
     let held = Buffer.alloc(0);
     let number = 0;
     // Set while the rest of a line already refused for its length is arriving:
     // that rest is the same line, so it is dropped up to its newline rather
     // than read — and counted — as a line of its own.
     let skipping = false;
+    // The batches of lines read and not yet admitted: reading is held while
+    // there is one.
+    let admitting = 0;
+    // Set once the stream has ended or been let go, so its last line is taken
+    // once.
+    let done = false;
     this.#lines = Promise.resolve();
     stdout.on("data", (chunk: Buffer) => {
       held = Buffer.concat([held, chunk]);
@@ -1109,23 +1169,38 @@ class Consumer {
       }
       if (lines.length === 0) return;
       stdout.pause();
+      admitting += 1;
       this.#lines = this.#lines.then(async () => {
-        for (const line of lines) {
-          number += 1;
-          await this.#line(line, number);
+        try {
+          for (const line of lines) {
+            number += 1;
+            await this.#line(line, number);
+          }
+        } finally {
+          admitting -= 1;
         }
-        if (!this.#stopping) stdout.resume();
+        if (!this.#stopping && !done) stdout.resume();
       });
     });
-    stdout.on("end", () => {
+    const last = (): void => {
+      if (done) return;
+      done = true;
       if (held.length === 0 || skipping) return;
-      const last = held;
+      const tail = held;
       held = Buffer.alloc(0);
       this.#lines = this.#lines.then(async () => {
         number += 1;
-        await this.#line(last, number);
+        await this.#line(tail, number);
       });
-    });
+    };
+    stdout.on("end", last);
+    return {
+      holding: () => admitting > 0,
+      letGo: () => {
+        last();
+        stdout.destroy();
+      },
+    };
   }
 
   /** Admit one line to every bound trigger, then journal its checkpoint. */
@@ -1255,8 +1330,10 @@ class Consumer {
     // program that crashes after starting one would leave one more behind,
     // and none of them would end when `serve` does. The program's exit began
     // ending it already; this is that same reap, for a runtime that reported
-    // no exit.
-    if (child?.pid !== undefined) void this.#reap(child.pid);
+    // no exit. Where one was reported, the group is not signalled from here:
+    // its reap is under way or done, and once the group has gone its id — the
+    // program's pid — may name another process's group.
+    if (exitedAt === undefined && child?.pid !== undefined) void this.#reap(child.pid);
     const endedAt = exitedAt ?? Date.now();
     const ran = this.#startedAt === 0 ? 0 : endedAt - this.#startedAt;
     this.#attempt = ran > this.#command.restartMaxMs ? 1 : this.#attempt + 1;
@@ -1306,6 +1383,41 @@ class Consumer {
       else this.#spawn();
     }, Math.min(wait, LONGEST_SLEEP_MS));
     this.#timer.unref?.();
+  }
+
+  /**
+   * Let a run's pipes go where they outlive its group, and end the run.
+   *
+   * Once the program has exited and `reaped` has emptied its group, nothing
+   * of the program's is left to write to its stdout or stderr, and a process
+   * still holding either open left the group — `setsid`, a daemon — and is not
+   * the program's (grammar 14.4). Its hold would keep `close`, and with it the
+   * run's end, from ever coming: never journaled, never restarted, reported
+   * `running` with its program gone — and a stop would one day signal the
+   * group id of a program long gone, which may by then name someone else's
+   * group. So the pipes are read on for [`LET_GO_MS`], counted only while
+   * `stdout` is not held for an admission — a slow intake drops nothing the
+   * program wrote — and `letGo` is called then, unless `over` says the run
+   * has ended first, as it does at once where nothing outside the group holds
+   * the pipes. Not unref'd, as [`#reap`]'s poll is not: a stop waits on the
+   * run's end, and this is bounded.
+   */
+  async #letGoAfter(
+    reaped: Promise<void> | undefined,
+    stdout: Reading,
+    over: () => boolean,
+    letGo: () => void,
+  ): Promise<void> {
+    await reaped;
+    let read = 0;
+    while (!over()) {
+      if (read >= LET_GO_MS) {
+        letGo();
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, GROUP_POLL_MS));
+      if (!stdout.holding()) read += GROUP_POLL_MS;
+    }
   }
 
   /**
@@ -1365,11 +1477,20 @@ class Consumer {
     // ([`#reap`]). The program going first cuts nobody else's grace short: a
     // helper still cleaning up when its leader exits on the `SIGTERM` has the
     // rest of the two seconds. Where there is no group to end — a host
-    // without process groups — the program alone is asked and told.
+    // without process groups — the program alone is asked and told. A program
+    // whose exit was already seen is neither: its group's reap began at that
+    // exit, and is the one waited for here, and once the group has gone its
+    // id — the program's pid — may name another process's group.
     child.stdin?.end();
-    const reaped = child.pid === undefined ? undefined : this.#reap(child.pid);
+    const exited = child.exitCode !== null || child.signalCode !== null;
+    const reaped =
+      child.pid === undefined
+        ? undefined
+        : exited
+          ? this.#reaping.get(child.pid)
+          : this.#reap(child.pid);
     let kill: ReturnType<typeof setTimeout> | undefined;
-    if (reaped === undefined) {
+    if (reaped === undefined && !exited) {
       signalGroup(child, "SIGTERM");
       kill = setTimeout(() => signalGroup(child, "SIGKILL"), STOP_GRACE_MS);
       kill.unref?.();
@@ -1393,10 +1514,14 @@ class Consumer {
     ]);
     if (bound !== undefined) clearTimeout(bound);
     // The rest of the grace, for a member of the group that outlived its
-    // leader: still the program's, and ended with it.
+    // leader: still the program's, and ended with it. A reap sends whatever
+    // is still in the group `SIGKILL` itself once the grace is up; with none,
+    // the program is told here where it has not exited.
     await reaped;
     if (kill !== undefined) clearTimeout(kill);
-    signalGroup(child, "SIGKILL");
+    if (reaped === undefined && child.exitCode === null && child.signalCode === null) {
+      signalGroup(child, "SIGKILL");
+    }
     child.stderr?.destroy();
   }
 }
