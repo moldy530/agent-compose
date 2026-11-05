@@ -382,15 +382,29 @@ interface Execution {
    */
   journaled: boolean;
   /**
-   * Whether a stop **before** the lifecycle row puts this execution's arrival
-   * back on its trigger's queue, to be started again under this same id: a
-   * start of an arrival the intake answered with its `intake_id`
-   * ([`IntakeLedger.#begin`]). Such a stop is not the execution's settle — the
-   * execution that arrival is owed has yet to run — so [`settling`] pushes no
-   * `settled` webhook for it, and the webhook goes where the start that does
-   * reach its row closes it ([`closed`]).
+   * Whether this start is **gated** on its lifecycle row: whoever started it
+   * is answered only once the row is down, so a stop **before** the row is
+   * that answer's to tell, never a `settled` webhook's (Decision D163's
+   * Status). Two starts are:
+   *
+   *  * an admission a gate keeps — a tick's `fired` row, a dedupe key — or
+   *    an intake start of an arrival that never waited ([`admit`],
+   *    [`IntakeLedger.#begin`]). A stop before the row is answered `unbegun`
+   *    — on `http`, a `503` that says nothing started and the request may be
+   *    sent again — so its caller was never handed this execution's id, and
+   *    a push of `failed` for it would be a settle of an execution nobody
+   *    was told of, beside the one the resend starts;
+   *  * a start of an arrival the intake answered with its `intake_id`, which
+   *    a stop before the row puts back on its trigger's queue, to be started
+   *    again under this same id. That stop is not the execution's settle —
+   *    the execution the arrival is owed has yet to run — and the webhook
+   *    goes where the start that does reach its row closes it ([`closed`]).
+   *
+   * Either way [`settling`] pushes nothing for it. A start that is not gated
+   * — an `http` request with no `dedupe_key:` and no `concurrency:` — was
+   * answered `202` as it was set going, and is owed the failure.
    */
-  requeues: boolean;
+  gated: boolean;
   outputs?: Record<string, unknown>;
   trace?: readonly runtime.TraceEntry[];
   error?: string;
@@ -1638,7 +1652,10 @@ async function admit(
     if (gate.outcome === "held") return gate;
     claim = gate.fired;
   }
-  const { record, begun: lifecycle } = register(executions, admission, id);
+  // Gated where a gate is kept: such a start is answered only once its row is
+  // down, and a stop before it is answered `unbegun` ([`Execution.gated`]).
+  const gated = admission.gate !== undefined;
+  const { record, begun: lifecycle } = register(executions, admission, id, gated);
   if (admission.gate === undefined) return { outcome: "started", record };
   try {
     await lifecycle;
@@ -1648,6 +1665,16 @@ async function admit(
     // the takeover look for — and a repeat of this event in this process is
     // not answered with an execution that does not exist.
     if (executions.get(id) === record) executions.delete(id);
+    // …unless its lifecycle row is down after all, its answer lost on the
+    // way back from a dialled journal: then it began, and it runs here as
+    // the start it was ([`adopt`]) rather than answered as refused — a key
+    // every resend finds held by an execution nothing would run until the
+    // next start of `serve`.
+    const landed = await openJournal()
+      .then((journal) => journal.execution(id))
+      .catch(() => undefined);
+    const adopted = landed === undefined ? undefined : await adopt(executions, landed);
+    if (adopted !== undefined) return { outcome: "started", record: adopted };
     return {
       outcome: "unbegun",
       execution: id,
@@ -1712,7 +1739,7 @@ async function claimGate(
         key: gate.key,
         execution: id,
         admittedAt: new Date(at).toISOString(),
-        expiresAt: new Date(at + gate.windowMs).toISOString(),
+        expiresAt: instantAfter(at, gate.windowMs),
       };
     };
     const held = await journal.claimDedupe(claim());
@@ -1971,6 +1998,29 @@ const DROPPED_HEADER = "X-AgentCompose-Dropped";
 
 /** The `24h` a dedupe key is held for where a trigger declares no window. */
 const DEFAULT_DEDUPE_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The latest instant a dedupe row's expiry or a debounce's deadline is written
+ * as: the last millisecond of the year 9999, the latest a four-digit ISO 8601
+ * year can name (Decision D163's Status).
+ *
+ * Nothing bounds `dedupe_window:` or `debounce:` — grammar 4.4 puts no ceiling
+ * on a duration — and the journal compares these instants as the strings it
+ * holds: a dedupe row is swept where its `expires_at` sorts at or below the
+ * instant a claim was made at. Past the year 9999 a `Date` is written with a
+ * signed six-digit year, `+010000-…`, which sorts below every instant of this
+ * millennium, so a window that long would be swept by the trigger's next
+ * claim — held for no time at all, the opposite of what it asks — and past
+ * 8.64e15 ms from the epoch a `Date` names no instant at all, and every
+ * arrival would throw. An instant later than this one is written as this one:
+ * held for as long as asked, as far as the journal's strings can say.
+ */
+const LAST_INSTANT_MS = Date.UTC(9999, 11, 31, 23, 59, 59, 999);
+
+/** The instant `ms` after `from`, as an intake row records it ([`LAST_INSTANT_MS`]). */
+function instantAfter(from: number, ms: number): string {
+  return new Date(Math.min(from + ms, LAST_INSTANT_MS)).toISOString();
+}
 
 /** Why an arrival whose `dedupe_key:` answered `''` is refused (Decision D163). */
 const EMPTY_DEDUPE_KEY =
@@ -2590,7 +2640,7 @@ class IntakeLedger {
     }
     const debounce = trigger.concurrency.debounceMs ?? 0;
     const now = Date.now();
-    const deadline = new Date(now + debounce).toISOString();
+    const deadline = instantAfter(now, debounce);
     const joined: JoinedArrival | undefined =
       gate === undefined
         ? undefined
@@ -2846,7 +2896,10 @@ class IntakeLedger {
    * a slot is an open lifecycle row — and the next start repairs it once
    * ([`#prepare`]): a row that waited starts under the id it recorded, a row
    * that did not is taken back. A start the journal would not begin is
-   * undone the same two ways here and now.
+   * undone the same two ways here and now — unless its lifecycle row is down
+   * after all, whose execution then runs ([`adopt`]) — and a waiting row
+   * whose execution has begun already is never begun again
+   * ([`#begunAlready`]).
    */
   async #begin(
     journal: Journal,
@@ -2858,6 +2911,10 @@ class IntakeLedger {
     repairing: boolean,
     group?: string,
   ): Promise<AdmitAnswer> {
+    if (waiting !== undefined && !repairing) {
+      const already = await this.#begunAlready(journal, trigger, bound, waiting);
+      if (already !== undefined) return already;
+    }
     const startedAt = new Date().toISOString();
     let row: IntakeRow;
     if (repairing && waiting !== undefined) {
@@ -2889,15 +2946,34 @@ class IntakeLedger {
         ...(bound.traceparent === undefined ? {} : { traceparent: bound.traceparent }),
       },
       id,
-      // A start of an arrival answered with its intake id is undone below by
-      // putting it back on the queue, not by settling it.
-      row.waited,
+      // Every start the intake makes is answered only once its lifecycle row
+      // is down, so a stop before it is undone below — the arrival put back on
+      // the queue, or refused — and is never the execution's settle.
+      true,
     );
     try {
       await begun;
     } catch (error) {
       if (this.#executions.get(id) === record) this.#executions.delete(id);
       const reason = message(error);
+      // **Unless its lifecycle row is down after all** (Decision D163's
+      // Status): a dialled journal can commit an insert whose answer never
+      // arrives, so a start told it failed may have begun its execution all
+      // the same. Undone, the arrival would be started a second time — a
+      // waited row begun again under its id beside the execution the next
+      // start of `serve` recovers, an unwaited one refused while that
+      // execution runs anyway — so its row stays `started`, holding its slot
+      // as the open execution's, and the execution runs here as a recovery
+      // would run it ([`adopt`]).
+      const landed = await journal.execution(id).catch(() => undefined);
+      const adopted = landed === undefined ? undefined : await adopt(this.#executions, landed);
+      if (adopted !== undefined) {
+        sayIntake(
+          trigger.name,
+          `${row.id}'s start of ${id} was answered with a failure (${reason}), but its lifecycle row is down: it runs as the journal holds it`,
+        );
+        return { outcome: "started", record: adopted };
+      }
       if (row.waited) {
         // Owed: the arrival was answered with its intake id, so the row goes
         // back on the queue and is started again as a slot allows. A journal
@@ -2908,10 +2984,11 @@ class IntakeLedger {
         // the next start of `serve` finds the row either way ([`#prepare`]).
         //
         // Nothing settled: the run's tail pushes no `settled` webhook for a
-        // start it was told requeues, and looks at no queue for a run that
-        // never reached its row ([`settling`]) — so the next try is the look
-        // armed here, in [`DRAIN_RETRY_MS`], or the next arrival's, never one
-        // this failure set going itself.
+        // gated start that never reached its row, and looks at no queue for
+        // one ([`settling`]) — so the next try is the look armed here, in
+        // [`DRAIN_RETRY_MS`], or the next arrival's, never one this failure
+        // set going itself. A row whose execution's row lands after this read
+        // missed it is started where a look finds it ([`#begunAlready`]).
         const detail = `its execution could not be journaled: ${reason}`;
         const requeued = await journal
           .moveIntake(row.id, "started", { state: "queued", detail })
@@ -2923,6 +3000,9 @@ class IntakeLedger {
         );
         this.#redrainLater(trigger.name);
       } else {
+        // Refused, and answered so — a `503` on `http` — so nothing is pushed
+        // for it either ([`Execution.gated`]): its caller was never handed
+        // the execution's id.
         await journal.abandonIntake(row.id).catch(() => undefined);
       }
       return { outcome: "unbegun", execution: id, ...(fired === undefined ? {} : { fired }), reason };
@@ -2936,6 +3016,51 @@ class IntakeLedger {
       );
     }
     return { outcome: "started", record };
+  }
+
+  /**
+   * **A waiting row whose execution exists already is started, never begun
+   * again** (Decision D163's Status): answered with what the start would
+   * have been, or `undefined` where its execution has not begun.
+   *
+   * Its execution exists where this process runs it — a recovery put it on
+   * the board — or where the journal holds its lifecycle row. Either is a
+   * start whose row landed while its answer did not: a dialled journal can
+   * commit an insert and lose the answer, and a start that read its own row
+   * before the commit did ([`#begin`]) put its arrival back on the queue
+   * naming an execution that runs, or that the next start of `serve`
+   * recovers. Begun again it would be a second generation of one execution —
+   * refused beside the recovered one, taking that one's place on the board as
+   * it went, and run whole a second time once that one settled. So the row is
+   * moved to `started`, where it holds its slot while the execution is open,
+   * and an open execution nothing in this process runs is run here as a
+   * recovery runs one ([`adopt`]).
+   *
+   * One read of the lifecycle row per start: a look costs what it can start.
+   */
+  async #begunAlready(
+    journal: Journal,
+    trigger: IntakeTrigger,
+    bound: IntakeAdmission,
+    row: IntakeRow,
+  ): Promise<AdmitAnswer | undefined> {
+    const landed = await journal.execution(row.execution);
+    if (landed === undefined && !this.#executions.has(row.execution)) return undefined;
+    const started = await this.#moved(journal, row, {
+      state: "started",
+      admission: bound,
+      startedAt: landed?.startedAt ?? new Date().toISOString(),
+    });
+    const record =
+      this.#executions.get(row.execution) ??
+      (landed === undefined ? undefined : await adopt(this.#executions, landed));
+    sayIntake(
+      trigger.name,
+      `${started.id}'s execution ${row.execution} had already begun, so it is not begun again: ${record === undefined ? "it has settled" : "it runs as the journal holds it"}`,
+    );
+    return record === undefined
+      ? { outcome: "held", execution: row.execution, intake: started }
+      : { outcome: "started", record };
   }
 
   /**
@@ -2996,7 +3121,9 @@ class IntakeLedger {
         continue;
       }
       const answer = await this.#begin(journal, trigger, row.admission, row.execution, row, undefined, false, row.group);
-      if (answer.outcome !== "started") {
+      // Started, or found begun already and settled ([`#begunAlready`]):
+      // either way the row is off the queue.
+      if (answer.outcome === "unbegun") {
         stalled = true;
         break;
       }
@@ -3021,22 +3148,31 @@ class IntakeLedger {
    * Put each start this process owes back on the queue ([`#owe`]), where the
    * row still names an execution that never began — answering whether any is
    * still owed. A row that has moved on, or whose execution the journal holds
-   * after all, is owed nothing. One the journal will not move yet stays owed,
-   * holding its slot ([`#leases`]), and the rest of the queue is looked at
-   * past it.
+   * after all, is owed nothing — and the latter's execution runs here, where
+   * nothing in this process runs it yet ([`adopt`]). One the journal will
+   * not move yet stays owed, holding its slot ([`#leases`]), and the rest of
+   * the queue is looked at past it.
    */
   async #requeue(journal: Journal, trigger: IntakeTrigger): Promise<boolean> {
     const owed = this.#owed.get(trigger.name);
     if (owed === undefined) return false;
     for (const [id, detail] of [...owed]) {
       const row = await journal.intake(id);
-      if (
-        row === undefined ||
-        row.state !== "started" ||
-        this.#executions.has(row.execution) ||
-        (await journal.execution(row.execution)) !== undefined
-      ) {
+      if (row === undefined || row.state !== "started" || this.#executions.has(row.execution)) {
         owed.delete(id);
+        continue;
+      }
+      // Its execution's row landed after all: the row is `started` where it
+      // belongs, and the execution runs here ([`adopt`]).
+      const landed = await journal.execution(row.execution);
+      if (landed !== undefined) {
+        owed.delete(id);
+        if ((await adopt(this.#executions, landed)) !== undefined) {
+          sayIntake(
+            trigger.name,
+            `${id}'s execution ${row.execution} had begun after all: it runs as the journal holds it`,
+          );
+        }
         continue;
       }
       const moved = await journal
@@ -3462,7 +3598,12 @@ async function recoverExecutions(
     // of it: a recovered execution re-parks under the same wait ids, and a
     // parking webhook for a question already asked would tell a receiver
     // something happened that did not (PRD resolved q35).
-    resumeInto(executions, flow, row, await announced(row.id));
+    const reported = await announced(row.id);
+    // Looked at again past that read: a gated start whose row landed while
+    // its answer did not runs its execution as this does ([`adopt`]), and one
+    // generation per process is the rule.
+    if (executions.has(row.id)) continue;
+    resumeInto(executions, flow, row, reported);
     process.stderr.write(`recovered ${row.id} (${row.flow})\n`);
   }
   return undefined;
@@ -3516,7 +3657,7 @@ function resumeInto(
     announced: false,
     // Its row is the one recovery read it from.
     journaled: true,
-    requeues: false,
+    gated: false,
     settled: Promise.resolve(),
   };
   // The replay has stopped: whatever it did or did not reach, nothing more is
@@ -3595,7 +3736,7 @@ function trackChild(
     // A child's row opens before anything about it is refused (`runFlow`'s
     // note on child executions), and it holds no slot of any lease either way.
     journaled: true,
-    requeues: false,
+    gated: false,
     settled: Promise.resolve(),
   };
   const run = runChildFlow(child, (produced, error) => closed(execution, produced, error));
@@ -3607,6 +3748,38 @@ function trackChild(
 }
 
 /**
+ * Run here an open execution whose lifecycle row is down and that nothing in
+ * this process runs — what the next start of `serve` would recover
+ * (`docs/durability.md` §6.1) — as that recovery would run it
+ * ([`resumeInto`]): from its row, replaying what the journal holds.
+ *
+ * The one such row a running `serve` meets is a gated start's whose lifecycle
+ * row landed while its answer did not: a dialled journal can commit an insert
+ * and lose the answer, and the start reads as refused ([`admit`],
+ * [`IntakeLedger.#begin`]). Its generation never got past the row, so it
+ * recorded nothing, and the replay is its first run — answered as the start
+ * it was, rather than refused while the execution runs at the next start
+ * anyway, or started a second time beside it (Decision D163's Status).
+ *
+ * Answers its record; none for a row that has closed, which leaves nothing to
+ * run, or one of a flow this build does not declare.
+ */
+async function adopt(
+  executions: Map<string, Execution>,
+  landed: runtime.ExecutionRow,
+): Promise<Execution | undefined> {
+  const held = executions.get(landed.id);
+  if (held !== undefined) return held;
+  if (landed.status !== "open") return undefined;
+  const flow = flows[landed.flow];
+  if (flow === undefined) return undefined;
+  const reported = await announced(landed.id);
+  // Looked at again past that read: a recovery may have put it on the board
+  // meanwhile, and one generation per process is the rule.
+  return executions.get(landed.id) ?? resumeInto(executions, flow, landed, reported);
+}
+
+/**
  * Start the run, and record what it does when it stops.
  *
  * Answers the execution's record and **`begun`**: resolved once the run's
@@ -3614,15 +3787,16 @@ function trackChild(
  * whatever stopped the run before it was. What a gated [`admit`] waits for
  * before it says the execution started.
  *
- * `requeues` is the intake's, for an arrival it answered with an `intake_id`
- * ([`Execution.requeues`]): a stop before the row puts that arrival back on
+ * `gated` is the gate's and the intake's, for a start whose caller is
+ * answered only once its row is down ([`Execution.gated`]): a stop before the
+ * row is that answer's, or puts an arrival answered with its intake id back on
  * the queue under this id rather than settling the execution.
  */
 function register(
   executions: Map<string, Execution>,
   admission: Admission,
   id: string,
-  requeues = false,
+  gated = false,
 ): { readonly record: Execution; readonly begun: Promise<void> } {
   const { flow, inputs, sessionKey, callback, traceparent } = admission;
   const execution: Execution = {
@@ -3644,7 +3818,7 @@ function register(
     announced: false,
     // Until `runFlow`'s `opened` hook says its row is down.
     journaled: false,
-    requeues,
+    gated,
     // Replaced immediately below. The record has to exist before the run does,
     // because the run's own handlers write into it.
     settled: Promise.resolve(),
@@ -3770,13 +3944,18 @@ function callbackOf(trigger: HttpTrigger, payload: Payload): string | undefined 
  * could not be opened. Nothing is journaled about such a run at all, so nothing
  * will ever recover it, and the absence of a row is exactly what says so.
  *
- * **Except where the intake owes the start** ([`Execution.requeues`]): an
- * arrival answered with its `intake_id` whose start the journal would not
- * begin goes back on its trigger's queue and is started again under this same
- * execution id ([`IntakeLedger.#begin`]). That stop is not the execution's —
- * pushed as `failed`, it would be the only settle the caller ever hears, since
- * the start that does run the execution finds that push journaled
- * ([`settledAlready`]) and announces nothing (Decision D163's Status).
+ * **Except where the start is gated on its row** ([`Execution.gated`]):
+ * whoever started it is answered only once the row is down, so a stop before
+ * it is answered there (Decision D163's Status). A gated admission is told
+ * nothing started — on `http` a `503` that says the request may be sent
+ * again, so the caller holds no `202` and was never handed this execution's
+ * id; pushed as `failed`, it would be a settle of an execution nobody was told
+ * of, beside the one the resend starts. And an arrival answered with its
+ * `intake_id` goes back on its trigger's queue and is started again under
+ * this same execution id ([`IntakeLedger.#begin`]); pushed as `failed`, it
+ * would be the only settle that caller ever hears, since the start that does
+ * run the execution finds that push journaled ([`settledAlready`]) and
+ * announces nothing.
  */
 function settling(execution: Execution, run: Promise<FlowRun>): Promise<void> {
   return run
@@ -3789,15 +3968,16 @@ function settling(execution: Execution, run: Promise<FlowRun>): Promise<void> {
       // difference: the report is this process's, the push is the execution's.
       recorded(execution, undefined, error);
       if (execution.announced) return;
-      // Back on the queue under this id: the push is the start's that reaches
-      // the row.
-      if (execution.requeues && !execution.journaled) return;
+      // Answered as nothing started, or back on the queue under this id: the
+      // push, where one is owed, is the start's that reaches the row.
+      if (execution.gated && !execution.journaled) return;
       // The one settle [`closed`] never hears about: a run that failed **before
       // it was journaled at all** — its inputs refused by a flow whose
       // `inputs:` this build has narrowed, a `session_key:` the composition has
       // since started requiring, a journal that could not be opened. No row
-      // means no start will ever recover it, so the caller holding a `202` is
-      // owed the failure now and this process is the only one that can push it.
+      // means no start will ever recover it, so the caller holding a `202` —
+      // a start no gate kept — is owed the failure now, and this process is
+      // the only one that can push it.
       if (await unjournaled(execution.id)) void deliver(execution, "settled", []);
     })
     .finally(() => {
