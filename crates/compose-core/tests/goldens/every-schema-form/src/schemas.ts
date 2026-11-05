@@ -442,12 +442,43 @@ export const flowShapeNodeShiftOutput = z.object({
 }).strict();
 export type FlowShapeNodeShiftOutput = z.infer<typeof flowShapeNodeShiftOutput>;
 
+/**
+ * `flow.shape` node `record` — what the `set` of `store.events` answers, derived from the op and the store (grammar 11.4, Decision D34).
+ */
+export const flowShapeNodeRecordOutput = z.object({
+  key: z.string(),
+  applied: z.boolean(),
+  version: z.number().int(),
+  deduped: z.boolean(),
+}).strict();
+export type FlowShapeNodeRecordOutput = z.infer<typeof flowShapeNodeRecordOutput>;
+
+/**
+ * `flow.shape` node `close` — what the `batch` of `store.events` answers, derived from the op and the store (grammar 11.4, Decision D34).
+ */
+export const flowShapeNodeCloseOutput = z.object({
+  applied: z.boolean(),
+  deduped: z.boolean(),
+  results: z.array(z.object({
+    key: z.string(),
+    version: z.number().int(),
+  }).strict()).max(2),
+  failed: z.number().int(),
+}).strict();
+export type FlowShapeNodeCloseOutput = z.infer<typeof flowShapeNodeCloseOutput>;
+
 /** `store.docs` — the metadata a match carries (grammar 11.1). */
 export const storeDocsMetadataSchema = z.object({
   source: z.string(),
   updated_at: z.string().refine(rfc3339DateTime, { message: "expected an RFC 3339 date-time" }),
 }).strict();
 export type StoreDocsMetadataSchema = z.infer<typeof storeDocsMetadataSchema>;
+
+/** `store.events` — the value it stores (grammar 11.1). */
+export const storeEventsValueSchema = z.object({
+  seen: z.number().int(),
+}).strict();
+export type StoreEventsValueSchema = z.infer<typeof storeEventsValueSchema>;
 
 /** `store.ledger` — the value it stores (grammar 11.1). */
 export const storeLedgerValueSchema = z.object({
