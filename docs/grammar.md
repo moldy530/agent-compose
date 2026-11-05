@@ -6489,12 +6489,16 @@ What `serve` does with one:
   outside the project is named by an absolute path or an `${ENV}` reference.
   Its stdin is a pipe `serve` holds
   and never writes — it ends when `serve` does, however `serve` ends. Stopped by
-  `SIGTERM` to the group and, two seconds later, `SIGKILL`. A run that ends
+  `SIGTERM` to the group and, two seconds later, `SIGKILL` — to every member
+  of the group, so one that outlives the program on the `SIGTERM` still has the
+  rest of the two seconds. A run that ends
   takes its group with it: whatever the program started and left in the group
   — a helper it never waited for — is sent the same `SIGTERM` and `SIGKILL`
   when the program exits, so a restart never runs beside what the last run
-  left, and a stop while the source backs off ends it too. A source no `event`
-  trigger binds is not started.
+  left, and a stop while the source backs off ends it too. The run ends at the
+  program's exit: a helper in the group still holding its stdout or stderr is
+  ended with the group, what is left in the pipes is read, and the restart
+  follows. A source no `event` trigger binds is not started.
 - **Lines.** Each line of stdout is one event; it becomes `payload.body` when it
   is a JSON object. Anything else — not JSON, JSON that is not an object, a line
   longer than 1 MiB — is **refused**: logged with the source and the line's
@@ -13644,14 +13648,22 @@ following are the implementation's own readings and await the owner's ruling:
 - A source no `event` trigger binds is not started, and its status route reads
   `stopped`; an `event` trigger whose source `local` does not declare is logged
   at start.
-- A stop ends the program's stdin, then sends its group `SIGTERM` and, after
-  the grace, `SIGKILL`; `serve` waits at most twice the grace for the program's
-  pipes to close, so a descendant that left the group cannot hold `serve` open.
-  A run that ends gets the same sequence for what is left in its group, before
-  the restart and without delaying it, and a stop waits for that too — so a
-  program that crashes after starting a helper leaves nothing per restart, and
-  nothing outlives a stop that finds the source backing off. A descendant that
-  left the group is not the program's, and is not followed.
+- A stop ends the program's stdin, then sends its group `SIGTERM` and, two
+  seconds after it, `SIGKILL` to whatever is still in the group — the program
+  exiting first cuts no other member's grace short; `serve` waits at most twice
+  the grace for the program's pipes to close, so a descendant that left the
+  group cannot hold `serve` open. A run that ends gets the same sequence for
+  what is left in its group, begun at the program's exit, before the restart
+  and without delaying it, and a stop waits for that too — so a program that
+  crashes after starting a helper leaves nothing per restart, and nothing
+  outlives a stop that finds the source backing off. A run ends at its
+  program's exit rather than when its pipes close: a helper in the group that
+  inherited stdout or stderr would otherwise hold the run open — never
+  journaled, never restarted, and reported `running` — so the exit's
+  `SIGTERM` and `SIGKILL` end it, what is left in the pipes is read and
+  admitted, and the `restarts` row records the exit's instant, from which the
+  backoff is counted. A descendant that left the group is not the program's,
+  and is not followed.
 - The refused-line and accepted-event counts are the running process's, not
   journaled.
 - `auth:` on an `event` trigger, a **grammar addition q78 does not make**.

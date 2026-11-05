@@ -1396,7 +1396,8 @@ writes a project's journal (§2), so nothing interleaves them.
 ### 3.14 A source restart
 
 One row per exit of a `kind: command` source's program, in the `restarts`
-table: the source, when the run ended (the primary key's second column), the
+table: the source, when the run ended — the instant the program exited, which
+is what the backoff is counted from (the primary key's second column) — the
 restart's attempt number, the exit code **or** the signal that ended it — one of
 the two, never both — how long the run lasted, and the backoff before the next
 start. Written by `recordRestart`; `restartsOf` pages them newest first with
