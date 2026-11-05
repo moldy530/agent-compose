@@ -619,7 +619,8 @@ finds its group full does what `on_conflict:` says:
   still going and lets it finish.
 - **`supersede`** cancels the group's running executions — and the child
   executions they started — and starts the newcomer. `latest` always builds
-  the newest change.
+  the newest change: an older change of the group still waiting for a slot
+  (behind `max_running:`) is dropped as the newer one lands, never built.
 
 **`debounce:`** coalesces a group's arrivals into one execution, started once no
 arrival has come for that long, with the newest payload and

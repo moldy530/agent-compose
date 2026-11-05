@@ -1513,7 +1513,15 @@ decisions about one row agree on one.
   debounce, and an arrival moves it — newest payload, one more `coalesced`, a
   deadline `debounce:` after now — or, finding none, writes one. The deadline is
   the row's, so a restarted `serve` re-arms each pending row from it, and one
-  that passed while nothing ran closes at once.
+  that passed while nothing ran closes at once. An arrival that finds the row
+  open past its deadline — its close not yet run — closes it first and writes a
+  row of its own: a row due to start is never moved again.
+* **A queue is read as far as it can start.** `queuedGroups` answers the groups
+  a trigger's queue holds rows of, off the `(trigger_name, state, group_hash)`
+  index without reading a row; a look at the queue asks it, beside the lease,
+  first, and reads the rows (`intakesOf`) only where one of those groups has a
+  free slot. `groupQueue` reads one group's queued rows down the same index —
+  what a `supersede` arrival drops, its group's older arrivals still waiting.
 * **An arrival is counted in the move that records it.** Every arrival claims
   its gate — its dedupe key (§3.12), its tick's `fired` row (§3.11) — under an id
   of its own. An arrival that opens a pending row starts it under that id; one

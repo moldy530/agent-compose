@@ -5633,15 +5633,18 @@ may hold admits nothing.
   executions are cancelled with it — and starts the arrival in the slot that
   frees. It never reaches another group: an arrival whose own group it emptied,
   but whose trigger is at `max_running:` by other groups' executions, waits as
-  `queue` would.
+  `queue` would. Its group's older arrivals still waiting there are replaced as
+  well — each such `queued` row is dropped as the newcomer lands, naming it —
+  so a group holds at most one queued arrival, its newest.
 - **`debounce:`** coalesces a group's arrivals into one **pending** intake row
   holding the newest payload. Each arrival moves the row's deadline to
   `debounce:` after it; once the deadline passes with nothing new, one
   execution is admitted with that payload — against the lease and its
   `on_conflict:`, as any arrival is — and **`payload.coalesced`**, the number of
-  arrivals the debounce closed over, is a member of it. Carrying every
-  coalesced payload rather than the newest is deferred (PRD resolved q77 ruling
-  c).
+  arrivals the debounce closed over, is a member of it. An arrival that finds
+  the row's deadline already past closes it first and opens a row of its own:
+  a row that is due is never joined. Carrying every coalesced payload rather
+  than the newest is deferred (PRD resolved q77 ruling c).
 - **`payload.coalesced`** is an integer, and a member of the payload only on a
   trigger whose block declares `debounce:` — read anywhere else it is an unknown
   field, whose help says so. It is readable in `input:` and `session_key:`,
@@ -14077,7 +14080,19 @@ ruling:
 - **`supersede` cancels every running execution of the group**, not only the
   oldest; and where the trigger's `max_running:` is held by other groups'
   executions, which a supersede never cancels, the arrival waits as `queue`
-  would.
+  would. **It replaces its group's queued arrivals too**: a row of the group
+  still `queued` — held by `max_running:`, or behind a queue that stalled — is
+  an older arrival a freed slot would otherwise start ahead of the newcomer and
+  run whole, so each is dropped as the newcomer lands (a debounce's close
+  included), its `detail` naming the execution the newcomer is to be and the
+  serve log saying so, before the queue is looked at — so before the
+  newcomer's own start, and a newcomer the journal then refuses (a `503`, to be
+  sent again) has replaced them all the same. Such a row names no running
+  execution — it was replaced, not turned away — so its intake, and a repeat of
+  its dedupe key, answer as an arrival that never began. A group under
+  `supersede` therefore holds at most one queued arrival, its newest. A start
+  the process owes because the journal refused it (below) is not a queued row,
+  and is started as owed.
 - **What `drop` answers.** `202`, the group's oldest running execution — or the
   trigger's, where it is `max_running:` that is full — its status URL, and the
   dropped row's `intake_id`; never a `409` or `429`, since the ruling answers a
@@ -14092,7 +14107,13 @@ ruling:
   not begin, or with a start this process owes and could not put back on the
   queue — leaves any slot it freed to the rows still waiting: an arrival
   behind it queues, whatever its group has free and whatever `on_conflict:`
-  says, and starts after them.
+  says, and starts after them. **What a look costs is what it can start**:
+  every arrival looks first, so a look reads the lease and the groups the
+  queue holds — off the `intakes` index, never its rows — and stops there when
+  none of them has a free slot; only a look that can start something reads the
+  queue's rows, and it reads the lease again only after a start. A burst queued
+  behind a full group costs each arrival the same however deep the queue it
+  joins.
 - **A queued row is bound again before it starts.** It holds the admission the
   build that took it bound, and the build serving when its slot frees may be
   another: one whose flow narrowed its `inputs:`, or gained a `scope: session`
@@ -14107,7 +14128,15 @@ ruling:
   "dropped"`, the intake's status URL — since its execution never began.
 - **A debounce is trailing and unbounded.** Each arrival moves the deadline to
   `debounce:` after itself, with no longest wait, so arrivals that never pause
-  never start. At the deadline the one execution is decided against the lease
+  never start. **A row past its deadline is closed, never extended**: the row
+  starts at the deadline it records (rulings c, f), so an arrival that finds
+  its group's row open after that instant — its close armed but queued behind
+  this arrival's decision, as a restart's look that the journal cut short and
+  the arrival then made itself leaves it, or a timer that fell due while
+  another decision held the trigger — closes it first, over the arrivals it
+  already counted, and opens a row of its own. Counted in, it would replace a
+  payload already due to start and push the deadline out again. At the
+  deadline the one execution is decided against the lease
   and `on_conflict:` as any arrival is — a debounce under `drop` whose group is
   busy is dropped, one under `queue` is queued. Each arrival is bound as it
   lands, with `payload.coalesced` `1`, so a request the trigger could never
