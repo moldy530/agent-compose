@@ -2372,6 +2372,12 @@ const SOURCES: &[Criterion] = &[
                 "a_tick_claimed_by_a_serve_that_stopped_before_starting_it_is_started_by_the_next_serve",
                 Status::Live,
             ),
+            // …and for a tick whose execution the journal would not begin:
+            // the schedule holds, claiming nothing past it, until it starts.
+            (
+                "a_tick_whose_execution_the_journal_will_not_begin_holds_the_schedule_until_it_starts_under_its_claim",
+                Status::Live,
+            ),
             // …with a skipped span past the counted ticks still named through
             // the last tick before the start.
             (
@@ -2404,6 +2410,12 @@ const SOURCES: &[Criterion] = &[
                 "a_program_that_keeps_exiting_is_restarted_after_a_backoff_that_doubles_to_its_max_and_starts_over_after_a_long_run",
                 Status::Live,
             ),
+            // …and a backoff longer than a timer can hold is waited out
+            // rather than fired at once.
+            (
+                "a_restart_backoff_longer_than_a_timer_can_hold_is_waited_out_rather_than_fired_at_once",
+                Status::Live,
+            ),
             // …a re-emitted window starts nothing for its repeats (dedupe).
             (
                 "a_restarted_program_that_re_emits_events_starts_nothing_for_the_repeats",
@@ -2428,6 +2440,12 @@ const SOURCES: &[Criterion] = &[
             ),
             (
                 "an_event_the_journal_will_not_admit_holds_the_stream_and_moves_no_checkpoint",
+                Status::Live,
+            ),
+            // …including one whose claim landed and whose execution the
+            // journal would not begin: never counted as started, never lost.
+            (
+                "an_event_whose_execution_the_journal_will_not_begin_holds_the_stream_and_is_not_lost",
                 Status::Live,
             ),
             // …a key claimed for an execution that never began is taken over,

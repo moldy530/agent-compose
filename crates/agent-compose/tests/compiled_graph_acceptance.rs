@@ -29638,6 +29638,150 @@ fn an_event_the_journal_will_not_admit_holds_the_stream_and_moves_no_checkpoint(
     );
 }
 
+/// An event whose **execution** the journal will not begin holds the stream,
+/// moves no checkpoint and is not lost (`docs/durability.md` §3.12, §3.13, PRD
+/// resolved q78 ruling c): the intake says an event started an execution only
+/// once that execution's lifecycle row is journaled, never as soon as its run
+/// is set going.
+///
+/// The program emits three events and waits. The case installs a SQLite
+/// trigger on the journal's `executions` table that refuses every lifecycle
+/// row, and lets the program go on with three more. The fourth event's dedupe
+/// claim lands — it is the row after it that is refused — which is the case a
+/// consumer told "started" too early loses for good: its checkpoint would read
+/// "6", the claims for 4 to 6 would name executions that never began, and a
+/// restart would hand the program "6". Here, for three seconds, the checkpoint
+/// reads "3" on the route and in the journal and nothing past the third has a
+/// lifecycle row. The trigger is dropped, the retry takes the fourth event's
+/// claim over, and each of the last three starts exactly one execution, whose
+/// id is the one its key now names.
+#[test]
+fn an_event_whose_execution_the_journal_will_not_begin_holds_the_stream_and_is_not_lost() {
+    let scratch = harness::Scratch::new("feed-unbegun");
+    let Some(project) = harness::scratch_project("feed-unbegun") else {
+        return;
+    };
+    let release = scratch.path().join("release");
+    let release_path = release.display().to_string();
+    let environment = feed_environment(
+        scratch.path(),
+        &[
+            ("FEED_TOTAL", "6"),
+            ("FEED_HOLD_AT", "4"),
+            ("FEED_HOLD_FILE", release_path.as_str()),
+        ],
+    );
+    let Some(mut served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    eventually(Duration::from_secs(60), "the third event", || {
+        (source(&app, "feed")["checkpoint"] == "3" && completed_of(&project, "ingest") == 3)
+            .then_some(())
+    });
+
+    let refused = harness::journal_sql(
+        &project,
+        "CREATE TRIGGER refuse_every_execution BEFORE INSERT ON executions BEGIN SELECT RAISE(ABORT, 'this journal refuses the execution'); END;",
+    );
+    assert!(
+        refused.status.success(),
+        "the trigger is installed: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    std::fs::write(&release, "").expect("the scratch directory is writable");
+    let emitted = scratch.path().join("emitted.log");
+    eventually(Duration::from_secs(30), "the fourth event emitted", || {
+        lines_of(&emitted)
+            .iter()
+            .any(|seq| seq == "4")
+            .then_some(())
+    });
+    // The fourth event's claim is down — the half of its admission the
+    // trigger lets through — so what the window below holds is the lifecycle
+    // row's refusal, not the claim's.
+    eventually(Duration::from_secs(30), "the fourth event's claim", || {
+        (!harness::journal_rows(
+            &project,
+            "SELECT execution FROM dedupe WHERE trigger_name = 'ingest' AND dedupe_key = '\"4\"'",
+        )
+        .as_array()
+        .expect("rows")
+        .is_empty())
+        .then_some(())
+    });
+    let window = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < window {
+        let status = source(&app, "feed");
+        assert_eq!(
+            status["checkpoint"], "3",
+            "an event whose execution never began moved no checkpoint: {status}"
+        );
+        assert_eq!(status["accepted_events"], 3, "{status}");
+        assert_eq!(journaled_checkpoint(&project).as_deref(), Some("3"));
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert_eq!(
+        executions_of(&project, "ingest").len(),
+        3,
+        "nothing past the third event has a lifecycle row"
+    );
+
+    let dropped = harness::journal_sql(&project, "DROP TRIGGER refuse_every_execution;");
+    assert!(
+        dropped.status.success(),
+        "the trigger is dropped: {}",
+        String::from_utf8_lossy(&dropped.stderr)
+    );
+    eventually(Duration::from_secs(60), "the sixth event", || {
+        (source(&app, "feed")["checkpoint"] == "6" && completed_of(&project, "ingest") == 6)
+            .then_some(())
+    });
+    let ids = ids_of(&project, "ingest");
+    assert_eq!(
+        ids.keys().cloned().collect::<BTreeSet<_>>(),
+        ids_through(6),
+        "the events whose executions the journal refused for a while were not lost"
+    );
+    assert!(
+        ids.values().all(|count| *count == 1),
+        "each event started once, the held one included: {ids:?}"
+    );
+    let fourth = executions_of(&project, "ingest")
+        .into_iter()
+        .find(|(_, inputs, _)| inputs["id"] == "4")
+        .map(|(id, _, _)| id)
+        .expect("an execution for event 4");
+    assert_eq!(
+        harness::journal_rows(
+            &project,
+            "SELECT execution FROM dedupe WHERE trigger_name = 'ingest' AND dedupe_key = '\"4\"'"
+        ),
+        json!([{ "execution": fourth }]),
+        "the fourth event's key names the execution that began, not the one refused"
+    );
+    let said = served.stop_and_read_stderr();
+    assert!(
+        said.contains("event source `feed`: event \"4\" could not be admitted to `ingest` (its execution exec_")
+            && said.contains(
+                "could not be journaled: this journal refuses the execution); trying it again in 1000ms, and reading no further line until it is"
+            ),
+        "the window was real: the fourth event's execution was refused and the admission retried: {said}"
+    );
+    assert!(
+        said.contains(&format!(
+            "event source `feed`: event \"4\" started {fourth} for `ingest`"
+        )),
+        "the start the serve log names is the one that began: {said}"
+    );
+    assert_eq!(
+        said.matches("event source `feed`: event \"4\" started ")
+            .count(),
+        1,
+        "and it is the only start the serve log claims for event 4: {said}"
+    );
+}
+
 /// A dedupe claim whose execution **never began** is taken over rather than
 /// honoured (`docs/durability.md` §3.12, Decision D162's Status).
 ///
@@ -30306,6 +30450,267 @@ fn a_tick_claimed_by_a_serve_that_stopped_before_starting_it_is_started_by_the_n
         )),
         "the serve log names the tick it started: {said}"
     );
+}
+
+/// A tick whose **execution** the journal will not begin holds the schedule
+/// until that execution starts under the tick's claim (`docs/durability.md`
+/// §3.11): the admission says a tick fired only once its execution's lifecycle
+/// row is journaled, and the scheduler claims no later tick while one it
+/// claimed is owed — so the owed claim stays the newest row, which is the one
+/// row a repair reads.
+///
+/// `AGENT_COMPOSE_SCHEDULE_CLOCK_RATE=60` makes the every-minute cron tick once
+/// a real second. Once a tick has run, the case installs a SQLite trigger on
+/// the journal's `executions` table that refuses every lifecycle row. The next
+/// tick's `fired` row lands naming an execution the journal has no row for,
+/// and for the three seconds after — three ticks' worth — no later tick is
+/// claimed. The trigger is dropped; the execution the row names runs under
+/// that id, bound to the tick's own instant; the schedule goes on; and the
+/// serve log never says the held tick fired.
+#[test]
+fn a_tick_whose_execution_the_journal_will_not_begin_holds_the_schedule_until_it_starts_under_its_claim()
+ {
+    let Some(project) = harness::scratch_project("ticks-refused-begin") else {
+        return;
+    };
+    let fast = vec![(
+        "AGENT_COMPOSE_SCHEDULE_CLOCK_RATE".to_string(),
+        "60".to_string(),
+    )];
+    let fired = |project: &Path| -> Vec<(String, String)> {
+        harness::journal_rows(
+            project,
+            "SELECT scheduled_at, execution FROM fired WHERE trigger_name = 'every_minute' ORDER BY scheduled_at",
+        )
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| {
+            (
+                row["scheduled_at"].as_str().expect("an instant").to_string(),
+                row["execution"].as_str().expect("an execution").to_string(),
+            )
+        })
+        .collect()
+    };
+    let began = |project: &Path, execution: &str| -> bool {
+        !harness::journal_rows(
+            project,
+            &format!("SELECT id FROM executions WHERE id = '{execution}'"),
+        )
+        .as_array()
+        .expect("rows")
+        .is_empty()
+    };
+    let Some(mut served) = harness::serve_into(&project, "schedules", &fast) else {
+        return;
+    };
+    eventually(Duration::from_secs(60), "a first tick's execution", || {
+        (completed_of(&project, "every_minute") >= 1).then_some(())
+    });
+
+    let refused = harness::journal_sql(
+        &project,
+        "CREATE TRIGGER refuse_every_execution BEFORE INSERT ON executions BEGIN SELECT RAISE(ABORT, 'this journal refuses the execution'); END;",
+    );
+    assert!(
+        refused.status.success(),
+        "the trigger is installed: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    // A claim whose execution is still unbegun a second after it was seen: not
+    // one whose lifecycle row was merely in flight when the rows were read.
+    let (held_at, held) = eventually(
+        Duration::from_secs(30),
+        "a tick claimed for an execution the journal refused",
+        || {
+            let candidate = fired(&project)
+                .into_iter()
+                .find(|(_, execution)| !began(&project, execution))?;
+            std::thread::sleep(Duration::from_millis(1_000));
+            (!began(&project, &candidate.1)).then_some(candidate)
+        },
+    );
+    let claimed = fired(&project).len();
+    let window = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < window {
+        let ticks = fired(&project);
+        assert_eq!(
+            ticks.len(),
+            claimed,
+            "no tick is claimed past one whose execution never began: {ticks:?}"
+        );
+        assert_eq!(
+            ticks.last().map(|(_, execution)| execution.as_str()),
+            Some(held.as_str()),
+            "the owed claim is the newest row: {ticks:?}"
+        );
+        assert!(!began(&project, &held));
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    let dropped = harness::journal_sql(&project, "DROP TRIGGER refuse_every_execution;");
+    assert!(
+        dropped.status.success(),
+        "the trigger is dropped: {}",
+        String::from_utf8_lossy(&dropped.stderr)
+    );
+    let nominal = held_at.replace(".000Z", "+00:00");
+    let inputs = eventually(
+        Duration::from_secs(60),
+        "the held tick's execution, under its claim",
+        || {
+            executions_of(&project, "every_minute")
+                .into_iter()
+                .find(|(id, _, status)| *id == held && status == "completed")
+                .map(|(_, inputs, _)| inputs)
+        },
+    );
+    assert_eq!(
+        inputs,
+        json!({ "scheduled_at": nominal, "trigger": "every_minute" }),
+        "the execution is the held tick's: its nominal instant, under the id its row recorded"
+    );
+    let after = eventually(Duration::from_secs(60), "a tick after the held one", || {
+        let ticks = fired(&project);
+        (ticks.len() > claimed + 1).then_some(ticks)
+    });
+    // Every claim but the newest — which may be in flight as the case reads —
+    // names an execution that began.
+    for (at, execution) in &after[..after.len() - 1] {
+        assert!(
+            began(&project, execution),
+            "the {at} tick's claim names an execution that began: {after:?}"
+        );
+    }
+    let said = served.stop_and_read_stderr();
+    assert!(
+        said.contains(&format!(
+            "schedule `every_minute`: the {nominal} tick was claimed as {held}, whose execution could not be journaled (this journal refuses the execution): no later tick is claimed until it starts"
+        )),
+        "the serve log says the held tick's execution was refused: {said}"
+    );
+    assert!(
+        said.contains(&format!(
+            "schedule `every_minute`: the {nominal} tick was claimed as {held} by this scheduler, and could not be started then, so it starts now"
+        )),
+        "…and names it when it starts: {said}"
+    );
+    assert!(
+        !said.contains(&format!("fired the {nominal} tick as {held}")),
+        "a tick whose execution was refused is never logged as fired: {said}"
+    );
+    assert!(
+        said.contains(
+            "which fell while this scheduler was holding the schedule for a claimed tick's start"
+        ),
+        "the ticks the hold skipped are named as such: {said}"
+    );
+}
+
+/// A `restart.backoff:` longer than a timer can hold is waited out, not fired
+/// at once (grammar 14.4, PRD resolved q78 ruling c).
+///
+/// A timer's delay is a signed 32-bit count of milliseconds in Node and Bun
+/// alike, and one past it — some 24.8 days — fires after a millisecond. The
+/// fixture is staged with `restart: { backoff: 600h, max: 600h }`, 2,160,000,000
+/// milliseconds, and a program that exits after its first event. For three
+/// seconds after the exit the source reads `backing_off` until a moment 600
+/// hours out, with one restart row and one start of the program: the backoff
+/// is armed in steps rather than whole, so it neither restarts the program at
+/// once nor warns that its timeout overflowed.
+#[test]
+fn a_restart_backoff_longer_than_a_timer_can_hold_is_waited_out_rather_than_fired_at_once() {
+    let local =
+        std::fs::read_to_string(harness::projects().join("command-source/deploy/local.yml"))
+            .expect("the fixture's deploy file");
+    let long = local.replace(
+        "      backoff: 200ms\n      max: 2s\n",
+        "      backoff: 600h\n      max: 600h\n",
+    );
+    assert_ne!(
+        long, local,
+        "the staged deploy file gained its long backoff"
+    );
+    let (staged, entrypoint) =
+        harness::staged_with_deploy("feed-long-backoff", "command-source", "local", &long);
+    let Some(project) = harness::scratch_project("feed-long-backoff") else {
+        return;
+    };
+    let environment = feed_environment(
+        staged.path(),
+        &[("FEED_TOTAL", "3"), ("FEED_EXIT_AFTER", "1")],
+    );
+    let Some(mut served) = harness::serve_entrypoint_into(&project, &entrypoint, &environment)
+    else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let status = eventually(Duration::from_secs(60), "the program's first exit", || {
+        let status = source(&app, "feed");
+        (status["restart_count"] == 1).then_some(status)
+    });
+    assert_eq!(
+        status["restarts"][0]["backoff_ms"], 2_160_000_000_u64,
+        "the backoff is the one declared: {status}"
+    );
+    let window = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < window {
+        let status = source(&app, "feed");
+        assert_eq!(status["state"], "backing_off", "{status}");
+        assert_eq!(status["restart_count"], 1, "no second exit: {status}");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let held = source(&app, "feed");
+    let until = held["backing_off_until"]
+        .as_str()
+        .expect("a backing-off source says until when");
+    let ended = held["restarts"][0]["ended_at"]
+        .as_str()
+        .expect("the restart row says when the run ended");
+    assert_eq!(
+        epoch_ms_of(until) - epoch_ms_of(ended),
+        2_160_000_000,
+        "the backoff ends 600 hours after the exit: {held}"
+    );
+    let starts = lines_of(&staged.path().join("starts.log"));
+    assert_eq!(
+        starts.len(),
+        1,
+        "the program was started once, and not again: {starts:?}"
+    );
+    let said = served.stop_and_read_stderr();
+    assert!(
+        said.contains("restarting it in 2160000000ms (restart 1 in a row)"),
+        "the serve log names the backoff: {said}"
+    );
+    assert!(
+        !said.contains("TimeoutOverflowWarning"),
+        "no timer was armed past what a timer holds: {said}"
+    );
+    assert_eq!(
+        said.matches("event source `feed`: started `node`").count(),
+        1,
+        "one start in the serve log: {said}"
+    );
+}
+
+/// Epoch milliseconds of an instant `toISOString` wrote,
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+fn epoch_ms_of(written: &str) -> i64 {
+    let field = |range: std::ops::Range<usize>| -> i64 {
+        written[range]
+            .parse()
+            .unwrap_or_else(|_| panic!("an ISO instant: {written}"))
+    };
+    let day = compose_core::cron::days_from_civil(
+        field(0..4),
+        u32::try_from(field(5..7)).expect("a month"),
+        u32::try_from(field(8..10)).expect("a day"),
+    );
+    ((day * 24 + field(11..13)) * 60 + field(14..16)) * 60_000
+        + field(17..19) * 1_000
+        + field(20..23)
 }
 
 /// Past the ten thousand ticks the serve log counts, a skipped span still ends
