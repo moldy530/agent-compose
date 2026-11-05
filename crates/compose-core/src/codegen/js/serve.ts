@@ -2485,6 +2485,9 @@ class IntakeLedger {
         const pending = await journal.pendingIntake(trigger.name, group);
         return this.#debounce(journal, trigger, group, payload, id, pending, admission.gate);
       }
+      // Under `supersede`, the older arrivals of its group still queued are
+      // the newcomer's to replace, before the queue can start one of them.
+      await this.#supersedeQueued(journal, trigger, group, id);
       // The queue first: a slot that freed is the oldest waiting arrival's,
       // never a newcomer's (FIFO per group, PRD resolved q77 ruling b) — and
       // a queue that stopped short of its end keeps every slot it left free
@@ -2514,6 +2517,15 @@ class IntakeLedger {
    *    never lost;
    *  * a crash between the move and the fold leaves the row naming the gate,
    *    and the next move, the close or the next start folds it first.
+   *
+   * **A row whose deadline has passed is closed, never extended** (PRD
+   * resolved q77 ruling c, f): it starts at the deadline it records, so an
+   * arrival that finds it still open — its close armed and queued behind
+   * this decision, as a look made inline by an admission leaves it, or a
+   * timer that fell due while another decision held the lock — closes it
+   * first, under the lock this decision already holds, and opens a row of
+   * its own. Counted in, the arrival would replace a payload already due to
+   * start and push a deadline already past out by another `debounce:`.
    */
   async #debounce(
     journal: Journal,
@@ -2521,9 +2533,19 @@ class IntakeLedger {
     group: string | undefined,
     payload: unknown,
     id: string,
-    pending: IntakeRow | undefined,
+    open: IntakeRow | undefined,
     gate: Admission["gate"],
   ): Promise<AdmitAnswer> {
+    let pending = open;
+    if (open?.deadline !== undefined && Date.parse(open.deadline) <= Date.now()) {
+      await this.#close(open.id);
+      // Closed: started, queued or dropped. A row the close left open — the
+      // app is stopping — is neither extended nor joined by a second.
+      pending = await journal.pendingIntake(trigger.name, group);
+      if (pending?.id === open.id) {
+        throw new Error(`the debounce ${open.id} is past its deadline and could not be closed`);
+      }
+    }
     const debounce = trigger.concurrency.debounceMs ?? 0;
     const now = Date.now();
     const deadline = new Date(now + debounce).toISOString();
@@ -2869,18 +2891,38 @@ class IntakeLedger {
    * yet been started into is its own — a later row of its group, or one that
    * would take the trigger's last `max_running:`, waits for it rather than
    * running beside the execution it will be.
+   *
+   * **What a look costs is what it can start** (Decision D163's Status). Every
+   * arrival, every settle and every re-drain looks, so a look at a queue none
+   * of whose groups has a free slot reads the lease and the queue's groups —
+   * the index, never the rows — and stops there; only a look that can start
+   * something reads the queue, and it reads the lease again only after each
+   * start, passing over the rows of a group it has seen full without asking
+   * again. A burst queued behind a full group therefore costs each arrival
+   * the same, however deep the queue it joins.
    */
   async #drain(journal: Journal, trigger: IntakeTrigger): Promise<boolean> {
     const owed = await this.#requeue(journal, trigger);
+    let leases = await this.#leases(journal, trigger);
+    const groups = await journal.queuedGroups(trigger.name);
+    const room = (): boolean => groups.some((group) => hasSlot(trigger.concurrency, leases, group));
+    if (!room()) {
+      if (groups.length > 0 || owed || this.#owed.has(trigger.name)) this.#redrainLater(trigger.name);
+      return owed;
+    }
     const queued = await journal.intakesOf(trigger.name, "queued");
     let waiting = queued.length;
     let stalled = false;
+    const full = new Set<string | undefined>();
     for (const row of queued) {
       if (this.#stopped) return false;
-      const leases = await this.#leases(journal, trigger);
-      const max = trigger.concurrency.maxRunning;
-      if (max !== undefined && leases.length >= max) break;
-      if (!hasSlot(trigger.concurrency, leases, row.group)) continue;
+      if (full.has(row.group)) continue;
+      if (!hasSlot(trigger.concurrency, leases, row.group)) {
+        // Full now, and full for the rest of this look: what it starts only
+        // adds to the lease.
+        full.add(row.group);
+        continue;
+      }
       if (row.admission === undefined) continue;
       if (!(await this.#stillBinds(journal, trigger, row, row.admission))) {
         waiting -= 1;
@@ -2892,6 +2934,10 @@ class IntakeLedger {
         break;
       }
       waiting -= 1;
+      leases = await this.#leases(journal, trigger);
+      // Every group the queue holds is full, or the trigger is at its
+      // `max_running:`: nothing past here can start.
+      if (!room()) break;
     }
     if (waiting > 0 || owed || this.#owed.has(trigger.name)) this.#redrainLater(trigger.name);
     return stalled || owed;
@@ -3001,8 +3047,37 @@ class IntakeLedger {
       sayIntake(trigger.name, `${row.id} dropped: ${detail}`);
       return;
     }
+    await this.#supersedeQueued(journal, trigger, row.group, row.execution);
     const stalled = await this.#drain(journal, trigger);
     await this.#place(journal, trigger, row.group, bound, row.execution, undefined, row, stalled);
+  }
+
+  /**
+   * **A superseding arrival replaces its group's queued arrivals too**
+   * (Decision D163's Status): under `on_conflict: supersede` only the newest
+   * arrival of a group is owed a run, so the group's rows still `queued` —
+   * held there by the trigger's `max_running:`, or behind a queue that
+   * stalled — are dropped as the newcomer lands, each naming the arrival that
+   * superseded it, before a slot could start one of them to run whole ahead
+   * of it. The running ones are cancelled where the arrival is placed
+   * ([`#place`]). A row dropped so names no running execution: it was
+   * replaced, not turned away, and its intake answers as one that never
+   * began.
+   */
+  async #supersedeQueued(
+    journal: Journal,
+    trigger: IntakeTrigger,
+    group: string | undefined,
+    by: string,
+  ): Promise<void> {
+    if (trigger.concurrency.onConflict !== "supersede") return;
+    for (const row of await journal.groupQueue(trigger.name, group)) {
+      if (row.execution === by) continue;
+      const detail = `a newer arrival of its group superseded it before it started, for ${by}`;
+      if (await journal.moveIntake(row.id, "queued", { state: "dropped", detail })) {
+        sayIntake(trigger.name, `${row.id} dropped: ${detail}`);
+      }
+    }
   }
 
   /**

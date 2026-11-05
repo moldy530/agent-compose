@@ -1209,6 +1209,19 @@ export interface Journal {
   /** A trigger's intake rows in one state, in insertion order — a queue's FIFO. */
   intakesOf(trigger: string, state: IntakeState): Promise<readonly IntakeRow[]>;
   /**
+   * The groups a trigger's queue holds rows of — `undefined` for the key-less
+   * group — read down the `intakes_by_trigger` index without reading a row's
+   * admission: what a look at the queue asks first, so a queue none of whose
+   * groups has a free slot costs an index read rather than the whole queue
+   * (Decision D163's Status).
+   */
+  queuedGroups(trigger: string): Promise<readonly (string | undefined)[]>;
+  /**
+   * One group's queue: its `queued` rows, in insertion order, read down the
+   * same index — what a superseding arrival drops (Decision D163's Status).
+   */
+  groupQueue(trigger: string, group: string | undefined): Promise<readonly IntakeRow[]>;
+  /**
    * A trigger's `started` rows whose execution has no lifecycle row, in
    * insertion order — what a restart repairs or takes back before it admits
    * anything (`docs/durability.md` §3.15).
@@ -2095,6 +2108,46 @@ class SqlJournal implements Journal {
         `SELECT intakes.${order} AS insertion_order, intakes.* FROM intakes
            WHERE trigger_name = ? AND state = ? ORDER BY intakes.${order} ASC`,
         [trigger, state],
+      );
+      return rows.map((row) => intakeOf(row));
+    });
+  }
+
+  queuedGroups(trigger: string): Promise<readonly (string | undefined)[]> {
+    return this.#serial(async () => {
+      // The distinct hashes off the index alone — `(trigger_name, state,
+      // group_hash)` covers the read — and then one row's key for each keyed
+      // group, found down the same index: what this costs is the queue's index
+      // entries and one row per group, never the queue's admissions.
+      const hashes = await this.#all(
+        "SELECT DISTINCT group_hash FROM intakes WHERE trigger_name = ? AND state = 'queued'",
+        [trigger],
+      );
+      const groups: (string | undefined)[] = [];
+      for (const row of hashes) {
+        const hash = String(row["group_hash"]);
+        if (hash === "") {
+          groups.push(undefined);
+          continue;
+        }
+        const keyed = await this.#one(
+          "SELECT group_key FROM intakes WHERE trigger_name = ? AND state = 'queued' AND group_hash = ? LIMIT 1",
+          [trigger, hash],
+        );
+        const key = keyed?.["group_key"];
+        if (key !== null && key !== undefined) groups.push(JSON.parse(String(key)) as string);
+      }
+      return groups;
+    });
+  }
+
+  groupQueue(trigger: string, group: string | undefined): Promise<readonly IntakeRow[]> {
+    return this.#serial(async () => {
+      const order = this.#driver.dialect.insertionOrder;
+      const rows = await this.#all(
+        `SELECT intakes.${order} AS insertion_order, intakes.* FROM intakes
+           WHERE trigger_name = ? AND state = 'queued' AND group_hash = ? ORDER BY intakes.${order} ASC`,
+        [trigger, groupHash(group)],
       );
       return rows.map((row) => intakeOf(row));
     });

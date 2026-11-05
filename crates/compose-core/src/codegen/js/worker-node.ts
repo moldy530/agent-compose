@@ -540,6 +540,14 @@ class DispatchJournal implements Journal {
     throw new WorkerJournalReach("read a trigger's intake");
   }
 
+  queuedGroups(_trigger: string): Promise<readonly (string | undefined)[]> {
+    throw new WorkerJournalReach("read a trigger's intake");
+  }
+
+  groupQueue(_trigger: string, _group: string | undefined): Promise<readonly IntakeRow[]> {
+    throw new WorkerJournalReach("read a trigger's intake");
+  }
+
   unbegunIntakes(_trigger: string): Promise<readonly IntakeRow[]> {
     throw new WorkerJournalReach("read a trigger's intake");
   }
