@@ -373,6 +373,24 @@ interface Execution {
    * for every ordinary run.
    */
   announced: boolean;
+  /**
+   * Whether this run's lifecycle row has been journaled — by this generation
+   * (`runFlow`'s `opened` hook) or, for a recovered execution, by the one
+   * that died. A run that stopped short of it held no slot of its trigger's
+   * lease, so its settle frees none, and [`settling`] looks at no queue for
+   * it (Decision D163's Status).
+   */
+  journaled: boolean;
+  /**
+   * Whether a stop **before** the lifecycle row puts this execution's arrival
+   * back on its trigger's queue, to be started again under this same id: a
+   * start of an arrival the intake answered with its `intake_id`
+   * ([`IntakeLedger.#begin`]). Such a stop is not the execution's settle — the
+   * execution that arrival is owed has yet to run — so [`settling`] pushes no
+   * `settled` webhook for it, and the webhook goes where the start that does
+   * reach its row closes it ([`closed`]).
+   */
+  requeues: boolean;
   outputs?: Record<string, unknown>;
   trace?: readonly runtime.TraceEntry[];
   error?: string;
@@ -672,9 +690,27 @@ export function createApp(): FastifyInstance {
     // does not know is a different mistake from a cancel the caller may not
     // make, and the guard comes before anything about the execution is said
     // (grammar 13.3, PRD resolved q32).
-    if (execution === undefined) return unknownExecution(reply, id);
+    if (execution === undefined) {
+      // …save one left open in the journal, still holding a slot of its
+      // trigger's lease, that recovery put on no board here — this build has
+      // no flow of the name it ran — or has not reached yet ([`unrunLease`]).
+      const held = await unrunLease(id);
+      if (held === undefined) return unknownExecution(reply, id);
+      const refusal = guardedBy(held.trigger, request);
+      if (refusal !== undefined) return refuse(reply, held.trigger, refusal);
+      return cancelUnrun(reply, held, undefined);
+    }
     const refusal = guarded(execution, request);
     if (refusal !== undefined) return refuse(reply, execution.trigger, refusal);
+    if (execution.status !== "running" && !execution.announced) {
+      // Settled **here** without reaching the hook that closes its row
+      // ([`closed`]), so open in the journal: a recovery this build could not
+      // take — a replay that diverged, recorded inputs it no longer accepts —
+      // which leaves the row open on purpose (`docs/durability.md` §7). Where
+      // it holds a slot of a lease, its cancel is what frees it.
+      const held = await unrunLease(id);
+      if (held !== undefined) return cancelUnrun(reply, held, execution);
+    }
     if (execution.status !== "running") {
       return reply.code(409).send({
         execution_id: id,
@@ -2648,13 +2684,29 @@ class IntakeLedger {
         await this.#cancel(lease.execution);
         sayIntake(trigger.name, `superseded ${lease.execution} for ${id}`);
       }
+      // **A slot the cancels freed under `max_running:` is the queue's
+      // first** (Decision D163's Status): the rule [`admit`] keeps — a slot
+      // that freed is the oldest waiting arrival's, never a newcomer's — holds
+      // for one the newcomer's own cancel freed. An older arrival of another
+      // group, queued because the trigger was at its total, starts into it
+      // ahead of the newcomer, which then waits as `queue` would; taken by the
+      // newcomer, a group superseded faster than its runs end would hold the
+      // trigger's total for ever and every other group's arrivals would starve.
+      // The newcomer's own group has nothing queued to start here — its rows
+      // were dropped as it landed ([`#supersedeQueued`]) — and with no
+      // `max_running:` a cancel frees no other group's slot, so there is
+      // nothing to look at.
+      if (concurrency.maxRunning !== undefined && (await this.#drain(journal, trigger))) {
+        return this.#enqueue(journal, trigger, group, bound, id, waiting, await journal.leasesOf(trigger.name), true);
+      }
       leases = await journal.leasesOf(trigger.name);
       if (hasSlot(concurrency, leases, group)) {
         return this.#begin(journal, trigger, bound, id, waiting, fired, false, group);
       }
       // Still no slot: the group had none of its own to give, and the
-      // trigger's `max_running:` is held by its other groups' executions,
-      // which a supersede never cancels. The arrival waits for one.
+      // trigger's `max_running:` is held by its other groups' executions —
+      // which a supersede never cancels — or was just given to the oldest of
+      // their queued arrivals. The arrival waits for one.
     }
     if (concurrency.onConflict === "drop") {
       const running = oldestOf(leases, group) ?? "";
@@ -2837,6 +2889,9 @@ class IntakeLedger {
         ...(bound.traceparent === undefined ? {} : { traceparent: bound.traceparent }),
       },
       id,
+      // A start of an arrival answered with its intake id is undone below by
+      // putting it back on the queue, not by settling it.
+      row.waited,
     );
     try {
       await begun;
@@ -2851,6 +2906,12 @@ class IntakeLedger {
         // reads the queue — so the start is remembered as owed, and every drain
         // of the trigger tries the move again until it lands ([`#requeue`]);
         // the next start of `serve` finds the row either way ([`#prepare`]).
+        //
+        // Nothing settled: the run's tail pushes no `settled` webhook for a
+        // start it was told requeues, and looks at no queue for a run that
+        // never reached its row ([`settling`]) — so the next try is the look
+        // armed here, in [`DRAIN_RETRY_MS`], or the next arrival's, never one
+        // this failure set going itself.
         const detail = `its execution could not be journaled: ${reason}`;
         const requeued = await journal
           .moveIntake(row.id, "started", { state: "queued", detail })
@@ -3453,6 +3514,9 @@ function resumeInto(
     reported,
     deliveries: Promise.resolve(),
     announced: false,
+    // Its row is the one recovery read it from.
+    journaled: true,
+    requeues: false,
     settled: Promise.resolve(),
   };
   // The replay has stopped: whatever it did or did not reach, nothing more is
@@ -3528,6 +3592,10 @@ function trackChild(
     reported: new Set<string>(),
     deliveries: Promise.resolve(),
     announced: false,
+    // A child's row opens before anything about it is refused (`runFlow`'s
+    // note on child executions), and it holds no slot of any lease either way.
+    journaled: true,
+    requeues: false,
     settled: Promise.resolve(),
   };
   const run = runChildFlow(child, (produced, error) => closed(execution, produced, error));
@@ -3545,11 +3613,16 @@ function trackChild(
  * lifecycle row is journaled — `runFlow`'s `opened` hook — and rejected with
  * whatever stopped the run before it was. What a gated [`admit`] waits for
  * before it says the execution started.
+ *
+ * `requeues` is the intake's, for an arrival it answered with an `intake_id`
+ * ([`Execution.requeues`]): a stop before the row puts that arrival back on
+ * the queue under this id rather than settling the execution.
  */
 function register(
   executions: Map<string, Execution>,
   admission: Admission,
   id: string,
+  requeues = false,
 ): { readonly record: Execution; readonly begun: Promise<void> } {
   const { flow, inputs, sessionKey, callback, traceparent } = admission;
   const execution: Execution = {
@@ -3569,6 +3642,9 @@ function register(
     reported: new Set<string>(),
     deliveries: Promise.resolve(),
     announced: false,
+    // Until `runFlow`'s `opened` hook says its row is down.
+    journaled: false,
+    requeues,
     // Replaced immediately below. The record has to exist before the run does,
     // because the run's own handlers write into it.
     settled: Promise.resolve(),
@@ -3576,7 +3652,10 @@ function register(
   const unwatch = watchPauses(execution);
   let opened: () => void = () => {};
   const journaled = new Promise<void>((resolve) => {
-    opened = resolve;
+    opened = () => {
+      execution.journaled = true;
+      resolve();
+    };
   });
   // `resumable: true` is what makes a `human` node a *pause* rather than the end
   // of the run: this app mounts the route that answers one (grammar 8.7,
@@ -3690,6 +3769,14 @@ function callbackOf(trigger: HttpTrigger, payload: Payload): string | undefined 
  * `session_key:` the composition has since started requiring, a journal that
  * could not be opened. Nothing is journaled about such a run at all, so nothing
  * will ever recover it, and the absence of a row is exactly what says so.
+ *
+ * **Except where the intake owes the start** ([`Execution.requeues`]): an
+ * arrival answered with its `intake_id` whose start the journal would not
+ * begin goes back on its trigger's queue and is started again under this same
+ * execution id ([`IntakeLedger.#begin`]). That stop is not the execution's —
+ * pushed as `failed`, it would be the only settle the caller ever hears, since
+ * the start that does run the execution finds that push journaled
+ * ([`settledAlready`]) and announces nothing (Decision D163's Status).
  */
 function settling(execution: Execution, run: Promise<FlowRun>): Promise<void> {
   return run
@@ -3702,6 +3789,9 @@ function settling(execution: Execution, run: Promise<FlowRun>): Promise<void> {
       // difference: the report is this process's, the push is the execution's.
       recorded(execution, undefined, error);
       if (execution.announced) return;
+      // Back on the queue under this id: the push is the start's that reaches
+      // the row.
+      if (execution.requeues && !execution.journaled) return;
       // The one settle [`closed`] never hears about: a run that failed **before
       // it was journaled at all** — its inputs refused by a flow whose
       // `inputs:` this build has narrowed, a `session_key:` the composition has
@@ -3714,7 +3804,14 @@ function settling(execution: Execution, run: Promise<FlowRun>): Promise<void> {
       // The run has stopped and its lifecycle row has closed (or stayed open,
       // which frees nothing): a slot of its trigger's lease may be free, and
       // the queue it held back is looked at (PRD resolved q77 ruling b).
-      released(execution.trigger);
+      //
+      // **Not for a run that never reached its row**: it held no slot, so it
+      // freed none. Above all not for an intake start the journal refused —
+      // its arrival is back on the queue, and a look now would start it again
+      // at once, to be refused again, in a loop paced only by the journal's
+      // latency. The start that failed armed the queue's next look itself, in
+      // [`DRAIN_RETRY_MS`] ([`IntakeLedger.#begin`]).
+      if (execution.journaled) released(execution.trigger);
     });
 }
 
@@ -4496,6 +4593,73 @@ function unknownExecution(reply: FastifyReply, id: string): unknown {
   return reply
     .code(404)
     .send({ error: `no execution \`${id}\` was started by this process` });
+}
+
+/**
+ * The lifecycle row of `id` where it **holds a slot of a trigger's lease and
+ * this process runs no generation of it** (Decision D163's Status): open in
+ * the journal, started by a trigger's intake — a `started` intake row names it
+ * — and, as the cancel route asks it, either on no board here or settled on
+ * this one. `undefined` for anything else, and for a journal that cannot be
+ * read, which leaves the route's answer what it was.
+ *
+ * Two ways a build leaves one. A recovery whose replay **diverged**, or whose
+ * recorded inputs this build's `inputs:` refuse, leaves the row open on
+ * purpose (`docs/durability.md` §7) while this process reports it `failed`;
+ * and an open row of a flow this build does not declare is left in the
+ * journal by recovery and put on no board at all. Either still holds its slot
+ * — the lease is the open rows ([`Journal.leasesOf`]) — and nothing this build
+ * runs will close it, so without a way to free it its group, or the trigger's
+ * whole `max_running:`, would be held for as long as the build is served.
+ * Only intake-started rows are asked about: a `run` beside a `serve` writes an
+ * open row this process is not running either, and its cancel is not
+ * `serve`'s (PRD resolved q75 ruling d).
+ */
+async function unrunLease(id: string): Promise<runtime.ExecutionRow | undefined> {
+  try {
+    const journal = await openJournal();
+    const row = await journal.execution(id);
+    if (row === undefined || row.status !== "open") return undefined;
+    const intake = await journal.intakeOf(id);
+    if (intake === undefined || intake.state !== "started" || intake.execution !== id) return undefined;
+    return row;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Cancel an execution [`unrunLease`] found: the request recorded and the
+ * cascade taken, as every cancel is (`runtime.cancelExecution`) — which frees
+ * its slot of the lease the moment the request is down, since a slot is held
+ * by an execution nobody has asked to cancel — and its trigger's queue looked
+ * at. Nothing fires here, because nothing here is running it: the row stays
+ * open, and the start that next recovers it under a build that can run it
+ * completes the cancel (`docs/durability.md` §6.1). `202`, as for any open
+ * execution (PRD resolved q75 ruling d), its `status` this process's report
+ * where it has one and the journal's `open` where it has none.
+ */
+async function cancelUnrun(
+  reply: FastifyReply,
+  row: runtime.ExecutionRow,
+  execution: Execution | undefined,
+): Promise<unknown> {
+  await cancelExecution(row.id);
+  released(row.trigger);
+  return reply.code(202).send({
+    execution_id: row.id,
+    status: execution === undefined ? "open" : statusOf(execution),
+    cancelling: true,
+    ...(execution === undefined ? {} : { status_url: `/executions/${row.id}` }),
+    detail: `${unrunBecause(row, execution)}, so its lifecycle row stays open; the cancel is recorded, which frees the slot it held of the trigger \`${row.trigger}\`'s lease, and the start that next recovers it under a build that can run it completes the cancel`,
+  });
+}
+
+/** Why this process runs no generation of an execution [`unrunLease`] found. */
+function unrunBecause(row: runtime.ExecutionRow, execution: Execution | undefined): string {
+  if (execution !== undefined) return "this process could not take up its recovery";
+  if (flows[row.flow] === undefined) return `this build declares no flow \`${row.flow}\` to run it by`;
+  return "this process has not recovered it";
 }
 
 /**

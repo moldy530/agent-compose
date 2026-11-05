@@ -2269,6 +2269,14 @@ class SqlJournal implements Journal {
       // finds the lease the rows hold, and a slot frees the moment the row
       // that held it closes or is asked to cancel.
       //
+      // **An open row the serving build cannot run holds its slot too** — a
+      // recovery whose replay diverged, which stays open on purpose (§7), or
+      // a row of a flow the build no longer declares, which recovery leaves
+      // where it is. The rows say it is running, and no process can know
+      // better; what frees such a slot is its cancel, which `serve`'s cancel
+      // route records for an execution like it as for any open one (Decision
+      // D163's Status).
+      //
       // **Driven from the open lifecycle rows**, never from the intake's:
       // intake rows are kept (§3.15), so a trigger's `started` rows are its
       // whole history, while its open executions are what is running now. The
