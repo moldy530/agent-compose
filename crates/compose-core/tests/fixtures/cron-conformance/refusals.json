@@ -90,6 +90,16 @@
     "error": "a cron expression has 5 fields, and this one has 6"
   },
   {
+    "name": "a-next-line-character-separates-no-fields",
+    "cron": "0\u00853 * * *",
+    "error": "a cron expression has 5 fields, and this one has 4"
+  },
+  {
+    "name": "a-no-break-space-separates-no-fields",
+    "cron": "0 3 * * *",
+    "error": "a cron expression has 5 fields, and this one has 4"
+  },
+  {
     "name": "a-range-of-names-that-runs-backwards",
     "cron": "0 0 * * FRI-SUN",
     "error": "the day-of-week field `FRI-SUN` has the range `FRI-SUN`, which runs backwards: write the smaller end first"

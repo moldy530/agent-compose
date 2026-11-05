@@ -15,8 +15,15 @@
 //!
 //! # The grammar (grammar 13.4)
 //!
-//! Five fields separated by whitespace — minute, hour, day of the month, month,
-//! day of the week. Each is a list of entries separated by `,`, and an entry is
+//! Five fields separated by ASCII whitespace — minute, hour, day of the month,
+//! month, day of the week. The separators are exactly
+//! [`str::split_ascii_whitespace`]'s — space, tab, line feed, form feed and
+//! carriage return — and the emitted evaluator splits on the same five: Unicode
+//! "whitespace" is read two ways (Rust's `White_Space` has U+0085, ECMAScript's
+//! `\s` does not), and a separator either reader takes and the other refuses is
+//! an expression `validate` passes and `serve` cannot evaluate. Any other
+//! character is part of a field, which then refuses it. Each field is a list of
+//! entries separated by `,`, and an entry is
 //!
 //! * `*` — every value of the field;
 //! * a value — a decimal number, or, in the month and day-of-week fields only,
@@ -175,7 +182,7 @@ impl Cron {
     /// A [`CronError`] naming the first field that is wrong and how, or saying
     /// that the expression can never fire.
     pub fn parse(text: &str) -> Result<Self, CronError> {
-        let parts: Vec<&str> = text.split_whitespace().collect();
+        let parts: Vec<&str> = text.split_ascii_whitespace().collect();
         if parts.len() != 5 {
             return Err(CronError {
                 message: format!(

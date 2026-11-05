@@ -1080,16 +1080,23 @@ fn schedule_trigger(fields: &mut Fields<'_>, cx: &mut Cx) -> ScheduleTrigger {
     }
 }
 
-/// Whether `cron` has the shape grammar 13.4 fixes: five whitespace-separated
-/// fields and nothing around them (Decision D46).
+/// Whether `cron` has the shape grammar 13.4 fixes: five fields separated by
+/// ASCII whitespace and nothing around them (Decision D46).
 ///
-/// The published schema spells the same shape as `^\S+(\s+\S+){4}$`, and the
-/// anchors are the load-bearing part. Counting the fields alone would accept
-/// `"0 3 * * * "`, which the schema rejects — and cron shape is not on PRD §7
-/// M0's static-check list, so no later pass would recover it, leaving this pass
+/// The published schema spells the same shape as
+/// `^[^ \t\n\f\r]+([ \t\n\f\r]+[^ \t\n\f\r]+){4}$`, and the anchors are the
+/// load-bearing part. Counting the fields alone would accept `"0 3 * * * "`,
+/// which the schema rejects — and cron shape is not on PRD §7 M0's
+/// static-check list, so no later pass would recover it, leaving this pass
 /// looser than the schema on a rule it owns (Appendix B).
+///
+/// **ASCII** whitespace, here and in both evaluators (`compose_core::cron`, the
+/// emitted `src/cron.ts`): Unicode's is read two ways — Rust's `White_Space`
+/// has U+0085, ECMAScript's `\s` does not — and a separator one reader takes
+/// and the other refuses is an expression `validate` passes and `serve` cannot
+/// evaluate. Any other character is part of a field, which then refuses it.
 fn cron_shape(cron: &Spanned<String>, cx: &mut Cx) -> bool {
-    if cron.value.trim() != cron.value {
+    if cron.value.trim_matches(|c: char| c.is_ascii_whitespace()) != cron.value {
         cx.push(
             Diagnostic::error(
                 DiagnosticCode::InvalidValue,
@@ -1105,7 +1112,7 @@ fn cron_shape(cron: &Spanned<String>, cx: &mut Cx) -> bool {
         );
         return false;
     }
-    let fields_count = cron.value.split_whitespace().count();
+    let fields_count = cron.value.split_ascii_whitespace().count();
     if fields_count == 5 {
         return cron_fields(cron, cx);
     }

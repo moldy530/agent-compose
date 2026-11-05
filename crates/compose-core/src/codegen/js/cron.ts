@@ -92,9 +92,20 @@ export const HORIZON_DAYS = 366 * 9;
 /** A sentinel for a run of digits too long to be in any field's range. */
 const TOO_LONG = 0xffffffff;
 
+/**
+ * The characters that separate a cron expression's fields: ASCII whitespace,
+ * exactly the set Rust's `split_ascii_whitespace` splits on in
+ * `compose_core::cron` — space, tab, line feed, form feed and carriage return.
+ * Not `\s`, which takes in the Unicode spaces too, and not quite the set
+ * `split_whitespace` reads (that one has U+0085, which `\s` does not): two
+ * readers of "whitespace" are two readings of the expression, and `validate`
+ * would pass what `serve` could not evaluate.
+ */
+const FIELD_SEPARATOR = /[ \t\n\f\r]+/;
+
 /** Parse grammar 13.4's five-field expression, or throw a [`CronError`]. */
 export function parseCron(text: string): Cron {
-  const parts = text.split(/\s+/).filter((part) => part !== "");
+  const parts = text.split(FIELD_SEPARATOR).filter((part) => part !== "");
   if (parts.length !== 5) {
     throw new CronError(`a cron expression has 5 fields, and this one has ${parts.length}`);
   }

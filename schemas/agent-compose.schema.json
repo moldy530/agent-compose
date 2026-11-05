@@ -2979,7 +2979,7 @@
       "required": ["type"],
       "properties": {
         "type": {
-          "description": "Which invocation source this trigger declares. manual and http are active in v0; schedule and event are reserved grammar (parsed and validated, no-op).",
+          "description": "Which invocation source this trigger declares. manual is the agent-compose run entry point; http mounts a route serve answers; schedule is a cron serve fires at each tick; event admits each event a bound event source produces, consumed by serve. run fires no schedule and consumes no event source. Grammar 13 / PRD resolved q78.",
           "enum": ["manual", "http", "schedule", "event"]
         }
       },
@@ -3163,8 +3163,8 @@
         "type": { "const": "schedule", "description": "Schedule invocation: serve evaluates the cron and starts an execution at each tick; run fires nothing." },
         "flow": { "description": "The flow this trigger starts.", "$ref": "#/$defs/flowRef" },
         "cron": {
-          "description": "5-field POSIX cron expression - minute, hour, day of the month, month (1-12 or JAN-DEC), day of the week (0-7 or SUN-SAT) - each a list of *, a value, a range a-b, or a step */n or a-b/n; when both day fields are restricted a day matching either fires. validate holds every field to the grammar serve evaluates (invalid-cron), so env references are illegal (grammar 4.3 class 3, Decision D92).",
-          "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "pattern": "^\\S+(\\s+\\S+){4}$" }]
+          "description": "5-field POSIX cron expression - minute, hour, day of the month, month (1-12 or JAN-DEC), day of the week (0-7 or SUN-SAT) - separated by ASCII whitespace (space, tab, line feed, form feed, carriage return; any other character is part of a field), each a list of *, a value, a range a-b, or a step */n or a-b/n; when both day fields are restricted a day matching either fires. validate holds every field to the grammar serve evaluates (invalid-cron), so env references are illegal (grammar 4.3 class 3, Decision D92).",
+          "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "pattern": "^[^ \\t\\n\\f\\r]+([ \\t\\n\\f\\r]+[^ \\t\\n\\f\\r]+){4}$" }]
         },
         "timezone": { "description": "IANA timezone name (default UTC), the wall clock the cron is matched against: a time daylight saving skips fires at the first instant after the gap, one it repeats fires once. Shape-checked at compile time and refused at serve start when the runtime's database does not know it, so env references are illegal (grammar 4.3 class 3, Decision D92).", "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "pattern": "^[A-Za-z][A-Za-z0-9_+-]*(/[A-Za-z][A-Za-z0-9_+-]*)*$" }] },
         "input": { "description": "Bindings, CEL over payload.scheduled_at / payload.trigger.", "$ref": "#/$defs/triggerInput" },

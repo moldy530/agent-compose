@@ -763,9 +763,9 @@ triggers:
 }
 
 /// `cron:` is anchored — five fields with nothing around them — but the
-/// separator between them is a *run* of whitespace in grammar 13.4 and in the
-/// published schema's `^\S+(\s+\S+){4}$` alike, so an aligned expression is
-/// legal and a tab is whitespace like any other.
+/// separator between them is a *run* of ASCII whitespace in grammar 13.4 and in
+/// the published schema's `^[^ \t\n\f\r]+([ \t\n\f\r]+[^ \t\n\f\r]+){4}$`
+/// alike, so an aligned expression is legal and a tab separates like a space.
 #[test]
 fn a_cron_expression_whose_fields_are_separated_by_runs_of_whitespace() {
     accepts(

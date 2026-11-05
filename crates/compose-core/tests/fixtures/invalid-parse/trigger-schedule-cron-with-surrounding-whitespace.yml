@@ -8,6 +8,6 @@ triggers:
     type: schedule
     flow: flow.triage
     # The field count is right, so counting alone accepts this; the published
-    # schema anchors the shape as `^\S+(\s+\S+){4}$`, and the trailing space
-    # alone is what it rejects.
+    # schema anchors the shape as five runs of non-separators between ASCII
+    # whitespace, and the trailing space alone is what it rejects.
     cron: "0 3 * * * "
