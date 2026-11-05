@@ -13758,7 +13758,9 @@ fired row or a checkpoint is kept in; both live in the journal under every
 target. [D46](#d46-reserved-trigger-shapes-are-fully-specified): amended, with a note on it. [D117](#d117-payloadbody-is-an-empty-object-on-a-bodyless-request) (`payload.body` on a bodyless
 request): untouched — a command source's body is always the line's object, so
 there is no bodyless event. [D160](#d160-a-cancel-ends-an-execution-cancelled-through-one-controller-every-node-chains-to): the process-group discipline a command
-source's program is stopped by. **D163** is reserved for q77. `docs/distributed.md`
+source's program is stopped by. [D163](#d163-a-triggers-intake-a-dedupe-window-and-groups-leased-off-the-journal)
+(PRD resolved q77): extends this admission seam with the intake ledger, and
+amends the dedupe row's lifetime, with a note on it above. `docs/distributed.md`
 **§8**: rule 2 is amended to name the fired row's exception, and the two-hub
 reading of a tick is stated there. Rule 3 ("no schema or protocol may assume
 one writer per journal") is **not** amended: the tick repair and the dedupe
