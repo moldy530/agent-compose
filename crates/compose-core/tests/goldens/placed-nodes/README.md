@@ -312,10 +312,12 @@ What `serve` writes about them goes to **stderr**, one line each:
 | ``event source `<s>`: event "<id>" started <execution> for `<t>` `` | an event is admitted |
 | ``event source `<s>`: event "<id>" repeats one `<t>` already admitted as <execution>, so it started nothing`` | a repeat is deduplicated |
 | ``event source `<s>`: event "<id>" could not be admitted to `<t>` (<why>); trying it again in <ms>ms, and reading no further line until it is`` | the journal refused the event's claim or its execution: the stream holds, and the checkpoint does not move |
-| ``event source `<s>`: line <n> is not a JSON object, so it was refused and starts nothing (<n> refused so far)`` | a line is refused |
+| ``event source `<s>`: line <n> is not a JSON object, so it was refused and starts nothing (<n> refused so far)`` | a line is refused — one longer than 1 MiB among them, once: the rest of it is dropped |
+| ``event source `<s>`: line <n>'s `checkpoint` could not be handed back to the program (<why>), so it was refused and starts nothing (<n> refused so far)`` | a line's checkpoint holds a NUL or a lone surrogate, or is longer than 64 KiB: journaled, every later start would be handed it |
 | ``event source `<s>`: the program exited with code <c> after <seconds>s; restarting it in <ms>ms (restart <n> in a row)`` | the program ends, by an exit or a signal |
 | ``[source <s>] <line>`` | the program writes a line to its stderr; one longer than 1 MiB is logged cut there, ending `[cut: …]` |
 | ``event trigger `<t>`: no event source `<s>` is bound under this target, so nothing consumes for it`` | a trigger's source is unbound under `local` |
+| ``this project's journal can be read now, so the <n> executions it holds open are recovered now, before any tick or event is admitted`` | a `serve` whose start could not read the journal — a standby, while another held it — can read it: what it holds open is recovered before any tick fires or event is admitted |
 
 Stopping it stops the graph: `agent-compose serve` passes `SIGINT` and `SIGTERM`
 on to this project, which closes the app, stops every schedule and every

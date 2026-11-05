@@ -63,7 +63,11 @@
 //    in its environment and in place of any argument written exactly
 //    `{checkpoint}` — unset, and the empty string, before there is one. A
 //    journal that cannot say which holds the program back, retried with
-//    backoff, rather than starting it as if there were none.
+//    backoff, rather than starting it as if there were none. A line whose
+//    checkpoint no program could be handed back — a NUL in it, a lone
+//    surrogate, more than 64 KiB — is refused with the line, as one whose
+//    `checkpoint:` cannot be evaluated is: journaled, it would be the position
+//    every later start was handed, and every one of them would fail.
 //
 // An exit, with any code or by any signal, restarts the program after a
 // backoff that doubles per consecutive restart up to `restart.max` and starts
@@ -133,9 +137,11 @@ export type TickAdmitted =
  * or a schedule armed past a tick, whose execution the journal never held
  * would lose that event or that tick for good.
  *
- * A promise that **rejects** is a journal that could not be written: the tick
- * did not fire, or the event was not admitted, and the caller says so rather
- * than counting it either way.
+ * A promise that **rejects** is a journal that could not be written — or one
+ * whose open executions this process has not yet recovered, which it never
+ * admits a tick or an event beside (a standby's, until the journal opens to
+ * it: `docs/distributed.md` §8) — so the tick did not fire, or the event was
+ * not admitted, and the caller says so rather than counting it either way.
  */
 export interface Intake {
   tick(trigger: ScheduleTrigger, at: number, payload: SchedulePayload): Promise<TickAdmitted>;
@@ -737,6 +743,49 @@ const STOP_GRACE_MS = 2_000;
  */
 const LONGEST_LINE_BYTES = 1 << 20;
 
+/**
+ * The longest a checkpoint may be, in UTF-8 bytes.
+ *
+ * A checkpoint is handed back to **every** start of the program — as
+ * [`CHECKPOINT_VARIABLE`] and as each `{checkpoint}` argument — so one no
+ * process could be started with would be journaled, handed back, and refuse
+ * every start after it: Linux will not `exec` a process one of whose arguments
+ * or environment strings is longer than 128 KiB (`MAX_ARG_STRLEN`), and every
+ * host bounds argv and the environment together. A checkpoint is a position
+ * rather than a payload, so it is held to half that one-string limit, which
+ * leaves the variable's name and the rest of the program's argv room.
+ */
+const LONGEST_CHECKPOINT_BYTES = 1 << 16;
+
+/** A UTF-16 surrogate that is not half of a pair. */
+const LONE_SURROGATE = /\p{Cs}/u;
+
+/**
+ * Why `checkpoint` could not be handed to the program **as it was journaled**,
+ * or `undefined` where it can be.
+ *
+ * A NUL ends a C string, so no argument or environment variable carries one —
+ * Node and Bun refuse the start outright — and a lone surrogate has no UTF-8
+ * encoding, so the program would be handed U+FFFD in its place and resume from
+ * a position nobody wrote. Either, like a checkpoint past
+ * [`LONGEST_CHECKPOINT_BYTES`], is refused with its line (grammar 14.4): once
+ * journaled it would be the position every later start was handed, and every
+ * one of those starts would fail, or resume from somewhere else, for good.
+ */
+function unhandable(checkpoint: string): string | undefined {
+  if (checkpoint.includes("\u0000")) {
+    return "it holds a NUL character, which no program argument or environment variable can carry";
+  }
+  if (LONE_SURROGATE.test(checkpoint)) {
+    return "it holds a lone UTF-16 surrogate, which has no UTF-8 encoding to hand a program";
+  }
+  const bytes = Buffer.byteLength(checkpoint, "utf8");
+  if (bytes > LONGEST_CHECKPOINT_BYTES) {
+    return `it is ${bytes} bytes long, and a checkpoint is at most ${LONGEST_CHECKPOINT_BYTES}: it is handed to every start of the program as an argument and an environment variable, which a host bounds`;
+  }
+  return undefined;
+}
+
 class Consumer {
   readonly #source: EventSource;
   readonly #command: CommandSource;
@@ -905,27 +954,35 @@ class Consumer {
     let held = Buffer.alloc(0);
     // Set while the rest of a line already cut for its length is arriving.
     let skipping = false;
+    // One line of the log for one line of stderr — cut at the bound wherever
+    // its newline fell: one that arrives in the chunk that took it past the
+    // bound is as long as one that has not ended yet.
+    const log = (line: Buffer): void => {
+      say(
+        line.length > LONGEST_LINE_BYTES
+          ? `${tag} ${line.subarray(0, LONGEST_LINE_BYTES).toString("utf8")} [cut: the line is longer than ${LONGEST_LINE_BYTES} bytes, and the rest of it is not logged]`
+          : `${tag} ${line.toString("utf8")}`,
+      );
+    };
     stderr.on("data", (chunk: Buffer) => {
       held = Buffer.concat([held, chunk]);
       let newline = held.indexOf(0x0a);
       while (newline >= 0) {
         if (skipping) skipping = false;
-        else say(`${tag} ${held.subarray(0, newline).toString("utf8")}`);
+        else log(held.subarray(0, newline));
         held = held.subarray(newline + 1);
         newline = held.indexOf(0x0a);
       }
       if (skipping) {
         held = Buffer.alloc(0);
       } else if (held.length > LONGEST_LINE_BYTES) {
-        say(
-          `${tag} ${held.subarray(0, LONGEST_LINE_BYTES).toString("utf8")} [cut: the line is longer than ${LONGEST_LINE_BYTES} bytes, and the rest of it is not logged]`,
-        );
+        log(held);
         held = Buffer.alloc(0);
         skipping = true;
       }
     });
     stderr.on("end", () => {
-      if (held.length > 0 && !skipping) say(`${tag} ${held.toString("utf8")}`);
+      if (held.length > 0 && !skipping) log(held);
     });
   }
 
@@ -1015,6 +1072,16 @@ class Consumer {
       this.refused += 1;
       say(
         `${this.#named}: line ${number}'s \`checkpoint\` could not be read (${messageOf(error)}), so it was refused and starts nothing (${this.refused} refused so far)`,
+      );
+      return;
+    }
+    // Refused before it is admitted, so it never becomes the checkpoint every
+    // later start is handed (see [`unhandable`]).
+    const unfit = this.#command.checkpoint === undefined ? undefined : unhandable(id);
+    if (unfit !== undefined) {
+      this.refused += 1;
+      say(
+        `${this.#named}: line ${number}'s \`checkpoint\` could not be handed back to the program (${unfit}), so it was refused and starts nothing (${this.refused} refused so far)`,
       );
       return;
     }

@@ -58,7 +58,7 @@
 // Executions are tracked **in this process**: a `Map` from id to the run's state
 // and the promise it settles. The *record* is this process's; the **run** is
 // not — every execution is journaled as it goes (`./journal.ts`, PRD resolved
-// q26-q29), and [`recover`] puts every one the journal holds open back on this
+// q26-q29), and [`Recovery`] puts every one the journal holds open back on this
 // map before the app accepts a connection. So a restart loses the reports of
 // executions that had already finished and keeps the ones that had not, which is
 // the half that matters: a status route answers `404` for an id neither this
@@ -269,7 +269,7 @@ interface Execution {
    */
   status: Exclude<ExecutionStatus, "interrupted">;
   /**
-   * Whether this is an execution [`recover`] picked up whose replay is **still
+   * Whether this is an execution [`Recovery`] picked up whose replay is **still
    * running**.
    *
    * `false` for every execution a request started, and for a recovered one from
@@ -479,17 +479,23 @@ export function createApp(): FastifyInstance {
   // `listen` resolves therefore finds its wait, which is the whole promise —
   // the wait id is deterministic (node path + ordinal), so it is the same id the
   // caller was given by the process that died.
+  const recovery = new Recovery(executions);
   app.addHook("onReady", async () => {
-    await recover(executions);
+    await recovery.atStart();
     // **After** recovery (PRD resolved q78 ruling c): the schedules start
     // taking ticks and each `kind: command` source's program starts with the
     // newest checkpoint the process that died had accepted — and no execution
-    // a tick or an event starts is one a replay is racing.
-    await startSources(intake(executions));
+    // a tick or an event starts is one a replay is racing. A recovery this
+    // start could not finish — a standby's, on a journal another `serve` is
+    // writing — is finished before any tick or event is admitted
+    // ([`Recovery.before`]), so that ordering holds for a takeover too.
+    await startSources(intake(executions, recovery));
   });
   // The programs go with the app: `SIGTERM` to each group, `SIGKILL` after a
-  // grace (Decision D160's exec discipline), and no tick armed after it.
+  // grace (Decision D160's exec discipline), and no tick armed after it — nor
+  // a recovery retry.
   app.addHook("onClose", async () => {
+    recovery.stop();
     await stopSources();
   });
 
@@ -1381,13 +1387,24 @@ async function begun(
 
 /**
  * The [`Intake`] `./sources.ts` hands its ticks and events to: each bound to
- * its flow's inputs and held to its flow's `inputs:` here, then [`admit`]ted.
+ * its flow's inputs and held to its flow's `inputs:` here, then [`admit`]ted —
+ * and none of them before `recovery` is done ([`Recovery.before`]), which
+ * rejects while it cannot be, as a journal that could not be written does.
  */
-function intake(executions: Map<string, Execution>): Intake {
+function intake(executions: Map<string, Execution>, recovery: Recovery): Intake {
   return {
-    tick: (trigger, at, payload) => admitTick(executions, trigger, at, payload),
-    unbegun: (trigger, fired, payload) => admitUnbegun(executions, trigger, fired, payload),
-    event: (trigger, payload) => admitEvent(executions, trigger, payload),
+    tick: async (trigger, at, payload) => {
+      await recovery.before();
+      return admitTick(executions, trigger, at, payload);
+    },
+    unbegun: async (trigger, fired, payload) => {
+      await recovery.before();
+      return admitUnbegun(executions, trigger, fired, payload);
+    },
+    event: async (trigger, payload) => {
+      await recovery.before();
+      return admitEvent(executions, trigger, payload);
+    },
   };
 }
 
@@ -1558,14 +1575,140 @@ async function admitEvent(
  * lock and breaks a stale one — so a start that let one failure carry the other
  * would leave every `pending` row unattempted for the life of the process while
  * the file it could not read a moment ago answers every other query.
+ *
+ * **A start that cannot read the journal owes the recovery, and pays it the
+ * first time the journal opens.** A second `serve` on a dialled journal is the
+ * case that makes this more than a transient: the writer guard refuses it the
+ * journal for as long as the first holds it (`docs/durability.md` §2.3), and
+ * when the first goes, this one's scheduler and consumers start succeeding at
+ * the journal (`docs/distributed.md` §8). What the first left open — an
+ * execution an event or a tick had started, a run parked on a wait — is only
+ * ever put back on a board by this walk, and it ran once, at a start that
+ * could not read it. So a half that could not read what it walks stays owed:
+ * it is taken again with backoff, and again before every tick and every event
+ * this process admits ([`before`], awaited by [`intake`]), so those are never
+ * matched against an execution the journal holds open and nothing runs — a
+ * repeat answered `held` by a dead hub's execution, a tick repaired as begun
+ * — and the ordering ruling a gives a start holds for a takeover too.
  */
-async function recover(executions: Map<string, Execution>): Promise<void> {
-  await recoverExecutions(executions);
-  await resumeDeliveries();
+class Recovery {
+  readonly #executions: Map<string, Execution>;
+  /** Whether [`recoverExecutions`] has read the open executions and walked them. */
+  #executionsRead = false;
+  /** Whether [`resumeDeliveries`] has read the owed deliveries and walked them. */
+  #deliveriesRead = false;
+  /** Why the newest attempt could not read the journal, for [`before`]'s refusal. */
+  #failure = "";
+  /** The attempt under way, which a tick, an event and a retry share. */
+  #attempt: Promise<boolean> | undefined;
+  #timer: ReturnType<typeof setTimeout> | undefined;
+  #stopped = false;
+
+  constructor(executions: Map<string, Execution>) {
+    this.#executions = executions;
+  }
+
+  /** Whether both halves have read what they walk. */
+  get done(): boolean {
+    return this.#executionsRead && this.#deliveriesRead;
+  }
+
+  /**
+   * The recovery `onReady` runs before the server accepts a connection — and,
+   * where it could not read the journal, the retries that finish it once the
+   * journal opens.
+   */
+  async atStart(): Promise<void> {
+    await this.#once(false);
+    if (!this.done) this.#retryIn(1_000);
+  }
+
+  /**
+   * Resolve once the open executions are back on the board — taking the walk
+   * again first, where it is still owed — and reject, saying why, where the
+   * journal still cannot be read. Awaited before every tick and every event is
+   * admitted, so the first time the journal opens in a process whose start
+   * could not read it, the executions it holds open are recovered before the
+   * scheduler claims a tick or a consumer matches an event against them. The
+   * deliveries half is not waited for: no tick or event is answered by one,
+   * and the retries pick it up.
+   */
+  async before(): Promise<void> {
+    if (this.#executionsRead) return;
+    await this.#once(true);
+    if (this.#executionsRead) return;
+    throw new Error(
+      `the executions this project's journal holds open are not recovered yet, and no tick or event is admitted before they are (\`docs/durability.md\` §6.1): ${this.#failure}`,
+    );
+  }
+
+  /** No retry after this: the app is closing. */
+  stop(): void {
+    this.#stopped = true;
+    if (this.#timer !== undefined) clearTimeout(this.#timer);
+    this.#timer = undefined;
+  }
+
+  /**
+   * One attempt at whatever is still owed, shared by everyone who asks while it
+   * runs. `late` is every attempt but the start's: it says nothing about a
+   * journal that still cannot be read — the start already did, and a tick
+   * that cannot be admitted says so itself — and names the recovery when one
+   * runs, since nothing else in the serve log would say why executions are
+   * being recovered by a process that has been serving for a while.
+   */
+  #once(late: boolean): Promise<boolean> {
+    if (this.done) return Promise.resolve(true);
+    this.#attempt ??= (async () => {
+      try {
+        if (!this.#executionsRead) {
+          const failure = await recoverExecutions(this.#executions, late);
+          this.#executionsRead = failure === undefined;
+          if (failure !== undefined) this.#failure = failure;
+        }
+        if (!this.#deliveriesRead) {
+          const failure = await resumeDeliveries(late);
+          this.#deliveriesRead = failure === undefined;
+          if (failure !== undefined) this.#failure = failure;
+        }
+      } catch (error) {
+        // Neither half throws for a journal it cannot read; this is anything
+        // else, and it leaves the halves that did not finish owed.
+        this.#failure = message(error);
+      } finally {
+        this.#attempt = undefined;
+      }
+      return this.done;
+    })();
+    return this.#attempt;
+  }
+
+  /** Take the recovery again in `delay` milliseconds, backing off while it fails. */
+  #retryIn(delay: number): void {
+    if (this.#stopped || this.done) return;
+    this.#timer = setTimeout(() => {
+      this.#timer = undefined;
+      if (this.#stopped) return;
+      void this.#once(true).then((done) => {
+        if (!done) this.#retryIn(Math.min(delay * 2, LONGEST_RECOVERY_RETRY_MS));
+      });
+    }, delay);
+    this.#timer.unref?.();
+  }
 }
 
-/** The half of [`recover`] that puts open executions back on the board. */
-async function recoverExecutions(executions: Map<string, Execution>): Promise<void> {
+/** The longest a recovery the start could not finish waits between attempts. */
+const LONGEST_RECOVERY_RETRY_MS = 30_000;
+
+/**
+ * The half of [`Recovery`] that puts open executions back on the board:
+ * `undefined` once it has read and walked them, and what stopped it where the
+ * journal could not be read.
+ */
+async function recoverExecutions(
+  executions: Map<string, Execution>,
+  late: boolean,
+): Promise<string | undefined> {
   let open: readonly runtime.ExecutionRow[];
   try {
     open = await openExecutions();
@@ -1573,15 +1716,22 @@ async function recoverExecutions(executions: Map<string, Execution>): Promise<vo
     // A journal that cannot be opened is a project that cannot recover, and it
     // is not a reason to refuse to serve: the app starts, new executions
     // journal (or fail loudly when they cannot), and this says what happened.
-    process.stderr.write(`this project's journal could not be read: ${message(error)}\n`);
-    return;
+    if (!late) process.stderr.write(`this project's journal could not be read: ${message(error)}\n`);
+    return message(error);
+  }
+  if (late) {
+    process.stderr.write(
+      `this project's journal can be read now, so the ${open.length} execution${open.length === 1 ? "" : "s"} it holds open ${open.length === 1 ? "is" : "are"} recovered now, before any tick or event is admitted\n`,
+    );
   }
   const stillOpen = new Set(open.map((row) => row.id));
   for (const row of open) {
-    // One generation of one execution per process. Nothing can be running yet —
-    // this hook is what runs before the first connection — so the guard is a
-    // statement rather than a fix: an execution this process is already replaying
-    // is never replayed a second time beside itself.
+    // One generation of one execution per process. At start nothing can be
+    // running yet — this hook is what runs before the first connection — so the
+    // guard is a statement there; a recovery the start could not finish runs in
+    // a process that has been serving since, and there it is a fix: an
+    // execution this process started, or is already replaying, is never
+    // replayed a second time beside itself.
     if (executions.has(row.id)) continue;
     const flow = flows[row.flow];
     if (flow === undefined) {
@@ -1630,6 +1780,7 @@ async function recoverExecutions(executions: Map<string, Execution>): Promise<vo
     resumeInto(executions, flow, row, await announced(row.id));
     process.stderr.write(`recovered ${row.id} (${row.flow})\n`);
   }
+  return undefined;
 }
 
 /**
@@ -2459,7 +2610,7 @@ function credentialed(url: string): boolean {
  * Pick up every delivery the journal still holds pending
  * (`docs/durability.md` §6.1).
  *
- * Beside the executions [`recover`] replays, and separately from them: a
+ * Beside the executions [`Recovery`] replays, and separately from them: a
  * delivery reports on an execution that may have **ended** in the process that
  * died, so there is nothing to recover and something still to send. Its
  * remaining schedule is computed from the recorded intent, so a delivery whose
@@ -2475,16 +2626,24 @@ function credentialed(url: string): boolean {
  * picked up inside its own guard, in the posture [`recoverExecutions`] takes for
  * the read it guards and §3.7 takes for a webhook — a courtesy the status route
  * backstops, and one the next start picks up again.
+ *
+ * `undefined` once it has read the owed rows and walked them; what stopped it
+ * where the journal could not be read, which leaves the walk owed
+ * ([`Recovery`]). A row this process has already put on its schedule is never
+ * put on a second one ([`resumeDelivery`]), so a walk a standby takes late
+ * leaves alone a delivery it started itself.
  */
-async function resumeDeliveries(): Promise<void> {
+async function resumeDeliveries(late: boolean): Promise<string | undefined> {
   let pending: readonly runtime.DeliveryRecord[];
   try {
     pending = await undeliveredDeliveries();
   } catch (error) {
-    process.stderr.write(
-      `this project's undelivered deliveries could not be read: ${message(error)}\n`,
-    );
-    return;
+    if (!late) {
+      process.stderr.write(
+        `this project's undelivered deliveries could not be read: ${message(error)}\n`,
+      );
+    }
+    return message(error);
   }
   for (const record of pending) {
     try {
@@ -2498,6 +2657,7 @@ async function resumeDeliveries(): Promise<void> {
       );
     }
   }
+  return undefined;
 }
 
 /** One owed delivery, put back on its schedule. See [`resumeDeliveries`]. */
