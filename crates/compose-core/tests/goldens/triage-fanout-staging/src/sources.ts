@@ -35,7 +35,11 @@
 // Firing is a claim: the fired row is journaled, keyed `(trigger,
 // scheduled_at)`, **before** the execution starts, and only the claim that wins
 // starts one. So a tick fires once across restarts, and across hubs sharing a
-// journal (`docs/distributed.md` §8).
+// journal (`docs/distributed.md` §8). A claim a `serve` died holding — the row
+// down, the execution it names never journaled — is the one the next start
+// owes: before it arms its first tick, the scheduler hands the newest row back
+// to the admission, which starts that execution under the id the row recorded
+// where no lifecycle row has it, and the serve log names the tick.
 //
 // # Command sources
 //
@@ -51,13 +55,16 @@
 //    process. A line that is not a JSON object is refused: logged with the
 //    source and its line number, counted on the source's status, and never an
 //    execution.
-//  * **stderr** copied to the serve log, each line tagged with the source.
+//  * **stderr** copied to the serve log, each line tagged with the source —
+//    a line longer than stdout's bound is logged cut there, the rest dropped.
 //  * **stdin** a pipe this process holds open and never writes: it reaches
 //    end-of-file when `serve` exits, however it exits, which is the one signal
 //    a `SIGKILL`ed `serve` can still give its program.
 //  * the newest **checkpoint** the intake accepted, as `AGENT_COMPOSE_CHECKPOINT`
 //    in its environment and in place of any argument written exactly
-//    `{checkpoint}` — unset, and the empty string, before there is one.
+//    `{checkpoint}` — unset, and the empty string, before there is one. A
+//    journal that cannot say which holds the program back, retried with
+//    backoff, rather than starting it as if there were none.
 //
 // An exit, with any code or by any signal, restarts the program after a
 // backoff that doubles per consecutive restart up to `restart.max` and starts
@@ -69,7 +76,7 @@ import { createHash } from "node:crypto";
 import process from "node:process";
 
 import { type Cron, type Zone, nextAfter, parseCron, render, zoneOf } from "./cron.ts";
-import { type RestartRow, openJournal } from "./journal.ts";
+import { type FiredRow, type RestartRow, openJournal } from "./journal.ts";
 import { interpolate } from "./runtime.ts";
 import {
   type CommandSource,
@@ -108,6 +115,14 @@ export type Admitted =
  */
 export interface Intake {
   tick(trigger: ScheduleTrigger, at: number, payload: SchedulePayload): Promise<Admitted>;
+  /**
+   * Start the execution a tick's `fired` row already names, where that
+   * execution **never began** — a `serve` that stopped between claiming the
+   * tick and journaling the execution it claimed it for
+   * (`docs/durability.md` §3.11). `undefined` where it did begin, which is
+   * every row but that one: nothing is owed for it.
+   */
+  unbegun(trigger: ScheduleTrigger, fired: FiredRow, payload: SchedulePayload): Promise<Admitted | undefined>;
   event(trigger: EventTrigger, payload: EventPayload): Promise<Admitted>;
 }
 
@@ -369,6 +384,14 @@ class Scheduler {
   readonly #zone: Zone;
   #timer: ReturnType<typeof setTimeout> | undefined;
   #stopped = false;
+  /**
+   * Whether this scheduler has looked at the newest `fired` row for a claim
+   * whose execution never began ([`#repair`]): at start, and — where the
+   * journal could not be read then, as a standby's cannot until the `serve`
+   * holding it goes (`docs/distributed.md` §8) — before each tick, until a
+   * look reaches the journal.
+   */
+  #repaired = false;
 
   constructor(trigger: ScheduleTrigger, intake: Intake, clock: Clock) {
     this.#trigger = trigger;
@@ -389,8 +412,9 @@ class Scheduler {
     try {
       const fired = await (await openJournal()).lastFired(this.#trigger.name);
       if (fired !== undefined) last = Date.parse(fired.scheduledAt);
+      await this.#repair(fired);
     } catch (error) {
-      say(`${this.#named}: the journal could not say when it last fired (${messageOf(error)}), so no skipped span is reported`);
+      say(`${this.#named}: the journal could not say when it last fired (${messageOf(error)}), so no skipped span is reported, and the tick it last claimed is looked at again before the next one fires`);
     }
     if (last !== undefined) {
       const first = nextAfter(this.#cron, last, this.#zone);
@@ -409,6 +433,46 @@ class Scheduler {
     this.#timer = undefined;
   }
 
+  /**
+   * Start the execution the newest `fired` row names, where it never began
+   * (`docs/durability.md` §3.11).
+   *
+   * A `serve` that stops between claiming a tick and journaling the execution
+   * it claimed it for leaves a row that wins every later claim of that tick
+   * and names an execution nothing will ever recover: honoured, the tick would
+   * fire zero times. Only the newest row can be that claim — a scheduler arms
+   * its next tick only after the one before was admitted — and only the
+   * admission can say whether its execution began, so the row is handed back to
+   * it, which starts the execution under the id the row recorded and with the
+   * payload the tick would have had. One process at a time writes a project's
+   * journal (`docs/durability.md` §2.1), and this one has not yet fired a tick
+   * of its own, so nothing is admitting that claim beside this.
+   */
+  async #repair(fired: FiredRow | undefined): Promise<void> {
+    if (fired === undefined) {
+      this.#repaired = true;
+      return;
+    }
+    const payload: SchedulePayload = {
+      scheduled_at: render(Date.parse(fired.scheduledAt), this.#zone),
+      trigger: this.#trigger.name,
+    };
+    const tick = `the ${payload.scheduled_at} tick`;
+    const claimed = `${tick} was claimed as ${fired.execution} by a serve that stopped before starting it`;
+    try {
+      const admitted = await this.#intake.unbegun(this.#trigger, fired, payload);
+      this.#repaired = true;
+      if (admitted === undefined) return;
+      if (admitted.outcome === "started") say(`${this.#named}: ${claimed}, so it starts now`);
+      else if (admitted.outcome === "held") say(`${this.#named}: ${tick} was already fired, as ${admitted.execution}`);
+      else say(`${this.#named}: ${claimed}, and starts nothing: ${admitted.reason}`);
+    } catch (error) {
+      say(
+        `${this.#named}: whether ${tick}, claimed as ${fired.execution}, was ever started could not be read (${messageOf(error)}); it is looked at again before the next tick fires`,
+      );
+    }
+  }
+
   /** Say which ticks fell between `first` and `now` without firing. */
   #skipped(first: number, now: number, why: string): void {
     let count = 0;
@@ -419,10 +483,34 @@ class Scheduler {
       if (count >= SKIPPED_COUNTED) break;
       at = nextAfter(this.#cron, at, this.#zone);
     }
-    const counted = count >= SKIPPED_COUNTED ? `at least ${SKIPPED_COUNTED} ticks` : `${count} tick${count === 1 ? "" : "s"}`;
+    const capped = count >= SKIPPED_COUNTED;
+    // Past the count the span still ends where the outage did — at the newest
+    // tick at or before now — rather than at the tick the count stopped on.
+    if (capped) latest = this.#lastThrough(latest, now);
+    const counted = capped ? `at least ${SKIPPED_COUNTED} ticks` : `${count} tick${count === 1 ? "" : "s"}`;
     say(
       `${this.#named}: skipped ${counted} from ${render(first, this.#zone)} through ${render(latest, this.#zone)}, which fell while ${why}: a tick is never back-filled, and a job catches itself up from \`payload.scheduled_at\``,
     );
+  }
+
+  /**
+   * The newest tick at or before `now`, given `from`, a tick at or before it —
+   * found by bisecting for the latest instant whose next tick is still not
+   * after `now`, so it costs some forty evaluations however many ticks lie
+   * between the two.
+   */
+  #lastThrough(from: number, now: number): number {
+    // The next tick after `low` is never after `now`, and the next after `high`
+    // always is: `from - 1`'s is `from` itself, and `now`'s is past it.
+    let low = from - 1;
+    let high = now;
+    while (high - low > 1) {
+      const middle = Math.floor((low + high) / 2);
+      const next = nextAfter(this.#cron, middle, this.#zone);
+      if (next !== undefined && next <= now) low = middle;
+      else high = middle;
+    }
+    return nextAfter(this.#cron, low, this.#zone) ?? from;
   }
 
   #arm(at: number): void {
@@ -439,6 +527,19 @@ class Scheduler {
     if (this.#clock.now() < at) {
       this.#arm(at);
       return;
+    }
+    if (!this.#repaired) {
+      // The look the start could not take. A journal that still cannot be read
+      // says so on the fire below, which needs it too, so it is not said twice.
+      let fired: FiredRow | undefined;
+      let read = false;
+      try {
+        fired = await (await openJournal()).lastFired(this.#trigger.name);
+        read = true;
+      } catch {
+        // Looked at again before the next tick.
+      }
+      if (read) await this.#repair(fired);
     }
     await this.#fire(at);
     if (this.#stopped) return;
@@ -479,9 +580,10 @@ export const CHECKPOINT_VARIABLE = "AGENT_COMPOSE_CHECKPOINT";
 const STOP_GRACE_MS = 2_000;
 
 /**
- * The longest a line may be. A program that writes without a newline would
- * otherwise grow this process's buffer for as long as it wrote; a line past
- * this is refused like any line that is not a JSON object.
+ * The longest a line may be, on either of the program's output streams. A
+ * program that writes without a newline would otherwise grow this process's
+ * buffer for as long as it wrote: a stdout line past this is refused like any
+ * line that is not a JSON object, and a stderr line past it is logged cut here.
  */
 const LONGEST_LINE_BYTES = 1 << 20;
 
@@ -525,11 +627,40 @@ class Consumer {
     return `event source \`${this.#source.name}\``;
   }
 
+  /**
+   * Read the source's checkpoint out of the journal and start the program with
+   * it — **only** with it.
+   *
+   * A journal that cannot say is not a source with no checkpoint: started
+   * without one, a program whose first start means "from the tip" would skip
+   * every event between the journaled position and the tip, and one whose
+   * first start means "from the beginning" would re-emit everything, moving
+   * the journaled checkpoint backwards as each repeat was admitted. So the
+   * read is retried with backoff — as an event the journal will not admit is
+   * (see [`#admit`]) — and the program waits, `starting`, until it answers.
+   * The first attempt is awaited; the retries are not, so a journal that is
+   * down holds this source and not the app (a standby `serve` on a dialled
+   * journal is one: `docs/distributed.md` §8).
+   */
   async start(): Promise<void> {
+    await this.#readCheckpoint(1_000);
+  }
+
+  async #readCheckpoint(delay: number): Promise<void> {
+    if (this.#stopping) return;
     try {
       this.checkpoint = await (await openJournal()).checkpointOf(this.#source.name);
     } catch (error) {
-      say(`${this.#named}: the journal could not say its checkpoint (${messageOf(error)}), so the program starts without one`);
+      if (this.#stopping) return;
+      say(
+        `${this.#named}: the journal could not say its checkpoint (${messageOf(error)}), so the program is not started yet; trying again in ${delay}ms`,
+      );
+      this.#timer = setTimeout(() => {
+        this.#timer = undefined;
+        void this.#readCheckpoint(Math.min(delay * 2, LONGEST_INTAKE_RETRY_MS));
+      }, delay);
+      this.#timer.unref?.();
+      return;
     }
     this.#spawn();
   }
@@ -611,20 +742,43 @@ class Consumer {
   /** The chain every line of the current run is admitted on, in order. */
   #lines: Promise<void> = Promise.resolve();
 
+  /**
+   * Copy the program's stderr to the serve log, one tagged line per line it
+   * wrote — held to stdout's bound, for stdout's reason: a program that writes
+   * to stderr without a newline (a progress bar redrawn with `\r`, a binary
+   * blob, a diagnostic it never ends) would otherwise grow this process's
+   * buffer for as long as it wrote. A line past [`LONGEST_LINE_BYTES`] is
+   * logged cut there, saying so, and the rest of it is dropped up to its
+   * newline.
+   */
   #tagStderr(child: ChildProcess): void {
-    let held = "";
-    child.stderr?.setEncoding("utf8");
-    child.stderr?.on("data", (chunk: string) => {
-      held += chunk;
-      let newline = held.indexOf("\n");
+    const stderr = child.stderr;
+    if (stderr === null) return;
+    const tag = `[source ${this.#source.name}]`;
+    let held = Buffer.alloc(0);
+    // Set while the rest of a line already cut for its length is arriving.
+    let skipping = false;
+    stderr.on("data", (chunk: Buffer) => {
+      held = Buffer.concat([held, chunk]);
+      let newline = held.indexOf(0x0a);
       while (newline >= 0) {
-        say(`[source ${this.#source.name}] ${held.slice(0, newline)}`);
-        held = held.slice(newline + 1);
-        newline = held.indexOf("\n");
+        if (skipping) skipping = false;
+        else say(`${tag} ${held.subarray(0, newline).toString("utf8")}`);
+        held = held.subarray(newline + 1);
+        newline = held.indexOf(0x0a);
+      }
+      if (skipping) {
+        held = Buffer.alloc(0);
+      } else if (held.length > LONGEST_LINE_BYTES) {
+        say(
+          `${tag} ${held.subarray(0, LONGEST_LINE_BYTES).toString("utf8")} [cut: the line is longer than ${LONGEST_LINE_BYTES} bytes, and the rest of it is not logged]`,
+        );
+        held = Buffer.alloc(0);
+        skipping = true;
       }
     });
-    child.stderr?.on("end", () => {
-      if (held !== "") say(`[source ${this.#source.name}] ${held}`);
+    stderr.on("end", () => {
+      if (held.length > 0 && !skipping) say(`${tag} ${held.toString("utf8")}`);
     });
   }
 

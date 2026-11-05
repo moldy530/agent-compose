@@ -280,10 +280,11 @@ starts neither.
 
 A tick journals a `fired` row keyed by the trigger and the tick **before** its
 execution starts, so it fires once across restarts and across hubs sharing one
-journal. Ticks that fell while no `serve` was running are **skipped, never
-back-filled**: the next tick after a start is the first one after now, and a
-job catches itself up from `payload.scheduled_at`, the nominal tick it was
-started for. A program's stdout is one JSON object per line, admitted line by
+journal; a tick a stopped `serve` had claimed and not yet started is started
+by the next one, under the execution id its row recorded. Ticks that fell while
+no `serve` was running are **skipped, never back-filled**: the next tick after
+a start is the first one after now, and a job catches itself up from
+`payload.scheduled_at`, the nominal tick it was started for. A program's stdout is one JSON object per line, admitted line by
 line — each event is admitted before the next line is read, so a slow start
 holds the program at its own write — and a line that is not a JSON object is
 refused and counted, never an execution. An `event` trigger's `dedupe_key:`
@@ -304,12 +305,14 @@ What `serve` writes about them goes to **stderr**, one line each:
 | ``schedule `<t>`: skipped <n> ticks from <tick> through <tick>, which fell while no serve was running: …`` | ticks fell in downtime, or while the process could not see them |
 | ``schedule `<t>`: fired the <scheduled_at> tick as <execution>`` | a tick fires |
 | ``schedule `<t>`: the <scheduled_at> tick was already fired, as <execution>`` | another generation, or a hub sharing the journal, fired it first |
+| ``schedule `<t>`: the <scheduled_at> tick was claimed as <execution> by a serve that stopped before starting it, so it starts now`` | a scheduler starts and finds the tick a stopped `serve` claimed and never started |
 | ``event source `<s>`: started `<command>` (pid <pid>) with checkpoint "<c>"`` | the program starts (or `with no checkpoint`) |
+| ``event source `<s>`: the journal could not say its checkpoint (<why>), so the program is not started yet; trying again in <ms>ms`` | the program waits for the journal rather than starting from no position |
 | ``event source `<s>`: event "<id>" started <execution> for `<t>` `` | an event is admitted |
 | ``event source `<s>`: event "<id>" repeats one `<t>` already admitted as <execution>, so it started nothing`` | a repeat is deduplicated |
 | ``event source `<s>`: line <n> is not a JSON object, so it was refused and starts nothing (<n> refused so far)`` | a line is refused |
 | ``event source `<s>`: the program exited with code <c> after <seconds>s; restarting it in <ms>ms (restart <n> in a row)`` | the program ends, by an exit or a signal |
-| ``[source <s>] <line>`` | the program writes a line to its stderr |
+| ``[source <s>] <line>`` | the program writes a line to its stderr; one longer than 1 MiB is logged cut there, ending `[cut: …]` |
 | ``event trigger `<t>`: no event source `<s>` is bound under this target, so nothing consumes for it`` | a trigger's source is unbound under `local` |
 
 Stopping it stops the graph: `agent-compose serve` passes `SIGINT` and `SIGTERM`

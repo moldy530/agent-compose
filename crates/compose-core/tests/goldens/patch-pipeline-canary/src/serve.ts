@@ -198,7 +198,7 @@ import {
   workDelivery,
 } from "./delivery.ts";
 import { type CompiledFlow, type FlowRun, flows, runChildFlow, runFlow } from "./graph.ts";
-import { openJournal } from "./journal.ts";
+import { type FiredRow, type Journal, openJournal } from "./journal.ts";
 import { mountWorkerRoutes, placementWaits, watchPlacementWaits } from "./mesh.ts";
 import {
   type Admitted,
@@ -1239,6 +1239,12 @@ interface Admission {
   readonly gate?:
     | { readonly kind: "tick"; readonly scheduledAt: string }
     | { readonly kind: "dedupe"; readonly key: string };
+  /**
+   * The id a gate's row already names for this execution, where a process
+   * died holding the row: a tick's `fired` row whose execution never began
+   * ([`admitUnbegun`]). Absent, a fresh id is allocated.
+   */
+  readonly execution?: string;
 }
 
 /** What [`admit`] did: the execution it started, or the one its gate already held. */
@@ -1255,7 +1261,10 @@ type AdmitAnswer =
  *  * **a tick's `fired` row**, claimed before the execution exists. The insert
  *    that wins fires; a tick some earlier generation of this process or another
  *    hub sharing the journal already fired is answered with that execution and
- *    starts nothing (`docs/durability.md` §3.11).
+ *    starts nothing (`docs/durability.md` §3.11). The one row it is handed
+ *    back is a claim a process died holding — `admission.execution` names the
+ *    id it recorded — and that starts under the id only where no execution of
+ *    it began, which is the tick's repair: honoured, the tick would never fire.
  *  * **an event's dedupe key**, claimed as the execution is registered. A key
  *    already held by an execution that exists — in this process, or anywhere in
  *    the journal — is a repeat and starts nothing. A key held by one that
@@ -1270,16 +1279,20 @@ async function admit(
   executions: Map<string, Execution>,
   admission: Admission,
 ): Promise<AdmitAnswer> {
-  const id = `exec_${globalThis.crypto.randomUUID()}`;
+  const id = admission.execution ?? `exec_${globalThis.crypto.randomUUID()}`;
   const gate = admission.gate;
   if (gate?.kind === "tick") {
-    const held = await (await openJournal()).fire({
+    const journal = await openJournal();
+    const held = await journal.fire({
       trigger: admission.trigger,
       scheduledAt: gate.scheduledAt,
       execution: id,
       firedAt: new Date().toISOString(),
     });
     if (held.execution !== id) return { outcome: "held", execution: held.execution };
+    if (admission.execution !== undefined && (await begun(executions, journal, id))) {
+      return { outcome: "held", execution: id };
+    }
   }
   if (gate?.kind === "dedupe") {
     const journal = await openJournal();
@@ -1290,9 +1303,9 @@ async function admit(
       admittedAt: new Date().toISOString(),
     });
     if (held.execution !== id) {
-      const begun =
-        executions.has(held.execution) || (await journal.execution(held.execution)) !== undefined;
-      if (begun) return { outcome: "held", execution: held.execution };
+      if (await begun(executions, journal, held.execution)) {
+        return { outcome: "held", execution: held.execution };
+      }
       if (!(await journal.retakeDedupe(admission.trigger, gate.key, held.execution, id))) {
         const now = await journal.claimDedupe({
           trigger: admission.trigger,
@@ -1309,12 +1322,27 @@ async function admit(
 }
 
 /**
+ * Whether `id` names an execution that began: one this process holds — its
+ * lifecycle row may still be in flight — or one the journal has a lifecycle
+ * row for. What a gate's row names and this answers `false` for is a claim a
+ * process died holding before it journaled the execution.
+ */
+async function begun(
+  executions: Map<string, Execution>,
+  journal: Journal,
+  id: string,
+): Promise<boolean> {
+  return executions.has(id) || (await journal.execution(id)) !== undefined;
+}
+
+/**
  * The [`Intake`] `./sources.ts` hands its ticks and events to: each bound to
  * its flow's inputs and held to its flow's `inputs:` here, then [`admit`]ted.
  */
 function intake(executions: Map<string, Execution>): Intake {
   return {
     tick: (trigger, at, payload) => admitTick(executions, trigger, at, payload),
+    unbegun: (trigger, fired, payload) => admitUnbegun(executions, trigger, fired, payload),
     event: (trigger, payload) => admitEvent(executions, trigger, payload),
   };
 }
@@ -1325,6 +1353,33 @@ async function admitTick(
   trigger: ScheduleTrigger,
   at: number,
   payload: SchedulePayload,
+): Promise<Admitted> {
+  return admitTickAs(executions, trigger, new Date(at).toISOString(), payload, undefined);
+}
+
+/**
+ * Start the execution a tick's `fired` row names, where it never began — the
+ * repair `./sources.ts`'s scheduler asks for at start (`docs/durability.md`
+ * §3.11). `undefined`, and nothing bound, where the execution did begin: that
+ * is every row a `serve` that stopped cleanly leaves.
+ */
+async function admitUnbegun(
+  executions: Map<string, Execution>,
+  trigger: ScheduleTrigger,
+  fired: FiredRow,
+  payload: SchedulePayload,
+): Promise<Admitted | undefined> {
+  if (await begun(executions, await openJournal(), fired.execution)) return undefined;
+  return admitTickAs(executions, trigger, fired.scheduledAt, payload, fired.execution);
+}
+
+/** Bind one tick and admit it under the `fired` row for `scheduledAt`. */
+async function admitTickAs(
+  executions: Map<string, Execution>,
+  trigger: ScheduleTrigger,
+  scheduledAt: string,
+  payload: SchedulePayload,
+  execution: string | undefined,
 ): Promise<Admitted> {
   const flow = flows[trigger.flow];
   if (flow === undefined) {
@@ -1344,7 +1399,8 @@ async function admitTick(
     flow,
     inputs,
     sessionKey,
-    gate: { kind: "tick", scheduledAt: new Date(at).toISOString() },
+    gate: { kind: "tick", scheduledAt },
+    ...(execution === undefined ? {} : { execution }),
   });
   return admitted.outcome === "started"
     ? { outcome: "started", execution: admitted.record.id }
