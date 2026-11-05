@@ -1345,8 +1345,12 @@ window closes. Written by `claimDedupe`, called through `admit` in
   again after its window is a new claim and the table holds no more than the
   trigger's live windows. A row an older build wrote has no `expires_at`, and
   is read as expiring one window — the claiming trigger's — after it was
-  admitted. This amends what this bullet said under D162: that rows did not
-  expire.
+  admitted. The sweep is two range reads down the index `dedupe_by_expiry`,
+  `(trigger_name, expires_at, admitted_at)` — one for the rows whose window
+  has passed, one for the older build's window-less rows — so a claim pays for
+  the rows that expired and never walks the trigger's live ones; made on open
+  where a journal lacks it, as `expires_at` is added (§11.2). This amends what
+  this bullet said under D162: that rows did not expire.
 * **A repeat is answered with what the first delivery got.** On `http`, under
   `X-AgentCompose-Deduped: true`: the execution's id, or — where the first
   arrival is still `queued` or `pending` in the intake (§3.15) — that arrival's
@@ -1355,7 +1359,10 @@ window closes. Written by `claimDedupe`, called through `admit` in
   under a debounce once the arrival has been counted (§3.15), so a repeat of a
   counted arrival counts nothing. A key that answers the empty string is
   refused before anything is claimed: it names nothing a repeat could be told
-  by.
+  by. So is an empty `session_key:` for a flow that reaches a `scope: session`
+  store, which the run would refuse before its lifecycle row: a claim waits for
+  that row, and would read the refusal as the journal's (`503`, the key taken
+  over by every resend), so the request is refused `400` first.
 * **An event starts an execution only once its lifecycle row is down.** The
   admission waits for the row (§3.5) before it answers the consumer, so the
   checkpoint (§3.13) never moves past an event whose execution the journal does
@@ -1476,7 +1483,20 @@ decisions about one row agree on one.
   waited row goes back to `queued`, naming why in `detail`. Where the journal
   refuses that move too, the row stays `started` with no lifecycle row, which no
   drain of the queue reads; the process keeps the start owed and makes the move
-  at its next look at the queue that the journal takes.
+  at its next look at the queue that the journal takes. A look at the queue
+  that stops at such a start, or still owes one, leaves the slots it freed to
+  the rows waiting: an arrival behind it is queued after them, never started
+  ahead of them.
+* **A queued row is held to the serving build before it starts.** The
+  `admission` was bound by the build that took the arrival, and the build
+  serving when its slot frees — after a restart onto a new deploy — may refuse
+  it: a narrowed `inputs:`, or a `scope: session` store the row's empty session
+  key cannot reach. Each queued row, and each owed start a restart repairs, is
+  bound against the serving flow first, and one that no longer binds is moved
+  to `dropped` with `detail` saying why, and the queue goes on past it — as a
+  debounce whose payload no longer binds is dropped at its close. A row the run
+  itself would refuse is never left for the journal-failure path above, which
+  would put it back on the queue and try it first at every look for ever.
 * **A pending row is one per group.** `pendingIntake` finds the group's open
   debounce, and an arrival moves it — newest payload, one more `coalesced`, a
   deadline `debounce:` after now — or, finding none, writes one. The deadline is
@@ -2531,11 +2551,16 @@ on all three backends — `PRAGMA table_info`, `pg_attribute`, `information_sche
 — and nullable for every column's reason: a row written before it had no
 window, and is read as expiring one window after it was admitted. Neither holds
 a §4 key or is consumed by a replay, so an execution open in an older journal
-replays identically. Executed: `journal_backend_conformance` removes the table
-and the column from a journal on each of the three arms and writes a dedupe row
-as an older build did, with no window, two days old; re-opens it, writes an
-intake row, finds the column grown back, and has a claim of a fresh key with a
-day's window sweep the old row
+replays identically. The index the dedupe sweep reads down, `dedupe_by_expiry`
+(§3.12), is an index and nothing else, so it is made on open wherever it is
+missing — `CREATE INDEX IF NOT EXISTS` on SQLite, after the column's probe, and
+on Postgres; `information_schema.statistics` asked first on MySQL, which has no
+such clause — and a journal without it answers the same, only slower.
+Executed: `journal_backend_conformance` removes the table, the index and the
+column from a journal on each of the three arms and writes a dedupe row as an
+older build did, with no window, two days old; re-opens it, writes an intake
+row, finds the column and the index grown back, and has a claim of a fresh key
+with a day's window sweep the old row
 (`a_journal_written_before_the_intake_ledger_gains_it_on_open`), beside the
 window's expiry and sweep, an intake row's round trip, a queue's order, a move
 won once, a debounce extended and started once, the lease's join, and the

@@ -599,7 +599,9 @@ default: a repeat inside the window starts nothing and is answered with what the
 first delivery got, under `X-AgentCompose-Deduped: true` — beside a debounce,
 the intake it joined, without counting it again. After the window the same key
 starts again. A key that answers the empty string is refused with a `400`: it
-names nothing to tell a repeat by.
+names nothing to tell a repeat by. So is a `session_key:` that answers it for a
+flow that reaches a `scope: session` store — before the key is claimed, so the
+request is never answered as one that may be sent again.
 
 **`concurrency:`** admits arrivals into **groups** — one per `key:` value, or one
 for the whole trigger without a `key:` — each with `limit:` slots (default `1`).
@@ -640,7 +642,10 @@ always. One that is queued or joins a debounce has no execution yet, so it gets
 trigger's `auth:`, and keeps answering after the execution has settled. Every
 intake row is journaled: a restarted `serve` starts what was queued, in order,
 and closes each debounce at its recorded deadline. Starting an arrival the
-intake already accepted is not a re-fire, so nothing starts twice.
+intake already accepted is not a re-fire, so nothing starts twice. A queued
+arrival is held to the flow being served when its turn comes, and a deploy may
+have changed it: one that no longer fits the flow's `inputs:` is `dropped`, its
+`detail` saying why, and the queue goes on to the next.
 
 **A run is refused, never queued.** `run` shares the project's journal, so it
 sees the slots the serving process holds: a run of a flow that a trigger's

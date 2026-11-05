@@ -6373,7 +6373,7 @@ Keys are identifiers (§2.1).
 | Key | Type | Required | Notes |
 |---|---|---|---|
 | `members` | list of `agent.*` / `tool.*` addresses | yes | non-empty, each named once; every address MUST resolve in the composition |
-| `max_running` | integer ≥ 1 | no | how many unsettled dispatches of this placement **one worker session** may hold at once; default `1` (PRD resolved q79, Decision [D161](#d161-max_running-is-how-many-dispatches-one-worker-session-holds-for-a-placement)) |
+| `max_running` | integer ≥ 1 | no | how many unsettled dispatches of this placement **one worker session** may hold at once; default `1` (PRD resolved q79, Decision [D161](#d161-max_running-is-how-many-dispatches-one-worker-session-holds-for-a-placement)) — not a trigger's `concurrency.max_running:` (§13.1, PRD resolved q77), which is that trigger's running executions across its groups |
 | `description` | string | no | documentation only (D54) |
 
 ```yaml
@@ -6395,7 +6395,12 @@ cap, and gives a parked dispatch to the **least-loaded** session polling for it
 poll between equals (`docs/distributed.md` §2, §3.2). It bounds *running*, not
 *admission*: a `map`'s `max_concurrency:` (§8.6) is still how many instances
 the graph lets be in flight, and the placement's capacity is how many of them
-a pool can be running (`docs/distributed.md` §2). An integer below `1` is
+a pool can be running (`docs/distributed.md` §2). Nor is it the key of the
+same name inside a trigger's `concurrency:` block (§13.1, PRD resolved q77,
+Decision [D163](#d163-a-triggers-intake-a-dedupe-window-and-groups-leased-off-the-journal)):
+that one is a trigger's total of running *executions* across its groups, read
+off the journal's intake rows, where this one is a worker session's count of a
+placement's *dispatches*, read off the dispatch rows. An integer below `1` is
 `value-out-of-range`, and a string or a fraction is `wrong-type`: a placement
 no session may hold a dispatch of is one nothing would ever run.
 
@@ -13564,7 +13569,11 @@ declare its own capacity, the deploy file does.
 `map`'s `max_concurrency:` (§8.6) is still how many instances are in flight, and
 a placed node's `timeout:` still runs from dispatch, so an item waiting for a
 free slot fails on its budget exactly as one waiting for a machine that is off
-(`docs/distributed.md` §6.5).
+(`docs/distributed.md` §6.5). Nor is it the trigger key of the same name a
+later decision added: a trigger's `concurrency.max_running:` (§13.1, PRD
+resolved q77, [D163](#d163-a-triggers-intake-a-dedupe-window-and-groups-leased-off-the-journal)) bounds how many executions that trigger has
+running across its groups, and is read off the intake rows rather than the
+dispatch rows — two keys, one name, each documented naming the other.
 
 **Collision review.** The mesh "no capacity knob" decision is retired, with its
 pinning test replaced by tests of the cap and of the least-loaded rule. PRD
@@ -13955,8 +13964,9 @@ holds a slot is exactly what the journal says is running, and a restarted
   pending row is armed at the deadline it records, and a start a dead process
   claimed and never journaled is repaired once.
 
-**The journal.** One new table and one new column, each migrated on open on
-every backend — no `JOURNAL_VERSION` bump (`docs/durability.md` §11.2):
+**The journal.** One new table, one new column and one new index, each
+migrated on open on every backend — no `JOURNAL_VERSION` bump
+(`docs/durability.md` §11.2):
 
 - **`intakes`** — one row per arrival the intake held or started:
   `id` (the `intake_id`, `int_<uuid>`), `trigger_name`, `group_hash` (the
@@ -13978,7 +13988,14 @@ every backend — no `JOURNAL_VERSION` bump (`docs/durability.md` §11.2):
   `pg_attribute` in a `DO` block, MySQL `information_schema.columns`, each
   followed by `ADD COLUMN`. A row an older
   build wrote has none, and is read as expiring one window after it was
-  admitted.
+  admitted. Beside it, the index **`dedupe_by_expiry`** on `(trigger_name,
+  expires_at, admitted_at)`, made on open where it is missing — `IF NOT
+  EXISTS` on SQLite and Postgres, `information_schema.statistics` probed on
+  MySQL — which each claim's sweep of its trigger's expired rows reads down,
+  as two range reads (one per half: a row's own window, and an older build's
+  window-less row): what the sweep costs is what expired, not the trigger's
+  live windows, which every claim would otherwise walk inside the journal's
+  one serial chain.
 
 The lease is one read — `leasesOf(trigger)`: the trigger's open lifecycle
 rows joined to their `started` intake rows, less those with a `cancellations`
@@ -14059,7 +14076,23 @@ ruling:
   `max_running:`. A queue is looked at again when an execution of its trigger
   settles or is cancelled in this process, and every two seconds while it holds
   rows — a settle another process wrote, such as a `resume` that finished one,
-  is seen by nothing else.
+  is seen by nothing else. A look that stops short — at a row the journal would
+  not begin, or with a start this process owes and could not put back on the
+  queue — leaves any slot it freed to the rows still waiting: an arrival
+  behind it queues, whatever its group has free and whatever `on_conflict:`
+  says, and starts after them.
+- **A queued row is bound again before it starts.** It holds the admission the
+  build that took it bound, and the build serving when its slot frees may be
+  another: one whose flow narrowed its `inputs:`, or gained a `scope: session`
+  store the row's empty session key cannot reach. Each row is held to the
+  serving build's flow before it is started — and so is a start a dead process
+  owed (ruling f) — and one that no longer binds is **dropped**, its `detail`
+  saying why, the serve log naming it, and the queue goes on past it to the
+  next row. Without that, the run's own refusal before its lifecycle row would
+  read as the journal's failure: the row back on the queue, tried first at
+  every look for ever, and every row behind it held. A repeat of a dropped
+  arrival's dedupe key is answered with its intake — `202`, `status:
+  "dropped"`, the intake's status URL — since its execution never began.
 - **A debounce is trailing and unbounded.** Each arrival moves the deadline to
   `debounce:` after itself, with no longest wait, so arrivals that never pause
   never start. At the deadline the one execution is decided against the lease
@@ -14129,6 +14162,12 @@ ruling:
   `dedupe_key:` that answers the empty string, which names nothing a repeat
   could be told by and would otherwise make every such delivery one for the
   whole window, as an empty `session_key:` a flow needs is refused (D162).
+  And that empty `session_key:` is refused up front — a `400` on `http` —
+  wherever the arrival is gated: under a `concurrency:` block, and on an `http`
+  trigger with a `dedupe_key:` and no block, whose answer waits for the
+  lifecycle row the run would refuse to write, and so would otherwise be a
+  `503` saying the request may be sent again, every resend taking the key over
+  to fail the same way.
 - **The serve log** names every decision under ``intake `<trigger>` ``: queued
   and for which execution, started, a debounce closed and over how many
   arrivals, dropped and why, superseded, a repaired start, and a start the

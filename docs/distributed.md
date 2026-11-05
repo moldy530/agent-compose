@@ -169,7 +169,11 @@ Both halves are normative; the second is a placement's `max_running:` (grammar
 - The hub offers a session work of a placement while the session's **unsettled
   dispatches for that placement number fewer than the placement's
   `max_running:`** — an integer of at least `1`, default `1`, declared in the
-  deploy file beside the placement's members. A worker claiming two placements
+  deploy file beside the placement's members. (A trigger's
+  `concurrency.max_running:` — grammar §13.1, Decision D163 — is a different
+  key with the same name: how many executions that trigger has running across
+  its groups, which §8's lease reads off the intake rows, where this one is
+  read off a session's dispatch rows.) A worker claiming two placements
   holds up to each one's cap of each. A worker runs every dispatch it holds
   concurrently, each in its own node runner, and keeps polling while any is
   unsettled.

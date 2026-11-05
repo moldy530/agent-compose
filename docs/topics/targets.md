@@ -495,12 +495,15 @@ tool — rather than load assignment.
 | Key | Shape |
 |---|---|
 | `placements.<name>.members` | non-empty list of distinct `agent.*` / `tool.*` addresses that must resolve |
-| `placements.<name>.max_running` | integer ≥ 1, default `1` — how many of this placement's dispatches **one worker session** may hold at once |
+| `placements.<name>.max_running` | integer ≥ 1, default `1` — how many of this placement's dispatches **one worker session** may hold at once; not a trigger's `concurrency.max_running:` (`agent-compose docs triggers`), which bounds that trigger's running executions |
 | `placements.<name>.description` | documentation |
 | `hub.join_token` | the bearer credential a worker joins with, as an `${ENV}` reference — required wherever `placements:` is non-empty |
 | `hub.public_url` | the absolute `http`/`https` base every ingress URL derives from; no wildcard, because this is your URL rather than an allowlist pattern |
 
-**`max_running:` is a session's capacity, not the placement's.** Leave it out
+**`max_running:` is a session's capacity, not the placement's** — and not a
+trigger's either: the `max_running:` inside a trigger's `concurrency:` block
+(`agent-compose docs triggers`) is a different key, the trigger's total of
+running executions across its groups. Leave it out
 and each worker runs one of the placement's nodes at a time, so a pool of one
 worker is one-at-a-time whatever its machine can take; `max_running: 3` lets
 each worker that claims the placement hold three of its dispatches and run them
