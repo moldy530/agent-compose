@@ -2447,8 +2447,14 @@ const SOURCES: &[Criterion] = &[
                 "a_line_that_is_not_a_json_object_is_refused_counted_and_starts_nothing",
                 Status::Live,
             ),
-            // …and so is one whose checkpoint no program could be handed back,
-            // so the restart after it still starts.
+            // …and so is one whose `checkpoint:` cannot be evaluated, and the
+            // events after it still start…
+            (
+                "a_line_whose_checkpoint_cannot_be_evaluated_is_refused_and_the_events_after_it_start",
+                Status::Live,
+            ),
+            // …and one whose checkpoint no program could be handed back, so the
+            // restart after it still starts.
             (
                 "a_line_whose_checkpoint_no_program_could_be_handed_is_refused_and_the_restart_still_starts",
                 Status::Live,
@@ -2468,6 +2474,13 @@ const SOURCES: &[Criterion] = &[
             ),
             (
                 "an_event_the_journal_will_not_admit_holds_the_stream_and_moves_no_checkpoint",
+                Status::Live,
+            ),
+            // …but an event — or a tick — whose `session_key:` answers the
+            // empty string is its trigger's binding failure, refused and never
+            // retried, so neither the stream nor the schedule is held by it.
+            (
+                "an_empty_session_key_refuses_its_tick_or_event_as_a_binding_failure_and_the_next_one_starts",
                 Status::Live,
             ),
             // …including one whose claim landed and whose execution the

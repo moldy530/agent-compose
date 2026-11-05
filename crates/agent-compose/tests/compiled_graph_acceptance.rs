@@ -29470,6 +29470,87 @@ fn a_line_that_is_not_a_json_object_is_refused_counted_and_starts_nothing() {
     );
 }
 
+/// A line whose `checkpoint:` cannot be evaluated is refused like a line that
+/// is not an object — counted, logged, and never an execution (grammar 14.4,
+/// Decision D162's Status) — and the stream goes on past it.
+///
+/// The fixture's `checkpoint:` is `payload.body.cursor`, which `text()` holds
+/// to a string. Before its third event the program emits two lines that are
+/// JSON objects and still have no checkpoint: one with no `cursor` (line 3), and
+/// one whose `cursor` is the number `3` (line 4). Both are refused, counted on
+/// `GET /sources/feed` and named in the serve log by their line; neither starts
+/// an execution or moves the checkpoint; and the two events after them are each
+/// admitted and move it on to "4". A refusal that escaped the line's admission
+/// instead would leave the program's stdout paused for good, so the last two
+/// events would never arrive.
+#[test]
+fn a_line_whose_checkpoint_cannot_be_evaluated_is_refused_and_the_events_after_it_start() {
+    let scratch = harness::Scratch::new("feed-unreadable");
+    let Some(project) = harness::scratch_project("feed-unreadable") else {
+        return;
+    };
+    let environment = feed_environment(
+        scratch.path(),
+        &[("FEED_TOTAL", "4"), ("FEED_UNREADABLE_AT", "3")],
+    );
+    let Some(mut served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let status = eventually(
+        Duration::from_secs(60),
+        "the two events after the unreadable lines",
+        || {
+            let status = source(&app, "feed");
+            (status["checkpoint"] == "4" && completed_of(&project, "ingest") == 4).then_some(status)
+        },
+    );
+    assert_eq!(
+        status["refused_lines"], 2,
+        "both unreadable lines are refused and counted: {status}"
+    );
+    assert_eq!(status["accepted_events"], 4, "{status}");
+    assert_eq!(
+        status["restart_count"], 0,
+        "the program was never restarted: {status}"
+    );
+    let ids = ids_of(&project, "ingest");
+    assert_eq!(
+        ids.keys().cloned().collect::<BTreeSet<_>>(),
+        ids_through(4),
+        "the two unreadable lines started nothing"
+    );
+    assert!(
+        ids.values().all(|count| *count == 1),
+        "exactly one execution per event: {ids:?}"
+    );
+    assert_eq!(journaled_checkpoint(&project).as_deref(), Some("4"));
+    let said = served.stop_and_read_stderr();
+    for (line, why, count) in [
+        (
+            3,
+            "`payload.body.cursor` is not present: nothing has supplied it",
+            1,
+        ),
+        (
+            4,
+            "`checkpoint` of the event source `feed` answered 3 rather than a string",
+            2,
+        ),
+    ] {
+        let refusal = format!(
+            "event source `feed`: line {line}'s `checkpoint` could not be read ({why}), so it was refused and starts nothing ({count} refused so far)"
+        );
+        assert!(said.contains(&refusal), "{refusal}\n{said}");
+    }
+    for seq in 1..=4 {
+        assert!(
+            said.contains(&format!("event source `feed`: event \"{seq}\" started ")),
+            "event {seq} started an execution: {said}"
+        );
+    }
+}
+
 /// A checkpoint is handed back to every start of the program — as
 /// `AGENT_COMPOSE_CHECKPOINT` and as the `{checkpoint}` argument — so a line
 /// whose checkpoint no program could be handed back unchanged is refused before
@@ -30394,6 +30475,245 @@ fn a_source_and_its_executions_enforce_the_auth_of_the_event_triggers_bound_to_i
     assert_eq!(own.status, 200, "{}", own.text());
     assert_eq!(own.json()["trigger"], "ingest");
     drop(served);
+}
+
+/// The composition [`an_empty_session_key_refuses_its_tick_or_event_as_a_binding_failure_and_the_next_one_starts`]
+/// serves beside the `command-source` fixture's program: two flows that each
+/// write a `scope: session` store, so neither can run without a session
+/// identity; an `event` trigger on the `feed` source whose `session_key:`
+/// answers the empty string for event "2" alone; and an every-minute schedule
+/// whose `session_key:` answers it for a tick on an even minute.
+const EMPTY_SESSION_KEYS: &str = r#"version: "0.1"
+
+store.memory:
+  kind: kv
+  scope: session
+  description: What each session was last started for.
+  value_schema:
+    id: { type: string }
+
+flow.ingest:
+  inputs:
+    id: { type: string }
+  outputs: {}
+  nodes:
+    note:
+      store: store.memory
+      op: set
+      key: "execution.session_key"
+      value:
+        id: "input.id"
+  edges:
+    - { from: start, to: note }
+    - { from: note, to: end }
+
+flow.tick:
+  inputs:
+    scheduled_at: { type: string }
+  outputs: {}
+  nodes:
+    note:
+      store: store.memory
+      op: set
+      key: "execution.session_key"
+      value:
+        id: "input.scheduled_at"
+  edges:
+    - { from: start, to: note }
+    - { from: note, to: end }
+
+triggers:
+  ingest:
+    type: event
+    flow: flow.ingest
+    source: feed
+    session_key: 'payload.id == "2" ? "" : "feed/" + payload.id'
+    input:
+      id: "payload.id"
+  every_minute:
+    type: schedule
+    flow: flow.tick
+    cron: "* * * * *"
+    timezone: UTC
+    session_key: 'payload.scheduled_at.matches("[02468]:00[+]00:00$") ? "" : "ticks"'
+    input:
+      scheduled_at: "payload.scheduled_at"
+"#;
+
+/// The sentence a run of `flow` with no session identity is refused with, for
+/// [`EMPTY_SESSION_KEYS`]'s one session-scoped store.
+fn session_refusal(flow: &str) -> String {
+    format!(
+        "`{flow}` reaches `store.memory`, which is `scope: session`, so this run needs a session identity and arrived with none: pass `--session <key>` to `agent-compose run`, or declare `session_key:` on the trigger that starts it — and where one is declared, it answered the empty string for this invocation (grammar 11.3, 13.2)"
+    )
+}
+
+/// A tick or an event whose `session_key:` answers the empty string, for a
+/// flow that reaches a `scope: session` store, is refused as a binding failure
+/// for its trigger — logged, never retried — and the next one starts (grammar
+/// 11.3, Decision D162's Status).
+///
+/// The run would refuse it before journaling anything, and a gated admission
+/// reads a run that never reached its lifecycle row as the journal's failure:
+/// an event retried with backoff and holding the stream, a tick claimed and
+/// owed, holding the schedule — for good, since no retry supplies a key. So the
+/// admission asks first.
+///
+/// [`EMPTY_SESSION_KEYS`] is served with the fixture's program emitting three
+/// events, and its schedule ticking once a second
+/// (`AGENT_COMPOSE_SCHEDULE_CLOCK_RATE=60`). Event "2" starts nothing, is
+/// logged naming the store, and is never offered again; events "1" and "3"
+/// start, each under its own session, and move the checkpoint to "3". A tick
+/// on an even minute is logged the same way and leaves no `fired` row; the
+/// ticks on odd minutes fire, those after a refused one included.
+#[test]
+fn an_empty_session_key_refuses_its_tick_or_event_as_a_binding_failure_and_the_next_one_starts() {
+    let local =
+        std::fs::read_to_string(harness::projects().join("command-source/deploy/local.yml"))
+            .expect("the fixture's deploy file");
+    let (staged, entrypoint) =
+        harness::staged_with_deploy("empty-session-keys", "command-source", "local", &local);
+    std::fs::write(&entrypoint, EMPTY_SESSION_KEYS).expect("the staged entrypoint is writable");
+    let Some(project) = harness::scratch_project("empty-session-keys") else {
+        return;
+    };
+    let mut environment = feed_environment(staged.path(), &[("FEED_TOTAL", "3")]);
+    environment.push((
+        "AGENT_COMPOSE_SCHEDULE_CLOCK_RATE".to_string(),
+        "60".to_string(),
+    ));
+    let Some(mut served) = harness::serve_entrypoint_into(&project, &entrypoint, &environment)
+    else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let status = eventually(
+        Duration::from_secs(60),
+        "the events either side of the refused one, and two ticks",
+        || {
+            let status = source(&app, "feed");
+            (status["checkpoint"] == "3"
+                && completed_of(&project, "ingest") == 2
+                && completed_of(&project, "every_minute") >= 2)
+                .then_some(status)
+        },
+    );
+    let said = served.stop_and_read_stderr();
+
+    // The event: refused for `ingest`, never retried, and the stream went on.
+    assert_eq!(
+        status["accepted_events"], 2,
+        "event 2 was accepted by no trigger: {status}"
+    );
+    assert_eq!(
+        status["refused_lines"], 0,
+        "it was a line the source read, and its trigger refused: {status}"
+    );
+    let event_refusal = format!(
+        "event source `feed`: event \"2\" started nothing for `ingest`: the trigger `ingest` could not bind this event: {}",
+        session_refusal("flow.ingest")
+    );
+    assert_eq!(
+        said.matches(&event_refusal).count(),
+        1,
+        "the refusal is logged once, naming the store: {event_refusal}\n{said}"
+    );
+    assert!(
+        !said.contains("could not be admitted to `ingest`"),
+        "the event was never retried as a refused admission: {said}"
+    );
+    let sessions: std::collections::BTreeMap<String, String> = harness::journal_rows(
+        &project,
+        "SELECT inputs, session_key FROM executions WHERE trigger_kind = 'ingest'",
+    )
+    .as_array()
+    .expect("rows")
+    .iter()
+    .map(|row| {
+        let inputs: Value =
+            serde_json::from_str(row["inputs"].as_str().expect("inputs")).expect("JSON inputs");
+        (
+            inputs["id"].as_str().expect("an id").to_string(),
+            row["session_key"]
+                .as_str()
+                .expect("a session key")
+                .to_string(),
+        )
+    })
+    .collect();
+    assert_eq!(
+        sessions,
+        std::collections::BTreeMap::from([
+            ("1".to_string(), "feed/1".to_string()),
+            ("3".to_string(), "feed/3".to_string()),
+        ]),
+        "events 1 and 3 started, each under the session its key answered"
+    );
+    assert_eq!(journaled_checkpoint(&project).as_deref(), Some("3"));
+
+    // The ticks: one on an even minute refused before its claim, and the
+    // schedule went on past it.
+    let tick_refusal = format!(
+        " tick started nothing: the trigger `every_minute` could not bind this tick: {}",
+        session_refusal("flow.tick")
+    );
+    let refused: Vec<i64> = said
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("schedule `every_minute`: the ")?
+                .strip_suffix(tick_refusal.as_str())
+        })
+        .map(minute_of)
+        .collect();
+    let fired: Vec<i64> = harness::journal_rows(
+        &project,
+        "SELECT scheduled_at FROM fired WHERE trigger_name = 'every_minute' ORDER BY scheduled_at",
+    )
+    .as_array()
+    .expect("rows")
+    .iter()
+    .map(|row| minute_of(row["scheduled_at"].as_str().expect("an instant")))
+    .collect();
+    assert!(
+        refused.iter().all(|minute| minute % 2 == 0),
+        "only a tick on an even minute is refused: {refused:?}"
+    );
+    assert!(
+        fired.iter().all(|minute| minute % 2 != 0),
+        "a refused tick is refused before its claim, so it leaves no `fired` row: {fired:?}"
+    );
+    let last_fired = *fired.last().expect("ticks fired");
+    assert!(
+        refused.iter().any(|minute| *minute < last_fired),
+        "a tick fired after one was refused — the schedule was not held by it: refused {refused:?}, fired {fired:?}\n{said}"
+    );
+    assert!(
+        !said.contains("no later tick is claimed"),
+        "no refused tick was left owed: {said}"
+    );
+    let tick_sessions: Vec<String> = harness::journal_rows(
+        &project,
+        "SELECT session_key FROM executions WHERE trigger_kind = 'every_minute'",
+    )
+    .as_array()
+    .expect("rows")
+    .iter()
+    .map(|row| {
+        row["session_key"]
+            .as_str()
+            .expect("a session key")
+            .to_string()
+    })
+    .collect();
+    assert_eq!(
+        tick_sessions.len(),
+        fired.len(),
+        "one execution per fired row: {tick_sessions:?}"
+    );
+    assert!(
+        tick_sessions.iter().all(|key| key == "ticks"),
+        "every tick that fired ran under the session its key answered: {tick_sessions:?}"
+    );
 }
 
 /// PRD resolved q78's second verification clause: "a cron fires at its times

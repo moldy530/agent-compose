@@ -24,6 +24,11 @@
 //   FEED_HOLD_AT     before emitting this sequence number, wait for the file
 //   FEED_HOLD_FILE   FEED_HOLD_FILE names to exist: how a test does something
 //                    to the journal between two events
+//   FEED_UNREADABLE_AT
+//                    before emitting this sequence number, emit two lines whose
+//                    `checkpoint:` cannot be evaluated: one with no `cursor` at
+//                    all, and one whose `cursor` is the number rather than the
+//                    string a checkpoint must be
 //   FEED_LOG         append every sequence number emitted, one per line — the
 //                    oracle the acceptance suite counts executions against
 //   FEED_STARTS      append, per start, the checkpoint it was handed: the
@@ -136,9 +141,16 @@ if (process.env.FEED_GARBAGE) {
   await write("[1, 2, 3]");
 }
 const holdAt = process.env.FEED_HOLD_AT ? Number(process.env.FEED_HOLD_AT) : undefined;
+const unreadableAt = process.env.FEED_UNREADABLE_AT
+  ? Number(process.env.FEED_UNREADABLE_AT)
+  : undefined;
 for (let seq = first; seq <= last; seq += 1) {
   if (seq === holdAt) {
     while (!existsSync(process.env.FEED_HOLD_FILE ?? "")) await sleep(50);
+  }
+  if (seq === unreadableAt) {
+    await write(JSON.stringify({ seq, text: `event ${seq}, with no cursor` }));
+    await write(JSON.stringify({ seq, cursor: seq, text: `event ${seq}, its cursor a number` }));
   }
   await write(JSON.stringify({ seq, cursor: String(seq), text: `event ${seq}` }));
   if (process.env.FEED_LOG) appendFileSync(process.env.FEED_LOG, `${seq}\n`);
