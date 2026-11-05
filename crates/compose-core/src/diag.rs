@@ -623,6 +623,23 @@ pub enum DiagnosticCode {
     /// Two `manual` triggers name one flow and declare different `session_key:`
     /// expressions, which are two answers for one CLI entry (grammar 13.2).
     ConflictingSessionKey,
+    /// A `manual` trigger declares a `concurrency:` block (grammar 13.1, 13.2,
+    /// PRD resolved q77 ruling b, Decision D163). Its own class rather than an
+    /// [`UnknownKey`](Self::UnknownKey): the key is one three of the four
+    /// trigger types take, and the repair is a sentence about why a terminal is
+    /// not a queue — a `run` is refused at start when a group covering its flow
+    /// is full, and the block that would bound it belongs to the trigger whose
+    /// arrivals it admits.
+    ConcurrencyOnManual,
+    /// A trigger's `dedupe_key:` or `concurrency.key:` reads `payload.coalesced`
+    /// (grammar 13.1, PRD resolved q77 ruling c, Decision D163). The count
+    /// exists only once a debounce has closed, and both keys are evaluated when
+    /// each arrival lands — before there is a count to read — so the
+    /// expression would be defined in terms of the coalescing it decides. Its
+    /// own class rather than an [`UnknownField`](Self::UnknownField): on a
+    /// trigger that declares `debounce:`, the field is a member of the payload
+    /// `input:` and `session_key:` read.
+    CoalescedInKey,
     /// An `http` trigger declares `callback_auth:` and no `callback_allow:`
     /// (grammar 13.3, PRD resolved q33). Its own class rather than a
     /// [`MissingKey`](Self::MissingKey), for the reason
@@ -798,6 +815,8 @@ impl DiagnosticCode {
         Self::RoutedFinally,
         Self::DuplicateRoute,
         Self::ConflictingSessionKey,
+        Self::ConcurrencyOnManual,
+        Self::CoalescedInKey,
         Self::MissingCallbackAllowlist,
         Self::UnsupportedPlacement,
         Self::ConflictingPlacement,
@@ -893,6 +912,8 @@ impl DiagnosticCode {
             Self::RoutedFinally => "routed-finally",
             Self::DuplicateRoute => "duplicate-route",
             Self::ConflictingSessionKey => "conflicting-session-key",
+            Self::ConcurrencyOnManual => "concurrency-on-manual",
+            Self::CoalescedInKey => "coalesced-in-key",
             Self::MissingCallbackAllowlist => "missing-callback-allowlist",
             Self::UnsupportedPlacement => "unsupported-placement",
             Self::ConflictingPlacement => "conflicting-placement",

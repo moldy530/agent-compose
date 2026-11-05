@@ -169,6 +169,8 @@ const TOPICS_WITHOUT_A_RUNNABLE_EXAMPLE: &[(&str, &str)] = &[
 /// did — the report simply goes quiet — so the repaired spec is the only thing
 /// that says which edit produces the quiet report.
 const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
+    "coalesced-in-key",
+    "concurrency-on-manual",
     "conflicting-connection-variable",
     "finally-interrupt",
     "invalid-cron",

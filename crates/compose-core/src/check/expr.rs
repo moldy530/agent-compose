@@ -289,21 +289,33 @@ pub(crate) fn tool_scope(input: &FieldMap, address: &str) -> Scope {
 
 /// The scope of a trigger's expressions: `payload`, shaped by the trigger type
 /// (grammar 13).
-pub(crate) fn trigger_scope(kind: &TriggerKind, surface: impl Into<String>) -> Scope {
+///
+/// `coalesced` adds `payload.coalesced` — an integer, the count of arrivals a
+/// debounce coalesced into the one execution it starts — to every kind's
+/// payload, and is `true` exactly where the trigger's `concurrency:` declares
+/// `debounce:` (grammar 13.1, PRD resolved q77 ruling c, Decision D163). On a
+/// trigger that declares none the member does not exist, so a read of it is
+/// the [`UnknownField`](crate::diag::DiagnosticCode::UnknownField) a misspelt
+/// member is.
+pub(crate) fn trigger_scope(
+    kind: &TriggerKind,
+    coalesced: bool,
+    surface: impl Into<String>,
+) -> Scope {
     let property = |name: &str, ty: Type| Property {
         name: name.to_string(),
         ty,
         optional: false,
         defaulted: false,
     };
-    let payload = match kind {
+    let (origin, mut properties) = match kind {
         // The CLI's `--session <key>` is the manual payload's one member
         // (grammar 13.2).
-        TriggerKind::Manual => Type::object(
+        TriggerKind::Manual => (
             Origin::Payload("manual"),
             vec![property("session", Type::String)],
         ),
-        TriggerKind::Http(_) => Type::object(
+        TriggerKind::Http(_) => (
             Origin::Payload("http"),
             vec![
                 // A decoded JSON object: present and readable, with a shape the
@@ -315,14 +327,14 @@ pub(crate) fn trigger_scope(kind: &TriggerKind, surface: impl Into<String>) -> S
                 property("method", Type::String),
             ],
         ),
-        TriggerKind::Schedule(_) => Type::object(
+        TriggerKind::Schedule(_) => (
             Origin::Payload("schedule"),
             vec![
                 property("scheduled_at", Type::String),
                 property("trigger", Type::String),
             ],
         ),
-        TriggerKind::Event(_) => Type::object(
+        TriggerKind::Event(_) => (
             Origin::Payload("event"),
             vec![
                 property("id", Type::String),
@@ -332,5 +344,11 @@ pub(crate) fn trigger_scope(kind: &TriggerKind, surface: impl Into<String>) -> S
             ],
         ),
     };
-    Scope::new(surface, vec![("payload".to_string(), payload)])
+    if coalesced {
+        properties.push(property("coalesced", Type::Int));
+    }
+    Scope::new(
+        surface,
+        vec![("payload".to_string(), Type::object(origin, properties))],
+    )
 }

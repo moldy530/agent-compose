@@ -64,6 +64,7 @@ pub const RESERVED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/executions/:id/resume"),
     ("POST", "/executions/:id/cancel"),
     ("GET", "/sources/:name"),
+    ("GET", "/intakes/:id"),
 ];
 
 /// `src/serve.ts`.

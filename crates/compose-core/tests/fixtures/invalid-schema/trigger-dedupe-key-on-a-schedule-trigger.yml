@@ -1,0 +1,9 @@
+# rule: a tick is deduplicated by its own fired row, so `dedupe_key:` is not a key of a `schedule` trigger (grammar 13.4 / PRD resolved q77)
+# at: /triggers/nightly
+# via: /$defs/scheduleTrigger/additionalProperties
+triggers:
+  nightly:
+    type: schedule
+    cron: "0 3 * * *"
+    flow: flow.support
+    dedupe_key: "payload.scheduled_at"

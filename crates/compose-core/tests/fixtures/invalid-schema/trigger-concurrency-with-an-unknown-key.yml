@@ -1,0 +1,10 @@
+# rule: a trigger's `concurrency:` is a closed block of five keys (grammar 13.1 / PRD resolved q77)
+# at: /triggers/feed_in/concurrency
+# via: /$defs/triggerConcurrency/additionalProperties
+triggers:
+  feed_in:
+    type: event
+    source: feed
+    flow: flow.support
+    concurrency:
+      group: "payload.source"

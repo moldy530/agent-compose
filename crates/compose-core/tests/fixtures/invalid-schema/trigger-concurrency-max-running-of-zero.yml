@@ -1,0 +1,10 @@
+# rule: a trigger none of whose executions may run admits nothing, so `concurrency.max_running:` is at least 1 (grammar 13.1 / PRD resolved q77)
+# at: /triggers/nightly/concurrency/max_running
+# via: /$defs/triggerConcurrency/properties/max_running/minimum
+triggers:
+  nightly:
+    type: schedule
+    cron: "0 3 * * *"
+    flow: flow.support
+    concurrency:
+      max_running: 0

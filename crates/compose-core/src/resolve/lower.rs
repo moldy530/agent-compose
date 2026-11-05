@@ -761,6 +761,8 @@ fn trigger(source: &ast_trigger::Trigger) -> Option<ir::Trigger> {
                     .callback_allow
                     .as_ref()
                     .map(|allow| allow.patterns.clone()),
+                dedupe_key: http.dedupe_key.clone(),
+                dedupe_window: http.dedupe_window.clone(),
             })
         }
         ast_trigger::TriggerKind::Schedule(schedule) => {
@@ -775,6 +777,7 @@ fn trigger(source: &ast_trigger::Trigger) -> Option<ir::Trigger> {
                 source: event.source.clone()?,
                 input: event.input.as_ref().map(bindings),
                 dedupe_key: event.dedupe_key.clone(),
+                dedupe_window: event.dedupe_window.clone(),
                 auth: optional(event.auth.as_ref(), inbound_auth)?,
             })
         }
@@ -784,6 +787,17 @@ fn trigger(source: &ast_trigger::Trigger) -> Option<ir::Trigger> {
         flow: source.flow.clone()?,
         session_key: source.session_key.clone(),
         description: source.description.clone(),
+        concurrency: source
+            .concurrency
+            .as_ref()
+            .map(|block| ir::trigger::Concurrency {
+                key: block.key.clone(),
+                limit: block.limit.clone(),
+                on_conflict: block.on_conflict.as_ref().map(|mode| mode.value),
+                debounce: block.debounce.clone(),
+                max_running: block.max_running.clone(),
+                span: block.span.clone(),
+            }),
         span: source.span.clone(),
         kind,
     })

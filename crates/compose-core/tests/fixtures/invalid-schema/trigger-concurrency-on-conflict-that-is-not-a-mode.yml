@@ -1,0 +1,9 @@
+# rule: `concurrency.on_conflict:` is one of `queue`, `drop` and `supersede` (grammar 13.1 / PRD resolved q77)
+# at: /triggers/on_request/concurrency/on_conflict
+# via: /$defs/triggerConcurrency/properties/on_conflict/enum
+triggers:
+  on_request:
+    type: http
+    flow: flow.support
+    concurrency:
+      on_conflict: wait

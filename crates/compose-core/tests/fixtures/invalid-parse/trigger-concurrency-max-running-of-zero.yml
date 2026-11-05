@@ -1,0 +1,11 @@
+# rule: a trigger's `concurrency.max_running:` is at least 1 (grammar 13.1, PRD resolved q77)
+# code: value-out-of-range
+# message: `concurrency.max_running` of trigger `nightly` must be at least 1, found 0
+# at: 11:20
+triggers:
+  nightly:
+    type: schedule
+    cron: "0 3 * * *"
+    flow: flow.support
+    concurrency:
+      max_running: 0

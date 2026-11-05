@@ -21,6 +21,7 @@ Spec(
                             cel("payload.session") @ 8:18..8:35,
                         ),
                         description: None,
+                        concurrency: None,
                         kind: Some(
                             Manual,
                         ),
@@ -35,6 +36,7 @@ Spec(
                             cel("payload.body.project") @ 18:18..18:40,
                         ),
                         description: None,
+                        concurrency: None,
                         kind: Some(
                             Http(
                                 HttpTrigger {
@@ -69,6 +71,8 @@ Spec(
                                     auth: None,
                                     callback_auth: None,
                                     callback_allow: None,
+                                    dedupe_key: None,
+                                    dedupe_window: None,
                                 },
                             ),
                         ),
@@ -83,6 +87,7 @@ Spec(
                             cel("'nightly'") @ 32:18..32:29,
                         ),
                         description: None,
+                        concurrency: None,
                         kind: Some(
                             Schedule(
                                 ScheduleTrigger {
@@ -121,6 +126,7 @@ Spec(
                             cel("payload.body.project") @ 43:18..43:40,
                         ),
                         description: None,
+                        concurrency: None,
                         kind: Some(
                             Event(
                                 EventTrigger {
@@ -145,6 +151,7 @@ Spec(
                                     dedupe_key: Some(
                                         cel("payload.id") @ 44:17..44:29,
                                     ),
+                                    dedupe_window: None,
                                     auth: None,
                                 },
                             ),

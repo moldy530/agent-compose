@@ -637,6 +637,25 @@ const GRAMMAR: &[Check] = &[
         evidence: Evidence::Fixture,
     },
     Check {
+        // A trigger's intake (PRD resolved q77, Decision D163): `concurrency:`
+        // bounds the arrivals an intake admits, and a `manual` run is a command
+        // at a terminal rather than an arrival — it is refused at start when a
+        // group covering its flow is full, never queued under one.
+        rule: "`concurrency:` is a key of `http`, `schedule` and `event` triggers, and not of `manual` (13.1, 13.2, D163)",
+        pass: "parse/section.rs",
+        codes: &["concurrency-on-manual"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        // The two keys an intake evaluates as each arrival lands answer strings
+        // and read nothing a debounce has yet to count: `payload.coalesced` is
+        // known only once the debounce the arrival joins has closed.
+        rule: "a trigger's `dedupe_key:` and `concurrency.key:` answer strings and do not read `payload.coalesced` (13.1, 13.3, D163)",
+        pass: "check/triggers.rs",
+        codes: &["coalesced-in-key", "type-mismatch"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
         rule: "every CEL surface: roots, paths, constructs, and result type (4.1)",
         pass: "cel/mod.rs, over check/expr.rs",
         codes: &[

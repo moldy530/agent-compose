@@ -1,0 +1,10 @@
+# rule: an `http` trigger's `dedupe_window:` needs the `dedupe_key:` it is the window of (grammar 13.3, PRD resolved q77)
+# code: conflicting-keys
+# message: `dedupe_window` is not legal on trigger `on_request`, which declares no `dedupe_key`
+# at: 10:5
+# help: the window is how long a dedupe key is held, and an `http` trigger's `dedupe_key:` has no default — a request body has no id of its own — so a window beside no key holds nothing: declare the `dedupe_key:` the window is for, or drop the key (grammar 13.3, PRD resolved q77)
+triggers:
+  on_request:
+    type: http
+    flow: flow.support
+    dedupe_window: 1h

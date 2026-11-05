@@ -1,0 +1,11 @@
+# rule: a trigger's `dedupe_window:` is a literal duration (grammar 4.4, 13.5, PRD resolved q77)
+# code: invalid-duration
+# message: `forever` is not a valid duration for `dedupe_window`
+# at: 11:20
+# help: durations are a positive integer followed by `ms`, `s`, `m`, or `h`, e.g. `30s`; compound forms like `1m30s` are not supported
+triggers:
+  on_event:
+    type: event
+    source: feed
+    flow: flow.support
+    dedupe_window: forever

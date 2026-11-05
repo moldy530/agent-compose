@@ -292,7 +292,7 @@ fn routes(ctx: &mut Ctx) {
                     ),
                 )
                 .with_help(format!(
-                    "a generated app mounts `status`, `resume` and `cancel` for each execution and `sources` for each event source for itself, beside each trigger's `start` (grammar 13.3, 14.4) — {} — and cannot dispatch one method and path two ways: give the trigger its own `path:`",
+                    "a generated app mounts for itself `status`, `resume` and `cancel` for each execution, `sources` for each event source and `intakes` for each arrival a trigger's intake admits, beside each trigger's `start` (grammar 13.3, 14.4) — {} — and cannot dispatch one method and path two ways: give the trigger its own `path:`",
                     crate::parse::reader::list(
                         crate::codegen::serve::RESERVED_ROUTES
                             .iter()
@@ -360,7 +360,13 @@ fn route_span(trigger: &Trigger, http: &HttpTrigger) -> Span {
 
 fn one(ctx: &mut Ctx, trigger: &Trigger) {
     let name = text(&trigger.name);
-    let scope = expr::trigger_scope(&trigger.kind, format!("the trigger `{name}`"));
+    // `payload.coalesced` is a member of the payload exactly where a debounce
+    // closes over arrivals (grammar 13.1, PRD resolved q77 ruling c).
+    let debounced = trigger
+        .concurrency
+        .as_ref()
+        .is_some_and(|block| block.debounce.is_some());
+    let scope = expr::trigger_scope(&trigger.kind, debounced, format!("the trigger `{name}`"));
     let bindings = match &trigger.kind {
         TriggerKind::Manual => None,
         TriggerKind::Http(http) => http.input.as_ref(),
@@ -384,8 +390,43 @@ fn one(ctx: &mut Ctx, trigger: &Trigger) {
     {
         strings.push(("dedupe_key", dedupe));
     }
+    if let TriggerKind::Http(http) = &trigger.kind
+        && let Some(dedupe) = &http.dedupe_key
+    {
+        strings.push(("dedupe_key", dedupe));
+    }
+    if let Some(key) = trigger
+        .concurrency
+        .as_ref()
+        .and_then(|block| block.key.as_ref())
+    {
+        strings.push(("concurrency.key", key));
+    }
     for (key, expression) in strings {
         let analysis = expr::analyze(ctx, expression, &scope);
+        // The two keys an intake evaluates as each arrival lands — before a
+        // debounce has closed, so before there is a count to read (PRD
+        // resolved q77 ruling c, Decision D163).
+        if matches!(key, "dedupe_key" | "concurrency.key")
+            && let Some(read) = analysis.reads.iter().find(|read| {
+                read.root == "payload" && read.path.first().is_some_and(|f| f == "coalesced")
+            })
+        {
+            ctx.push(
+                Diagnostic::error(
+                    DiagnosticCode::CoalescedInKey,
+                    expression.span.clone(),
+                    format!(
+                        "`{key}` of the trigger `{name}` reads `{}`, which is not known until the trigger's debounce has closed",
+                        read.spelling()
+                    ),
+                )
+                .with_help(
+                    "both keys are evaluated as each arrival lands — the dedupe key to decide whether it is a repeat, the group key to decide which debounce it joins — and `payload.coalesced` is the count of arrivals the debounce closed over, which exists only once it has: read it in `input:` or `session_key:`, which are bound when the execution starts, and key the arrival off what it carries (grammar 13.1, PRD resolved q77)",
+                ),
+            );
+            continue;
+        }
         expr::expect(
             ctx,
             expression,

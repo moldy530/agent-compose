@@ -67,6 +67,7 @@ const PARSER_CODES: &[&str] = &[
     "invalid-env-ref",
     "unexpected-env-ref",
     "reserved-name",
+    "concurrency-on-manual",
 ];
 
 struct Expectation {
