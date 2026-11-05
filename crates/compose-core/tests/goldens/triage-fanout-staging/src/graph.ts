@@ -644,12 +644,13 @@ const agentTriage: runtime.AgentBinding = {
         ],
         "type": "object"
       },
-      invoke: async (args, context) =>
+      invoke: async (args, context, site) =>
         stores.runStoreTool(
           storeDocs,
           "search",
           runtime.parseToolArguments(storeDocsToolSearchInput, args, "the arguments `docs_search` was called with") as Record<string, unknown>,
           context,
+          site,
         ),
     },
   ],
@@ -1202,7 +1203,7 @@ const flowTriageNodeRemember: runtime.NodeDescriptor = {
       "set",
       input as stores.StoreParams,
       context,
-      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "remember")].join("/") },
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "remember")].join("/"), path: runtime.instancePath(view, "remember").join("/") },
     ),
   }),
   writes: [],
