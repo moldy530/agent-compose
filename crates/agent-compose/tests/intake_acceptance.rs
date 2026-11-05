@@ -84,6 +84,15 @@
 //!   and with a completion webhook, pushed once, for the run that finished,
 //!   while the refused start is tried again on the queue's period —
 //!   [`a_waiting_arrivals_refused_start_pushes_one_settle_and_is_retried_on_the_drain_period`];
+//!   and a gated arrival's refused start, answered `503` and pushed nothing —
+//!   [`a_gated_arrivals_refused_start_is_answered_503_and_pushed_nothing`];
+//! * a start whose lifecycle row landed while the journal's answer was lost,
+//!   run once as the execution its row is, and a queued arrival whose
+//!   execution a recovery runs, never begun again —
+//!   [`a_start_whose_lifecycle_row_landed_while_its_answer_was_lost_runs_once`];
+//! * a dedupe window or a debounce ending past the last instant the journal
+//!   can write, held to it —
+//!   [`a_dedupe_window_or_debounce_past_the_last_instant_is_held_to_it`];
 //! * a slot held by an open execution the serving build cannot run, freed by
 //!   its cancel — off the board, its flow renamed —
 //!   [`an_open_execution_of_a_flow_the_build_no_longer_declares_frees_its_slot_when_cancelled`],
@@ -4373,4 +4382,610 @@ fn a_slot_a_superseding_arrivals_cancel_frees_is_another_groups_older_arrivals_f
         said.lines().any(|line| line == superseded),
         "the serve log says `{superseded}`:\n{said}"
     );
+}
+
+/// The composition a lost lifecycle answer is tested under: one key-less
+/// group of one slot over a flow that tallies its start, then ends when the
+/// file its `hold` names appears, and calls back when it settles.
+const LANDING: &str = r#"version: "0.1"
+
+triggers:
+  landing:
+    type: http
+    path: /landing
+    flow: flow.tallied
+    respond: async
+    input:
+      tag: "payload.body.tag"
+      hold: "payload.body.hold"
+    callback: "payload.body.callback_url"
+    callback_allow:
+      - "http://127.0.0.1:*"
+    concurrency:
+      limit: 1
+
+flow.tallied:
+  description: One tagged piece of work, tallied as it starts, that ends when a file appears.
+  inputs:
+    tag: { type: string }
+    hold: { type: string }
+  outputs: {}
+  nodes:
+    work:
+      exec:
+        command: "${TALLY_BIN}/work"
+      input:
+        tag: "input.tag"
+        linger: "'0'"
+        pushes: "1"
+    wait:
+      exec:
+        command: "${TALLY_BIN}/hold"
+      input:
+        hold: "input.hold"
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: wait }
+    - { from: wait, to: end }
+"#;
+
+/// How many of the tally's lines record a start of the execution tagged `tag`.
+fn starts_of(log: &Path, tag: &str) -> usize {
+    let started = format!("{tag} start ");
+    tally(log)
+        .iter()
+        .filter(|line| line.starts_with(&started))
+        .count()
+}
+
+/// **A start whose lifecycle row landed while the journal's answer was lost
+/// runs once, as the execution its row is, and is never begun again**
+/// (Decision D163's Status, `docs/durability.md` §3.15).
+///
+/// A dialled journal can commit an insert whose answer never arrives. The test
+/// makes SQLite do the same: a trigger it installs raises `FAIL` **after** the
+/// lifecycle row of every execution whose inputs name `owed` is inserted, so
+/// the row stays and the start is told it failed.
+///
+/// * `first` holds `landing`'s one slot and `owed` queues behind it. When
+///   `first` settles, `owed`'s start is told its row was refused — and the row
+///   is there. The arrival is not put back on the queue: its intake row stays
+///   `started`, and its execution runs here at once, as the journal holds it —
+///   its status route answers it, and it tallies one start.
+/// * `serve` is then killed and the intake row put back on the queue by hand:
+///   what a start whose own read of its row missed the commit leaves. The
+///   restart finds a queued arrival whose execution its recovery is already
+///   running, and moves the row to `started` beginning nothing — so the
+///   recovered execution keeps its place on the board, its status route
+///   answering it throughout, and once it settles nothing starts it a second
+///   time: one lifecycle row, one tallied start, one `settled` webhook, and
+///   the queue moves on to the arrival behind it.
+#[test]
+fn a_start_whose_lifecycle_row_landed_while_its_answer_was_lost_runs_once() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    let scratch = harness::Scratch::new("intake-landed");
+    let (environment, log) = environment(&provider, &scratch, &[]);
+    let entrypoint = scratch.path().join("main.yml");
+    std::fs::write(&entrypoint, LANDING).expect("the scratch area is writable");
+    let Some(project) = harness::scratch_project("intake-landed") else {
+        return;
+    };
+    let file = |name: &str| scratch.path().join(name).display().to_string();
+    let release = |name: &str| {
+        std::fs::write(scratch.path().join(name), "").expect("the release file");
+    };
+    let callback = format!("{}/done", receiver.base_url);
+
+    let (first, intake, owed, said) = {
+        let Some(mut served) = harness::serve_entrypoint_into(&project, &entrypoint, &environment)
+        else {
+            return;
+        };
+        let app = Client::new(&served.base_url).expect("a client");
+        let first = execution_of(&post(
+            &app,
+            "/landing",
+            &json!({ "tag": "first", "hold": file("first-done"), "callback_url": callback }),
+        ));
+        let queued = post(
+            &app,
+            "/landing",
+            &json!({ "tag": "owed", "hold": file("owed-done"), "callback_url": callback }),
+        );
+        assert_eq!(queued.json()["status"], "queued", "{}", queued.text());
+        let intake = intake_id_of(&queued);
+        let owed = execution_named_by(&project, &intake);
+        let lose = harness::journal_sql(
+            &project,
+            "CREATE TRIGGER lose_the_owed_answers AFTER INSERT ON executions \
+               WHEN NEW.inputs LIKE '%owed%' BEGIN SELECT RAISE(FAIL, 'lost by the test'); END;\n",
+        );
+        assert!(
+            lose.status.success(),
+            "{}",
+            String::from_utf8_lossy(&lose.stderr)
+        );
+        release("first-done");
+        assert_eq!(harness::settled(&app, &first)["status"], "completed");
+
+        // Run at once, as the journal holds it: on the board, and started.
+        let report = eventually(
+            Duration::from_secs(30),
+            "the owed arrival's execution to run although its start was told it failed",
+            || {
+                let answered = get(&app, &format!("/executions/{owed}"));
+                (answered.status == 200 && starts_of(&log, "owed") == 1).then(|| answered.json())
+            },
+        );
+        assert_eq!(report["status"], "running", "{report}");
+        // Several of the queue's periods: the arrival is never queued again,
+        // and its execution is never begun a second time beside itself.
+        std::thread::sleep(Duration::from_secs(5));
+        let report = get(&app, &format!("/intakes/{intake}")).json();
+        assert_eq!(report["state"], "started", "{report}");
+        assert_eq!(report["execution_id"], owed.as_str(), "{report}");
+        assert_eq!(
+            get(&app, &format!("/executions/{owed}")).json()["status"],
+            "running"
+        );
+        assert_eq!(starts_of(&log, "owed"), 1, "{:?}", tally(&log));
+        let rows = executions_of(&project, "landing");
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.id.as_str(), row.status.as_str()))
+                .collect::<Vec<_>>(),
+            [(first.as_str(), "completed"), (owed.as_str(), "open")],
+            "{rows:#?}"
+        );
+        // `SIGKILL` to the whole group, the owed execution's row left open.
+        (first, intake, owed, served.stop_and_read_stderr())
+    };
+    let adopted =
+        format!("intake `landing`: {intake}'s start of {owed} was answered with a failure (");
+    assert!(
+        said.lines().any(|line| line.starts_with(&adopted)
+            && line.contains("lost by the test")
+            && line.ends_with("but its lifecycle row is down: it runs as the journal holds it")),
+        "`{adopted}…`\n{said}"
+    );
+    assert!(
+        !said.lines().any(|line| line.contains(&format!(
+            "{intake}'s execution {owed} could not be journaled"
+        ))),
+        "the arrival whose execution began was not put back on the queue:\n{said}"
+    );
+
+    // What a start whose read of its own row missed the commit leaves: the
+    // arrival back on the queue, its execution open.
+    let surgery = harness::journal_sql(
+        &project,
+        &format!(
+            "DROP TRIGGER lose_the_owed_answers;\n\
+             UPDATE intakes SET state = 'queued' WHERE id = '{intake}';\n"
+        ),
+    );
+    assert!(
+        surgery.status.success(),
+        "{}",
+        String::from_utf8_lossy(&surgery.stderr)
+    );
+
+    let Some(mut served) = harness::serve_entrypoint_into(&project, &entrypoint, &environment)
+    else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client");
+    eventually(
+        Duration::from_secs(30),
+        "the queued arrival whose execution began to be started without a second start",
+        || (get(&app, &format!("/intakes/{intake}")).json()["state"] == "started").then_some(()),
+    );
+    // Its recovered execution keeps its place on the board look after look.
+    let behind = intake_id_of(&post(
+        &app,
+        "/landing",
+        &json!({ "tag": "behind", "hold": file("behind-done"), "callback_url": callback }),
+    ));
+    for _ in 0..5 {
+        let answered = get(&app, &format!("/executions/{owed}"));
+        assert_eq!(answered.status, 200, "{}", answered.text());
+        assert_eq!(answered.json()["status"], "running", "{}", answered.text());
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    assert_eq!(
+        get(&app, &format!("/intakes/{behind}")).json()["state"],
+        "queued",
+        "the arrival behind waits for the recovered execution's slot"
+    );
+
+    release("owed-done");
+    assert_eq!(harness::settled(&app, &owed)["status"], "completed");
+    let report = eventually(
+        Duration::from_secs(30),
+        "the arrival behind to start once the recovered execution's slot frees",
+        || {
+            let report = get(&app, &format!("/intakes/{behind}")).json();
+            (report["state"] == "started").then_some(report)
+        },
+    );
+    let behind = report["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+    release("behind-done");
+    assert_eq!(harness::settled(&app, &behind)["status"], "completed");
+    // Two of the queue's periods for a second start of `owed`, which none makes.
+    std::thread::sleep(Duration::from_secs(5));
+    assert_eq!(
+        starts_of(&log, "owed"),
+        1,
+        "the recovery replayed the recorded start, and nothing ran it again: {:?}",
+        tally(&log)
+    );
+    let rows = executions_of(&project, "landing");
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.id.as_str(), row.status.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (first.as_str(), "completed"),
+            (owed.as_str(), "completed"),
+            (behind.as_str(), "completed"),
+        ],
+        "{rows:#?}"
+    );
+    receiver.wait_for_event("settled", 3, Duration::from_secs(30));
+    std::thread::sleep(Duration::from_secs(2));
+    for execution in [&first, &owed, &behind] {
+        let pushed: Vec<harness::Delivered> = receiver
+            .of_event("settled")
+            .into_iter()
+            .filter(|held| held.body["execution_id"] == execution.as_str())
+            .collect();
+        let mut ids: Vec<&str> = pushed
+            .iter()
+            .map(|held| {
+                held.header("x-agentcompose-delivery")
+                    .expect("a delivery id")
+            })
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 1, "one settle of {execution}: {pushed:?}");
+        assert_eq!(
+            pushed[0].body["status"], "completed",
+            "{:?}",
+            pushed[0].body
+        );
+    }
+
+    let said = served.stop_and_read_stderr();
+    let found = format!(
+        "intake `landing`: {intake}'s execution {owed} had already begun, so it is not begun again: it runs as the journal holds it"
+    );
+    assert!(said.lines().any(|line| line == found), "`{found}`\n{said}");
+    assert!(
+        !said.contains("is already running in this process"),
+        "no second generation of the recovered execution was begun:\n{said}"
+    );
+}
+
+/// The composition a gated arrival's refused start is tested under: one
+/// trigger whose arrivals a group admits, one whose arrivals a dedupe key
+/// does, both calling back when their executions settle.
+const GATED: &str = r#"version: "0.1"
+
+triggers:
+  gated_serial:
+    type: http
+    path: /gated-serial
+    flow: flow.work
+    respond: async
+    input:
+      tag: "payload.body.tag"
+    callback: "payload.body.callback_url"
+    callback_allow:
+      - "http://127.0.0.1:*"
+    concurrency:
+      limit: 1
+  gated_deduped:
+    type: http
+    path: /gated-deduped
+    flow: flow.work
+    respond: async
+    input:
+      tag: "payload.body.tag"
+    callback: "payload.body.callback_url"
+    callback_allow:
+      - "http://127.0.0.1:*"
+    dedupe_key: "payload.body.id"
+
+flow.work:
+  description: One tagged piece of work that takes as long as it is told to.
+  inputs:
+    tag: { type: string }
+    linger: { type: string, default: "0" }
+    pushes: { type: integer, default: 1 }
+  outputs: {}
+  nodes:
+    work:
+      exec:
+        command: "${TALLY_BIN}/work"
+      input:
+        tag: "input.tag"
+        linger: "input.linger"
+        pushes: "input.pushes"
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+"#;
+
+/// **A gated arrival whose start the journal refuses is answered `503` and
+/// pushed nothing** (Decision D163's Status, grammar 13.3).
+///
+/// An arrival a group admits into a free slot, and one a dedupe key admits,
+/// are each answered only once their lifecycle row is down. While a SQLite
+/// trigger the test installs refuses the row of every execution whose inputs
+/// name `refused`, each is answered `503` — nothing started, and the request
+/// may be sent again — and no `settled` webhook follows for the execution the
+/// answer never named: the caller holds no `202`, and a push of `failed` would
+/// be a settle of an execution nobody was told of, beside the one the resend
+/// starts. Once the refusal is lifted each resend starts and settles, and is
+/// pushed exactly once, `completed`.
+#[test]
+fn a_gated_arrivals_refused_start_is_answered_503_and_pushed_nothing() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    let scratch = harness::Scratch::new("intake-gated-refused");
+    let (environment, _log) = environment(&provider, &scratch, &[]);
+    let entrypoint = scratch.path().join("main.yml");
+    std::fs::write(&entrypoint, GATED).expect("the scratch area is writable");
+    let Some(project) = harness::scratch_project("intake-gated-refused") else {
+        return;
+    };
+    let Some(served) = harness::serve_entrypoint_into(&project, &entrypoint, &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client");
+    let callback = format!("{}/done", receiver.base_url);
+    // One run first, so the journal the refusal is installed in exists.
+    let warm = execution_of(&post(
+        &app,
+        "/gated-serial",
+        &json!({ "tag": "warm", "callback_url": callback }),
+    ));
+    assert_eq!(harness::settled(&app, &warm)["status"], "completed");
+    receiver.wait_for_event("settled", 1, Duration::from_secs(30));
+    let refuse = harness::journal_sql(
+        &project,
+        "CREATE TRIGGER refuse_the_gated_begins BEFORE INSERT ON executions \
+           WHEN NEW.inputs LIKE '%refused%' BEGIN SELECT RAISE(ABORT, 'refused by the test'); END;\n",
+    );
+    assert!(
+        refuse.status.success(),
+        "{}",
+        String::from_utf8_lossy(&refuse.stderr)
+    );
+
+    let requests = [
+        (
+            "/gated-serial",
+            "gated_serial",
+            json!({ "tag": "refused serial", "callback_url": callback }),
+        ),
+        (
+            "/gated-deduped",
+            "gated_deduped",
+            json!({ "tag": "refused deduped", "id": "once", "callback_url": callback }),
+        ),
+    ];
+    for (route, trigger, body) in &requests {
+        let answered = post(&app, route, body);
+        assert_eq!(answered.status, 503, "{}", answered.text());
+        let expected = format!(
+            "the trigger `{trigger}` admitted this request, but its execution could not be journaled \
+             (refused by the test): nothing started, so the request may be sent again"
+        );
+        assert_eq!(
+            answered.json()["error"],
+            expected.as_str(),
+            "{}",
+            answered.text()
+        );
+    }
+    // Time for a push of either refused start to land, which none should.
+    std::thread::sleep(Duration::from_secs(3));
+    let settled = receiver.of_event("settled");
+    assert!(
+        settled
+            .iter()
+            .all(|held| held.body["execution_id"] == warm.as_str()),
+        "a refused gated start is answered, never pushed: {settled:?}"
+    );
+    let rows = harness::journal_rows(
+        &project,
+        "SELECT COUNT(*) AS n FROM deliveries WHERE event = 'settled'",
+    );
+    assert_eq!(
+        rows[0]["n"], 1,
+        "only the warm run's settle is journaled: {rows}"
+    );
+
+    let lift = harness::journal_sql(&project, "DROP TRIGGER refuse_the_gated_begins;\n");
+    assert!(
+        lift.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lift.stderr)
+    );
+    let mut resent = Vec::new();
+    for (route, _, body) in &requests {
+        let execution = execution_of(&post(&app, route, body));
+        assert_eq!(harness::settled(&app, &execution)["status"], "completed");
+        resent.push(execution);
+    }
+    receiver.wait_for_event("settled", 3, Duration::from_secs(30));
+    std::thread::sleep(Duration::from_secs(2));
+    let settled = receiver.of_event("settled");
+    for execution in resent.iter().chain(std::iter::once(&warm)) {
+        let pushed: Vec<&harness::Delivered> = settled
+            .iter()
+            .filter(|held| held.body["execution_id"] == execution.as_str())
+            .collect();
+        assert_eq!(
+            pushed.len(),
+            1,
+            "one execution, one settle webhook: {settled:?}"
+        );
+        assert_eq!(
+            pushed[0].body["status"], "completed",
+            "{:?}",
+            pushed[0].body
+        );
+    }
+    assert_eq!(
+        settled.len(),
+        3,
+        "a settle for each execution that ran, and none else: {settled:?}"
+    );
+}
+
+/// The composition a window and a debounce past what an instant can name are
+/// tested under: a dedupe window that ends past the year 9999, one that ends
+/// past the last instant a JavaScript `Date` names, and a debounce as long.
+const FOREVER: &str = r#"version: "0.1"
+
+triggers:
+  forever:
+    type: http
+    path: /forever
+    flow: flow.work
+    input:
+      tag: "payload.body.tag"
+    dedupe_key: "payload.body.id"
+    dedupe_window: 100000000h
+  boundless:
+    type: http
+    path: /boundless
+    flow: flow.work
+    input:
+      tag: "payload.body.tag"
+    dedupe_key: "payload.body.id"
+    dedupe_window: 2600000000h
+  boundless_burst:
+    type: http
+    path: /boundless-burst
+    flow: flow.work
+    input:
+      tag: "payload.body.tag"
+    concurrency:
+      debounce: 2600000000h
+
+flow.work:
+  description: One tagged piece of work that takes as long as it is told to.
+  inputs:
+    tag: { type: string }
+    linger: { type: string, default: "0" }
+    pushes: { type: integer, default: 1 }
+  outputs: {}
+  nodes:
+    work:
+      exec:
+        command: "${TALLY_BIN}/work"
+      input:
+        tag: "input.tag"
+        linger: "input.linger"
+        pushes: "input.pushes"
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+"#;
+
+/// The last instant a four-digit ISO 8601 year names, which an intake row's
+/// expiry and deadline are held to.
+const LAST_INSTANT: &str = "9999-12-31T23:59:59.999Z";
+
+/// **A dedupe window or a debounce that ends past what an instant can name is
+/// held to the last one the journal can write** (Decision D163's Status,
+/// grammar 13.3, 13.5).
+///
+/// Nothing bounds either duration, and the journal compares the instants it
+/// holds as strings. A window ending past the year 9999 would be written with
+/// a signed six-digit year that sorts below every instant of this millennium —
+/// swept by the trigger's next claim, and every repeat started again — and one
+/// ending past the last instant a `Date` names would refuse every arrival.
+/// Here each is held to [`LAST_INSTANT`]: under `forever` (a window of 100
+/// million hours) and `boundless` (2.6 billion) a repeat is answered with the
+/// first delivery's execution and starts nothing, and under `boundless_burst`
+/// (a debounce of 2.6 billion hours) arrivals coalesce into one pending row
+/// whose deadline is that instant.
+#[test]
+fn a_dedupe_window_or_debounce_past_the_last_instant_is_held_to_it() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("intake-forever");
+    let (environment, log) = environment(&provider, &scratch, &[]);
+    let entrypoint = scratch.path().join("main.yml");
+    std::fs::write(&entrypoint, FOREVER).expect("the scratch area is writable");
+    let Some(project) = harness::scratch_project("intake-forever") else {
+        return;
+    };
+    let Some(served) = harness::serve_entrypoint_into(&project, &entrypoint, &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client");
+
+    for trigger in ["forever", "boundless"] {
+        let route = format!("/{trigger}");
+        let first = post(
+            &app,
+            &route,
+            &json!({ "tag": format!("{trigger} first"), "id": "k" }),
+        );
+        let started = execution_of(&first);
+        assert_eq!(deduped(&first), None, "{}", first.text());
+        assert_eq!(harness::settled(&app, &started)["status"], "completed");
+        // A second key's claim sweeps the trigger's expired rows first.
+        let other = execution_of(&post(
+            &app,
+            &route,
+            &json!({ "tag": format!("{trigger} other"), "id": "other" }),
+        ));
+        assert_eq!(harness::settled(&app, &other)["status"], "completed");
+        let repeat = post(
+            &app,
+            &route,
+            &json!({ "tag": format!("{trigger} repeat"), "id": "k" }),
+        );
+        assert_eq!(execution_of(&repeat), started, "{}", repeat.text());
+        assert_eq!(deduped(&repeat), Some("true"), "{}", repeat.text());
+        let rows = harness::journal_rows(
+            &project,
+            &format!("SELECT dedupe_key, expires_at FROM dedupe WHERE trigger_name = '{trigger}'"),
+        );
+        let rows = rows.as_array().expect("rows");
+        assert_eq!(rows.len(), 2, "{rows:#?}");
+        for row in rows {
+            assert_eq!(row["expires_at"], LAST_INSTANT, "{row}");
+        }
+        assert_eq!(
+            starts_of(&log, &format!("{trigger} repeat")),
+            0,
+            "a repeat inside its window starts nothing: {:?}",
+            tally(&log)
+        );
+    }
+
+    let mut intakes = Vec::new();
+    for tag in ["burst one", "burst two"] {
+        let answered = post(&app, "/boundless-burst", &json!({ "tag": tag }));
+        assert_eq!(answered.json()["status"], "pending", "{}", answered.text());
+        intakes.push(intake_id_of(&answered));
+    }
+    assert_eq!(intakes[0], intakes[1], "one debounce over both arrivals");
+    let rows = harness::journal_rows(
+        &project,
+        "SELECT coalesced, deadline FROM intakes WHERE trigger_name = 'boundless_burst' AND state = 'pending'",
+    );
+    assert_eq!(rows[0]["coalesced"], 2, "{rows}");
+    assert_eq!(rows[0]["deadline"], LAST_INSTANT, "{rows}");
 }
