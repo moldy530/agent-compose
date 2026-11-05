@@ -339,8 +339,9 @@ export async function startSources(intake: Intake): Promise<void> {
 
 /**
  * Stop every scheduler and every program: no tick is armed after this, and each
- * program's group is sent `SIGTERM` and, after a grace, `SIGKILL`. Resolves when
- * every program has exited.
+ * program's group — and whatever an earlier run of it left in its own — is sent
+ * `SIGTERM` and, after a grace, `SIGKILL`. Resolves when every program has
+ * exited.
  */
 export async function stopSources(): Promise<void> {
   for (const scheduler of schedulers.values()) scheduler.stop();
@@ -419,13 +420,20 @@ const SKIPPED_COUNTED = 10_000;
  */
 const LONGEST_INTAKE_RETRY_MS = 30_000;
 
+/**
+ * How long a scheduler whose look at its newest claim could not reach the
+ * journal waits before the first retry ([`Scheduler.#settle`]), doubling to
+ * [`LONGEST_INTAKE_RETRY_MS`].
+ */
+const FIRST_LOOK_RETRY_MS = 1_000;
+
 /** Who claimed a tick a starting scheduler finds unbegun, for the serve log. */
 const STOPPED_BEFORE_STARTING = "by a serve that stopped before starting it";
 
 /**
- * The same, for the look a scheduler takes before a tick — a standby's first
- * once the journal reads, or one after a claim that failed — where the claimer
- * may be another `serve` or this one.
+ * The same, for the look a scheduler holds its schedule for — a standby's, once
+ * the journal reads, or one after a claim that failed — where the claimer may be
+ * another `serve` or this one.
  */
 const NEVER_STARTED = "and was never started";
 
@@ -434,6 +442,10 @@ const OWED_BY_THIS_SCHEDULER = "by this scheduler, and could not be started then
 
 /** What the ticks a held schedule skipped fell during, for the serve log. */
 const HELD_FOR_A_CLAIM = "this scheduler was holding the schedule for a claimed tick's start";
+
+/** The same, for a schedule held for its look at the newest claim ([`Scheduler.#settle`]). */
+const HELD_FOR_A_LOOK =
+  "this scheduler was holding the schedule until the journal could say whether the tick it last claimed was ever started";
 
 class Scheduler {
   readonly #trigger: ScheduleTrigger;
@@ -447,11 +459,12 @@ class Scheduler {
   #stopped = false;
   /**
    * Whether this scheduler has looked at the newest `fired` row for a claim
-   * whose execution never began ([`#repair`]): at start, and — where the
-   * journal could not be read then, as a standby's cannot until the `serve`
-   * holding it goes (`docs/distributed.md` §8), or where a tick's claim failed
-   * in a way that may still have landed — before the next tick, until a look
-   * reaches the journal.
+   * whose execution never began ([`#repair`]) since it last had reason to: at
+   * start, and after a tick's claim failed in a way that may still have landed.
+   * While it has not — the journal could not be read, as a standby's cannot
+   * until the `serve` holding it goes (`docs/distributed.md` §8) — **no tick is
+   * armed**: the look is retried with backoff until one reaches the journal
+   * ([`#settle`]), and only then is the schedule armed again.
    */
   #repaired = false;
   /**
@@ -464,6 +477,12 @@ class Scheduler {
   #owed: FiredRow | undefined;
   /** Who claimed [`#owed`] and why it was not started then, for the serve log. */
   #owedBy = OWED_BY_THIS_SCHEDULER;
+  /**
+   * The instant of the newest `fired` row a look read ([`#repair`]), where it
+   * read one: on a standby, the last tick the `serve` it took over from
+   * claimed, which is where the ticks nobody fired begin.
+   */
+  #newestClaim: number | undefined;
 
   constructor(trigger: ScheduleTrigger, intake: Intake, clock: Clock) {
     this.#trigger = trigger;
@@ -491,7 +510,7 @@ class Scheduler {
       if (fired !== undefined) last = Date.parse(fired.scheduledAt);
       await this.#repair(fired, STOPPED_BEFORE_STARTING);
     } catch (error) {
-      say(`${this.#named}: the journal could not say when it last fired (${messageOf(error)}), so no skipped span is reported, and the tick it last claimed is looked at again before the next one fires`);
+      say(`${this.#named}: the journal could not say when it last fired (${messageOf(error)}), so no skipped span is reported, and no tick is claimed until it can say whether the tick it last claimed was ever started; looking again in ${FIRST_LOOK_RETRY_MS}ms`);
     }
     if (last !== undefined) {
       const first = nextAfter(this.#cron, last, this.#zone);
@@ -501,11 +520,12 @@ class Scheduler {
     say(
       `${this.#named} (\`${this.#trigger.cron}\` in ${this.#trigger.timezone}): last fired ${last === undefined ? "never" : render(last, this.#zone)}, next tick ${next === undefined ? "none" : render(next, this.#zone)}`,
     );
-    if (this.#owed !== undefined) {
-      // The claim the repair could not start holds the schedule, as one this
-      // scheduler made would ([`#due`]). Not awaited, so a journal that keeps
-      // refusing it holds this trigger and not the app.
-      void this.#dischargeThenArm(now);
+    if (!this.#repaired || this.#owed !== undefined) {
+      // The look the start could not take, or the claim its repair could not
+      // start, holds the schedule, as one this scheduler made would
+      // ([`#due`]). Not awaited, so a journal that keeps refusing it holds
+      // this trigger and not the app.
+      void this.#settleThenArm(now);
       return;
     }
     if (next !== undefined) this.#arm(next);
@@ -545,7 +565,9 @@ class Scheduler {
       this.#owed = undefined;
       return;
     }
-    const payload = this.#payloadOf(Date.parse(fired.scheduledAt));
+    const claimedAt = Date.parse(fired.scheduledAt);
+    if (Number.isFinite(claimedAt)) this.#newestClaim = claimedAt;
+    const payload = this.#payloadOf(claimedAt);
     const tick = `the ${payload.scheduled_at} tick`;
     const named = `${tick} was claimed as ${fired.execution} ${claimed}`;
     try {
@@ -584,10 +606,52 @@ class Scheduler {
     return !this.#stopped;
   }
 
-  /** [`#discharge`], then arm the first tick after `from`, naming any the hold skipped. */
-  async #dischargeThenArm(from: number): Promise<void> {
-    if (!(await this.#discharge())) return;
-    this.#armAfter(from, HELD_FOR_A_CLAIM);
+  /**
+   * Take the look at the newest `fired` row ([`#repair`]) until one reaches the
+   * journal — retried with backoff, and logged each time it cannot — and then
+   * start what that look leaves owed ([`#discharge`]). `false` where the
+   * scheduler was stopped first; `true` at once where nothing is owed.
+   *
+   * Nothing is armed while the look is owed, so **no tick is claimed past a
+   * newest row nobody has looked at**. Claimed, the tick's own row would become
+   * the newest, and the one below it — a claim whose execution never began, as
+   * a `serve` that stopped between a claim and its execution leaves, or as this
+   * scheduler's own claim that failed after its insert may have landed does —
+   * would never be read by a look again: that tick would fire zero times
+   * (`docs/durability.md` §3.11). And a look retried on its own backoff rather
+   * than at the next tick reaches a claim a standby inherits as soon as the
+   * journal opens to it, not a schedule's period later.
+   */
+  async #settle(): Promise<boolean> {
+    let delay = FIRST_LOOK_RETRY_MS;
+    while (!this.#repaired) {
+      if (!(await this.#rest(delay))) return false;
+      delay = Math.min(delay * 2, LONGEST_INTAKE_RETRY_MS);
+      try {
+        const fired = await (await openJournal()).lastFired(this.#trigger.name);
+        await this.#repair(fired, NEVER_STARTED);
+      } catch (error) {
+        say(
+          `${this.#named}: the journal still could not say whether the tick it last claimed was ever started (${messageOf(error)}), so no tick is claimed yet; looking again in ${delay}ms`,
+        );
+      }
+    }
+    return this.#discharge();
+  }
+
+  /**
+   * [`#settle`], then arm the first tick after `from` — or after the newest
+   * claim the look read, where that is later — naming any the hold skipped.
+   */
+  async #settleThenArm(from: number): Promise<void> {
+    const looking = !this.#repaired;
+    if (!(await this.#settle())) return;
+    // A standby's look reads what the `serve` holding the journal claimed
+    // while this scheduler held its schedule: the ticks up to the newest of
+    // those were that `serve`'s, and only the ones after it fell with nobody
+    // firing them.
+    const after = Math.max(from, this.#newestClaim ?? from);
+    this.#armAfter(after, looking ? HELD_FOR_A_LOOK : HELD_FOR_A_CLAIM);
   }
 
   /** Wait `ms` real milliseconds, or until a stop: `false` for a stop. */
@@ -678,30 +742,26 @@ class Scheduler {
       this.#arm(at);
       return;
     }
-    if (!this.#repaired) {
-      // The look the start could not take. A journal that still cannot be read
-      // says so on the fire below, which needs it too, so it is not said twice.
-      let fired: FiredRow | undefined;
-      let read = false;
-      try {
-        fired = await (await openJournal()).lastFired(this.#trigger.name);
-        read = true;
-      } catch {
-        // Looked at again before the next tick.
-      }
-      if (read) await this.#repair(fired, NEVER_STARTED);
-    }
-    // A claim still owed is started before this tick is claimed, and so is one
-    // this tick's own claim leaves owed: the newest row stays the one the
-    // repair looks at, and no tick is claimed past a claim nothing started.
+    // Nothing arms a tick while a look is owed ([`#settle`]), so this one is
+    // claimed after a look reached the journal. A claim still owed is started
+    // before this tick is claimed, and so is one this tick's own claim leaves
+    // owed — and the look a claim that failed asks for is taken before the
+    // next tick is armed: the newest row stays the one the repair looks at, and
+    // no tick is claimed past a claim nothing started, or past one nobody
+    // looked at.
     let held = this.#owed !== undefined;
-    if (!(await this.#discharge())) return;
+    if (!(await this.#settle())) return;
     await this.#fire(at);
+    const looking = !this.#repaired;
     held ||= this.#owed !== undefined;
-    if (!(await this.#discharge())) return;
+    if (!(await this.#settle())) return;
     this.#armAfter(
       at,
-      held ? HELD_FOR_A_CLAIM : "this scheduler could not see them (the process stalled or the machine slept)",
+      looking
+        ? HELD_FOR_A_LOOK
+        : held
+          ? HELD_FOR_A_CLAIM
+          : "this scheduler could not see them (the process stalled or the machine slept)",
     );
   }
 
@@ -724,7 +784,7 @@ class Scheduler {
     } catch (error) {
       // A claim that failed may still have landed — a dialled journal can
       // commit an insert whose answer never arrives — so the newest row is
-      // looked at again before the next tick is claimed.
+      // looked at again before the next tick is armed ([`#settle`]).
       this.#repaired = false;
       say(`${this.#named}: ${tick} could not be journaled, so it did not fire: ${messageOf(error)}`);
     }
@@ -812,6 +872,11 @@ class Consumer {
   #stopping = false;
   /** Resolves when the running program's stdio has closed. */
   #closed: Promise<void> = Promise.resolve();
+  /**
+   * The process groups of runs that have ended and still had members when they
+   * did, by group id, each with the [`#reap`] that empties it.
+   */
+  readonly #reaping = new Map<number, Promise<void>>();
 
   constructor(
     source: EventSource,
@@ -917,7 +982,7 @@ class Consumer {
       if (over) return;
       over = true;
       resolveClosed();
-      void this.#lines.then(() => this.#ended(code, signal));
+      void this.#lines.then(() => this.#ended(code, signal, child));
     };
     child.on("error", (error) => {
       if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
@@ -1149,14 +1214,28 @@ class Consumer {
     }
   }
 
-  /** The program ended — or could not be started. Journal it, and restart it. */
-  #ended(code: number | undefined, signal: NodeJS.Signals | undefined): void {
+  /**
+   * The program ended — or could not be started. Journal it, end what is left
+   * of its group, and restart it.
+   */
+  #ended(
+    code: number | undefined,
+    signal: NodeJS.Signals | undefined,
+    child?: ChildProcess,
+  ): void {
     this.#child = undefined;
     this.runningSince = undefined;
     if (this.#stopping) {
+      // [`stop`] is ending this run's group itself.
       this.state = "stopped";
       return;
     }
+    // A member of the group that outlived its leader — a helper the program
+    // started and never waited for — is still the program's, and the restart
+    // starts a group of its own beside it: left alone, every restart of a
+    // program that crashes after starting one would leave one more behind,
+    // and none of them would end when `serve` does.
+    if (child?.pid !== undefined) this.#reap(child.pid);
     const endedAt = Date.now();
     const ran = this.#startedAt === 0 ? 0 : endedAt - this.#startedAt;
     this.#attempt = ran > this.#command.restartMaxMs ? 1 : this.#attempt + 1;
@@ -1208,16 +1287,50 @@ class Consumer {
     this.#timer.unref?.();
   }
 
-  /** Stop the program, group and all: `SIGTERM`, then `SIGKILL` after a grace. */
+  /**
+   * End what is left of an ended run's process group `group`: `SIGTERM` to it
+   * at once, and `SIGKILL` once the grace is up where anything is still in it
+   * — the stop's sequence (grammar 14.4), for a group whose leader has already
+   * gone. Not awaited by the restart, which starts a group of its own; awaited
+   * by [`stop`], so nothing a run left behind outlives the stop.
+   */
+  #reap(group: number): void {
+    if (this.#reaping.has(group) || !groupLives(group)) return;
+    signalGroupId(group, "SIGTERM");
+    const reaped = (async () => {
+      const deadline = Date.now() + STOP_GRACE_MS;
+      while (groupLives(group) && Date.now() < deadline) {
+        // Not unref'd: a stop waits on this, and a timer that did not hold the
+        // event loop open would let the process exit before the `SIGKILL`.
+        await new Promise((resolve) => setTimeout(resolve, GROUP_POLL_MS));
+      }
+      if (groupLives(group)) signalGroupId(group, "SIGKILL");
+    })().finally(() => {
+      this.#reaping.delete(group);
+    });
+    this.#reaping.set(group, reaped);
+  }
+
+  /**
+   * Stop the program, group and all: `SIGTERM`, then `SIGKILL` after a grace —
+   * and what earlier runs left in their groups with it ([`#reap`]).
+   */
   async stop(): Promise<void> {
     this.#stopping = true;
     if (this.#timer !== undefined) clearTimeout(this.#timer);
     this.#timer = undefined;
     const child = this.#child;
-    if (child === undefined) {
-      this.state = "stopped";
-      return;
-    }
+    if (child !== undefined) await this.#stopRun(child);
+    // A consumer stopped while it backs off has no run to stop, and the groups
+    // its earlier runs left may still hold members: each was sent `SIGTERM`
+    // when its run ended and is sent `SIGKILL` when its grace is up, and the
+    // stop waits for both.
+    await Promise.all(this.#reaping.values());
+    this.state = "stopped";
+  }
+
+  /** Stop the run `child` leads, group and all. */
+  async #stopRun(child: ChildProcess): Promise<void> {
     // Its stdin ends first — the signal a program that reads it gets however
     // `serve` stops — and then the group is asked, then told.
     child.stdin?.end();
@@ -1246,7 +1359,33 @@ class Consumer {
     // A member of the group that outlived its leader is still the program's.
     signalGroup(child, "SIGKILL");
     child.stderr?.destroy();
-    this.state = "stopped";
+  }
+}
+
+/** How often a group [`Consumer.#reap`] is ending is looked at for members. */
+const GROUP_POLL_MS = 50;
+
+/**
+ * Whether the process group `group` has a member: signal 0 to it, which
+ * delivers nothing. `EPERM` is a member this process may not signal — still a
+ * member — and anything else (`ESRCH`, or a host without process groups) is
+ * none.
+ */
+function groupLives(group: number): boolean {
+  try {
+    process.kill(-group, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** `signal` to the process group `group`, where it still has members. */
+function signalGroupId(group: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-group, signal);
+  } catch {
+    // Already empty.
   }
 }
 

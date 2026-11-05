@@ -294,7 +294,8 @@ checkpoint the intake accepted is handed back on every restart of the program �
 written `{checkpoint}` — and an exit restarts it after a backoff that doubles up
 to `restart.max:`. The program runs in a process group of its own, its stdin is
 a pipe that ends when `serve` does, and a stop sends the group `SIGTERM` and,
-after two seconds, `SIGKILL`. A target declaring a `redis_streams`, `sqs` or
+after two seconds, `SIGKILL` — as does a run's end, to whatever the program
+left in its group. A target declaring a `redis_streams`, `sqs` or
 `nats` source is refused at start, naming it.
 
 What `serve` writes about them goes to **stderr**, one line each:
@@ -302,11 +303,13 @@ What `serve` writes about them goes to **stderr**, one line each:
 | line | when |
 |---|---|
 | ``schedule `<t>` (`<cron>` in <zone>): last fired <tick or never>, next tick <tick>`` | a scheduler starts |
+| ``schedule `<t>`: the journal could not say when it last fired (<why>), so no skipped span is reported, and no tick is claimed until it can say whether the tick it last claimed was ever started; looking again in <ms>ms`` | a scheduler starts and cannot read the journal — a standby's, while another `serve` holds it: the schedule holds, and no tick is armed until a look reaches the journal |
+| ``schedule `<t>`: the journal still could not say whether the tick it last claimed was ever started (<why>), so no tick is claimed yet; looking again in <ms>ms`` | the held look is refused again, and retried with backoff — so no tick is claimed past a claim nobody has looked at |
 | ``schedule `<t>`: skipped <n> ticks from <tick> through <tick>, which fell while no serve was running: …`` | ticks fell in downtime, or while the process could not see them |
 | ``schedule `<t>`: fired the <scheduled_at> tick as <execution>`` | a tick fires |
 | ``schedule `<t>`: the <scheduled_at> tick was already fired, as <execution>`` | another generation, or a hub sharing the journal, fired it first |
 | ``schedule `<t>`: the <scheduled_at> tick was claimed as <execution> by a serve that stopped before starting it, so it starts now`` | a scheduler starts and finds the tick a stopped `serve` claimed and never started |
-| ``schedule `<t>`: the <scheduled_at> tick was claimed as <execution> and was never started, so it starts now`` | the look a scheduler takes before a tick — a standby's first once the journal reads, or one after a claim that failed — finds a claim whose execution never began |
+| ``schedule `<t>`: the <scheduled_at> tick was claimed as <execution> and was never started, so it starts now`` | the look a scheduler holds its schedule for — a standby's, once the journal reads, or one after a claim that failed — finds a claim whose execution never began |
 | ``schedule `<t>`: the <scheduled_at> tick was claimed as <execution>, whose execution could not be journaled (<why>): no later tick is claimed until it starts`` | the tick is claimed and the journal would not begin its execution: the schedule holds, retrying with backoff |
 | ``schedule `<t>`: the <scheduled_at> tick was claimed as <execution> by this scheduler, and could not be started then, so it starts now`` | the held tick's execution starts under its claim, and the schedule goes on |
 | ``schedule `<t>`: the <scheduled_at> tick started nothing: <why>`` | the trigger could not bind the tick — its `input:` or `session_key:` did not evaluate, the flow refused the inputs, or the key answered the empty string for a flow that reaches a `scope: session` store: refused before its claim, never retried, and the next tick is armed as usual |
