@@ -22,6 +22,11 @@ of the coalescing it decides, and there is no value for it to read. `input:`
 and `session_key:` are bound when the execution starts — after the debounce has
 closed — so they read it freely.
 
+This code is for a trigger that declares `debounce:`. On one that does not,
+`payload.coalesced` is no member of the payload at all, and a key that reads it
+is refused once, as `unknown-field`, whose help names where the count comes
+from.
+
 ## A spec that triggers it
 
 ```yaml triggers

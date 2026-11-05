@@ -406,8 +406,13 @@ fn one(ctx: &mut Ctx, trigger: &Trigger) {
         let analysis = expr::analyze(ctx, expression, &scope);
         // The two keys an intake evaluates as each arrival lands — before a
         // debounce has closed, so before there is a count to read (PRD
-        // resolved q77 ruling c, Decision D163).
-        if matches!(key, "dedupe_key" | "concurrency.key")
+        // resolved q77 ruling c, Decision D163). Only a debounced trigger's
+        // payload has the member at all: on one without `debounce:` the read
+        // is an unknown field, which `analyze` has already said, and saying
+        // it again as a debounce that has not closed would name a debounce
+        // the trigger does not declare.
+        if debounced
+            && matches!(key, "dedupe_key" | "concurrency.key")
             && let Some(read) = analysis.reads.iter().find(|read| {
                 read.root == "payload" && read.path.first().is_some_and(|f| f == "coalesced")
             })
