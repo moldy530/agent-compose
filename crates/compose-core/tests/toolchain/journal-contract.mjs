@@ -1475,6 +1475,29 @@ try {
     historic[0]?.execution === live &&
     historic[0]?.startedAt === at(40) &&
     (await handle.leasesOf(builds)).every((lease) => lease.execution !== live);
+
+  // One slot per execution, however many `started` rows name it: a start the
+  // journal would not begin can leave its row behind, and the retry admits
+  // the same execution again under a second row.
+  const doubleTrigger = `twice_${suffix}`;
+  const doubled = `exec_twice_${suffix}`;
+  for (const n of [1, 2]) {
+    await handle.admitIntake({
+      id: `int_twice_${n}_${suffix}`,
+      trigger: doubleTrigger,
+      group: "branch",
+      state: "started",
+      execution: doubled,
+      waited: false,
+      coalesced: 1,
+      admittedAt: at(n),
+      startedAt: at(n),
+    });
+  }
+  await handle.begin({ ...lifecycle(doubled, at(3)), trigger: doubleTrigger });
+  const once = await handle.leasesOf(doubleTrigger);
+  results.a_lease_counts_an_execution_once_however_many_rows_name_it =
+    once.length === 1 && once[0]?.execution === doubled && once[0]?.group === "branch";
 } finally {
   await journal.releaseJournal().catch(() => undefined);
 }

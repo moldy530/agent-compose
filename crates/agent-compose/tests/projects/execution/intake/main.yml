@@ -31,7 +31,8 @@
 #   * `deduped_serial` and `deduped_dropping` — a `dedupe_key:` beside a group
 #     of one that queues, and one that drops.
 #   * `sync_serial`, `sync_dropping` and `deduped_sync` — the same under
-#     `respond: sync`, and a sync key with no block.
+#     `respond: sync`, each keyed on the body's `id`, and a sync key with no
+#     block.
 version: "0.1"
 
 defaults:
@@ -200,6 +201,7 @@ triggers:
     input:
       tag: "payload.body.tag"
       linger: "payload.body.linger"
+    dedupe_key: "payload.body.id"
     concurrency:
       on_conflict: drop
 

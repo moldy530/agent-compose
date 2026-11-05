@@ -759,10 +759,12 @@ const TRUE_EVERYWHERE: &[&str] = &[
     // is found, so a repeat of a counted arrival is told from a claim no
     // debounce counted; folding the gate onto the row's execution keeps its
     // window and moves only a row still naming that id, for a key and a tick
-    // alike; and the lease is what is running, however much the trigger ran.
+    // alike; and the lease is what is running, however much the trigger ran —
+    // one slot per execution, however many `started` rows name it.
     "a_debounced_arrival_is_found_by_the_id_its_gate_was_claimed_under",
     "a_gate_folds_onto_its_pending_rows_execution_and_keeps_its_window",
     "a_lease_holds_only_what_is_running_however_much_the_trigger_ran",
+    "a_lease_counts_an_execution_once_however_many_rows_name_it",
     // …and the dispatch board's half of the same field: a placed node's settled
     // failure keeps what a finally node raised on the worker beside it
     // (`docs/distributed.md` §3.4, §3.8).

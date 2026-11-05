@@ -27,7 +27,13 @@
 //!    [`a_pending_row_holds_the_request_without_the_credential_its_auth_read`];
 //! 5. a restart mid-queue and mid-debounce —
 //!    [`a_restart_with_three_queued_arrivals_starts_each_once_in_order`] and
-//!    [`a_restart_with_a_debounce_pending_fires_it_once`];
+//!    [`a_restart_with_a_debounce_pending_fires_it_once`]; mid-start, between
+//!    a slot freeing and the queued arrival's lifecycle row —
+//!    [`a_start_a_killed_serve_claimed_and_never_journaled_starts_once_as_the_lease_allows`];
+//!    mid-debounce with a first look the journal cuts short —
+//!    [`a_debounce_whose_fold_the_journal_refuses_at_a_restart_is_still_armed_and_fires`];
+//!    and onto a build that removed the blocks —
+//!    [`queued_and_pending_arrivals_a_deploy_left_without_a_block_start_with_no_bound`];
 //! 6. a refused `run` — [`a_run_of_a_flow_whose_group_is_full_is_refused_and_journals_nothing`];
 //! 7. `drop` — [`an_arrival_its_full_group_drops_is_answered_with_the_running_execution`]
 //!    and the event half in (2);
@@ -58,7 +64,8 @@
 //! * a queued arrival a new build no longer binds, dropped while the queue
 //!   moves on past it —
 //!   [`a_queued_arrival_the_new_build_no_longer_binds_is_dropped_and_the_queue_moves_on`];
-//! * a start the journal refused, owed, and the arrival queued behind it —
+//! * a start the journal refused, owed and holding its slot, and the arrivals
+//!   queued behind it —
 //!   [`a_start_the_journal_refused_twice_is_owed_and_started_once_it_recovers`];
 //! * the serve log's lines — [`the_serve_log_names_each_intake_decision`], and
 //!   the supersede line in (3).
@@ -1451,9 +1458,10 @@ fn a_crash_inside_a_debounced_arrival_neither_loses_it_nor_counts_it_twice() {
 }
 
 /// **A repeat of a queued arrival is that arrival, and a repeat of a dropped
-/// one is the execution it was dropped for** (grammar 13.3's answer table,
-/// Decision D163's Status) — a key beside a group that queues, and one that
-/// drops.
+/// one is the drop** — the execution it was dropped for, its own intake id and
+/// `X-AgentCompose-Dropped: true` beside `X-AgentCompose-Deduped: true`
+/// (grammar 13.3's answer table, Decision D163's Status) — a key beside a
+/// group that queues, and one that drops.
 #[test]
 fn a_repeat_of_a_queued_or_dropped_arrival_is_answered_with_what_the_first_got() {
     let provider = MockProvider::start().expect("a loopback port");
@@ -1532,6 +1540,16 @@ fn a_repeat_of_a_queued_or_dropped_arrival_is_answered_with_what_the_first_got()
         "a repeat of a dropped arrival names the execution it was dropped for"
     );
     assert_eq!(
+        repeat.header("x-agentcompose-dropped"),
+        Some("true"),
+        "a repeat of a dropped arrival is the drop: {repeat:?}"
+    );
+    assert_eq!(
+        repeat.json(),
+        dropped.json(),
+        "the first delivery's body, its intake id with it"
+    );
+    assert_eq!(
         intakes_of(&project, "deduped_dropping").len(),
         2,
         "one started row, one dropped row, and nothing for the repeat"
@@ -1586,7 +1604,9 @@ fn an_arrival_whose_dedupe_key_answers_the_empty_string_is_refused() {
 
 /// **Under `respond: sync`** (grammar 13.3, Decision D163's Status): a queued
 /// arrival and a dropped one are answered as they are under `async`, at once;
-/// a repeat of a started one waits on the first's execution and is answered
+/// a repeat of a dropped one is the drop again — its headers, its body, at
+/// once — and never the running execution's answer, which would be another
+/// payload's outputs; a repeat of a started one waits on the first's execution and is answered
 /// with its outputs; and a repeat after a restart, whose execution settled
 /// before it, is answered from its lifecycle row — the id, the status, the
 /// status URL — since a settled row holds no outputs.
@@ -1646,7 +1666,7 @@ fn under_respond_sync_an_intake_answers_at_once_and_a_repeat_with_the_first() {
                 post(
                     &app,
                     "/sync-dropping",
-                    &json!({ "tag": "d1", "linger": "3" }),
+                    &json!({ "tag": "d1", "id": "d1", "linger": "3" }),
                 )
             })
         };
@@ -1658,7 +1678,7 @@ fn under_respond_sync_an_intake_answers_at_once_and_a_repeat_with_the_first() {
         let dropped = post(
             &app,
             "/sync-dropping",
-            &json!({ "tag": "d2", "linger": "0" }),
+            &json!({ "tag": "d2", "id": "d2", "linger": "0" }),
         );
         assert_eq!(
             dropped.header("x-agentcompose-dropped"),
@@ -1666,6 +1686,40 @@ fn under_respond_sync_an_intake_answers_at_once_and_a_repeat_with_the_first() {
             "{dropped:?}"
         );
         assert_eq!(execution_of(&dropped), holder);
+        let dropped_intake = intake_id_of(&dropped);
+        assert_eq!(
+            dropped.json(),
+            json!({
+                "execution_id": holder,
+                "status_url": format!("/executions/{holder}"),
+                "intake_id": dropped_intake,
+            })
+        );
+
+        // A repeat of the dropped arrival, while the run it was dropped for
+        // still lingers: the drop again, at once — never a wait on that run,
+        // whose outputs are another payload's (grammar 13.3's table).
+        let repeat = post(
+            &app,
+            "/sync-dropping",
+            &json!({ "tag": "d2", "id": "d2", "linger": "0" }),
+        );
+        assert_eq!(deduped(&repeat), Some("true"), "{repeat:?}");
+        assert_eq!(
+            repeat.header("x-agentcompose-dropped"),
+            Some("true"),
+            "a repeat of a dropped arrival is the drop: {repeat:?}"
+        );
+        assert_eq!(repeat.status, 202, "{}", repeat.text());
+        assert_eq!(repeat.json(), dropped.json());
+        assert_eq!(
+            executions_of(&project, "sync_dropping")
+                .iter()
+                .map(|row| row.status.as_str())
+                .collect::<Vec<_>>(),
+            ["open"],
+            "the repeat was answered while the run it names was still open"
+        );
 
         let first = waiting.join().expect("the first arrival's thread");
         assert_eq!(first.status, 200, "{}", first.text());
@@ -1679,6 +1733,22 @@ fn under_respond_sync_an_intake_answers_at_once_and_a_repeat_with_the_first() {
         );
         let lingered = lingering.join().expect("the dropping run's thread");
         assert_eq!(lingered.status, 200, "{}", lingered.text());
+        // …and once that run has settled, still the drop: its outputs are
+        // `d1`'s, and `d2` never ran.
+        let repeat = post(
+            &app,
+            "/sync-dropping",
+            &json!({ "tag": "d2", "id": "d2", "linger": "0" }),
+        );
+        assert_eq!(deduped(&repeat), Some("true"), "{repeat:?}");
+        assert_eq!(
+            repeat.header("x-agentcompose-dropped"),
+            Some("true"),
+            "{repeat:?}"
+        );
+        assert_eq!(repeat.status, 202, "{}", repeat.text());
+        assert_eq!(repeat.json(), dropped.json());
+        assert_eq!(executions_of(&project, "sync_dropping").len(), 1);
 
         // A repeat of the started one: the first's answer, outputs and all.
         let repeat = post(
@@ -1982,6 +2052,11 @@ fn a_run_is_refused_by_its_triggers_max_running_below_its_groups_limit() {
 /// queue reads. The process remembers it owes the start: once the refusals are
 /// lifted the row goes back on the queue and starts, in this same `serve`.
 ///
+/// **The owed start holds its slot** meanwhile: `next`, queued behind it, is
+/// never started into the slot the owed arrival was answered for, however many
+/// looks at the queue pass over it while the move is refused — it runs after
+/// the owed one, so the group never runs the two at once.
+///
 /// The refusals are lifted one at a time. With the move onto the queue taken
 /// again and the lifecycle row still refused, each look at the queue puts the
 /// owed row back and fails its start once more — and an arrival then finds
@@ -2009,6 +2084,11 @@ fn a_start_the_journal_refused_twice_is_owed_and_started_once_it_recovers() {
         &app,
         "/serial",
         &json!({ "tag": "owed", "linger": "0" }),
+    ));
+    let next = intake_id_of(&post(
+        &app,
+        "/serial",
+        &json!({ "tag": "next", "linger": "0" }),
     ));
     let refuse = harness::journal_sql(
         &project,
@@ -2044,6 +2124,15 @@ fn a_start_the_journal_refused_twice_is_owed_and_started_once_it_recovers() {
     assert!(
         stranded(),
         "the refusals hold the row where the failed start left it"
+    );
+    let rows = executions_of(&project, "serial");
+    assert!(
+        rows.iter().all(|row| row.inputs["tag"] != "next"),
+        "the arrival queued behind the owed start never took its slot: {rows:#?}"
+    );
+    assert_eq!(
+        get(&app, &format!("/intakes/{next}")).json()["state"],
+        "queued"
     );
     let half = harness::journal_sql(&project, "DROP TRIGGER refuse_the_requeue;\n");
     assert!(
@@ -2104,8 +2193,8 @@ fn a_start_the_journal_refused_twice_is_owed_and_started_once_it_recovers() {
         .collect();
     assert_eq!(
         order,
-        ["first", "owed", "behind"],
-        "the owed arrival ran before the one queued behind it"
+        ["first", "owed", "next", "behind"],
+        "the owed arrival ran before the ones queued behind it"
     );
     never_overlapping(&rows);
     assert!(
@@ -2457,4 +2546,531 @@ fn a_queued_arrival_the_new_build_no_longer_binds_is_dropped_and_the_queue_moves
         !said.contains("could not be journaled"),
         "the row was never tried as a start the journal would not begin: {said}"
     );
+}
+
+/// The execution an intake row names, read off the journal.
+fn execution_named_by(project: &Path, intake: &str) -> String {
+    let rows = harness::journal_rows(
+        project,
+        &format!("SELECT execution FROM intakes WHERE id = '{intake}'"),
+    );
+    rows[0]["execution"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the row {intake} names an execution: {rows}"))
+        .to_string()
+}
+
+/// **A start a killed `serve` claimed and never journaled starts once, under
+/// the id its row recorded, as the lease allows** (PRD resolved q77 ruling f,
+/// Decision D163's Status, `docs/durability.md` §3.15, §6.3).
+///
+/// Two groups of one, each holding one execution and one queued arrival, and
+/// `serve` killed. The journal is then left as a `SIGKILL` between a slot
+/// freeing and the queued arrival's start leaves it: the queued row says
+/// `started`, naming an execution that has no lifecycle row.
+///
+/// * Under `held`, the execution that held the slot had settled first, so its
+///   slot is free: the restart starts the claimed arrival at once, under the
+///   execution id its row recorded, and once.
+/// * Under `keyed`, the execution holding the group is still open — the
+///   restart recovers it, and it holds the group's one slot. The claimed
+///   arrival is **not** started beside it: it goes back on the queue at its
+///   place and starts when the recovered execution settles, so the group never
+///   runs two at once.
+#[test]
+fn a_start_a_killed_serve_claimed_and_never_journaled_starts_once_as_the_lease_allows() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("intake-claimed-start");
+    let (environment, _log) = environment(&provider, &scratch, &[]);
+    let Some(project) = harness::scratch_project("intake-claimed-start") else {
+        return;
+    };
+    let file = |name: &str| scratch.path().join(name).display().to_string();
+    let (held_first, held_intake, keyed_first, keyed_intake) = {
+        let Some(served) = harness::serve_into(&project, FIXTURE, &environment) else {
+            return;
+        };
+        let app = Client::new(&served.base_url).expect("a client");
+        let held_first = execution_of(&post(
+            &app,
+            "/held",
+            &json!({ "tag": "held first", "hold": file("held-first") }),
+        ));
+        let held_intake = intake_id_of(&post(
+            &app,
+            "/held",
+            &json!({ "tag": "held claimed", "hold": file("held-claimed") }),
+        ));
+        let keyed_first = execution_of(&post(
+            &app,
+            "/keyed",
+            &json!({ "tag": "keyed first", "group": "g", "hold": file("keyed-first") }),
+        ));
+        let keyed_intake = intake_id_of(&post(
+            &app,
+            "/keyed",
+            &json!({ "tag": "keyed claimed", "group": "g", "hold": file("keyed-claimed") }),
+        ));
+        eventually(
+            Duration::from_secs(10),
+            "both held executions' rows",
+            || {
+                (executions_of(&project, "held").len() == 1
+                    && executions_of(&project, "keyed").len() == 1)
+                    .then_some(())
+            },
+        );
+        (held_first, held_intake, keyed_first, keyed_intake)
+        // Dropped here: `SIGKILL` to the whole group.
+    };
+    let held_claimed = execution_named_by(&project, &held_intake);
+    let keyed_claimed = execution_named_by(&project, &keyed_intake);
+    let now = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
+    let surgery = harness::journal_sql(
+        &project,
+        &format!(
+            "UPDATE executions SET status = 'completed', ended_at = {now} WHERE id = '{held_first}';\n\
+             UPDATE intakes SET state = 'started', started_at = {now} \
+               WHERE id IN ('{held_intake}', '{keyed_intake}');\n"
+        ),
+    );
+    assert!(
+        surgery.status.success(),
+        "{}",
+        String::from_utf8_lossy(&surgery.stderr)
+    );
+    let unbegun = |intake: &str| {
+        let row = harness::journal_rows(
+            &project,
+            &format!(
+                "SELECT intakes.state AS state, executions.id AS begun FROM intakes \
+                 LEFT JOIN executions ON executions.id = intakes.execution \
+                 WHERE intakes.id = '{intake}'"
+            ),
+        );
+        row[0]["state"] == "started" && row[0]["begun"].is_null()
+    };
+    assert!(
+        unbegun(&held_intake) && unbegun(&keyed_intake),
+        "both rows claim a start no lifecycle row followed"
+    );
+
+    let Some(mut served) = harness::serve_into(&project, FIXTURE, &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client");
+
+    // `held`'s slot was free: started at once, under the id the row recorded.
+    let report = eventually(
+        Duration::from_secs(20),
+        "the claimed start of `held` to be made",
+        || {
+            let report = get(&app, &format!("/intakes/{held_intake}")).json();
+            executions_of(&project, "held")
+                .iter()
+                .any(|row| row.id == held_claimed)
+                .then_some(report)
+        },
+    );
+    assert_eq!(report["state"], "started", "{report}");
+    assert_eq!(report["execution_id"], held_claimed.as_str(), "{report}");
+
+    // `keyed`'s one slot is held by the recovered execution: the claimed
+    // arrival waits on the queue, and never runs beside it.
+    eventually(
+        Duration::from_secs(20),
+        "the claimed start of `keyed` to go back on the queue",
+        || {
+            (get(&app, &format!("/intakes/{keyed_intake}")).json()["state"] == "queued")
+                .then_some(())
+        },
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    let rows = executions_of(&project, "keyed");
+    assert_eq!(
+        rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+        [keyed_first.as_str()],
+        "the claimed arrival did not start beside the execution holding its group: {rows:#?}"
+    );
+    assert_eq!(rows[0].status, "open", "{rows:#?}");
+
+    std::fs::write(scratch.path().join("keyed-first"), "").expect("the release file");
+    let report = eventually(
+        Duration::from_secs(30),
+        "the claimed start of `keyed` to be made once its slot frees",
+        || {
+            let report = get(&app, &format!("/intakes/{keyed_intake}")).json();
+            (report["state"] == "started").then_some(report)
+        },
+    );
+    assert_eq!(report["execution_id"], keyed_claimed.as_str(), "{report}");
+    for name in ["held-claimed", "keyed-claimed"] {
+        std::fs::write(scratch.path().join(name), "").expect("the release file");
+    }
+    for (trigger, first, claimed) in [
+        ("held", &held_first, &held_claimed),
+        ("keyed", &keyed_first, &keyed_claimed),
+    ] {
+        let rows = eventually(
+            Duration::from_secs(30),
+            "both of a group's executions to complete",
+            || {
+                let rows = executions_of(&project, trigger);
+                (rows.len() == 2 && rows.iter().all(|row| row.status == "completed"))
+                    .then_some(rows)
+            },
+        );
+        never_overlapping(&rows);
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            [first.as_str(), claimed.as_str()],
+            "the claimed arrival started once, under the id its row recorded"
+        );
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        executions_of(&project, "held").len(),
+        2,
+        "none started twice"
+    );
+    assert_eq!(
+        executions_of(&project, "keyed").len(),
+        2,
+        "none started twice"
+    );
+
+    let said = served.stop_and_read_stderr();
+    let repaired = format!(
+        "intake `held`: {held_intake} started {held_claimed}, whose start a stopped serve had claimed and not journaled"
+    );
+    assert!(
+        said.lines().any(|line| line == repaired),
+        "`{repaired}`\n{said}"
+    );
+    let requeued = format!("intake `keyed`: {keyed_intake} is back on the queue: ");
+    assert!(
+        said.lines().any(|line| line.starts_with(&requeued)
+            && line.contains("its group had no free slot")
+            && line.contains(&keyed_first)),
+        "`{requeued}…`\n{said}"
+    );
+}
+
+/// **A pending debounce is armed after a restart even where the journal
+/// refuses its first look's fold** (PRD resolved q77 ruling f, Decision D163's
+/// Status, `docs/durability.md` §6.3).
+///
+/// `burst` counts two deliveries into one ten-second debounce; `serve` is
+/// killed and the second's dedupe key put back on the id it was claimed under,
+/// as a crash between the count and the fold leaves it. The journal then
+/// refuses every update of a dedupe row — the fold the restart's look makes
+/// first — until the test lifts the refusal. The look that could not fold
+/// still arms the debounce: it closes once its deadline passes and the
+/// journal takes the fold, starting one execution over both arrivals, and the
+/// key the look could not move names that execution in the end.
+#[test]
+fn a_debounce_whose_fold_the_journal_refuses_at_a_restart_is_still_armed_and_fires() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("intake-unfolded-restart");
+    let (environment, log) = environment(&provider, &scratch, &[]);
+    let Some(project) = harness::scratch_project("intake-unfolded-restart") else {
+        return;
+    };
+    let intake = {
+        let Some(served) = harness::serve_into(&project, FIXTURE, &environment) else {
+            return;
+        };
+        let app = Client::new(&served.base_url).expect("a client");
+        let intake = intake_id_of(&post(
+            &app,
+            "/burst",
+            &json!({ "tag": "first", "id": "u1" }),
+        ));
+        let second = post(&app, "/burst", &json!({ "tag": "second", "id": "u2" }));
+        assert_eq!(second.json()["coalesced"], 2, "{}", second.text());
+        intake
+        // Dropped here: `SIGKILL` to the whole group.
+    };
+    let row = pending_of(&project, "burst");
+    let own = row["execution"]
+        .as_str()
+        .expect("the row's execution")
+        .to_string();
+    let newest = row["joined_execution"]
+        .as_str()
+        .expect("the row records its newest arrival's id")
+        .to_string();
+    let surgery = harness::journal_sql(
+        &project,
+        &format!(
+            "UPDATE dedupe SET execution = '{newest}' \
+               WHERE trigger_name = 'burst' AND dedupe_key = '\"u2\"';\n\
+             CREATE TRIGGER refuse_the_fold BEFORE UPDATE ON dedupe \
+               BEGIN SELECT RAISE(ABORT, 'refused by the test'); END;\n"
+        ),
+    );
+    assert!(
+        surgery.status.success(),
+        "{}",
+        String::from_utf8_lossy(&surgery.stderr)
+    );
+
+    let Some(mut served) = harness::serve_into(&project, FIXTURE, &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client");
+    // The look has been made, and could not fold.
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        dedupe_of(&project, "burst").get("u2"),
+        Some(&newest),
+        "the refusal held the key where the crash left it"
+    );
+    let lift = harness::journal_sql(&project, "DROP TRIGGER refuse_the_fold;\n");
+    assert!(
+        lift.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lift.stderr)
+    );
+
+    let rows = eventually(
+        Duration::from_secs(40),
+        "the debounce to close and its execution to complete",
+        || {
+            let rows = executions_of(&project, "burst");
+            (!rows.is_empty() && rows.iter().all(|row| row.status == "completed")).then_some(rows)
+        },
+    );
+    assert_eq!(rows.len(), 1, "one execution: {rows:#?}");
+    assert_eq!(rows[0].id, own, "the row's own execution: {rows:#?}");
+    assert_eq!(rows[0].inputs["pushes"], 2, "both arrivals: {rows:#?}");
+    assert_eq!(
+        rows[0].inputs["tag"], "second",
+        "the newest payload: {rows:#?}"
+    );
+    assert_eq!(tally(&log), ["second start 2", "second end"]);
+    let report = get(&app, &format!("/intakes/{intake}")).json();
+    assert_eq!(report["state"], "started", "{report}");
+    assert_eq!(
+        dedupe_of(&project, "burst").get("u2"),
+        Some(&own),
+        "the close folded the key the look could not"
+    );
+
+    let said = served.stop_and_read_stderr();
+    let unfolded = format!(
+        "intake `burst`: {intake}'s newest arrival's gate could not yet be moved onto {own} ("
+    );
+    assert!(
+        said.lines().any(|line| line.starts_with(&unfolded)),
+        "`{unfolded}…`\n{said}"
+    );
+}
+
+/// The composition [`queued_and_pending_arrivals_a_deploy_left_without_a_block_start_with_no_bound`]
+/// serves: a group of one that queues and a debounce, each over a flow whose
+/// execution ends when the file its `hold` names appears — with their
+/// `concurrency:` blocks, or without them, as a deploy that removed them
+/// leaves it.
+fn unblocked(blocks: bool) -> String {
+    let (serial, burst) = if blocks {
+        (
+            "\n    concurrency:\n      limit: 1",
+            "\n    concurrency:\n      debounce: 4s",
+        )
+    } else {
+        ("", "")
+    };
+    format!(
+        r#"version: "0.1"
+
+triggers:
+  serial:
+    type: http
+    path: /serial
+    flow: flow.held
+    input:
+      tag: "payload.body.tag"
+      hold: "payload.body.hold"
+    dedupe_key: "payload.body.id"{serial}
+
+  burst:
+    type: http
+    path: /burst
+    flow: flow.held
+    input:
+      tag: "payload.body.tag"
+      hold: "payload.body.hold"{burst}
+
+flow.held:
+  description: One tagged piece of work that ends when a file appears.
+  inputs:
+    tag: {{ type: string }}
+    hold: {{ type: string }}
+  outputs: {{}}
+  nodes:
+    wait:
+      exec:
+        command: "${{TALLY_BIN}}/hold"
+      input:
+        tag: "input.tag"
+        hold: "input.hold"
+  edges:
+    - {{ from: start, to: wait }}
+    - {{ from: wait, to: end }}
+"#
+    )
+}
+
+/// **Queued and pending arrivals a deploy left without a `concurrency:`
+/// block start with no bound** (PRD resolved q77 ruling f, Decision D163's
+/// Status, `docs/durability.md` §6.3).
+///
+/// `serial` holds `first` and queues `second` and `third`; `burst` has a
+/// debounce open. `serve` is killed and started again under a build that
+/// declares neither block. The arrivals were accepted and answered with their
+/// intake ids, so they are owed a start; the serving build bounds the trigger
+/// by nothing, so `second` and `third` start at once beside the recovered
+/// `first`, and the debounce closes at the deadline its row records — each
+/// under the id its row recorded, once — and a repeat of `second`'s key is
+/// answered with the execution it started.
+#[test]
+fn queued_and_pending_arrivals_a_deploy_left_without_a_block_start_with_no_bound() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("intake-unblocked");
+    let (environment, _log) = environment(&provider, &scratch, &[]);
+    let release = scratch.path().join("release-first");
+    let released = scratch.path().join("released");
+    std::fs::write(&released, "").expect("the scratch area is writable");
+    let hold = |file: &Path| file.display().to_string();
+    let before = scratch.path().join("before");
+    let after = scratch.path().join("after");
+    for (directory, blocks) in [(&before, true), (&after, false)] {
+        std::fs::create_dir_all(directory).expect("the scratch area is writable");
+        std::fs::write(directory.join("main.yml"), unblocked(blocks))
+            .expect("the scratch area is writable");
+    }
+    let Some(project) = harness::scratch_project("intake-unblocked") else {
+        return;
+    };
+    let (first, queued, pending) = {
+        let Some(served) =
+            harness::serve_entrypoint_into(&project, &before.join("main.yml"), &environment)
+        else {
+            return;
+        };
+        let app = Client::new(&served.base_url).expect("a client");
+        let first = execution_of(&post(
+            &app,
+            "/serial",
+            &json!({ "id": "first", "tag": "first", "hold": hold(&release) }),
+        ));
+        let queued: Vec<String> = ["second", "third"]
+            .iter()
+            .map(|tag| {
+                let answered = post(
+                    &app,
+                    "/serial",
+                    &json!({ "id": tag, "tag": tag, "hold": hold(&released) }),
+                );
+                assert_eq!(answered.json()["status"], "queued", "{}", answered.text());
+                intake_id_of(&answered)
+            })
+            .collect();
+        let pending = post(
+            &app,
+            "/burst",
+            &json!({ "tag": "burst", "hold": hold(&released) }),
+        );
+        assert_eq!(pending.json()["status"], "pending", "{}", pending.text());
+        (first, queued, intake_id_of(&pending))
+        // Dropped here: `SIGKILL` to the whole group.
+    };
+    let claimed: Vec<String> = queued
+        .iter()
+        .map(|intake| execution_named_by(&project, intake))
+        .collect();
+    let burst = execution_named_by(&project, &pending);
+
+    let Some(mut served) =
+        harness::serve_entrypoint_into(&project, &after.join("main.yml"), &environment)
+    else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client");
+    let rows = eventually(
+        Duration::from_secs(30),
+        "the queued arrivals to complete beside the recovered first",
+        || {
+            let rows = executions_of(&project, "serial");
+            (rows.len() == 3
+                && rows
+                    .iter()
+                    .filter(|row| row.id != first)
+                    .all(|row| row.status == "completed"))
+            .then_some(rows)
+        },
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.id == first)
+            .map(|row| row.status.as_str()),
+        Some("open"),
+        "the queued arrivals ran while first still held what was its group: {rows:#?}"
+    );
+    for (intake, execution) in queued.iter().zip(&claimed) {
+        let report = get(&app, &format!("/intakes/{intake}")).json();
+        assert_eq!(report["state"], "started", "{report}");
+        assert_eq!(report["execution_id"], execution.as_str(), "{report}");
+    }
+    let repeat = post(
+        &app,
+        "/serial",
+        &json!({ "id": "second", "tag": "second", "hold": hold(&released) }),
+    );
+    assert_eq!(deduped(&repeat), Some("true"), "{repeat:?}");
+    assert_eq!(execution_of(&repeat), claimed[0]);
+
+    let rows = eventually(
+        Duration::from_secs(30),
+        "the debounce to close and its execution to complete",
+        || {
+            let rows = executions_of(&project, "burst");
+            (rows.len() == 1 && rows[0].status == "completed").then_some(rows)
+        },
+    );
+    assert_eq!(rows[0].id, burst, "the id its row recorded: {rows:#?}");
+    let report = get(&app, &format!("/intakes/{pending}")).json();
+    assert_eq!(report["state"], "started", "{report}");
+
+    std::fs::write(&release, "").expect("the release file");
+    eventually(Duration::from_secs(30), "first to complete", || {
+        executions_of(&project, "serial")
+            .iter()
+            .any(|row| row.id == first && row.status == "completed")
+            .then_some(())
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        executions_of(&project, "serial").len(),
+        3,
+        "none started twice"
+    );
+    assert_eq!(
+        executions_of(&project, "burst").len(),
+        1,
+        "none started twice"
+    );
+
+    let said = served.stop_and_read_stderr();
+    for trigger in ["serial", "burst"] {
+        let line = format!(
+            "intake `{trigger}`: this build declares no `concurrency:` on the trigger, so the arrivals an earlier build's intake accepted for it start with no bound"
+        );
+        assert_eq!(
+            said.lines().filter(|said| *said == line).count(),
+            1,
+            "`{line}`\n{said}"
+        );
+    }
 }
