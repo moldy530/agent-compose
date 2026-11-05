@@ -133,6 +133,36 @@ CREATE TABLE IF NOT EXISTS cancellations (
   execution    TEXT COLLATE "C" PRIMARY KEY,
   requested_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS fired (
+  trigger_name TEXT COLLATE "C" NOT NULL,
+  scheduled_at TEXT COLLATE "C" NOT NULL,
+  execution    TEXT COLLATE "C" NOT NULL,
+  fired_at     TEXT NOT NULL,
+  PRIMARY KEY (trigger_name, scheduled_at)
+);
+CREATE TABLE IF NOT EXISTS dedupe (
+  trigger_name TEXT COLLATE "C" NOT NULL,
+  key_hash     TEXT COLLATE "C" NOT NULL,
+  dedupe_key   TEXT NOT NULL,
+  execution    TEXT COLLATE "C" NOT NULL,
+  admitted_at  TEXT NOT NULL,
+  PRIMARY KEY (trigger_name, key_hash)
+);
+CREATE TABLE IF NOT EXISTS checkpoints (
+  source           TEXT COLLATE "C" PRIMARY KEY,
+  checkpoint_value TEXT NOT NULL,
+  recorded_at      TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS restarts (
+  source      TEXT COLLATE "C" NOT NULL,
+  ended_at    TEXT COLLATE "C" NOT NULL,
+  attempt     INTEGER NOT NULL,
+  exit_code   INTEGER,
+  exit_signal TEXT,
+  ran_ms      BIGINT NOT NULL,
+  backoff_ms  BIGINT NOT NULL,
+  PRIMARY KEY (source, ended_at)
+);
 CREATE INDEX IF NOT EXISTS effects_of_execution ON effects (execution);
 CREATE INDEX IF NOT EXISTS executions_by_status ON executions (status, started_at);
 CREATE INDEX IF NOT EXISTS deliveries_by_status ON deliveries (status, intended_at);

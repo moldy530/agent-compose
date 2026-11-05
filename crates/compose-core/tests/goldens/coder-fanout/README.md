@@ -20,6 +20,7 @@ The LangGraph TypeScript project `agent-compose build` produced from `main.yml`,
 | `manifest.json` | what a **worker** reads out of this tree before it can run anything: the node runner's path, which files here the compiler did not write, and each placement's environment as `docs/distributed.md` §9.1 partitions it. The same partition `src/deployment.ts` carries, in the format the `agent-compose worker` binary can read without a JavaScript runtime |
 | `src/artifact.ts` | what this tree **is**: a content hash over its own files — the emitted ones and the authored ones the composition references — the file list a worker fetch is served from, and the compiler release that wrote it (`docs/distributed.md` §4) |
 | `src/cel.ts` | the CEL evaluator the routers embed (PRD 5.5) |
+| `src/cron.ts` | the cron evaluator a `schedule` trigger's `cron:` is read by, in its `timezone:` through `Intl`: the five-field grammar `validate` holds it to, daylight saving's gaps and repeats included (grammar 13.4) |
 | `src/delivery.ts` | what a settled execution owes the outside world: the bounded, journaled schedule a lifecycle `callback:` and a `trace_sink:` export are both worked on, and the one place this project POSTs one (`docs/durability.md` §3.7) |
 | `src/deployment.ts` | what the deploy layer declares: the placements a worker may claim, the per-process environment partition the hub and a worker both read out of it (`docs/distributed.md` §9.1), and the address every settled trace ships to (grammar §14.5) |
 | `src/env.ts` | every `${ENV}` reference **this process** needs — the hub's own list, which is the whole composition's unless a placement takes something off it — and `readEnvironment()`, the presence check over them |
@@ -33,8 +34,9 @@ The LangGraph TypeScript project `agent-compose build` produced from `main.yml`,
 | `src/state.ts` | the graph's state model: one channel per `state:` channel, the implicit conversation history, and `$run` — what the runtime keeps beside them |
 | `src/graph.ts` | the compiled graph: one node per flow node, the `flows` registry, and `runFlow` |
 | `src/harness.ts` | the coding-harness drivers a `coder:` node reaches its SDK through, one per harness this composition binds, plus a scripted driver for tests. The one generated module whose *imports* depend on the composition (grammar 8.9) |
-| `src/triggers.ts` | the composition's declared `http` triggers: their routes, their response modes, and the CEL that reads a request payload |
-| `src/serve.ts` | the app over those triggers: start, status and resume (PRD 5.11) |
+| `src/triggers.ts` | the composition's declared triggers: each `http` trigger's route, its response mode and the CEL that reads a request payload; each `schedule` trigger's `cron:`; each `event` trigger's source and `dedupe_key:`; and the target's `event_sources:` |
+| `src/serve.ts` | the app over those triggers: start, status, resume and cancel (PRD 5.11), the one admission every trigger kind's start passes through, and `GET /sources/:name` |
+| `src/sources.ts` | what `serve` runs beside its routes: the scheduler that fires every `schedule` trigger's ticks, and the consumer that runs each `kind: command` source's program and admits what it prints (PRD resolved q78) |
 | `src/cli.ts` | this project's own command line, which `agent-compose run`, `agent-compose resume` and `agent-compose serve` launch |
 | `src/index.ts` | the project's public surface, the one caller of `readEnvironment()`, and the entry point the command line hangs off |
 | `src/worker-node.ts` | the worker half of the worker protocol: one placed node, executed out of this tree by `agent-compose worker`, with the dispatch on standard input and its effects and result as NDJSON on standard output (`docs/distributed.md` §3.2) |
@@ -215,10 +217,7 @@ target's own backend, with no flow written: `get <key>`, `set <key> <json>`
 `{ key, value, version, expires_at }` on stdout — and `import`, which reads the
 same from standard input or `--file`, writes each line at a fresh version,
 honours a remaining `expires_at` as a `ttl`, skips a line already expired, and
-with `--if-absent` keeps a key the store already holds — and `log <key>`
-(`--limit`, `--after`), one page of the key's history, oldest first, on a store
-that declares `history: true`: each write's `seq`, time, op, version, actor and
-the value before and after. The partition is the one
+with `--if-absent` keeps a key the store already holds. The partition is the one
 the store's scope names: `--session` for `scope: session`, `--execution` for
 `scope: execution`, neither for `scope: global`. A value is held to the store's
 `value_schema` before it is written. The answer is a table, or one JSON document
@@ -227,16 +226,15 @@ under `--format json`; the exit code is `0` for a key found or a write applied,
 failed, and `2` for a command line it does not take — a value `value_schema`
 refuses among it, since nothing was written and the value is what is to fix.
 **An operator's write is not an effect**: it belongs to no execution, carries no
-idempotency key, and writes no journal row, no ledger row and no trace record.
-On a store that declares `history: true` it is recorded in one place, its
-history row, as actor `cli`; on any other it is recorded nowhere.
+idempotency key, and writes no journal row, no ledger row and no trace record,
+so it is recorded nowhere.
 
 `serve` starts the app over the composition's declared `http` triggers and
 announces where it is listening as one JSON line on stdout. Beside them it
-mounts three routes of its own — `GET /executions/:id` for an execution's
-status, `POST /executions/:id/resume` and `POST /executions/:id/cancel` — so
-those are the app's and a trigger cannot declare one: the compiler refuses one
-that does. On start it
+mounts four routes of its own — `GET /executions/:id` for an execution's
+status, `POST /executions/:id/resume`, `POST /executions/:id/cancel` and
+`GET /sources/:name` — so those are the app's and a trigger cannot declare one:
+the compiler refuses one that does. On start it
 **recovers** every execution the journal holds open, before it accepts a
 connection, so a pause comes back under the same wait id and a resume URL
 prepared against the process that died still finds it; triggers are not
@@ -255,7 +253,9 @@ verifies its caller before it reads a payload, and the execution it starts
 carries that guard: its `GET /executions/:id`, `POST /executions/:id/resume` and
 `POST /executions/:id/cancel` enforce the auth of the trigger that started it, in this process and in the one
 that recovers it after a restart. An execution a trigger with no `auth:` began
-keeps open routes. A trigger's `callback:` is a subscription to the execution's
+keeps open routes. An `event` trigger may declare the same `auth:`: nobody calls
+it, so it guards only the routes of the executions it started and its source's
+`GET /sources/:name`, and a `schedule` trigger declares none. A trigger's `callback:` is a subscription to the execution's
 **lifecycle** rather than only to its end: one webhook per parking, listing every
 pause then open, and one when the execution settles, each carrying the report
 the status route serves under the `X-AgentCompose-*` headers the grammar
@@ -266,11 +266,55 @@ route rather than failing the run. `AGENT_COMPOSE_CALLBACK_RETRY` shortens that
 schedule for a diagnostic run: a comma-separated list of durations
 (`0s,1s,2s`), refused at launch if it is not one.
 
+**Schedules and event sources run here, and only here.** After recovery,
+`serve` starts a scheduler for every `schedule` trigger — five-field cron, in
+the trigger's `timezone:` (`UTC` by default) — and, for every `kind: command`
+event source an `event` trigger binds, the source's program. `agent-compose run`
+starts neither.
+
+| route | answers |
+|---|---|
+| `GET /sources/:name` | a `kind: command` source's `state` (`running`, `backing_off`, `stopped`), `running_since` or `backing_off_until`, its newest `checkpoint`, the `accepted_events` and `refused_lines` it has counted since this process started, and its `restart_count` with the newest twenty `restarts` (`ended_at`, `attempt`, `exit_code`, `signal`, `ran_ms`, `backoff_ms`); `404` for a name the target does not declare. Guarded by the `auth:` of the `event` triggers bound to the source — a caller any one of them verifies is answered, `401` otherwise — and open where none declares one |
+
+A tick journals a `fired` row keyed by the trigger and the tick **before** its
+execution starts, so it fires once across restarts and across hubs sharing one
+journal. Ticks that fell while no `serve` was running are **skipped, never
+back-filled**: the next tick after a start is the first one after now, and a
+job catches itself up from `payload.scheduled_at`, the nominal tick it was
+started for. A program's stdout is one JSON object per line, admitted line by
+line — each event is admitted before the next line is read, so a slow start
+holds the program at its own write — and a line that is not a JSON object is
+refused and counted, never an execution. An `event` trigger's `dedupe_key:`
+(default `payload.id`) is enforced: a repeat starts nothing. The newest
+checkpoint the intake accepted is handed back on every restart of the program —
+`AGENT_COMPOSE_CHECKPOINT` in its environment, and in place of an argument
+written `{checkpoint}` — and an exit restarts it after a backoff that doubles up
+to `restart.max:`. The program runs in a process group of its own, its stdin is
+a pipe that ends when `serve` does, and a stop sends the group `SIGTERM` and,
+after two seconds, `SIGKILL`. A target declaring a `redis_streams`, `sqs` or
+`nats` source is refused at start, naming it.
+
+What `serve` writes about them goes to **stderr**, one line each:
+
+| line | when |
+|---|---|
+| ``schedule `<t>` (`<cron>` in <zone>): last fired <tick or never>, next tick <tick>`` | a scheduler starts |
+| ``schedule `<t>`: skipped <n> ticks from <tick> through <tick>, which fell while no serve was running: …`` | ticks fell in downtime, or while the process could not see them |
+| ``schedule `<t>`: fired the <scheduled_at> tick as <execution>`` | a tick fires |
+| ``schedule `<t>`: the <scheduled_at> tick was already fired, as <execution>`` | another generation, or a hub sharing the journal, fired it first |
+| ``event source `<s>`: started `<command>` (pid <pid>) with checkpoint "<c>"`` | the program starts (or `with no checkpoint`) |
+| ``event source `<s>`: event "<id>" started <execution> for `<t>` `` | an event is admitted |
+| ``event source `<s>`: event "<id>" repeats one `<t>` already admitted as <execution>, so it started nothing`` | a repeat is deduplicated |
+| ``event source `<s>`: line <n> is not a JSON object, so it was refused and starts nothing (<n> refused so far)`` | a line is refused |
+| ``event source `<s>`: the program exited with code <c> after <seconds>s; restarting it in <ms>ms (restart <n> in a row)`` | the program ends, by an exit or a signal |
+| ``[source <s>] <line>`` | the program writes a line to its stderr |
+| ``event trigger `<t>`: no event source `<s>` is bound under this target, so nothing consumes for it`` | a trigger's source is unbound under `local` |
+
 Stopping it stops the graph: `agent-compose serve` passes `SIGINT` and `SIGTERM`
-on to this project, which closes the app, finishes the work its stores still
-have running — a settled execution's ledger prune, the start's sweep of expired
-keys — and exits, so a supervisor that signals the command is not left with a
-listener behind it.
+on to this project, which closes the app, stops every schedule and every
+source's program, finishes the work its stores still have running — a settled
+execution's ledger prune, the start's sweep of expired keys — and exits, so a
+supervisor that signals the command is not left with a listener behind it.
 
 ### On Node instead
 

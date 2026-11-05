@@ -25,7 +25,7 @@
 // agent-compose release that generated this tree, which a join carries and a
 // mismatch is refused on, naming both sides.
 
-export const ARTIFACT_HASH = "sha256:5b9e746efd0d0b4b0340719897f5940de4b1ba7d280bf6a7641da405bdad6208";
+export const ARTIFACT_HASH = "sha256:6a33f2bb07af8c17058c38f1726afe3a976762aa8ea102d2e2dbd705718d49e2";
 
 export const COMPILER_VERSION = "0.0.0-dev";
 
@@ -39,6 +39,7 @@ export const ARTIFACT_FILES: readonly string[] = [
   "src/artifact.ts",
   "src/cel.ts",
   "src/cli.ts",
+  "src/cron.ts",
   "src/delivery.ts",
   "src/deployment.ts",
   "src/env.ts",
@@ -52,6 +53,7 @@ export const ARTIFACT_FILES: readonly string[] = [
   "src/runtime.ts",
   "src/schemas.ts",
   "src/serve.ts",
+  "src/sources.ts",
   "src/state.ts",
   "src/stores.ts",
   "src/triggers.ts",

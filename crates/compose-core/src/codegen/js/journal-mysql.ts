@@ -183,6 +183,42 @@ const MYSQL_SCHEMA = [
   requested_at VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   PRIMARY KEY (execution)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
+  // The intake (PRD resolved q78, `docs/durability.md` §3.11-§3.14): four
+  // tables of their own, so `IF NOT EXISTS` is their whole migration. A trigger
+  // or source name is an identifier — ASCII, at most 64 characters — so the
+  // keys are bounded ASCII by the rule above; a dedupe key is the caller's, so
+  // it is keyed by its SHA-256 (64 hex characters) and kept whole beside it.
+  `CREATE TABLE IF NOT EXISTS fired (
+  trigger_name VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  scheduled_at VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  execution    VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  fired_at     VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  PRIMARY KEY (trigger_name, scheduled_at)
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
+  `CREATE TABLE IF NOT EXISTS dedupe (
+  trigger_name VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  key_hash     VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  dedupe_key   LONGTEXT NOT NULL,
+  execution    VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  admitted_at  VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  PRIMARY KEY (trigger_name, key_hash)
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
+  `CREATE TABLE IF NOT EXISTS checkpoints (
+  source           VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  checkpoint_value LONGTEXT NOT NULL,
+  recorded_at      VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  PRIMARY KEY (source)
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
+  `CREATE TABLE IF NOT EXISTS restarts (
+  source      VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  ended_at    VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  attempt     INT NOT NULL,
+  exit_code   INT,
+  exit_signal VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin,
+  ran_ms      BIGINT NOT NULL,
+  backoff_ms  BIGINT NOT NULL,
+  PRIMARY KEY (source, ended_at)
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
 ];
 
 /**

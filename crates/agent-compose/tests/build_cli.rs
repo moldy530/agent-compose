@@ -103,7 +103,7 @@ fn build_writes_the_project_layout_where_out_points() {
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     assert_eq!(stdout(&output), "", "human output goes to stderr");
     assert!(
-        stderr(&output).contains("wrote 25 files"),
+        stderr(&output).contains("wrote 27 files"),
         "{}",
         stderr(&output)
     );
@@ -117,6 +117,7 @@ fn build_writes_the_project_layout_where_out_points() {
             "src/artifact.ts",
             "src/cel.ts",
             "src/cli.ts",
+            "src/cron.ts",
             "src/delivery.ts",
             "src/deployment.ts",
             "src/env.ts",
@@ -130,6 +131,7 @@ fn build_writes_the_project_layout_where_out_points() {
             "src/runtime.ts",
             "src/schemas.ts",
             "src/serve.ts",
+            "src/sources.ts",
             "src/state.ts",
             "src/stores.ts",
             "src/triggers.ts",
@@ -237,7 +239,7 @@ fn build_emits_with_every_environment_reference_unset() {
     let output = command.output().expect("the command runs");
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     assert!(
-        stderr(&output).contains("wrote 25 files"),
+        stderr(&output).contains("wrote 27 files"),
         "{}",
         stderr(&output)
     );

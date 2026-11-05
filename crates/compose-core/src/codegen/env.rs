@@ -916,10 +916,28 @@ impl References {
 
         if let Some(triggers) = &ir.triggers {
             for (name, trigger) in &triggers.entries {
+                let at = format!("triggers.{name}");
+                // An `event` trigger's `auth:` guards the routes about its
+                // work (grammar 13.5, Decision D162), so its credential is the
+                // served app's to hold exactly as an `http` trigger's is.
+                if let TriggerKind::Event(event) = &trigger.kind {
+                    match &event.auth {
+                        Some(InboundAuth::Bearer(bearer)) => {
+                            references.record(
+                                &bearer.token.value.name,
+                                &format!("{at}.auth.bearer.token"),
+                            );
+                        }
+                        Some(InboundAuth::Hmac(hmac)) => {
+                            references
+                                .record(&hmac.secret.value.name, &format!("{at}.auth.hmac.secret"));
+                        }
+                        None => {}
+                    }
+                }
                 let TriggerKind::Http(http) = &trigger.kind else {
                     continue;
                 };
-                let at = format!("triggers.{name}");
                 match &http.auth {
                     Some(InboundAuth::Bearer(bearer)) => {
                         references
@@ -956,6 +974,15 @@ impl References {
                 }
                 for (key, value) in &source.extra {
                     references.plugin(&value.value, &format!("{at}.{key}"));
+                }
+                // A `kind: command` source is interpolated where `serve`
+                // starts its program (grammar 4.3 class 2, like an `exec:`
+                // block), so its references are the hub's to hold at launch.
+                if let Some(command) = &source.command {
+                    references.text(&command.command.value, &format!("{at}.command"));
+                    for (index, arg) in command.args.iter().enumerate() {
+                        references.text(&arg.value, &format!("{at}.args[{index}]"));
+                    }
                 }
             }
         }

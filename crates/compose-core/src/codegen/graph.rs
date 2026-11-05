@@ -5261,7 +5261,7 @@ fn surface_fields<'ir>(surfaces: &[schema::Surface<'ir>], path: &str) -> Cow<'ir
 }
 
 /// An interpolable string as the runtime's parts (grammar 4.3 class 2).
-fn interpolation(text: &Interpolated, site: &str) -> String {
+pub(crate) fn interpolation(text: &Interpolated, site: &str) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut literal = String::new();
     let raw = text.as_str();

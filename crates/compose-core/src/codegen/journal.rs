@@ -925,16 +925,21 @@ mod tests {
             expected.keys().collect::<Vec<_>>(),
             vec![
                 "cancellations",
+                "checkpoints",
+                "dedupe",
                 "deliveries",
                 "dispatches",
                 "effects",
                 "executions",
-                "lineage"
+                "fired",
+                "lineage",
+                "restarts"
             ],
             "the SQLite schema is the inventory every other backend is held to, and it no \
-             longer holds the six tables `docs/durability.md` §3 describes — a child \
+             longer holds the ten tables `docs/durability.md` §3 describes — a child \
              execution's cause (§3.5, PRD resolved q65) and a cancel's request (§3.5, PRD \
-             resolved q75) beside the lifecycle row"
+             resolved q75) beside the lifecycle row, and the intake's four (§3.11-§3.14, \
+             PRD resolved q78)"
         );
         for (arm, name) in [
             (POSTGRES, "journal-postgres.ts"),
@@ -1828,6 +1833,16 @@ mod tests {
         //    app it reaches records the request on its own journal before it
         //    acts, so a second request is the route's no-op rather than a
         //    second effect.
+        //  * `Consumer` — a `kind: command` event source's program, which
+        //    `serve` starts and restarts (grammar 14.4, PRD resolved q78). It is
+        //    the *source* of executions rather than something one issues: no
+        //    graph spawns it, no execution's journal holds it, and no replay is
+        //    "of" it — a recovered execution is replayed into a `serve` whose
+        //    consumer is already running, which is `fastify`'s reason one level
+        //    up. What it hands the intake is admitted through the journal's own
+        //    `fired`/`dedupe`/`checkpoints` rows (`docs/durability.md` §3.11–
+        //    §3.14), so a restarted program re-emitting what it already said
+        //    starts nothing twice.
         //  * the journal's **own** storage: the three drivers, the open paths
         //    that create and migrate each backend's schema, the lock a killed
         //    writer leaves behind (§2), and `journalExists`. These are the record
@@ -1835,7 +1850,7 @@ mod tests {
         //    its own journal, which is what a replay *is*. The two remote arms
         //    are read here like every other emitted module, so a driver call
         //    that ever escaped one of them fails this test rather than nothing.
-        const NOT_AN_EFFECT: [(&str, &str); 18] = [
+        const NOT_AN_EFFECT: [(&str, &str); 19] = [
             ("src/stores.ts", "releaseExecution"),
             ("src/stores.ts", "pruneStore"),
             ("src/stores.ts", "pruneBlobLedger"),
@@ -1845,6 +1860,7 @@ mod tests {
             ("src/cli.ts", "writeTrace"),
             ("src/cli.ts", "readImportFile"),
             ("src/cli.ts", "cancelVerb"),
+            ("src/sources.ts", "Consumer"),
             ("src/journal.ts", "SqliteDriver"),
             ("src/journal.ts", "openSqlite"),
             ("src/journal.ts", "breakStaleLock"),
@@ -1870,6 +1886,8 @@ mod tests {
             ("src/otlp.ts", include_str!("js/otlp.ts")),
             ("src/cli.ts", include_str!("js/cli.ts")),
             ("src/cel.ts", include_str!("js/cel.ts")),
+            ("src/cron.ts", include_str!("js/cron.ts")),
+            ("src/sources.ts", include_str!("js/sources.ts")),
         ];
         // The primitives, derived. Each one *is* the effect — the moment a
         // process leaves itself — so a replay that reaches one has re-executed

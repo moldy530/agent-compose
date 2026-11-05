@@ -18,9 +18,22 @@
 // | status | `GET /executions/:id` | the execution's state, its outputs once it has them, and any pause it is holding |
 // | resume | `POST /executions/:id/resume` | delivers a human's answer to an interrupted execution |
 // | cancel | `POST /executions/:id/cancel` | cancels an open execution, and every open child execution in its lineage |
+// | source status | `GET /sources/:name` | a `kind: command` event source's program, checkpoint, restarts and refused lines |
 //
 // It is byte-identical in every project this compiler release builds, like
 // `./runtime.ts`: what differs between two projects is `./triggers.ts`.
+//
+// # Admission: one function every trigger kind's start passes through
+//
+// An execution starts in one place, [`admit`], whatever started it: an `http`
+// request after its auth, its body and its `input:`; a `schedule` tick the
+// scheduler found due; an `event` a `kind: command` source printed (PRD
+// resolved q78, `./sources.ts`). Each arrives with its inputs bound and its
+// flow's `inputs:` checked, and with the **gate** its kind keeps — a tick's
+// `fired` row, claimed before the execution starts so a tick fires once across
+// restarts and hubs; an event's dedupe key, claimed when the execution is
+// registered so a repeat starts nothing (`docs/durability.md` §3.11, §3.12).
+// PRD resolved q77's intake ledger lands on the same seam.
 //
 // # Why Fastify
 //
@@ -185,7 +198,18 @@ import {
   workDelivery,
 } from "./delivery.ts";
 import { type CompiledFlow, type FlowRun, flows, runChildFlow, runFlow } from "./graph.ts";
+import { openJournal } from "./journal.ts";
 import { mountWorkerRoutes, placementWaits, watchPlacementWaits } from "./mesh.ts";
+import {
+  type Admitted,
+  type Intake,
+  declaresSource,
+  preflightSources,
+  sourceStatus,
+  startSources,
+  stopSources,
+  triggersOf,
+} from "./sources.ts";
 import { drainStores, sweepBoundStores } from "./stores.ts";
 import {
   cancelExecution,
@@ -210,7 +234,19 @@ import {
   watchQuiescence,
 } from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
-import { type HttpTrigger, httpTriggers } from "./triggers.ts";
+import {
+  type EventPayload,
+  type EventTrigger,
+  type HttpTrigger,
+  type InboundAuth,
+  type SchedulePayload,
+  type ScheduleTrigger,
+  eventTriggers,
+  httpTriggers,
+  scheduleTriggers,
+} from "./triggers.ts";
+
+export { ScheduleError, UnimplementedSourceError } from "./sources.ts";
 
 /** What an execution this process started is doing (PRD 5.11). */
 export type ExecutionStatus = "running" | "completed" | "failed" | "interrupted" | "cancelled";
@@ -399,6 +435,11 @@ export function createApp(): FastifyInstance {
   // (see [`blankCredentials`]).
   const blank = blankCredentials();
   if (blank.length > 0) throw new BlankCredentialError(blank);
+  // And what the scheduler and the consumers would otherwise fail on after the
+  // app is listening: an event source of a kind this release runs no consumer
+  // for — refused by name, PRD resolved q78's q63 posture — a timezone the
+  // runtime's database does not know, a clock variable that is not one.
+  preflightSources();
   decodeBodies(app);
 
   // The worker protocol's five routes, on a target that declares `placements:`
@@ -439,6 +480,16 @@ export function createApp(): FastifyInstance {
   // caller was given by the process that died.
   app.addHook("onReady", async () => {
     await recover(executions);
+    // **After** recovery (PRD resolved q78 ruling c): the schedules start
+    // taking ticks and each `kind: command` source's program starts with the
+    // newest checkpoint the process that died had accepted — and no execution
+    // a tick or an event starts is one a replay is racing.
+    await startSources(intake(executions));
+  });
+  // The programs go with the app: `SIGTERM` to each group, `SIGKILL` after a
+  // grace (Decision D160's exec discipline), and no tick armed after it.
+  app.addHook("onClose", async () => {
+    await stopSources();
   });
 
   app.get("/executions/:id", async (request, reply) => {
@@ -610,6 +661,39 @@ export function createApp(): FastifyInstance {
     });
   });
 
+  app.get("/sources/:name", async (request, reply) => {
+    const name = (request.params as { name: string }).name;
+    // The existence check first, as on the execution routes: a name this
+    // target does not declare is a different mistake from a caller the route
+    // refuses.
+    if (!declaresSource(name)) {
+      return reply.code(404).send({
+        error: `no event source \`${name}\` is declared under this target (grammar 14.4)`,
+      });
+    }
+    // …and the guard second, on the reading PRD resolved q32 takes one level
+    // up: the route enforces the `auth:` of the `event` triggers bound to the
+    // source. Where any of them declares one, a caller must satisfy one of
+    // them; where none does, the route is open, exactly as an execution a
+    // no-auth trigger started keeps open routes (Decision D162, whose Status
+    // names the reading).
+    const refusal = sourceGuard(name, request);
+    if (refusal !== undefined) {
+      return reply.code(401).send({
+        source: name,
+        ...(refusal.scheme === undefined ? {} : { scheme: refusal.scheme }),
+        error: `the event source \`${name}\` refused this request: ${refusal.detail}`,
+      });
+    }
+    const status = await sourceStatus(name);
+    if (status === undefined) {
+      return reply.code(404).send({
+        error: `no event source \`${name}\` is declared under this target (grammar 14.4)`,
+      });
+    }
+    return reply.code(200).send(status);
+  });
+
   return app;
 }
 
@@ -658,7 +742,10 @@ function refuse(reply: FastifyReply, trigger: string, refusal: Refusal): unknown
  * A trigger declaring no `auth:` refuses nothing, which is grammar 13.3's own
  * default: absent leaves the route open.
  */
-function verified(trigger: HttpTrigger, request: FastifyRequest): Refusal | undefined {
+function verified(
+  trigger: { readonly auth?: InboundAuth },
+  request: FastifyRequest,
+): Refusal | undefined {
   const auth = trigger.auth;
   if (auth === undefined) return undefined;
   const sent = headerValues(request, auth.header);
@@ -752,6 +839,13 @@ function blankCredentials(): readonly string[] {
     if (delivery?.bearer !== undefined) named(delivery.bearer.tokenEnv);
     if (delivery?.hmac !== undefined) named(delivery.hmac.secretEnv);
   }
+  // An `event` trigger's `auth:` guards the routes about its work (grammar
+  // 13.5, Decision D162), and an empty credential would open them as surely.
+  for (const trigger of eventTriggers) {
+    const auth = trigger.auth;
+    if (auth?.scheme === "bearer") named(auth.tokenEnv);
+    if (auth?.scheme === "hmac") named(auth.secretEnv);
+  }
   for (const variable of blankSinkCredentials()) named(variable);
   return blank;
 }
@@ -797,9 +891,51 @@ export class BlankCredentialError extends Error {
 function guarded(execution: Execution, request: FastifyRequest): Refusal | undefined {
   const trigger = httpTriggers.find((one) => one.name === execution.trigger);
   if (trigger !== undefined) return verified(trigger, request);
+  // An `event` trigger enforces its own `auth:` on the routes of the
+  // executions it started, on PRD resolved q32's coverage clause — nobody
+  // called it, but somebody may poll, resume or cancel what it began
+  // (grammar 13.5, Decision D162).
+  const event = eventTriggers.find((one) => one.name === execution.trigger);
+  if (event !== undefined) return verified(event, request);
   if (execution.trigger === MANUAL) return undefined;
+  // A `schedule` trigger is a declared trigger with no `auth:` — grammar 13.4
+  // gives it none, since nobody calls a clock — so the routes of an execution
+  // one started are open, PRD resolved q32's "an execution a no-auth trigger
+  // started keeps open routes" (Decision D162).
+  if (scheduleTriggers.some((one) => one.name === execution.trigger)) return undefined;
   return {
     detail: `it was started by the trigger \`${execution.trigger}\`, which this build does not declare, so the authentication that trigger required cannot be read`,
+  };
+}
+
+/**
+ * The refusal `GET /sources/:name` has for this request (grammar 14.4, PRD
+ * resolved q32 one level up, Decision D162).
+ *
+ * The route reports on a source, and a source belongs to the `event` triggers
+ * bound to it, so it enforces theirs: where none declares an `auth:` it is
+ * open; where some do, a request any one of them verifies is answered — each
+ * of those triggers may already read what the source started through its own
+ * executions' routes, so none of them learns more here than it could there.
+ */
+function sourceGuard(source: string, request: FastifyRequest): Refusal | undefined {
+  const guarding = triggersOf(source).filter((trigger) => trigger.auth !== undefined);
+  if (guarding.length === 0) return undefined;
+  const refusals: { readonly trigger: string; readonly refusal: Refusal }[] = [];
+  for (const trigger of guarding) {
+    const refusal = verified(trigger, request);
+    if (refusal === undefined) return undefined;
+    refusals.push({ trigger: trigger.name, refusal });
+  }
+  const only = refusals.length === 1 ? refusals[0] : undefined;
+  if (only !== undefined) {
+    return {
+      ...(only.refusal.scheme === undefined ? {} : { scheme: only.refusal.scheme }),
+      detail: `it enforces the \`auth:\` of the trigger \`${only.trigger}\` bound to it, and ${only.refusal.detail}`,
+    };
+  }
+  return {
+    detail: `it enforces the \`auth:\` of the triggers bound to it, and none of them verified it (${refusals.map(({ trigger, refusal }) => `\`${trigger}\`: ${refusal.detail}`).join("; ")})`,
   };
 }
 
@@ -1027,7 +1163,32 @@ async function start(
     });
   }
 
-  const execution = register(executions, flow, trigger, inputs, sessionKey, payload);
+  // The caller's own trace, where the caller named one (PRD resolved q51), and
+  // the completion webhook this request asked for — both read here, when the
+  // request arrived, and journaled on the lifecycle row: the export that adopts
+  // the trace and the delivery that calls back happen at settle, which may be
+  // in another process. Header names are case-insensitive and this framework
+  // lowercases them, so the lookup is the lowercase spelling W3C writes anyway.
+  const callback = callbackOf(trigger, payload);
+  const traceparent = (payload.headers["traceparent"] ?? "").trim();
+  const admitted = await admit(executions, {
+    trigger: trigger.name,
+    flow,
+    inputs,
+    sessionKey,
+    ...(callback === undefined ? {} : { callback }),
+    ...(traceparent === "" ? {} : { traceparent }),
+  });
+  // An `http` admission keeps no gate in this release, so nothing can already
+  // hold it; PRD resolved q77's `dedupe_key:` is what will make this branch
+  // reachable, answering the first execution's id.
+  if (admitted.outcome !== "started") {
+    return reply.code(202).send({
+      execution_id: admitted.execution,
+      status_url: `/executions/${admitted.execution}`,
+    });
+  }
+  const execution = admitted.record;
 
   if (trigger.respond === "sync") {
     const budget = trigger.timeoutMs ?? DEFAULT_SYNC_TIMEOUT_MS;
@@ -1052,6 +1213,176 @@ async function start(
 
 /** The `60s` grammar 13.3 defaults a sync trigger's response budget to. */
 const DEFAULT_SYNC_TIMEOUT_MS = 60_000;
+
+// ---------------------------------------------------------------------------
+// Admission (PRD resolved q78 ruling e)
+// ---------------------------------------------------------------------------
+
+/**
+ * One execution about to start, from whichever trigger started it — its inputs
+ * bound and already held to its flow's `inputs:`.
+ */
+interface Admission {
+  /** The trigger's name, as the lifecycle row records it. */
+  readonly trigger: string;
+  readonly flow: CompiledFlow;
+  readonly inputs: Record<string, unknown>;
+  readonly sessionKey: string;
+  /** An `http` trigger's resolved `callback:`, where the request yielded one. */
+  readonly callback?: string;
+  /** The `traceparent` an `http` request carried. */
+  readonly traceparent?: string;
+  /**
+   * The gate this trigger kind keeps, where it keeps one: a `schedule` tick's
+   * `fired` row, or an `event` trigger's dedupe key.
+   */
+  readonly gate?:
+    | { readonly kind: "tick"; readonly scheduledAt: string }
+    | { readonly kind: "dedupe"; readonly key: string };
+}
+
+/** What [`admit`] did: the execution it started, or the one its gate already held. */
+type AdmitAnswer =
+  | { readonly outcome: "started"; readonly record: Execution }
+  | { readonly outcome: "held"; readonly execution: string };
+
+/**
+ * Start one execution — **the** start, for every trigger kind (PRD resolved
+ * q78 ruling e).
+ *
+ * The execution's id is allocated first, so the gate's row can name it:
+ *
+ *  * **a tick's `fired` row**, claimed before the execution exists. The insert
+ *    that wins fires; a tick some earlier generation of this process or another
+ *    hub sharing the journal already fired is answered with that execution and
+ *    starts nothing (`docs/durability.md` §3.11).
+ *  * **an event's dedupe key**, claimed as the execution is registered. A key
+ *    already held by an execution that exists — in this process, or anywhere in
+ *    the journal — is a repeat and starts nothing. A key held by one that
+ *    **never began** is a claim a process died holding between this line and
+ *    the lifecycle row, and is taken over rather than honoured: honoured, the
+ *    event would be lost (§3.12).
+ *
+ * An `http` request keeps no gate in this release; PRD resolved q77 gives it
+ * `dedupe_key:` on this same seam.
+ */
+async function admit(
+  executions: Map<string, Execution>,
+  admission: Admission,
+): Promise<AdmitAnswer> {
+  const id = `exec_${globalThis.crypto.randomUUID()}`;
+  const gate = admission.gate;
+  if (gate?.kind === "tick") {
+    const held = await (await openJournal()).fire({
+      trigger: admission.trigger,
+      scheduledAt: gate.scheduledAt,
+      execution: id,
+      firedAt: new Date().toISOString(),
+    });
+    if (held.execution !== id) return { outcome: "held", execution: held.execution };
+  }
+  if (gate?.kind === "dedupe") {
+    const journal = await openJournal();
+    const held = await journal.claimDedupe({
+      trigger: admission.trigger,
+      key: gate.key,
+      execution: id,
+      admittedAt: new Date().toISOString(),
+    });
+    if (held.execution !== id) {
+      const begun =
+        executions.has(held.execution) || (await journal.execution(held.execution)) !== undefined;
+      if (begun) return { outcome: "held", execution: held.execution };
+      if (!(await journal.retakeDedupe(admission.trigger, gate.key, held.execution, id))) {
+        const now = await journal.claimDedupe({
+          trigger: admission.trigger,
+          key: gate.key,
+          execution: id,
+          admittedAt: new Date().toISOString(),
+        });
+        if (now.execution !== id) return { outcome: "held", execution: now.execution };
+      }
+    }
+  }
+  const record = register(executions, admission, id);
+  return { outcome: "started", record };
+}
+
+/**
+ * The [`Intake`] `./sources.ts` hands its ticks and events to: each bound to
+ * its flow's inputs and held to its flow's `inputs:` here, then [`admit`]ted.
+ */
+function intake(executions: Map<string, Execution>): Intake {
+  return {
+    tick: (trigger, at, payload) => admitTick(executions, trigger, at, payload),
+    event: (trigger, payload) => admitEvent(executions, trigger, payload),
+  };
+}
+
+/** Bind one tick and admit it under its `fired` gate. */
+async function admitTick(
+  executions: Map<string, Execution>,
+  trigger: ScheduleTrigger,
+  at: number,
+  payload: SchedulePayload,
+): Promise<Admitted> {
+  const flow = flows[trigger.flow];
+  if (flow === undefined) {
+    return { outcome: "refused", reason: `\`${trigger.flow}\` is not a flow of this composition` };
+  }
+  let inputs: Record<string, unknown>;
+  let sessionKey = "";
+  try {
+    inputs = trigger.input(payload);
+    if (trigger.sessionKey !== undefined) sessionKey = trigger.sessionKey(payload);
+    flow.parse(inputs);
+  } catch (error) {
+    return { outcome: "refused", reason: `the trigger \`${trigger.name}\` could not bind this tick: ${message(error)}` };
+  }
+  const admitted = await admit(executions, {
+    trigger: trigger.name,
+    flow,
+    inputs,
+    sessionKey,
+    gate: { kind: "tick", scheduledAt: new Date(at).toISOString() },
+  });
+  return admitted.outcome === "started"
+    ? { outcome: "started", execution: admitted.record.id }
+    : admitted;
+}
+
+/** Bind one event and admit it under its trigger's dedupe key. */
+async function admitEvent(
+  executions: Map<string, Execution>,
+  trigger: EventTrigger,
+  payload: EventPayload,
+): Promise<Admitted> {
+  const flow = flows[trigger.flow];
+  if (flow === undefined) {
+    return { outcome: "refused", reason: `\`${trigger.flow}\` is not a flow of this composition` };
+  }
+  let inputs: Record<string, unknown>;
+  let sessionKey = "";
+  let key: string;
+  try {
+    key = trigger.dedupeKey(payload);
+    inputs = trigger.input(payload);
+    if (trigger.sessionKey !== undefined) sessionKey = trigger.sessionKey(payload);
+    flow.parse(inputs);
+  } catch (error) {
+    return { outcome: "refused", reason: `the trigger \`${trigger.name}\` could not bind this event: ${message(error)}` };
+  }
+  const admitted = await admit(executions, {
+    trigger: trigger.name,
+    flow,
+    inputs,
+    sessionKey,
+    gate: { kind: "dedupe", key },
+  });
+  return admitted.outcome === "started"
+    ? { outcome: "started", execution: admitted.record.id }
+    : admitted;
+}
 
 /**
  * Put every execution this project's journal holds open back on the board
@@ -1297,24 +1628,14 @@ function trackChild(
 /** Start the run, and record what it does when it stops. */
 function register(
   executions: Map<string, Execution>,
-  flow: CompiledFlow,
-  trigger: HttpTrigger,
-  inputs: Record<string, unknown>,
-  sessionKey: string,
-  payload: Payload,
+  admission: Admission,
+  id: string,
 ): Execution {
-  const id = `exec_${globalThis.crypto.randomUUID()}`;
-  const callback = callbackOf(trigger, payload);
-  // The caller's own trace, where the caller named one (PRD resolved q51). Read
-  // here for [`callbackOf`]'s reason and journaled for the same: the export that
-  // adopts it happens at settle, which may be in another process. Header names
-  // are case-insensitive and this framework lowercases them, so the lookup is
-  // the lowercase spelling W3C writes anyway.
-  const traceparent = (payload.headers["traceparent"] ?? "").trim();
+  const { flow, inputs, sessionKey, callback, traceparent } = admission;
   const execution: Execution = {
     id,
     flow: flow.address,
-    trigger: trigger.name,
+    trigger: admission.trigger,
     status: "running",
     // This request is the execution's first generation, so there is nothing for
     // it to catch up to: a pause it has not reached yet is one nobody has been
@@ -1347,7 +1668,7 @@ function register(
       // the resume and status routes of this execution can enforce the auth of
       // the trigger that started it after a restart (grammar 13.3); never
       // re-fired on recovery (PRD resolved q28).
-      trigger: trigger.name,
+      trigger: admission.trigger,
       // And where its lifecycle webhooks go, on the same row and for the
       // reason [`resumeInto`] reads it back: the process that finishes this
       // execution may not be this one.
@@ -1356,7 +1677,7 @@ function register(
       // arrived and validated where it is read (`./otlp.ts`'s
       // `parseTraceparent`), so a malformed header costs the execution nothing
       // — which is the W3C trace-context behaviour and PRD resolved q51's.
-      ...(traceparent === "" ? {} : { traceparent }),
+      ...(traceparent === undefined ? {} : { traceparent }),
       // The `settled` webhook, journaled before the row closes — see [`closed`].
       closing: (produced, error) => closed(execution, produced, error),
     }),
