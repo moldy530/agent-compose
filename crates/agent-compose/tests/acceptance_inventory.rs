@@ -2391,6 +2391,12 @@ const SOURCES: &[Criterion] = &[
                 "a_schedule_claims_no_tick_until_its_look_at_the_newest_claim_reaches_the_journal",
                 Status::Live,
             ),
+            // …and a claim that failed after it may have landed is looked at
+            // before the next tick's row can bury it.
+            (
+                "a_tick_claim_that_failed_after_it_may_have_landed_is_looked_at_before_the_next_tick_is_claimed",
+                Status::Live,
+            ),
             // …with a skipped span past the counted ticks still named through
             // the last tick before the start.
             (
@@ -2529,6 +2535,17 @@ const SOURCES: &[Criterion] = &[
             // by a stop that finds the source backing off.
             (
                 "what_a_run_leaves_in_its_process_group_is_ended_with_it_and_by_a_stop_while_backing_off",
+                Status::Live,
+            ),
+            // …a run ends at its program's exit, even while a helper in its
+            // group holds the program's output open, so it is still restarted.
+            (
+                "a_program_that_exits_while_a_helper_in_its_group_holds_its_output_is_restarted_and_the_helper_ended",
+                Status::Live,
+            ),
+            // …and a stop gives the whole group its grace, not only the program.
+            (
+                "a_stop_gives_every_member_of_the_programs_group_its_grace_once_the_program_has_gone",
                 Status::Live,
             ),
             // …the `sh` program `docs triggers` writes out runs as written.

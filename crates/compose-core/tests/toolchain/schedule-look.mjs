@@ -10,7 +10,7 @@
 // do to a real journal refuses that one read and admits the claim after it — a
 // standby's journal refuses both until the `serve` holding it goes, and opens
 // to both at once — so this runner holds the journal's `lastFired` itself, and
-// stands in for the admission the scheduler hands its ticks to. Two cases:
+// stands in for the admission the scheduler hands its ticks to. Three cases:
 //
 //   * **bypass**: the clock runs sixty times fast, so the every-minute
 //     trigger ticks once a real second. The newest row is a claim whose
@@ -24,8 +24,16 @@
 //     look is refused twice, as a standby's is while the guard is held. The
 //     claim is started on the look's own backoff, seconds in, with no tick
 //     claimed and none due: not at the next tick's look a period later.
+//   * **landed**: sixty times fast again, over an empty `fired` table, and no
+//     look is refused. The first tick's claim **lands and then fails** — its
+//     row is down, and the admission throws, as a dialled journal does when it
+//     commits an insert whose answer never arrives. That claim names an
+//     execution nothing started, and the next tick's own row would bury it, so
+//     the scheduler must look at the newest row again before it claims another
+//     tick: the look finds the landed claim and hands it back for its start,
+//     and only then is the next tick claimed.
 //
-// Usage: bun schedule-look.mjs <built project of the `schedules` fixture>
+// Usage: bun schedule-look.mjs <built project of the `schedules` fixture> <case>…
 // Prints one JSON object, `{ "<case>": [<call>, …] }`, read by
 // `compiled_graph_acceptance.rs`; the serve log the scheduler writes goes to
 // stderr, as `serve`'s does.
@@ -34,9 +42,9 @@ import { pathToFileURL } from "node:url";
 import path from "node:path";
 import process from "node:process";
 
-const [, , project] = process.argv;
-if (project === undefined) {
-  throw new Error("usage: bun schedule-look.mjs <generated project directory>");
+const [, , project, ...cases] = process.argv;
+if (project === undefined || cases.length === 0) {
+  throw new Error("usage: bun schedule-look.mjs <generated project directory> <case>…");
 }
 
 const at = (relative) => pathToFileURL(path.resolve(project, relative)).href;
@@ -45,24 +53,28 @@ const sources = await import(at("src/sources.ts"));
 const journal = await journalModule.openJournal();
 
 const TRIGGER = "every_minute";
-const REFUSED_LOOKS = 2;
 const MINUTE = 60_000;
 
-/** One case: a fired table holding `stranded`, and the calls the admission received. */
-async function scenario(name, rate, stranded, until, budgetMs) {
+/**
+ * One case: a fired table holding `stranded`, where there is one, the first
+ * `refusedLooks` looks refused and the first `landsThenThrows` claims landed
+ * and then failed — and the calls the admission received.
+ */
+async function scenario(name, { rate, stranded, refusedLooks, landsThenThrows = 0 }, until, budgetMs) {
   process.env.AGENT_COMPOSE_SCHEDULE_CLOCK_RATE = String(rate);
-  const rows = [stranded];
+  const rows = stranded === undefined ? [] : [stranded];
   const begun = new Set();
   const calls = [];
   let looks = 0;
   journal.lastFired = async (trigger) => {
     looks += 1;
-    if (looks <= REFUSED_LOOKS) {
+    if (looks <= refusedLooks) {
       calls.push({ look: looks, refused: true });
       throw new Error(`this journal refuses look ${looks}`);
     }
     calls.push({ look: looks, refused: false });
     const own = rows.filter((row) => row.trigger === trigger);
+    if (own.length === 0) return undefined;
     return own.reduce((newest, row) => (row.scheduledAt > newest.scheduledAt ? row : newest));
   };
   let claims = 0;
@@ -76,6 +88,11 @@ async function scenario(name, rate, stranded, until, budgetMs) {
         execution,
         firedAt: new Date().toISOString(),
       });
+      if (claims <= landsThenThrows) {
+        // Down, and its execution never started: the answer is what is lost.
+        calls.push({ tick: payload.scheduled_at, execution, answered: false });
+        throw new Error(`the answer to claim ${claims} never arrived`);
+      }
       begun.add(execution);
       calls.push({ tick: payload.scheduled_at, execution });
       return { outcome: "started", execution };
@@ -108,38 +125,65 @@ function minutesAgo(minutes) {
   return new Date(now - (now % MINUTE) - minutes * MINUTE).toISOString();
 }
 
+/** How many ticks `calls` claimed. */
+const ticks = (calls) => calls.filter((call) => call.tick !== undefined).length;
+
+const CASES = {
+  // Done once a tick has been claimed after the stranded claim was handed
+  // back, or once a tick was claimed with no hand-back before it — the
+  // regression.
+  bypass: () =>
+    scenario(
+      "bypass",
+      {
+        rate: 60,
+        refusedLooks: 2,
+        stranded: {
+          trigger: TRIGGER,
+          scheduledAt: minutesAgo(3),
+          execution: "exec_stranded_by_a_stopped_serve",
+          firedAt: minutesAgo(3),
+        },
+      },
+      (calls) => ticks(calls) >= 1,
+      20_000,
+    ),
+  // Done once the stranded claim was handed back, or once the budget is spent
+  // — well short of a period, and long enough for the look's backoff of one
+  // second and then two.
+  standby: () =>
+    scenario(
+      "standby",
+      {
+        rate: 1,
+        refusedLooks: 2,
+        stranded: {
+          trigger: TRIGGER,
+          scheduledAt: minutesAgo(0),
+          execution: "exec_claimed_by_a_dead_primary",
+          firedAt: minutesAgo(0),
+        },
+      },
+      (calls) => calls.some((call) => call.unbegun !== undefined),
+      10_000,
+    ),
+  // Done once a second tick has been claimed — after the landed claim was
+  // handed back, or, the regression, past it with nobody having looked.
+  landed: () =>
+    scenario(
+      "landed",
+      { rate: 60, refusedLooks: 0, landsThenThrows: 1 },
+      (calls) => ticks(calls) >= 2,
+      20_000,
+    ),
+};
+
 const results = {};
-
-// Done once a tick has been claimed after the stranded claim was handed back,
-// or once a tick was claimed with no hand-back before it — the regression.
-results.bypass = await scenario(
-  "bypass",
-  60,
-  {
-    trigger: TRIGGER,
-    scheduledAt: minutesAgo(3),
-    execution: "exec_stranded_by_a_stopped_serve",
-    firedAt: minutesAgo(3),
-  },
-  (calls) => calls.some((call) => call.tick !== undefined),
-  20_000,
-);
-
-// Done once the stranded claim was handed back, or once the budget is spent —
-// well short of a period, and long enough for the look's backoff of one
-// second and then two.
-results.standby = await scenario(
-  "standby",
-  1,
-  {
-    trigger: TRIGGER,
-    scheduledAt: minutesAgo(0),
-    execution: "exec_claimed_by_a_dead_primary",
-    firedAt: minutesAgo(0),
-  },
-  (calls) => calls.some((call) => call.unbegun !== undefined),
-  10_000,
-);
+for (const name of cases) {
+  const run = CASES[name];
+  if (run === undefined) throw new Error(`no case named ${name}`);
+  results[name] = await run();
+}
 
 await journalModule.closeJournal?.();
 process.stdout.write(JSON.stringify(results));

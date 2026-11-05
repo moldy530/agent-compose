@@ -43,6 +43,17 @@
 //                    program in, holding none of its pipes — and append the
 //                    helper's pid to this file: what a run leaves in its group
 //                    when it ends, unless something ends the group
+//   FEED_HELPER_STDIO
+//                    `inherit`: the FEED_HELPER helper keeps this program's
+//                    stdout and stderr instead, as `cmd &` in a shell or a
+//                    `Popen` left with the default stdio does — so the pipes
+//                    `serve` reads stay open after this program exits, for as
+//                    long as the helper lives
+//   FEED_CLEANER     start a helper in this program's group, holding none of
+//                    its pipes, that on SIGTERM takes a second to clean up and
+//                    then writes `cleaned` to this file and exits — while this
+//                    program itself goes at once: whether the helper is given
+//                    its grace once its leader has gone
 //   FEED_EXIT_CODE   after the last event, exit with this code rather than
 //                    wait for stdin to end — on every run, so a restart whose
 //                    checkpoint is already the last event exits as soon as it
@@ -97,12 +108,29 @@ if (linger) {
 }
 const helper = process.env.FEED_HELPER;
 if (helper) {
-  // Not detached, and its stdio closed: a member of this program's group that
-  // keeps none of its pipes open, so the run ends when this process exits and
-  // the helper is still running. `trap '' TERM` survives the `exec`: an
-  // ignored signal stays ignored across one.
-  const child = spawn("sh", ["-c", "trap '' TERM; exec sleep 600"], { stdio: "ignore" });
+  // Not detached: a member of this program's group. With its stdio closed it
+  // keeps none of its pipes open, so the run's output ends when this process
+  // exits and the helper is still running; with FEED_HELPER_STDIO=inherit it
+  // keeps stdout and stderr open past this process's exit. `trap '' TERM`
+  // survives the `exec`: an ignored signal stays ignored across one.
+  const stdio =
+    process.env.FEED_HELPER_STDIO === "inherit" ? ["ignore", "inherit", "inherit"] : "ignore";
+  const child = spawn("sh", ["-c", "trap '' TERM; exec sleep 600"], { stdio });
   appendFileSync(helper, `${child.pid}\n`);
+  child.unref();
+}
+const cleaner = process.env.FEED_CLEANER;
+if (cleaner) {
+  // Not detached, and its stdio closed: a member of this program's group that
+  // holds none of its pipes, so the run's output ends the moment this process
+  // goes. The `SIGTERM` a stop sends the group interrupts the `wait`; the trap
+  // then cleans up for a second — a `sleep` started after the signal, which
+  // the signal never reached — and only then marks the cleanup done.
+  const child = spawn(
+    "sh",
+    ["-c", 'trap \'sleep 1; echo cleaned > "$1"; exit 0\' TERM; sleep 600 & wait', "cleaner", cleaner],
+    { stdio: "ignore" },
+  );
   child.unref();
 }
 process.stdin.on("data", () => {});

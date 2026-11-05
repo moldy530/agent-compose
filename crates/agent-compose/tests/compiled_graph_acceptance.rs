@@ -30413,31 +30413,11 @@ fn what_a_run_leaves_in_its_process_group_is_ended_with_it_and_by_a_stop_while_b
         return;
     };
     let app = Client::new(&served.base_url).expect("a client for the generated app");
-    let started = |path: &Path| -> Vec<i32> {
-        std::fs::read_to_string(path)
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| line.trim().parse().ok())
-            .collect()
-    };
-    // Alive, and not a zombie waiting for whoever adopted it to reap it.
-    let alive = |pid: i32| -> bool {
-        // SAFETY: signal 0 delivers nothing; it asks whether `pid` exists.
-        let exists = unsafe { libc::kill(pid, 0) == 0 };
-        let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .ok()
-            .and_then(|stat| {
-                stat.rsplit_once(") ")
-                    .map(|(_, rest)| rest.starts_with('Z'))
-            })
-            .unwrap_or(false);
-        exists && !zombie
-    };
     let four = eventually(
         Duration::from_secs(60),
         "four runs, each with its helper",
         || {
-            let held = started(&helpers);
+            let held = pids_listed_in(&helpers);
             (held.len() >= 4).then_some(held)
         },
     );
@@ -30445,7 +30425,7 @@ fn what_a_run_leaves_in_its_process_group_is_ended_with_it_and_by_a_stop_while_b
     eventually(
         Duration::from_secs(20),
         "the helpers of the runs that ended and were restarted to be gone",
-        || earlier.iter().all(|pid| !alive(*pid)).then_some(()),
+        || earlier.iter().all(|pid| !running(*pid)).then_some(()),
     );
     let status = source(&app, "feed");
     assert_ne!(
@@ -30466,11 +30446,180 @@ fn what_a_run_leaves_in_its_process_group_is_ended_with_it_and_by_a_stop_while_b
     // The stop sent the last group its `SIGKILL` before `serve` exited; the
     // helpers' own exits may still be under way, and a helper nothing ended
     // would live for ten minutes.
-    let every = started(&helpers);
+    let every = pids_listed_in(&helpers);
     eventually(
         Duration::from_secs(10),
         "every helper any run started to be gone",
-        || every.iter().all(|pid| !alive(*pid)).then_some(()),
+        || every.iter().all(|pid| !running(*pid)).then_some(()),
+    );
+}
+
+/// The pids the fixture listed in `path`, one per line, in the order it
+/// started them.
+fn pids_listed_in(path: &Path) -> Vec<i32> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
+}
+
+/// Whether `pid` is running: alive, and not a zombie waiting for whoever
+/// adopted it to reap it.
+fn running(pid: i32) -> bool {
+    // SAFETY: signal 0 delivers nothing; it asks whether `pid` exists.
+    let exists = unsafe { libc::kill(pid, 0) == 0 };
+    let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit_once(") ")
+                .map(|(_, rest)| rest.starts_with('Z'))
+        })
+        .unwrap_or(false);
+    exists && !zombie
+}
+
+/// A run ends when its program exits, even while a member of its group holds
+/// the program's stdout and stderr open (grammar 14.4: an exit, any code, is
+/// journaled and restarted, and it never gives up; PRD resolved q78 ruling c,
+/// Decision D162).
+///
+/// `FEED_HELPER_STDIO=inherit` makes the helper `FEED_HELPER` leaves in the
+/// program's group on every run keep the program's stdout and stderr — what
+/// `cmd &` in a shell does, or a `Popen` left with the default stdio — and the
+/// helper ignores `SIGTERM`; `FEED_EXIT_CODE` makes every run exit. The pipes
+/// `serve` reads stay open past each exit for as long as the helper lives, so
+/// a run that ended only once they closed would never end: no `restarts` row,
+/// no restart, and the source reported `running` with its program gone. The
+/// exit takes the group with it instead — `SIGTERM`, then `SIGKILL` when the
+/// grace is up — so each exit is a `restarts` row carrying the program's own
+/// code, the program is started again, the one line it wrote before its first
+/// exit is admitted, and each ended run's helper is gone.
+#[test]
+fn a_program_that_exits_while_a_helper_in_its_group_holds_its_output_is_restarted_and_the_helper_ended()
+ {
+    let scratch = harness::Scratch::new("feed-held-output");
+    let Some(project) = harness::scratch_project("feed-held-output") else {
+        return;
+    };
+    let helpers = scratch.path().join("helpers.pids");
+    let environment = feed_environment(
+        scratch.path(),
+        &[
+            ("FEED_TOTAL", "1"),
+            ("FEED_EXIT_CODE", "3"),
+            ("FEED_HELPER", &helpers.display().to_string()),
+            ("FEED_HELPER_STDIO", "inherit"),
+        ],
+    );
+    let Some(mut served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let status = eventually(
+        Duration::from_secs(60),
+        "two exits journaled while each run's helper held its output",
+        || {
+            let status = source(&app, "feed");
+            (status["restart_count"].as_u64().unwrap_or(0) >= 2).then_some(status)
+        },
+    );
+    let restarts = status["restarts"].as_array().expect("restart rows");
+    assert!(restarts.len() >= 2, "{status}");
+    for row in restarts {
+        assert_eq!(
+            row["exit_code"], 3,
+            "every row is the program's own exit, not the helper's end: {status}"
+        );
+        assert_eq!(row["signal"], Value::Null, "{status}");
+    }
+    eventually(Duration::from_secs(30), "the one event", || {
+        (completed_of(&project, "ingest") == 1).then_some(())
+    });
+    let starts = lines_of(&scratch.path().join("starts.log"));
+    assert!(
+        starts.len() >= 2,
+        "the program was started again after it exited: {starts:?}"
+    );
+    let ended = pids_listed_in(&helpers);
+    assert!(ended.len() >= 2, "a helper per run: {ended:?}");
+    let ended = &ended[..2];
+    eventually(
+        Duration::from_secs(20),
+        "the helpers of the two runs that ended to be gone",
+        || ended.iter().all(|pid| !running(*pid)).then_some(()),
+    );
+
+    served.signal(libc::SIGTERM);
+    let exit = served.wait();
+    assert_eq!(
+        exit.code(),
+        Some(0),
+        "a stop that was asked for is not a failure: {exit:?}"
+    );
+    let every = pids_listed_in(&helpers);
+    eventually(
+        Duration::from_secs(10),
+        "every helper any run started to be gone",
+        || every.iter().all(|pid| !running(*pid)).then_some(()),
+    );
+    let said = served.stop_and_read_stderr();
+    assert!(
+        said.contains("event source `feed`: the program exited with code 3 after")
+            && said.contains("restarting it in 200ms (restart 1 in a row)"),
+        "the serve log names the exit and the restart: {said}"
+    );
+}
+
+/// A stop gives every member of the program's group the whole grace, not only
+/// the program (grammar 14.4: stopped by `SIGTERM` to the group and, two
+/// seconds later, `SIGKILL`; PRD resolved q78 ruling c, Decision D162).
+///
+/// `FEED_CLEANER` leaves a helper in the program's group, holding none of its
+/// pipes, that answers `SIGTERM` by cleaning up for a second and then marking
+/// the cleanup done, while the program goes the moment the stop reaches it.
+/// The program's going closes its pipes at once; a stop that sent the group
+/// `SIGKILL` then would cut the helper's cleanup short, and the mark would
+/// never be written. Given the rest of the two seconds, the helper finishes —
+/// and `serve` exits only once it has, so the mark is there when it does.
+#[test]
+fn a_stop_gives_every_member_of_the_programs_group_its_grace_once_the_program_has_gone() {
+    let scratch = harness::Scratch::new("feed-cleaner");
+    let Some(project) = harness::scratch_project("feed-cleaner") else {
+        return;
+    };
+    let mark = scratch.path().join("cleaned");
+    let environment = feed_environment(
+        scratch.path(),
+        &[
+            ("FEED_TOTAL", "1"),
+            ("FEED_CLEANER", &mark.display().to_string()),
+        ],
+    );
+    let Some(mut served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    eventually(Duration::from_secs(60), "the one event", || {
+        (completed_of(&project, "ingest") == 1).then_some(())
+    });
+    assert_eq!(source(&app, "feed")["state"], "running");
+    assert!(
+        !mark.exists(),
+        "nothing has asked the helper to clean up yet"
+    );
+
+    served.signal(libc::SIGTERM);
+    let exit = served.wait();
+    assert_eq!(
+        exit.code(),
+        Some(0),
+        "a stop that was asked for is not a failure: {exit:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&mark).unwrap_or_default().trim(),
+        "cleaned",
+        "the helper finished its cleanup within the grace, before `serve` exited"
     );
 }
 
@@ -31265,13 +31414,7 @@ fn a_schedule_claims_no_tick_until_its_look_at_the_newest_claim_reaches_the_jour
         "the schedules fixture builds: {}",
         String::from_utf8_lossy(&built.stderr)
     );
-    let mut runner = harness::toolchain::runner("schedule-look.mjs");
-    runner.arg(&project).current_dir(&project);
-    let output =
-        harness::toolchain::output_within(&mut runner, Duration::from_secs(90), "schedule-look");
-    let said = String::from_utf8_lossy(&output.stderr).to_string();
-    assert!(output.status.success(), "the runner failed: {said}");
-    let calls: Value = serde_json::from_slice(&output.stdout).expect("one JSON object");
+    let (calls, said) = schedule_look(&project, &["bypass", "standby"]);
     let refused = json!([{ "look": 1, "refused": true }, { "look": 2, "refused": true }]);
 
     let bypass = calls["bypass"].as_array().expect("the bypass case's calls");
@@ -31328,6 +31471,89 @@ fn a_schedule_claims_no_tick_until_its_look_at_the_newest_claim_reaches_the_jour
             "was claimed as exec_claimed_by_a_dead_primary and was never started, so it starts now"
         ),
         "the serve log names it: {said}"
+    );
+}
+
+/// Run `schedule-look.mjs` over the built `schedules` fixture at `project` for
+/// `cases`, answering the calls each case's admission received, by case, and
+/// the serve log the scheduler wrote.
+fn schedule_look(project: &Path, cases: &[&str]) -> (Value, String) {
+    let mut runner = harness::toolchain::runner("schedule-look.mjs");
+    runner.arg(project).args(cases).current_dir(project);
+    let output =
+        harness::toolchain::output_within(&mut runner, Duration::from_secs(90), "schedule-look");
+    let said = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(output.status.success(), "the runner failed: {said}");
+    let calls: Value = serde_json::from_slice(&output.stdout).expect("one JSON object");
+    (calls, said)
+}
+
+/// A tick whose claim failed in a way that may still have landed is looked at
+/// again before the next tick is claimed (`docs/durability.md` §3.11, PRD
+/// resolved q78 ruling b, Decision D162).
+///
+/// A dialled journal can commit a claim's insert and lose the answer, so the
+/// scheduler cannot tell a claim that failed from one that is down naming an
+/// execution nothing started. The look reads only the newest `fired` row, and
+/// the next tick's own row would be the newest: claimed first, it would bury
+/// the landed claim where no look reads it, and that tick would fire zero
+/// times. `schedule-look.mjs`'s **landed** case has the first claim's row land
+/// and its admission throw: the next thing the scheduler does is look, the look
+/// finds that claim and hands it back for its start under the id it recorded,
+/// and only then is a second tick claimed.
+#[test]
+fn a_tick_claim_that_failed_after_it_may_have_landed_is_looked_at_before_the_next_tick_is_claimed()
+{
+    let Some((project, built)) = harness::build_under_toolchain("schedules", "schedule-landed")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the schedules fixture builds: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let (calls, said) = schedule_look(&project, &["landed"]);
+    let landed = calls["landed"].as_array().expect("the landed case's calls");
+    let call = |at: usize| landed.get(at).cloned().unwrap_or(Value::Null);
+    assert_eq!(
+        call(0),
+        json!({ "look": 1, "refused": false }),
+        "the start's look reads an empty table: {landed:?}"
+    );
+    let first = call(1)["tick"].clone();
+    assert!(first.is_string(), "{landed:?}");
+    assert_eq!(
+        call(1),
+        json!({ "tick": first, "execution": "exec_landed_claim_1", "answered": false }),
+        "the first tick's claim lands and its answer is lost: {landed:?}"
+    );
+    assert_eq!(
+        json!([call(2), call(3)]),
+        json!([
+            { "look": 2, "refused": false },
+            { "unbegun": "exec_landed_claim_1", "begun": false, "scheduled_at": first },
+        ]),
+        "the next thing the scheduler does is look, and the landed claim is started under its own id and tick: {landed:?}"
+    );
+    assert_eq!(
+        call(4)["execution"],
+        "exec_landed_claim_2",
+        "…and only then is the next tick claimed: {landed:?}"
+    );
+    assert!(
+        call(4)["tick"].as_str() > first.as_str(),
+        "a later tick: {landed:?}"
+    );
+    assert!(
+        said.contains(
+            "could not be journaled, so it did not fire: the answer to claim 1 never arrived"
+        ),
+        "the serve log says the claim failed: {said}"
+    );
+    assert!(
+        said.contains("was claimed as exec_landed_claim_1 and was never started, so it starts now"),
+        "…and names the claim the look found: {said}"
     );
 }
 
