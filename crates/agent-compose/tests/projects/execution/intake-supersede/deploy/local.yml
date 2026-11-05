@@ -1,0 +1,14 @@
+# The zero-infra target, declaring the one `event_sources:` kind it may: the
+# `command-source` fixture's program, steered by the `FEED_*` variables a test
+# sets (Decision D87 as amended by D162).
+version: "0.1"
+
+event_sources:
+  feed:
+    kind: command
+    command: node
+    args: ["${FEED_PROGRAM}", "{checkpoint}"]
+    checkpoint: "payload.body.cursor"
+    restart:
+      backoff: 200ms
+      max: 2s

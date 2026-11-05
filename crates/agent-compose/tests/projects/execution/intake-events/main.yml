@@ -1,0 +1,59 @@
+# Acceptance fixture: `concurrency:` on `event` triggers (grammar 13.1, 13.5,
+# PRD resolved q77, Decision D163).
+#
+# The source is the `command-source` fixture's `feed.mjs`, named by
+# `${FEED_PROGRAM}`; every event it prints is offered to both triggers below,
+# and each admits it under its own block:
+#
+#   * `serial` — every event in one group (the key is a constant) of one, so
+#     the twenty events queue and run one at a time, in the order they arrived;
+#   * `dropping` — one group of one that drops what finds it full, so an event
+#     arriving while its execution runs is answered with that execution and
+#     leaves a `dropped` intake row.
+#
+# Each execution is `${TALLY_BIN}/work`, lingering `linger` seconds.
+version: "0.1"
+
+defaults:
+  timeout: 300s
+
+triggers:
+  serial:
+    type: event
+    source: feed
+    flow: flow.work
+    input:
+      tag: "payload.id"
+      linger: "'0.3'"
+    concurrency:
+      key: "'every event'"
+      limit: 1
+
+  dropping:
+    type: event
+    source: feed
+    flow: flow.work
+    input:
+      tag: "payload.id"
+      linger: "'2'"
+    concurrency:
+      on_conflict: drop
+
+flow.work:
+  description: One tagged piece of work that takes as long as it is told to.
+  inputs:
+    tag: { type: string }
+    linger: { type: string, default: "0" }
+    pushes: { type: integer, default: 1 }
+  outputs: {}
+  nodes:
+    work:
+      exec:
+        command: "${TALLY_BIN}/work"
+      input:
+        tag: "input.tag"
+        linger: "input.linger"
+        pushes: "input.pushes"
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }

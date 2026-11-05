@@ -159,6 +159,14 @@ pub const FIXTURES: &[&str] = &[
     "flow-as-tool",
     "http-events",
     "http-trigger",
+    // A trigger's intake (PRD resolved q77): `dedupe_key:` and the
+    // `concurrency:` block on `http` triggers; the same block on two `event`
+    // triggers bound to one `kind: command` source, queueing and dropping; and
+    // `on_conflict: supersede` over a parent with a detached child — what
+    // `tests/intake_acceptance.rs` serves.
+    "intake",
+    "intake-events",
+    "intake-supersede",
     "keyless-gateway",
     "model-failover",
     "module-tools",
