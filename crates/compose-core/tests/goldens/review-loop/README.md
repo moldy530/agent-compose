@@ -292,8 +292,9 @@ checkpoint the intake accepted is handed back on every restart of the program �
 written `{checkpoint}` — and an exit restarts it after a backoff that doubles up
 to `restart.max:`. The program runs in a process group of its own, its stdin is
 a pipe that ends when `serve` does, and a stop sends the group `SIGTERM` and,
-after two seconds, `SIGKILL` — as does a run's end, to whatever the program
-left in its group. A target declaring a `redis_streams`, `sqs` or
+after two seconds, `SIGKILL` — as does the program's exit, to whatever it left
+in its group, so a helper holding its output cannot keep the run from ending
+and restarting. A target declaring a `redis_streams`, `sqs` or
 `nats` source is refused at start, naming it.
 
 What `serve` writes about them goes to **stderr**, one line each:

@@ -968,6 +968,9 @@ class Consumer {
     // follow with a `close` and some do not, and one that ran ends at `close`
     // — once its stdio has drained and every line it wrote has been admitted.
     let over = false;
+    // When the program exited, where it has: the instant its run ended, which
+    // the `close` after it can trail by as long as its group takes to go.
+    let exitedAt: number | undefined;
     let resolveClosed: () => void = () => {};
     this.#closed = new Promise<void>((resolve) => {
       resolveClosed = resolve;
@@ -976,8 +979,22 @@ class Consumer {
       if (over) return;
       over = true;
       resolveClosed();
-      void this.#lines.then(() => this.#ended(code, signal, child));
+      void this.#lines.then(() => this.#ended(code, signal, child, exitedAt));
     };
+    // The program's exit takes its group with it, at once ([`#reap`]): a
+    // member that inherited its stdout or stderr — a helper started with
+    // `cmd &`, or by a `Popen` left with the default stdio — holds the pipe
+    // open, and `close` waits for every holder, so a run waiting on `close`
+    // alone would never end while that helper lived: never journaled, never
+    // restarted, and reported `running` with its program gone (grammar 14.4:
+    // an exit, any code, is restarted, and it never gives up). Ended, the
+    // group lets go of the pipes, what is left in them is read and admitted,
+    // and `close` ends the run. During a stop, [`#stopRun`] is already ending
+    // the group, and this is the same reap.
+    child.on("exit", () => {
+      exitedAt = Date.now();
+      if (child.pid !== undefined) void this.#reap(child.pid);
+    });
     child.on("error", (error) => {
       if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
         // An error about a process that is running — a signal it could not
@@ -1210,12 +1227,14 @@ class Consumer {
 
   /**
    * The program ended — or could not be started. Journal it, end what is left
-   * of its group, and restart it.
+   * of its group, and restart it. `exitedAt` is when the program exited, where
+   * it ran: the run's end, which the restart's backoff is counted from.
    */
   #ended(
     code: number | undefined,
     signal: NodeJS.Signals | undefined,
     child?: ChildProcess,
+    exitedAt?: number,
   ): void {
     this.#child = undefined;
     this.runningSince = undefined;
@@ -1228,9 +1247,11 @@ class Consumer {
     // started and never waited for — is still the program's, and the restart
     // starts a group of its own beside it: left alone, every restart of a
     // program that crashes after starting one would leave one more behind,
-    // and none of them would end when `serve` does.
-    if (child?.pid !== undefined) this.#reap(child.pid);
-    const endedAt = Date.now();
+    // and none of them would end when `serve` does. The program's exit began
+    // ending it already; this is that same reap, for a runtime that reported
+    // no exit.
+    if (child?.pid !== undefined) void this.#reap(child.pid);
+    const endedAt = exitedAt ?? Date.now();
     const ran = this.#startedAt === 0 ? 0 : endedAt - this.#startedAt;
     this.#attempt = ran > this.#command.restartMaxMs ? 1 : this.#attempt + 1;
     const backoff = Math.min(
@@ -1282,14 +1303,20 @@ class Consumer {
   }
 
   /**
-   * End what is left of an ended run's process group `group`: `SIGTERM` to it
-   * at once, and `SIGKILL` once the grace is up where anything is still in it
-   * — the stop's sequence (grammar 14.4), for a group whose leader has already
-   * gone. Not awaited by the restart, which starts a group of its own; awaited
-   * by [`stop`], so nothing a run left behind outlives the stop.
+   * End the process group `group`: `SIGTERM` to it at once, and `SIGKILL` once
+   * the grace is up where anything is still in it — the stop's sequence
+   * (grammar 14.4), every member given the whole grace, not only the program.
+   * Begun when the program exits, for whatever its run left in the group, and
+   * by [`#stopRun`] for a run being stopped: one reap per group, so a group
+   * both reach is asked once and told once. Not awaited by the restart, which
+   * starts a group of its own; awaited by [`stop`], so nothing a run left
+   * behind outlives the stop. `undefined` where the group has no member to end
+   * — or the host has no process groups.
    */
-  #reap(group: number): void {
-    if (this.#reaping.has(group) || !groupLives(group)) return;
+  #reap(group: number): Promise<void> | undefined {
+    const reaping = this.#reaping.get(group);
+    if (reaping !== undefined) return reaping;
+    if (!groupLives(group)) return undefined;
     signalGroupId(group, "SIGTERM");
     const reaped = (async () => {
       const deadline = Date.now() + STOP_GRACE_MS;
@@ -1303,6 +1330,7 @@ class Consumer {
       this.#reaping.delete(group);
     });
     this.#reaping.set(group, reaped);
+    return reaped;
   }
 
   /**
@@ -1317,8 +1345,8 @@ class Consumer {
     if (child !== undefined) await this.#stopRun(child);
     // A consumer stopped while it backs off has no run to stop, and the groups
     // its earlier runs left may still hold members: each was sent `SIGTERM`
-    // when its run ended and is sent `SIGKILL` when its grace is up, and the
-    // stop waits for both.
+    // when its program exited and is sent `SIGKILL` when its grace is up, and
+    // the stop waits for both.
     await Promise.all(this.#reaping.values());
     this.state = "stopped";
   }
@@ -1326,17 +1354,26 @@ class Consumer {
   /** Stop the run `child` leads, group and all. */
   async #stopRun(child: ChildProcess): Promise<void> {
     // Its stdin ends first — the signal a program that reads it gets however
-    // `serve` stops — and then the group is asked, then told.
+    // `serve` stops — and then the group is asked, then told: `SIGTERM` now,
+    // and `SIGKILL` two seconds after it to whatever is still in the group
+    // ([`#reap`]). The program going first cuts nobody else's grace short: a
+    // helper still cleaning up when its leader exits on the `SIGTERM` has the
+    // rest of the two seconds. Where there is no group to end — a host
+    // without process groups — the program alone is asked and told.
     child.stdin?.end();
-    signalGroup(child, "SIGTERM");
+    const reaped = child.pid === undefined ? undefined : this.#reap(child.pid);
+    let kill: ReturnType<typeof setTimeout> | undefined;
+    if (reaped === undefined) {
+      signalGroup(child, "SIGTERM");
+      kill = setTimeout(() => signalGroup(child, "SIGKILL"), STOP_GRACE_MS);
+      kill.unref?.();
+    }
     // What it printed and this consumer has not read is dropped rather than
     // admitted: the stream is held paused while a batch is admitted, and a
     // paused stream never closes. Nothing is lost by it — the checkpoint did
     // not move past those lines, so the next start hands the program the
     // position before them.
     child.stdout?.destroy();
-    const kill = setTimeout(() => signalGroup(child, "SIGKILL"), STOP_GRACE_MS);
-    kill.unref?.();
     // Bounded: a descendant that left the group can hold the program's stderr
     // open past the group's death, and a stop that waited on it would hold
     // `serve` open for as long as that process lived.
@@ -1348,9 +1385,11 @@ class Consumer {
         bound.unref?.();
       }),
     ]);
-    clearTimeout(kill);
     if (bound !== undefined) clearTimeout(bound);
-    // A member of the group that outlived its leader is still the program's.
+    // The rest of the grace, for a member of the group that outlived its
+    // leader: still the program's, and ended with it.
+    await reaped;
+    if (kill !== undefined) clearTimeout(kill);
     signalGroup(child, "SIGKILL");
     child.stderr?.destroy();
   }
