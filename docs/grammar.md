@@ -6498,7 +6498,13 @@ What `serve` does with one:
   left, and a stop while the source backs off ends it too. The run ends at the
   program's exit: a helper in the group still holding its stdout or stderr is
   ended with the group, what is left in the pipes is read, and the restart
-  follows. A source no `event` trigger binds is not started.
+  follows. A process that left the group — `setsid`, a daemon — is not the
+  program's, and is neither signalled nor followed: where one still holds the
+  pipes once the group has gone, they are read for two seconds more (time a
+  line spends being admitted is not counted), the line they were in the
+  middle of is taken as the last, and they are let go — the run ends with the
+  exit's code or signal, saying so in the serve log. A source no `event`
+  trigger binds is not started.
 - **Lines.** Each line of stdout is one event; it becomes `payload.body` when it
   is a JSON object. Anything else — not JSON, JSON that is not an object, a line
   longer than 1 MiB — is **refused**: logged with the source and the line's
@@ -13663,7 +13669,14 @@ following are the implementation's own readings and await the owner's ruling:
   `SIGTERM` and `SIGKILL` end it, what is left in the pipes is read and
   admitted, and the `restarts` row records the exit's instant, from which the
   backoff is counted. A descendant that left the group is not the program's,
-  and is not followed.
+  and is not followed — nor does its hold on the pipes keep the run open:
+  once the group has gone, the pipes are read for two seconds more, counted
+  only while reading is not held for an admission, so a slow intake drops
+  nothing the program wrote; the line they were in the middle of is taken as
+  the last, they are let go, and the run ends with the exit's code or signal,
+  the serve log saying why. A program whose exit was seen is never signalled
+  again, by a stop or a restart: its pid — its group's id — may by then name
+  another process's group.
 - The refused-line and accepted-event counts are the running process's, not
   journaled.
 - `auth:` on an `event` trigger, a **grammar addition q78 does not make**.

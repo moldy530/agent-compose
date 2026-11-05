@@ -502,7 +502,10 @@ The program runs in a process group of its own, in the built project's
 directory, and is stopped with `SIGTERM` to the group and, two seconds later,
 `SIGKILL` to whatever is still in it — and so is what a run leaves in its group
 when the program exits, before it is restarted: a background job still holding
-the program's stdout cannot keep the run from ending. Its
+the program's stdout cannot keep the run from ending. Nor can a daemon that
+left the group (`setsid`): it is not the program's and is left running, and
+two seconds after the group has gone the pipes it holds are let go and the
+run ends. Its
 stdin is a pipe that ends when `serve` does, however `serve` ends — which is
 why the script above waits on it: a `serve` killed outright sends nothing, and
 the end of that pipe is how its program learns it has gone. `redis_streams`,
