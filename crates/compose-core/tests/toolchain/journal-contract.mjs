@@ -1294,6 +1294,130 @@ try {
     tookQuiet === true &&
     (await handle.intake(quiet.id)) === undefined &&
     (await handle.intake(owed.id))?.state === "started";
+
+  // A debounce counts an arrival in the move that records it: the row names
+  // the id the arrival's gate was claimed under, and is found by that id as
+  // well as by its own execution — which is what tells a counted arrival's
+  // repeat from a claim no debounce counted.
+  const burst = `burst_${suffix}`;
+  const burstRow = await handle.admitIntake({
+    id: `int_burst_${suffix}`,
+    trigger: burst,
+    state: "pending",
+    execution: `exec_burst_${suffix}`,
+    waited: true,
+    payload: { body: { n: 1 } },
+    coalesced: 1,
+    admittedAt: at(0),
+    deadline: at(5),
+  });
+  const counted = await handle.moveIntake(burstRow.id, "pending", {
+    state: "pending",
+    payload: { body: { n: 2 } },
+    coalesced: 2,
+    deadline: at(6),
+    joined: { execution: `exec_arrival_${suffix}`, gate: { kind: "dedupe", key: UNICODE } },
+  });
+  const countedRow = await handle.intake(burstRow.id);
+  const byArrival = await handle.intakeOf(`exec_arrival_${suffix}`);
+  const byOwn = await handle.intakeOf(`exec_burst_${suffix}`);
+  results.a_debounced_arrival_is_found_by_the_id_its_gate_was_claimed_under =
+    burstRow.joined === undefined &&
+    counted === true &&
+    countedRow?.coalesced === 2 &&
+    countedRow?.joined?.execution === `exec_arrival_${suffix}` &&
+    countedRow?.joined?.gate?.kind === "dedupe" &&
+    countedRow?.joined?.gate?.key === UNICODE &&
+    byArrival?.id === burstRow.id &&
+    byArrival?.execution === `exec_burst_${suffix}` &&
+    byOwn?.id === burstRow.id &&
+    (await handle.intakeOf(`exec_never_counted_${suffix}`)) === undefined;
+
+  // Folding a gate re-points it at the pending row's execution and keeps its
+  // window; it moves a row only from the id it still names, for a dedupe key
+  // and a tick alike.
+  const folds = `folds_${suffix}`;
+  const claimedOnce = await handle.claimDedupe({
+    trigger: folds,
+    key: UNICODE,
+    execution: "exec_arrival",
+    admittedAt: at(0),
+    expiresAt: at(30),
+  });
+  await handle.foldGate(folds, { kind: "dedupe", key: UNICODE }, "exec_somebody_else", "exec_wrong");
+  const unmoved = await handle.claimDedupe({
+    trigger: folds,
+    key: UNICODE,
+    execution: "exec_repeat",
+    admittedAt: at(1),
+    expiresAt: at(31),
+  });
+  await handle.foldGate(folds, { kind: "dedupe", key: UNICODE }, "exec_arrival", "exec_pending");
+  const folded = await handle.claimDedupe({
+    trigger: folds,
+    key: UNICODE,
+    execution: "exec_repeat",
+    admittedAt: at(2),
+    expiresAt: at(32),
+  });
+  const tick = at(0);
+  await handle.fire({ trigger: folds, scheduledAt: tick, execution: "exec_tick", firedAt: at(0) });
+  await handle.foldGate(folds, { kind: "tick", scheduledAt: tick }, "exec_tick", "exec_pending");
+  const firedFolded = await handle.fire({
+    trigger: folds,
+    scheduledAt: tick,
+    execution: "exec_tick_again",
+    firedAt: at(1),
+  });
+  results.a_gate_folds_onto_its_pending_rows_execution_and_keeps_its_window =
+    claimedOnce.execution === "exec_arrival" &&
+    unmoved.execution === "exec_arrival" &&
+    folded.execution === "exec_pending" &&
+    folded.admittedAt === at(0) &&
+    folded.expiresAt === at(30) &&
+    firedFolded.execution === "exec_pending" &&
+    firedFolded.firedAt === at(0);
+
+  // The lease is read off the open lifecycle rows of the trigger: a settled
+  // execution's `started` row — the history every trigger keeps — holds no
+  // slot however many of them there are, and an open execution another
+  // trigger started is no slot of this one's.
+  const history = `history_${suffix}`;
+  const settledIds = [];
+  for (let n = 0; n < 25; n += 1) {
+    const execution = `exec_history_${n}_${suffix}`;
+    settledIds.push(execution);
+    await handle.admitIntake({
+      id: `int_history_${n}_${suffix}`,
+      trigger: history,
+      state: "started",
+      execution,
+      waited: false,
+      coalesced: 1,
+      admittedAt: at(n),
+      startedAt: at(n),
+    });
+    await handle.begin({ ...lifecycle(execution, at(n)), trigger: history });
+    await handle.end(execution, "completed");
+  }
+  const live = `exec_history_live_${suffix}`;
+  await handle.admitIntake({
+    id: `int_history_live_${suffix}`,
+    trigger: history,
+    state: "started",
+    execution: live,
+    waited: false,
+    coalesced: 1,
+    admittedAt: at(40),
+    startedAt: at(40),
+  });
+  await handle.begin({ ...lifecycle(live, at(40)), trigger: history });
+  const historic = await handle.leasesOf(history);
+  results.a_lease_holds_only_what_is_running_however_much_the_trigger_ran =
+    historic.length === 1 &&
+    historic[0]?.execution === live &&
+    historic[0]?.startedAt === at(40) &&
+    (await handle.leasesOf(builds)).every((lease) => lease.execution !== live);
 } finally {
   await journal.releaseJournal().catch(() => undefined);
 }
