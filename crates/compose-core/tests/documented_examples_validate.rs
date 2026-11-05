@@ -171,6 +171,7 @@ const TOPICS_WITHOUT_A_RUNNABLE_EXAMPLE: &[(&str, &str)] = &[
 const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
     "conflicting-connection-variable",
     "finally-interrupt",
+    "invalid-cron",
     "invalid-path-expression",
     "missing-callback-allowlist",
     "missing-capability",
@@ -208,6 +209,7 @@ const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
 /// its deploy blocks would still read as a worked example and would be checked
 /// by nothing.
 const EXPLANATIONS_WITH_A_DEPLOY_EXAMPLE: &[&str] = &[
+    "circular-checkpoint",
     "conflicting-placement",
     "conflicting-registry-credential",
     "harness-sdk-outside-audited-range",

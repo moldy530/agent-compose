@@ -229,15 +229,23 @@ it. `agent-compose docs targets` has where the journal lives;
 
 ## `serve`
 
-Same build, then starts the generated app for the project's `http` triggers:
-start, resume, cancel and status routes. `--port 0` takes one the operating system
-picks. Its stdout is the app's readiness line.
+Same build, then starts the generated app for the project's triggers: each
+`http` trigger's start route beside the status, resume and cancel routes, a
+scheduler for each `schedule` trigger, and the program of each `kind: command`
+event source an `event` trigger binds — with `GET /sources/:name` reporting it.
+`--port 0` takes one the operating system picks. Its stdout is the app's
+readiness line. A target that declares a `redis_streams`, `sqs` or `nats`
+source is refused at start, exit `2`, naming the source: this release runs no
+consumer for those kinds.
 
 On start it **recovers** every execution the journal holds open, before it
 accepts a connection: an execution parked on a `human` pause re-parks under the
 same wait id, so a `POST /executions/:id/resume` prepared against the process
 that died still finds its wait. Triggers are not re-fired — recovery replays the
-executions that exist.
+executions that exist — and the schedulers and source programs start only once
+it has: a tick already fired is not fired again, ticks that fell while nothing
+was serving are skipped and named in the log, and each program is started with
+the checkpoint it last had accepted.
 
 It does not wait for those replays, so an answer can arrive while one is still on
 its way back to its pause: that request is refused with `recovering: true` and
@@ -548,6 +556,9 @@ requires no deploy file at all. See `agent-compose docs targets`.
 | `AGENT_COMPOSE_MESH_POLL_HOLD_MS` | `serve`, on a target with `placements:` | how long the hub holds a worker's poll before answering it empty, in whole milliseconds; unset, it is `docs/distributed.md` §2's 25 seconds. It has to stay shorter than the liveness window, and a pair that does not is refused before the app listens. Lengthening it needs nothing of the workers (§10.2): `agent-compose worker` waits a hold out and then waits longer, which is how it learns one it was not built expecting |
 | `AGENT_COMPOSE_MESH_LIVENESS_WINDOW_MS` | `serve`, on a target with `placements:` | how long a worker session may go without a request before the hub declares it gone and supersedes the dispatch it was holding, in whole milliseconds; unset, it is §2's 90 seconds |
 | `AGENT_COMPOSE_STORE_CLOCK_OFFSET_MS` | the emitted project | whole milliseconds added to the clock a `kv` store judges expiry by — the process's on SQLite, the server's on `postgres`/`mysql` — for a test that moves past a `ttl:` without waiting for it (`agent-compose docs stores`); unset, it is `0`. A value that is not an integer fails the store op that reads it |
+| `AGENT_COMPOSE_SCHEDULE_CLOCK_OFFSET_MS` | `serve` | whole milliseconds added to the clock every `schedule` trigger's scheduler reads, for a test that simulates an outage — stop `serve`, restart it with a larger offset, and the ticks in between fell while nothing ran (`agent-compose docs triggers`); unset, it is `0`. A test's hook, not a deployment's setting: a value that is not an integer refuses the start |
+| `AGENT_COMPOSE_SCHEDULE_CLOCK_RATE` | `serve` | how many scheduler milliseconds pass per real one, counted from the start — at `60` an every-minute cron ticks once a second; unset, it is `1`. A test's hook like the offset beside it, refused at start unless it is a whole number of at least `1` |
+| `AGENT_COMPOSE_CHECKPOINT` | a `kind: command` source's program | set **by** `serve`, never read by it: the newest checkpoint the intake accepted for the source, handed to its program on every start. Unset before there is one, and the same value an argument written `{checkpoint}` is replaced by (`agent-compose docs targets`) |
 | `NO_COLOR` | every verb that reports | any non-empty value turns styling off, whatever the stream is |
 
 Provider credentials reach a run the same way: an `${ENV}` reference in the spec

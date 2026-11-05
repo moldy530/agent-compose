@@ -131,8 +131,8 @@ a trigger is specified in full.
 | field | type | presence | meaning |
 |---|---|---|---|
 | `name` | string | always | The trigger's name. |
-| `type` | `"manual"` \| `"http"` \| `"schedule"` \| `"event"` | always | Which of grammar §13's four it is. `schedule` and `event` are reserved grammar: parsed and carried, executing as no-ops in v0 (grammar §15). |
-| `summary` | string | always | The one line that says how an execution arrives — `POST /reports · respond async`, `cron 0 3 * * * (UTC) · reserved in v0`. Written for a person; §9.1 makes it text a reader MUST NOT parse. |
+| `type` | `"manual"` \| `"http"` \| `"schedule"` \| `"event"` | always | Which of grammar §13's four it is. All four execute: `schedule` and `event` under `serve`, which fires the one and runs the other's source (grammar §13.4, §13.5). |
+| `summary` | string | always | The one line that says how an execution arrives — `POST /reports · respond async`, `cron 0 3 * * * (UTC)`, `source bug_reports`. Written for a person; §9.1 makes it text a reader MUST NOT parse. |
 | `session_key` | string | when the trigger declares one | The CEL supplying session identity, which session-scoped stores and history key off (grammar §11.3). |
 | `description` | string | when the trigger declares one | `description:`. |
 | `input` | array of [bindings](#4-schemas-and-bindings) | when the trigger declares any | `input:` — flow input field to CEL over `payload`, in declaration order. |
