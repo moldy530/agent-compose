@@ -2220,6 +2220,8 @@ class IntakeLedger {
    * [`atStart`]).
    */
   readonly #unbounded = new Map<string, IntakeTrigger>();
+  /** The armed looks again at triggers declaring no block ([`#lookLater`]). */
+  readonly #looks = new Set<ReturnType<typeof setTimeout>>();
   #stopped = false;
 
   constructor(executions: Map<string, Execution>) {
@@ -2273,26 +2275,66 @@ class IntakeLedger {
         this.#redrainLater(trigger.name);
       });
     }
+    // Most such triggers hold no rows, so a journal this start cannot read
+    // yet — a standby's — is not said once per trigger: the recovery has said
+    // it, and each trigger is looked at again until the journal answers.
+    const unlooked: IntakeTrigger[] = [];
     for (const trigger of unboundedTriggers()) {
-      await this.#locked(trigger.name, async () => {
-        const journal = await openJournal();
-        if (!(await holdsOpenRows(journal, trigger.name))) return;
-        this.#unbounded.set(trigger.name, trigger);
+      await this.#lookUnbounded(trigger).catch(() => {
+        unlooked.push(trigger);
+      });
+    }
+    this.#lookLater(unlooked);
+  }
+
+  /**
+   * Look at the rows of one trigger this build declares with no
+   * `concurrency:` ([`atStart`]): none, and it is looked at no further; some,
+   * and from here on it is one of this ledger's, read with no bound.
+   */
+  #lookUnbounded(trigger: IntakeTrigger): Promise<void> {
+    return this.#locked(trigger.name, async () => {
+      if (this.#stopped || this.#unbounded.has(trigger.name)) return;
+      const journal = await openJournal();
+      if (!(await holdsOpenRows(journal, trigger.name))) return;
+      this.#unbounded.set(trigger.name, trigger);
+      sayIntake(
+        trigger.name,
+        "this build declares no `concurrency:` on the trigger, so the arrivals an earlier build's intake accepted for it start with no bound",
+      );
+      // A look cut short from here on is the ledger's own to make again
+      // ([`kick`]), as any trigger's is.
+      await this.#prepare(trigger).catch((error: unknown) => {
         sayIntake(
           trigger.name,
-          "this build declares no `concurrency:` on the trigger, so the arrivals an earlier build's intake accepted for it start with no bound",
-        );
-        await this.#prepare(trigger);
-      }).catch((error: unknown) => {
-        // Unknown whether it holds any: looked at again, as one that might.
-        this.#unbounded.set(trigger.name, trigger);
-        sayIntake(
-          trigger.name,
-          `its intake rows could not be read (${message(error)}); they are looked at again shortly`,
+          `its intake rows could not be read (${message(error)}); they are looked at again before its next admission`,
         );
         this.#redrainLater(trigger.name);
       });
-    }
+    });
+  }
+
+  /**
+   * Look again, in [`DRAIN_RETRY_MS`], at the triggers declaring no block
+   * whose rows a start could not read — quietly, since most such triggers hold
+   * none ([`atStart`]).
+   */
+  #lookLater(triggers: readonly IntakeTrigger[]): void {
+    if (this.#stopped || triggers.length === 0) return;
+    const timer = setTimeout(() => {
+      this.#looks.delete(timer);
+      void (async () => {
+        const still: IntakeTrigger[] = [];
+        for (const trigger of triggers) {
+          await this.#lookUnbounded(trigger).catch(() => {
+            still.push(trigger);
+          });
+        }
+        this.#lookLater(still);
+      })();
+    }, DRAIN_RETRY_MS);
+    timer.unref?.();
+    this.#looks.add(timer);
   }
 
   /** No timer is armed and no decision begun after this: the app is closing. */
@@ -2300,8 +2342,10 @@ class IntakeLedger {
     this.#stopped = true;
     for (const timer of this.#timers.values()) clearTimeout(timer);
     for (const timer of this.#drains.values()) clearTimeout(timer);
+    for (const timer of this.#looks) clearTimeout(timer);
     this.#timers.clear();
     this.#drains.clear();
+    this.#looks.clear();
   }
 
   /**
