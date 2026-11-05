@@ -870,6 +870,29 @@ export interface IntakeRow {
   readonly detail?: string;
   /** The row's place in insertion order — the order a group's queue drains in. */
   readonly order?: number;
+  /**
+   * A `pending` row's newest arrival, where that arrival kept a gate: the id
+   * its gate's row was claimed under, and the gate. Every arrival claims its
+   * gate under an id of its own, and the move that counts it into the row
+   * records the two — one statement, so an arrival is counted exactly where
+   * this names it — before the gate's row is re-pointed at the row's own
+   * execution ([`Journal.foldGate`], `docs/durability.md` §3.15). So a gate
+   * that names an id no row records is a claim no debounce counted, and one
+   * that names this is a counted arrival whose re-pointing a crash cut short.
+   */
+  readonly joined?: JoinedArrival;
+}
+
+/** The gate an arrival a debounce counted was admitted under. */
+export type IntakeGate =
+  | { readonly kind: "dedupe"; readonly key: string }
+  | { readonly kind: "tick"; readonly scheduledAt: string };
+
+/** What a `pending` row records of its newest arrival ([`IntakeRow.joined`]). */
+export interface JoinedArrival {
+  /** The id the arrival's gate was claimed under. */
+  readonly execution: string;
+  readonly gate: IntakeGate;
 }
 
 /**
@@ -887,6 +910,7 @@ export interface IntakeChange {
   readonly startedAt?: string;
   readonly detail?: string;
   readonly waited?: boolean;
+  readonly joined?: JoinedArrival;
 }
 
 /**
@@ -1182,7 +1206,11 @@ export interface Journal {
   admitIntake(row: IntakeRow): Promise<IntakeRow>;
   /** One intake row, by its id. */
   intake(id: string): Promise<IntakeRow | undefined>;
-  /** The newest intake row naming an execution, where one does. */
+  /**
+   * The newest intake row naming an execution, where one does — as the
+   * execution it starts or started, or else as the id its newest counted
+   * arrival's gate was claimed under ([`IntakeRow.joined`]).
+   */
   intakeOf(execution: string): Promise<IntakeRow | undefined>;
   /** A trigger's intake rows in one state, in insertion order — a queue's FIFO. */
   intakesOf(trigger: string, state: IntakeState): Promise<readonly IntakeRow[]>;
@@ -1200,6 +1228,15 @@ export interface Journal {
    * waiting arrival goes through, so two movers of one row agree on one winner.
    */
   moveIntake(id: string, from: IntakeState, change: IntakeChange): Promise<boolean>;
+  /**
+   * Re-point a gate's row — a dedupe key's, or a tick's `fired` row — from
+   * the id an arrival claimed it under to the execution the `pending` row that
+   * counted the arrival will start, keeping its window: the step that folds a
+   * debounced arrival into its row (`docs/durability.md` §3.15). Conditional
+   * on the row still naming `from`, so a key another admission has since
+   * taken, or a fold already made, is left as it is.
+   */
+  foldGate(trigger: string, gate: IntakeGate, from: string, to: string): Promise<void>;
   /**
    * Take back a `started` row that never waited and whose execution never
    * began — a claim no answer was ever given for — answering whether this call
@@ -1996,8 +2033,9 @@ class SqlJournal implements Journal {
       await this.#run(
         `INSERT INTO intakes
            (id, trigger_name, group_hash, group_key, state, execution, waited, held_by, payload,
-            admission, coalesced, admitted_at, deadline, started_at, detail)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            admission, coalesced, admitted_at, deadline, started_at, detail, joined_execution,
+            joined_gate)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ${this.#conflict("(id)", "id = id")}`,
         [
           row.id,
@@ -2015,6 +2053,8 @@ class SqlJournal implements Journal {
           row.deadline ?? null,
           row.startedAt ?? null,
           row.detail ?? null,
+          row.joined?.execution ?? null,
+          row.joined === undefined ? null : JSON.stringify(row.joined.gate),
         ],
       );
       return (await this.#intake(row.id)) ?? row;
@@ -2036,10 +2076,19 @@ class SqlJournal implements Journal {
   intakeOf(execution: string): Promise<IntakeRow | undefined> {
     return this.#serial(async () => {
       const order = this.#driver.dialect.insertionOrder;
-      const found = await this.#one(
-        `SELECT intakes.${order} AS insertion_order, intakes.* FROM intakes WHERE execution = ? ORDER BY intakes.${order} DESC LIMIT 1`,
-        [execution],
-      );
+      // Two reads, each down an index of its own, rather than one `OR` a
+      // planner may answer with a scan: the row that starts the execution
+      // first, and only where there is none, the row whose newest counted
+      // arrival's gate was claimed under the id.
+      const found =
+        (await this.#one(
+          `SELECT intakes.${order} AS insertion_order, intakes.* FROM intakes WHERE execution = ? ORDER BY intakes.${order} DESC LIMIT 1`,
+          [execution],
+        )) ??
+        (await this.#one(
+          `SELECT intakes.${order} AS insertion_order, intakes.* FROM intakes WHERE joined_execution = ? ORDER BY intakes.${order} DESC LIMIT 1`,
+          [execution],
+        ));
       return found === undefined ? undefined : intakeOf(found);
     });
   }
@@ -2101,6 +2150,10 @@ class SqlJournal implements Journal {
       if (change.startedAt !== undefined) set("started_at", change.startedAt);
       if (change.detail !== undefined) set("detail", change.detail);
       if (change.waited !== undefined) set("waited", change.waited ? 1 : 0);
+      if (change.joined !== undefined) {
+        set("joined_execution", change.joined.execution);
+        set("joined_gate", JSON.stringify(change.joined.gate));
+      }
       const before = await this.#one("SELECT state FROM intakes WHERE id = ?", [id]);
       if (before === undefined || String(before["state"]) !== from) return false;
       await this.#run(`UPDATE intakes SET ${sets.join(", ")} WHERE id = ? AND state = ?`, [
@@ -2117,7 +2170,26 @@ class SqlJournal implements Journal {
         after.state === change.state &&
         (change.execution === undefined || after.execution === change.execution) &&
         (change.coalesced === undefined || after.coalesced === change.coalesced) &&
-        (change.deadline === undefined || after.deadline === change.deadline)
+        (change.deadline === undefined || after.deadline === change.deadline) &&
+        (change.joined === undefined || after.joined?.execution === change.joined.execution)
+      );
+    });
+  }
+
+  foldGate(trigger: string, gate: IntakeGate, from: string, to: string): Promise<void> {
+    return this.#serial(async () => {
+      // The gate's own column and nothing else: a dedupe row keeps the window
+      // its claim opened, and a `fired` row the instant its tick was claimed.
+      if (gate.kind === "dedupe") {
+        await this.#run(
+          "UPDATE dedupe SET execution = ? WHERE trigger_name = ? AND key_hash = ? AND execution = ?",
+          [to, trigger, keyHash(gate.key), from],
+        );
+        return;
+      }
+      await this.#run(
+        "UPDATE fired SET execution = ? WHERE trigger_name = ? AND scheduled_at = ? AND execution = ?",
+        [to, trigger, gate.scheduledAt, from],
       );
     });
   }
@@ -2142,15 +2214,25 @@ class SqlJournal implements Journal {
       // is open and whose cancel nobody has requested. A restart therefore
       // finds the lease the rows hold, and a slot frees the moment the row
       // that held it closes or is asked to cancel.
+      //
+      // **Driven from the open lifecycle rows**, never from the intake's:
+      // intake rows are kept (§3.15), so a trigger's `started` rows are its
+      // whole history, while its open executions are what is running now. The
+      // one constant the statement gives the outer table is the
+      // `executions_by_status` index's `status`, and the trigger is matched on
+      // the lifecycle row's own `trigger_kind` — never on an `intakes` column a
+      // planner could start from — so the read walks the open rows and probes
+      // each one's intake row down `intakes_by_execution`: what it costs is
+      // what is running, not what ever ran.
       const rows = await this.#all(
-        `SELECT intakes.execution AS execution, intakes.group_key AS group_key,
+        `SELECT executions.id AS execution, intakes.group_key AS group_key,
                 executions.started_at AS started_at
-           FROM intakes
-           JOIN executions ON executions.id = intakes.execution
-           LEFT JOIN cancellations ON cancellations.execution = intakes.execution
-          WHERE intakes.trigger_name = ? AND intakes.state = 'started'
-            AND executions.status = 'open' AND cancellations.execution IS NULL
-          ORDER BY executions.started_at ASC, intakes.execution ASC`,
+           FROM executions
+           JOIN intakes ON intakes.execution = executions.id
+           LEFT JOIN cancellations ON cancellations.execution = executions.id
+          WHERE executions.status = 'open' AND executions.trigger_kind = ?
+            AND intakes.state = 'started' AND cancellations.execution IS NULL
+          ORDER BY executions.started_at ASC, executions.id ASC`,
         [trigger],
       );
       return rows.map((row) => {
@@ -2302,6 +2384,8 @@ function intakeOf(row: Row): IntakeRow {
   const deadline = optional("deadline");
   const startedAt = optional("started_at");
   const detail = optional("detail");
+  const joinedExecution = optional("joined_execution");
+  const joinedGate = optional("joined_gate");
   const order = row["insertion_order"];
   return {
     id: String(row["id"]),
@@ -2319,6 +2403,9 @@ function intakeOf(row: Row): IntakeRow {
     ...(startedAt === undefined ? {} : { startedAt }),
     ...(detail === undefined ? {} : { detail }),
     ...(order === null || order === undefined ? {} : { order: Number(order) }),
+    ...(joinedExecution === undefined || joinedGate === undefined
+      ? {}
+      : { joined: { execution: joinedExecution, gate: JSON.parse(joinedGate) as IntakeGate } }),
   };
 }
 
@@ -2494,7 +2581,9 @@ CREATE TABLE IF NOT EXISTS intakes (
   admitted_at  TEXT NOT NULL,
   deadline     TEXT,
   started_at   TEXT,
-  detail       TEXT
+  detail       TEXT,
+  joined_execution TEXT,
+  joined_gate      TEXT
 );
 CREATE TABLE IF NOT EXISTS checkpoints (
   source           TEXT PRIMARY KEY,
@@ -2677,6 +2766,19 @@ async function migrated(
       if (!dedupe.some((column) => column["name"] === "expires_at")) {
         database.exec("ALTER TABLE dedupe ADD COLUMN expires_at TEXT;");
       }
+      // A pending row's newest counted arrival (`docs/durability.md` §3.15),
+      // added to the intake ledger after an earlier build of it created the
+      // table: nullable, because a row with none is a row no gated arrival
+      // joined. Its index is made here rather than in the schema above, which
+      // runs before a table it finds already there has the column.
+      const intakes = database.all("PRAGMA table_info(intakes)") as Row[];
+      if (!intakes.some((column) => column["name"] === "joined_execution")) {
+        database.exec("ALTER TABLE intakes ADD COLUMN joined_execution TEXT;");
+      }
+      if (!intakes.some((column) => column["name"] === "joined_gate")) {
+        database.exec("ALTER TABLE intakes ADD COLUMN joined_gate TEXT;");
+      }
+      database.exec("CREATE INDEX IF NOT EXISTS intakes_by_joined ON intakes (joined_execution);");
       const effects = database.all("PRAGMA table_info(effects)") as Row[];
       if (!effects.some((column) => column["name"] === "refused")) {
         database.exec("ALTER TABLE effects ADD COLUMN refused INTEGER NOT NULL DEFAULT 0;");
@@ -4369,8 +4471,21 @@ CREATE TABLE IF NOT EXISTS intakes (
   admitted_at  TEXT COLLATE "C" NOT NULL,
   deadline     TEXT COLLATE "C",
   started_at   TEXT COLLATE "C",
-  detail       TEXT
+  detail       TEXT,
+  joined_execution TEXT COLLATE "C",
+  joined_gate      TEXT
 );
+DO $migrate$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_attribute
+    WHERE attrelid = 'intakes'::regclass AND attname = 'joined_execution' AND NOT attisdropped
+  ) THEN
+    ALTER TABLE intakes ADD COLUMN IF NOT EXISTS joined_execution TEXT COLLATE "C";
+    ALTER TABLE intakes ADD COLUMN IF NOT EXISTS joined_gate TEXT;
+  END IF;
+END
+$migrate$;
 CREATE TABLE IF NOT EXISTS checkpoints (
   source           TEXT COLLATE "C" PRIMARY KEY,
   checkpoint_value TEXT NOT NULL,
@@ -4393,6 +4508,7 @@ CREATE INDEX IF NOT EXISTS dispatches_by_id ON dispatches (id);
 CREATE INDEX IF NOT EXISTS dispatches_by_status ON dispatches (status, parked_at);
 CREATE INDEX IF NOT EXISTS intakes_by_trigger ON intakes (trigger_name, state, group_hash);
 CREATE INDEX IF NOT EXISTS intakes_by_execution ON intakes (execution);
+CREATE INDEX IF NOT EXISTS intakes_by_joined ON intakes (joined_execution);
 `;
 
 /**

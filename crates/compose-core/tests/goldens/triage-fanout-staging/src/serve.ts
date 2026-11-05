@@ -220,6 +220,7 @@ import {
   type IntakeAdmission,
   type IntakeChange,
   type IntakeRow,
+  type JoinedArrival,
   type Journal,
   type Lease,
   openJournal,
@@ -1241,6 +1242,16 @@ async function start(
       error: `the trigger \`${trigger.name}\` could not read this request: ${message(error)}`,
     });
   }
+  // A key that answered the empty string names nothing a repeat could be told
+  // by: every request whose field is empty, or whose fallback answered `''`,
+  // would be one delivery for the whole window, and all but the first would
+  // start nothing. It is refused, as an empty `session_key:` a flow needs is
+  // (Decision D163's Status).
+  if (dedupe === "") {
+    return reply.code(400).send({
+      error: `the trigger \`${trigger.name}\` could not read this request: ${EMPTY_DEDUPE_KEY}`,
+    });
+  }
 
   // The payload is held to the flow's own `inputs:` before an execution exists,
   // which is what makes a bad request a `400` rather than a failed run: the same
@@ -1351,7 +1362,7 @@ async function answered(
       // Under `sync`, a repeat waits on the execution the first delivery
       // started, up to the budget, as the first did (Decision D163's Status).
       if (record !== undefined) return responded(trigger, reply, record);
-      return reply.code(202).send({ execution_id: running, status_url: `/executions/${running}` });
+      return journaledAnswer(reply, running, holder);
     }
     case "queued":
     case "pending":
@@ -1371,6 +1382,38 @@ async function answered(
         error: `the trigger \`${trigger.name}\` admitted this request, but its execution could not be journaled (${admitted.reason}): nothing started, so the request may be sent again`,
       });
   }
+}
+
+/**
+ * A repeat's answer where the execution it names is not this process's: one
+ * that settled before this process started, which recovery does not put back
+ * on its board (`docs/durability.md` §6.1). Its lifecycle row answers — the
+ * id, the status, the status URL, the shape an `async` start has — and under
+ * `respond: sync` the same `202`, because the row holds no outputs to answer
+ * with (Decision D163's Status). An intake row owed a start whose execution
+ * has no row yet answers as the intake it is.
+ */
+async function journaledAnswer(
+  reply: FastifyReply,
+  id: string,
+  holder: IntakeRow | undefined,
+): Promise<unknown> {
+  let row: runtime.ExecutionRow | undefined;
+  try {
+    row = await (await openJournal()).execution(id);
+  } catch {
+    row = undefined;
+  }
+  if (row === undefined && holder !== undefined && holder.state === "started") {
+    return reply.code(202).send({
+      intake_id: holder.id,
+      status: holder.state,
+      status_url: `/intakes/${holder.id}`,
+    });
+  }
+  const status: ExecutionStatus =
+    row === undefined || row.status === "open" ? "running" : row.status;
+  return reply.code(202).send({ execution_id: id, status, status_url: `/executions/${id}` });
 }
 
 /** What a started execution answers, per `respond:` (grammar 13.3). */
@@ -1503,10 +1546,12 @@ type AdmitAnswer =
  * schedule and starts it under the claim ([`admitUnbegun`]), and an event's
  * retry takes the key over.
  *
- * An `http` request keeps no gate in this release, and is answered as soon as
- * its run is set going, as it always was: a run that fails before its row is
- * reported by the status route and the completion webhook ([`settling`]).
- * PRD resolved q77 gives it `dedupe_key:` on this same seam.
+ * An `http` request with no `dedupe_key:` keeps no gate, and is answered as
+ * soon as its run is set going, as it always was: a run that fails before its
+ * row is reported by the status route and the completion webhook
+ * ([`settling`]). One with a key keeps the dedupe gate on this same seam (PRD
+ * resolved q77 ruling a), and is answered only once its lifecycle row is down,
+ * as a tick or an event is.
  */
 async function admit(
   executions: Map<string, Execution>,
@@ -1568,6 +1613,17 @@ async function claimGate(
   | { readonly outcome: "held"; readonly execution: string; readonly intake?: IntakeRow }
 > {
   const gate = admission.gate;
+  // A repeat is answered with the execution its holder is or will be: under a
+  // debounce, the one the row that counted it starts — which a gate a crash
+  // cut short of its fold still names by the arrival's own id (D163).
+  const repeat = async (holder: string) => {
+    const intake = await journal.intakeOf(holder);
+    return {
+      outcome: "held" as const,
+      execution: intake?.execution ?? holder,
+      ...(intake === undefined ? {} : { intake }),
+    };
+  };
   if (gate?.kind === "tick") {
     const held = await journal.fire({
       trigger: admission.trigger,
@@ -1575,9 +1631,9 @@ async function claimGate(
       execution: id,
       firedAt: new Date().toISOString(),
     });
-    if (held.execution !== id) return { outcome: "held", execution: held.execution };
+    if (held.execution !== id) return repeat(held.execution);
     if (admission.execution !== undefined && (await begun(executions, journal, id))) {
-      return { outcome: "held", execution: id };
+      return repeat(id);
     }
     return { outcome: "claimed", fired: held };
   }
@@ -1590,14 +1646,6 @@ async function claimGate(
         execution: id,
         admittedAt: new Date(at).toISOString(),
         expiresAt: new Date(at + gate.windowMs).toISOString(),
-      };
-    };
-    const repeat = async (holder: string) => {
-      const intake = await journal.intakeOf(holder);
-      return {
-        outcome: "held" as const,
-        execution: holder,
-        ...(intake === undefined ? {} : { intake }),
       };
     };
     const held = await journal.claimDedupe(claim());
@@ -1637,8 +1685,10 @@ async function begun(
   if (executions.has(id) || (await journal.execution(id)) !== undefined) return true;
   // …or one an intake accepted (PRD resolved q77): queued, pending, dropped,
   // or started after it waited — which the intake starts, or repairs at its
-  // next start ([`IntakeLedger`]). A `started` row that never waited and whose
-  // execution never began was answered to nobody, and is no admission.
+  // next start ([`IntakeLedger`]) — or an arrival a debounce counted, whose
+  // gate was claimed under `id` and not yet folded into the row's execution
+  // ([`Journal.intakeOf`] reads both). A `started` row that never waited and
+  // whose execution never began was answered to nobody, and is no admission.
   const intake = await journal.intakeOf(id);
   return intake !== undefined && (intake.state !== "started" || intake.waited);
 }
@@ -1791,6 +1841,7 @@ async function admitEvent(
   let group: string | undefined;
   try {
     key = trigger.dedupeKey(payload);
+    if (key === "") throw new Error(EMPTY_DEDUPE_KEY);
     if (concurrency?.key !== undefined) group = concurrency.key(payload);
     inputs = trigger.input(bound);
     if (trigger.sessionKey !== undefined) sessionKey = trigger.sessionKey(bound);
@@ -1853,6 +1904,10 @@ const DROPPED_HEADER = "X-AgentCompose-Dropped";
 
 /** The `24h` a dedupe key is held for where a trigger declares no window. */
 const DEFAULT_DEDUPE_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/** Why an arrival whose `dedupe_key:` answered `''` is refused (Decision D163). */
+const EMPTY_DEDUPE_KEY =
+  "its `dedupe_key:` answered the empty string, so there is no key to tell a repeat of it by (grammar 13.3)";
 
 /**
  * How soon a trigger whose queue still holds rows is looked at again.
@@ -2048,9 +2103,10 @@ function released(trigger: string): void {
  * serialization, not a counter: what is counted is still the rows.
  *
  * Every decision lands on [`admit`]'s seam: the gate a kind keeps — a tick's
- * `fired` row, a dedupe key — is claimed first, under the execution id the
- * arrival will start (or, under a debounce, the id of the open row it joins),
- * and only then is the group asked.
+ * `fired` row, a dedupe key — is claimed first, under the arrival's own id —
+ * the execution it will start, or under a debounce the id its group's pending
+ * row records it by once it is counted ([`#debounce`]) — and only then is the
+ * group asked.
  */
 class IntakeLedger {
   readonly #executions: Map<string, Execution>;
@@ -2062,6 +2118,11 @@ class IntakeLedger {
   readonly #timers = new Map<string, ReturnType<typeof setTimeout>>();
   /** The armed re-drains, by trigger. */
   readonly #drains = new Map<string, ReturnType<typeof setTimeout>>();
+  /**
+   * The starts this process owes and could not put back on the queue, by
+   * trigger, each with why its execution was not journaled ([`#begin`]).
+   */
+  readonly #owed = new Map<string, Map<string, string>>();
   #stopped = false;
 
   constructor(executions: Map<string, Execution>) {
@@ -2146,8 +2207,9 @@ class IntakeLedger {
    *    execution never began is a claim nobody was told of, and is taken back
    *    — its arrival's own source re-delivers it;
    *  * the queue drains as the lease the rows hold allows;
-   *  * each open debounce is armed at its deadline, re-derived from the row —
-   *    one already past fires at once.
+   *  * each open debounce has its newest arrival's gate folded, and is armed
+   *    at its deadline, re-derived from the row — one already past fires at
+   *    once.
    */
   async #prepare(trigger: IntakeTrigger): Promise<void> {
     const journal = await openJournal();
@@ -2168,7 +2230,12 @@ class IntakeLedger {
     }
     this.#prepared.add(trigger.name);
     await this.#drain(journal, trigger);
-    for (const row of await journal.intakesOf(trigger.name, "pending")) this.#arm(row);
+    for (const row of await journal.intakesOf(trigger.name, "pending")) {
+      // A counted arrival whose gate a stopped serve had not yet moved onto
+      // the row's execution ([`#debounce`]).
+      await this.#fold(journal, row);
+      this.#arm(row);
+    }
   }
 
   /**
@@ -2182,15 +2249,15 @@ class IntakeLedger {
       if (!this.#prepared.has(trigger.name)) await this.#prepare(trigger);
       const { group, payload } = admission.intake;
       const concurrency = trigger.concurrency;
-      // **A debounce joins its group's open row** (PRD resolved q77 ruling
-      // c): the arrival's gate is claimed under the execution that row will
-      // start, so a tick's `fired` row and a dedupe row name an execution the
-      // intake holds — never one nothing will ever begin.
-      const pending =
-        concurrency.debounceMs === undefined
-          ? undefined
-          : await journal.pendingIntake(trigger.name, group);
-      const id = admission.execution ?? pending?.execution ?? newExecutionId();
+      // **Every arrival claims its gate under an id of its own** (Decision
+      // D163's Status) — the execution it starts, or under a debounce, the id
+      // its group's open row records it by once the row has counted it. So a
+      // tick's `fired` row and a dedupe row name an id the intake holds
+      // exactly where the arrival was admitted: a repeat finds what the first
+      // got, and a claim a crash left uncounted names an id nothing holds —
+      // which the gate's repair and takeover read as a claim no admission
+      // began under, and admit again.
+      const id = admission.execution ?? newExecutionId();
       const gate = await claimGate(this.#executions, journal, admission, id);
       if (gate.outcome === "held") return gate;
       const bound: IntakeAdmission = {
@@ -2200,7 +2267,8 @@ class IntakeLedger {
         ...(admission.traceparent === undefined ? {} : { traceparent: admission.traceparent }),
       };
       if (concurrency.debounceMs !== undefined) {
-        return this.#debounce(journal, trigger, group, payload, id, pending, admission.execution);
+        const pending = await journal.pendingIntake(trigger.name, group);
+        return this.#debounce(journal, trigger, group, payload, id, pending, admission.gate);
       }
       // The queue first: a slot that freed is the oldest waiting arrival's,
       // never a newcomer's (FIFO per group, PRD resolved q77 ruling b).
@@ -2213,6 +2281,22 @@ class IntakeLedger {
    * Open the group's debounce, or extend the one it has: the newest payload,
    * a deadline `debounce:` from now, one more arrival coalesced (PRD resolved
    * q77 ruling c).
+   *
+   * **An arrival is counted in the move that records it** (Decision D163's
+   * Status, `docs/durability.md` §3.15). Its gate was claimed under `id`, its
+   * own; the move that adds it to `coalesced` names `id` and the gate as the
+   * row's newest arrival, in the one statement, and only then is the gate's
+   * row re-pointed at the execution the row will start ([`#fold`]). So:
+   *
+   *  * a repeat of a counted arrival finds the row — through the folded gate,
+   *    or the record of the newest — and is answered with it, never counted
+   *    again;
+   *  * a claim a crash left before the move names an id nothing records,
+   *    which a repeat's takeover and a tick's repair read as a claim no
+   *    admission began under — so the arrival is counted when it comes again,
+   *    never lost;
+   *  * a crash between the move and the fold leaves the row naming the gate,
+   *    and the next move, the close or the next start folds it first.
    */
   async #debounce(
     journal: Journal,
@@ -2221,30 +2305,50 @@ class IntakeLedger {
     payload: unknown,
     id: string,
     pending: IntakeRow | undefined,
-    repairing: string | undefined,
+    gate: Admission["gate"],
   ): Promise<AdmitAnswer> {
     const debounce = trigger.concurrency.debounceMs ?? 0;
     const now = Date.now();
     const deadline = new Date(now + debounce).toISOString();
+    const joined: JoinedArrival | undefined =
+      gate === undefined
+        ? undefined
+        : {
+            execution: id,
+            gate:
+              gate.kind === "tick"
+                ? { kind: "tick", scheduledAt: gate.scheduledAt }
+                : { kind: "dedupe", key: gate.key },
+          };
     if (pending !== undefined) {
+      // The arrival the row last counted is folded first: this move overwrites
+      // the record of it, and a gate naming an id nothing records any more
+      // would read as a claim nobody counted.
+      await this.#fold(journal, pending);
       const moved = await journal.moveIntake(pending.id, "pending", {
         state: "pending",
         payload,
         coalesced: pending.coalesced + 1,
         deadline,
-        // A tick a dead process claimed and never admitted, coalesced here on
-        // its repair: the row starts under the id that tick's `fired` row
-        // names, so the newest claim names an execution the intake holds.
-        ...(repairing !== undefined && repairing !== pending.execution
-          ? { execution: repairing }
-          : {}),
+        ...(joined === undefined ? {} : { joined }),
       });
       const row = moved ? await journal.intake(pending.id) : undefined;
       if (row !== undefined) {
+        // …and this one, now that it is counted. One that cannot be folded now
+        // is folded by the next move, the close or the next start: the row
+        // records it, which is what a repeat of it reads meanwhile.
+        await this.#fold(journal, row).catch((error: unknown) => {
+          sayIntake(
+            trigger.name,
+            `${row.id} counted an arrival whose gate could not yet be moved onto ${row.execution} (${message(error)}); it is moved when the debounce next moves`,
+          );
+        });
         this.#arm(row);
         return { outcome: "pending", intake: row };
       }
     }
+    // None open, or it closed under this decision: the arrival opens one,
+    // which starts under the id its gate was claimed under — nothing to fold.
     const row = await journal.admitIntake({
       id: newIntakeId(),
       trigger: trigger.name,
@@ -2348,6 +2452,18 @@ class IntakeLedger {
     return { outcome: "queued", intake: row };
   }
 
+  /**
+   * Re-point the gate of the arrival `row` counted last at the execution the
+   * row starts ([`Journal.foldGate`]). Nothing where the row records none, or
+   * where that arrival opened the row and so claimed its gate under the row's
+   * own id.
+   */
+  async #fold(journal: Journal, row: IntakeRow): Promise<void> {
+    const joined = row.joined;
+    if (joined === undefined || joined.execution === row.execution) return;
+    await journal.foldGate(row.trigger, joined.gate, joined.execution, row.execution);
+  }
+
   /** Move a waiting row on, answering what it became. */
   async #moved(journal: Journal, row: IntakeRow, change: IntakeChange): Promise<IntakeRow> {
     if (!(await journal.moveIntake(row.id, row.state, change))) {
@@ -2420,13 +2536,17 @@ class IntakeLedger {
       const reason = message(error);
       if (row.waited) {
         // Owed: the arrival was answered with its intake id, so the row goes
-        // back on the queue and is started again as a slot allows.
-        await journal
-          .moveIntake(row.id, "started", {
-            state: "queued",
-            detail: `its execution could not be journaled: ${reason}`,
-          })
-          .catch(() => undefined);
+        // back on the queue and is started again as a slot allows. A journal
+        // that will not take that move either leaves the row `started`, naming
+        // an execution that never began — which no drain reads, since a drain
+        // reads the queue — so the start is remembered as owed, and every drain
+        // of the trigger tries the move again until it lands ([`#requeue`]);
+        // the next start of `serve` finds the row either way ([`#prepare`]).
+        const detail = `its execution could not be journaled: ${reason}`;
+        const requeued = await journal
+          .moveIntake(row.id, "started", { state: "queued", detail })
+          .catch(() => false);
+        if (!requeued) this.#owe(trigger.name, row.id, detail);
         sayIntake(
           trigger.name,
           `${row.id}'s execution ${id} could not be journaled (${reason}); it waits on the queue again`,
@@ -2455,6 +2575,7 @@ class IntakeLedger {
    * while the trigger is at its `max_running:`.
    */
   async #drain(journal: Journal, trigger: IntakeTrigger): Promise<void> {
+    const owed = await this.#requeue(journal, trigger);
     const queued = await journal.intakesOf(trigger.name, "queued");
     let waiting = queued.length;
     for (const row of queued) {
@@ -2468,7 +2589,44 @@ class IntakeLedger {
       if (answer.outcome !== "started") break;
       waiting -= 1;
     }
-    if (waiting > 0) this.#redrainLater(trigger.name);
+    if (waiting > 0 || owed || this.#owed.has(trigger.name)) this.#redrainLater(trigger.name);
+  }
+
+  /** Remember a start this process owes and could not put back on the queue. */
+  #owe(name: string, id: string, detail: string): void {
+    const owed = this.#owed.get(name) ?? new Map<string, string>();
+    owed.set(id, detail);
+    this.#owed.set(name, owed);
+  }
+
+  /**
+   * Put each start this process owes back on the queue ([`#owe`]), where the
+   * row still names an execution that never began — answering whether any is
+   * still owed. A row that has moved on, or whose execution the journal holds
+   * after all, is owed nothing.
+   */
+  async #requeue(journal: Journal, trigger: IntakeTrigger): Promise<boolean> {
+    const owed = this.#owed.get(trigger.name);
+    if (owed === undefined) return false;
+    for (const [id, detail] of [...owed]) {
+      const row = await journal.intake(id);
+      if (
+        row === undefined ||
+        row.state !== "started" ||
+        this.#executions.has(row.execution) ||
+        (await journal.execution(row.execution)) !== undefined
+      ) {
+        owed.delete(id);
+        continue;
+      }
+      if (await journal.moveIntake(id, "started", { state: "queued", detail })) {
+        owed.delete(id);
+        sayIntake(trigger.name, `${id} is back on the queue: ${detail}`);
+      }
+    }
+    if (owed.size > 0) return true;
+    this.#owed.delete(trigger.name);
+    return false;
   }
 
   /** Look at a trigger's queue again in [`DRAIN_RETRY_MS`], once. */
@@ -2521,6 +2679,9 @@ class IntakeLedger {
       sayIntake(row.trigger, `${row.id} stays pending: this build declares no \`concurrency:\` on the trigger`);
       return;
     }
+    // Every counted arrival's gate names the execution about to be decided
+    // before it is: a repeat of one after this is a repeat of that execution.
+    await this.#fold(journal, row);
     let bound: IntakeAdmission;
     try {
       bound = trigger.bind({ ...(row.payload as Record<string, unknown>), coalesced: row.coalesced });

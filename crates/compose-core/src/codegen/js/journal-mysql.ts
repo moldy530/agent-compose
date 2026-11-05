@@ -226,10 +226,13 @@ const MYSQL_SCHEMA = [
   deadline     VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NULL,
   started_at   VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NULL,
   detail       LONGTEXT,
+  joined_execution VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NULL,
+  joined_gate      LONGTEXT,
   PRIMARY KEY (id),
   UNIQUE KEY intakes_seq (seq),
   KEY intakes_by_trigger (trigger_name, state, group_hash),
-  KEY intakes_by_execution (execution)
+  KEY intakes_by_execution (execution),
+  KEY intakes_by_joined (joined_execution)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
   `CREATE TABLE IF NOT EXISTS checkpoints (
   source           VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
@@ -278,6 +281,18 @@ const MYSQL_MIGRATIONS: readonly { readonly probe: string; readonly add: string 
       "AND TABLE_NAME = 'dedupe' AND COLUMN_NAME = 'expires_at'",
     add:
       "ALTER TABLE dedupe ADD COLUMN expires_at VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NULL AFTER admitted_at",
+  },
+  // A pending intake row's newest counted arrival (`docs/durability.md`
+  // §3.15), added after an earlier build of the ledger created the table:
+  // nullable, because a row with none is one no gated arrival joined; the
+  // index `intakeOf` reads it down comes with it, in the one statement.
+  {
+    probe:
+      "SELECT COUNT(*) AS held FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() " +
+      "AND TABLE_NAME = 'intakes' AND COLUMN_NAME = 'joined_execution'",
+    add:
+      "ALTER TABLE intakes ADD COLUMN joined_execution VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NULL AFTER detail, " +
+      "ADD COLUMN joined_gate LONGTEXT NULL AFTER joined_execution, ADD KEY intakes_by_joined (joined_execution)",
   },
 ];
 

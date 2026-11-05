@@ -175,8 +175,21 @@ CREATE TABLE IF NOT EXISTS intakes (
   admitted_at  TEXT COLLATE "C" NOT NULL,
   deadline     TEXT COLLATE "C",
   started_at   TEXT COLLATE "C",
-  detail       TEXT
+  detail       TEXT,
+  joined_execution TEXT COLLATE "C",
+  joined_gate      TEXT
 );
+DO $migrate$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_attribute
+    WHERE attrelid = 'intakes'::regclass AND attname = 'joined_execution' AND NOT attisdropped
+  ) THEN
+    ALTER TABLE intakes ADD COLUMN IF NOT EXISTS joined_execution TEXT COLLATE "C";
+    ALTER TABLE intakes ADD COLUMN IF NOT EXISTS joined_gate TEXT;
+  END IF;
+END
+$migrate$;
 CREATE TABLE IF NOT EXISTS checkpoints (
   source           TEXT COLLATE "C" PRIMARY KEY,
   checkpoint_value TEXT NOT NULL,
@@ -199,6 +212,7 @@ CREATE INDEX IF NOT EXISTS dispatches_by_id ON dispatches (id);
 CREATE INDEX IF NOT EXISTS dispatches_by_status ON dispatches (status, parked_at);
 CREATE INDEX IF NOT EXISTS intakes_by_trigger ON intakes (trigger_name, state, group_hash);
 CREATE INDEX IF NOT EXISTS intakes_by_execution ON intakes (execution);
+CREATE INDEX IF NOT EXISTS intakes_by_joined ON intakes (joined_execution);
 `;
 
 /**

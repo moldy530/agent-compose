@@ -198,6 +198,7 @@ import {
   type ExecutionStatus,
   type FiredRow,
   type IntakeChange,
+  type IntakeGate,
   type IntakeRow,
   type IntakeState,
   type Journal,
@@ -552,6 +553,10 @@ class DispatchJournal implements Journal {
   }
 
   abandonIntake(_id: string): Promise<boolean> {
+    throw new WorkerJournalReach("admit a trigger's arrival");
+  }
+
+  foldGate(_trigger: string, _gate: IntakeGate, _from: string, _to: string): Promise<void> {
     throw new WorkerJournalReach("admit a trigger's arrival");
   }
 
