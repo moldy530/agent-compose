@@ -2366,6 +2366,18 @@ const SOURCES: &[Criterion] = &[
                 "two_serves_on_one_postgres_journal_fire_each_tick_once",
                 Status::Live,
             ),
+            // …and once, not never, for a tick a `serve` claimed and died
+            // before starting: the next start runs it under the recorded id.
+            (
+                "a_tick_claimed_by_a_serve_that_stopped_before_starting_it_is_started_by_the_next_serve",
+                Status::Live,
+            ),
+            // …with a skipped span past the counted ticks still named through
+            // the last tick before the start.
+            (
+                "a_skipped_span_past_the_counted_ticks_ends_at_the_last_tick_before_the_start",
+                Status::Live,
+            ),
             // …by an evaluator that agrees with the validator's, over the
             // shared corpus and its daylight-saving cases.
             (
@@ -2405,6 +2417,29 @@ const SOURCES: &[Criterion] = &[
             // …a line that is not an object is refused and counted.
             (
                 "a_line_that_is_not_a_json_object_is_refused_counted_and_starts_nothing",
+                Status::Live,
+            ),
+            // …the checkpoint moves only for an event the intake accepted: not
+            // for one every trigger refuses, nor one the journal will not yet
+            // admit, which holds the stream instead.
+            (
+                "an_event_every_bound_trigger_refuses_leaves_the_journaled_checkpoint_where_it_was",
+                Status::Live,
+            ),
+            (
+                "an_event_the_journal_will_not_admit_holds_the_stream_and_moves_no_checkpoint",
+                Status::Live,
+            ),
+            // …a key claimed for an execution that never began is taken over,
+            // so the event is not lost to a dead process's claim.
+            (
+                "a_dedupe_claim_whose_execution_never_began_is_taken_over_by_the_next_event_with_its_key",
+                Status::Live,
+            ),
+            // …and a checkpoint the journal cannot read at start holds the
+            // program back rather than starting it from no position.
+            (
+                "a_checkpoint_the_journal_cannot_read_at_start_holds_the_program_until_it_can",
                 Status::Live,
             ),
             // …the source's state is on `GET /sources/:name`.

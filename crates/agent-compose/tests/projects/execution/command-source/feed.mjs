@@ -15,6 +15,15 @@
 //                    `restart.max`
 //   FEED_GARBAGE     write a line that is not JSON, and one that is JSON but not
 //                    an object, before the first event
+//   FEED_UNBINDABLE  after the last event, emit one more whose `seq` is not an
+//                    integer — so the trigger's `input:` binds nothing the
+//                    flow accepts and every bound trigger refuses it — and then
+//                    a line that is not JSON: lines are taken in one at a time,
+//                    so that line's refusal being counted is the sign the event
+//                    before it has been dealt with
+//   FEED_HOLD_AT     before emitting this sequence number, wait for the file
+//   FEED_HOLD_FILE   FEED_HOLD_FILE names to exist: how a test does something
+//                    to the journal between two events
 //   FEED_LOG         append every sequence number emitted, one per line — the
 //                    oracle the acceptance suite counts executions against
 //   FEED_STARTS      append, per start, the checkpoint it was handed: the
@@ -30,7 +39,7 @@
 // stdin to end — which is how a program learns its `serve` has gone, whatever
 // stopped it.
 import { spawn } from "node:child_process";
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 import process from "node:process";
 
 const argument = process.argv[2] ?? "";
@@ -82,10 +91,19 @@ if (process.env.FEED_GARBAGE) {
   await write("this line is not JSON");
   await write("[1, 2, 3]");
 }
+const holdAt = process.env.FEED_HOLD_AT ? Number(process.env.FEED_HOLD_AT) : undefined;
 for (let seq = first; seq <= last; seq += 1) {
+  if (seq === holdAt) {
+    while (!existsSync(process.env.FEED_HOLD_FILE ?? "")) await sleep(50);
+  }
   await write(JSON.stringify({ seq, cursor: String(seq), text: `event ${seq}` }));
   if (process.env.FEED_LOG) appendFileSync(process.env.FEED_LOG, `${seq}\n`);
   if (pace > 0) await sleep(pace);
+}
+if (process.env.FEED_UNBINDABLE) {
+  const seq = last + 1;
+  await write(JSON.stringify({ seq: "not a number", cursor: String(seq), text: `event ${seq}` }));
+  await write("the event before this line binds no input");
 }
 if (!resumed && exitAfter !== undefined) {
   await sleep(Number(process.env.FEED_RUN_MS ?? "0"));
