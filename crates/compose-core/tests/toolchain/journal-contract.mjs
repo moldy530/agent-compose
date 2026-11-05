@@ -1255,6 +1255,19 @@ try {
     queue.map((row) => row.id).join(",") === [queuedA.id, queuedB.id, queuedC.id].join(",") &&
     queuedC.group === undefined;
 
+  // …and what a look at it asks first: the groups it holds, off the index —
+  // the key-less one among them — and one group's rows, in their order.
+  const queuedGroups = await handle.queuedGroups(builds);
+  results.a_triggers_queue_groups_and_one_groups_queue_read_in_order =
+    queuedGroups.length === 2 &&
+    queuedGroups.includes(UNICODE) &&
+    queuedGroups.includes(undefined) &&
+    (await handle.groupQueue(builds, UNICODE)).map((row) => row.id).join(",") ===
+      [queuedA.id, queuedB.id].join(",") &&
+    (await handle.groupQueue(builds, undefined)).map((row) => row.id).join(",") === queuedC.id &&
+    (await handle.groupQueue(builds, "other")).length === 0 &&
+    (await handle.queuedGroups(`never_${suffix}`)).length === 0;
+
   // A move is conditional on the state it leaves: the first mover of a row
   // wins, and a second move out of the same state takes nothing.
   const moved = await handle.moveIntake(queuedA.id, "queued", {

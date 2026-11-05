@@ -750,6 +750,7 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "a_dedupe_takeover_carries_its_new_window",
     "an_intake_row_round_trips_and_is_admitted_once",
     "a_triggers_queue_reads_in_admission_order",
+    "a_triggers_queue_groups_and_one_groups_queue_read_in_order",
     "an_intake_move_is_won_once",
     "a_pending_intake_is_extended_and_started_once",
     "a_lease_is_the_open_uncancelled_executions_of_the_rows",

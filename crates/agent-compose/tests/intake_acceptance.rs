@@ -57,7 +57,16 @@
 //! * `respond: sync` on every intake path, and a repeat after a restart —
 //!   [`under_respond_sync_an_intake_answers_at_once_and_a_repeat_with_the_first`];
 //! * deliveries racing for the last slot —
-//!   [`deliveries_racing_for_one_slot_start_one_and_queue_or_drop_the_rest`];
+//!   [`deliveries_racing_for_one_slot_start_one_and_queue_or_drop_the_rest`],
+//!   and with each lifecycle row landing late, so that only a start's wait for
+//!   its row keeps the next decision from reading the slot free —
+//!   [`a_start_holds_its_triggers_decisions_until_its_lifecycle_row_is_down`];
+//! * an arrival that finds its debounce past the deadline —
+//!   [`an_arrival_past_its_debounces_deadline_closes_it_and_opens_its_own`];
+//! * `supersede` replacing its group's queued arrivals —
+//!   [`a_superseding_arrival_drops_its_groups_queued_arrivals`];
+//! * what a burst behind a full group costs each arrival —
+//!   [`arrivals_behind_a_full_group_never_read_its_queue`];
 //! * an empty `session_key:` a flow needs, refused before a dedupe key is
 //!   claimed as before a group is asked —
 //!   [`an_empty_session_key_is_refused_before_a_dedupe_key_or_a_group_is_claimed`];
@@ -1816,6 +1825,30 @@ fn under_respond_sync_an_intake_answers_at_once_and_a_repeat_with_the_first() {
     assert_eq!(executions_of(&project, "deduped_sync").len(), 1);
 }
 
+/// `count` deliveries to `route`, released together from as many threads —
+/// `racer <n>`, each lingering `linger` seconds — and what each was answered.
+fn race(app: &Client, route: &'static str, count: usize, linger: &'static str) -> Vec<Response> {
+    let gate = std::sync::Arc::new(std::sync::Barrier::new(count));
+    let threads: Vec<_> = (0..count)
+        .map(|n| {
+            let app = app.clone();
+            let gate = std::sync::Arc::clone(&gate);
+            std::thread::spawn(move || {
+                gate.wait();
+                post(
+                    &app,
+                    route,
+                    &json!({ "tag": format!("racer {n}"), "linger": linger }),
+                )
+            })
+        })
+        .collect();
+    threads
+        .into_iter()
+        .map(|thread| thread.join().expect("a racer"))
+        .collect()
+}
+
 /// **Deliveries racing for one slot**: one starts, and every other is queued
 /// or dropped — never two started (PRD resolved q77 ruling b).
 ///
@@ -1835,29 +1868,8 @@ fn deliveries_racing_for_one_slot_start_one_and_queue_or_drop_the_rest() {
         return;
     };
     let app = Client::new(&served.base_url).expect("a client");
-    let race = |route: &'static str, count: usize, linger: &'static str| -> Vec<Response> {
-        let gate = std::sync::Arc::new(std::sync::Barrier::new(count));
-        let threads: Vec<_> = (0..count)
-            .map(|n| {
-                let app = app.clone();
-                let gate = std::sync::Arc::clone(&gate);
-                std::thread::spawn(move || {
-                    gate.wait();
-                    post(
-                        &app,
-                        route,
-                        &json!({ "tag": format!("racer {n}"), "linger": linger }),
-                    )
-                })
-            })
-            .collect();
-        threads
-            .into_iter()
-            .map(|thread| thread.join().expect("a racer"))
-            .collect()
-    };
 
-    let answers = race("/serial", 8, "1");
+    let answers = race(&app, "/serial", 8, "1");
     let started: Vec<&Response> = answers
         .iter()
         .filter(|answered| answered.json().get("intake_id").is_none())
@@ -1887,7 +1899,7 @@ fn deliveries_racing_for_one_slot_start_one_and_queue_or_drop_the_rest() {
         "each racer started once: {intakes:#?}"
     );
 
-    let answers = race("/dropping", 6, "3");
+    let answers = race(&app, "/dropping", 6, "3");
     let started: Vec<String> = answers
         .iter()
         .filter(|answered| answered.header("x-agentcompose-dropped").is_none())
@@ -3073,4 +3085,451 @@ fn queued_and_pending_arrivals_a_deploy_left_without_a_block_start_with_no_bound
             "`{line}`\n{said}"
         );
     }
+}
+
+/// The host module [`a_start_holds_its_triggers_decisions_until_its_lifecycle_row_is_down`]
+/// serves through: the journal the app is about to open, with each of
+/// `serial`'s lifecycle rows begun `LIFECYCLE_DELAY_MS` late — the row joins
+/// the journal's queue only after that wait, as a slower backend or run path
+/// would land it — and then the project's own `serve`.
+const LATE_LIFECYCLE_ROWS: &str = r#"import process from "node:process";
+import { openJournal } from "./src/journal.ts";
+
+await import("./src/index.ts");
+const journal = await openJournal();
+const begin = journal.begin.bind(journal);
+const late = Number(process.env.LIFECYCLE_DELAY_MS ?? "0");
+journal.begin = async (row) => {
+  if (row.trigger === "serial") await new Promise((resolve) => setTimeout(resolve, late));
+  return begin(row);
+};
+const { runMain } = await import("./src/cli.ts");
+await runMain(process.argv.slice(2));
+"#;
+
+/// **A start holds its trigger's decisions until its lifecycle row is down**
+/// (Decision D163's Status: each start waits for its lifecycle row before the
+/// next decision reads the lease, so two arrivals never both read one slot
+/// free).
+///
+/// The lease is the journal's rows, so a start whose lifecycle row has not yet
+/// landed holds no slot the next decision could read. On SQLite the row lands
+/// ahead of that read whether or not the start waits for it — the journal's one
+/// queue orders the two — so here the app's journal begins each of `serial`'s
+/// lifecycle rows a second and a half late. Four deliveries released together
+/// still start exactly one: every other decision waited behind that start for
+/// its row, read the one slot held, and queued; and the four ran one at a
+/// time.
+#[test]
+fn a_start_holds_its_triggers_decisions_until_its_lifecycle_row_is_down() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("intake-late-row");
+    let (environment, _log) = environment(&provider, &scratch, &[("LIFECYCLE_DELAY_MS", "1500")]);
+    let Some((project, built)) =
+        harness::build_entrypoint(&harness::fixture(FIXTURE), "intake-late-row")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let Some(served) = harness::serve_built_hosted(&project, LATE_LIFECYCLE_ROWS, &environment)
+    else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client");
+
+    let answers = race(&app, "/serial", 4, "1");
+    let started: Vec<&Response> = answers
+        .iter()
+        .filter(|answered| answered.json().get("intake_id").is_none())
+        .collect();
+    assert_eq!(
+        started.len(),
+        1,
+        "one racer took the slot, however late its row landed: {answers:#?}"
+    );
+    assert!(
+        answers
+            .iter()
+            .filter(|answered| answered.json().get("intake_id").is_some())
+            .all(|answered| answered.status == 202 && answered.json()["status"] == "queued"),
+        "every other racer read the slot held and queued: {answers:#?}"
+    );
+    let rows = eventually(
+        Duration::from_secs(60),
+        "four executions to complete",
+        || {
+            let rows = executions_of(&project, "serial");
+            (rows.len() == 4 && rows.iter().all(|row| row.status == "completed")).then_some(rows)
+        },
+    );
+    never_overlapping(&rows);
+    assert_eq!(rows[0].id, execution_of(started[0]), "the winner ran first");
+    assert!(
+        intakes_of(&project, "serial")
+            .iter()
+            .all(|row| row["state"] == "started"),
+        "each racer started once"
+    );
+}
+
+/// The host module [`an_arrival_past_its_debounces_deadline_closes_it_and_opens_its_own`]
+/// serves through: the app's journal, refusing once the read of `debounced`'s
+/// unbegun starts — the first step of the look a start takes at a trigger's
+/// rows — as a journal a standby cannot yet read refuses it, so the look is
+/// made again by the trigger's first arrival.
+const FIRST_LOOK_REFUSED: &str = r#"import process from "node:process";
+import { openJournal } from "./src/journal.ts";
+
+await import("./src/index.ts");
+const journal = await openJournal();
+const unbegun = journal.unbegunIntakes.bind(journal);
+let refused = false;
+journal.unbegunIntakes = async (trigger) => {
+  if (trigger === "debounced" && !refused) {
+    refused = true;
+    throw new Error("refused by the test");
+  }
+  return unbegun(trigger);
+};
+const { runMain } = await import("./src/cli.ts");
+await runMain(process.argv.slice(2));
+"#;
+
+/// **An arrival that finds its debounce past the deadline closes it and opens
+/// its own** (PRD resolved q77 rulings c and f, Decision D163's Status).
+///
+/// Two deliveries open `debounced`'s three-second debounce; `serve` is killed
+/// and started again once the deadline has passed, with the start's look at the
+/// trigger's rows refused once — so the row is still open, its close not yet
+/// run, when a third delivery arrives and makes the look itself. The row starts
+/// at the deadline it recorded, over the two arrivals it counted and with the
+/// second's payload; the third is never counted into it nor moves its
+/// deadline, and is answered as the first arrival of a debounce of its own — a
+/// new intake, `coalesced: 1` — which starts three seconds on.
+#[test]
+fn an_arrival_past_its_debounces_deadline_closes_it_and_opens_its_own() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("intake-overdue");
+    let (environment, log) = environment(&provider, &scratch, &[]);
+    let Some(project) = harness::scratch_project("intake-overdue") else {
+        return;
+    };
+    let first = {
+        let Some(served) = harness::serve_into(&project, FIXTURE, &environment) else {
+            return;
+        };
+        let app = Client::new(&served.base_url).expect("a client");
+        let first = intake_id_of(&post(&app, "/debounced", &json!({ "tag": "first" })));
+        let second = post(&app, "/debounced", &json!({ "tag": "second" }));
+        assert_eq!(
+            second.json()["intake_id"],
+            first.as_str(),
+            "{}",
+            second.text()
+        );
+        assert_eq!(second.json()["coalesced"], 2, "{}", second.text());
+        first
+        // Dropped here, inside the debounce: `SIGKILL` to the whole group.
+    };
+    // Past the deadline the row records, with nothing running to close it.
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(pending_of(&project, "debounced")["id"], first.as_str());
+
+    let Some(mut served) = harness::serve_built_hosted(&project, FIRST_LOOK_REFUSED, &environment)
+    else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client");
+    let third = post(&app, "/debounced", &json!({ "tag": "third" }));
+    assert_eq!(third.status, 202, "{}", third.text());
+    assert_eq!(third.json()["status"], "pending", "{}", third.text());
+    assert_eq!(
+        third.json()["coalesced"],
+        1,
+        "the third opened a debounce of its own: {}",
+        third.text()
+    );
+    let own = intake_id_of(&third);
+    assert_ne!(own, first, "never counted into a row past its deadline");
+
+    let rows = eventually(
+        Duration::from_secs(40),
+        "both debounces to start and complete",
+        || {
+            let rows = executions_of(&project, "debounced");
+            (rows.len() == 2 && rows.iter().all(|row| row.status == "completed")).then_some(rows)
+        },
+    );
+    assert_eq!(rows[0].inputs["tag"], "second", "{rows:#?}");
+    assert_eq!(rows[0].inputs["pushes"], 2, "the two it counted: {rows:#?}");
+    assert_eq!(rows[1].inputs["tag"], "third", "{rows:#?}");
+    assert_eq!(rows[1].inputs["pushes"], 1, "{rows:#?}");
+    for (id, row) in [(&first, &rows[0]), (&own, &rows[1])] {
+        let report = get(&app, &format!("/intakes/{id}")).json();
+        assert_eq!(report["state"], "started", "{report}");
+        assert_eq!(report["execution_id"], row.id.as_str(), "{report}");
+    }
+    assert_eq!(
+        tally(&log),
+        ["second start 2", "second end", "third start 1", "third end"]
+    );
+    let said = served.stop_and_read_stderr();
+    assert!(
+        said.contains(
+            "intake `debounced`: its intake rows could not be read (refused by the test)"
+        ),
+        "the start's look was the one refused: {said}"
+    );
+}
+
+/// The composition [`a_superseding_arrival_drops_its_groups_queued_arrivals`]
+/// serves: a group per body `group`, superseding, and the trigger's own
+/// `max_running: 1` across them, over a flow whose execution ends when the
+/// file its `hold` names appears.
+const SUPERSEDING: &str = r#"version: "0.1"
+
+triggers:
+  latest:
+    type: http
+    path: /latest
+    flow: flow.held
+    input:
+      tag: "payload.body.tag"
+      hold: "payload.body.hold"
+    concurrency:
+      key: "payload.body.group"
+      on_conflict: supersede
+      max_running: 1
+
+flow.held:
+  description: One tagged piece of work that ends when a file appears.
+  inputs:
+    tag: { type: string }
+    hold: { type: string }
+  outputs: {}
+  nodes:
+    wait:
+      exec:
+        command: "${TALLY_BIN}/hold"
+      input:
+        tag: "input.tag"
+        hold: "input.hold"
+  edges:
+    - { from: start, to: wait }
+    - { from: wait, to: end }
+"#;
+
+/// **A superseding arrival drops its group's queued arrivals** (PRD resolved
+/// q77 ruling b, Decision D163's Status): only the newest arrival of a group
+/// is owed a run, so an older one still waiting is never started ahead of it.
+///
+/// `latest` supersedes within a group and runs one execution across all of
+/// them. `a1` holds the trigger's one slot; `b1` arrives for another group and
+/// queues behind `max_running:`, which a supersede never reaches past its own
+/// group; `b2` arrives for `b1`'s group and drops `b1` — `GET /intakes/:id`
+/// says so, naming the execution `b2` will be, and the serve log does too —
+/// and queues in its place. Once `a1` ends, `b2` runs; `b1` never does.
+#[test]
+fn a_superseding_arrival_drops_its_groups_queued_arrivals() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("intake-superseded-queue");
+    let (environment, _log) = environment(&provider, &scratch, &[]);
+    let release = scratch.path().join("release-a1");
+    let released = scratch.path().join("released");
+    std::fs::write(&released, "").expect("the scratch area is writable");
+    let hold = |file: &Path| file.display().to_string();
+    let entrypoint = scratch.path().join("main.yml");
+    std::fs::write(&entrypoint, SUPERSEDING).expect("the scratch area is writable");
+    let Some(project) = harness::scratch_project("intake-superseded-queue") else {
+        return;
+    };
+    let Some(mut served) = harness::serve_entrypoint_into(&project, &entrypoint, &environment)
+    else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client");
+    let a1 = execution_of(&post(
+        &app,
+        "/latest",
+        &json!({ "group": "a", "tag": "a1", "hold": hold(&release) }),
+    ));
+    let b1 = post(
+        &app,
+        "/latest",
+        &json!({ "group": "b", "tag": "b1", "hold": hold(&released) }),
+    );
+    assert_eq!(b1.json()["status"], "queued", "{}", b1.text());
+    let b1 = intake_id_of(&b1);
+    let b2 = post(
+        &app,
+        "/latest",
+        &json!({ "group": "b", "tag": "b2", "hold": hold(&released) }),
+    );
+    assert_eq!(b2.json()["status"], "queued", "{}", b2.text());
+    let b2 = intake_id_of(&b2);
+    let successor = execution_named_by(&project, &b2);
+
+    let detail =
+        format!("a newer arrival of its group superseded it before it started, for {successor}");
+    let report = get(&app, &format!("/intakes/{b1}")).json();
+    assert_eq!(report["state"], "dropped", "{report}");
+    assert_eq!(report["detail"], detail.as_str(), "{report}");
+    assert!(
+        report.get("execution_id").is_none() && report.get("running_execution_id").is_none(),
+        "a replaced arrival names no execution of its own or running: {report}"
+    );
+    assert_eq!(
+        get(&app, &format!("/intakes/{b2}")).json()["state"],
+        "queued",
+        "the newest waits in its place"
+    );
+
+    std::fs::write(&release, "").expect("the release file");
+    let rows = eventually(Duration::from_secs(60), "a1 and b2 to complete", || {
+        let rows = executions_of(&project, "latest");
+        (rows.len() == 2 && rows.iter().all(|row| row.status == "completed")).then_some(rows)
+    });
+    never_overlapping(&rows);
+    let order: Vec<&str> = rows
+        .iter()
+        .map(|row| row.inputs["tag"].as_str().expect("a tag"))
+        .collect();
+    assert_eq!(order, ["a1", "b2"], "the older arrival of b never ran");
+    assert_eq!(rows[0].id, a1);
+    assert_eq!(rows[1].id, successor);
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        executions_of(&project, "latest").len(),
+        2,
+        "nothing more started"
+    );
+
+    let said = served.stop_and_read_stderr();
+    let dropped = format!("intake `latest`: {b1} dropped: {detail}");
+    assert_eq!(
+        said.lines().filter(|line| *line == dropped).count(),
+        1,
+        "`{dropped}`\n{said}"
+    );
+}
+
+/// The host module [`arrivals_behind_a_full_group_never_read_its_queue`] serves
+/// through: the journal the app is about to open, with every read of a
+/// trigger's intake rows in one state, and of its lease, written as a line to
+/// `READS_LOG` — `rows <trigger> <state>` and `lease <trigger>` — before it is
+/// made.
+const READS_COUNTED: &str = r#"import process from "node:process";
+import { appendFileSync } from "node:fs";
+import { openJournal } from "./src/journal.ts";
+
+await import("./src/index.ts");
+const journal = await openJournal();
+const log = process.env.READS_LOG;
+const intakesOf = journal.intakesOf.bind(journal);
+journal.intakesOf = (trigger, state) => {
+  appendFileSync(log, `rows ${trigger} ${state}\n`);
+  return intakesOf(trigger, state);
+};
+const leasesOf = journal.leasesOf.bind(journal);
+journal.leasesOf = (trigger) => {
+  appendFileSync(log, `lease ${trigger}\n`);
+  return leasesOf(trigger);
+};
+const { runMain } = await import("./src/cli.ts");
+await runMain(process.argv.slice(2));
+"#;
+
+/// **Arrivals behind a full group never read its queue** (Decision D163's
+/// Status: what a look costs is what it can start).
+///
+/// Every arrival looks at its trigger's queue before it is placed, so a look
+/// that read the whole queue — or the lease once per queued row — would make
+/// each arrival of a burst cost more than the one before it, and filling a
+/// queue cost the square of its depth. `held`'s one slot is taken by an
+/// execution waiting for a file, and twelve more deliveries queue behind it:
+/// no look in that time reads the queue's rows, since none of its groups had
+/// a slot to start one into, and the lease is read a bounded number of times a
+/// delivery — not once more for every row ahead of it. Once the file appears
+/// the thirteen run, one at a time, in the order they arrived.
+#[test]
+fn arrivals_behind_a_full_group_never_read_its_queue() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("intake-burst-reads");
+    let reads = scratch.path().join("reads.log");
+    let (environment, _log) = environment(
+        &provider,
+        &scratch,
+        &[("READS_LOG", reads.to_str().expect("a UTF-8 path"))],
+    );
+    let release = scratch.path().join("release");
+    let hold = release.display().to_string();
+    let Some((project, built)) =
+        harness::build_entrypoint(&harness::fixture(FIXTURE), "intake-burst-reads")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let Some(served) = harness::serve_built_hosted(&project, READS_COUNTED, &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client");
+    let first = execution_of(&post(
+        &app,
+        "/held",
+        &json!({ "tag": "first", "hold": hold }),
+    ));
+    for n in 0..12 {
+        let answered = post(
+            &app,
+            "/held",
+            &json!({ "tag": format!("queued {n}"), "hold": hold }),
+        );
+        assert_eq!(answered.json()["status"], "queued", "{}", answered.text());
+    }
+    let lines: Vec<String> = std::fs::read_to_string(&reads)
+        .expect("the reads were logged")
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| *line == "rows held queued")
+            .count(),
+        0,
+        "no look read the queue's rows while its one group was full: {lines:#?}"
+    );
+    let leases = lines.iter().filter(|line| *line == "lease held").count();
+    assert!(
+        leases <= 3 * 13,
+        "the lease was read {leases} times for 13 deliveries — more than a bounded few each: {lines:#?}"
+    );
+
+    std::fs::write(&release, "").expect("the release file");
+    let rows = eventually(
+        Duration::from_secs(60),
+        "the thirteen executions to complete",
+        || {
+            let rows = executions_of(&project, "held");
+            (rows.len() == 13 && rows.iter().all(|row| row.status == "completed")).then_some(rows)
+        },
+    );
+    never_overlapping(&rows);
+    assert_eq!(rows[0].id, first);
+    let order: Vec<String> = rows
+        .iter()
+        .map(|row| row.inputs["tag"].as_str().expect("a tag").to_string())
+        .collect();
+    let expected: Vec<String> = std::iter::once("first".to_string())
+        .chain((0..12).map(|n| format!("queued {n}")))
+        .collect();
+    assert_eq!(order, expected, "first in, first out");
 }

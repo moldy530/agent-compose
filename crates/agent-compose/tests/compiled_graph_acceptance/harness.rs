@@ -1955,6 +1955,46 @@ pub fn serve_target_on(
         command.process_group(0);
     }
     seal(&mut command, environment);
+    Some(announced(&mut command))
+}
+
+/// Serve a project **already built** into `project` through a host module of
+/// the test's own, rather than through `agent-compose serve`.
+///
+/// `host` is written into the project as `host-serve.mjs` and launched with
+/// `serve --host 127.0.0.1 --port 0`: it does what has to happen before the app
+/// starts — wrapping one method of the journal the app is about to open, which
+/// is how a test stages a journal no real backend can be made to be, such as
+/// one whose lifecycle row lands late — and then hands its arguments to the
+/// project's own command line (`runMain` in `src/cli.ts`), exactly the verb
+/// `agent-compose serve` launches. Nothing is built: the project is the one an
+/// earlier [`serve_into`] built, journal and all.
+pub fn serve_built_hosted(
+    project: &Path,
+    host: &str,
+    environment: &[(String, String)],
+) -> Option<Served> {
+    installed()?;
+    let module = project.join("host-serve.mjs");
+    std::fs::write(&module, host).expect("the project directory is writable");
+    let mut command = bun();
+    command
+        .arg(&module)
+        .args(["serve", "--host", "127.0.0.1", "--port", "0"])
+        .current_dir(project)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    seal(&mut command, environment);
+    Some(announced(&mut command))
+}
+
+/// Spawn a serving command and wait for the address its app announces.
+fn announced(command: &mut Command) -> Served {
     let mut child = command.spawn().expect("the command runs");
     let stderr = Arc::new(Mutex::new(Vec::new()));
     let stderr_reader = drain(
@@ -1972,13 +2012,13 @@ pub fn serve_target_on(
         .as_str()
         .unwrap_or_else(|| panic!("the readiness line names no base url: {announced}"))
         .to_string();
-    Some(Served {
+    Served {
         child,
         reaped: false,
         base_url,
         stderr,
         stderr_reader: Some(stderr_reader),
-    })
+    }
 }
 
 /// `agent-compose serve <fixture> --port <port>`, **waited on** rather than
