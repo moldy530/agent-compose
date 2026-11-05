@@ -1282,9 +1282,16 @@ journal does not hold.
   id the row recorded**, bound to the tick's own `payload.scheduled_at`, where
   neither the process nor the journal has an execution of that id — and the
   serve log names the tick. Where the journal cannot be read at start — a
-  standby's dialled journal, guarded by the `serve` that holds it — the look is
-  taken again before each tick until it can be, and so it is after a claim
-  that failed in a way that may still have landed.
+  standby's dialled journal, guarded by the `serve` that holds it — and after a
+  claim that failed in a way that may still have landed, **no tick is armed
+  until the look reaches the journal**: it is taken again with backoff, a
+  second and then doubling to thirty seconds apart (`#settle` in
+  `src/sources.ts`), and the schedule is armed after it, the ticks that fell
+  meanwhile skipped and named as fallen while the schedule was held. A tick
+  claimed past a newest row nobody looked at would make its own row the newest
+  and leave the claim below it where no look reads it — that tick would fire
+  zero times — and a look taken only as each tick falls due would reach a claim
+  a standby inherits a schedule's period late.
 * **A claim whose execution the journal will not begin is owed, and holds the
   schedule.** The row is down, so it wins every later claim of its tick, and
   the execution it names has no lifecycle row — the state a crash leaves,
@@ -1297,8 +1304,9 @@ journal does not hold.
   execution began is owed the same way.
 * **Only the newest row can be an owed claim**, because a scheduler claims its
   next tick only after the one before was admitted — started, found held, or
-  refused for its own bindings — and holds while one is owed. That is what lets
-  the repair read one row. It also rests on §2.1's one-writer rule, as §3.12's
+  refused for its own bindings — holds while one is owed, and claims nothing
+  until a look has read the newest row. That is what lets the repair read one
+  row. It also rests on §2.1's one-writer rule, as §3.12's
   takeover does: "its execution never began" is read off the absence of a
   lifecycle row, which says the claimer is gone only while nobody else writes
   the journal. `docs/distributed.md` §8 rule 3 forbids a protocol that assumes

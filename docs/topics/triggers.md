@@ -499,7 +499,9 @@ What the runtime does around it:
   own pipe.
 
 The program runs in a process group of its own, in the built project's
-directory, and is stopped with `SIGTERM` to the group and then `SIGKILL`. Its
+directory, and is stopped with `SIGTERM` to the group and then `SIGKILL` — and
+so is what a run leaves in its group when the program exits, before it is
+restarted. Its
 stdin is a pipe that ends when `serve` does, however `serve` ends — which is
 why the script above waits on it: a `serve` killed outright sends nothing, and
 the end of that pipe is how its program learns it has gone. `redis_streams`,

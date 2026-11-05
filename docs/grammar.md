@@ -6489,7 +6489,11 @@ What `serve` does with one:
   outside the project is named by an absolute path or an `${ENV}` reference.
   Its stdin is a pipe `serve` holds
   and never writes — it ends when `serve` does, however `serve` ends. Stopped by
-  `SIGTERM` to the group and, two seconds later, `SIGKILL`. A source no `event`
+  `SIGTERM` to the group and, two seconds later, `SIGKILL`. A run that ends
+  takes its group with it: whatever the program started and left in the group
+  — a helper it never waited for — is sent the same `SIGTERM` and `SIGKILL`
+  when the program exits, so a restart never runs beside what the last run
+  left, and a stop while the source backs off ends it too. A source no `event`
   trigger binds is not started.
 - **Lines.** Each line of stdout is one event; it becomes `payload.body` when it
   is a JSON object. Anything else — not JSON, JSON that is not an object, a line
@@ -13568,8 +13572,13 @@ following are the implementation's own readings and await the owner's ruling:
   that execution under the id the row recorded, with the tick's own
   `payload.scheduled_at`, where no lifecycle row has it — and logs the tick by
   name (`docs/durability.md` §3.11). A scheduler that cannot read the journal
-  at start takes the look again before each tick until it can, and so it does
-  after a claim that failed in a way that may still have landed.
+  at start, or whose claim failed in a way that may still have landed, arms no
+  tick until the look reaches the journal: it is retried with backoff — a
+  second, doubling to thirty — and the schedule is armed after it, the ticks
+  that fell meanwhile skipped and named. Claimed before the look, a tick's row
+  would become the newest and leave a claim nobody started below it, where no
+  look reads it; and a look taken only as each tick falls due would reach a
+  claim a standby inherits a schedule's period late.
 - A tick or an event is admitted as **started** only once its execution's
   lifecycle row is journaled — the admission waits for that row — so a
   checkpoint never moves past, and a schedule is never armed past, an execution
@@ -13638,6 +13647,11 @@ following are the implementation's own readings and await the owner's ruling:
 - A stop ends the program's stdin, then sends its group `SIGTERM` and, after
   the grace, `SIGKILL`; `serve` waits at most twice the grace for the program's
   pipes to close, so a descendant that left the group cannot hold `serve` open.
+  A run that ends gets the same sequence for what is left in its group, before
+  the restart and without delaying it, and a stop waits for that too — so a
+  program that crashes after starting a helper leaves nothing per restart, and
+  nothing outlives a stop that finds the source backing off. A descendant that
+  left the group is not the program's, and is not followed.
 - The refused-line and accepted-event counts are the running process's, not
   journaled.
 - `auth:` on an `event` trigger, a **grammar addition q78 does not make**.
@@ -13664,8 +13678,12 @@ following are the implementation's own readings and await the owner's ruling:
   is exactly `*`.
 - The two-hub case on a dialled journal is held in practice by the journal's
   writer guard (`docs/durability.md` §2.3) — the second `serve` is a standby
-  whose ticks are refused at the journal. A start that could not read the
-  journal, a standby's among them, owes the recovery: it is retried with
+  the journal refuses, whose schedulers claim no tick while they cannot read
+  it: a scheduler arms no tick until its look at the newest claim reaches the
+  journal, retried with backoff, so no tick is claimed past a claim nobody
+  started and a claim the first `serve` died holding starts as the journal
+  opens to the standby, not a schedule's period later. A start that could not
+  read the journal, a standby's among them, owes the recovery: it is retried with
   backoff and taken again before every tick and event the process admits, so
   when the standby takes over, the executions the first `serve` left open are
   resumed before any tick is claimed or event admitted

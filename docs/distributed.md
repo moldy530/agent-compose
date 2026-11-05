@@ -1723,9 +1723,10 @@ other claim is answered with the execution the winner named — so a tick is
 claimed once however many schedulers evaluate it, and a dedupe key once however
 many consumers see its event. Today the journal's writer guard
 (`docs/durability.md` §2.3) is the stronger rule on a dialled journal: one
-`serve` holds it, and a second over the same journal is a standby whose claims
-the journal refuses — it logs each tick as not fired, and takes the schedule
-over when the first goes. Before it claims a tick or admits an event there it
+`serve` holds it, and a second over the same journal is a standby the journal
+refuses — its schedulers claim no tick, holding each schedule and looking again
+with backoff, and take the schedule over when the first goes. Before it claims
+a tick or admits an event there it
 recovers what the first left open — the recovery its own start could not do,
 owed until the journal opens to it (`docs/durability.md` §6.1) — so a dead
 hub's executions are resumed rather than stranded, and a tick or an event is
