@@ -48,7 +48,11 @@
 //                    stdout and stderr instead, as `cmd &` in a shell or a
 //                    `Popen` left with the default stdio does — so the pipes
 //                    `serve` reads stay open after this program exits, for as
-//                    long as the helper lives
+//                    long as the helper lives. `escape`: it keeps them too,
+//                    and leaves this program's group for a session of its own
+//                    (`setsid`), as a daemon does — so nothing sent to the
+//                    group reaches it, and the pipes stay open past this
+//                    program's exit and its group's end alike
 //   FEED_CLEANER     start a helper in this program's group, holding none of
 //                    its pipes, that on SIGTERM takes a second to clean up and
 //                    then writes `cleaned` to this file and exits — while this
@@ -112,10 +116,14 @@ if (helper) {
   // keeps none of its pipes open, so the run's output ends when this process
   // exits and the helper is still running; with FEED_HELPER_STDIO=inherit it
   // keeps stdout and stderr open past this process's exit. `trap '' TERM`
-  // survives the `exec`: an ignored signal stays ignored across one.
-  const stdio =
-    process.env.FEED_HELPER_STDIO === "inherit" ? ["ignore", "inherit", "inherit"] : "ignore";
-  const child = spawn("sh", ["-c", "trap '' TERM; exec sleep 600"], { stdio });
+  // survives the `exec`: an ignored signal stays ignored across one. With
+  // FEED_HELPER_STDIO=escape it keeps them and is detached — `setsid`, a
+  // session and a group of its own — so it outlives the group as well.
+  const stdio = process.env.FEED_HELPER_STDIO;
+  const child = spawn("sh", ["-c", "trap '' TERM; exec sleep 600"], {
+    stdio: stdio === "inherit" || stdio === "escape" ? ["ignore", "inherit", "inherit"] : "ignore",
+    detached: stdio === "escape",
+  });
   appendFileSync(helper, `${child.pid}\n`);
   child.unref();
 }

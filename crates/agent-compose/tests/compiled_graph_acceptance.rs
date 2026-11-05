@@ -30571,6 +30571,120 @@ fn a_program_that_exits_while_a_helper_in_its_group_holds_its_output_is_restarte
     );
 }
 
+/// A run ends once its program has exited and its group has gone, even while a
+/// process that left the group still holds the program's stdout and stderr
+/// open (grammar 14.4: an exit, any code, is journaled and restarted, and it
+/// never gives up; a descendant that left the group is not the program's, and
+/// is not followed; PRD resolved q78 ruling c, Decision D162).
+///
+/// `FEED_HELPER_STDIO=escape` makes the helper `FEED_HELPER` starts on every
+/// run keep the program's stdout and stderr and leave its process group for a
+/// session of its own, as a daemon does; `FEED_EXIT_CODE` makes every run exit.
+/// Nothing `serve` sends the group reaches such a helper, so the pipes `serve`
+/// reads stay open past the program's exit and past its group's end, for as
+/// long as the helper lives — and a run that ended only once they closed would
+/// never end: no `restarts` row, no restart, and the source reported `running`
+/// with its program gone. Once the group has gone the pipes are let go
+/// instead: each exit is a `restarts` row carrying the program's own code, the
+/// program is started again, the one line it wrote before its first exit is
+/// admitted, and the serve log says why the run ended with its pipes still
+/// open. The helpers that hold them are still alive when those ends are seen,
+/// so no end this test sees is the pipes closing.
+#[test]
+fn a_program_that_exits_while_a_process_that_left_its_group_holds_its_output_is_still_restarted() {
+    let scratch = harness::Scratch::new("feed-escaped-output");
+    let Some(project) = harness::scratch_project("feed-escaped-output") else {
+        return;
+    };
+    let helpers = scratch.path().join("helpers.pids");
+    // Nothing `serve` does reaches a process that left the group, so the test
+    // ends the helpers itself, however it ends.
+    let _helpers_ended = KilledWhenDropped(helpers.clone());
+    let environment = feed_environment(
+        scratch.path(),
+        &[
+            ("FEED_TOTAL", "1"),
+            ("FEED_EXIT_CODE", "3"),
+            ("FEED_HELPER", &helpers.display().to_string()),
+            ("FEED_HELPER_STDIO", "escape"),
+        ],
+    );
+    let Some(mut served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let status = eventually(
+        Duration::from_secs(60),
+        "two exits journaled while a process outside each run's group held its output",
+        || {
+            let status = source(&app, "feed");
+            (status["restart_count"].as_u64().unwrap_or(0) >= 2).then_some(status)
+        },
+    );
+    let restarts = status["restarts"].as_array().expect("restart rows");
+    assert!(restarts.len() >= 2, "{status}");
+    for row in restarts {
+        assert_eq!(
+            row["exit_code"], 3,
+            "every row is the program's own exit: {status}"
+        );
+        assert_eq!(row["signal"], Value::Null, "{status}");
+    }
+    let escaped = pids_listed_in(&helpers);
+    assert!(escaped.len() >= 2, "a helper per run: {escaped:?}");
+    assert!(
+        escaped[..2].iter().all(|pid| running(*pid)),
+        "the helpers of the two runs that ended are alive, still holding the pipes those runs \
+         wrote to — and not followed: {escaped:?}"
+    );
+    eventually(Duration::from_secs(30), "the one event", || {
+        (completed_of(&project, "ingest") == 1).then_some(())
+    });
+    let starts = lines_of(&scratch.path().join("starts.log"));
+    assert!(
+        starts.len() >= 2,
+        "the program was started again after it exited: {starts:?}"
+    );
+
+    served.signal(libc::SIGTERM);
+    let exit = served.wait();
+    assert_eq!(
+        exit.code(),
+        Some(0),
+        "a stop that was asked for is not a failure: {exit:?}"
+    );
+    let said = served.stop_and_read_stderr();
+    assert!(
+        said.contains("event source `feed`: the program exited with code 3 after")
+            && said.contains("restarting it in 200ms (restart 1 in a row)"),
+        "the serve log names the exit and the restart: {said}"
+    );
+    assert!(
+        said.contains(
+            "event source `feed`: the program has exited and its process group has gone, \
+             and a process outside the group still holds its stdout or stderr open"
+        ),
+        "the serve log says why the run ended with its pipes still open: {said}"
+    );
+}
+
+/// The pids listed in its file, sent `SIGKILL` when it is dropped: the
+/// processes a test's fixture starts outside the program's group, which
+/// nothing `serve` does ends.
+struct KilledWhenDropped(std::path::PathBuf);
+
+impl Drop for KilledWhenDropped {
+    fn drop(&mut self) {
+        for pid in pids_listed_in(&self.0) {
+            // SAFETY: `kill` only delivers a signal; the pid is one the
+            // fixture started and listed for this test.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
 /// A stop gives every member of the program's group the whole grace, not only
 /// the program (grammar 14.4: stopped by `SIGTERM` to the group and, two
 /// seconds later, `SIGKILL`; PRD resolved q78 ruling c, Decision D162).

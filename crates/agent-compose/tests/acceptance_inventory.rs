@@ -2543,6 +2543,12 @@ const SOURCES: &[Criterion] = &[
                 "a_program_that_exits_while_a_helper_in_its_group_holds_its_output_is_restarted_and_the_helper_ended",
                 Status::Live,
             ),
+            // …and even while a process that left the group holds it: once the
+            // group has gone, the pipes are let go and the run still ends.
+            (
+                "a_program_that_exits_while_a_process_that_left_its_group_holds_its_output_is_still_restarted",
+                Status::Live,
+            ),
             // …and a stop gives the whole group its grace, not only the program.
             (
                 "a_stop_gives_every_member_of_the_programs_group_its_grace_once_the_program_has_gone",
