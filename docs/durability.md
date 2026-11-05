@@ -1477,7 +1477,15 @@ decisions about one row agree on one.
   is what is running, not the trigger's history. It is one slot per execution,
   however many `started` rows name it: a never-waited start the journal would
   not begin, whose row could not be taken back either, is admitted again by its
-  source under the same execution id and a second row.
+  source under the same execution id and a second row. **An open row the
+  serving build cannot run holds its slot as any open row does** — a recovery
+  whose replay diverged or whose recorded inputs the build refuses, open on
+  purpose (§7), or a row of a flow the build no longer declares, which
+  recovery leaves where it is — and nothing that build runs will close it, so
+  `serve`'s cancel route records a cancel for such an execution too, where an
+  intake started it: the `cancellations` row frees the slot, and the row stays
+  open for the start that next recovers it under a build that can run it,
+  which completes the cancel (§6.1; `docs/grammar.md` D163's Status).
 * **A started row is written before its execution is registered**, as a tick's
   `fired` row is (§3.11), and the start waits for the lifecycle row before the
   next decision reads the lease. A crash between the two leaves a `started` row
@@ -1489,7 +1497,14 @@ decisions about one row agree on one.
   starts when a slot frees; a row that did not wait was never answered, and is
   taken back (`abandonIntake`) for its arrival's source to re-deliver. A
   start the journal would not begin is undone the same two ways at once — a
-  waited row goes back to `queued`, naming why in `detail`. Where the journal
+  waited row goes back to `queued`, naming why in `detail`, and is started
+  again under the same execution id. That refused start is **not a settle**:
+  it journals no `settled` delivery (§3.7), which would be the execution's one
+  and be reported `failed`, so the start that does run it would find it and
+  announce nothing; and its end looks at no queue, since a run that never
+  reached its lifecycle row held no slot — the row is tried again by the
+  queue's periodic look, or the next arrival's, never in a loop as fast as
+  the journal can refuse it. Where the journal
   refuses that move too, the row stays `started` with no lifecycle row, which no
   drain of the queue reads; the process keeps the start owed and makes the move
   at its next look at the queue that the journal takes. **An owed start holds

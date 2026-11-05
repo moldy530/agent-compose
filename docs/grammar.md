@@ -5633,7 +5633,10 @@ may hold admits nothing.
   executions are cancelled with it — and starts the arrival in the slot that
   frees. It never reaches another group: an arrival whose own group it emptied,
   but whose trigger is at `max_running:` by other groups' executions, waits as
-  `queue` would. Its group's older arrivals still waiting there are replaced as
+  `queue` would — and so does one whose cancel freed the trigger's last
+  `max_running:` slot while another group's older arrival was queued for it,
+  since that slot is the older arrival's (FIFO across the trigger's total, as
+  for any slot that frees). Its group's older arrivals still waiting there are replaced as
   well — each such `queued` row is dropped as the newcomer lands, naming it —
   so a group holds at most one queued arrival, its newest.
 - **`debounce:`** coalesces a group's arrivals into one **pending** intake row
@@ -5794,7 +5797,11 @@ a flow input field can accept it.
   takes no body, answers `202` for an execution that is open (a second cancel of
   one already cancelling included), `409` naming the status for one that has
   completed, failed or been cancelled, and `404` for an id the process does not
-  know. Like the other two it is the app's own, so a trigger cannot declare it.
+  know — save an execution a trigger's intake started whose row is open in the
+  journal while this process runs no generation of it, a recovery this build
+  could not take or a flow it no longer declares, which is open, and whose
+  cancel frees the slot it holds (D163's Status). Like the other two it is the
+  app's own, so a trigger cannot declare it.
   A fifth, `GET /sources/:name`, reports an event source's consumer (§14.4,
   PRD resolved q78), and a sixth, `GET /intakes/:id`, an arrival a trigger's
   intake admitted (below, PRD resolved q77); both are reserved the same way.
@@ -13458,7 +13465,13 @@ check it, before anything about the execution is said: `404` for an id this
 process does not know, the trigger's refusal for a caller it does not verify,
 `409` naming the status for an execution that has completed, failed or been
 cancelled, and `202` for one that is open — a second cancel of one already
-cancelling included, since the request stands either way. `agent-compose cancel`
+cancelling included, since the request stands either way. (*Read by
+[D163](#d163-a-triggers-intake-a-dedupe-window-and-groups-leased-off-the-journal)'s
+Status: an execution a trigger's intake started whose lifecycle row is open
+while this process runs no generation of it — a recovery the build could not
+take, reported `failed`, or a flow the build no longer declares, on no board —
+is open, and answered `202`; its cancel frees the slot it holds of the
+trigger's lease.*) `agent-compose cancel`
 is the emitted command line's `cancel` verb: it sends the request to `--url`, or
 to the target's `hub.public_url`, with the headers `--header` names, and exits
 `0` on `202`, `1` on a refusal, and `2` where it could not ask. A `run` keeps
@@ -14042,10 +14055,14 @@ nothing (`docs/durability.md` §6.3 carries the amended rule). **q32** (inbound
 auth): the dedupe key is evaluated after the trigger's `auth:`, and the intake
 route enforces the trigger's `auth:` as an execution's routes do. **q35** (the
 outbound delivery ledger): mirrored, not touched — the intake is the inbound
-ledger, journaled the same way. **q36** (`http` is the webhook): stands; no
+ledger, journaled the same way; and **q34**'s `settled` push stays once per
+execution, owed to the run that settles it, so an intake start the journal
+refused and puts back on the queue pushes nothing (Status). **q36** (`http` is the webhook): stands; no
 trigger kind is added. **q65** and **q75**: `supersede` is q75's cancel, so it
 cascades to q65's child executions, and the slot frees when the cancel is
-recorded. **q79**: a placement's `max_running:` ([D161](#d161-max_running-is-how-many-dispatches-one-worker-session-holds-for-a-placement)) is a different
+recorded; and ruling d's `202` for an open execution is read to cover one an
+intake started that the serving build cannot run, whose row is open in the
+journal — the one way to free the slot it holds (Status). **q79**: a placement's `max_running:` ([D161](#d161-max_running-is-how-many-dispatches-one-worker-session-holds-for-a-placement)) is a different
 key with the same name — how many dispatches one worker session holds — and
 the trigger's `concurrency.max_running:` bounds its own executions across its
 groups; each is documented naming the other. [D28](#d28-max_concurrency-is-required-on-the-map-node-routes-may-only-tighten-it) (map admission):
@@ -14109,10 +14126,41 @@ ruling:
   execution whose cancel nobody has requested, so a superseding arrival starts
   the moment its predecessors' cancels are recorded, while they unwind and run
   their `finally:` nodes beside it.
+- **An open execution the serving build cannot run still holds its slot, and
+  its cancel frees it.** The lease is the open rows, and two rows stay open
+  that nothing this build runs will close: a recovery whose replay diverged,
+  or whose recorded inputs the build's `inputs:` refuse — open on purpose
+  (`docs/durability.md` §7) while the status route reports it `failed` — and a
+  row of a flow the build no longer declares, which recovery leaves in the
+  journal and puts on no board. Either would hold its group, or the trigger's
+  whole `max_running:`, for as long as the build is served. So the cancel
+  route reads such an execution as the open one it is in the journal — PRD
+  resolved q75 ruling d's `202` for an open execution — where an intake
+  started it, which is what makes it hold a slot: the request is recorded and
+  the cascade taken as for any cancel, which frees the slot, and the queue is
+  looked at; nothing fires, since nothing here is running it, and the row
+  stays open for the start that next recovers it under a build that can run
+  it, which completes the cancel. The answer is `202`, `cancelling: true` and
+  a `detail` saying why the row stays open; its `status` is this process's
+  report where the execution is on the board (`failed`, with its
+  `status_url`) and the journal's `open` where it is not (no `status_url`:
+  the status route of this build does not know it). Before, the first was
+  refused `409` as already failed and the second `404` as unknown, and
+  nothing short of reverting the build or editing the journal freed the
+  slot. A `run` beside a `serve` writes an open row this process is not
+  running either; it was started by no intake, holds no slot, and its cancel
+  is not `serve`'s (ruling d), so it is still `404` here.
 - **`supersede` cancels every running execution of the group**, not only the
   oldest; and where the trigger's `max_running:` is held by other groups'
   executions, which a supersede never cancels, the arrival waits as `queue`
-  would. **It replaces its group's queued arrivals too**: a row of the group
+  would. **A slot its cancels free under `max_running:` is the queue's
+  first**: the rule every look keeps — a slot that frees is the oldest waiting
+  arrival's, never a newcomer's — holds for one the newcomer's own cancel
+  freed, so an older arrival of another group, queued because the trigger was
+  at its total, starts into it, and the newcomer waits behind it as `queue`
+  would. Taken by the newcomer, a group superseded faster than its runs end
+  would hold the trigger's total for good and every other group's arrivals
+  would starve. **It replaces its group's queued arrivals too**: a row of the group
   still `queued` — held by `max_running:`, or behind a queue that stalled — is
   an older arrival a freed slot would otherwise start ahead of the newcomer and
   run whole, so each is dropped as the newcomer lands (a debounce's close
@@ -14135,7 +14183,11 @@ ruling:
   `max_running:`. A queue is looked at again when an execution of its trigger
   settles or is cancelled in this process, and every two seconds while it holds
   rows — a settle another process wrote, such as a `resume` that finished one,
-  is seen by nothing else. A look that stops short — at a row the journal would
+  is seen by nothing else. A run that stopped before its lifecycle row held no
+  slot and settles nothing, so its end looks at no queue: a start the journal
+  refused is tried again on the two-second look, or at the next arrival's,
+  never at once — at once, a row the journal goes on refusing would be started
+  again as fast as the journal could refuse it. A look that stops short — at a row the journal would
   not begin, or with a start this process owes and could not put back on the
   queue — leaves any slot it freed to the rows still waiting: an arrival
   behind it queues, whatever its group has free and whatever `on_conflict:`
@@ -14205,7 +14257,16 @@ ruling:
   it. A start the journal
   would not begin is undone the same two ways at once: a waited row goes back on
   the queue, and an unwaited one is taken back and its arrival refused — a
-  `503` on `http` — as any admission the journal would not take is. A journal
+  `503` on `http` — as any admission the journal would not take is. **A
+  refused start of a waited row is not a settle**: the arrival is owed its
+  execution under the id it recorded, so no `settled` webhook is pushed for
+  it — pushed `failed`, it would be the only one the caller ever heard, since
+  the start that does run the execution finds that push journaled and
+  announces nothing — and the webhook goes where the start that reaches its
+  row closes it, as for any run (a debounce's close and a restart's repair
+  alike). An arrival that waited and is then dropped — superseded, or no
+  longer bound by the serving build — never began, and is pushed nothing;
+  its intake answers it. A journal
   that refuses the move back onto the queue too leaves the waited row
   `started`, naming an execution that never began, which no drain of the queue
   reads; the process keeps the start owed and tries the move again at every look

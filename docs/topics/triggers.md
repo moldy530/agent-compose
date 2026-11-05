@@ -157,7 +157,10 @@ recorded, `409` naming the status for an execution that has already ended,
 `404` for an id the app does not know. The execution then settles `cancelled`,
 and a `callback:` subscriber is told so by the `settled` webhook, whose body's
 `status` is `cancelled` and carries no `error`. `agent-compose cancel <path> <execution>` sends it
-(`agent-compose docs cli`).
+(`agent-compose docs cli`). An execution a trigger's `concurrency:` started
+that this build cannot run — its recovery diverged or no longer binds, or its
+flow was renamed away — stays open in the journal and so keeps its slot; its
+cancel is answered `202` too, and frees the slot.
 
 ## Authenticating an `http` trigger
 
@@ -621,6 +624,10 @@ finds its group full does what `on_conflict:` says:
   executions they started — and starts the newcomer. `latest` always builds
   the newest change: an older change of the group still waiting for a slot
   (behind `max_running:`) is dropped as the newer one lands, never built.
+  Where the trigger declares `max_running:`, a slot the cancel frees is still
+  the oldest waiting arrival's: another group's arrival queued for it starts
+  first and the newcomer waits behind it, so a busy group cannot starve the
+  rest.
 
 **`debounce:`** coalesces a group's arrivals into one execution, started once no
 arrival has come for that long, with the newest payload and
