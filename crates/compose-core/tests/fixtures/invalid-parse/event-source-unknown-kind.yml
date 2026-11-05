@@ -2,7 +2,7 @@
 # code: unknown-variant
 # message: `kafka` is not a valid event source `kind`
 # at: 10:11
-# help: event source `kind` takes one of `redis_streams`, `sqs`, `nats`
+# help: event source `kind` takes one of `command`, `redis_streams`, `sqs`, `nats`
 version: "0.1"
 
 event_sources:

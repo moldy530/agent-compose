@@ -1,0 +1,10 @@
+# rule: a `kind: command` event source names the program it runs (grammar 14.4, PRD resolved q78)
+# code: missing-key
+# message: missing required key `command` in event source `feed`
+# at: 9:5
+version: "0.1"
+
+event_sources:
+  feed:
+    kind: command
+    args: ["--follow"]

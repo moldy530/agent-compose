@@ -1,0 +1,13 @@
+# rule: `restart.backoff` is a duration (grammar 14.4, 4.4, PRD resolved q78)
+# code: invalid-duration
+# message: `soon` is not a valid duration for `backoff`
+# at: 13:16
+# help: durations are a positive integer followed by `ms`, `s`, `m`, or `h`, e.g. `30s`; compound forms like `1m30s` are not supported
+version: "0.1"
+
+event_sources:
+  feed:
+    kind: command
+    command: ./bin/feed
+    restart:
+      backoff: soon

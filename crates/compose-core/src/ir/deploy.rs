@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::ast::common::{Address, EnvRef, Ident};
+use crate::ast::common::{Address, EnvRef, Ident, Interpolated};
 use crate::ast::definition::StoreKind;
 use crate::ast::deploy::{
     BackendProvider, EventSourceKind, JournalProvider, PluginValue, TraceSinkFormat,
@@ -68,8 +68,9 @@ pub struct Deploy {
     /// (grammar 14.5, PRD resolved q50).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_sink: Option<TraceSink>,
-    /// `event_sources:` — reserved grammar, keyed by the logical name an
-    /// `event` trigger's `source:` names (grammar 14.4).
+    /// `event_sources:`, keyed by the logical name an `event` trigger's
+    /// `source:` names (grammar 14.4): `kind: command` runs under `serve`,
+    /// and the queue kinds are vocabulary it refuses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_sources: Option<Section<EventSource>>,
 }
@@ -295,7 +296,7 @@ pub struct BackendConfig {
 pub struct EventSource {
     /// The logical name, repeated from the key with its own span.
     pub name: Spanned<Ident>,
-    /// `kind:` — the consumer plugin.
+    /// `kind:` — the consumer.
     pub kind: EventSourceKind,
     /// The connection fields of grammar 4.3, each an unresolved environment
     /// reference.
@@ -304,8 +305,37 @@ pub struct EventSource {
     /// Everything else, for the consumer plugin's schema.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Spanned<PluginValue>>,
+    /// The `kind: command` keys, **defaults applied**, on a source of that
+    /// kind and no other (grammar 14.4, PRD resolved q78).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<CommandSource>,
     /// The whole entry's span.
     pub span: Span,
+}
+
+/// A `kind: command` source, as `serve` runs it (grammar 14.4, PRD resolved
+/// q78).
+///
+/// `restart:` lands resolved, for the reason an `http` trigger's `auth:` does:
+/// the runtime is the wrong place to re-derive a default, because getting one
+/// wrong there does not fail a build, it restarts a crashing program at a rate
+/// nobody wrote.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CommandSource {
+    /// `command:` — argv\[0\], interpolable (grammar 4.3 class 2).
+    pub command: Spanned<Interpolated>,
+    /// `args:` — the rest of argv, each interpolable; an entry that is exactly
+    /// `{checkpoint}` is the source's newest checkpoint.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<Spanned<Interpolated>>,
+    /// `checkpoint:` — CEL over the event to a string; absent means the event's
+    /// id is the SHA-256 of its line and the source keeps no checkpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<Spanned<crate::ast::common::Cel>>,
+    /// `restart.backoff:` in milliseconds, default one second.
+    pub restart_backoff_ms: u64,
+    /// `restart.max:` in milliseconds, default one minute.
+    pub restart_max_ms: u64,
 }
 
 // ---------------------------------------------------------------------------

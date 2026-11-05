@@ -1256,8 +1256,8 @@ const SIBLINGS_SWAPPED: &str = r#"    - { from: approve, to: escalate, when: "ap
 
 /// The `hub:` block of the `local` deploy layer, and the same file with an event
 /// source planted under it so that there is one to edit — `local` declares none,
-/// and `event_sources:` is the reserved section it admits beside the two live
-/// ones (`docs/plan.md` §11).
+/// and `event_sources:` of `kind: command` is the one kind of that section it
+/// admits (grammar §14, Decision D87 as amended by D162; `docs/plan.md` §11).
 ///
 /// The anchor is the hub rather than a placement, because `local` places
 /// nothing: a placed component is dispatched to whichever worker claims its
@@ -1271,10 +1271,9 @@ const EVENT_SOURCE: &str = r#"hub:
 
 event_sources:
   bug_reports:
-    kind: redis_streams
-    url: ${REDIS_URL}
-    stream: bug-reports
-    consumer_group: agent-compose"#;
+    kind: command
+    command: ./bin/feed
+    args: ["--stream", "bug-reports"]"#;
 const EVENT_SOURCE_EMPTY: &str = r#"hub:
   join_token: ${MESH_JOIN_TOKEN}
 
@@ -1284,10 +1283,9 @@ const EVENT_SOURCE_MOVED: &str = r#"hub:
 
 event_sources:
   bug_reports:
-    kind: redis_streams
-    url: ${REDIS_URL}
-    stream: triage-reports
-    consumer_group: agent-compose"#;
+    kind: command
+    command: ./bin/feed
+    args: ["--stream", "triage-reports"]"#;
 
 /// A trace sink planted under the same anchor, and the two edits a plan has to
 /// report about one (grammar §14.5, `docs/plan.md` §4).

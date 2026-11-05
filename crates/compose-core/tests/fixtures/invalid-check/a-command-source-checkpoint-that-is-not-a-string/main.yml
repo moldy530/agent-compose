@@ -1,0 +1,27 @@
+# rule: a command source's `checkpoint:` answers a string (grammar 14.4, PRD resolved q78)
+# code: type-mismatch
+# message: the `checkpoint:` of the event source `feed` must evaluate to a string, found an integer
+# at: deploy/local.yml:7:17
+#
+# The checkpoint is journaled as written and handed back to the program as an
+# environment variable and an argument, both of which are strings — so a count
+# is written out as one by the program (`cursor: "42"`), not converted here.
+version: "0.1"
+
+flow.ingest:
+  inputs:
+    report: { type: string }
+  outputs: {}
+  nodes:
+    store:
+      exec: { command: "true" }
+  edges:
+    - { from: start, to: store }
+    - { from: store, to: end }
+
+triggers:
+  reports:
+    type: event
+    flow: flow.ingest
+    source: feed
+    input: { report: "payload.body.text" }

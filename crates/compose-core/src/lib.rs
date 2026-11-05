@@ -73,6 +73,7 @@ pub mod ast;
 pub mod cel;
 pub mod check;
 pub mod codegen;
+pub mod cron;
 pub mod diag;
 pub mod docs;
 pub mod graph;

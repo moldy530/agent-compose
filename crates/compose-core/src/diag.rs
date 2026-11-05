@@ -366,6 +366,16 @@ pub enum DiagnosticCode {
     InvalidDuration,
     /// A string is not a legal path expression (grammar 4.2).
     InvalidPathExpression,
+    /// A `schedule` trigger's `cron:` has five fields and one of them is a
+    /// field the runtime's evaluator cannot read — a value outside its range,
+    /// a step over a single value, a backwards range, a name where none is
+    /// taken — or the expression names a day no month it names has, so it never
+    /// fires (grammar 13.4, PRD resolved q78, Decision D162). Its own class
+    /// rather than an [`InvalidValue`](Self::InvalidValue), because the grammar
+    /// it holds the field to is one the emitted scheduler evaluates and a
+    /// shared conformance corpus pins: what is refused is a schedule `serve`
+    /// would otherwise have had to guess at.
+    InvalidCron,
     /// An environment reference is malformed, or a secret-bearing field holds a
     /// literal instead of one.
     InvalidEnvRef,
@@ -404,6 +414,14 @@ pub enum DiagnosticCode {
     /// and is a member of the root — at another site — so the repair is moving
     /// the read, never correcting it.
     OutcomeOutsideFinally,
+    /// A `kind: command` event source's `checkpoint:` reads `payload.id`,
+    /// which is the checkpoint's own value when one is declared — so the
+    /// expression would be defined in terms of itself (grammar 14.4, PRD
+    /// resolved q78, Decision D162). Its own class rather than an
+    /// [`UnknownField`](Self::UnknownField): `id` is a member of every event
+    /// payload a trigger reads, and the repair is reading the line's own body
+    /// rather than spelling the field differently.
+    CircularCheckpoint,
 
     // --- state (grammar 10) -----------------------------------------------
     /// A `state.*` read, a `writes:` destination, or a flow `outputs:` field
@@ -729,6 +747,7 @@ impl DiagnosticCode {
         Self::InvalidReference,
         Self::InvalidDuration,
         Self::InvalidPathExpression,
+        Self::InvalidCron,
         Self::InvalidEnvRef,
         Self::UnexpectedEnvRef,
         Self::ReservedName,
@@ -741,6 +760,7 @@ impl DiagnosticCode {
         Self::UnknownField,
         Self::TypeMismatch,
         Self::OutcomeOutsideFinally,
+        Self::CircularCheckpoint,
         Self::UndefinedChannel,
         Self::UnreducedWrite,
         Self::ConflictingWrites,
@@ -822,6 +842,7 @@ impl DiagnosticCode {
             Self::InvalidReference => "invalid-reference",
             Self::InvalidDuration => "invalid-duration",
             Self::InvalidPathExpression => "invalid-path-expression",
+            Self::InvalidCron => "invalid-cron",
             Self::InvalidEnvRef => "invalid-env-ref",
             Self::UnexpectedEnvRef => "unexpected-env-ref",
             Self::ReservedName => "reserved-name",
@@ -834,6 +855,7 @@ impl DiagnosticCode {
             Self::UnknownField => "unknown-field",
             Self::TypeMismatch => "type-mismatch",
             Self::OutcomeOutsideFinally => "outcome-outside-finally",
+            Self::CircularCheckpoint => "circular-checkpoint",
             Self::UndefinedChannel => "undefined-channel",
             Self::UnreducedWrite => "unreduced-write",
             Self::ConflictingWrites => "conflicting-writes",

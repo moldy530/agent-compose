@@ -145,6 +145,7 @@ Spec(
                                     dedupe_key: Some(
                                         cel("payload.id") @ 44:17..44:29,
                                     ),
+                                    auth: None,
                                 },
                             ),
                         ),

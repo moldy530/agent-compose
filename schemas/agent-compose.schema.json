@@ -90,7 +90,7 @@
       "$ref": "#/$defs/traceSink"
     },
     "event_sources": {
-      "description": "DEPLOY FILE ONLY. Binds the logical `source:` names used by event triggers to infrastructure. RESERVED: parsed and validated in v0, executed in M3. Grammar 14.4 / PRD 5.11.",
+      "description": "DEPLOY FILE ONLY. Binds the logical `source:` names used by event triggers to infrastructure. `kind: command` runs under serve - a program emitting one JSON object per line - and is the one kind deploy/local.yml may declare; redis_streams, sqs and nats are parsed and validated, and refused when serve starts. Grammar 14.4 / PRD resolved q78.",
       "type": "object",
       "propertyNames": { "$ref": "#/$defs/identifier" },
       "additionalProperties": { "$ref": "#/$defs/eventSource" }
@@ -3156,17 +3156,17 @@
       }
     },
     "scheduleTrigger": {
-      "description": "RESERVED grammar: parsed and validated in v0, executed in M3. Grammar 13.4 / PRD 5.11.",
+      "description": "A cron schedule serve fires: each due tick journals a fired row before its execution starts, so a tick fires once across restarts and hubs; ticks that fell while no serve ran are skipped, never back-filled. Grammar 13.4 / PRD resolved q78.",
       "type": "object",
       "required": ["type", "flow", "cron"],
       "properties": {
-        "type": { "const": "schedule", "description": "Schedule invocation (reserved: no-op in v0)." },
+        "type": { "const": "schedule", "description": "Schedule invocation: serve evaluates the cron and starts an execution at each tick; run fires nothing." },
         "flow": { "description": "The flow this trigger starts.", "$ref": "#/$defs/flowRef" },
         "cron": {
-          "description": "5-field POSIX cron expression. Shape-checked at compile time, so env references are illegal (grammar 4.3 class 3, Decision D92).",
+          "description": "5-field POSIX cron expression - minute, hour, day of the month, month (1-12 or JAN-DEC), day of the week (0-7 or SUN-SAT) - each a list of *, a value, a range a-b, or a step */n or a-b/n; when both day fields are restricted a day matching either fires. validate holds every field to the grammar serve evaluates (invalid-cron), so env references are illegal (grammar 4.3 class 3, Decision D92).",
           "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "pattern": "^\\S+(\\s+\\S+){4}$" }]
         },
-        "timezone": { "description": "IANA timezone name (default UTC). Shape-checked at compile time, so env references are illegal (grammar 4.3 class 3, Decision D92).", "$ref": "#/$defs/noEnvRefString" },
+        "timezone": { "description": "IANA timezone name (default UTC), the wall clock the cron is matched against: a time daylight saving skips fires at the first instant after the gap, one it repeats fires once. Shape-checked at compile time and refused at serve start when the runtime's database does not know it, so env references are illegal (grammar 4.3 class 3, Decision D92).", "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "pattern": "^[A-Za-z][A-Za-z0-9_+-]*(/[A-Za-z][A-Za-z0-9_+-]*)*$" }] },
         "input": { "description": "Bindings, CEL over payload.scheduled_at / payload.trigger.", "$ref": "#/$defs/triggerInput" },
         "session_key": { "description": "CEL over payload producing the session identity.", "$ref": "#/$defs/cel" },
         "description": { "description": "Documentation.", "type": "string" }
@@ -3174,16 +3174,17 @@
       "additionalProperties": false
     },
     "eventTrigger": {
-      "description": "RESERVED grammar: parsed and validated in v0, executed in M3. Backend-agnostic - `source:` is a logical name bound by the deploy layer's event_sources. Grammar 13.5 / PRD 5.11.",
+      "description": "An event consumer serve runs: every event the bound source produces is admitted, deduplicated on dedupe_key. Backend-agnostic - `source:` is a logical name bound by the deploy layer's event_sources. Grammar 13.5 / PRD resolved q78.",
       "type": "object",
       "required": ["type", "flow", "source"],
       "properties": {
-        "type": { "const": "event", "description": "Event invocation (reserved: no-op in v0)." },
+        "type": { "const": "event", "description": "Event invocation: serve admits each event its source produces; run starts no consumer." },
         "flow": { "description": "The flow this trigger starts.", "$ref": "#/$defs/flowRef" },
         "source": { "description": "Logical source name, bound to infrastructure per target under event_sources.", "$ref": "#/$defs/identifier" },
         "input": { "description": "Bindings, CEL over payload.id / payload.body / payload.attributes / payload.source.", "$ref": "#/$defs/triggerInput" },
         "session_key": { "description": "CEL over payload producing the session identity.", "$ref": "#/$defs/cel" },
         "dedupe_key": { "description": "CEL over payload for inbound at-least-once dedupe (default payload.id).", "$ref": "#/$defs/cel" },
+        "auth": { "description": "The scheme the routes about this trigger's work enforce: the status, resume and cancel routes of every execution it starts, and its source's GET /sources/:name (a caller must satisfy one bound trigger's auth). Nobody calls an event trigger, so it authenticates no start; absent leaves those routes open (grammar 13.5 / PRD resolved q32, q78, Decision D162).", "$ref": "#/$defs/inboundAuth" },
         "description": { "description": "Documentation.", "type": "string" }
       },
       "additionalProperties": false
@@ -3419,11 +3420,13 @@
       }
     },
     "eventSource": {
-      "description": "Binding of a logical event source name to infrastructure. RESERVED: parsed and validated in v0, executed in M3. Grammar 14.4 / PRD 5.11.",
+      "description": "Binding of a logical event source name to infrastructure. kind: command is a closed object serve runs; the queue kinds are open plugin config, parsed and validated, and refused at serve start. Grammar 14.4 / PRD resolved q78.",
       "type": "object",
       "required": ["kind"],
+      "if": { "properties": { "kind": { "const": "command" } }, "required": ["kind"] },
+      "then": { "$ref": "#/$defs/commandEventSource" },
       "properties": {
-        "kind": { "description": "Consumer plugin.", "enum": ["redis_streams", "sqs", "nats"] },
+        "kind": { "description": "The consumer: command (a program on this machine, implemented) or a queue plugin (refused at serve start in this release).", "enum": ["command", "redis_streams", "sqs", "nats"] },
         "url": { "description": "Connection URL, as an ${ENV} reference.", "$ref": "#/$defs/envRef" },
         "stream": { "description": "Stream name (redis_streams).", "type": "string" },
         "consumer_group": { "description": "Consumer group (redis_streams).", "type": "string" },
@@ -3432,6 +3435,31 @@
         "subject": { "description": "Subject (nats).", "type": "string" },
         "durable_name": { "description": "Durable consumer name (nats).", "type": "string" }
       }
+    },
+    "commandEventSource": {
+      "description": "A kind: command event source: a long-running program serve starts after recovery, in a process group of its own, reading one JSON object per line of its stdout as payload.body. An exit restarts it after a backoff. Closed: an unknown key is an error (Decision D50). Grammar 14.4 / PRD resolved q78.",
+      "type": "object",
+      "required": ["kind", "command"],
+      "properties": {
+        "kind": { "const": "command", "description": "A program on this machine." },
+        "command": { "description": "argv[0], never shell-interpreted; ${ENV} references are substituted at serve start (grammar 4.3 class 2).", "allOf": [{ "$ref": "#/$defs/interpolatedString" }, { "minLength": 1 }] },
+        "args": {
+          "description": "The rest of argv, each interpolable; an entry written exactly {checkpoint} is replaced by the source's newest accepted checkpoint, the empty string before there is one.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/interpolatedString" }
+        },
+        "checkpoint": { "description": "CEL over the event - payload.body, payload.source, payload.attributes, never payload.id - to a string: the event's payload.id, and the position handed back on restart as AGENT_COMPOSE_CHECKPOINT. Absent, payload.id is the SHA-256 of the line.", "$ref": "#/$defs/cel" },
+        "restart": {
+          "description": "How the program is restarted when it exits: after backoff, doubling per consecutive restart up to max, starting over after a run longer than max.",
+          "type": "object",
+          "properties": {
+            "backoff": { "description": "The first restart's delay (default 1s); greater than zero and no longer than max.", "$ref": "#/$defs/duration" },
+            "max": { "description": "The ceiling the doubling stops at (default 1m), and the run length after which it starts over.", "$ref": "#/$defs/duration" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

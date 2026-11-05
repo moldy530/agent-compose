@@ -822,6 +822,99 @@ event_sources:
     assert_eq!(document.kind(), DocumentKind::Deploy);
 }
 
+/// A `kind: command` event source in its minimal form — a program and nothing
+/// else — and with every key it takes (grammar 14.4, PRD resolved q78): `args`
+/// with the literal `{checkpoint}` argument, a `checkpoint:` expression, and a
+/// `restart:` policy whose `backoff` and `max` are each optional. The parser
+/// reads the source as a closed object, so this is the over-rejection half of
+/// `event-source-command-with-a-queue-key.yml`.
+#[test]
+fn a_command_event_source_in_its_minimal_and_whole_forms() {
+    let document = accepts(
+        "deploy/local.yml",
+        r#"
+version: "0.1"
+
+event_sources:
+  bare:
+    kind: command
+    command: ./bin/feed
+  whole:
+    kind: command
+    command: ${FEED_BIN}
+    args: ["--after", "{checkpoint}", "--source", "${FEED_NAME}"]
+    checkpoint: "payload.body.cursor"
+    restart:
+      backoff: 500ms
+      max: 2m
+  backoff_only:
+    kind: command
+    command: node
+    restart: { backoff: 2s }
+  max_only:
+    kind: command
+    command: node
+    restart: { max: 5m }
+"#,
+    );
+    assert_eq!(document.kind(), DocumentKind::Deploy);
+}
+
+/// An `event` trigger may declare `auth:` — grammar 13.3's block, either scheme
+/// — which guards the routes about its work rather than any start: its
+/// executions' status, resume and cancel routes, and its source's
+/// `GET /sources/:name` (grammar 13.5, Decision D162).
+#[test]
+fn an_event_trigger_may_declare_the_auth_that_guards_its_routes() {
+    accepts(
+        "triggers.yml",
+        r#"
+triggers:
+  ingest:
+    type: event
+    flow: flow.triage
+    source: bug_reports
+    auth:
+      bearer:
+        token: ${FEED_STATUS_TOKEN}
+  mirror:
+    type: event
+    flow: flow.triage
+    source: bug_reports
+    dedupe_key: "payload.body.ticket"
+    auth:
+      hmac:
+        secret: ${FEED_STATUS_SECRET}
+        header: X-Signature
+"#,
+    );
+}
+
+/// The cron grammar's whole vocabulary, each spelling once (grammar 13.4,
+/// Decision D162): lists, ranges, steps over `*` and over a range, month and
+/// weekday names in any case, `7` for Sunday, both day fields restricted at
+/// once (the POSIX either-matches rule), and the leap day — an expression that
+/// fires once every four years still fires.
+#[test]
+fn every_cron_spelling_the_grammar_admits() {
+    for (name, cron) in [
+        ("lists", "0,15,30,45 * * * *"),
+        ("ranges", "0 9-17 * * 1-5"),
+        ("steps", "*/5 0-23/2 * * *"),
+        ("names", "0 0 1 jan,Jul MON-fri"),
+        ("sunday", "0 0 * * 7"),
+        ("both-days", "0 0 13 * FRI"),
+        ("leap-day", "0 12 29 2 *"),
+    ] {
+        accepts(
+            &format!("cron-{name}.yml"),
+            &format!(
+                "triggers:\n  t:\n    type: schedule\n    flow: flow.demo\n    cron: \"{cron}\"\n    timezone: Europe/Berlin\n"
+            ),
+        );
+    }
+}
+
 /// A placement may say how many unsettled dispatches one worker session holds
 /// for it (grammar 14.1, Decision D161, PRD resolved q79): `max_running: 3` is
 /// read as written, and a placement that says nothing carries no value — the

@@ -1,0 +1,14 @@
+# rule: `restart.backoff` is the first delay and `restart.max` the longest, so the first is not longer than the longest (grammar 14.4, PRD resolved q78)
+# code: invalid-value
+# message: `backoff` (2m) is longer than `max` (30s), the ceiling it doubles up to
+# at: 13:16
+# help: a restart waits `backoff`, then twice that, and so on up to `max`, so `backoff` is at most `max`; the defaults are `backoff: 1s` and `max: 1m` (grammar 14.4)
+version: "0.1"
+
+event_sources:
+  feed:
+    kind: command
+    command: ./bin/feed
+    restart:
+      backoff: 2m
+      max: 30s

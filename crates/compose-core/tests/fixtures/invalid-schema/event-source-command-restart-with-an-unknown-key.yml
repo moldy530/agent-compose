@@ -1,0 +1,11 @@
+# rule: a command source's `restart:` takes `backoff` and `max` and nothing else (grammar 14.4 / PRD resolved q78)
+# at: /event_sources/feed/restart
+# via: /$defs/commandEventSource/properties/restart/additionalProperties
+version: "0.1"
+event_sources:
+  feed:
+    kind: command
+    command: ./bin/feed
+    restart:
+      backoff: 1s
+      attempts: 5

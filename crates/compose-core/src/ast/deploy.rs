@@ -1,8 +1,10 @@
 //! The deploy layer: `deploy/<target>.yml` (grammar 14).
 //!
 //! Only this layer forks per environment (PRD 5.8's per-target invariant), and
-//! it is disjoint from spec files (Decision D3). `event_sources` is reserved
-//! grammar: parsed and validated in v0, executed in M3 (grammar 15).
+//! it is disjoint from spec files (Decision D3). `event_sources` is live for
+//! its `kind: command` entries — `serve` starts the program and admits what it
+//! prints (grammar 14.4, PRD resolved q78) — while the three queue kinds keep
+//! their vocabulary and are refused when `serve` starts (Decision D162).
 //!
 //! `hub:` and `placements:` are **not** reserved, and no longer awaiting a
 //! runtime either. They are the live surface of the distributed claims model
@@ -15,7 +17,7 @@
 
 use crate::diag::{Span, Spanned};
 
-use super::common::{Address, EnvRef, Ident, Interpolated};
+use super::common::{Address, Cel, Duration, EnvRef, Ident, Interpolated};
 use super::definition::StoreKind;
 use super::trigger::CallbackAuth;
 
@@ -528,7 +530,7 @@ impl BackendProvider {
     }
 }
 
-/// The `event_sources:` section — reserved grammar (grammar 14.4).
+/// The `event_sources:` section (grammar 14.4).
 #[derive(Clone, Debug, PartialEq)]
 pub struct EventSourcesSection {
     /// The sources, in declaration order.
@@ -542,20 +544,27 @@ pub struct EventSourcesSection {
 pub struct EventSource {
     /// The logical name an `event` trigger's `source:` refers to.
     pub name: Spanned<Ident>,
-    /// `kind:` — required; the consumer plugin.
+    /// `kind:` — required; the consumer.
     pub kind: Option<Spanned<EventSourceKind>>,
     /// Connection fields that must be environment references (grammar 4.3).
+    /// Empty on a `kind: command` source, whose keys are its own.
     pub connection: Vec<ConnectionField>,
-    /// Everything else, for the consumer plugin's schema to check.
+    /// Everything else, for the consumer plugin's schema to check. Empty on a
+    /// `kind: command` source, which is a closed object (Decision D50).
     pub extra: Vec<PluginEntry>,
+    /// The `kind: command` keys, on a source of that kind and no other.
+    pub command: Option<CommandSource>,
     /// The whole entry's span, name and body together. [`Self::name`] carries
     /// the name alone, for the diagnostics that are about the name.
     pub span: Span,
 }
 
-/// The v0 event-source kinds (grammar 14.4).
+/// The event-source kinds (grammar 14.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventSourceKind {
+    /// `command` — a long-running program on this machine, one JSON object
+    /// per line of its stdout (PRD resolved q78).
+    Command,
     /// `redis_streams`
     RedisStreams,
     /// `sqs`
@@ -566,17 +575,64 @@ pub enum EventSourceKind {
 
 impl EventSourceKind {
     /// Every kind, in the order grammar 14.4 lists them.
-    pub const ALL: &'static [Self] = &[Self::RedisStreams, Self::Sqs, Self::Nats];
+    pub const ALL: &'static [Self] = &[Self::Command, Self::RedisStreams, Self::Sqs, Self::Nats];
 
     /// The keyword that names this kind.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Command => "command",
             Self::RedisStreams => "redis_streams",
             Self::Sqs => "sqs",
             Self::Nats => "nats",
         }
     }
+
+    /// Whether `serve` runs a consumer for a source of this kind under this
+    /// compiler release, rather than refusing to start (PRD resolved q78).
+    ///
+    /// `command` is the reference backend and the one implemented kind. The
+    /// three queue kinds keep their vocabulary — parsed, validated, built —
+    /// and a `serve` whose target declares one exits before it listens, naming
+    /// the source and its kind: PRD resolved q63's posture, a named refusal
+    /// rather than a consumer that never consumes. A drift test holds this
+    /// answer equal to the emitted runtime's (`codegen::trigger`).
+    #[must_use]
+    pub const fn implemented(self) -> bool {
+        matches!(self, Self::Command)
+    }
+}
+
+/// A `kind: command` event source's own keys (grammar 14.4, PRD resolved q78).
+///
+/// A **closed** object, unlike the plugin kinds beside it: the keys are this
+/// grammar's rather than a plugin's, so an unknown one is a typo — Decision
+/// D50's posture everywhere but plugin config.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommandSource {
+    /// `command:` — required; argv\[0\], never shell-interpreted. Interpolable
+    /// (grammar 4.3 class 2), like an `exec:` block's.
+    pub command: Option<Spanned<Interpolated>>,
+    /// `args:` — the rest of argv, each interpolable; an entry that is exactly
+    /// `{checkpoint}` is replaced by the source's newest checkpoint.
+    pub args: Vec<Spanned<Interpolated>>,
+    /// `checkpoint:` — CEL over the event (`payload.body`, `payload.source`,
+    /// `payload.attributes`) to a string.
+    pub checkpoint: Option<Spanned<Cel>>,
+    /// `restart:` — how the program is restarted when it exits.
+    pub restart: Option<RestartPolicy>,
+}
+
+/// A command source's `restart:` block (grammar 14.4).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RestartPolicy {
+    /// `backoff:` — the first restart's delay, doubling per consecutive one.
+    pub backoff: Option<Spanned<Duration>>,
+    /// `max:` — the ceiling the doubling stops at, and the run length after
+    /// which the doubling starts over.
+    pub max: Option<Spanned<Duration>>,
+    /// The block's own span.
+    pub span: Span,
 }
 
 /// Field names that must hold an `${ENV}` value-form reference wherever they

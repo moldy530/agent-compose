@@ -1,0 +1,27 @@
+# rule: a command source's `checkpoint:` does not read `payload.id`, which is its own answer (grammar 14.4, PRD resolved q78)
+# code: circular-checkpoint
+# message: the `checkpoint:` of the event source `feed` reads `payload.id`, which is the checkpoint's own value
+# at: deploy/local.yml:7:17
+# help: where a source declares a `checkpoint:`, its value is the event's `payload.id`, so the expression is evaluated before there is an id to read: read the position out of the line itself — `payload.body.seq`, an offset, a cursor — or declare no `checkpoint:` and the id is the SHA-256 of the line (grammar 14.4)
+#
+# Where a source declares a `checkpoint:`, its value is the event's
+# `payload.id`, so the expression runs before there is an id to read.
+version: "0.1"
+
+flow.ingest:
+  inputs:
+    report: { type: string }
+  outputs: {}
+  nodes:
+    store:
+      exec: { command: "true" }
+  edges:
+    - { from: start, to: store }
+    - { from: store, to: end }
+
+triggers:
+  reports:
+    type: event
+    flow: flow.ingest
+    source: feed
+    input: { report: "payload.body.text" }
