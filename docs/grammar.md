@@ -14075,8 +14075,18 @@ amended, and the conflict below is recorded for the owner.
 
 **Status**: shipped as written here. The ruling fixes the keys, their defaults,
 the headers, the `intake_id` and its route, the refused `run` and the restart.
-The following are the implementation's own readings and await the owner's
-ruling:
+**Provisional, as a whole, on what becomes of a start the journal refuses** —
+a queued row's, an owed one's, a debounce's close, a restart's repair, a gated
+`http` arrival's — what is undone and what is kept, whether its row goes back
+on the queue or stays `started`, when it is tried again, what its caller is
+told and what is pushed to its callback, and what is read into a journal that
+answered a failure after the row landed: the ruling says only that a restart
+starts what was queued and fires what was pending, and the campaign's seven
+review rounds returned to that one seam again and again (rounds one, three,
+six and seven, the sixth with the campaign's last must-fix). It stands as
+shipped and tested below, and awaits the owner's ruling before it is treated
+as settled. The following are the implementation's own readings and await the
+owner's ruling:
 
 - **Which groups cover a `run`.** A run is in a trigger's group only where the
   trigger declares no `concurrency.key`: the key is CEL over a payload a run
