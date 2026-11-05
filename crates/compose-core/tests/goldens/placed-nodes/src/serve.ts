@@ -1291,7 +1291,7 @@ async function start(
   // lowercases them, so the lookup is the lowercase spelling W3C writes anyway.
   const callback = callbackOf(trigger, bound);
   const traceparent = (payload.headers["traceparent"] ?? "").trim();
-  const intaking = concurrency === undefined ? undefined : httpIntake(trigger);
+  const intaking = concurrency === undefined ? undefined : httpIntake(trigger, concurrency);
   // A gate or an intake decides against the journal, and one that cannot be
   // read decides nothing: the request was not admitted, nothing started, and
   // it may be sent again — said as such rather than as the framework's `500`.
@@ -1359,26 +1359,30 @@ async function answered(
       if (holder !== undefined && (holder.state === "queued" || holder.state === "pending")) {
         return intakeAccepted(reply, holder);
       }
-      const running =
-        holder?.state === "dropped" && holder.heldBy !== undefined && holder.heldBy !== ""
-          ? holder.heldBy
-          : admitted.execution;
-      const record = executions.get(running);
+      // **A repeat of a dropped arrival is the drop** (grammar 13.3's table,
+      // PRD resolved q77 ruling b): the arrival never ran, so it is answered
+      // as the drop was — the running execution's id beside the arrival's own
+      // `intake_id`, under `X-AgentCompose-Dropped: true` — and never as that
+      // execution's start, which under `sync` would wait on it and hand the
+      // caller another payload's outputs as its own. A row dropped with no
+      // execution to name answers as the intake it is ([`journaledAnswer`]).
+      if (holder?.state === "dropped") {
+        if (holder.heldBy !== undefined && holder.heldBy !== "") {
+          return droppedAnswer(reply, holder.heldBy, holder);
+        }
+        return journaledAnswer(reply, holder.execution, holder);
+      }
+      const record = executions.get(admitted.execution);
       // Under `sync`, a repeat waits on the execution the first delivery
       // started, up to the budget, as the first did (Decision D163's Status).
       if (record !== undefined) return responded(trigger, reply, record);
-      return journaledAnswer(reply, running, holder);
+      return journaledAnswer(reply, admitted.execution, holder);
     }
     case "queued":
     case "pending":
       return intakeAccepted(reply, admitted.intake);
     case "dropped":
-      reply.header(DROPPED_HEADER, "true");
-      return reply.code(202).send({
-        execution_id: admitted.running,
-        status_url: `/executions/${admitted.running}`,
-        intake_id: admitted.intake.id,
-      });
+      return droppedAnswer(reply, admitted.running, admitted.intake);
     case "unbegun":
       // Nothing started and nothing was answered: the gate this request claimed
       // names an execution that exists nowhere, so the same request sent again
@@ -1387,6 +1391,21 @@ async function answered(
         error: `the trigger \`${trigger.name}\` admitted this request, but its execution could not be journaled (${admitted.reason}): nothing started, so the request may be sent again`,
       });
   }
+}
+
+/**
+ * What a dropped arrival is answered, and a repeat of one with it (grammar
+ * 13.3's table): `202` naming the execution its full group was running and
+ * the arrival's own `intake_id`, under `X-AgentCompose-Dropped: true` —
+ * whatever `respond:` says, because the arrival started nothing to wait on.
+ */
+function droppedAnswer(reply: FastifyReply, running: string, row: IntakeRow): unknown {
+  reply.header(DROPPED_HEADER, "true");
+  return reply.code(202).send({
+    execution_id: running,
+    status_url: `/executions/${running}`,
+    intake_id: row.id,
+  });
 }
 
 /**
@@ -1801,7 +1820,7 @@ async function admitTickAs(
   } catch (error) {
     return { outcome: "refused", reason: `the trigger \`${trigger.name}\` could not bind this tick: ${message(error)}` };
   }
-  const intaking = concurrency === undefined ? undefined : scheduleIntake(trigger);
+  const intaking = concurrency === undefined ? undefined : scheduleIntake(trigger, concurrency);
   const admitted = await admit(executions, {
     trigger: trigger.name,
     flow,
@@ -1862,7 +1881,7 @@ async function admitEvent(
   } catch (error) {
     return { outcome: "refused", reason: `the trigger \`${trigger.name}\` could not bind this event: ${message(error)}` };
   }
-  const intaking = concurrency === undefined ? undefined : eventIntake(trigger);
+  const intaking = concurrency === undefined ? undefined : eventIntake(trigger, concurrency);
   const admitted = await admit(executions, {
     trigger: trigger.name,
     flow,
@@ -1960,20 +1979,50 @@ interface IntakeTrigger {
 /** The trigger called `name`, where it declares `concurrency:`. */
 function intakeTrigger(name: string): IntakeTrigger | undefined {
   const http = httpTriggers.find((one) => one.name === name);
-  if (http !== undefined) return httpIntake(http);
+  if (http !== undefined) return httpIntake(http, http.concurrency);
   const schedule = scheduleTriggers.find((one) => one.name === name);
-  if (schedule !== undefined) return scheduleIntake(schedule);
+  if (schedule !== undefined) return scheduleIntake(schedule, schedule.concurrency);
   const event = eventTriggers.find((one) => one.name === name);
-  if (event !== undefined) return eventIntake(event);
+  if (event !== undefined) return eventIntake(event, event.concurrency);
   return undefined;
 }
 
 /** Every trigger this build declares `concurrency:` on. */
 function intakeTriggers(): readonly IntakeTrigger[] {
   return [
-    ...httpTriggers.map(httpIntake),
-    ...scheduleTriggers.map(scheduleIntake),
-    ...eventTriggers.map(eventIntake),
+    ...httpTriggers.map((one) => httpIntake(one, one.concurrency)),
+    ...scheduleTriggers.map((one) => scheduleIntake(one, one.concurrency)),
+    ...eventTriggers.map((one) => eventIntake(one, one.concurrency)),
+  ].filter((trigger): trigger is IntakeTrigger => trigger !== undefined);
+}
+
+/**
+ * What a trigger this build declares **without** `concurrency:` is read
+ * under, for the rows an earlier build's intake accepted for it: no group is
+ * ever full, so each queued row starts as soon as it is looked at and a
+ * pending one at the deadline it records (Decision D163's Status).
+ */
+const UNBOUNDED: IntakeTrigger["concurrency"] = {
+  limit: Number.POSITIVE_INFINITY,
+  onConflict: "queue",
+};
+
+/**
+ * Every trigger this build declares with no `concurrency:` block, read with
+ * no bound ([`UNBOUNDED`]) — the ones a deploy stripped of the block its
+ * intake rows were accepted under ([`IntakeLedger.atStart`]).
+ */
+function unboundedTriggers(): readonly IntakeTrigger[] {
+  return [
+    ...httpTriggers
+      .filter((one) => one.concurrency === undefined)
+      .map((one) => httpIntake(one, UNBOUNDED)),
+    ...scheduleTriggers
+      .filter((one) => one.concurrency === undefined)
+      .map((one) => scheduleIntake(one, UNBOUNDED)),
+    ...eventTriggers
+      .filter((one) => one.concurrency === undefined)
+      .map((one) => eventIntake(one, UNBOUNDED)),
   ].filter((trigger): trigger is IntakeTrigger => trigger !== undefined);
 }
 
@@ -1989,8 +2038,10 @@ function bindAdmission(
   return { inputs, sessionKey, ...extra };
 }
 
-function httpIntake(trigger: HttpTrigger): IntakeTrigger | undefined {
-  const concurrency = trigger.concurrency;
+function httpIntake(
+  trigger: HttpTrigger,
+  concurrency: IntakeTrigger["concurrency"] | undefined,
+): IntakeTrigger | undefined {
   const flow = flows[trigger.flow];
   if (concurrency === undefined || flow === undefined) return undefined;
   return {
@@ -2011,8 +2062,10 @@ function httpIntake(trigger: HttpTrigger): IntakeTrigger | undefined {
   };
 }
 
-function scheduleIntake(trigger: ScheduleTrigger): IntakeTrigger | undefined {
-  const concurrency = trigger.concurrency;
+function scheduleIntake(
+  trigger: ScheduleTrigger,
+  concurrency: IntakeTrigger["concurrency"] | undefined,
+): IntakeTrigger | undefined {
   const flow = flows[trigger.flow];
   if (concurrency === undefined || flow === undefined) return undefined;
   return {
@@ -2028,8 +2081,10 @@ function scheduleIntake(trigger: ScheduleTrigger): IntakeTrigger | undefined {
   };
 }
 
-function eventIntake(trigger: EventTrigger): IntakeTrigger | undefined {
-  const concurrency = trigger.concurrency;
+function eventIntake(
+  trigger: EventTrigger,
+  concurrency: IntakeTrigger["concurrency"] | undefined,
+): IntakeTrigger | undefined {
   const flow = flows[trigger.flow];
   if (concurrency === undefined || flow === undefined) return undefined;
   return {
@@ -2077,6 +2132,30 @@ function hasSlot(
 ): boolean {
   if (heldBy(leases, group).length >= concurrency.limit) return false;
   return concurrency.maxRunning === undefined || leases.length < concurrency.maxRunning;
+}
+
+/**
+ * Whether a trigger's intake holds anything still owed a start: a queued row,
+ * a pending one, or a waited start no lifecycle row followed.
+ */
+async function holdsOpenRows(journal: Journal, trigger: string): Promise<boolean> {
+  return (
+    (await journal.intakesOf(trigger, "queued")).length > 0 ||
+    (await journal.intakesOf(trigger, "pending")).length > 0 ||
+    (await journal.unbegunIntakes(trigger)).length > 0
+  );
+}
+
+/**
+ * The slot a start this process owes holds, read as a lease: the execution
+ * its row names, in the row's group ([`IntakeLedger.#leases`]).
+ */
+function leaseOf(row: IntakeRow): Lease {
+  return {
+    execution: row.execution,
+    ...(row.group === undefined ? {} : { group: row.group }),
+    startedAt: row.startedAt ?? row.admittedAt,
+  };
 }
 
 /** What a group at its limit is answered with: its oldest running execution. */
@@ -2135,10 +2214,21 @@ class IntakeLedger {
    * trigger, each with why its execution was not journaled ([`#begin`]).
    */
   readonly #owed = new Map<string, Map<string, string>>();
+  /**
+   * The triggers this build declares with no `concurrency:` whose rows an
+   * earlier build's intake accepted, each read with no bound ([`UNBOUNDED`],
+   * [`atStart`]).
+   */
+  readonly #unbounded = new Map<string, IntakeTrigger>();
   #stopped = false;
 
   constructor(executions: Map<string, Execution>) {
     this.#executions = executions;
+  }
+
+  /** The trigger a row of this ledger's names, as its decisions read it. */
+  #triggerOf(name: string): IntakeTrigger | undefined {
+    return intakeTrigger(name) ?? this.#unbounded.get(name);
   }
 
   /**
@@ -2163,6 +2253,15 @@ class IntakeLedger {
    * After recovery and before anything is admitted (PRD resolved q77 ruling
    * f): every trigger's rows a dead process left are looked at — a start it
    * claimed and never journaled, its queue, its open debounces.
+   *
+   * **A trigger this build declares without `concurrency:`** may hold rows an
+   * earlier build's intake accepted under a block a deploy has since removed:
+   * arrivals answered `202` with an intake id, owed a start (ruling f). They
+   * are read under no bound ([`UNBOUNDED`]) — the bound the serving build
+   * declares — so every queued row starts as it is looked at, and each pending
+   * one at the deadline it records, as the rows say and the build now allows
+   * (Decision D163's Status). A trigger with none of them is looked at no
+   * further.
    */
   async atStart(): Promise<void> {
     for (const trigger of intakeTriggers()) {
@@ -2170,6 +2269,26 @@ class IntakeLedger {
         sayIntake(
           trigger.name,
           `its intake rows could not be read (${message(error)}); they are looked at again before its next admission`,
+        );
+        this.#redrainLater(trigger.name);
+      });
+    }
+    for (const trigger of unboundedTriggers()) {
+      await this.#locked(trigger.name, async () => {
+        const journal = await openJournal();
+        if (!(await holdsOpenRows(journal, trigger.name))) return;
+        this.#unbounded.set(trigger.name, trigger);
+        sayIntake(
+          trigger.name,
+          "this build declares no `concurrency:` on the trigger, so the arrivals an earlier build's intake accepted for it start with no bound",
+        );
+        await this.#prepare(trigger);
+      }).catch((error: unknown) => {
+        // Unknown whether it holds any: looked at again, as one that might.
+        this.#unbounded.set(trigger.name, trigger);
+        sayIntake(
+          trigger.name,
+          `its intake rows could not be read (${message(error)}); they are looked at again shortly`,
         );
         this.#redrainLater(trigger.name);
       });
@@ -2191,7 +2310,7 @@ class IntakeLedger {
    */
   kick(name: string): void {
     if (this.#stopped) return;
-    const trigger = intakeTrigger(name);
+    const trigger = this.#triggerOf(name);
     if (trigger === undefined) return;
     void this.#locked(name, async () => {
       if (this.#stopped) return;
@@ -2214,14 +2333,24 @@ class IntakeLedger {
    *  * a `started` row that **waited** — it was answered with its intake id,
    *    so the intake owes its start — whose execution has no lifecycle row is
    *    a start the process died between claiming and journaling: it starts
-   *    now under the execution id the row recorded, once. A row that did not
-   *    wait was answered only once its lifecycle row was down, so a row whose
-   *    execution never began is a claim nobody was told of, and is taken back
-   *    — its arrival's own source re-delivers it;
-   *  * the queue drains as the lease the rows hold allows;
+   *    under the execution id the row recorded, once, **as the lease allows**.
+   *    Its group may have no slot for it now — the execution the dead process
+   *    was running is recovered and holds it, or another arrival took the
+   *    slot while the start was owed — so a row with no free slot is owed
+   *    rather than started, and goes back on the queue at the place it was
+   *    admitted in ([`#requeue`]), to start when a slot frees. A row that did
+   *    not wait was answered only once its lifecycle row was down, so a row
+   *    whose execution never began is a claim nobody was told of, and is taken
+   *    back — its arrival's own source re-delivers it;
    *  * each open debounce has its newest arrival's gate folded, and is armed
    *    at its deadline, re-derived from the row — one already past fires at
-   *    once.
+   *    once. A fold the journal will not take now is the close's to make
+   *    first ([`#close`]), so the row is armed all the same;
+   *  * the queue drains as the lease the rows hold allows.
+   *
+   * The trigger counts as looked at only once all three are done: a look the
+   * journal cut short is made again, whole, before the trigger's next decision
+   * ([`kick`], [`admit`]) — never left with a pending row nothing armed.
    */
   async #prepare(trigger: IntakeTrigger): Promise<void> {
     const journal = await openJournal();
@@ -2231,8 +2360,18 @@ class IntakeLedger {
         await journal.abandonIntake(row.id);
         continue;
       }
+      // Already owed by this process: the drain puts it back ([`#requeue`]).
+      if (this.#owed.get(trigger.name)?.has(row.id) === true) continue;
       if (row.admission === undefined) continue;
       if (!(await this.#stillBinds(journal, trigger, row, row.admission))) continue;
+      // Read with the starts this pass already owes, each of which holds its
+      // group's slot as a lease would.
+      const leases = await this.#leases(journal, trigger);
+      if (!hasSlot(trigger.concurrency, leases, row.group)) {
+        const detail = `its start was claimed by a stopped serve and not journaled, and its group had no free slot: ${oldestOf(leases, row.group) ?? "its trigger"} held it`;
+        this.#owe(trigger.name, row.id, detail);
+        continue;
+      }
       const answer = await this.#begin(journal, trigger, row.admission, row.execution, row, undefined, true);
       if (answer.outcome === "started") {
         sayIntake(
@@ -2241,14 +2380,39 @@ class IntakeLedger {
         );
       }
     }
-    this.#prepared.add(trigger.name);
-    await this.#drain(journal, trigger);
     for (const row of await journal.intakesOf(trigger.name, "pending")) {
       // A counted arrival whose gate a stopped serve had not yet moved onto
       // the row's execution ([`#debounce`]).
-      await this.#fold(journal, row);
+      await this.#fold(journal, row).catch((error: unknown) => {
+        sayIntake(
+          trigger.name,
+          `${row.id}'s newest arrival's gate could not yet be moved onto ${row.execution} (${message(error)}); it is moved when the debounce closes`,
+        );
+      });
       this.#arm(row);
     }
+    await this.#drain(journal, trigger);
+    this.#prepared.add(trigger.name);
+  }
+
+  /**
+   * A trigger's lease as a decision reads it: the rows' ([`Journal.leasesOf`]),
+   * and each start this process owes and could not yet put back on the queue
+   * ([`#requeue`]) — the slot its arrival was answered for, which no later
+   * arrival may take while it waits to be started.
+   */
+  async #leases(journal: Journal, trigger: IntakeTrigger): Promise<readonly Lease[]> {
+    const leases = await journal.leasesOf(trigger.name);
+    const owed = this.#owed.get(trigger.name);
+    if (owed === undefined || owed.size === 0) return leases;
+    const held: Lease[] = [];
+    for (const id of owed.keys()) {
+      const row = await journal.intake(id);
+      if (row !== undefined && row.state === "started" && !leases.some((one) => one.execution === row.execution)) {
+        held.push(leaseOf(row));
+      }
+    }
+    return [...leases, ...held];
   }
 
   /**
@@ -2661,6 +2825,12 @@ class IntakeLedger {
    * dropped, naming why, and the drain goes on past it ([`#stillBinds`]):
    * only a start the journal itself would not take stops it, since the next
    * start would meet the same journal.
+   *
+   * **A start still owed holds its group's slot** ([`#leases`]): its arrival
+   * was answered with its intake id and its turn came, so a slot it has not
+   * yet been started into is its own — a later row of its group, or one that
+   * would take the trigger's last `max_running:`, waits for it rather than
+   * running beside the execution it will be.
    */
   async #drain(journal: Journal, trigger: IntakeTrigger): Promise<boolean> {
     const owed = await this.#requeue(journal, trigger);
@@ -2669,7 +2839,7 @@ class IntakeLedger {
     let stalled = false;
     for (const row of queued) {
       if (this.#stopped) return false;
-      const leases = await journal.leasesOf(trigger.name);
+      const leases = await this.#leases(journal, trigger);
       const max = trigger.concurrency.maxRunning;
       if (max !== undefined && leases.length >= max) break;
       if (!hasSlot(trigger.concurrency, leases, row.group)) continue;
@@ -2700,7 +2870,9 @@ class IntakeLedger {
    * Put each start this process owes back on the queue ([`#owe`]), where the
    * row still names an execution that never began — answering whether any is
    * still owed. A row that has moved on, or whose execution the journal holds
-   * after all, is owed nothing.
+   * after all, is owed nothing. One the journal will not move yet stays owed,
+   * holding its slot ([`#leases`]), and the rest of the queue is looked at
+   * past it.
    */
   async #requeue(journal: Journal, trigger: IntakeTrigger): Promise<boolean> {
     const owed = this.#owed.get(trigger.name);
@@ -2716,7 +2888,10 @@ class IntakeLedger {
         owed.delete(id);
         continue;
       }
-      if (await journal.moveIntake(id, "started", { state: "queued", detail })) {
+      const moved = await journal
+        .moveIntake(id, "started", { state: "queued", detail })
+        .catch(() => false);
+      if (moved) {
         owed.delete(id);
         sayIntake(trigger.name, `${id} is back on the queue: ${detail}`);
       }
@@ -2771,9 +2946,9 @@ class IntakeLedger {
       this.#arm(row);
       return;
     }
-    const trigger = intakeTrigger(row.trigger);
+    const trigger = this.#triggerOf(row.trigger);
     if (trigger === undefined) {
-      sayIntake(row.trigger, `${row.id} stays pending: this build declares no \`concurrency:\` on the trigger`);
+      sayIntake(row.trigger, `${row.id} stays pending: this build declares no trigger of that name`);
       return;
     }
     // Every counted arrival's gate names the execution about to be decided

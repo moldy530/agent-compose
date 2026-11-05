@@ -2236,16 +2236,29 @@ class SqlJournal implements Journal {
           ORDER BY executions.started_at ASC, executions.id ASC`,
         [trigger],
       );
-      return rows.map((row) => {
+      // **One slot per execution**, however many `started` rows name it. A
+      // start the journal would not begin leaves its never-waited row behind
+      // where the row cannot be taken back either, and the retry its
+      // arrival's source makes — a tick's scheduler, an event's consumer —
+      // admits again under the same execution id, so two rows name the one
+      // execution once it begins. The join would read that execution twice,
+      // and its group full with one execution running.
+      const seen = new Set<string>();
+      const leases: Lease[] = [];
+      for (const row of rows) {
+        const execution = String(row["execution"]);
+        if (seen.has(execution)) continue;
+        seen.add(execution);
         const group = row["group_key"];
-        return {
-          execution: String(row["execution"]),
+        leases.push({
+          execution,
           ...(group === null || group === undefined
             ? {}
             : { group: JSON.parse(String(group)) as string }),
           startedAt: String(row["started_at"]),
-        };
-      });
+        });
+      }
+      return leases;
     });
   }
 
