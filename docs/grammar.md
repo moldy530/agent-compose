@@ -7653,7 +7653,12 @@ the grammar §13.4 states — the five-field shape check stays first, and the
 fields inside it are now the evaluator's (`invalid-cron`) — and `timezone` to
 the shape of an IANA name. `event_sources` gains `kind: command`, whose keys are
 a closed object the runtime reads rather than plugin config; the three queue
-kinds keep theirs.
+kinds keep theirs. And the `event` shape gains a key D46 did not specify:
+**`auth:`**, §13.3's block, guarding the routes about the trigger's work —
+its executions' status, resume and cancel routes and its source's
+`GET /sources/:name` — and never asked of an event. q78 does not rule it; it
+is this release's reading of PRD resolved q32 onto the new route, recorded as
+such in D162's Status for the owner.
 
 ### D47. Placement entries take `runtime` plus a reserved `network:` — RETIRED
 
@@ -13498,7 +13503,9 @@ is an exception to `docs/distributed.md` §8 rule 2 that the rule now names. The
 `dedupe`, `checkpoints` and `restarts` tables are the same kind of row — keyed
 by a trigger or a source — and are named beside it there and in
 `src/journal.ts`'s index comment. None of them is a counter: each is one row per
-thing that happened, read back by key.
+thing that happened, read back by key — and `fired` also newest-first per
+trigger, which is ruling b's "last fired time recorded" and the read the tick
+repair finds an unstarted claim by (Status, below).
 
 **Collision review.** PRD resolved **q7** (an `event` backend abstraction with
 one blessed reference backend in M3): its reference backend is changed by the
@@ -13509,9 +13516,11 @@ and its other half stands: `http` is still the webhook, and no trigger kind is
 added. **q37** (the hub owns triggers) is why `serve` alone fires. **q28**
 ("triggers fire once"): the fired row and the dedupe row *are* that rule, made
 durable; recovery still replays executions and re-fires nothing. **q32**
-(inbound auth): an `event` trigger may declare grammar 13.3's `auth:` block,
-which guards the status, resume and cancel routes of the executions it started
-— q32's coverage clause, unchanged — and `GET /sources/:name` enforces the
+(inbound auth): this release reads q32 onto the new surfaces, and the reading
+is the implementation's, not ruling c's — q78 says nothing about auth (Status,
+below). An `event` trigger may declare grammar 13.3's `auth:` block, which
+guards the status, resume and cancel routes of the executions it started —
+q32's coverage clause, unchanged — and `GET /sources/:name` enforces the
 `auth:` of the triggers bound to the source, any one of them sufficing, open
 where none declares one: the q32 reading applied one level up. A `schedule`
 trigger takes no `auth:`, so an execution one started keeps open routes, as
@@ -13531,7 +13540,10 @@ request): untouched — a command source's body is always the line's object, so
 there is no bodyless event. [D160](#d160-a-cancel-ends-an-execution-cancelled-through-one-controller-every-node-chains-to): the process-group discipline a command
 source's program is stopped by. **D163** is reserved for q77. `docs/distributed.md`
 **§8**: rule 2 is amended to name the fired row's exception, and the two-hub
-reading of a tick is stated there.
+reading of a tick is stated there. Rule 3 ("no schema or protocol may assume
+one writer per journal") is **not** amended: the tick repair and the dedupe
+takeover do assume one writer, held by the writer guard, and that conflict is
+recorded in the Status below for the owner rather than resolved here.
 
 **Status**: shipped as written here. The ruling fixes the keys, the payloads,
 the fired-row identity, the skip, the checkpoint hand-back and the refusals; the
@@ -13548,18 +13560,45 @@ following are the implementation's own readings and await the owner's ruling:
   tick, the scheduler hands the newest row back to the admission, which starts
   that execution under the id the row recorded, with the tick's own
   `payload.scheduled_at`, where no lifecycle row has it — and logs the tick by
-  name (`docs/durability.md` §3.11). It rests on the one-writer rule, as the
-  dedupe takeover below does; a scheduler that cannot read the journal at start
-  takes the look again before each tick until it can.
+  name (`docs/durability.md` §3.11). A scheduler that cannot read the journal
+  at start takes the look again before each tick until it can, and so it does
+  after a claim that failed in a way that may still have landed.
+- A tick or an event is admitted as **started** only once its execution's
+  lifecycle row is journaled — the admission waits for that row — so a
+  checkpoint never moves past, and a schedule is never armed past, an execution
+  the journal does not hold. A tick whose claim landed and whose execution the
+  journal would not begin is owed: the scheduler claims no later tick until
+  that execution has started under the claim, retried with backoff, and names
+  the ticks that fell meanwhile as skipped while the schedule was held. An
+  event in the same position is a refused admission, retried and holding the
+  stream, and its retry takes the key over.
+- A tick or an event whose `session_key:` answers the empty string for a flow
+  that reaches a `scope: session` store is refused as a binding failure for
+  its trigger — logged, never retried — since the run would refuse it before
+  journaling anything.
 - A skipped span longer than ten thousand ticks is counted as "at least" that
   many, and still named through the newest tick at or before now.
-- A dedupe claim whose execution was never journaled is taken over, by a
+- A dedupe claim whose execution was never journaled — a crash between the two,
+  or a lifecycle row the journal would not write — is taken over, by a
   conditional update naming the old holder, by the next event with that key.
+- **The tick repair and the dedupe takeover assume one writer, and
+  `docs/distributed.md` §8 rule 3 forbids that.** Both decide that a claim's
+  holder is gone from the absence of the lifecycle row it names, and the repair
+  finds the claim by the newest `fired` row across executions: true while one
+  process writes the journal (`docs/durability.md` §2.1), which the writer
+  guard enforces today (§2.3), and false for two hubs without it — the second
+  would take a live hub's claim between its insert and its execution's row for
+  a dead one's, and run the execution beside it. This release does not amend
+  rule 3. Whether the two stand as a named exception to it, or move onto a
+  criterion that holds across hubs — the claim held under the execution-set
+  lease rule 1 requires, so that a holder is gone when its lease is — is the
+  owner's call, and it is owed before the writer guard is lifted for multi-hub.
 - The checkpoint advances only when some bound trigger accepted the event — a
   start or a dedupe repeat; an event every trigger refused (an input that did
   not bind) advances nothing.
-- An intake that fails at the journal is retried with backoff and holds the
-  stream rather than skipping the line, and moves no checkpoint.
+- An intake that fails at the journal — at the event's claim, or at its
+  execution's lifecycle row — is retried with backoff and holds the stream
+  rather than skipping the line, and moves no checkpoint.
 - A checkpoint the journal cannot read at start is retried with backoff, and
   the program is not started until it is read — never started as if there were
   none, which would skip events or move the checkpoint backwards. The source
@@ -13588,17 +13627,23 @@ following are the implementation's own readings and await the owner's ruling:
   pipes to close, so a descendant that left the group cannot hold `serve` open.
 - The refused-line and accepted-event counts are the running process's, not
   journaled.
-- `auth:` on an `event` trigger. Ruling c puts `GET /sources/:name` under the
-  auth of the `event` triggers bound to the source, and grammar 13.5 gave an
-  `event` trigger no `auth:` to read, so this release gives it §13.3's block:
-  it guards that route and the routes of the executions the trigger started,
-  and nothing else — no event is ever asked for a credential. Where several
-  bound triggers declare one, a caller any one of them verifies is answered;
-  where none does, the route is open. A `schedule` trigger takes none. This is
-  a grammar addition the ruling implies rather than states, and the owner may
-  rule it otherwise.
+- `auth:` on an `event` trigger, a **grammar addition q78 does not make**.
+  Ruling c says only that each restart is "a journaled row the status route and
+  the serve log show"; it says nothing about auth or about who may read that
+  route. This release reads PRD resolved q32 onto the new route — a route that
+  reports what a trigger's work did is guarded by that trigger's `auth:`, as an
+  execution's routes are by the trigger that started it — and grammar 13.5 gave
+  an `event` trigger no `auth:` to read, so it gives one §13.3's block: it
+  guards `GET /sources/:name` and the routes of the executions the trigger
+  started, and nothing else — no event is ever asked for a credential. Where
+  several bound triggers declare one, a caller any one of them verifies is
+  answered; where none does, the route is open. A `schedule` trigger takes
+  none. The key is noted on [D46](#d46-reserved-trigger-shapes-are-fully-specified)'s amendment; whether it
+  stands is the owner's call.
 - The restart defaults — `backoff: 1s`, `max: 1m` — and the two-second stop
-  grace.
+  grace. A backoff longer than a runtime timer can hold (2³¹−1 ms, some 24.8
+  days; nothing bounds `restart:`) is waited out in steps of at most a minute
+  rather than armed whole, which Node and Bun would fire after a millisecond.
 - A `timezone:` is shape-checked at compile time and checked against the
   runtime's `Intl` at `serve` start.
 - The cron dialect: names accepted in any case; `a/n` refused; a backwards range
@@ -13606,8 +13651,10 @@ following are the implementation's own readings and await the owner's ruling:
   is exactly `*`.
 - The two-hub case on a dialled journal is held in practice by the journal's
   writer guard (`docs/durability.md` §2.3) — the second `serve` is a standby
-  whose ticks are refused at the journal — with the fired row's identity the
-  rule that holds when hubs share a journal without it.
+  whose ticks are refused at the journal. Without the guard the fired row's
+  identity still keeps a tick's claim once across hubs, and the dedupe row an
+  event's; what it does not keep is the repair and the takeover above, which
+  is the rule-3 conflict recorded there.
 
 *PRD resolved q7, q28, q32, q36, q37, q63, q77, q78; PRD 5.11, §7 M3; §13.4,
 §13.5, §14.4, §15; amends D46 and D87.*

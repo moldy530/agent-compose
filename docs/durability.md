@@ -1257,7 +1257,11 @@ nominal instant (`scheduled_at`, a UTC ISO string to the millisecond), the
 execution it started, and when it was written. Its key is **`(trigger,
 scheduled_at)`**, and it is written by `fire` in `src/journal.ts`, called from
 `admitTick` in `src/serve.ts`, **before** the execution is registered — so a
-tick is claimed and then started, never started and then claimed.
+tick is claimed and then started, never started and then claimed. And a tick
+is **fired** only once its execution's lifecycle row (§3.5) is down: the
+admission waits for that row before it answers the scheduler, so a claim is
+never logged as fired, nor the next tick armed past it, for an execution the
+journal does not hold.
 
 * **The insert that wins fires.** A second claim of the same tick — the same
   scheduler after a restart, or a second hub sharing the journal — inserts
@@ -1277,13 +1281,29 @@ tick is claimed and then started, never started and then claimed.
   (`admitUnbegun` in `src/serve.ts`), which starts that execution **under the
   id the row recorded**, bound to the tick's own `payload.scheduled_at`, where
   neither the process nor the journal has an execution of that id — and the
-  serve log names the tick. Only the newest row can be that claim, since a
-  scheduler arms its next tick only after the one before was admitted. It rests
-  on §2.1's one-writer rule, as §3.12's takeover does: the starting scheduler
-  has fired nothing yet, and nobody else writes the journal, so nothing is
-  admitting that claim beside it. Where the journal cannot be read at start — a
+  serve log names the tick. Where the journal cannot be read at start — a
   standby's dialled journal, guarded by the `serve` that holds it — the look is
-  taken again before each tick until it can be.
+  taken again before each tick until it can be, and so it is after a claim
+  that failed in a way that may still have landed.
+* **A claim whose execution the journal will not begin is owed, and holds the
+  schedule.** The row is down, so it wins every later claim of its tick, and
+  the execution it names has no lifecycle row — the state a crash leaves,
+  reached in a live process. The admission answers `unbegun` rather than
+  `started`, and takes the execution off the process's map; the scheduler logs
+  the tick as claimed and not started, and **claims no later tick** until it has
+  started that execution under the claim, retried with backoff (`#discharge` in
+  `src/sources.ts`). Ticks that fall meanwhile are skipped and named as fallen
+  while the schedule was held. A start that cannot say whether the claim's
+  execution began is owed the same way.
+* **Only the newest row can be an owed claim**, because a scheduler claims its
+  next tick only after the one before was admitted — started, found held, or
+  refused for its own bindings — and holds while one is owed. That is what lets
+  the repair read one row. It also rests on §2.1's one-writer rule, as §3.12's
+  takeover does: "its execution never began" is read off the absence of a
+  lifecycle row, which says the claimer is gone only while nobody else writes
+  the journal. `docs/distributed.md` §8 rule 3 forbids a protocol that assumes
+  one writer; this one does, held today by the writer guard (§2.3), and Decision
+  D162's Status records it for the owner's ruling before that guard is lifted.
 * **It is not an effect.** No §4 key, no replay consumes it, and a recovered
   execution a tick started is recovered by its lifecycle row like any other
   (§6.3).
@@ -1309,13 +1329,22 @@ before the execution is registered.
   two keys, and a key is scoped to its trigger.
 * **Rows do not expire.** PRD resolved q77's `dedupe_window:` is what will give
   them a TTL; until it lands a key is admitted once for the life of the journal.
+* **An event starts an execution only once its lifecycle row is down.** The
+  admission waits for the row (§3.5) before it answers the consumer, so the
+  checkpoint (§3.13) never moves past an event whose execution the journal does
+  not hold. One the journal will not begin is a refusal of the admission: the
+  execution is taken off the process's map, and the consumer retries the event
+  and holds the stream, as for a claim the journal refused.
 * **A claim whose execution never began is taken over.** If `serve` died between
-  the claim and the registration, the row names an execution the journal has no
-  lifecycle row for, and the next event with the key would otherwise be refused
-  for ever. So a repeat whose holder exists neither in the process nor in the
-  journal is re-claimed with a conditional update — `retakeDedupe`, which moves
-  the row only from the execution it still names — and starts. Two takeovers at
-  once agree on one, for the reason two claims do.
+  the claim and the lifecycle row, or the journal would not write that row, the
+  claim names an execution the journal has no lifecycle row for, and the next
+  event with the key would otherwise be refused for ever. So a repeat whose
+  holder exists neither in the process nor in the journal is re-claimed with a
+  conditional update — `retakeDedupe`, which moves the row only from the
+  execution it still names — and starts. Two takeovers at once agree on one, for
+  the reason two claims do. Deciding that the holder never began from the
+  absence of its row rests on §2.1's one-writer rule, as §3.11's repair does,
+  and `docs/distributed.md` §8 rule 3 is the rule it is held against there.
 
 ### 3.13 A source checkpoint
 
@@ -1324,12 +1353,14 @@ One row per `kind: command` event source (`docs/grammar.md` §14.4), in the
 JSON-encoded, for the reason a dedupe key is — and when it was written.
 Written by `recordCheckpoint` in `src/journal.ts`, called by the consumer in
 `src/sources.ts` **after** the intake accepted the event the checkpoint names:
-some bound trigger started an execution for it, or found the one it already
-had. So the checkpoint a restarted program is handed is never ahead of what was
-admitted, and what the program emitted past it before a crash is emitted again
-and answered by §3.12. An event every bound trigger refused — its inputs did not
-bind — moves nothing, and neither does one the journal would not admit: that
-event is retried and holds the stream until it is admitted.
+some bound trigger started an execution for it — one whose lifecycle row is
+journaled, which is when the admission says so (§3.12) — or found the one it
+already had. So the checkpoint a restarted program is handed is never ahead of
+what was admitted, and what the program emitted past it before a crash is
+emitted again and answered by §3.12. An event every bound trigger refused — its
+inputs did not bind — moves nothing, and neither does one the journal would not
+admit, whether it refused the event's claim or its execution's lifecycle row:
+that event is retried and holds the stream until it is admitted.
 
 **A start that cannot read the row does not start the program.** No row means
 the source has never had an event accepted, and a program started that way may
