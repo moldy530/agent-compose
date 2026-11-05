@@ -67,6 +67,9 @@
 //!   [`a_superseding_arrival_drops_its_groups_queued_arrivals`] — and starting
 //!   at its predecessor's cancel, while that execution is still unwinding —
 //!   [`a_superseding_arrival_starts_while_the_execution_it_cancelled_unwinds`];
+//!   and leaving a slot its cancel freed under `max_running:` to another
+//!   group's older arrival —
+//!   [`a_slot_a_superseding_arrivals_cancel_frees_is_another_groups_older_arrivals_first`];
 //! * what a burst behind a full group costs each arrival —
 //!   [`arrivals_behind_a_full_group_never_read_its_queue`];
 //! * an empty `session_key:` a flow needs, refused before a dedupe key is
@@ -77,7 +80,15 @@
 //!   [`a_queued_arrival_the_new_build_no_longer_binds_is_dropped_and_the_queue_moves_on`];
 //! * a start the journal refused, owed and holding its slot, and the arrivals
 //!   queued behind it —
-//!   [`a_start_the_journal_refused_twice_is_owed_and_started_once_it_recovers`];
+//!   [`a_start_the_journal_refused_twice_is_owed_and_started_once_it_recovers`],
+//!   and with a completion webhook, pushed once, for the run that finished,
+//!   while the refused start is tried again on the queue's period —
+//!   [`a_waiting_arrivals_refused_start_pushes_one_settle_and_is_retried_on_the_drain_period`];
+//! * a slot held by an open execution the serving build cannot run, freed by
+//!   its cancel — off the board, its flow renamed —
+//!   [`an_open_execution_of_a_flow_the_build_no_longer_declares_frees_its_slot_when_cancelled`],
+//!   and on it, its recovery refused —
+//!   [`an_execution_whose_recovery_the_build_could_not_take_frees_its_slot_when_cancelled`];
 //! * the serve log's lines — [`the_serve_log_names_each_intake_decision`], and
 //!   the supersede line in (3).
 
@@ -297,19 +308,22 @@ fn identical_deliveries_inside_the_window_start_one_execution_across_a_restart()
         return;
     };
     let delivery = json!({ "tag": "push", "id": "delivery-7" });
-    let first_at = Instant::now();
-    let first = {
+    let (first, first_at) = {
         let Some(served) = harness::serve_into(&project, FIXTURE, &environment) else {
             return;
         };
         let app = Client::new(&served.base_url).expect("a client");
+        // Taken once the app is up, just before the delivery whose claim
+        // opens the window: a start that took long under load would otherwise
+        // leave the wait for the window's end short of it.
+        let first_at = Instant::now();
         let answered = post(&app, "/deduped", &delivery);
         assert_eq!(
             answered.header("x-agentcompose-deduped"),
             None,
             "{answered:?}"
         );
-        execution_of(&answered)
+        (execution_of(&answered), first_at)
         // Dropped here: `SIGKILL` to the whole group.
     };
 
@@ -3715,4 +3729,648 @@ fn arrivals_behind_a_full_group_never_read_its_queue() {
         .chain((0..12).map(|n| format!("queued {n}")))
         .collect();
     assert_eq!(order, expected, "first in, first out");
+}
+
+/// The composition
+/// [`a_waiting_arrivals_refused_start_pushes_one_settle_and_is_retried_on_the_drain_period`]
+/// serves: a group of one that queues and a debounce, each `http` trigger
+/// asking for its lifecycle webhooks at the body's `callback_url`.
+const OWING: &str = r#"version: "0.1"
+
+triggers:
+  owing:
+    type: http
+    path: /owing
+    flow: flow.work
+    respond: async
+    input:
+      tag: "payload.body.tag"
+      linger: "payload.body.linger"
+    callback: "payload.body.callback_url"
+    callback_allow:
+      - "http://127.0.0.1:*"
+    concurrency:
+      limit: 1
+  owing_burst:
+    type: http
+    path: /owing-burst
+    flow: flow.work
+    respond: async
+    input:
+      tag: "payload.body.tag"
+    callback: "payload.body.callback_url"
+    callback_allow:
+      - "http://127.0.0.1:*"
+    concurrency:
+      debounce: 1s
+
+flow.work:
+  description: One tagged piece of work that takes as long as it is told to.
+  inputs:
+    tag: { type: string }
+    linger: { type: string, default: "0" }
+    pushes: { type: integer, default: 1 }
+  outputs: {}
+  nodes:
+    work:
+      exec:
+        command: "${TALLY_BIN}/work"
+      input:
+        tag: "input.tag"
+        linger: "input.linger"
+        pushes: "input.pushes"
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+"#;
+
+/// The `detail` a waited row is put back on the queue with when the journal
+/// refuses its execution's lifecycle row, as [`OWING`]'s test refuses it.
+const REFUSED_BEGIN: &str = "its execution could not be journaled: refused by the test";
+
+/// **A waiting arrival whose start the journal refuses pushes no `settled`
+/// webhook until its execution really settles, and is tried again on the
+/// queue's period rather than at once** (Decision D163's Status,
+/// `docs/durability.md` §3.15, grammar 13.3).
+///
+/// `owing` queues `owed` behind `first`, and `owing_burst` holds `owed burst`
+/// in a one-second debounce; both ask for their webhooks. While a SQLite
+/// trigger the test installs refuses the lifecycle row of every execution whose
+/// inputs name `owed`, `first` settles and frees `owing`'s slot, and the
+/// debounce closes: each owed start is refused, its row put back on the queue
+/// under the execution id it recorded — and nothing is pushed for it. A push of
+/// `failed` then would be the only settle the caller ever heard: the start that
+/// does run the execution finds that push journaled and announces nothing.
+///
+/// Nor does the refused start's own end look at the queue again: a run that
+/// never reached its row freed no slot, and a look then would start the row
+/// again at once, refused again, in a loop paced only by the journal — the
+/// serve log flooded, and the app too busy to answer its own status route.
+/// So each owed row is tried again on the
+/// queue's two-second period ([`REFUSED_BEGIN`] is its `detail` meanwhile), a
+/// bounded number of times while the refusal holds. Once it is lifted both run,
+/// and each execution — `first` too — is pushed exactly one `settled` webhook,
+/// `completed`, with one `settled` delivery row in the journal.
+#[test]
+fn a_waiting_arrivals_refused_start_pushes_one_settle_and_is_retried_on_the_drain_period() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    let scratch = harness::Scratch::new("intake-owed-callback");
+    let (environment, _log) = environment(&provider, &scratch, &[]);
+    let entrypoint = scratch.path().join("main.yml");
+    std::fs::write(&entrypoint, OWING).expect("the scratch area is writable");
+    let Some(project) = harness::scratch_project("intake-owed-callback") else {
+        return;
+    };
+    let Some(mut served) = harness::serve_entrypoint_into(&project, &entrypoint, &environment)
+    else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client");
+    let callback = format!("{}/done", receiver.base_url);
+    let first = execution_of(&post(
+        &app,
+        "/owing",
+        &json!({ "tag": "first", "linger": "2", "callback_url": callback }),
+    ));
+    let owed = post(
+        &app,
+        "/owing",
+        &json!({ "tag": "owed", "linger": "0", "callback_url": callback }),
+    );
+    assert_eq!(owed.json()["status"], "queued", "{}", owed.text());
+    let owed = intake_id_of(&owed);
+    let refuse = harness::journal_sql(
+        &project,
+        "CREATE TRIGGER refuse_the_owed_begins BEFORE INSERT ON executions \
+           WHEN NEW.inputs LIKE '%owed%' BEGIN SELECT RAISE(ABORT, 'refused by the test'); END;\n",
+    );
+    assert!(
+        refuse.status.success(),
+        "{}",
+        String::from_utf8_lossy(&refuse.stderr)
+    );
+    let refused_from = Instant::now();
+    let burst = post(
+        &app,
+        "/owing-burst",
+        &json!({ "tag": "owed burst", "callback_url": callback }),
+    );
+    assert_eq!(burst.json()["status"], "pending", "{}", burst.text());
+    let burst = intake_id_of(&burst);
+
+    // Asked of the app rather than the journal, which a start retried in a
+    // loop would keep too busy to read.
+    let report = harness::settled(&app, &first);
+    assert_eq!(report["status"], "completed", "{report}");
+    // Held refused for several of the queue's periods — the debounce closed
+    // inside the first of them: each owed row is tried again on it, and
+    // nothing about either execution is pushed meanwhile.
+    std::thread::sleep(Duration::from_secs(7));
+    assert!(
+        receiver
+            .of_event("settled")
+            .iter()
+            .all(|held| held.body["execution_id"] == first.as_str()),
+        "a refused start of a waiting arrival is no settle: {:?}",
+        receiver.of_event("settled")
+    );
+    let lift = harness::journal_sql(&project, "DROP TRIGGER refuse_the_owed_begins;\n");
+    assert!(
+        lift.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lift.stderr)
+    );
+    let refused_for = refused_from.elapsed();
+
+    let mut started = BTreeMap::new();
+    for (intake, trigger) in [(&owed, "owing"), (&burst, "owing_burst")] {
+        let execution = eventually(
+            Duration::from_secs(30),
+            "the owed arrival to start and complete once the journal takes it",
+            || {
+                let report = get(&app, &format!("/intakes/{intake}")).json();
+                let execution = report["execution_id"].as_str()?.to_string();
+                executions_of(&project, trigger)
+                    .iter()
+                    .any(|row| row.id == execution && row.status == "completed")
+                    .then_some(execution)
+            },
+        );
+        started.insert(trigger, execution);
+    }
+    receiver.wait_for_event("settled", 3, Duration::from_secs(30));
+    // Time for a second push of any of them to land, which none should.
+    std::thread::sleep(Duration::from_secs(2));
+    let settled = receiver.of_event("settled");
+    for execution in [&first, &started["owing"], &started["owing_burst"]] {
+        let pushed: Vec<&harness::Delivered> = settled
+            .iter()
+            .filter(|held| held.body["execution_id"] == execution.as_str())
+            .collect();
+        assert_eq!(
+            pushed.len(),
+            1,
+            "one execution, one settle webhook: {settled:?}"
+        );
+        assert_eq!(
+            pushed[0].body["status"], "completed",
+            "the push is the run that finished: {:?}",
+            pushed[0].body
+        );
+        let rows = harness::journal_rows(
+            &project,
+            &format!(
+                "SELECT COUNT(*) AS n FROM deliveries \
+                 WHERE execution = '{execution}' AND event = 'settled'"
+            ),
+        );
+        assert_eq!(
+            rows[0]["n"], 1,
+            "one `settled` delivery journaled for {execution}: {rows}"
+        );
+    }
+
+    let said = served.stop_and_read_stderr();
+    // One try when the slot freed or the debounce closed, then one each
+    // period the refusal held — never one per journal round trip — with one
+    // more for the look the lift raced.
+    let bound = 3 + usize::try_from(refused_for.as_secs() / 2).expect("a small count");
+    for intake in [&owed, &burst] {
+        let tries = said
+            .lines()
+            .filter(|line| {
+                line.contains(&format!("{intake}'s execution "))
+                    && line.contains("could not be journaled (refused by the test)")
+            })
+            .count();
+        assert!(
+            (2..=bound).contains(&tries),
+            "{intake} was tried {tries} times in the {refused_for:?} the journal refused it — \
+             expected one try and then one per two-second look, at most {bound}:\n{said}"
+        );
+        // Each was put back on the queue saying why, which the start that
+        // then ran it left as it was.
+        let rows = harness::journal_rows(
+            &project,
+            &format!("SELECT detail FROM intakes WHERE id = '{intake}'"),
+        );
+        assert_eq!(rows[0]["detail"], REFUSED_BEGIN, "{intake}: {rows}");
+    }
+}
+
+/// The composition a test starts an intake's execution under before it moves
+/// the build: one key-less group of one slot over a flow whose execution ends
+/// when the file its `hold` names appears.
+const SLOT_HELD: &str = r#"version: "0.1"
+
+triggers:
+  slot:
+    type: http
+    path: /slot
+    flow: flow.held
+    input:
+      tag: "payload.body.tag"
+      hold: "payload.body.hold"
+    concurrency:
+      limit: 1
+
+flow.held:
+  description: One tagged piece of work that ends when a file appears.
+  inputs:
+    tag: { type: string }
+    hold: { type: string }
+  outputs: {}
+  nodes:
+    wait:
+      exec:
+        command: "${TALLY_BIN}/hold"
+      input:
+        tag: "input.tag"
+        hold: "input.hold"
+  edges:
+    - { from: start, to: wait }
+    - { from: wait, to: end }
+"#;
+
+/// [`SLOT_HELD`] moved by a deploy that renamed its flow: the trigger is the
+/// same, and nothing this build declares can run what `flow.held` began.
+const SLOT_RENAMED: &str = r#"version: "0.1"
+
+triggers:
+  slot:
+    type: http
+    path: /slot
+    flow: flow.held_again
+    input:
+      tag: "payload.body.tag"
+      hold: "payload.body.hold"
+    concurrency:
+      limit: 1
+
+flow.held_again:
+  description: The same work under a new name.
+  inputs:
+    tag: { type: string }
+    hold: { type: string }
+  outputs: {}
+  nodes:
+    wait:
+      exec:
+        command: "${TALLY_BIN}/hold"
+      input:
+        tag: "input.tag"
+        hold: "input.hold"
+  edges:
+    - { from: start, to: wait }
+    - { from: wait, to: end }
+"#;
+
+/// [`SLOT_HELD`] moved by a deploy that gave its flow a required input, so the
+/// inputs an execution of it recorded no longer bind and its recovery fails
+/// before it can open anything.
+const SLOT_NARROWED: &str = r#"version: "0.1"
+
+triggers:
+  slot:
+    type: http
+    path: /slot
+    flow: flow.held
+    input:
+      tag: "payload.body.tag"
+      hold: "payload.body.hold"
+      reason: "payload.body.tag"
+    concurrency:
+      limit: 1
+
+flow.held:
+  description: One tagged piece of work that ends when a file appears, saying why.
+  inputs:
+    tag: { type: string }
+    hold: { type: string }
+    reason: { type: string }
+  outputs: {}
+  nodes:
+    wait:
+      exec:
+        command: "${TALLY_BIN}/hold"
+      input:
+        tag: "input.tag"
+        hold: "input.hold"
+  edges:
+    - { from: start, to: wait }
+    - { from: wait, to: end }
+"#;
+
+/// Start `first` under [`SLOT_HELD`], holding the trigger's one slot on a file
+/// nothing writes, and kill the `serve` that started it — leaving its
+/// lifecycle row open and its slot held. Answers its execution id.
+fn leave_the_slot_held(
+    project: &Path,
+    scratch: &harness::Scratch,
+    environment: &[(String, String)],
+) -> Option<String> {
+    let entrypoint = scratch.path().join("held.yml");
+    std::fs::write(&entrypoint, SLOT_HELD).expect("the scratch area is writable");
+    let never = scratch.path().join("never");
+    let served = harness::serve_entrypoint_into(project, &entrypoint, environment)?;
+    let app = Client::new(&served.base_url).expect("a client");
+    let first = execution_of(&post(
+        &app,
+        "/slot",
+        &json!({ "tag": "first", "hold": never.display().to_string() }),
+    ));
+    eventually(Duration::from_secs(30), "first's lifecycle row", || {
+        executions_of(project, "slot")
+            .iter()
+            .any(|row| row.id == first && row.status == "open")
+            .then_some(())
+    });
+    // Dropped here: `SIGKILL` to the whole group, the row left open.
+    drop(served);
+    Some(first)
+}
+
+/// Under a moved build, send `second` to the slot `first` still holds, see it
+/// wait there, cancel `first`, and see `second` start into the slot the
+/// cancel freed and complete. Answers the cancel's `202` body.
+fn cancel_frees_the_slot(
+    app: &Client,
+    project: &Path,
+    scratch: &harness::Scratch,
+    first: &str,
+) -> Value {
+    let present = scratch.path().join("present");
+    std::fs::write(&present, "").expect("the scratch area is writable");
+    let second = post(
+        app,
+        "/slot",
+        &json!({ "tag": "second", "hold": present.display().to_string() }),
+    );
+    assert_eq!(
+        second.json()["status"],
+        "queued",
+        "first's open row holds the slot: {}",
+        second.text()
+    );
+    let second = intake_id_of(&second);
+    // Held for good while nothing frees it: no run of this build will ever
+    // close first's row.
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        get(app, &format!("/intakes/{second}")).json()["state"],
+        "queued",
+        "the slot is still first's"
+    );
+
+    let cancelled = app
+        .send(Request::post(format!("/executions/{first}/cancel")))
+        .expect("the cancel route answers");
+    assert_eq!(cancelled.status, 202, "{}", cancelled.text());
+    let body = cancelled.json();
+    assert_eq!(body["execution_id"], first, "{body}");
+    assert_eq!(body["cancelling"], true, "{body}");
+
+    let started = eventually(
+        Duration::from_secs(30),
+        "second to start into the slot the cancel freed, and complete",
+        || {
+            let report = get(app, &format!("/intakes/{second}")).json();
+            let execution = report["execution_id"].as_str()?.to_string();
+            executions_of(project, "slot")
+                .iter()
+                .any(|row| row.id == execution && row.status == "completed")
+                .then_some(execution)
+        },
+    );
+    assert_ne!(started, first);
+    let rows = executions_of(project, "slot");
+    let held = rows
+        .iter()
+        .find(|row| row.id == first)
+        .expect("first's row");
+    assert_eq!(
+        (held.status.as_str(), held.ended_at.as_deref()),
+        ("open", None),
+        "nothing this build runs closed first's row: the cancel freed its slot, and the \
+         start that next recovers it under a build that can run it completes the cancel"
+    );
+    let cancels = harness::journal_rows(
+        project,
+        &format!("SELECT COUNT(*) AS n FROM cancellations WHERE execution = '{first}'"),
+    );
+    assert_eq!(cancels[0]["n"], 1, "the cancel is recorded: {cancels}");
+
+    // Asked again, it is the same request again.
+    let again = app
+        .send(Request::post(format!("/executions/{first}/cancel")))
+        .expect("the cancel route answers");
+    assert_eq!(again.status, 202, "{}", again.text());
+    body
+}
+
+/// **An open execution of a flow the serving build no longer declares frees
+/// its slot when it is cancelled** (Decision D163's Status, PRD resolved q75
+/// ruling d, `docs/durability.md` §3.15).
+///
+/// `first` holds `slot`'s one slot when its `serve` dies, and the next build
+/// renames the flow. Recovery leaves `first`'s row open in the journal and puts
+/// it on no board — nothing here can run it — and the lease is the open rows,
+/// so `second` queues behind it, and would for as long as the build is served.
+/// `POST /executions/<first>/cancel` reaches it all the same: `202`, the
+/// journal's `open` and a `detail` naming the flow this build lacks; the cancel
+/// is recorded, which frees the slot, and `second` starts and completes while
+/// `first`'s row stays open for a build that can complete the cancel. An id
+/// the journal does not hold is still `404`.
+#[test]
+fn an_open_execution_of_a_flow_the_build_no_longer_declares_frees_its_slot_when_cancelled() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("intake-unrun-renamed");
+    let (environment, _log) = environment(&provider, &scratch, &[]);
+    let Some(project) = harness::scratch_project("intake-unrun-renamed") else {
+        return;
+    };
+    let Some(first) = leave_the_slot_held(&project, &scratch, &environment) else {
+        return;
+    };
+    let entrypoint = scratch.path().join("renamed.yml");
+    std::fs::write(&entrypoint, SLOT_RENAMED).expect("the scratch area is writable");
+    let Some(served) = harness::serve_entrypoint_into(&project, &entrypoint, &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client");
+    assert_eq!(
+        get(&app, &format!("/executions/{first}")).status,
+        404,
+        "first is on no board of this build"
+    );
+
+    let body = cancel_frees_the_slot(&app, &project, &scratch, &first);
+    assert_eq!(body["status"], "open", "{body}");
+    assert!(
+        body.get("status_url").is_none(),
+        "no route of this build reports it: {body}"
+    );
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("this build declares no flow `flow.held` to run it by"),
+        "{body}"
+    );
+    let unknown = app
+        .send(Request::post("/executions/exec_nobody_started/cancel"))
+        .expect("the cancel route answers");
+    assert_eq!(unknown.status, 404, "{}", unknown.text());
+}
+
+/// **An execution whose recovery the serving build could not take frees its
+/// slot when it is cancelled** (Decision D163's Status, PRD resolved q75
+/// ruling d, `docs/durability.md` §7).
+///
+/// `first` holds `slot`'s one slot when its `serve` dies, and the next build
+/// gives the flow a required input `first` never recorded. Its recovery fails
+/// before anything opens, so this process reports it `failed` while its row
+/// stays open on purpose — the build's disagreement, not the execution's — and
+/// the open row holds the slot: `second` queues behind it. Cancelling `first`
+/// is not refused as already failed: `202`, this process's `failed` and its
+/// status URL; the slot frees, and `second` runs.
+#[test]
+fn an_execution_whose_recovery_the_build_could_not_take_frees_its_slot_when_cancelled() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("intake-unrun-narrowed");
+    let (environment, _log) = environment(&provider, &scratch, &[]);
+    let Some(project) = harness::scratch_project("intake-unrun-narrowed") else {
+        return;
+    };
+    let Some(first) = leave_the_slot_held(&project, &scratch, &environment) else {
+        return;
+    };
+    let entrypoint = scratch.path().join("narrowed.yml");
+    std::fs::write(&entrypoint, SLOT_NARROWED).expect("the scratch area is writable");
+    let Some(served) = harness::serve_entrypoint_into(&project, &entrypoint, &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client");
+    let reported = harness::settled(&app, &first);
+    assert_eq!(reported["status"], "failed", "{reported}");
+
+    let body = cancel_frees_the_slot(&app, &project, &scratch, &first);
+    assert_eq!(body["status"], "failed", "{body}");
+    assert_eq!(body["status_url"], format!("/executions/{first}"), "{body}");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("this process could not take up its recovery"),
+        "{body}"
+    );
+}
+
+/// **A slot a superseding arrival's cancel frees under `max_running:` is an
+/// older arrival's of another group first** (Decision D163's Status, PRD
+/// resolved q77 ruling b, grammar 13.1).
+///
+/// [`SUPERSEDING`]'s `latest` supersedes within a group and runs one execution
+/// across all of them. `a1` holds the trigger's one slot, and `b1` queues for
+/// another group behind `max_running:`. `a2` arrives for `a1`'s group and
+/// cancels it — but the slot that cancel frees is `b1`'s, the oldest waiting
+/// arrival's: `b1` starts into it and `a2` is answered `queued`, to run once
+/// `b1` has ended. Taken by `a2`, a group superseded faster than its runs end
+/// would hold the trigger's total for good, and `b1` would never start.
+#[test]
+fn a_slot_a_superseding_arrivals_cancel_frees_is_another_groups_older_arrivals_first() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("intake-supersede-fair");
+    let (environment, _log) = environment(&provider, &scratch, &[]);
+    let never = scratch.path().join("never");
+    let release_b1 = scratch.path().join("release-b1");
+    let present = scratch.path().join("present");
+    std::fs::write(&present, "").expect("the scratch area is writable");
+    let hold = |file: &Path| file.display().to_string();
+    let entrypoint = scratch.path().join("main.yml");
+    std::fs::write(&entrypoint, SUPERSEDING).expect("the scratch area is writable");
+    let Some(project) = harness::scratch_project("intake-supersede-fair") else {
+        return;
+    };
+    let Some(mut served) = harness::serve_entrypoint_into(&project, &entrypoint, &environment)
+    else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client");
+    let a1 = execution_of(&post(
+        &app,
+        "/latest",
+        &json!({ "group": "a", "tag": "a1", "hold": hold(&never) }),
+    ));
+    let b1 = post(
+        &app,
+        "/latest",
+        &json!({ "group": "b", "tag": "b1", "hold": hold(&release_b1) }),
+    );
+    assert_eq!(b1.json()["status"], "queued", "{}", b1.text());
+    let b1 = intake_id_of(&b1);
+
+    let a2 = post(
+        &app,
+        "/latest",
+        &json!({ "group": "a", "tag": "a2", "hold": hold(&present) }),
+    );
+    assert_eq!(
+        a2.json()["status"],
+        "queued",
+        "the slot a1's cancel freed is b1's, the older arrival's: {}",
+        a2.text()
+    );
+    let a2 = intake_id_of(&a2);
+    let b1_execution = eventually(
+        Duration::from_secs(30),
+        "b1 to start into the slot a1's cancel freed",
+        || {
+            get(&app, &format!("/intakes/{b1}")).json()["execution_id"]
+                .as_str()
+                .map(str::to_string)
+        },
+    );
+    // b1 holds the trigger's total until the test lets it end: a2 waits.
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        get(&app, &format!("/intakes/{a2}")).json()["state"],
+        "queued",
+        "a2 waits for the trigger's total, as `queue` would"
+    );
+    std::fs::write(&release_b1, "").expect("the release file");
+    let rows = eventually(Duration::from_secs(60), "b1 and a2 to complete", || {
+        let rows = executions_of(&project, "latest");
+        let done = |tag: &str| {
+            rows.iter()
+                .any(|row| row.inputs["tag"] == tag && row.status == "completed")
+        };
+        (done("b1") && done("a2")).then_some(rows)
+    });
+    let row = |tag: &str| {
+        rows.iter()
+            .find(|row| row.inputs["tag"] == tag)
+            .unwrap_or_else(|| panic!("{tag}'s row: {rows:#?}"))
+    };
+    assert_eq!(row("a1").id, a1);
+    assert_eq!(row("a1").status, "cancelled", "{rows:#?}");
+    assert_eq!(row("b1").id, b1_execution);
+    let b1_ended = row("b1").ended_at.as_deref().expect("b1 ended");
+    assert!(
+        row("a2").started_at.as_str() >= b1_ended,
+        "a2 began at {} only after b1 ended at {b1_ended}: one execution across the trigger",
+        row("a2").started_at
+    );
+    assert_eq!(rows.len(), 3, "{rows:#?}");
+
+    let said = served.stop_and_read_stderr();
+    let superseded = format!(
+        "intake `latest`: superseded {a1} for {}",
+        execution_named_by(&project, &a2)
+    );
+    assert!(
+        said.lines().any(|line| line == superseded),
+        "the serve log says `{superseded}`:\n{said}"
+    );
 }
