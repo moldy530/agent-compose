@@ -362,7 +362,9 @@ nightly_digest:
 
 - **A tick fires once.** It is journaled before its execution starts, keyed by
   the trigger and the tick, so a restarted `serve` — or a second hub on the same
-  journal — never starts it again.
+  journal — never starts it again. A `serve` killed between journaling a tick
+  and starting its execution leaves that tick to the next one, which starts it
+  on its way up and says so in the serve log.
 - **Downtime is skipped, never back-filled.** Ticks that fell while no `serve`
   was running do not fire when it comes back; the serve log names the span.
   `payload.scheduled_at` is the tick the execution was started for — its
@@ -469,7 +471,10 @@ What the runtime does around it:
 - **The checkpoint** is journaled once the trigger has accepted the event, and
   handed back on every start: as `AGENT_COMPOSE_CHECKPOINT`, and in place of an
   argument written exactly `{checkpoint}`. Before there is one, the variable is
-  unset and the argument is the empty string. `checkpoint:` reads the line —
+  unset and the argument is the empty string — and a journal that cannot say
+  which holds the program back until it can, rather than starting it from no
+  position. An event the trigger refuses, or the journal will not yet admit,
+  moves nothing. `checkpoint:` reads the line —
   `payload.body`, `payload.source`, `payload.attributes` — and never
   `payload.id`, which is its own answer (`circular-checkpoint`).
 - **Dedupe.** `dedupe_key:` defaults to `payload.id`, so an event the program
@@ -477,7 +482,7 @@ What the runtime does around it:
   restarted — starts one execution; the repeat is logged and starts nothing.
 - **A line that is not a JSON object** is refused, logged with its line number
   and counted; it starts nothing. stderr goes to the serve log, tagged
-  `[source reports]`.
+  `[source reports]`, a line longer than 1 MiB cut there.
 - **Restarts.** When the program exits it is started again after
   `restart.backoff` (default `1s`), doubling up to `restart.max` (default `1m`),
   and each restart is journaled.

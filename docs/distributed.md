@@ -1720,10 +1720,13 @@ however many schedulers evaluate it. Today the journal's writer guard
 (`docs/durability.md` §2.3) is the stronger rule on a dialled journal: one
 `serve` holds it, and a second over the same journal is a standby whose claims
 the journal refuses — it logs each tick as not fired, and takes the schedule
-over when the first goes. The row is what keeps the tick once when leases are
-per execution set and the guard is gone. A consumer's checkpoint is the same
-shape at a source's granularity: one row per source, written by whichever hub
-admitted the event it names.
+over when the first goes, starting first a tick the first claimed and died
+before starting (`docs/durability.md` §3.11). The row is what keeps the tick
+once when leases are per execution set and the guard is gone. A consumer's
+checkpoint is the same shape at a source's granularity: one row per source,
+written by whichever hub admitted the event it names — and a standby's
+consumer, which cannot read it, holds its program back until it can rather
+than starting it from no position (§3.13 there).
 
 **Ingress obeys the same discipline** (resolved q44's fourth invariant): URLs
 derive from a configurable public base — `hub.public_url:`, grammar §14.2 — and

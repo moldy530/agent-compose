@@ -1269,10 +1269,21 @@ tick is claimed and then started, never started and then claimed.
   answers the greatest `scheduled_at`, whatever order the rows were written in;
   every tick after it and before now is skipped and named in the serve log,
   never fired (PRD resolved q78: "jobs that run can catch themselves up").
-* **A crash between the claim and the start loses the tick.** The row is down
-  and no execution was registered under its id, so no later claim starts it —
-  at most once, never twice, which is the direction ruling b asks for. The
-  window is one journal write wide.
+* **A crash between the claim and the start is repaired at the next start.**
+  The row is down and names an execution the journal has no lifecycle row for,
+  so it wins every later claim of its tick and nothing would ever recover what
+  it names: honoured, the tick would fire zero times. So a scheduler starting
+  hands the newest row back to the admission before it arms a tick
+  (`admitUnbegun` in `src/serve.ts`), which starts that execution **under the
+  id the row recorded**, bound to the tick's own `payload.scheduled_at`, where
+  neither the process nor the journal has an execution of that id — and the
+  serve log names the tick. Only the newest row can be that claim, since a
+  scheduler arms its next tick only after the one before was admitted. It rests
+  on §2.1's one-writer rule, as §3.12's takeover does: the starting scheduler
+  has fired nothing yet, and nobody else writes the journal, so nothing is
+  admitting that claim beside it. Where the journal cannot be read at start — a
+  standby's dialled journal, guarded by the `serve` that holds it — the look is
+  taken again before each tick until it can be.
 * **It is not an effect.** No §4 key, no replay consumes it, and a recovered
   execution a tick started is recovered by its lifecycle row like any other
   (§6.3).
@@ -1317,7 +1328,16 @@ some bound trigger started an execution for it, or found the one it already
 had. So the checkpoint a restarted program is handed is never ahead of what was
 admitted, and what the program emitted past it before a crash is emitted again
 and answered by §3.12. An event every bound trigger refused — its inputs did not
-bind — moves nothing.
+bind — moves nothing, and neither does one the journal would not admit: that
+event is retried and holds the stream until it is admitted.
+
+**A start that cannot read the row does not start the program.** No row means
+the source has never had an event accepted, and a program started that way may
+begin at its tip — skipping everything after the journaled position — or at its
+beginning, re-emitting what was admitted and moving the checkpoint backwards as
+the repeats are answered. So `checkpointOf` failing at start is retried with
+backoff, the source reads `starting` on its status route meanwhile, and the
+program is started only once the journal has said which position it holds.
 
 The write is an insert-if-absent followed by an update, two statements each
 atomic on its own rather than one upsert in three dialects; one writer at a time

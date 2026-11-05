@@ -5970,9 +5970,13 @@ ruling a): the hub owns triggers (PRD resolved q37), so the scheduler runs in th
 process `serve` starts, after recovery, and stops with it. `agent-compose run`
 of the same flow fires no tick — a one-shot command is not a clock.
 
-**The cron grammar.** Five whitespace-separated fields and nothing around them —
-the shape, checked first and reported as `invalid-value` — each holding values
-in its own range:
+**The cron grammar.** Five fields separated by ASCII whitespace and nothing
+around them — the shape, checked first and reported as `invalid-value` — each
+holding values in its own range. The separators are space, tab, line feed, form
+feed and carriage return, and no other character: a no-break space or a U+0085
+is part of the field it sits in, which then refuses it. Unicode's own
+"whitespace" is read differently by the validator's language and the
+scheduler's, so neither reads it.
 
 | Field | Values | Names |
 |---|---|---|
@@ -13539,18 +13543,33 @@ following are the implementation's own readings and await the owner's ruling:
 - A scheduler that wakes late fires the one tick it was waiting for and skips
   the rest, logged the way downtime is.
 - The fired row is claimed after the trigger's inputs are bound and before the
-  execution is registered, so a crash between the two loses that tick — at most
-  once, never twice.
+  execution is registered. A crash between the two leaves a row naming an
+  execution that never began, and the next start repairs it: before arming a
+  tick, the scheduler hands the newest row back to the admission, which starts
+  that execution under the id the row recorded, with the tick's own
+  `payload.scheduled_at`, where no lifecycle row has it — and logs the tick by
+  name (`docs/durability.md` §3.11). It rests on the one-writer rule, as the
+  dedupe takeover below does; a scheduler that cannot read the journal at start
+  takes the look again before each tick until it can.
+- A skipped span longer than ten thousand ticks is counted as "at least" that
+  many, and still named through the newest tick at or before now.
 - A dedupe claim whose execution was never journaled is taken over, by a
   conditional update naming the old holder, by the next event with that key.
 - The checkpoint advances only when some bound trigger accepted the event — a
   start or a dedupe repeat; an event every trigger refused (an input that did
   not bind) advances nothing.
 - An intake that fails at the journal is retried with backoff and holds the
-  stream rather than skipping the line.
+  stream rather than skipping the line, and moves no checkpoint.
+- A checkpoint the journal cannot read at start is retried with backoff, and
+  the program is not started until it is read — never started as if there were
+  none, which would skip events or move the checkpoint backwards. The source
+  reads `starting` meanwhile; the app serves.
 - Lines longer than 1 MiB are refused like lines that are not JSON objects —
   once, as one line: the rest of it, up to its newline, is dropped rather than
-  read as a line of its own.
+  read as a line of its own. A stderr line past the same bound is logged cut
+  at it, saying so, and the rest of it is dropped the same way.
+- `cron:` fields are separated by ASCII whitespace only, in the validator, the
+  emitted evaluator and the schema alike.
 - A line whose `checkpoint:` cannot be evaluated is refused like a line that
   is not an object: counted, logged, and never an execution. One whose
   `input:`, `session_key:` or `dedupe_key:` a trigger cannot evaluate starts
