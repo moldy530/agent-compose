@@ -648,11 +648,14 @@ arrival is held to the flow being served when its turn comes, and a deploy may
 have changed it: one that no longer fits the flow's `inputs:` is `dropped`, its
 `detail` saying why, and the queue goes on to the next.
 
-**A run is refused, never queued.** `run` shares the project's journal, so it
-sees the slots the serving process holds: a run of a flow that a trigger's
-**key-less** group covers is refused at start while that group is full, exit
-`2`, naming the execution that holds it, with nothing started or journaled.
-Run it again once that execution settles (`agent-compose docs cli`).
+**A run is refused, never queued.** `run` reads the slots off the project's
+journal: a run of a flow that a trigger's **key-less** group covers is refused
+at start while that group is full, exit `2`, naming the execution that holds
+it, with nothing started or journaled. Run it again once that execution
+settles. On SQLite that is what a run beside a `serve` meets; on Postgres and
+MySQL a `serve` that is up holds the journal's writer guard, so a run beside it
+is refused by the guard before it reads any slot, naming no execution
+(`agent-compose docs cli`).
 
 ## Idempotency keys
 

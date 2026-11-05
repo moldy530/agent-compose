@@ -5651,7 +5651,9 @@ may hold admits nothing.
   which bind when the execution starts. `dedupe_key:` and `concurrency.key` are
   evaluated as each arrival lands — the one to decide whether it is a repeat,
   the other which debounce it joins — before the count exists, so neither may
-  read it (`coalesced-in-key`). An arrival under a debounce is bound as it
+  read it (`coalesced-in-key`). On a trigger with no `debounce:` there is no
+  count to wait for, and either key's read is the unknown field above, reported
+  once. An arrival under a debounce is bound as it
   lands too, with `payload.coalesced` `1`, so one the trigger could never start
   is refused then rather than at the deadline.
 - **An arrival with no execution yet is answered with an id of its own.** A
@@ -5704,15 +5706,28 @@ defaulted `session_key:`, exists implicitly for every flow (§13 preamble).
 (PRD resolved q77 ruling e, [D163](#d163-a-triggers-intake-a-dedupe-window-and-groups-leased-off-the-journal)). A manual trigger has no
 arrivals — it describes a command somebody typed — so a `concurrency:` block on
 one is a compile error, `concurrency-on-manual`, rather than a bound nothing
-enforces. What a run does respect is the groups other triggers declare: a run
-shares the project's journal, so it reads the lease the serving process holds,
-and a run of a flow that some `http`, `schedule` or `event` trigger's
+enforces. What a run does respect is the groups other triggers declare: the
+lease is rows of the project's journal, and a run reads them there before it
+starts. A run of a flow that some `http`, `schedule` or `event` trigger's
 **key-less** group covers is refused at start while that group has no free slot
 — counting the trigger's `max_running:` — exit `2`, naming the execution that
 holds it, with nothing started or journaled. It never waits for a slot: a
 terminal is not a queue. A keyed group's `key:` is CEL over a payload a run does
 not have, so no keyed group covers a run; and a run that starts holds no slot,
 because the lease is the trigger's executions and a run is not one of them.
+
+**Which refusal a run meets depends on who holds the journal.** On SQLite a run
+opens the journal beside a `serve` that is up — the lock is taken per statement
+(`docs/durability.md` §2.2) — so it reads the lease the serving process holds,
+and the refusal above is the one it meets. On Postgres and MySQL a `serve` that
+is up holds the journal's writer guard for as long as it runs (§2.3), so a run
+beside it never reaches the lease: its open of the journal is refused by the
+guard — whether the group is full or has a free slot, for a covered flow and
+any other alike — with the guard's own message, which says one process at a
+time writes the journal and names no execution, and the run journals nothing.
+With no `serve` up, a run on those arms opens the journal and reads the lease
+as on SQLite, where an execution a stopped `serve` left open still holds its
+slot.
 
 ### 13.3 `http` (active in v0)
 
@@ -13969,7 +13984,9 @@ holds a slot is exactly what the journal says is running, and a restarted
   It is the app's sixth reserved route, so a trigger cannot declare it.
 - **(e) `run`.** A run of a flow a trigger's group covers is refused at start
   while the group has no free slot, naming the execution holding it — exit `2`,
-  nothing started or journaled — and never queues.
+  nothing started or journaled — and never queues. That is where the run can
+  open the journal; on Postgres and MySQL a `serve` that is up holds the writer
+  guard, which refuses the run first (Status, §13.2).
 - **(f) Restart.** After recovery and before any admission, each trigger's rows
   are looked at: what was queued starts in its order as the lease allows, each
   pending row is armed at the deadline it records, and a start a dead process
@@ -14052,6 +14069,21 @@ ruling:
   of them — so arrivals are not held back by runs. This is the reading most
   worth the owner's eye: ruling e says "a flow some trigger's group covers"
   without saying which.
+- **Which journal lets a `run` see the lease.** Ruling e's "it shares the
+  journal, so it sees the lease" holds where a run can open the journal beside
+  a `serve`, which is SQLite: its lock is taken per statement
+  (`docs/durability.md` §2.2). On Postgres and MySQL a `serve` that is up holds
+  the journal's writer guard — a session advisory lock — for as long as it
+  runs (§2.3), so a run beside it never reads the lease: its open is refused by
+  the guard, whether the group is full or has a free slot and whether or not a
+  group covers the flow, with the guard's message, which names no execution.
+  That is the one-writer rule's refusal, which a run beside a `serve` met on
+  those arms before this release, and this release leaves it as it is. Ruling
+  e's refusal, naming the execution holding the slot, is reached on those arms
+  only with no `serve` up — an execution a stopped `serve` left open still
+  holding its slot. A run that reads the lease beside a `serve` without
+  writing — a read the guard does not cover — is not built here; whether
+  ruling e asks for one is the owner's call.
 - **A repeat's answer.** A repeat inside the window is answered with the first
   delivery's answer as it stands now: the execution's id and status URL, or —
   under `respond: sync` — the execution's outputs, the repeat waiting on it up
@@ -14214,7 +14246,10 @@ ruling:
   enforces today (§2.3). Two hubs over one journal without the guard would each
   read a slot free and both start; and a `run` refused by the lease reads it
   without the serving process's lock, so on SQLite a run and an arrival
-  deciding together can both see the last slot free. `docs/distributed.md` §8
+  deciding together can both see the last slot free. On Postgres and MySQL
+  there is no such race while a `serve` is up, because a run beside it is
+  refused by the writer guard before it reads anything (above, "Which journal
+  lets a `run` see the lease"). `docs/distributed.md` §8
   rule 3 forbids a protocol assuming one writer, and this release does not amend
   it: whether the intake stands as a named exception, or moves its decision
   under the execution-set lease rule 1 requires, is the owner's call, owed

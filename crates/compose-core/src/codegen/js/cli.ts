@@ -393,11 +393,11 @@ async function run(argv: readonly string[]): Promise<number> {
  * Refuse a `run` of a flow a trigger's `concurrency:` covers while that group
  * has no free slot (PRD resolved q77 ruling e, Decision D163).
  *
- * A run shares the journal, so it sees the lease the serving process holds —
- * read off the same rows, never counted here — and it **never queues**,
- * because a terminal is not a queue: it is refused at start, naming the
- * execution holding the slot, and journals nothing. A command that could not
- * run at all, so exit `2`.
+ * The lease is rows of the journal, so a run reads it there — off the same
+ * rows the serving process decides over, never counted here — and it **never
+ * queues**, because a terminal is not a queue: it is refused at start, naming
+ * the execution holding the slot, and journals nothing. A command that could
+ * not run at all, so exit `2`.
  *
  * **Which group a run is in** is the implementation's reading, flagged for the
  * owner in D163's Status: a run is in a trigger's group only where the
@@ -408,7 +408,13 @@ async function run(argv: readonly string[]): Promise<number> {
  *
  * A journal this command cannot read for the question says nothing about the
  * lease, and the run goes on to meet the same journal itself, which reports
- * what is wrong with it.
+ * what is wrong with it. **That is what a run beside a `serve` meets on
+ * Postgres and MySQL**: the serving process holds the writer guard for as long
+ * as it runs (`docs/durability.md` §2.3), so the open here is refused, and the
+ * run's own open is refused the same way with the guard's message — full group
+ * or free, naming no execution. The lease refusal is what a run meets where it
+ * can open the journal: on SQLite, whose lock is per statement (§2.2), and on
+ * those arms with no `serve` up (grammar 13.2).
  */
 async function refuseCovered(address: string): Promise<void> {
   const covering = [...httpTriggers, ...scheduleTriggers, ...eventTriggers].filter(
