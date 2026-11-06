@@ -1,0 +1,10 @@
+# rule: a trigger's `concurrency.limit:` is an integer (grammar 13.1, PRD resolved q77)
+# code: wrong-type
+# message: expected an integer for `concurrency.limit` of trigger `on_request`, found a string
+# at: 10:14
+triggers:
+  on_request:
+    type: http
+    flow: flow.support
+    concurrency:
+      limit: two

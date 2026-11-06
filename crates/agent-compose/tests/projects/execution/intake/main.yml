@@ -1,0 +1,268 @@
+# Acceptance fixture: a trigger's intake — `dedupe_key:` and `dedupe_window:`
+# on an `http` trigger, and the `concurrency:` block (grammar 13.1, 13.3, PRD
+# resolved q77, Decision D163).
+#
+# Every execution is `${TALLY_BIN}/work`, a shim that appends `<tag> start
+# <pushes>` to `$TALLY_LOG`, sleeps `linger` seconds and appends `<tag> end` —
+# or `${TALLY_BIN}/hold`, which waits for the file `hold` names to exist. So a
+# test reads what ran, in what order and with which payload off the lifecycle
+# rows and the tally, and decides when a held execution may end.
+#
+#   * `deduped` — a `dedupe_key:` over the body's `id`, held for 20 seconds: a
+#     repeat inside the window starts nothing, one after it starts again.
+#   * `serial` — one key-less group of one: the second arrival queues.
+#   * `dropping` — the same group, dropping what finds it full.
+#   * `debounced` — the arrivals of one group coalesced for three seconds into
+#     one execution, which reads the count as `pushes`.
+#   * `guarded` — a queue behind a bearer token, whose intake route the same
+#     token guards.
+#   * `guarded_burst` — a debounce behind the same token, whose pending row
+#     holds the request without the credential it carried.
+#   * `capped` — a group per body `group`, one each, and the trigger's own
+#     `max_running: 1` across them.
+#   * `held` — a key-less group of one over `flow.held`, which a `run` of that
+#     flow is refused against while it is full.
+#   * `held_capped` — a key-less group of three over `flow.held_too`, whose
+#     trigger's `max_running: 1` is what a `run` of that flow is refused by.
+#   * `keyed` — a group per body `group`, one each and no `max_running:`, over
+#     `flow.held`: two groups run side by side while a busy one queues.
+#   * `burst` — a `dedupe_key:` beside a ten-second debounce: a repeat of an
+#     arrival the debounce counted is a repeat, never counted again.
+#   * `deduped_serial` and `deduped_dropping` — a `dedupe_key:` beside a group
+#     of one that queues, and one that drops.
+#   * `sync_serial`, `sync_dropping` and `deduped_sync` — the same under
+#     `respond: sync`, each keyed on the body's `id`, and a sync key with no
+#     block.
+version: "0.1"
+
+defaults:
+  timeout: 300s
+
+triggers:
+  deduped:
+    type: http
+    path: /deduped
+    flow: flow.work
+    input:
+      tag: "payload.body.tag"
+    dedupe_key: "payload.body.id"
+    dedupe_window: 20s
+
+  serial:
+    type: http
+    path: /serial
+    flow: flow.work
+    input:
+      tag: "payload.body.tag"
+      linger: "payload.body.linger"
+    concurrency:
+      limit: 1
+
+  dropping:
+    type: http
+    path: /dropping
+    flow: flow.work
+    input:
+      tag: "payload.body.tag"
+      linger: "payload.body.linger"
+    concurrency:
+      on_conflict: drop
+
+  debounced:
+    type: http
+    path: /debounced
+    flow: flow.work
+    input:
+      tag: "payload.body.tag"
+      pushes: "payload.coalesced"
+    concurrency:
+      debounce: 3s
+
+  guarded:
+    type: http
+    path: /guarded
+    flow: flow.work
+    input:
+      tag: "payload.body.tag"
+      linger: "payload.body.linger"
+    auth:
+      bearer:
+        token: "${INTAKE_TOKEN}"
+    concurrency:
+      limit: 1
+
+  guarded_burst:
+    type: http
+    path: /guarded-burst
+    flow: flow.work
+    input:
+      tag: "payload.headers['x-note'] + ' ' + payload.body.tag"
+      pushes: "payload.coalesced"
+    auth:
+      bearer:
+        token: "${INTAKE_TOKEN}"
+    concurrency:
+      debounce: 1s
+
+  capped:
+    type: http
+    path: /capped
+    flow: flow.work
+    input:
+      tag: "payload.body.tag"
+      linger: "payload.body.linger"
+    concurrency:
+      key: "payload.body.group"
+      limit: 1
+      max_running: 1
+
+  held:
+    type: http
+    path: /held
+    flow: flow.held
+    input:
+      tag: "payload.body.tag"
+      hold: "payload.body.hold"
+    concurrency:
+      limit: 1
+
+  held_capped:
+    type: http
+    path: /held-capped
+    flow: flow.held_too
+    input:
+      tag: "payload.body.tag"
+      hold: "payload.body.hold"
+    concurrency:
+      limit: 3
+      max_running: 1
+
+  keyed:
+    type: http
+    path: /keyed
+    flow: flow.held
+    input:
+      tag: "payload.body.tag"
+      hold: "payload.body.hold"
+    concurrency:
+      key: "payload.body.group"
+      limit: 1
+
+  burst:
+    type: http
+    path: /burst
+    flow: flow.work
+    input:
+      tag: "payload.body.tag"
+      pushes: "payload.coalesced"
+    dedupe_key: "payload.body.id"
+    concurrency:
+      debounce: 10s
+
+  deduped_serial:
+    type: http
+    path: /deduped-serial
+    flow: flow.work
+    input:
+      tag: "payload.body.tag"
+      linger: "payload.body.linger"
+    dedupe_key: "payload.body.id"
+    concurrency:
+      limit: 1
+
+  deduped_dropping:
+    type: http
+    path: /deduped-dropping
+    flow: flow.work
+    input:
+      tag: "payload.body.tag"
+      linger: "payload.body.linger"
+    dedupe_key: "payload.body.id"
+    concurrency:
+      on_conflict: drop
+
+  sync_serial:
+    type: http
+    path: /sync-serial
+    flow: flow.work
+    respond: sync
+    input:
+      tag: "payload.body.tag"
+      linger: "payload.body.linger"
+    dedupe_key: "payload.body.id"
+    concurrency:
+      limit: 1
+
+  sync_dropping:
+    type: http
+    path: /sync-dropping
+    flow: flow.work
+    respond: sync
+    input:
+      tag: "payload.body.tag"
+      linger: "payload.body.linger"
+    dedupe_key: "payload.body.id"
+    concurrency:
+      on_conflict: drop
+
+  deduped_sync:
+    type: http
+    path: /deduped-sync
+    flow: flow.work
+    respond: sync
+    input:
+      tag: "payload.body.tag"
+    dedupe_key: "payload.body.id"
+
+flow.work:
+  description: One tagged piece of work that takes as long as it is told to.
+  inputs:
+    tag: { type: string }
+    linger: { type: string, default: "0" }
+    pushes: { type: integer, default: 1 }
+  outputs: {}
+  nodes:
+    work:
+      exec:
+        command: "${TALLY_BIN}/work"
+      input:
+        tag: "input.tag"
+        linger: "input.linger"
+        pushes: "input.pushes"
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+
+flow.held:
+  description: One tagged piece of work that ends when a file appears.
+  inputs:
+    tag: { type: string }
+    hold: { type: string }
+  outputs: {}
+  nodes:
+    wait:
+      exec:
+        command: "${TALLY_BIN}/hold"
+      input:
+        tag: "input.tag"
+        hold: "input.hold"
+  edges:
+    - { from: start, to: wait }
+    - { from: wait, to: end }
+
+flow.held_too:
+  description: The same, covered by a trigger whose total is below its group's limit.
+  inputs:
+    tag: { type: string }
+    hold: { type: string }
+  outputs: {}
+  nodes:
+    wait:
+      exec:
+        command: "${TALLY_BIN}/hold"
+      input:
+        tag: "input.tag"
+        hold: "input.hold"
+  edges:
+    - { from: start, to: wait }
+    - { from: wait, to: end }

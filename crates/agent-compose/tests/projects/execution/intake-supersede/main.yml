@@ -1,0 +1,77 @@
+# Acceptance fixture: `on_conflict: supersede` on an `event` trigger (grammar
+# 13.1, PRD resolved q77 ruling b, Decision D163).
+#
+# The source is the `command-source` fixture's `feed.mjs`, named by
+# `${FEED_PROGRAM}`, paced so its second event arrives while the first one's
+# execution is still running. Each event starts `flow.parent`, which detaches a
+# `flow.child` child execution (Decision D150) and then lingers itself: the
+# first event's pair lingers ten minutes, the second's a second. The second
+# event supersedes the first — whose cancel cascades to its child (PRD resolved
+# q75) — and runs to completion.
+version: "0.1"
+
+defaults:
+  timeout: 900s
+
+triggers:
+  newest:
+    type: event
+    source: feed
+    flow: flow.parent
+    input:
+      tag: "payload.id"
+      lingers: "[payload.body.seq == 1 ? '600' : '1']"
+      linger: "payload.body.seq == 1 ? '600' : '1'"
+    concurrency:
+      on_conflict: supersede
+
+flow.parent:
+  description: A detached child that lingers, then lingering of the parent's own.
+  inputs:
+    tag: { type: string }
+    lingers:
+      type: array
+      max_items: 1
+      items: { type: string }
+    linger: { type: string }
+  outputs: {}
+  nodes:
+    spawn:
+      map:
+        over: input.lingers
+        as: seconds
+        node: flow.child
+        max_concurrency: 1
+        detach: true
+        input:
+          tag: "input.tag"
+          linger: "seconds"
+    hold:
+      exec:
+        command: "${TALLY_BIN}/work"
+      input:
+        tag: "input.tag"
+        linger: "input.linger"
+        pushes: "1"
+  edges:
+    - { from: start, to: spawn }
+    - { from: spawn, to: hold }
+    - { from: hold, to: end }
+
+flow.child:
+  description: The parent's detached child, lingering as long as it is told to.
+  inputs:
+    tag: { type: string }
+    linger: { type: string }
+  outputs: {}
+  nodes:
+    child_work:
+      exec:
+        command: "${TALLY_BIN}/work"
+      input:
+        tag: "input.tag"
+        linger: "input.linger"
+        pushes: "2"
+  edges:
+    - { from: start, to: child_work }
+    - { from: child_work, to: end }

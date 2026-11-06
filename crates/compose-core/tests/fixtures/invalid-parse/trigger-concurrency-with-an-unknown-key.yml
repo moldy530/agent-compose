@@ -1,0 +1,10 @@
+# rule: a trigger's `concurrency:` is a closed block of five keys (grammar 13.1, PRD resolved q77)
+# code: unknown-key
+# message: unknown key `group` in the `concurrency` of trigger `on_request`
+# at: 10:7
+triggers:
+  on_request:
+    type: http
+    flow: flow.support
+    concurrency:
+      group: "payload.body.repo"

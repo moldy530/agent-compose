@@ -11,7 +11,7 @@
 use serde::Serialize;
 
 use crate::ast::common::{Address, Cel, Duration, EnvRef, Ident};
-use crate::ast::trigger::{HmacAlgorithm, Respond, SignatureEncoding, TriggerMethod};
+use crate::ast::trigger::{HmacAlgorithm, OnConflict, Respond, SignatureEncoding, TriggerMethod};
 use crate::diag::{Span, Spanned};
 
 use super::binding::Bindings;
@@ -32,11 +32,57 @@ pub struct Trigger {
     /// `description:`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<Spanned<String>>,
+    /// `concurrency:` — the intake groups this trigger's executions are
+    /// admitted under (grammar 13.1, PRD resolved q77, Decision D163). Never
+    /// present on a `manual` trigger, where the parser refuses it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<Concurrency>,
     /// The trigger object's own span.
     pub span: Span,
     /// The type-specific half.
     #[serde(flatten)]
     pub kind: TriggerKind,
+}
+
+/// The `concurrency:` block (grammar 13.1, PRD resolved q77 ruling b, c),
+/// recorded as written; [`Concurrency::limit`] and [`Concurrency::on_conflict`]
+/// apply the two defaults.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Concurrency {
+    /// `key:` — CEL over the kind's payload, to a string. Absent means one
+    /// group for the whole trigger.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<Spanned<Cel>>,
+    /// `limit:` — absent means the default, `1`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<Spanned<i64>>,
+    /// `on_conflict:` — absent means the default, `queue`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_conflict: Option<OnConflict>,
+    /// `debounce:` — absent means no coalescing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debounce: Option<Spanned<Duration>>,
+    /// `max_running:` — the **trigger's** total across all its groups; absent
+    /// means no bound beyond each group's `limit:`. Not a placement's
+    /// `max_running:` (grammar 14.1, PRD resolved q79).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_running: Option<Spanned<i64>>,
+    /// The block's own span.
+    pub span: Span,
+}
+
+impl Concurrency {
+    /// How many executions one group's lease admits at once: `limit:`, or `1`.
+    #[must_use]
+    pub fn limit(&self) -> i64 {
+        self.limit.as_ref().map_or(1, |limit| limit.value)
+    }
+
+    /// What an arrival finding no free slot does: `on_conflict:`, or `queue`.
+    #[must_use]
+    pub fn on_conflict(&self) -> OnConflict {
+        self.on_conflict.unwrap_or(OnConflict::Queue)
+    }
 }
 
 /// The four trigger types (grammar 13), tagged by `type`.
@@ -95,6 +141,14 @@ pub struct HttpTrigger {
     /// wherever [`Self::callback_auth`] is (grammar 13.3, PRD resolved q33).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callback_allow: Option<Vec<Spanned<String>>>,
+    /// `dedupe_key:` — CEL over the request payload; absent means a request
+    /// is never deduplicated (grammar 13.3, PRD resolved q77 ruling a).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dedupe_key: Option<Spanned<Cel>>,
+    /// `dedupe_window:` — absent means the default, `24h`. Present only beside
+    /// [`Self::dedupe_key`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dedupe_window: Option<Spanned<Duration>>,
 }
 
 /// The inbound `auth:` of an `http` trigger, **defaults applied**
@@ -204,6 +258,10 @@ pub struct EventTrigger {
     /// `dedupe_key:` — absent means the default, `payload.id`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dedupe_key: Option<Spanned<Cel>>,
+    /// `dedupe_window:` — absent means the default, `24h` (grammar 13.5, PRD
+    /// resolved q77 ruling a): the TTL of every dedupe row the trigger claims.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dedupe_window: Option<Spanned<Duration>>,
     /// `auth:`, **defaults applied** — what the status, resume and cancel
     /// routes of an execution this trigger started enforce, and what its
     /// source's `GET /sources/:name` enforces (grammar 13.5, Decision D162).

@@ -78,6 +78,10 @@ const PREAMBLE: &str = r#"//
 // (`./serve.ts`'s `admit`). `eventSources` is the active target's
 // `event_sources:`, every entry with its kind — a kind this release does not
 // implement is refused by name when `serve` starts (grammar 14.4).
+//
+// A trigger's `dedupe_window:` and `concurrency:` block — defaults applied —
+// are what that admission's intake ledger decides under (PRD resolved q77): a
+// dedupe key's TTL, and the groups a trigger's arrivals are leased slots of.
 
 import * as runtime from "./runtime.ts";
 
@@ -94,6 +98,9 @@ const httpPayload: runtime.Shape = {
     headers: { properties: {}, rest: "string" },
     path: "string",
     method: "string",
+    // Present only where the trigger's `concurrency:` declares `debounce:`,
+    // on the payload the debounced execution starts with (PRD resolved q77).
+    coalesced: "int",
   },
 };
 
@@ -144,6 +151,40 @@ export interface HttpTrigger {
    * payload and is attacker-controlled by construction (Decision D110, D127).
    */
   readonly callbackAllow?: readonly string[];
+  /**
+   * `dedupe_key:` — the key a repeat delivery is recognised by (grammar 13.3,
+   * PRD resolved q77 ruling a). No default: absent, nothing is deduplicated.
+   */
+  dedupeKey?(payload: unknown): string;
+  /** `dedupe_window:` — how long a key is held, in milliseconds; beside `dedupeKey`. */
+  readonly dedupeWindowMs?: number;
+  /** `concurrency:` — the intake groups this trigger's requests are admitted under. */
+  readonly concurrency?: Concurrency<unknown>;
+}
+
+/**
+ * A trigger's `concurrency:` block, defaults applied (grammar 13.1, PRD
+ * resolved q77 ruling b, c, Decision D163).
+ *
+ * A group is a **lease** held by its running executions, which `./serve.ts`
+ * computes from the journal's rows at every admission: the arrivals whose `key`
+ * answers one value share one, `limit` of them hold it at once, and
+ * `maxRunning` bounds the trigger's executions across every group.
+ */
+export interface Concurrency<P> {
+  /** `key:` — the group an arrival belongs to; absent, one group for the trigger. */
+  key?(payload: P): string;
+  /** `limit:` — defaulting to `1`. */
+  readonly limit: number;
+  /** `on_conflict:` — defaulting to `queue`. */
+  readonly onConflict: "queue" | "drop" | "supersede";
+  /** `debounce:`, in milliseconds: the arrivals for a key coalesce into one execution. */
+  readonly debounceMs?: number;
+  /**
+   * `max_running:` — **the trigger's** total across all its groups. Not a
+   * placement's `max_running:` (grammar 14.1), which a worker session holds.
+   */
+  readonly maxRunning?: number;
 }
 
 /**
@@ -211,7 +252,7 @@ function roots(payload: unknown): runtime.Roots {
  * nominal instant in the trigger's zone (RFC 3339), and the trigger's name.
  */
 const schedulePayload: runtime.Shape = {
-  properties: { scheduled_at: "string", trigger: "string" },
+  properties: { scheduled_at: "string", trigger: "string", coalesced: "int" },
 };
 
 /**
@@ -226,6 +267,7 @@ const eventPayload: runtime.Shape = {
     body: { properties: {}, rest: "any" },
     attributes: { properties: {}, rest: "string" },
     source: "string",
+    coalesced: "int",
   },
 };
 
@@ -293,6 +335,8 @@ export interface ManualTrigger {
 export interface SchedulePayload {
   readonly scheduled_at: string;
   readonly trigger: string;
+  /** The arrivals a debounce coalesced into this execution (PRD resolved q77 ruling c). */
+  readonly coalesced?: number;
 }
 
 /** One event's payload (grammar 13.5, 14.4). */
@@ -301,6 +345,8 @@ export interface EventPayload {
   readonly body: Readonly<Record<string, unknown>>;
   readonly attributes: Readonly<Record<string, string>>;
   readonly source: string;
+  /** The arrivals a debounce coalesced into this execution (PRD resolved q77 ruling c). */
+  readonly coalesced?: number;
 }
 
 /** One line of a command source, decoded, before it has an id (grammar 14.4). */
@@ -325,6 +371,8 @@ export interface ScheduleTrigger {
   input(payload: SchedulePayload): Record<string, unknown>;
   /** `session_key:` — the session identity for session-scoped stores. */
   sessionKey?(payload: SchedulePayload): string;
+  /** `concurrency:` — the intake groups this trigger's ticks are admitted under. */
+  readonly concurrency?: Concurrency<SchedulePayload>;
 }
 
 /**
@@ -342,6 +390,10 @@ export interface EventTrigger {
   sessionKey?(payload: EventPayload): string;
   /** `dedupe_key:` — defaulting to `payload.id`. */
   dedupeKey(payload: EventPayload): string;
+  /** `dedupe_window:` — how long a key is held, in milliseconds; defaulting to 24h. */
+  readonly dedupeWindowMs: number;
+  /** `concurrency:` — the intake groups this trigger's events are admitted under. */
+  readonly concurrency?: Concurrency<EventPayload>;
   /**
    * `auth:` — what the status, resume and cancel routes of every execution
    * this trigger starts enforce, and what its source's `GET /sources/:name`
@@ -473,10 +525,52 @@ fn schedule_table(ir: &Ir) -> String {
                 names::string(&format!("`session_key` of the trigger `{name}`"))
             ));
         }
+        text.push_str(&concurrency(trigger, "scheduleRoots"));
         text.push_str("  },\n");
     }
     text.push_str("];\n");
     text
+}
+
+/// A trigger's `concurrency:` block, defaults applied, as one table member —
+/// or nothing, where it declares none (grammar 13.1, PRD resolved q77).
+fn concurrency(trigger: &crate::ir::Trigger, roots: &str) -> String {
+    let Some(block) = &trigger.concurrency else {
+        return String::new();
+    };
+    let name = trigger.name.value.as_str();
+    let mut text = String::from("    concurrency: {\n");
+    if let Some(key) = &block.key {
+        text.push_str(&format!(
+            "      key: (payload) => text({}, {roots}(payload), {}),\n",
+            names::string(key.value.as_str()),
+            names::string(&format!("`concurrency.key` of the trigger `{name}`"))
+        ));
+    }
+    text.push_str(&format!("      limit: {},\n", block.limit()));
+    text.push_str(&format!(
+        "      onConflict: {},\n",
+        names::string(block.on_conflict().as_str())
+    ));
+    if let Some(debounce) = &block.debounce {
+        text.push_str(&format!(
+            "      debounceMs: {},\n",
+            policy::milliseconds(&debounce.value)
+        ));
+    }
+    if let Some(max) = &block.max_running {
+        text.push_str(&format!("      maxRunning: {},\n", max.value));
+    }
+    text.push_str("    },\n");
+    text
+}
+
+/// A trigger's `dedupe_window:`, or the `24h` grammar 13.3 and 13.5 default
+/// it to, in milliseconds (PRD resolved q77 ruling a).
+fn window_ms(window: Option<&crate::diag::Spanned<crate::ast::common::Duration>>) -> u64 {
+    window.map_or(crate::ast::trigger::DEFAULT_DEDUPE_WINDOW_MS, |window| {
+        policy::milliseconds(&window.value)
+    })
 }
 
 /// The `event` entries, in the IR's canonical order (Decision D55).
@@ -525,6 +619,11 @@ fn event_table(ir: &Ir) -> String {
             names::string(dedupe),
             names::string(&format!("`dedupe_key` of the trigger `{name}`"))
         ));
+        text.push_str(&format!(
+            "    dedupeWindowMs: {},\n",
+            window_ms(event.dedupe_window.as_ref())
+        ));
+        text.push_str(&concurrency(trigger, "eventRoots"));
         if let Some(auth) = &event.auth {
             text.push_str(&inbound(auth));
         }
@@ -679,6 +778,18 @@ fn http_table(ir: &Ir) -> String {
             }
             text.push_str("    ],\n");
         }
+        if let Some(key) = trigger.dedupe_key {
+            text.push_str(&format!(
+                "    dedupeKey: (payload) => text({}, roots(payload), {}),\n",
+                names::string(key),
+                names::string(&format!("`dedupe_key` of the trigger `{name}`"))
+            ));
+            text.push_str(&format!(
+                "    dedupeWindowMs: {},\n",
+                trigger.dedupe_window_ms
+            ));
+        }
+        text.push_str(&concurrency(trigger.declared, "roots"));
         text.push_str("  },\n");
     }
     text.push_str("];\n");
@@ -787,6 +898,10 @@ struct Emitted<'ir> {
     auth: Option<&'ir InboundAuth>,
     callback_auth: Option<&'ir CallbackAuth>,
     callback_allow: Option<Vec<&'ir str>>,
+    dedupe_key: Option<&'ir str>,
+    dedupe_window_ms: u64,
+    /// The declared trigger, for what is emitted the same way on every kind.
+    declared: &'ir crate::ir::Trigger,
 }
 
 /// The declared `http` triggers, in the IR's canonical order.
@@ -851,6 +966,9 @@ fn triggers(ir: &Ir) -> Vec<Emitted<'_>> {
                     .map(|pattern| pattern.value.as_str())
                     .collect()
             }),
+            dedupe_key: http.dedupe_key.as_ref().map(|key| key.value.as_str()),
+            dedupe_window_ms: window_ms(http.dedupe_window.as_ref()),
+            declared: trigger,
         });
     }
     found
@@ -1137,6 +1255,129 @@ triggers:
             emitted.contains(
                 "    sessionKey: (session) => text(\"'tenant-' + payload.session\", \
                  manualRoots(session), \"`session_key` of the trigger `cli`\"),\n"
+            ),
+            "{emitted}"
+        );
+    }
+
+    /// The intake every trigger kind but `manual` may declare (grammar 13.1,
+    /// 13.3, 13.5, PRD resolved q77): an empty `concurrency:` block is one
+    /// key-less group of one that queues, and a dedupe key held for the `24h`
+    /// window both grammar sections default it to.
+    #[test]
+    fn an_intake_block_left_to_its_defaults_emits_one_queueing_group_of_one() {
+        let source = r#"version: "0.1"
+
+triggers:
+  on_request:
+    type: http
+    flow: flow.work
+    dedupe_key: "payload.headers['x-delivery']"
+    input: { tag: "payload.body.tag" }
+    concurrency: {}
+  nightly:
+    type: schedule
+    cron: "0 3 * * *"
+    flow: flow.work
+    input: { tag: "payload.scheduled_at" }
+    concurrency: {}
+  feed_in:
+    type: event
+    source: feed
+    flow: flow.work
+    input: { tag: "payload.id" }
+    concurrency: {}
+
+flow.work:
+  inputs:
+    tag: { type: string }
+  outputs: {}
+  nodes:
+    work:
+      exec: { command: "true" }
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+"#;
+        let emitted = module(&ir_of(source)).contents;
+        let defaults =
+            "    concurrency: {\n      limit: 1,\n      onConflict: \"queue\",\n    },\n";
+        assert_eq!(
+            emitted.matches(defaults).count(),
+            3,
+            "each of the three triggers carries the defaulted block: {emitted}"
+        );
+        assert_eq!(
+            emitted.matches("    dedupeWindowMs: 86400000,\n").count(),
+            2,
+            "the http key and the event's `payload.id` key are each held 24h: {emitted}"
+        );
+        assert!(!emitted.contains("debounceMs:"), "{emitted}");
+        assert!(!emitted.contains("maxRunning:"), "{emitted}");
+    }
+
+    /// Every key of the block, spelled, and a `dedupe_window:` of its own on
+    /// each kind that takes one.
+    #[test]
+    fn an_intake_block_carries_every_key_it_declares() {
+        let source = r#"version: "0.1"
+
+triggers:
+  on_request:
+    type: http
+    flow: flow.work
+    dedupe_key: "payload.headers['x-delivery']"
+    dedupe_window: 90s
+    input: { tag: "payload.body.tag" }
+    concurrency:
+      key: "payload.body.repo"
+      limit: 2
+      on_conflict: supersede
+      debounce: 1500ms
+      max_running: 3
+  feed_in:
+    type: event
+    source: feed
+    flow: flow.work
+    dedupe_window: 2h
+    input: { tag: "payload.id" }
+    concurrency:
+      on_conflict: drop
+
+flow.work:
+  inputs:
+    tag: { type: string }
+  outputs: {}
+  nodes:
+    work:
+      exec: { command: "true" }
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+"#;
+        let emitted = module(&ir_of(source)).contents;
+        assert!(
+            emitted.contains(
+                "    dedupeKey: (payload) => text(\"payload.headers['x-delivery']\", roots(payload), \
+                 \"`dedupe_key` of the trigger `on_request`\"),\n    dedupeWindowMs: 90000,\n"
+            ),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains(
+                "    concurrency: {\n      key: (payload) => text(\"payload.body.repo\", roots(payload), \
+                 \"`concurrency.key` of the trigger `on_request`\"),\n      limit: 2,\n      \
+                 onConflict: \"supersede\",\n      debounceMs: 1500,\n      maxRunning: 3,\n    },\n"
+            ),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("    dedupeWindowMs: 7200000,\n"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains(
+                "    concurrency: {\n      limit: 1,\n      onConflict: \"drop\",\n    },\n"
             ),
             "{emitted}"
         );

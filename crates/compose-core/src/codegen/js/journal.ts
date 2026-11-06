@@ -769,16 +769,156 @@ export interface FiredRow {
 }
 
 /**
- * One `event` trigger's dedupe key, and the execution it admitted (PRD
- * resolved q78 ruling e, `docs/durability.md` §3.12).
+ * One trigger's dedupe key, and the admission it answered (PRD resolved q78
+ * ruling e, q77 ruling a, `docs/durability.md` §3.12).
  */
 export interface DedupeRow {
   readonly trigger: string;
   /** The `dedupe_key:` value, as the trigger's expression answered it. */
   readonly key: string;
+  /**
+   * The execution the key admitted — begun, or held by an intake row that will
+   * start it (`docs/durability.md` §3.15).
+   */
   readonly execution: string;
   /** When it was admitted, ISO 8601. */
   readonly admittedAt: string;
+  /**
+   * When the key stops being held, ISO 8601 — `admittedAt` plus the trigger's
+   * `dedupe_window:` (PRD resolved q77 ruling a). Absent on a row a build
+   * before the window wrote, whose expiry is read as its `admittedAt` plus the
+   * window of the claim that meets it.
+   */
+  readonly expiresAt?: string;
+}
+
+/**
+ * Where one intake row stands (PRD resolved q77 ruling b-d,
+ * `docs/durability.md` §3.15).
+ *
+ * `queued` — an arrival that found its group full, waiting for a slot;
+ * `pending` — a debounce open over the newest arrival for its group;
+ * `started` — its execution has been claimed under the row, and is begun or
+ * about to be; `dropped` — answered with a running execution, and nothing
+ * started.
+ */
+export type IntakeState = "queued" | "pending" | "started" | "dropped";
+
+/**
+ * What an intake row starts its execution with, once it is bound: the same
+ * four facts a lifecycle row records about an invocation (§3.5).
+ */
+export interface IntakeAdmission {
+  readonly inputs: Record<string, unknown>;
+  readonly sessionKey: string;
+  readonly callback?: string;
+  readonly traceparent?: string;
+}
+
+/**
+ * One arrival a trigger's `concurrency:` block admitted (PRD resolved q77,
+ * Decision D163, `docs/durability.md` §3.15) — and, for every execution such a
+ * trigger started, the record of the group whose lease it holds.
+ *
+ * Keyed by an id of its own, `int_<uuid>`, which is what `GET /intakes/:id`
+ * answers on: a queued or pending arrival has no execution yet. One of the
+ * journal's few identities that is not an execution's
+ * (`docs/distributed.md` §8 rule 2's stated exceptions).
+ */
+export interface IntakeRow {
+  readonly id: string;
+  /** The trigger whose arrival this is. */
+  readonly trigger: string;
+  /** The group: `concurrency.key`'s answer, absent for the key-less group. */
+  readonly group?: string;
+  readonly state: IntakeState;
+  /**
+   * The execution this row starts or started, allocated when the arrival was
+   * admitted — the id a tick's `fired` row and a dedupe row name, so a gate
+   * claimed for a queued arrival names the execution it will be.
+   */
+  readonly execution: string;
+  /**
+   * Whether the arrival waited — was ever `queued` or `pending` — rather than
+   * starting as it landed. A row that waited was answered with its intake id
+   * and is the intake's to start; one that did not was answered only once its
+   * execution's lifecycle row was down, so a row naming an execution that never
+   * began is a claim nobody was told of (`docs/durability.md` §3.15).
+   */
+  readonly waited: boolean;
+  /** A `dropped` row's answer: the running execution it was answered with. */
+  readonly heldBy?: string;
+  /** A `pending` row's newest payload, as the trigger's kind fixes its shape. */
+  readonly payload?: unknown;
+  /** A `queued` or `started` row's bound invocation. */
+  readonly admission?: IntakeAdmission;
+  /** The arrivals coalesced into the row: `1` but under a debounce. */
+  readonly coalesced: number;
+  /** When the (first) arrival landed, ISO 8601. */
+  readonly admittedAt: string;
+  /** A `pending` row's deadline, ISO 8601: when its one execution starts. */
+  readonly deadline?: string;
+  /** When the row was started, ISO 8601. */
+  readonly startedAt?: string;
+  /** Why a row was dropped, or what last refused its start. */
+  readonly detail?: string;
+  /** The row's place in insertion order — the order a group's queue drains in. */
+  readonly order?: number;
+  /**
+   * A `pending` row's newest arrival, where that arrival kept a gate: the id
+   * its gate's row was claimed under, and the gate. Every arrival claims its
+   * gate under an id of its own, and the move that counts it into the row
+   * records the two — one statement, so an arrival is counted exactly where
+   * this names it — before the gate's row is re-pointed at the row's own
+   * execution ([`Journal.foldGate`], `docs/durability.md` §3.15). So a gate
+   * that names an id no row records is a claim no debounce counted, and one
+   * that names this is a counted arrival whose re-pointing a crash cut short.
+   */
+  readonly joined?: JoinedArrival;
+}
+
+/** The gate an arrival a debounce counted was admitted under. */
+export type IntakeGate =
+  | { readonly kind: "dedupe"; readonly key: string }
+  | { readonly kind: "tick"; readonly scheduledAt: string };
+
+/** What a `pending` row records of its newest arrival ([`IntakeRow.joined`]). */
+export interface JoinedArrival {
+  /** The id the arrival's gate was claimed under. */
+  readonly execution: string;
+  readonly gate: IntakeGate;
+}
+
+/**
+ * The columns one conditional move of an intake row sets ([`Journal.moveIntake`]):
+ * its new state, and whichever of the rest the move changes.
+ */
+export interface IntakeChange {
+  readonly state: IntakeState;
+  readonly execution?: string;
+  readonly heldBy?: string;
+  readonly payload?: unknown;
+  readonly admission?: IntakeAdmission;
+  readonly coalesced?: number;
+  readonly deadline?: string;
+  readonly startedAt?: string;
+  readonly detail?: string;
+  readonly waited?: boolean;
+  readonly joined?: JoinedArrival;
+}
+
+/**
+ * One slot of a trigger's lease (PRD resolved q77 ruling b,
+ * `docs/distributed.md` §8): an execution the trigger started under its
+ * `concurrency:` block whose lifecycle row is open and whose cancel nobody has
+ * requested — read off the rows, never counted.
+ */
+export interface Lease {
+  readonly execution: string;
+  /** The group the execution holds a slot of; absent for the key-less group. */
+  readonly group?: string;
+  /** When its lifecycle row began, ISO 8601. */
+  readonly startedAt: string;
 }
 
 /**
@@ -1026,14 +1166,16 @@ export interface Journal {
   /** Every tick a `schedule` trigger has fired, oldest first. */
   firedOf(trigger: string): Promise<readonly FiredRow[]>;
   /**
-   * Claim an `event` trigger's dedupe key for an execution, when that
-   * execution is registered (PRD resolved q78 ruling e, `docs/durability.md`
-   * §3.12).
+   * Claim a trigger's dedupe key for an execution, before anything is
+   * registered (PRD resolved q78 ruling e, q77 ruling a,
+   * `docs/durability.md` §3.12).
    *
-   * Idempotent on `(trigger, key)`: the insert that wins admits, and a repeat
-   * is answered with the row already there — the execution the key first
-   * started. Rows carry no expiry in this release (PRD resolved q77's
-   * `dedupe_window:` is what will bound them).
+   * Idempotent on `(trigger, key)` inside the key's window: the insert that
+   * wins admits, and a repeat is answered with the row already there — the
+   * admission the key first answered. The window is the row's TTL: every row of
+   * the trigger whose `expiresAt` the claim's `admittedAt` has reached is swept
+   * first, in the same step, so a key seen again after its window is a new
+   * claim.
    */
   claimDedupe(row: DedupeRow): Promise<DedupeRow>;
   /**
@@ -1041,9 +1183,79 @@ export interface Journal {
    * answering whether this call moved it — the repair for a process that died
    * between claiming a key and journaling the execution it claimed it for
    * (`docs/durability.md` §3.12). Conditional on the row still naming `from`, so
-   * a key another admission has since taken is left as it is.
+   * a key another admission has since taken is left as it is. The moved row's
+   * window starts again at the move, ending at `expiresAt` where one is given.
    */
-  retakeDedupe(trigger: string, key: string, from: string, to: string): Promise<boolean>;
+  retakeDedupe(
+    trigger: string,
+    key: string,
+    from: string,
+    to: string,
+    expiresAt?: string,
+  ): Promise<boolean>;
+  /**
+   * Record one admitted arrival, or answer the row already there under its id
+   * (PRD resolved q77, `docs/durability.md` §3.15).
+   */
+  admitIntake(row: IntakeRow): Promise<IntakeRow>;
+  /** One intake row, by its id. */
+  intake(id: string): Promise<IntakeRow | undefined>;
+  /**
+   * The newest intake row naming an execution, where one does — as the
+   * execution it starts or started, or else as the id its newest counted
+   * arrival's gate was claimed under ([`IntakeRow.joined`]).
+   */
+  intakeOf(execution: string): Promise<IntakeRow | undefined>;
+  /** A trigger's intake rows in one state, in insertion order — a queue's FIFO. */
+  intakesOf(trigger: string, state: IntakeState): Promise<readonly IntakeRow[]>;
+  /**
+   * The groups a trigger's queue holds rows of — `undefined` for the key-less
+   * group — read down the `intakes_by_trigger` index without reading a row's
+   * admission: what a look at the queue asks first, so a queue none of whose
+   * groups has a free slot costs an index read rather than the whole queue
+   * (Decision D163's Status).
+   */
+  queuedGroups(trigger: string): Promise<readonly (string | undefined)[]>;
+  /**
+   * One group's queue: its `queued` rows, in insertion order, read down the
+   * same index — what a superseding arrival drops (Decision D163's Status).
+   */
+  groupQueue(trigger: string, group: string | undefined): Promise<readonly IntakeRow[]>;
+  /**
+   * A trigger's `started` rows whose execution has no lifecycle row, in
+   * insertion order — what a restart repairs or takes back before it admits
+   * anything (`docs/durability.md` §3.15).
+   */
+  unbegunIntakes(trigger: string): Promise<readonly IntakeRow[]>;
+  /** A group's open debounce: its `pending` row, where it has one. */
+  pendingIntake(trigger: string, group: string | undefined): Promise<IntakeRow | undefined>;
+  /**
+   * Move an intake row out of the state `from` and into `change`, answering
+   * whether this call moved it — the conditional transition every start of a
+   * waiting arrival goes through, so two movers of one row agree on one winner.
+   */
+  moveIntake(id: string, from: IntakeState, change: IntakeChange): Promise<boolean>;
+  /**
+   * Re-point a gate's row — a dedupe key's, or a tick's `fired` row — from
+   * the id an arrival claimed it under to the execution the `pending` row that
+   * counted the arrival will start, keeping its window: the step that folds a
+   * debounced arrival into its row (`docs/durability.md` §3.15). Conditional
+   * on the row still naming `from`, so a key another admission has since
+   * taken, or a fold already made, is left as it is.
+   */
+  foldGate(trigger: string, gate: IntakeGate, from: string, to: string): Promise<void>;
+  /**
+   * Take back a `started` row that never waited and whose execution never
+   * began — a claim no answer was ever given for — answering whether this call
+   * took it (`docs/durability.md` §3.15).
+   */
+  abandonIntake(id: string): Promise<boolean>;
+  /**
+   * A trigger's lease: every execution it started under `concurrency:` whose
+   * lifecycle row is open and whose cancel nobody has requested, oldest first
+   * (PRD resolved q77 ruling b, `docs/distributed.md` §8).
+   */
+  leasesOf(trigger: string): Promise<readonly Lease[]>;
   /** The newest checkpoint a `kind: command` source's intake accepted, if any. */
   checkpointOf(source: string): Promise<string | undefined>;
   /**
@@ -1765,10 +1977,35 @@ class SqlJournal implements Journal {
   claimDedupe(row: DedupeRow): Promise<DedupeRow> {
     return this.#serial(async () => {
       const hash = keyHash(row.key);
+      // **The sweep, at the claim** (PRD resolved q77 ruling a): every row of
+      // this trigger whose window the claim's own instant has reached goes
+      // first, in the same step, so a key seen again after its window is a new
+      // claim and the table holds no more than the trigger's live windows. A
+      // row a build before the window wrote has no `expires_at`, and is read
+      // as expiring one window — this claim's — after it was admitted:
+      // ISO 8601 instants in UTC are fixed width, so the comparison is the
+      // string one every backend makes the same way. Each half is a range
+      // read down `dedupe_by_expiry` ([`DEDUPE_SWEEPS`]), so what the sweep
+      // costs is the rows that expired, never the trigger's live windows —
+      // which every claim of the trigger, inside the one serial chain every
+      // journal write waits on, would otherwise pay.
+      if (row.expiresAt !== undefined) {
+        const window = Date.parse(row.expiresAt) - Date.parse(row.admittedAt);
+        const cutoff = new Date(Date.parse(row.admittedAt) - Math.max(0, window)).toISOString();
+        await this.#run(DEDUPE_SWEEPS.windowed, [row.trigger, row.admittedAt]);
+        await this.#run(DEDUPE_SWEEPS.windowless, [row.trigger, cutoff]);
+      }
       await this.#run(
-        `INSERT INTO dedupe (trigger_name, key_hash, dedupe_key, execution, admitted_at) VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO dedupe (trigger_name, key_hash, dedupe_key, execution, admitted_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)
          ${this.#conflict("(trigger_name, key_hash)", "trigger_name = trigger_name")}`,
-        [row.trigger, hash, JSON.stringify(row.key), row.execution, row.admittedAt],
+        [
+          row.trigger,
+          hash,
+          JSON.stringify(row.key),
+          row.execution,
+          row.admittedAt,
+          row.expiresAt ?? null,
+        ],
       );
       const held = await this.#one(
         "SELECT * FROM dedupe WHERE trigger_name = ? AND key_hash = ?",
@@ -1778,18 +2015,305 @@ class SqlJournal implements Journal {
     });
   }
 
-  retakeDedupe(trigger: string, key: string, from: string, to: string): Promise<boolean> {
+  retakeDedupe(
+    trigger: string,
+    key: string,
+    from: string,
+    to: string,
+    expiresAt?: string,
+  ): Promise<boolean> {
     return this.#serial(async () => {
       const hash = keyHash(key);
       await this.#run(
-        "UPDATE dedupe SET execution = ?, admitted_at = ? WHERE trigger_name = ? AND key_hash = ? AND execution = ?",
-        [to, new Date().toISOString(), trigger, hash, from],
+        "UPDATE dedupe SET execution = ?, admitted_at = ?, expires_at = ? WHERE trigger_name = ? AND key_hash = ? AND execution = ?",
+        [to, new Date().toISOString(), expiresAt ?? null, trigger, hash, from],
       );
       const held = await this.#one(
         "SELECT execution FROM dedupe WHERE trigger_name = ? AND key_hash = ?",
         [trigger, hash],
       );
       return held !== undefined && String(held["execution"]) === to;
+    });
+  }
+
+  admitIntake(row: IntakeRow): Promise<IntakeRow> {
+    return this.#serial(async () => {
+      await this.#run(
+        `INSERT INTO intakes
+           (id, trigger_name, group_hash, group_key, state, execution, waited, held_by, payload,
+            admission, coalesced, admitted_at, deadline, started_at, detail, joined_execution,
+            joined_gate)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ${this.#conflict("(id)", "id = id")}`,
+        [
+          row.id,
+          row.trigger,
+          groupHash(row.group),
+          row.group === undefined ? null : JSON.stringify(row.group),
+          row.state,
+          row.execution,
+          row.waited ? 1 : 0,
+          row.heldBy ?? null,
+          row.payload === undefined ? null : JSON.stringify(row.payload),
+          row.admission === undefined ? null : JSON.stringify(row.admission),
+          row.coalesced,
+          row.admittedAt,
+          row.deadline ?? null,
+          row.startedAt ?? null,
+          row.detail ?? null,
+          row.joined?.execution ?? null,
+          row.joined === undefined ? null : JSON.stringify(row.joined.gate),
+        ],
+      );
+      return (await this.#intake(row.id)) ?? row;
+    });
+  }
+
+  intake(id: string): Promise<IntakeRow | undefined> {
+    return this.#serial(() => this.#intake(id));
+  }
+
+  async #intake(id: string): Promise<IntakeRow | undefined> {
+    const found = await this.#one(
+      `SELECT intakes.${this.#driver.dialect.insertionOrder} AS insertion_order, intakes.* FROM intakes WHERE id = ?`,
+      [id],
+    );
+    return found === undefined ? undefined : intakeOf(found);
+  }
+
+  intakeOf(execution: string): Promise<IntakeRow | undefined> {
+    return this.#serial(async () => {
+      const order = this.#driver.dialect.insertionOrder;
+      // Two reads, each down an index of its own, rather than one `OR` a
+      // planner may answer with a scan: the row that starts the execution
+      // first, and only where there is none, the row whose newest counted
+      // arrival's gate was claimed under the id.
+      const found =
+        (await this.#one(
+          `SELECT intakes.${order} AS insertion_order, intakes.* FROM intakes WHERE execution = ? ORDER BY intakes.${order} DESC LIMIT 1`,
+          [execution],
+        )) ??
+        (await this.#one(
+          `SELECT intakes.${order} AS insertion_order, intakes.* FROM intakes WHERE joined_execution = ? ORDER BY intakes.${order} DESC LIMIT 1`,
+          [execution],
+        ));
+      return found === undefined ? undefined : intakeOf(found);
+    });
+  }
+
+  intakesOf(trigger: string, state: IntakeState): Promise<readonly IntakeRow[]> {
+    return this.#serial(async () => {
+      const order = this.#driver.dialect.insertionOrder;
+      const rows = await this.#all(
+        `SELECT intakes.${order} AS insertion_order, intakes.* FROM intakes
+           WHERE trigger_name = ? AND state = ? ORDER BY intakes.${order} ASC`,
+        [trigger, state],
+      );
+      return rows.map((row) => intakeOf(row));
+    });
+  }
+
+  queuedGroups(trigger: string): Promise<readonly (string | undefined)[]> {
+    return this.#serial(async () => {
+      // The distinct hashes off the index alone — `(trigger_name, state,
+      // group_hash)` covers the read — and then one row's key for each keyed
+      // group, found down the same index: what this costs is the queue's index
+      // entries and one row per group, never the queue's admissions.
+      const hashes = await this.#all(
+        "SELECT DISTINCT group_hash FROM intakes WHERE trigger_name = ? AND state = 'queued'",
+        [trigger],
+      );
+      const groups: (string | undefined)[] = [];
+      for (const row of hashes) {
+        const hash = String(row["group_hash"]);
+        if (hash === "") {
+          groups.push(undefined);
+          continue;
+        }
+        const keyed = await this.#one(
+          "SELECT group_key FROM intakes WHERE trigger_name = ? AND state = 'queued' AND group_hash = ? LIMIT 1",
+          [trigger, hash],
+        );
+        const key = keyed?.["group_key"];
+        if (key !== null && key !== undefined) groups.push(JSON.parse(String(key)) as string);
+      }
+      return groups;
+    });
+  }
+
+  groupQueue(trigger: string, group: string | undefined): Promise<readonly IntakeRow[]> {
+    return this.#serial(async () => {
+      const order = this.#driver.dialect.insertionOrder;
+      const rows = await this.#all(
+        `SELECT intakes.${order} AS insertion_order, intakes.* FROM intakes
+           WHERE trigger_name = ? AND state = 'queued' AND group_hash = ? ORDER BY intakes.${order} ASC`,
+        [trigger, groupHash(group)],
+      );
+      return rows.map((row) => intakeOf(row));
+    });
+  }
+
+  unbegunIntakes(trigger: string): Promise<readonly IntakeRow[]> {
+    return this.#serial(async () => {
+      const order = this.#driver.dialect.insertionOrder;
+      const rows = await this.#all(
+        `SELECT intakes.${order} AS insertion_order, intakes.* FROM intakes
+           LEFT JOIN executions ON executions.id = intakes.execution
+          WHERE intakes.trigger_name = ? AND intakes.state = 'started' AND executions.id IS NULL
+          ORDER BY intakes.${order} ASC`,
+        [trigger],
+      );
+      return rows.map((row) => intakeOf(row));
+    });
+  }
+
+  pendingIntake(trigger: string, group: string | undefined): Promise<IntakeRow | undefined> {
+    return this.#serial(async () => {
+      const order = this.#driver.dialect.insertionOrder;
+      const found = await this.#one(
+        `SELECT intakes.${order} AS insertion_order, intakes.* FROM intakes
+           WHERE trigger_name = ? AND group_hash = ? AND state = 'pending' ORDER BY intakes.${order} ASC LIMIT 1`,
+        [trigger, groupHash(group)],
+      );
+      return found === undefined ? undefined : intakeOf(found);
+    });
+  }
+
+  moveIntake(id: string, from: IntakeState, change: IntakeChange): Promise<boolean> {
+    return this.#serial(async () => {
+      // A fixed set of columns, each named here rather than taken from the
+      // change, so a statement is only ever this module's.
+      const sets: string[] = ["state = ?"];
+      const values: Bound[] = [change.state];
+      const set = (column: string, value: Bound): void => {
+        sets.push(`${column} = ?`);
+        values.push(value);
+      };
+      if (change.execution !== undefined) set("execution", change.execution);
+      if (change.heldBy !== undefined) set("held_by", change.heldBy);
+      if (change.payload !== undefined) set("payload", JSON.stringify(change.payload));
+      if (change.admission !== undefined) set("admission", JSON.stringify(change.admission));
+      if (change.coalesced !== undefined) set("coalesced", change.coalesced);
+      if (change.deadline !== undefined) set("deadline", change.deadline);
+      if (change.startedAt !== undefined) set("started_at", change.startedAt);
+      if (change.detail !== undefined) set("detail", change.detail);
+      if (change.waited !== undefined) set("waited", change.waited ? 1 : 0);
+      if (change.joined !== undefined) {
+        set("joined_execution", change.joined.execution);
+        set("joined_gate", JSON.stringify(change.joined.gate));
+      }
+      const before = await this.#one("SELECT state FROM intakes WHERE id = ?", [id]);
+      if (before === undefined || String(before["state"]) !== from) return false;
+      await this.#run(`UPDATE intakes SET ${sets.join(", ")} WHERE id = ? AND state = ?`, [
+        ...values,
+        id,
+        from,
+      ]);
+      // Read back rather than trusted from an affected-row count, which the
+      // three drivers report three ways: the move landed exactly where the row
+      // now holds what it set.
+      const after = await this.#intake(id);
+      return (
+        after !== undefined &&
+        after.state === change.state &&
+        (change.execution === undefined || after.execution === change.execution) &&
+        (change.coalesced === undefined || after.coalesced === change.coalesced) &&
+        (change.deadline === undefined || after.deadline === change.deadline) &&
+        (change.joined === undefined || after.joined?.execution === change.joined.execution)
+      );
+    });
+  }
+
+  foldGate(trigger: string, gate: IntakeGate, from: string, to: string): Promise<void> {
+    return this.#serial(async () => {
+      // The gate's own column and nothing else: a dedupe row keeps the window
+      // its claim opened, and a `fired` row the instant its tick was claimed.
+      if (gate.kind === "dedupe") {
+        await this.#run(
+          "UPDATE dedupe SET execution = ? WHERE trigger_name = ? AND key_hash = ? AND execution = ?",
+          [to, trigger, keyHash(gate.key), from],
+        );
+        return;
+      }
+      await this.#run(
+        "UPDATE fired SET execution = ? WHERE trigger_name = ? AND scheduled_at = ? AND execution = ?",
+        [to, trigger, gate.scheduledAt, from],
+      );
+    });
+  }
+
+  abandonIntake(id: string): Promise<boolean> {
+    return this.#serial(async () => {
+      const before = await this.#one(
+        "SELECT id FROM intakes WHERE id = ? AND state = 'started' AND waited = 0",
+        [id],
+      );
+      if (before === undefined) return false;
+      await this.#run("DELETE FROM intakes WHERE id = ? AND state = 'started' AND waited = 0", [id]);
+      return (await this.#intake(id)) === undefined;
+    });
+  }
+
+  leasesOf(trigger: string): Promise<readonly Lease[]> {
+    return this.#serial(async () => {
+      // **Computed from the rows**, at every ask (`docs/distributed.md` §8):
+      // a slot is held by an execution this trigger started under its
+      // `concurrency:` block — its `started` intake row — whose lifecycle row
+      // is open and whose cancel nobody has requested. A restart therefore
+      // finds the lease the rows hold, and a slot frees the moment the row
+      // that held it closes or is asked to cancel.
+      //
+      // **An open row the serving build cannot run holds its slot too** — a
+      // recovery whose replay diverged, which stays open on purpose (§7), or
+      // a row of a flow the build no longer declares, which recovery leaves
+      // where it is. The rows say it is running, and no process can know
+      // better; what frees such a slot is its cancel, which `serve`'s cancel
+      // route records for an execution like it as for any open one (Decision
+      // D163's Status).
+      //
+      // **Driven from the open lifecycle rows**, never from the intake's:
+      // intake rows are kept (§3.15), so a trigger's `started` rows are its
+      // whole history, while its open executions are what is running now. The
+      // one constant the statement gives the outer table is the
+      // `executions_by_status` index's `status`, and the trigger is matched on
+      // the lifecycle row's own `trigger_kind` — never on an `intakes` column a
+      // planner could start from — so the read walks the open rows and probes
+      // each one's intake row down `intakes_by_execution`: what it costs is
+      // what is running, not what ever ran.
+      const rows = await this.#all(
+        `SELECT executions.id AS execution, intakes.group_key AS group_key,
+                executions.started_at AS started_at
+           FROM executions
+           JOIN intakes ON intakes.execution = executions.id
+           LEFT JOIN cancellations ON cancellations.execution = executions.id
+          WHERE executions.status = 'open' AND executions.trigger_kind = ?
+            AND intakes.state = 'started' AND cancellations.execution IS NULL
+          ORDER BY executions.started_at ASC, executions.id ASC`,
+        [trigger],
+      );
+      // **One slot per execution**, however many `started` rows name it. A
+      // start the journal would not begin leaves its never-waited row behind
+      // where the row cannot be taken back either, and the retry its
+      // arrival's source makes — a tick's scheduler, an event's consumer —
+      // admits again under the same execution id, so two rows name the one
+      // execution once it begins. The join would read that execution twice,
+      // and its group full with one execution running.
+      const seen = new Set<string>();
+      const leases: Lease[] = [];
+      for (const row of rows) {
+        const execution = String(row["execution"]);
+        if (seen.has(execution)) continue;
+        seen.add(execution);
+        const group = row["group_key"];
+        leases.push({
+          execution,
+          ...(group === null || group === undefined
+            ? {}
+            : { group: JSON.parse(String(group)) as string }),
+          startedAt: String(row["started_at"]),
+        });
+      }
+      return leases;
     });
   }
 
@@ -1874,6 +2398,29 @@ class SqlJournal implements Journal {
 }
 
 /**
+ * The two statements a dedupe claim sweeps its trigger's expired rows with
+ * (`claimDedupe`, `docs/durability.md` §3.12): each a range read down
+ * `dedupe_by_expiry` — `(trigger_name, expires_at, admitted_at)`, on every
+ * backend — so a sweep that finds nothing expired reads no row, and one that
+ * does reads the rows it deletes.
+ *
+ * Two statements rather than one predicate with an `OR` between its halves:
+ * a disjunction across the index's second and third columns is read down its
+ * first alone — every live row of the trigger, on every claim — by SQLite's
+ * planner, and by the other two as their statistics please. Exported for the
+ * contract runner, which asks SQLite's planner how it reads each one.
+ */
+export const DEDUPE_SWEEPS = {
+  /** The rows whose own window the claim's instant has reached. */
+  windowed: "DELETE FROM dedupe WHERE trigger_name = ? AND expires_at <= ?",
+  /**
+   * The rows a build before the window wrote, which have none, read as
+   * expiring one window — the claim's — after they were admitted.
+   */
+  windowless: "DELETE FROM dedupe WHERE trigger_name = ? AND expires_at IS NULL AND admitted_at <= ?",
+} as const;
+
+/**
  * The column a dedupe key is keyed by: its SHA-256, in lowercase hex.
  *
  * A key is whatever the trigger's `dedupe_key:` answered — any length, any
@@ -1896,12 +2443,61 @@ function firedOf(row: Row): FiredRow {
 }
 
 function dedupeOf(row: Row): DedupeRow {
+  const expires = row["expires_at"];
   return {
     trigger: String(row["trigger_name"]),
     // JSON, for the reason a checkpoint is (see `recordCheckpoint`).
     key: JSON.parse(String(row["dedupe_key"])) as string,
     execution: String(row["execution"]),
     admittedAt: String(row["admitted_at"]),
+    ...(expires === null || expires === undefined ? {} : { expiresAt: String(expires) }),
+  };
+}
+
+/**
+ * The column a group is keyed by: the SHA-256 of `concurrency.key`'s answer in
+ * lowercase hex, for [`keyHash`]'s reasons — and the empty string for the
+ * key-less group, which no digest can be.
+ */
+function groupHash(group: string | undefined): string {
+  return group === undefined ? "" : keyHash(group);
+}
+
+/** One `intakes` row, as this module reads it. */
+function intakeOf(row: Row): IntakeRow {
+  const optional = (column: string): string | undefined => {
+    const value = row[column];
+    return value === null || value === undefined ? undefined : String(value);
+  };
+  const group = optional("group_key");
+  const heldBy = optional("held_by");
+  const payload = optional("payload");
+  const admission = optional("admission");
+  const deadline = optional("deadline");
+  const startedAt = optional("started_at");
+  const detail = optional("detail");
+  const joinedExecution = optional("joined_execution");
+  const joinedGate = optional("joined_gate");
+  const order = row["insertion_order"];
+  return {
+    id: String(row["id"]),
+    trigger: String(row["trigger_name"]),
+    ...(group === undefined ? {} : { group: JSON.parse(group) as string }),
+    state: String(row["state"]) as IntakeState,
+    execution: String(row["execution"]),
+    waited: Number(row["waited"]) === 1,
+    ...(heldBy === undefined ? {} : { heldBy }),
+    ...(payload === undefined ? {} : { payload: JSON.parse(payload) as unknown }),
+    ...(admission === undefined ? {} : { admission: JSON.parse(admission) as IntakeAdmission }),
+    coalesced: Number(row["coalesced"]),
+    admittedAt: String(row["admitted_at"]),
+    ...(deadline === undefined ? {} : { deadline }),
+    ...(startedAt === undefined ? {} : { startedAt }),
+    ...(detail === undefined ? {} : { detail }),
+    ...(order === null || order === undefined ? {} : { order: Number(order) }),
+    ...(joinedExecution === undefined || joinedGate === undefined
+      ? {}
+      : { joined: { execution: joinedExecution, gate: JSON.parse(joinedGate) as IntakeGate } }),
   };
 }
 
@@ -2054,7 +2650,32 @@ CREATE TABLE IF NOT EXISTS dedupe (
   dedupe_key   TEXT NOT NULL,
   execution    TEXT NOT NULL,
   admitted_at  TEXT NOT NULL,
+  expires_at   TEXT,
   PRIMARY KEY (trigger_name, key_hash)
+);
+-- The intake ledger (PRD resolved q77, Decision D163, \`docs/durability.md\`
+-- §3.15): one row per arrival a trigger's \`concurrency:\` block admitted —
+-- queued, pending a debounce, started, or dropped — and so one row per
+-- execution such a trigger started, naming the group whose lease it holds.
+-- Keyed by an id of its own, because a queued arrival has no execution yet.
+CREATE TABLE IF NOT EXISTS intakes (
+  id           TEXT PRIMARY KEY,
+  trigger_name TEXT NOT NULL,
+  group_hash   TEXT NOT NULL,
+  group_key    TEXT,
+  state        TEXT NOT NULL,
+  execution    TEXT NOT NULL,
+  waited       INTEGER NOT NULL,
+  held_by      TEXT,
+  payload      TEXT,
+  admission    TEXT,
+  coalesced    INTEGER NOT NULL,
+  admitted_at  TEXT NOT NULL,
+  deadline     TEXT,
+  started_at   TEXT,
+  detail       TEXT,
+  joined_execution TEXT,
+  joined_gate      TEXT
 );
 CREATE TABLE IF NOT EXISTS checkpoints (
   source           TEXT PRIMARY KEY,
@@ -2082,6 +2703,8 @@ CREATE INDEX IF NOT EXISTS deliveries_by_status ON deliveries (status, intended_
 -- \`dispatch_id\` is a random handle the issuing hub owns (§10.1).
 CREATE INDEX IF NOT EXISTS dispatches_by_id ON dispatches (id);
 CREATE INDEX IF NOT EXISTS dispatches_by_status ON dispatches (status, parked_at);
+CREATE INDEX IF NOT EXISTS intakes_by_trigger ON intakes (trigger_name, state, group_hash);
+CREATE INDEX IF NOT EXISTS intakes_by_execution ON intakes (execution);
 `;
 
 /** SQLite's three answers: standard upsert, `?` as written, and the `rowid`. */
@@ -2227,6 +2850,33 @@ async function migrated(
       if (!columns.some((column) => column["name"] === "finally_error")) {
         database.exec("ALTER TABLE executions ADD COLUMN finally_error TEXT;");
       }
+      // A dedupe key's window, added to the row after it (PRD resolved q77
+      // ruling a): nullable, because a row written before it was held for
+      // ever, and a null is read as expiring one window after it was admitted
+      // (see `claimDedupe`).
+      const dedupe = database.all("PRAGMA table_info(dedupe)") as Row[];
+      if (!dedupe.some((column) => column["name"] === "expires_at")) {
+        database.exec("ALTER TABLE dedupe ADD COLUMN expires_at TEXT;");
+      }
+      // …and the index a claim's sweep reads down ([`DEDUPE_SWEEPS`]), made
+      // here rather than in the schema above for `intakes_by_joined`'s reason:
+      // the schema runs before a table it finds already there has the column.
+      database.exec(
+        "CREATE INDEX IF NOT EXISTS dedupe_by_expiry ON dedupe (trigger_name, expires_at, admitted_at);",
+      );
+      // A pending row's newest counted arrival (`docs/durability.md` §3.15),
+      // added to the intake ledger after an earlier build of it created the
+      // table: nullable, because a row with none is a row no gated arrival
+      // joined. Its index is made here rather than in the schema above, which
+      // runs before a table it finds already there has the column.
+      const intakes = database.all("PRAGMA table_info(intakes)") as Row[];
+      if (!intakes.some((column) => column["name"] === "joined_execution")) {
+        database.exec("ALTER TABLE intakes ADD COLUMN joined_execution TEXT;");
+      }
+      if (!intakes.some((column) => column["name"] === "joined_gate")) {
+        database.exec("ALTER TABLE intakes ADD COLUMN joined_gate TEXT;");
+      }
+      database.exec("CREATE INDEX IF NOT EXISTS intakes_by_joined ON intakes (joined_execution);");
       const effects = database.all("PRAGMA table_info(effects)") as Row[];
       if (!effects.some((column) => column["name"] === "refused")) {
         database.exec("ALTER TABLE effects ADD COLUMN refused INTEGER NOT NULL DEFAULT 0;");

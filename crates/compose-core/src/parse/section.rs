@@ -5,9 +5,9 @@ use crate::ast::common::Namespace;
 use crate::ast::document::{Channel, ImportPath, ImportsSection, Reduce, StateSection};
 use crate::ast::schema::{Surface, TypeForm, TypeNode};
 use crate::ast::trigger::{
-    AuthScheme, BearerAuth, CallbackAllow, CallbackAuth, CallbackHmac, EventTrigger, HmacAlgorithm,
-    HmacAuth, HttpTrigger, Respond, ScheduleTrigger, SignatureEncoding, TRIGGER_TYPES, Trigger,
-    TriggerKind, TriggerMethod, TriggersSection,
+    AuthScheme, BearerAuth, CallbackAllow, CallbackAuth, CallbackHmac, Concurrency, EventTrigger,
+    HmacAlgorithm, HmacAuth, HttpTrigger, OnConflict, Respond, ScheduleTrigger, SignatureEncoding,
+    TRIGGER_TYPES, Trigger, TriggerKind, TriggerMethod, TriggersSection,
 };
 use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
 use crate::yaml::Node;
@@ -250,6 +250,12 @@ const TRIGGER_METHODS: &[(&str, TriggerMethod)] = &[
 
 const RESPOND_MODES: &[(&str, Respond)] = &[("sync", Respond::Sync), ("async", Respond::Async)];
 
+const ON_CONFLICT_MODES: &[(&str, OnConflict)] = &[
+    ("queue", OnConflict::Queue),
+    ("drop", OnConflict::Drop),
+    ("supersede", OnConflict::Supersede),
+];
+
 const HMAC_ALGORITHMS: &[(&str, HmacAlgorithm)] = &[
     ("sha1", HmacAlgorithm::Sha1),
     ("sha256", HmacAlgorithm::Sha256),
@@ -309,10 +315,20 @@ fn trigger(name: Spanned<crate::ast::common::Ident>, node: &Node, cx: &mut Cx) -
                     ),
                 );
             }
+            undeduplicated(
+                &mut fields,
+                &subject,
+                "a `run` is a command somebody typed, and running it twice is asking twice: there is no delivery to recognise a repeat of (grammar 13.2, PRD resolved q77)",
+                cx,
+            );
             Some(TriggerKind::Manual)
         }
         Some("http") => Some(TriggerKind::Http(http_trigger(&mut fields, &subject, cx))),
-        Some("schedule") => Some(TriggerKind::Schedule(schedule_trigger(&mut fields, cx))),
+        Some("schedule") => Some(TriggerKind::Schedule(schedule_trigger(
+            &mut fields,
+            &subject,
+            cx,
+        ))),
         Some("event") => Some(TriggerKind::Event(event_trigger(&mut fields, &subject, cx))),
         Some(other) => {
             let span = type_name
@@ -332,6 +348,33 @@ fn trigger(name: Spanned<crate::ast::common::Ident>, node: &Node, cx: &mut Cx) -
             );
             None
         }
+        None => None,
+    };
+
+    // `concurrency:` is a common key of the three trigger types whose arrivals
+    // an intake admits (grammar 13.1, PRD resolved q77 ruling b), and illegal
+    // on the fourth: a `manual` run is a command at a terminal, which is not a
+    // queue — it is refused at start when a group covering its flow is full,
+    // and is never admitted under one (Decision D163).
+    let concurrency = match kind.as_ref() {
+        Some(TriggerKind::Manual) => {
+            if let Some(entry) = fields.take_entry("concurrency") {
+                cx.push(
+                    Diagnostic::error(
+                        DiagnosticCode::ConcurrencyOnManual,
+                        entry.key.span.clone(),
+                        format!("`concurrency` is not legal on the `manual` {subject}"),
+                    )
+                    .with_help(
+                        "a `manual` run is a command at a terminal, and a terminal is not a queue: `run` is refused at start when a group of another trigger covering the flow has no free slot, and never waits for one — declare `concurrency:` on the `http`, `schedule` or `event` trigger whose arrivals it should bound (grammar 13.1, 13.2, PRD resolved q77)",
+                    ),
+                );
+            }
+            None
+        }
+        Some(_) => fields
+            .take("concurrency")
+            .and_then(|node| concurrency(node, &subject, cx)),
         None => None,
     };
 
@@ -355,9 +398,68 @@ fn trigger(name: Spanned<crate::ast::common::Ident>, node: &Node, cx: &mut Cx) -
         flow,
         session_key,
         description,
+        concurrency,
         kind,
         span: node.span.clone(),
     })
+}
+
+/// Read a trigger's `concurrency:` block (grammar 13.1, PRD resolved q77
+/// ruling b, c, Decision D163).
+///
+/// A closed object of five optional keys. `limit:` and `max_running:` are
+/// integers of at least `1` — a group no execution may hold, or a trigger none
+/// of whose executions may run, is one that admits nothing — and `debounce:` is
+/// a literal duration (grammar 4.4), because it is a property of the intake
+/// rather than of one arrival.
+fn concurrency(node: &Node, subject: &str, cx: &mut Cx) -> Option<Concurrency> {
+    let block = format!("the `concurrency` of {subject}");
+    let mapping = expect_mapping(node, &block, cx)?;
+    let mut fields = Fields::new(mapping, node.span.clone(), &block);
+    let key = fields
+        .take("key")
+        .and_then(|node| lexical::cel(node, "`concurrency.key`", cx));
+    let limit_subject = format!("`concurrency.limit` of {subject}");
+    let limit = fields.take("limit").and_then(|node| {
+        super::reader::expect_integer(node, &limit_subject, cx)
+            .filter(|value| super::reader::at_least(value, &limit_subject, 1, cx))
+    });
+    let on_conflict = fields.take("on_conflict").and_then(|node| {
+        lexical::keyword(node, "`concurrency.on_conflict`", ON_CONFLICT_MODES, cx)
+    });
+    let debounce = fields
+        .take("debounce")
+        .and_then(|node| lexical::duration(node, "`concurrency.debounce`", cx));
+    // **The trigger's** total, across every group its `key:` makes — not a
+    // placement's `max_running:` (grammar 14.1, PRD resolved q79), which is how
+    // many dispatches one worker session holds. The subject names the trigger
+    // so a reader who has both open cannot take one for the other.
+    let max_subject = format!("`concurrency.max_running` of {subject}");
+    let max_running = fields.take("max_running").and_then(|node| {
+        super::reader::expect_integer(node, &max_subject, cx)
+            .filter(|value| super::reader::at_least(value, &max_subject, 1, cx))
+    });
+    fields.finish(cx);
+    Some(Concurrency {
+        key,
+        limit,
+        on_conflict,
+        debounce,
+        max_running,
+        span: node.span.clone(),
+    })
+}
+
+/// Read a trigger's `dedupe_window:` (grammar 13.3, 13.5, PRD resolved q77
+/// ruling a): a literal duration, the TTL of every dedupe row the trigger
+/// claims.
+fn dedupe_window(
+    fields: &mut Fields<'_>,
+    cx: &mut Cx,
+) -> Option<Spanned<crate::ast::common::Duration>> {
+    fields
+        .take("dedupe_window")
+        .and_then(|node| lexical::duration(node, "`dedupe_window`", cx))
 }
 
 fn http_trigger(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> HttpTrigger {
@@ -462,6 +564,31 @@ fn http_trigger(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> HttpTrig
         require_callback_allow(fields, subject, cx);
     }
 
+    // `dedupe_key:` has no default on an `http` trigger — a request body has
+    // no id of its own — so a window beside no key bounds nothing, and is
+    // refused the way `timeout:` on an async trigger is (grammar 13.3, PRD
+    // resolved q77 ruling a, Decision D81's posture).
+    let dedupe_key = fields
+        .take("dedupe_key")
+        .and_then(|node| lexical::cel(node, "`dedupe_key`", cx));
+    let dedupe_window = if fields.contains("dedupe_key") || dedupe_key.is_some() {
+        dedupe_window(fields, cx)
+    } else {
+        if let Some(entry) = fields.take_entry("dedupe_window") {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::ConflictingKeys,
+                    entry.key.span.clone(),
+                    format!("`dedupe_window` is not legal on {subject}, which declares no `dedupe_key`"),
+                )
+                .with_help(
+                    "the window is how long a dedupe key is held, and an `http` trigger's `dedupe_key:` has no default — a request body has no id of its own — so a window beside no key holds nothing: declare the `dedupe_key:` the window is for, or drop the key (grammar 13.3, PRD resolved q77)",
+                ),
+            );
+        }
+        None
+    };
+
     HttpTrigger {
         path,
         method,
@@ -472,6 +599,8 @@ fn http_trigger(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> HttpTrig
         auth,
         callback_auth,
         callback_allow,
+        dedupe_key,
+        dedupe_window,
     }
 }
 
@@ -1063,7 +1192,34 @@ fn require_callback_allow(fields: &Fields<'_>, subject: &str, cx: &mut Cx) {
     );
 }
 
-fn schedule_trigger(fields: &mut Fields<'_>, cx: &mut Cx) -> ScheduleTrigger {
+/// `dedupe_key:` or `dedupe_window:` on a trigger type that takes neither,
+/// refused as the unknown keys they are there — with the reason, because both
+/// are keys of two sibling types and the author has most likely carried one
+/// across (grammar 13.2, 13.4, PRD resolved q77).
+fn undeduplicated(fields: &mut Fields<'_>, subject: &str, why: &str, cx: &mut Cx) {
+    for key in ["dedupe_key", "dedupe_window"] {
+        if let Some(entry) = fields.take_entry(key) {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::UnknownKey,
+                    entry.key.span.clone(),
+                    format!("unknown key `{key}` in {subject}"),
+                )
+                .with_help(format!(
+                    "`dedupe_key:` and `dedupe_window:` belong to `http` and `event` triggers: {why}"
+                )),
+            );
+        }
+    }
+}
+
+fn schedule_trigger(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> ScheduleTrigger {
+    undeduplicated(
+        fields,
+        subject,
+        "a tick is deduplicated by its own `fired` row, keyed by the trigger and the instant it is for, so each tick fires once and there is no second key to declare (grammar 13.4, PRD resolved q78)",
+        cx,
+    );
     let cron = fields
         .require("cron", cx)
         .and_then(|node| lexical::text(node, "`cron`", cx))
@@ -1205,6 +1361,10 @@ fn event_trigger(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> EventTr
     let dedupe_key = fields
         .take("dedupe_key")
         .and_then(|node| lexical::cel(node, "`dedupe_key`", cx));
+    // Legal with or without a `dedupe_key:` here: an `event` trigger's key
+    // defaults to `payload.id`, so every event trigger dedupes and every one
+    // holds its keys for a window (grammar 13.5, PRD resolved q77 ruling a).
+    let dedupe_window = dedupe_window(fields, cx);
     // Grammar 13.3's block, read by the same function: nobody calls an `event`
     // trigger, so it authenticates no start — it guards the routes about this
     // trigger's work, its executions' and its source's (grammar 13.5, PRD
@@ -1214,6 +1374,7 @@ fn event_trigger(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> EventTr
         source,
         input,
         dedupe_key,
+        dedupe_window,
         auth,
     }
 }

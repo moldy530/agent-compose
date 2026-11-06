@@ -156,6 +156,8 @@ pub fn explanation(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::RoutedFinally => include_str!("codes/routed-finally.md"),
         DiagnosticCode::DuplicateRoute => include_str!("codes/duplicate-route.md"),
         DiagnosticCode::ConflictingSessionKey => include_str!("codes/conflicting-session-key.md"),
+        DiagnosticCode::ConcurrencyOnManual => include_str!("codes/concurrency-on-manual.md"),
+        DiagnosticCode::CoalescedInKey => include_str!("codes/coalesced-in-key.md"),
         DiagnosticCode::MissingCallbackAllowlist => {
             include_str!("codes/missing-callback-allowlist.md")
         }

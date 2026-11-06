@@ -145,7 +145,13 @@ from `payload.scheduled_at`. An event source of `kind: command` is a program
 printing one JSON object per line; its `checkpoint:` is handed back on every
 restart as `AGENT_COMPOSE_CHECKPOINT` and as a `{checkpoint}` argument, and
 `dedupe_key:` (default `payload.id`) keeps a re-emitted event from starting a
-second execution. `GET /sources/<name>` reports the program, under the
+second execution for `dedupe_window:` (default `24h`); an `http` trigger takes
+both too, with no default key. A `concurrency:` block on an `http`, `schedule`
+or `event` trigger — `key`, `limit` (default 1), `on_conflict: queue | drop |
+supersede`, `debounce`, `max_running` — bounds how many of its executions run
+at once; a queued or debounced request is answered `202` with an `intake_id`
+that `GET /intakes/<id>` follows, and a `run` of a flow a full key-less group
+covers is refused, exit `2`. `GET /sources/<name>` reports the program, under the
 `auth:` an `event` trigger bound to it may declare. `redis_streams`,
 `sqs` and `nats` validate, but `serve` refuses them by name. See
 `agent-compose docs triggers` and `agent-compose explain invalid-cron`.

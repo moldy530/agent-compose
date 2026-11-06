@@ -1,0 +1,9 @@
+# rule: a trigger's `concurrency:` is a mapping (grammar 13.1, PRD resolved q77)
+# code: wrong-type
+# message: expected a mapping for the `concurrency` of trigger `on_request`, found an integer
+# at: 9:18
+triggers:
+  on_request:
+    type: http
+    flow: flow.support
+    concurrency: 3

@@ -1,0 +1,10 @@
+# rule: `dedupe_key:` is a key of `http` and `event` triggers alone (grammar 13.2, PRD resolved q77)
+# code: unknown-key
+# message: unknown key `dedupe_key` in trigger `cli`
+# at: 10:5
+# help: `dedupe_key:` and `dedupe_window:` belong to `http` and `event` triggers: a `run` is a command somebody typed, and running it twice is asking twice: there is no delivery to recognise a repeat of (grammar 13.2, PRD resolved q77)
+triggers:
+  cli:
+    type: manual
+    flow: flow.support
+    dedupe_key: "'every run'"

@@ -1,0 +1,11 @@
+# rule: a trigger's `concurrency.on_conflict:` is `queue`, `drop` or `supersede` (grammar 13.1, PRD resolved q77)
+# code: unknown-variant
+# message: `wait` is not a valid `concurrency.on_conflict`
+# at: 11:20
+# help: `concurrency.on_conflict` takes one of `queue`, `drop`, `supersede`
+triggers:
+  on_request:
+    type: http
+    flow: flow.support
+    concurrency:
+      on_conflict: wait

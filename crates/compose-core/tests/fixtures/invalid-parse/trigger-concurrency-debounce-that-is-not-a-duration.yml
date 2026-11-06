@@ -1,0 +1,12 @@
+# rule: a trigger's `concurrency.debounce:` is a literal duration (grammar 4.4, 13.1, PRD resolved q77)
+# code: invalid-duration
+# message: `soon` is not a valid duration for `concurrency.debounce`
+# at: 12:17
+# help: durations are a positive integer followed by `ms`, `s`, `m`, or `h`, e.g. `30s`; compound forms like `1m30s` are not supported
+triggers:
+  on_event:
+    type: event
+    source: feed
+    flow: flow.support
+    concurrency:
+      debounce: soon

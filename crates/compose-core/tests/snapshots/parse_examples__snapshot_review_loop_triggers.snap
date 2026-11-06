@@ -19,6 +19,7 @@ Spec(
                         ),
                         session_key: None,
                         description: None,
+                        concurrency: None,
                         kind: Some(
                             Manual,
                         ),
@@ -33,6 +34,7 @@ Spec(
                             cel("payload.headers['x-session-id']") @ 20:18..20:51,
                         ),
                         description: None,
+                        concurrency: None,
                         kind: Some(
                             Http(
                                 HttpTrigger {
@@ -63,6 +65,8 @@ Spec(
                                     auth: None,
                                     callback_auth: None,
                                     callback_allow: None,
+                                    dedupe_key: None,
+                                    dedupe_window: None,
                                 },
                             ),
                         ),

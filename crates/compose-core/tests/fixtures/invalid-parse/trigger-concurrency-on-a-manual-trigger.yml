@@ -1,0 +1,11 @@
+# rule: `concurrency:` is illegal on a `manual` trigger, whose run is a command at a terminal (grammar 13.1, 13.2, PRD resolved q77)
+# code: concurrency-on-manual
+# message: `concurrency` is not legal on the `manual` trigger `cli`
+# at: 10:5
+# help: a `manual` run is a command at a terminal, and a terminal is not a queue: `run` is refused at start when a group of another trigger covering the flow has no free slot, and never waits for one — declare `concurrency:` on the `http`, `schedule` or `event` trigger whose arrivals it should bound (grammar 13.1, 13.2, PRD resolved q77)
+triggers:
+  cli:
+    type: manual
+    flow: flow.support
+    concurrency:
+      limit: 1

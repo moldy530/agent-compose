@@ -282,6 +282,16 @@ pub fn expressions(ir: &Ir) -> Vec<Expression<'_>> {
                 site: format!("{site}'s `session_key:`"),
             });
         }
+        if let Some(key) = trigger
+            .concurrency
+            .as_ref()
+            .and_then(|block| block.key.as_ref())
+        {
+            found.push(Expression {
+                source: key,
+                site: format!("{site}'s `concurrency.key:`"),
+            });
+        }
         match &trigger.kind {
             crate::ir::trigger::TriggerKind::Manual => {}
             crate::ir::trigger::TriggerKind::Http(http) => {
@@ -294,6 +304,12 @@ pub fn expressions(ir: &Ir) -> Vec<Expression<'_>> {
                     found.push(Expression {
                         source: callback,
                         site: format!("{site}'s `callback:`"),
+                    });
+                }
+                if let Some(key) = &http.dedupe_key {
+                    found.push(Expression {
+                        source: key,
+                        site: format!("{site}'s `dedupe_key:`"),
                     });
                 }
             }

@@ -11,6 +11,7 @@ TriggersSection {
             ),
             session_key: None,
             description: None,
+            concurrency: None,
             kind: Some(
                 Http(
                     HttpTrigger {
@@ -78,6 +79,8 @@ TriggersSection {
                                 span: 36:7..37:34,
                             },
                         ),
+                        dedupe_key: None,
+                        dedupe_window: None,
                     },
                 ),
             ),
@@ -90,6 +93,7 @@ TriggersSection {
             ),
             session_key: None,
             description: None,
+            concurrency: None,
             kind: Some(
                 Http(
                     HttpTrigger {
@@ -132,6 +136,8 @@ TriggersSection {
                                 span: 50:7..50:38,
                             },
                         ),
+                        dedupe_key: None,
+                        dedupe_window: None,
                     },
                 ),
             ),

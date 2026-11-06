@@ -3031,9 +3031,13 @@
         "auth": { "description": "How an inbound call to this trigger is authenticated, and with it the resume and status routes of every execution it starts. Absent means all three are open. Auth is per trigger, never server-wide: who may invoke this flow is readable off the trigger that exposes it (grammar 13.3 / PRD resolved q32).", "$ref": "#/$defs/inboundAuth" },
         "callback_auth": { "description": "How a delivered callback identifies itself to its receiver. Opt-in, and declaring it makes callback_allow mandatory. Absent is the documented test posture: the deployment signs nothing and may POST wherever the payload said (grammar 13.3 / PRD resolved q33).", "$ref": "#/$defs/callbackAuth" },
         "callback_allow": { "description": "The URL patterns this trigger's callback may point at, matched against the whole callback URL with * standing for any run of characters. Required wherever callback_auth is declared (grammar 13.3 / PRD resolved q33).", "$ref": "#/$defs/callbackAllow" },
+        "dedupe_key": { "description": "CEL over payload producing the key a repeat delivery is recognised by. No default - a request body has no id of its own - so absent means no dedupe. A repeat inside dedupe_window answers the first admission's id with X-AgentCompose-Deduped: true and starts nothing. May not read payload.coalesced (grammar 13.3 / PRD resolved q77).", "$ref": "#/$defs/cel" },
+        "dedupe_window": { "description": "How long a dedupe key is held, the TTL of its row (default 24h). A key seen again after the window starts a new execution. Legal only beside dedupe_key (grammar 13.3 / PRD resolved q77).", "$ref": "#/$defs/duration" },
+        "concurrency": { "description": "The intake groups this trigger's executions are admitted under: a group is a lease held by its running executions, computed from journal rows. Grammar 13.1 / PRD resolved q77.", "$ref": "#/$defs/triggerConcurrency" },
         "description": { "description": "Documentation.", "type": "string" }
       },
       "additionalProperties": false,
+      "dependentRequired": { "dedupe_window": ["dedupe_key"] },
       "allOf": [
         {
           "if": { "properties": { "respond": { "const": "sync" } }, "required": ["respond"] },
@@ -3155,6 +3159,21 @@
         "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "pattern": "^https?://[^\\s/?#]+([/?#]\\S*)?$" }]
       }
     },
+    "triggerConcurrency": {
+      "description": "A trigger's concurrency block. Legal on http, schedule and event triggers and refused on manual (concurrency-on-manual): a run is refused at start when a group covering its flow is full, and never queued. Grammar 13.1 / PRD resolved q77, Decision D163.",
+      "type": "object",
+      "properties": {
+        "key": { "description": "CEL over the trigger's payload producing the group an arrival belongs to. Absent means one group for the whole trigger. May not read payload.coalesced (coalesced-in-key).", "$ref": "#/$defs/cel" },
+        "limit": { "description": "How many executions of one group may run at once (default 1).", "type": "integer", "minimum": 1 },
+        "on_conflict": {
+          "description": "What an arrival that finds no free slot does: queue (default) journals an intake row started first-in first-out when a slot frees; drop answers the running execution's id with X-AgentCompose-Dropped: true and starts nothing; supersede cancels the group's running executions, children included, and starts.",
+          "enum": ["queue", "drop", "supersede"]
+        },
+        "debounce": { "description": "A literal duration: an arrival opens or extends one pending intake row per group holding the newest payload, and at its deadline one execution starts with that payload and payload.coalesced, the count of arrivals coalesced into it.", "$ref": "#/$defs/duration" },
+        "max_running": { "description": "The trigger's total running executions across all its groups - not a placement's max_running (grammar 14.1), which bounds one worker session's dispatches.", "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
     "scheduleTrigger": {
       "description": "A cron schedule serve fires: each due tick journals a fired row before its execution starts, so a tick fires once across restarts and hubs; ticks that fell while no serve ran are skipped, never back-filled. Grammar 13.4 / PRD resolved q78.",
       "type": "object",
@@ -3167,8 +3186,9 @@
           "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "pattern": "^[^ \\t\\n\\f\\r]+([ \\t\\n\\f\\r]+[^ \\t\\n\\f\\r]+){4}$" }]
         },
         "timezone": { "description": "IANA timezone name (default UTC), the wall clock the cron is matched against: a time daylight saving skips fires at the first instant after the gap, one it repeats fires once. Shape-checked at compile time and refused at serve start when the runtime's database does not know it, so env references are illegal (grammar 4.3 class 3, Decision D92).", "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "pattern": "^[A-Za-z][A-Za-z0-9_+-]*(/[A-Za-z][A-Za-z0-9_+-]*)*$" }] },
-        "input": { "description": "Bindings, CEL over payload.scheduled_at / payload.trigger.", "$ref": "#/$defs/triggerInput" },
+        "input": { "description": "Bindings, CEL over payload.scheduled_at / payload.trigger (and payload.coalesced under concurrency.debounce).", "$ref": "#/$defs/triggerInput" },
         "session_key": { "description": "CEL over payload producing the session identity.", "$ref": "#/$defs/cel" },
+        "concurrency": { "description": "The intake groups this trigger's executions are admitted under: a group is a lease held by its running executions, computed from journal rows. Grammar 13.1 / PRD resolved q77.", "$ref": "#/$defs/triggerConcurrency" },
         "description": { "description": "Documentation.", "type": "string" }
       },
       "additionalProperties": false
@@ -3183,7 +3203,9 @@
         "source": { "description": "Logical source name, bound to infrastructure per target under event_sources.", "$ref": "#/$defs/identifier" },
         "input": { "description": "Bindings, CEL over payload.id / payload.body / payload.attributes / payload.source.", "$ref": "#/$defs/triggerInput" },
         "session_key": { "description": "CEL over payload producing the session identity.", "$ref": "#/$defs/cel" },
-        "dedupe_key": { "description": "CEL over payload for inbound at-least-once dedupe (default payload.id).", "$ref": "#/$defs/cel" },
+        "dedupe_key": { "description": "CEL over payload for inbound at-least-once dedupe (default payload.id). May not read payload.coalesced (grammar 13.5 / PRD resolved q77).", "$ref": "#/$defs/cel" },
+        "dedupe_window": { "description": "How long a dedupe key is held, the TTL of its row (default 24h): an event whose key was seen longer ago than this starts a new execution (grammar 13.5 / PRD resolved q77).", "$ref": "#/$defs/duration" },
+        "concurrency": { "description": "The intake groups this trigger's executions are admitted under: a group is a lease held by its running executions, computed from journal rows. Grammar 13.1 / PRD resolved q77.", "$ref": "#/$defs/triggerConcurrency" },
         "auth": { "description": "The scheme the routes about this trigger's work enforce: the status, resume and cancel routes of every execution it starts, and its source's GET /sources/:name (a caller must satisfy one bound trigger's auth). Nobody calls an event trigger, so it authenticates no start; absent leaves those routes open (grammar 13.5 / PRD resolved q32, q78, Decision D162).", "$ref": "#/$defs/inboundAuth" },
         "description": { "description": "Documentation.", "type": "string" }
       },

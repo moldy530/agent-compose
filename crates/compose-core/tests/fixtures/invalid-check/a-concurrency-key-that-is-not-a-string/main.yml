@@ -1,0 +1,37 @@
+# rule: a trigger's `concurrency.key` evaluates to a string (grammar 13.1, PRD resolved q77)
+# code: type-mismatch
+# message: `concurrency.key` of the trigger `on_request` must evaluate to a string, found a map of strings
+# at: main.yml:26:12
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+triggers:
+  on_request:
+    type: http
+    flow: flow.f
+    input:
+      goal: "payload.body.goal"
+    concurrency:
+      key: "payload.query"
+flow.f:
+  inputs:
+    goal: { type: string }
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "input.goal" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

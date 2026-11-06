@@ -30,6 +30,11 @@ pub struct Trigger {
     pub session_key: Option<Spanned<Cel>>,
     /// `description:`
     pub description: Option<Spanned<String>>,
+    /// `concurrency:` — the intake groups this trigger's executions are
+    /// admitted under (grammar 13.1, PRD resolved q77, Decision D163). Legal on
+    /// `http`, `schedule` and `event` triggers; the parser refuses it on a
+    /// `manual` one (`concurrency-on-manual`) and leaves this `None`.
+    pub concurrency: Option<Concurrency>,
     /// The type-specific half. `None` when `type:` was missing or unknown, in
     /// which case the rest of the entry is not parsed — which keys are legal
     /// depends on the type.
@@ -148,6 +153,81 @@ pub struct HttpTrigger {
     /// `callback_allow:` — the URL patterns a callback may point at; mandatory
     /// wherever `callback_auth:` is declared (grammar 13.3, PRD resolved q33).
     pub callback_allow: Option<CallbackAllow>,
+    /// `dedupe_key:` — CEL over the request payload, to a string; no default,
+    /// because an HTTP body has no id of its own: absent means no dedupe
+    /// (grammar 13.3, PRD resolved q77 ruling a).
+    pub dedupe_key: Option<Spanned<Cel>>,
+    /// `dedupe_window:` — how long a key is held; defaults to
+    /// [`DEFAULT_DEDUPE_WINDOW`]. Legal only beside a `dedupe_key:`.
+    pub dedupe_window: Option<Spanned<Duration>>,
+}
+
+/// The window a dedupe key is held for when a trigger declares none: `24h`
+/// (grammar 13.3, 13.5, PRD resolved q77 ruling a).
+pub const DEFAULT_DEDUPE_WINDOW: &str = "24h";
+
+/// The window [`DEFAULT_DEDUPE_WINDOW`] spells, in milliseconds.
+pub const DEFAULT_DEDUPE_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// The `concurrency:` block (grammar 13.1, PRD resolved q77 ruling b, c).
+///
+/// A **group** is a lease held by its running executions: the arrivals whose
+/// `key:` answers one value share one, `limit:` of them may hold it at once, and
+/// `max_running:` bounds the trigger's executions across every group. What an
+/// arrival that finds no free slot does is `on_conflict:`'s; `debounce:`
+/// coalesces the arrivals for one key into one execution.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Concurrency {
+    /// `key:` — CEL over the kind's payload, to a string; absent means one
+    /// group for the whole trigger.
+    pub key: Option<Spanned<Cel>>,
+    /// `limit:` — an integer of at least `1`; defaults to `1`.
+    pub limit: Option<Spanned<i64>>,
+    /// `on_conflict:` — defaults to [`OnConflict::Queue`].
+    pub on_conflict: Option<Spanned<OnConflict>>,
+    /// `debounce:` — a literal duration; absent means no coalescing.
+    pub debounce: Option<Spanned<Duration>>,
+    /// `max_running:` — **the trigger's** total across all its groups, an
+    /// integer of at least `1`. Not a placement's `max_running:` (grammar 14.1,
+    /// PRD resolved q79), which bounds a worker session's dispatches.
+    pub max_running: Option<Spanned<i64>>,
+    /// The block's own span.
+    pub span: Span,
+}
+
+impl Concurrency {
+    /// The keys the block may declare, in the order grammar 13.1 lists them.
+    pub const KEYS: &'static [&'static str] =
+        &["key", "limit", "on_conflict", "debounce", "max_running"];
+}
+
+/// What an arrival that finds no free slot in its group does (grammar 13.1,
+/// PRD resolved q77 ruling b).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnConflict {
+    /// `queue` — the default: an intake row, started first-in first-out when a
+    /// slot frees.
+    Queue,
+    /// `drop` — answered with the running execution's id, and nothing starts.
+    Drop,
+    /// `supersede` — the group's running executions are cancelled, and this one
+    /// starts.
+    Supersede,
+}
+
+impl OnConflict {
+    /// Every mode, in the order grammar 13.1 lists them.
+    pub const ALL: &'static [Self] = &[Self::Queue, Self::Drop, Self::Supersede];
+
+    /// The keyword that names this mode.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queue => "queue",
+            Self::Drop => "drop",
+            Self::Supersede => "supersede",
+        }
+    }
 }
 
 /// The inbound authentication schemes (grammar 13.3, PRD resolved q32).
@@ -352,6 +432,9 @@ pub struct EventTrigger {
     pub input: Option<Bindings>,
     /// `dedupe_key:` — defaults to `payload.id`.
     pub dedupe_key: Option<Spanned<Cel>>,
+    /// `dedupe_window:` — how long a key is held; defaults to
+    /// [`DEFAULT_DEDUPE_WINDOW`] (grammar 13.5, PRD resolved q77 ruling a).
+    pub dedupe_window: Option<Spanned<Duration>>,
     /// `auth:` — the scheme the routes about this trigger's work enforce: the
     /// status, resume and cancel routes of every execution it starts, and its
     /// source's `GET /sources/:name` (grammar 13.5, PRD resolved q32 one level

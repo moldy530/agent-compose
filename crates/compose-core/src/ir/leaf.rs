@@ -76,7 +76,7 @@ use crate::ast::flow::{
     StoreTtl, WorkspaceAccess,
 };
 use crate::ast::schema::{Number, ScalarKind, StringFormat, Surface};
-use crate::ast::trigger::{HmacAlgorithm, Respond, SignatureEncoding, TriggerMethod};
+use crate::ast::trigger::{HmacAlgorithm, OnConflict, Respond, SignatureEncoding, TriggerMethod};
 use crate::diag::{Position, Span, Spanned};
 
 /// Write a span the way the IR records it: `<file>:<line>:<col>..<line>:<col>`.
@@ -153,6 +153,7 @@ serialize_as_keyword!(
     Harness,
     HmacAlgorithm,
     HttpMethod,
+    OnConflict,
     PermissionMode,
     ProviderKind,
     Reduce,

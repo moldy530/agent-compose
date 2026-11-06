@@ -169,7 +169,11 @@ Both halves are normative; the second is a placement's `max_running:` (grammar
 - The hub offers a session work of a placement while the session's **unsettled
   dispatches for that placement number fewer than the placement's
   `max_running:`** — an integer of at least `1`, default `1`, declared in the
-  deploy file beside the placement's members. A worker claiming two placements
+  deploy file beside the placement's members. (A trigger's
+  `concurrency.max_running:` — grammar §13.1, Decision D163 — is a different
+  key with the same name: how many executions that trigger has running across
+  its groups, which §8's lease reads off the intake rows, where this one is
+  read off a session's dispatch rows.) A worker claiming two placements
   holds up to each one's cap of each. A worker runs every dispatch it holds
   concurrently, each in its own node runner, and keeps polling while any is
   unsettled.
@@ -1691,10 +1695,18 @@ protocol equally.
    execution is the row's whole job, so it is the one identity in the schema
    keyed by a trigger and an instant rather than by an execution. The other
    intake tables are the same kind of row and are named with it — `dedupe`,
-   keyed `(trigger, key)` (§3.12); `checkpoints`, keyed by source (§3.13); and
-   `restarts`, keyed `(source, ended_at)` (§3.14). None is a counter: each is
-   one row per thing that happened, claimed by an insert that either wins or is
-   answered with the row that did. One read spans executions — `lastFired`, a
+   keyed `(trigger, key)` and held for its trigger's `dedupe_window:` (§3.12);
+   `checkpoints`, keyed by source (§3.13); `restarts`, keyed
+   `(source, ended_at)` (§3.14); and `intakes`, one row per arrival a trigger's
+   `concurrency:` block admitted, keyed by its `intake_id` and indexed by
+   trigger and group (§3.15, PRD resolved q77, grammar Decision D163). None is
+   a counter: each is one row per thing that happened, claimed by an insert
+   that either wins or is answered with the row that did. **A group's lease is
+   read off them, never counted**: its slots are the trigger's `started`
+   intake rows whose executions are open and uncancelled — a join over
+   execution-scoped rows, decided again at every arrival — so a group is a
+   lease over a set of executions, rule 1's granularity, and nothing in the
+   schema counts what is running. One read spans executions — `lastFired`, a
    trigger's newest `fired` row, which is the "last fired time recorded" PRD
    resolved q78 ruling b keeps and where a starting scheduler resumes from —
    and the tick repair also reads it to find a claim nobody started, which is
@@ -1736,6 +1748,14 @@ same shape at a source's granularity: one row per source, written by whichever
 hub admitted the event it names — and a standby's consumer, which cannot read
 it, holds its program back until it can rather than starting it from no
 position (§3.13 there).
+
+**Nor does it settle an intake's decision.** The rows are the lease, but the
+decision over them — a slot read free, then a start — is serialized per trigger
+inside the one process that serves it, and a `run` asking whether its flow's
+group is full reads the rows outside that serialization. While one process
+writes the journal that is the whole of it; two hubs without the guard would
+each read a slot free and both start. It is the same rule-3 conflict as the
+paragraph below, recorded in Decision D163's Status for the same ruling.
 
 **What the row does not settle without the guard is a claim nobody started.**
 The tick repair (`docs/durability.md` §3.11) and the dedupe takeover (§3.12)

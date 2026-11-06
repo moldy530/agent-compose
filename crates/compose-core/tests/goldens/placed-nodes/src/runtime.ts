@@ -124,6 +124,7 @@ import type {
   EffectSlot,
   ExecutionRow,
   Journal,
+  Lease,
   Lineage,
   LineageAdmission,
 } from "./journal.ts";
@@ -156,6 +157,7 @@ export type {
   JournalBinding,
   JournalProvider,
   JournalRecord,
+  Lease,
   Lineage,
   LineageAdmission,
 } from "./journal.ts";
@@ -16938,6 +16940,17 @@ export async function journaledExecution(id: string): Promise<ExecutionRow | und
 export async function openExecutions(): Promise<readonly ExecutionRow[]> {
   if (!journalExists()) return [];
   return await (await openJournal()).openExecutions();
+}
+
+/**
+ * A trigger's lease, read off this project's journal (PRD resolved q77,
+ * `docs/distributed.md` §8): every execution it started under `concurrency:`
+ * that is still open, oldest first — and none where nothing has ever been
+ * journaled, so asking creates no journal.
+ */
+export async function leasesOf(trigger: string): Promise<readonly Lease[]> {
+  if (!journalExists()) return [];
+  return await (await openJournal()).leasesOf(trigger);
 }
 
 // ---------------------------------------------------------------------------

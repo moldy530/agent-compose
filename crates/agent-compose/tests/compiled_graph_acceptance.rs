@@ -32514,12 +32514,12 @@ fn the_shell_program_the_triggers_topic_documents_feeds_its_trigger_under_serve(
             .join("docs/topics/triggers.md"),
     )
     .expect("the triggers topic is readable");
-    let spec = documented_block(&topic, "```yaml spec", None);
+    let spec = documented_block(&topic, "```yaml spec", Some("# main.yml"));
     let deploy = documented_block(&topic, "```yaml", Some("# deploy/local.yml"));
     let script = documented_block(&topic, "```sh", Some("#!/bin/sh"));
     assert!(
         spec.contains("source: reports") && script.contains("AGENT_COMPOSE_CHECKPOINT"),
-        "the topic's last spec is the event example, and its script reads the checkpoint"
+        "the topic's `# main.yml` spec is the event example, and its script reads the checkpoint"
     );
 
     let scratch = harness::Scratch::new("topic-feed");

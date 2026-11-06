@@ -3267,3 +3267,84 @@ event_sources:
         ),
     );
 }
+
+/// A trigger's intake over every key it may declare (grammar 13.1, 13.3, 13.5,
+/// PRD resolved q77, Decision D163): an `http` trigger with a `dedupe_key:`,
+/// its `dedupe_window:` and a debounced, keyed `concurrency:` block whose
+/// `input:` and `session_key:` read `payload.coalesced`; a `schedule` trigger
+/// that drops; an `event` trigger with a window and no key of its own (its key
+/// is `payload.id`) that supersedes under a `max_running:`; and an empty block,
+/// which is every default.
+///
+/// The accepting half of `coalesced-in-key` and of the unknown-field refusal of
+/// `payload.coalesced` on an undebounced trigger: the count is bound where the
+/// execution starts, on the one trigger kind whose payload carries it.
+#[test]
+fn every_intake_key_on_each_trigger_kind_that_takes_one() {
+    accepts_with_local(
+        "intake",
+        r#"
+flow.work:
+  inputs:
+    tag: { type: string }
+    count: { type: integer, default: 1 }
+  outputs: {}
+  nodes:
+    note:
+      exec: { command: "true" }
+  edges:
+    - { from: start, to: note }
+    - { from: note, to: end }
+
+triggers:
+  pushed:
+    type: http
+    flow: flow.work
+    path: /pushes
+    dedupe_key: "payload.headers['x-delivery']"
+    dedupe_window: 6h
+    input:
+      tag: "payload.body.repo"
+      count: "payload.coalesced"
+    session_key: "payload.body.repo + (payload.coalesced > 1 ? '#batch' : '#one')"
+    concurrency:
+      key: "payload.body.repo"
+      limit: 2
+      on_conflict: queue
+      debounce: 30s
+      max_running: 4
+  plain:
+    type: http
+    flow: flow.work
+    path: /plain
+    input: { tag: "payload.body.tag" }
+    concurrency: {}
+  nightly:
+    type: schedule
+    flow: flow.work
+    cron: "0 3 * * *"
+    input: { tag: "payload.scheduled_at" }
+    concurrency:
+      on_conflict: drop
+  newest:
+    type: event
+    flow: flow.work
+    source: feed
+    dedupe_window: 10m
+    input: { tag: "payload.id" }
+    concurrency:
+      key: "payload.source"
+      on_conflict: supersede
+      max_running: 1
+"#,
+        Some(
+            r#"version: "0.1"
+
+event_sources:
+  feed:
+    kind: command
+    command: ./bin/feed
+"#,
+        ),
+    );
+}

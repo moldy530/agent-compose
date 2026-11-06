@@ -727,6 +727,45 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "a_checkpoint_is_absent_until_written_and_then_the_newest",
     "restart_rows_are_paged_newest_first_with_their_total",
     "a_journal_without_the_intake_tables_gains_them_on_open",
+    // §3.12, §3.15 — the intake ledger (PRD resolved q77): a dedupe key is held
+    // for its window, claimed again after it, and the claim sweeps every row of
+    // the trigger whose window has passed; a takeover carries its new window.
+    // An intake row round-trips and is admitted once under its id; a trigger's
+    // queue reads in admission order; a move out of a state is won once, which
+    // is what makes a queued or pending arrival start once; a debounce's row is
+    // its group's one pending row, extended in place and started once; the
+    // lease is the open, uncancelled executions the rows name — read off the
+    // rows, never counted; a start nobody was told of is found and taken back,
+    // and one that waited is kept for its repair. And a journal a build before
+    // the ledger wrote gains the dedupe row's window column, the index its
+    // sweep reads down, and the intake table on open, its window-less rows
+    // expiring one window after they were admitted (§11.2). The sweep reads
+    // only what expired: the index is there in its one shape on every
+    // backend, and SQLite's planner reads each half of the sweep as a range
+    // over the window.
+    "a_journal_written_before_the_intake_ledger_gains_it_on_open",
+    "a_dedupe_key_is_held_for_its_window_and_claimed_again_after_it",
+    "a_dedupe_claim_sweeps_the_triggers_expired_rows",
+    "a_dedupe_sweep_reads_only_expired_rows_down_its_index",
+    "a_dedupe_takeover_carries_its_new_window",
+    "an_intake_row_round_trips_and_is_admitted_once",
+    "a_triggers_queue_reads_in_admission_order",
+    "a_triggers_queue_groups_and_one_groups_queue_read_in_order",
+    "an_intake_move_is_won_once",
+    "a_pending_intake_is_extended_and_started_once",
+    "a_lease_is_the_open_uncancelled_executions_of_the_rows",
+    "an_unbegun_start_is_found_and_only_an_untold_one_taken_back",
+    // …and a debounce's count (Decision D163's Status): the move that counts
+    // an arrival records the id its gate was claimed under, by which the row
+    // is found, so a repeat of a counted arrival is told from a claim no
+    // debounce counted; folding the gate onto the row's execution keeps its
+    // window and moves only a row still naming that id, for a key and a tick
+    // alike; and the lease is what is running, however much the trigger ran —
+    // one slot per execution, however many `started` rows name it.
+    "a_debounced_arrival_is_found_by_the_id_its_gate_was_claimed_under",
+    "a_gate_folds_onto_its_pending_rows_execution_and_keeps_its_window",
+    "a_lease_holds_only_what_is_running_however_much_the_trigger_ran",
+    "a_lease_counts_an_execution_once_however_many_rows_name_it",
     // …and the dispatch board's half of the same field: a placed node's settled
     // failure keeps what a finally node raised on the worker beside it
     // (`docs/distributed.md` §3.4, §3.8).

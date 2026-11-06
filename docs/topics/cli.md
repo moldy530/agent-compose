@@ -185,6 +185,25 @@ key off.
 Before invoking the graph it checks two preconditions: every `${ENV}` reference
 has a value, and the pinned dependency set is installed.
 
+**A run is refused rather than queued when a trigger's group is full.** A run
+reads the slots off the project's journal before it starts: where an `http`,
+`schedule` or `event` trigger's `concurrency:` block has no `key:` and covers
+the flow, a run is refused at start while that group has no free slot — exit
+**2**, naming the execution holding it, with nothing started or journaled:
+
+```
+error: `flow.deploy` is covered by the `concurrency:` of the trigger `pushed`, and its group has no free slot: exec_9f1c8a3e-… holds it (1 of 1 running). A run is refused rather than queued — a terminal is not a queue — so nothing was started or journaled: run it again once that execution settles (grammar 13.2, PRD resolved q77)
+```
+
+It never waits for a slot, and a run that does start holds none.
+
+That is the refusal a run meets where it can open the journal: on SQLite,
+beside a `serve` that is up, and on Postgres or MySQL with no `serve` up. On
+Postgres and MySQL a `serve` that is up holds the journal's writer guard for as
+long as it runs, so a run beside it is refused by the guard before it reads any
+slot — full group or free, covered flow or not — with the guard's message, which
+names no execution (`docs/durability.md` §2.3).
+
 A run that reaches a `human` pause with nobody to ask exits **3**. With a
 terminal — or `AGENT_COMPOSE_INTERACTIVE=1` — it renders the question, reads one
 JSON value per line, validates it against the node's `output:`, and carries on
@@ -232,7 +251,9 @@ it. `agent-compose docs targets` has where the journal lives;
 Same build, then starts the generated app for the project's triggers: each
 `http` trigger's start route beside the status, resume and cancel routes, a
 scheduler for each `schedule` trigger, and the program of each `kind: command`
-event source an `event` trigger binds — with `GET /sources/:name` reporting it.
+event source an `event` trigger binds — with `GET /sources/:name` reporting it,
+and `GET /intakes/:id` reporting an arrival a trigger's `concurrency:` queued,
+debounced, started or dropped.
 `--port 0` takes one the operating system picks. Its stdout is the app's
 readiness line. A target that declares a `redis_streams`, `sqs` or `nats`
 source is refused at start, exit `2`, naming the source: this release runs no
@@ -245,7 +266,9 @@ that died still finds its wait. Triggers are not re-fired — recovery replays t
 executions that exist — and the schedulers and source programs start only once
 it has: a tick already fired is not fired again, ticks that fell while nothing
 was serving are skipped and named in the log, and each program is started with
-the checkpoint it last had accepted.
+the checkpoint it last had accepted. What a trigger's intake had queued starts,
+in order, as its group's slots allow, and each pending debounce closes at the
+deadline its row recorded.
 
 It does not wait for those replays, so an answer can arrive while one is still on
 its way back to its pause: that request is refused with `recovering: true` and

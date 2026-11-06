@@ -995,6 +995,526 @@ async function claimTickElsewhere(provider, url, trigger, scheduledAt, execution
   }
 }
 
+/**
+ * Run one statement against the journal **from outside this process's
+ * handle** — the way a build before PRD resolved q77 left a row, or a reader
+ * counts what a sweep removed — on whichever backend this project bound.
+ * Answers the rows a query returned.
+ */
+async function outside(provider, url, statement, parameters = []) {
+  if (provider === "sqlite") {
+    const { Database } = await import("node-sqlite3-wasm");
+    const database = new Database(journal.journalPath());
+    try {
+      if (/^\s*(select|explain)/i.test(statement)) return database.all(statement, parameters);
+      database.run(statement, parameters);
+      return [];
+    } finally {
+      database.close();
+    }
+  }
+  if (provider === "postgres") {
+    const { Client } = await import("pg");
+    const client = new Client({ connectionString: url });
+    await client.connect();
+    try {
+      let next = 0;
+      const numbered = statement.replace(/\?/g, () => `$${++next}`);
+      return (await client.query(numbered, parameters)).rows ?? [];
+    } finally {
+      await client.end().catch(() => undefined);
+    }
+  }
+  const { createConnection } = await import("mysql2/promise");
+  const connection = await createConnection({ uri: url });
+  try {
+    const [rows] = await connection.query(statement, parameters);
+    return Array.isArray(rows) ? rows : [];
+  } finally {
+    await connection.end().catch(() => undefined);
+  }
+}
+
+/**
+ * The columns of the index a dedupe claim's sweep reads down
+ * (`DEDUPE_SWEEPS`, `docs/durability.md` §3.12), in index order, as the
+ * bound backend's own catalogue lists them — none where it has no such index.
+ */
+async function sweepIndexColumns(provider, url) {
+  const statement =
+    provider === "sqlite"
+      ? "SELECT name FROM pragma_index_info('dedupe_by_expiry') ORDER BY seqno"
+      : provider === "postgres"
+        ? "SELECT a.attname AS name FROM pg_index i " +
+          "JOIN pg_class c ON c.oid = i.indexrelid " +
+          "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey) " +
+          "WHERE c.relname = 'dedupe_by_expiry' AND pg_table_is_visible(c.oid) " +
+          "ORDER BY array_position(i.indkey::int2[], a.attnum)"
+        : "SELECT COLUMN_NAME AS name FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() " +
+          "AND TABLE_NAME = 'dedupe' AND INDEX_NAME = 'dedupe_by_expiry' ORDER BY SEQ_IN_INDEX";
+  return (await outside(provider, url, statement)).map((row) => String(row["name"]));
+}
+
+/** The one shape of that index: the trigger, then the window, then the admission. */
+const SWEEP_INDEX = ["trigger_name", "expires_at", "admitted_at"];
+
+// 8d. **A journal written before the intake ledger opens, and takes it**
+//     (§3.12, §3.15, §11.2, PRD resolved q77). The dedupe row grew a column —
+//     its window's end — which each backend's probe adds on open, and the
+//     intake rows are a table of their own, which `CREATE TABLE IF NOT EXISTS`
+//     adds. A dedupe row the older build wrote has no window, and is read as
+//     expiring one window — the claim's — after it was admitted.
+{
+  const provider = journal.journalBinding.provider;
+  const url = process.env[journal.journalBinding.urlEnv ?? ""] ?? "";
+  const suffix = `${Math.random().toString(16).slice(2)}${Date.now().toString(16)}`;
+  const older = `older_ledger_${suffix}`;
+  const dropped = await (async () => {
+    await outside(provider, url, "DROP TABLE IF EXISTS intakes");
+    // The sweep's index goes first: it names the column, which SQLite will
+    // not drop while an index holds it, and MySQL would drop from the index
+    // and keep the index under its name — a shape no older build left.
+    await outside(
+      provider,
+      url,
+      provider === "mysql"
+        ? "ALTER TABLE dedupe DROP INDEX dedupe_by_expiry"
+        : "DROP INDEX IF EXISTS dedupe_by_expiry",
+    );
+    await outside(provider, url, "ALTER TABLE dedupe DROP COLUMN expires_at");
+    // A row as the build before the window wrote it: no `expires_at`, admitted
+    // two days ago — so a day's window has long passed over it.
+    await outside(
+      provider,
+      url,
+      "INSERT INTO dedupe (trigger_name, key_hash, dedupe_key, execution, admitted_at) VALUES (?, ?, ?, ?, ?)",
+      [
+        older,
+        "0".repeat(64),
+        JSON.stringify("never-expiring"),
+        "exec_before_the_window",
+        new Date(Date.now() - 2 * 86_400_000).toISOString(),
+      ],
+    );
+    return true;
+  })().catch((error) => (error instanceof Error ? error.message : String(error)));
+  try {
+    handle = await opened(journal);
+    const now = new Date();
+    const later = new Date(now.getTime() + 86_400_000);
+    const row = await handle.admitIntake({
+      id: `int_older_${suffix}`,
+      trigger: older,
+      state: "queued",
+      execution: `exec_older_${suffix}`,
+      waited: true,
+      admission: { inputs: {}, sessionKey: "" },
+      coalesced: 1,
+      admittedAt: now.toISOString(),
+    });
+    const columns = await outside(
+      provider,
+      url,
+      provider === "sqlite"
+        ? "SELECT name FROM pragma_table_info('dedupe') WHERE name = 'expires_at'"
+        : "SELECT column_name AS name FROM information_schema.columns WHERE table_name = 'dedupe' AND column_name = 'expires_at'",
+    );
+    // The legacy row's key is not this one's digest, so the sweep is what is
+    // asked about: a claim of the trigger at `now` with a day's window sweeps a
+    // row admitted two days ago with no window of its own.
+    await handle.claimDedupe({
+      trigger: older,
+      key: "a fresh key",
+      execution: `exec_fresh_${suffix}`,
+      admittedAt: now.toISOString(),
+      expiresAt: later.toISOString(),
+    });
+    const left = await outside(
+      provider,
+      url,
+      "SELECT execution FROM dedupe WHERE trigger_name = ? AND execution = ?",
+      [older, "exec_before_the_window"],
+    );
+    const indexed = await sweepIndexColumns(provider, url);
+    results.a_journal_written_before_the_intake_ledger_gains_it_on_open =
+      dropped === true &&
+      row.id === `int_older_${suffix}` &&
+      row.state === "queued" &&
+      columns.length >= 1 &&
+      JSON.stringify(indexed) === JSON.stringify(SWEEP_INDEX) &&
+      left.length === 0;
+  } finally {
+    await journal.releaseJournal().catch(() => undefined);
+  }
+}
+
+// 13. **The intake ledger** (PRD resolved q77, `docs/durability.md` §3.12,
+//     §3.15): a dedupe key's window, and the rows a trigger's `concurrency:`
+//     admits under — each one's transitions, and the lease read off the rows.
+try {
+  handle = await opened(journal);
+  const provider = journal.journalBinding.provider;
+  const url = process.env[journal.journalBinding.urlEnv ?? ""] ?? "";
+  const suffix = `${Math.random().toString(16).slice(2)}${Date.now().toString(16)}`;
+  const base = Date.parse("2026-11-04T03:00:00.000Z");
+  const at = (seconds) => new Date(base + seconds * 1000).toISOString();
+
+  // The window is the row's TTL: inside it a repeat is answered with the
+  // first; at its end the key is claimed again; and the claim's sweep takes
+  // every row of the trigger whose window has passed, not only this key's.
+  const hooks = `hooks_${suffix}`;
+  const claim = (key, execution, second, window = 10) => ({
+    trigger: hooks,
+    key,
+    execution,
+    admittedAt: at(second),
+    expiresAt: at(second + window),
+  });
+  const first = await handle.claimDedupe(claim(UNICODE, "exec_w1", 0));
+  const inside = await handle.claimDedupe(claim(UNICODE, "exec_w2", 9));
+  const other = await handle.claimDedupe(claim("other key", "exec_other", 1, 2));
+  const after = await handle.claimDedupe(claim(UNICODE, "exec_w3", 10));
+  const swept = await outside(
+    provider,
+    url,
+    "SELECT execution FROM dedupe WHERE trigger_name = ? AND execution = ?",
+    [hooks, "exec_other"],
+  );
+  results.a_dedupe_key_is_held_for_its_window_and_claimed_again_after_it =
+    first.execution === "exec_w1" &&
+    first.expiresAt === at(10) &&
+    inside.execution === "exec_w1" &&
+    other.execution === "exec_other" &&
+    after.execution === "exec_w3" &&
+    after.expiresAt === at(20);
+  results.a_dedupe_claim_sweeps_the_triggers_expired_rows = swept.length === 0;
+
+  // The sweep costs what expired, never what is live: every backend holds the
+  // index it reads down, in its one shape, and SQLite's planner — the one
+  // whose choice is a rule rather than a statistic — reads each half of it
+  // as a range over the window's column, not a walk of the trigger's rows.
+  const sweepIndex = await sweepIndexColumns(provider, url);
+  let sweepPlans = true;
+  if (provider === "sqlite") {
+    for (const [statement, parameters] of [
+      [journal.DEDUPE_SWEEPS.windowed, [hooks, at(0)]],
+      [journal.DEDUPE_SWEEPS.windowless, [hooks, at(0)]],
+    ]) {
+      const plan = (await outside(provider, url, `EXPLAIN QUERY PLAN ${statement}`, parameters))
+        .map((step) => String(step["detail"]))
+        .join(" | ");
+      sweepPlans &&= plan.includes("USING INDEX dedupe_by_expiry (trigger_name=? AND expires_at");
+    }
+  }
+  results.a_dedupe_sweep_reads_only_expired_rows_down_its_index =
+    JSON.stringify(sweepIndex) === JSON.stringify(SWEEP_INDEX) &&
+    typeof journal.DEDUPE_SWEEPS?.windowed === "string" &&
+    sweepPlans;
+
+  // A takeover restarts the window it moves.
+  const retaken = await handle.retakeDedupe(hooks, UNICODE, "exec_w3", "exec_w4", at(99));
+  const held = await handle.claimDedupe(claim(UNICODE, "exec_w5", 11));
+  results.a_dedupe_takeover_carries_its_new_window =
+    retaken === true && held.execution === "exec_w4" && held.expiresAt === at(99);
+
+  // An intake row round-trips, is answered again under its id, and is found
+  // by the execution it names.
+  const builds = `builds_${suffix}`;
+  const intake = (id, state, execution, extra = {}) => ({
+    id: `int_${id}_${suffix}`,
+    trigger: builds,
+    state,
+    execution: `exec_${id}_${suffix}`,
+    waited: true,
+    coalesced: 1,
+    admittedAt: new Date().toISOString(),
+    ...extra,
+  });
+  const admission = { inputs: { goal: UNICODE }, sessionKey: "s", callback: "https://hooks.example/x" };
+  const queuedA = await handle.admitIntake(
+    intake("a", "queued", "a", { group: UNICODE, admission }),
+  );
+  const again = await handle.admitIntake(intake("a", "dropped", "a", { group: "other" }));
+  const queuedB = await handle.admitIntake(intake("b", "queued", "b", { group: UNICODE, admission }));
+  const queuedC = await handle.admitIntake(intake("c", "queued", "c", { admission }));
+  const read = await handle.intake(queuedA.id);
+  const named = await handle.intakeOf(`exec_a_${suffix}`);
+  results.an_intake_row_round_trips_and_is_admitted_once =
+    queuedA.state === "queued" &&
+    again.state === "queued" &&
+    again.group === UNICODE &&
+    read?.admission?.inputs?.goal === UNICODE &&
+    read?.admission?.callback === "https://hooks.example/x" &&
+    read?.waited === true &&
+    named?.id === queuedA.id &&
+    (await handle.intake(`int_nope_${suffix}`)) === undefined;
+
+  // A queue drains in the order its rows went in.
+  const queue = await handle.intakesOf(builds, "queued");
+  results.a_triggers_queue_reads_in_admission_order =
+    queue.map((row) => row.id).join(",") === [queuedA.id, queuedB.id, queuedC.id].join(",") &&
+    queuedC.group === undefined;
+
+  // …and what a look at it asks first: the groups it holds, off the index —
+  // the key-less one among them — and one group's rows, in their order.
+  const queuedGroups = await handle.queuedGroups(builds);
+  results.a_triggers_queue_groups_and_one_groups_queue_read_in_order =
+    queuedGroups.length === 2 &&
+    queuedGroups.includes(UNICODE) &&
+    queuedGroups.includes(undefined) &&
+    (await handle.groupQueue(builds, UNICODE)).map((row) => row.id).join(",") ===
+      [queuedA.id, queuedB.id].join(",") &&
+    (await handle.groupQueue(builds, undefined)).map((row) => row.id).join(",") === queuedC.id &&
+    (await handle.groupQueue(builds, "other")).length === 0 &&
+    (await handle.queuedGroups(`never_${suffix}`)).length === 0;
+
+  // A move is conditional on the state it leaves: the first mover of a row
+  // wins, and a second move out of the same state takes nothing.
+  const moved = await handle.moveIntake(queuedA.id, "queued", {
+    state: "started",
+    startedAt: new Date().toISOString(),
+  });
+  const twice = await handle.moveIntake(queuedA.id, "queued", { state: "started" });
+  const startedA = await handle.intake(queuedA.id);
+  const droppedC = await handle.moveIntake(queuedC.id, "queued", {
+    state: "dropped",
+    heldBy: "exec_running",
+    detail: UNSERIALIZED,
+  });
+  const readC = await handle.intake(queuedC.id);
+  results.an_intake_move_is_won_once =
+    moved === true &&
+    twice === false &&
+    startedA?.state === "started" &&
+    typeof startedA?.startedAt === "string" &&
+    droppedC === true &&
+    readC?.state === "dropped" &&
+    readC?.heldBy === "exec_running" &&
+    readC?.detail === UNSERIALIZED;
+
+  // A debounce's row: found as its group's one pending row, extended in place,
+  // and started once.
+  const pending = await handle.admitIntake(
+    intake("p", "pending", "p", { group: "branch", payload: { body: { n: 1 } }, deadline: at(30) }),
+  );
+  const open = await handle.pendingIntake(builds, "branch");
+  const none = await handle.pendingIntake(builds, "another branch");
+  const extended = await handle.moveIntake(pending.id, "pending", {
+    state: "pending",
+    payload: { body: { n: 2 } },
+    coalesced: 2,
+    deadline: at(40),
+  });
+  const extendedRow = await handle.intake(pending.id);
+  const closed = await handle.moveIntake(pending.id, "pending", { state: "started", admission });
+  const reopened = await handle.pendingIntake(builds, "branch");
+  results.a_pending_intake_is_extended_and_started_once =
+    open?.id === pending.id &&
+    none === undefined &&
+    extended === true &&
+    extendedRow?.coalesced === 2 &&
+    extendedRow?.deadline === at(40) &&
+    extendedRow?.payload?.body?.n === 2 &&
+    closed === true &&
+    reopened === undefined;
+
+  // The lease, read off the rows: a `started` row holds a slot while its
+  // execution's lifecycle row is open and nobody has asked to cancel it.
+  const lifecycle = (id, startedAt) => ({
+    id,
+    flow: "flow.review",
+    trigger: builds,
+    inputs: {},
+    sessionKey: "",
+    status: "open",
+    journalVersion: journal.JOURNAL_VERSION,
+    startedAt,
+  });
+  const execA = `exec_a_${suffix}`;
+  const execB = `exec_b_${suffix}`;
+  const execP = `exec_p_${suffix}`;
+  await handle.begin(lifecycle(execA, at(1)));
+  await handle.moveIntake(queuedB.id, "queued", { state: "started" });
+  await handle.begin(lifecycle(execB, at(2)));
+  await handle.begin(lifecycle(execP, at(3)));
+  const three = await handle.leasesOf(builds);
+  await handle.requestCancel(execB);
+  await handle.end(execP, "completed");
+  const one = await handle.leasesOf(builds);
+  results.a_lease_is_the_open_uncancelled_executions_of_the_rows =
+    three.map((lease) => lease.execution).join(",") === [execA, execB, execP].join(",") &&
+    three[0]?.group === UNICODE &&
+    three[2]?.group === "branch" &&
+    three[0]?.startedAt === at(1) &&
+    one.map((lease) => lease.execution).join(",") === execA &&
+    (await handle.leasesOf(`never_${suffix}`)).length === 0;
+
+  // A start nobody was told of — never waited, its execution never begun —
+  // is found and taken back; one that waited is found and kept.
+  const quiet = await handle.admitIntake(
+    intake("q", "started", "q", { waited: false, admission }),
+  );
+  const owed = await handle.admitIntake(intake("o", "started", "o", { admission }));
+  const unbegun = await handle.unbegunIntakes(builds);
+  const tookOwed = await handle.abandonIntake(owed.id);
+  const tookQuiet = await handle.abandonIntake(quiet.id);
+  results.an_unbegun_start_is_found_and_only_an_untold_one_taken_back =
+    unbegun.map((row) => row.id).join(",") === [quiet.id, owed.id].join(",") &&
+    tookOwed === false &&
+    tookQuiet === true &&
+    (await handle.intake(quiet.id)) === undefined &&
+    (await handle.intake(owed.id))?.state === "started";
+
+  // A debounce counts an arrival in the move that records it: the row names
+  // the id the arrival's gate was claimed under, and is found by that id as
+  // well as by its own execution — which is what tells a counted arrival's
+  // repeat from a claim no debounce counted.
+  const burst = `burst_${suffix}`;
+  const burstRow = await handle.admitIntake({
+    id: `int_burst_${suffix}`,
+    trigger: burst,
+    state: "pending",
+    execution: `exec_burst_${suffix}`,
+    waited: true,
+    payload: { body: { n: 1 } },
+    coalesced: 1,
+    admittedAt: at(0),
+    deadline: at(5),
+  });
+  const counted = await handle.moveIntake(burstRow.id, "pending", {
+    state: "pending",
+    payload: { body: { n: 2 } },
+    coalesced: 2,
+    deadline: at(6),
+    joined: { execution: `exec_arrival_${suffix}`, gate: { kind: "dedupe", key: UNICODE } },
+  });
+  const countedRow = await handle.intake(burstRow.id);
+  const byArrival = await handle.intakeOf(`exec_arrival_${suffix}`);
+  const byOwn = await handle.intakeOf(`exec_burst_${suffix}`);
+  results.a_debounced_arrival_is_found_by_the_id_its_gate_was_claimed_under =
+    burstRow.joined === undefined &&
+    counted === true &&
+    countedRow?.coalesced === 2 &&
+    countedRow?.joined?.execution === `exec_arrival_${suffix}` &&
+    countedRow?.joined?.gate?.kind === "dedupe" &&
+    countedRow?.joined?.gate?.key === UNICODE &&
+    byArrival?.id === burstRow.id &&
+    byArrival?.execution === `exec_burst_${suffix}` &&
+    byOwn?.id === burstRow.id &&
+    (await handle.intakeOf(`exec_never_counted_${suffix}`)) === undefined;
+
+  // Folding a gate re-points it at the pending row's execution and keeps its
+  // window; it moves a row only from the id it still names, for a dedupe key
+  // and a tick alike.
+  const folds = `folds_${suffix}`;
+  const claimedOnce = await handle.claimDedupe({
+    trigger: folds,
+    key: UNICODE,
+    execution: "exec_arrival",
+    admittedAt: at(0),
+    expiresAt: at(30),
+  });
+  await handle.foldGate(folds, { kind: "dedupe", key: UNICODE }, "exec_somebody_else", "exec_wrong");
+  const unmoved = await handle.claimDedupe({
+    trigger: folds,
+    key: UNICODE,
+    execution: "exec_repeat",
+    admittedAt: at(1),
+    expiresAt: at(31),
+  });
+  await handle.foldGate(folds, { kind: "dedupe", key: UNICODE }, "exec_arrival", "exec_pending");
+  const folded = await handle.claimDedupe({
+    trigger: folds,
+    key: UNICODE,
+    execution: "exec_repeat",
+    admittedAt: at(2),
+    expiresAt: at(32),
+  });
+  const tick = at(0);
+  await handle.fire({ trigger: folds, scheduledAt: tick, execution: "exec_tick", firedAt: at(0) });
+  await handle.foldGate(folds, { kind: "tick", scheduledAt: tick }, "exec_tick", "exec_pending");
+  const firedFolded = await handle.fire({
+    trigger: folds,
+    scheduledAt: tick,
+    execution: "exec_tick_again",
+    firedAt: at(1),
+  });
+  results.a_gate_folds_onto_its_pending_rows_execution_and_keeps_its_window =
+    claimedOnce.execution === "exec_arrival" &&
+    unmoved.execution === "exec_arrival" &&
+    folded.execution === "exec_pending" &&
+    folded.admittedAt === at(0) &&
+    folded.expiresAt === at(30) &&
+    firedFolded.execution === "exec_pending" &&
+    firedFolded.firedAt === at(0);
+
+  // The lease is read off the open lifecycle rows of the trigger: a settled
+  // execution's `started` row — the history every trigger keeps — holds no
+  // slot however many of them there are, and an open execution another
+  // trigger started is no slot of this one's.
+  const history = `history_${suffix}`;
+  const settledIds = [];
+  for (let n = 0; n < 25; n += 1) {
+    const execution = `exec_history_${n}_${suffix}`;
+    settledIds.push(execution);
+    await handle.admitIntake({
+      id: `int_history_${n}_${suffix}`,
+      trigger: history,
+      state: "started",
+      execution,
+      waited: false,
+      coalesced: 1,
+      admittedAt: at(n),
+      startedAt: at(n),
+    });
+    await handle.begin({ ...lifecycle(execution, at(n)), trigger: history });
+    await handle.end(execution, "completed");
+  }
+  const live = `exec_history_live_${suffix}`;
+  await handle.admitIntake({
+    id: `int_history_live_${suffix}`,
+    trigger: history,
+    state: "started",
+    execution: live,
+    waited: false,
+    coalesced: 1,
+    admittedAt: at(40),
+    startedAt: at(40),
+  });
+  await handle.begin({ ...lifecycle(live, at(40)), trigger: history });
+  const historic = await handle.leasesOf(history);
+  results.a_lease_holds_only_what_is_running_however_much_the_trigger_ran =
+    historic.length === 1 &&
+    historic[0]?.execution === live &&
+    historic[0]?.startedAt === at(40) &&
+    (await handle.leasesOf(builds)).every((lease) => lease.execution !== live);
+
+  // One slot per execution, however many `started` rows name it: a start the
+  // journal would not begin can leave its row behind, and the retry admits
+  // the same execution again under a second row.
+  const doubleTrigger = `twice_${suffix}`;
+  const doubled = `exec_twice_${suffix}`;
+  for (const n of [1, 2]) {
+    await handle.admitIntake({
+      id: `int_twice_${n}_${suffix}`,
+      trigger: doubleTrigger,
+      group: "branch",
+      state: "started",
+      execution: doubled,
+      waited: false,
+      coalesced: 1,
+      admittedAt: at(n),
+      startedAt: at(n),
+    });
+  }
+  await handle.begin({ ...lifecycle(doubled, at(3)), trigger: doubleTrigger });
+  const once = await handle.leasesOf(doubleTrigger);
+  results.a_lease_counts_an_execution_once_however_many_rows_name_it =
+    once.length === 1 && once[0]?.execution === doubled && once[0]?.group === "branch";
+} finally {
+  await journal.releaseJournal().catch(() => undefined);
+}
+
 // 12. **The intake** (PRD resolved q78, `docs/durability.md` §3.11-§3.14): the
 //     four ledgers that decide whether an execution exists. Every name below is
 //     suffixed with this run's own token, because a dialled journal is shared

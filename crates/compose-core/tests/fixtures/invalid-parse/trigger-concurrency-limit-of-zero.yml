@@ -1,0 +1,10 @@
+# rule: a trigger's `concurrency.limit:` is at least 1 (grammar 13.1, PRD resolved q77)
+# code: value-out-of-range
+# message: `concurrency.limit` of trigger `on_request` must be at least 1, found 0
+# at: 10:14
+triggers:
+  on_request:
+    type: http
+    flow: flow.support
+    concurrency:
+      limit: 0

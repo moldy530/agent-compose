@@ -922,6 +922,17 @@ impl Walk<'_> {
                             "`execution.{field}` says how the instance ended, so it exists in the one node that runs once it has — the node a flow's `finally:` names — and in no edge guard or other node, which all run before the end: move the read into the finally node, or route on the node output or channel that decided it (grammar 4.1, 7.9, Decision D159)"
                         ),
                     ),
+                    // The count a debounce closes over, read on a trigger
+                    // that declares none (grammar 13.1, PRD resolved q77
+                    // ruling c): the member exists exactly where the
+                    // trigger's `concurrency:` declares `debounce:`, so the
+                    // help says where it comes from rather than listing the
+                    // members a payload without it has.
+                    origin @ Origin::Payload(_) if field == "coalesced" => (
+                        DiagnosticCode::UnknownField,
+                        format!("`{spelling}` names no field of {}", describe(origin)),
+                        "`payload.coalesced` is the count of arrivals a debounce coalesced into one execution, and it is a member of the payload only on a trigger whose `concurrency:` declares `debounce:` (grammar 13.1, PRD resolved q77)".to_string(),
+                    ),
                     origin => (
                         DiagnosticCode::UnknownField,
                         format!("`{spelling}` names no field of {}", describe(origin)),

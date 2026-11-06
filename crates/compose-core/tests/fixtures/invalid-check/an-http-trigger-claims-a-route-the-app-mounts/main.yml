@@ -2,7 +2,7 @@
 # code: duplicate-route
 # message: the trigger `status_of` declares the route `GET /executions/:id`, which the generated app mounts for itself
 # at: main.yml:35:11
-# help: a generated app mounts `status`, `resume` and `cancel` for each execution and `sources` for each event source for itself, beside each trigger's `start` (grammar 13.3, 14.4) — `GET /executions/:id`, `POST /executions/:id/resume`, `POST /executions/:id/cancel`, `GET /sources/:name` — and cannot dispatch one method and path two ways: give the trigger its own `path:`
+# help: a generated app mounts for itself `status`, `resume` and `cancel` for each execution, `sources` for each event source and `intakes` for each arrival a trigger's intake admits, beside each trigger's `start` (grammar 13.3, 14.4) — `GET /executions/:id`, `POST /executions/:id/resume`, `POST /executions/:id/cancel`, `GET /sources/:name`, `GET /intakes/:id` — and cannot dispatch one method and path two ways: give the trigger its own `path:`
 #
 # §13.3 has a generated app expose `status` and `resume` beside each trigger's
 # `start`, at two fixed addresses. They are taken, so a trigger cannot have one:

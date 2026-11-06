@@ -1,0 +1,11 @@
+# rule: `dedupe_window:` is a key of `http` and `event` triggers alone (grammar 13.4, PRD resolved q77)
+# code: unknown-key
+# message: unknown key `dedupe_window` in trigger `nightly`
+# at: 11:5
+# help: `dedupe_key:` and `dedupe_window:` belong to `http` and `event` triggers: a tick is deduplicated by its own `fired` row, keyed by the trigger and the instant it is for, so each tick fires once and there is no second key to declare (grammar 13.4, PRD resolved q78)
+triggers:
+  nightly:
+    type: schedule
+    cron: "0 3 * * *"
+    flow: flow.support
+    dedupe_window: 1h

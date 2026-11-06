@@ -197,9 +197,14 @@ import {
   type ExecutionRow,
   type ExecutionStatus,
   type FiredRow,
+  type IntakeChange,
+  type IntakeGate,
+  type IntakeRow,
+  type IntakeState,
   type Journal,
   type JournalOutcome,
   type JournalRecord,
+  type Lease,
   type RestartPage,
   type RestartRow,
   closeSession,
@@ -506,8 +511,65 @@ class DispatchJournal implements Journal {
     throw new WorkerJournalReach("claim an event's dedupe key");
   }
 
-  retakeDedupe(_trigger: string, _key: string, _from: string, _to: string): Promise<boolean> {
+  retakeDedupe(
+    _trigger: string,
+    _key: string,
+    _from: string,
+    _to: string,
+    _expiresAt?: string,
+  ): Promise<boolean> {
     throw new WorkerJournalReach("claim an event's dedupe key");
+  }
+
+  // …and the intake ledger a trigger's `concurrency:` admits under (PRD
+  // resolved q77): which arrival starts, waits or is dropped is the hub's
+  // question for the same reason.
+  admitIntake(_row: IntakeRow): Promise<IntakeRow> {
+    throw new WorkerJournalReach("admit a trigger's arrival");
+  }
+
+  intake(_id: string): Promise<IntakeRow | undefined> {
+    throw new WorkerJournalReach("read a trigger's intake");
+  }
+
+  intakeOf(_execution: string): Promise<IntakeRow | undefined> {
+    throw new WorkerJournalReach("read a trigger's intake");
+  }
+
+  intakesOf(_trigger: string, _state: IntakeState): Promise<readonly IntakeRow[]> {
+    throw new WorkerJournalReach("read a trigger's intake");
+  }
+
+  queuedGroups(_trigger: string): Promise<readonly (string | undefined)[]> {
+    throw new WorkerJournalReach("read a trigger's intake");
+  }
+
+  groupQueue(_trigger: string, _group: string | undefined): Promise<readonly IntakeRow[]> {
+    throw new WorkerJournalReach("read a trigger's intake");
+  }
+
+  unbegunIntakes(_trigger: string): Promise<readonly IntakeRow[]> {
+    throw new WorkerJournalReach("read a trigger's intake");
+  }
+
+  pendingIntake(_trigger: string, _group: string | undefined): Promise<IntakeRow | undefined> {
+    throw new WorkerJournalReach("read a trigger's intake");
+  }
+
+  moveIntake(_id: string, _from: IntakeState, _change: IntakeChange): Promise<boolean> {
+    throw new WorkerJournalReach("admit a trigger's arrival");
+  }
+
+  abandonIntake(_id: string): Promise<boolean> {
+    throw new WorkerJournalReach("admit a trigger's arrival");
+  }
+
+  foldGate(_trigger: string, _gate: IntakeGate, _from: string, _to: string): Promise<void> {
+    throw new WorkerJournalReach("admit a trigger's arrival");
+  }
+
+  leasesOf(_trigger: string): Promise<readonly Lease[]> {
+    throw new WorkerJournalReach("read a trigger's lease");
   }
 
   checkpointOf(_source: string): Promise<string | undefined> {

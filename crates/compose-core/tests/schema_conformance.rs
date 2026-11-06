@@ -1079,6 +1079,62 @@ fn the_published_schema_accepts_a_command_source_beside_the_queue_kinds_and_a_zo
     }
 }
 
+/// A trigger's intake (grammar 13.1, 13.3, 13.5, PRD resolved q77), in the
+/// direction the negative corpus cannot reach. Seven fixtures under
+/// `invalid-schema/` pin the refusals — `concurrency:` on `manual`, the two
+/// minimums, the closed mode set, the closed block, `dedupe_key:` on
+/// `schedule`, a window without its key — and each is a keyword whose
+/// *accepting* half breaks silently: a `dependentRequired` written the other
+/// way round refuses every keyed trigger with no window, and a block missing
+/// from `eventTrigger` refuses an event intake the compiler takes. The example
+/// corpus declares no intake, so every shape is here, each run through the
+/// parser too.
+#[test]
+fn the_published_schema_accepts_the_whole_intake_surface() {
+    let validator = compile_schema();
+    let triggers = [
+        json!({ "type": "http", "flow": "flow.demo", "concurrency": {} }),
+        json!({ "type": "http", "flow": "flow.demo", "dedupe_key": "payload.headers['x-delivery']" }),
+        json!({
+            "type": "http",
+            "flow": "flow.demo",
+            "dedupe_key": "payload.headers['x-delivery']",
+            "dedupe_window": "6h",
+            "concurrency": {
+                "key": "payload.body.repo",
+                "limit": 2,
+                "on_conflict": "queue",
+                "debounce": "30s",
+                "max_running": 4,
+            },
+        }),
+        json!({
+            "type": "schedule",
+            "flow": "flow.demo",
+            "cron": "0 3 * * *",
+            "concurrency": { "on_conflict": "drop" },
+        }),
+        json!({
+            "type": "event",
+            "flow": "flow.demo",
+            "source": "feed",
+            "dedupe_window": "10m",
+            "concurrency": { "key": "payload.source", "on_conflict": "supersede", "max_running": 1 },
+        }),
+        json!({
+            "type": "event",
+            "flow": "flow.demo",
+            "source": "feed",
+            "dedupe_key": "payload.source + ':' + payload.id",
+            "concurrency": { "debounce": "2s" },
+        }),
+    ];
+    for trigger in triggers {
+        let instance = json!({ "triggers": { "arrivals": trigger } });
+        assert_accepted_and_parsed(&validator, &instance, "main.yml");
+    }
+}
+
 /// The schema accepts `instance`, and so does the parser — the pair agreeing.
 #[track_caller]
 fn assert_accepted_and_parsed(validator: &Validator, instance: &Value, name: &str) {

@@ -1,0 +1,9 @@
+# rule: `concurrency:` is illegal on a `manual` trigger, whose run is a command at a terminal rather than an arrival an intake admits (grammar 13.1, 13.2 / PRD resolved q77)
+# at: /triggers/cli
+# via: /$defs/manualTrigger/additionalProperties
+triggers:
+  cli:
+    type: manual
+    flow: flow.support
+    concurrency:
+      limit: 1
