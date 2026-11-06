@@ -232,8 +232,8 @@ impl Running {
     /// session ended, not why, so a dispatch whose execution a restarted hub
     /// is completing a cancel of is stopped here like any other — what it
     /// began ends `failed`, not `cancelled` — which is the limitation grammar
-    /// D160 and `docs/distributed.md` §5 name, and a protocol choice left to
-    /// the owner.
+    /// D160 and `docs/distributed.md` §5 name, accepted by the owner as one
+    /// protocol `3` does not close (PRD resolved q75 as amended 2026-11-06).
     pub(crate) fn orphan(&self, generation: u64) {
         let older: Vec<String> = self
             .0
