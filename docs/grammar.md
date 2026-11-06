@@ -13925,9 +13925,10 @@ The following remain the implementation's readings, recorded for the owner:
   answered; where none does, the route is open. A `schedule` trigger takes
   none. The key is noted on [D46](#d46-reserved-trigger-shapes-are-fully-specified)'s amendment; whether it
   stands is the owner's call.
-- The restart defaults — `backoff: 1s`, `max: 1m` — and the two-second stop
-  grace. A backoff longer than a runtime timer can hold (2³¹−1 ms, some 24.8
-  days; nothing bounds `restart:`) is waited out in steps of at most a minute
+- The restart defaults — `backoff: 1s`, `max: 1m`. (The two-second stop grace
+  is not among them: it is ratified above, with the reaping it times.) A
+  backoff longer than a runtime timer can hold (2³¹−1 ms, some 24.8 days;
+  nothing bounds `restart:`) is waited out in steps of at most a minute
   rather than armed whole, which Node and Bun would fire after a millisecond.
 - A `timezone:` is shape-checked at compile time and checked against the
   runtime's `Intl` at `serve` start.
