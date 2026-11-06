@@ -702,6 +702,31 @@ const TRUE_EVERYWHERE: &[&str] = &[
     // …and a journal a build before the cancel wrote, which has no such table,
     // gains it on open and records a cancel of a row it holds open (§11.2).
     "a_journal_without_the_cancellations_table_gains_it_on_open",
+    // §3.11-§3.14 — the intake (PRD resolved q78): a tick is claimed once, and
+    // claims of it made together agree on one winner — the race two hubs on one
+    // journal run, and a tick a second connection claimed first is that
+    // writer's — keyed by a trigger name whose case is part of it; the newest
+    // tick is the greatest instant. A dedupe key is claimed once per trigger,
+    // whatever its length or characters, two keys differing in case are two,
+    // and a claim is taken over only from the execution that holds it. A
+    // checkpoint is absent until written and then the newest; restart rows are
+    // paged newest first with their total, a code or a signal carried as it
+    // was. And a journal a build before the intake wrote gains the four tables
+    // on open, and answers on them (§11.2).
+    "a_tick_is_claimed_once_and_a_second_claim_is_answered_with_the_first",
+    "claims_of_one_tick_made_together_agree_on_one_winner",
+    "a_tick_another_writer_claimed_first_is_answered_with_its_execution",
+    "tick_claims_are_case_sensitive_by_trigger",
+    "the_newest_tick_is_the_greatest_instant",
+    "a_trigger_that_never_fired_has_no_last_tick",
+    "a_dedupe_key_is_claimed_once_and_a_repeat_is_answered_with_the_first",
+    "dedupe_keys_differing_in_case_are_two_keys",
+    "a_dedupe_key_of_any_length_is_one_row",
+    "a_dedupe_key_is_scoped_to_its_trigger",
+    "a_dedupe_claim_is_taken_over_only_from_its_holder",
+    "a_checkpoint_is_absent_until_written_and_then_the_newest",
+    "restart_rows_are_paged_newest_first_with_their_total",
+    "a_journal_without_the_intake_tables_gains_them_on_open",
     // …and the dispatch board's half of the same field: a placed node's settled
     // failure keeps what a finally node raised on the worker beside it
     // (`docs/distributed.md` §3.4, §3.8).

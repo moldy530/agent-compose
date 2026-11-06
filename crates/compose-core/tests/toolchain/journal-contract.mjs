@@ -879,6 +879,254 @@ async function dropTheCancellationsTable(provider, url) {
   }
 }
 
+/**
+ * Take the four intake tables away, so the file or database is the shape a
+ * build before PRD resolved q78 wrote (`docs/durability.md` §11.2). Answers
+ * `true` once they are gone.
+ */
+async function dropTheIntakeTables(provider, url) {
+  const tables = ["fired", "dedupe", "checkpoints", "restarts"];
+  if (provider === "sqlite") {
+    const { Database } = await import("node-sqlite3-wasm");
+    const database = new Database(journal.journalPath());
+    try {
+      for (const table of tables) database.exec(`DROP TABLE IF EXISTS ${table};`);
+      return !database
+        .all("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .some((table) => tables.includes(table.name));
+    } finally {
+      database.close();
+    }
+  }
+  if (provider === "postgres") {
+    const { Client } = await import("pg");
+    const client = new Client({ connectionString: url });
+    await client.connect();
+    try {
+      for (const table of tables) await client.query(`DROP TABLE IF EXISTS ${table}`);
+      return true;
+    } finally {
+      await client.end().catch(() => undefined);
+    }
+  }
+  const { createConnection } = await import("mysql2/promise");
+  const connection = await createConnection({ uri: url });
+  try {
+    for (const table of tables) await connection.query(`DROP TABLE IF EXISTS ${table}`);
+    return true;
+  } finally {
+    await connection.end().catch(() => undefined);
+  }
+}
+
+/**
+ * Claim one tick **from outside this process's journal handle** — a second
+ * connection writing the `fired` row the way another hub sharing the journal
+ * would — so the case below is a race between two writers, not two calls one
+ * serialized handle orders. Answers `true` once the row is there.
+ */
+async function claimTickElsewhere(provider, url, trigger, scheduledAt, execution) {
+  const firedAt = new Date().toISOString();
+  if (provider === "sqlite") {
+    const { Database } = await import("node-sqlite3-wasm");
+    const database = new Database(journal.journalPath());
+    try {
+      database.run(
+        "INSERT INTO fired (trigger_name, scheduled_at, execution, fired_at) VALUES (?, ?, ?, ?)",
+        [trigger, scheduledAt, execution, firedAt],
+      );
+      return true;
+    } finally {
+      database.close();
+    }
+  }
+  if (provider === "postgres") {
+    const { Client } = await import("pg");
+    const client = new Client({ connectionString: url });
+    await client.connect();
+    try {
+      await client.query(
+        "INSERT INTO fired (trigger_name, scheduled_at, execution, fired_at) VALUES ($1, $2, $3, $4)",
+        [trigger, scheduledAt, execution, firedAt],
+      );
+      return true;
+    } finally {
+      await client.end().catch(() => undefined);
+    }
+  }
+  const { createConnection } = await import("mysql2/promise");
+  const connection = await createConnection({ uri: url });
+  try {
+    await connection.query(
+      "INSERT INTO fired (trigger_name, scheduled_at, execution, fired_at) VALUES (?, ?, ?, ?)",
+      [trigger, scheduledAt, execution, firedAt],
+    );
+    return true;
+  } finally {
+    await connection.end().catch(() => undefined);
+  }
+}
+
+// 8c. **A journal written before the intake opens, and takes its four tables**
+//     (§3.11-§3.14, §11.2, PRD resolved q78). Each is a table of its own, so
+//     `CREATE TABLE IF NOT EXISTS` on open is the whole of the migration — and
+//     then every verb of the intake answers on it.
+{
+  const url = process.env[journal.journalBinding.urlEnv ?? ""] ?? "";
+  const dropped = await dropTheIntakeTables(journal.journalBinding.provider, url).catch((error) =>
+    error instanceof Error ? error.message : String(error),
+  );
+  try {
+    handle = await opened(journal);
+    const suffix = `${Math.random().toString(16).slice(2)}${Date.now().toString(16)}`;
+    const fired = await handle.fire({
+      trigger: `older_${suffix}`,
+      scheduledAt: "2026-11-04T03:00:00.000Z",
+      execution: `exec_older_${suffix}`,
+      firedAt: new Date().toISOString(),
+    });
+    await handle.recordCheckpoint(`older_${suffix}`, "7");
+    results.a_journal_without_the_intake_tables_gains_them_on_open =
+      dropped === true &&
+      fired.execution === `exec_older_${suffix}` &&
+      (await handle.checkpointOf(`older_${suffix}`)) === "7";
+  } finally {
+    await journal.releaseJournal().catch(() => undefined);
+  }
+}
+
+// 12. **The intake** (PRD resolved q78, `docs/durability.md` §3.11-§3.14): the
+//     four ledgers that decide whether an execution exists. Every name below is
+//     suffixed with this run's own token, because a dialled journal is shared
+//     with every earlier run of this suite and these tables are keyed by trigger
+//     and source rather than by execution.
+try {
+  handle = await opened(journal);
+  const suffix = `${Math.random().toString(16).slice(2)}${Date.now().toString(16)}`;
+  const nightly = `nightly_${suffix}`;
+  const at = (minute) => `2026-11-04T03:${String(minute).padStart(2, "0")}:00.000Z`;
+  const tick = (minute, execution, trigger = nightly) => ({
+    trigger,
+    scheduledAt: at(minute),
+    execution,
+    firedAt: new Date().toISOString(),
+  });
+
+  // A tick fires once: the insert that wins fires, and every later claim of the
+  // same tick is answered with the execution that holds it.
+  const won = await handle.fire(tick(0, "exec_first"));
+  const lost = await handle.fire(tick(0, "exec_second"));
+  results.a_tick_is_claimed_once_and_a_second_claim_is_answered_with_the_first =
+    won.execution === "exec_first" && lost.execution === "exec_first";
+
+  // …including claims made together, which is the race two hubs on one journal
+  // are when they wake for the same tick.
+  const racing = await Promise.all(
+    [1, 2, 3, 4, 5].map((n) => handle.fire(tick(1, `exec_racer_${n}`))),
+  );
+  results.claims_of_one_tick_made_together_agree_on_one_winner =
+    new Set(racing.map((row) => row.execution)).size === 1;
+
+  // …and a tick another writer of the same journal claimed first — a second
+  // connection, the hub that woke a moment earlier — is that writer's: this
+  // handle's claim of it is answered with the other's execution, and fires
+  // nothing (`docs/distributed.md` §8 rule 2's stated exception).
+  const elsewhere = await claimTickElsewhere(
+    journal.journalBinding.provider,
+    process.env[journal.journalBinding.urlEnv ?? ""] ?? "",
+    nightly,
+    at(2),
+    "exec_other_hub",
+  ).catch((error) => (error instanceof Error ? error.message : String(error)));
+  const behind = await handle.fire(tick(2, "exec_this_hub"));
+  results.a_tick_another_writer_claimed_first_is_answered_with_its_execution =
+    elsewhere === true && behind.execution === "exec_other_hub";
+
+  // A trigger name differing only in case is another trigger.
+  const cased = await handle.fire(tick(0, "exec_cased", `NIGHTLY_${suffix}`));
+  results.tick_claims_are_case_sensitive_by_trigger = cased.execution === "exec_cased";
+
+  // The newest tick is the greatest instant, whatever order they were claimed in.
+  await handle.fire(tick(30, "exec_thirty"));
+  await handle.fire(tick(15, "exec_fifteen"));
+  const last = await handle.lastFired(nightly);
+  const all = await handle.firedOf(nightly);
+  results.the_newest_tick_is_the_greatest_instant =
+    last?.scheduledAt === at(30) &&
+    last?.execution === "exec_thirty" &&
+    all.map((row) => row.scheduledAt).join(",") === [at(0), at(1), at(2), at(15), at(30)].join(",");
+  results.a_trigger_that_never_fired_has_no_last_tick =
+    (await handle.lastFired(`never_${suffix}`)) === undefined;
+
+  // Dedupe: a key is claimed once, by the first execution; the key is stored
+  // whole and keyed by its digest, so a key of any length and any character
+  // is one row — and two keys differing in case are two.
+  const ingest = `ingest_${suffix}`;
+  const admit = (key, execution, trigger = ingest) => ({
+    trigger,
+    key,
+    execution,
+    admittedAt: new Date().toISOString(),
+  });
+  const first = await handle.claimDedupe(admit(UNICODE, "exec_a"));
+  const again = await handle.claimDedupe(admit(UNICODE, "exec_b"));
+  const upper = await handle.claimDedupe(admit(UNICODE.toUpperCase(), "exec_c"));
+  const large = await handle.claimDedupe(admit(LARGE, "exec_large"));
+  const largeAgain = await handle.claimDedupe(admit(LARGE, "exec_large_again"));
+  const otherTrigger = await handle.claimDedupe(admit(UNICODE, "exec_other", `other_${suffix}`));
+  results.a_dedupe_key_is_claimed_once_and_a_repeat_is_answered_with_the_first =
+    first.execution === "exec_a" && again.execution === "exec_a" && again.key === UNICODE;
+  results.dedupe_keys_differing_in_case_are_two_keys = upper.execution === "exec_c";
+  results.a_dedupe_key_of_any_length_is_one_row =
+    large.execution === "exec_large" && largeAgain.execution === "exec_large" && largeAgain.key === LARGE;
+  results.a_dedupe_key_is_scoped_to_its_trigger = otherTrigger.execution === "exec_other";
+
+  // A claim whose execution never began is taken over, conditionally: only
+  // from the execution the row still names.
+  const moved = await handle.retakeDedupe(ingest, UNICODE, "exec_a", "exec_d");
+  const stale = await handle.retakeDedupe(ingest, UNICODE, "exec_a", "exec_e");
+  const holder = await handle.claimDedupe(admit(UNICODE, "exec_f"));
+  results.a_dedupe_claim_is_taken_over_only_from_its_holder =
+    moved === true && stale === false && holder.execution === "exec_d";
+
+  // Checkpoints: absent, then the newest written.
+  const feed = `feed_${suffix}`;
+  const none = await handle.checkpointOf(feed);
+  await handle.recordCheckpoint(feed, "10");
+  await handle.recordCheckpoint(feed, "11");
+  const eleven = await handle.checkpointOf(feed);
+  await handle.recordCheckpoint(feed, UNICODE);
+  const unicode = await handle.checkpointOf(feed);
+  await handle.recordCheckpoint(feed, LARGE);
+  const largest = await handle.checkpointOf(feed);
+  results.a_checkpoint_is_absent_until_written_and_then_the_newest =
+    none === undefined && eleven === "11" && unicode === UNICODE && largest === LARGE;
+
+  // Restarts: every row kept, the newest first, a page bounded, and how each
+  // run ended — a code or a signal — carried as it was.
+  const base = Date.parse("2026-11-04T03:00:00.000Z");
+  const ended = (n) => new Date(base + n * 1000).toISOString();
+  await handle.recordRestart({ source: feed, endedAt: ended(1), attempt: 1, exitCode: 0, ranMs: 1200, backoffMs: 1000 });
+  await handle.recordRestart({ source: feed, endedAt: ended(2), attempt: 2, exitCode: 3, ranMs: 50, backoffMs: 2000 });
+  await handle.recordRestart({ source: feed, endedAt: ended(3), attempt: 3, signal: "SIGKILL", ranMs: 4_000_000_000, backoffMs: 4000 });
+  const page = await handle.restartsOf(feed, 2);
+  const empty = await handle.restartsOf(`quiet_${suffix}`, 20);
+  results.restart_rows_are_paged_newest_first_with_their_total =
+    page.total === 3 &&
+    page.rows.length === 2 &&
+    page.rows[0]?.endedAt === ended(3) &&
+    page.rows[0]?.signal === "SIGKILL" &&
+    page.rows[0]?.exitCode === undefined &&
+    page.rows[0]?.ranMs === 4_000_000_000 &&
+    page.rows[1]?.exitCode === 3 &&
+    page.rows[1]?.signal === undefined &&
+    page.rows[1]?.attempt === 2 &&
+    empty.total === 0 &&
+    empty.rows.length === 0;
+} finally {
+  await journal.releaseJournal().catch(() => undefined);
+}
+
 // 9. **The writer guard.** A second opener of a journal a live process holds is
 //    refused by name rather than left to interleave (`docs/durability.md` §2).
 //    Only the two remote backends have one — SQLite's file lock is broken after

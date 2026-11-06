@@ -90,8 +90,8 @@ trace_sink:
     bearer:
       token: ${TRACE_SINK_TOKEN}
 
-# RESERVED (PRD 5.11): binds the logical `source: bug_reports` of the `ingest`
-# trigger to infrastructure. Delivery is at-least-once with inbound dedupe.
+# Binds the logical `source: bug_reports` of the `ingest` trigger (grammar 14.4).
+# `validate`/`build` accept it; `serve` refuses `redis_streams` by name (q78).
 event_sources:
   bug_reports:
     kind: redis_streams

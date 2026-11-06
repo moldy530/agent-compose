@@ -13,8 +13,12 @@
 // D64) — but it may declare the `session_key:` that remaps `--session` into the
 // session identity a `scope: session` store partitions by (grammar 13.2, 11.3).
 //
-// `schedule` and `event` are reserved grammar that executes as a no-op in v0
-// (grammar 15), and neither appears in either table.
+// `scheduleTriggers` and `eventTriggers` are what `./sources.ts` runs under
+// `serve` (PRD resolved q78): a schedule's ticks and a command source's lines
+// start executions through the same admission an `http` request does
+// (`./serve.ts`'s `admit`). `eventSources` is the active target's
+// `event_sources:`, every entry with its kind — a kind this release does not
+// implement is refused by name when `serve` starts (grammar 14.4).
 
 import * as runtime from "./runtime.ts";
 
@@ -143,6 +147,53 @@ function roots(payload: unknown): runtime.Roots {
   return { payload: runtime.bind(payload, httpPayload) };
 }
 
+/**
+ * The payload shape grammar 13.4 fixes for a `schedule` trigger: the tick's
+ * nominal instant in the trigger's zone (RFC 3339), and the trigger's name.
+ */
+const schedulePayload: runtime.Shape = {
+  properties: { scheduled_at: "string", trigger: "string" },
+};
+
+/**
+ * The payload shape grammar 13.5 fixes for an `event` trigger. A `kind:
+ * command` source fills it from one line: `body` is the decoded object, `id`
+ * its `checkpoint:` value or the SHA-256 of the line, `attributes` is `{}`,
+ * `source` the logical name (grammar 14.4).
+ */
+const eventPayload: runtime.Shape = {
+  properties: {
+    id: "string",
+    body: { properties: {}, rest: "any" },
+    attributes: { properties: {}, rest: "string" },
+    source: "string",
+  },
+};
+
+/** What a command source's `checkpoint:` reads: the event before it has an id. */
+const checkpointPayload: runtime.Shape = {
+  properties: {
+    body: { properties: {}, rest: "any" },
+    attributes: { properties: {}, rest: "string" },
+    source: "string",
+  },
+};
+
+/** The roots a `schedule` trigger's expressions are evaluated against. */
+function scheduleRoots(payload: SchedulePayload): runtime.Roots {
+  return { payload: runtime.bind(payload, schedulePayload) };
+}
+
+/** The roots an `event` trigger's expressions are evaluated against. */
+function eventRoots(payload: EventPayload): runtime.Roots {
+  return { payload: runtime.bind(payload, eventPayload) };
+}
+
+/** The roots a command source's `checkpoint:` is evaluated against. */
+function checkpointRoots(event: LineEvent): runtime.Roots {
+  return { payload: runtime.bind(event, checkpointPayload) };
+}
+
 /** The roots a `manual` trigger's `session_key:` is evaluated against. */
 function manualRoots(session: string): runtime.Roots {
   return { payload: runtime.bind({ session }, manualPayload) };
@@ -177,6 +228,104 @@ export interface ManualTrigger {
    * an expression to say so would answer what was passed in.
    */
   sessionKey?(session: string): string;
+}
+
+/** One tick's payload (grammar 13.4). */
+export interface SchedulePayload {
+  readonly scheduled_at: string;
+  readonly trigger: string;
+}
+
+/** One event's payload (grammar 13.5, 14.4). */
+export interface EventPayload {
+  readonly id: string;
+  readonly body: Readonly<Record<string, unknown>>;
+  readonly attributes: Readonly<Record<string, string>>;
+  readonly source: string;
+}
+
+/** One line of a command source, decoded, before it has an id (grammar 14.4). */
+export interface LineEvent {
+  readonly body: Readonly<Record<string, unknown>>;
+  readonly attributes: Readonly<Record<string, string>>;
+  readonly source: string;
+}
+
+/**
+ * One declared `schedule` trigger (grammar 13.4), which `serve`'s scheduler
+ * fires at every tick of its `cron:` in its `timezone:` (PRD resolved q78).
+ */
+export interface ScheduleTrigger {
+  readonly name: string;
+  readonly flow: string;
+  /** `cron:` — five fields, already held to the evaluator's grammar by `validate`. */
+  readonly cron: string;
+  /** `timezone:` — an IANA name, defaulting to `UTC`. */
+  readonly timezone: string;
+  /** `input:` — the flow inputs this trigger binds from one tick. */
+  input(payload: SchedulePayload): Record<string, unknown>;
+  /** `session_key:` — the session identity for session-scoped stores. */
+  sessionKey?(payload: SchedulePayload): string;
+}
+
+/**
+ * One declared `event` trigger (grammar 13.5): every event its `source:`
+ * produces is admitted to it, deduplicated on its own `dedupe_key:`.
+ */
+export interface EventTrigger {
+  readonly name: string;
+  readonly flow: string;
+  /** `source:` — the logical name the active target's `event_sources:` binds. */
+  readonly source: string;
+  /** `input:` — the flow inputs this trigger binds from one event. */
+  input(payload: EventPayload): Record<string, unknown>;
+  /** `session_key:` — the session identity for session-scoped stores. */
+  sessionKey?(payload: EventPayload): string;
+  /** `dedupe_key:` — defaulting to `payload.id`. */
+  dedupeKey(payload: EventPayload): string;
+  /**
+   * `auth:` — what the status, resume and cancel routes of every execution
+   * this trigger starts enforce, and what its source's `GET /sources/:name`
+   * enforces (grammar 13.5, PRD resolved q32 one level up, Decision D162).
+   * Nobody calls an `event` trigger, so it authenticates no start.
+   *
+   * Absent leaves those routes open.
+   */
+  readonly auth?: InboundAuth;
+}
+
+/** grammar 14.4's kinds. */
+export type EventSourceKind = "command" | "redis_streams" | "sqs" | "nats";
+
+/**
+ * The kinds `serve` runs a consumer for in this release (PRD resolved q78).
+ * The others keep their vocabulary and are refused at start, by name.
+ */
+export const IMPLEMENTED_SOURCE_KINDS: readonly EventSourceKind[] = ["command"];
+
+/** One argument of a command source's program (grammar 14.4). */
+export type CommandArgument =
+  | { readonly text: readonly runtime.Interpolation[] }
+  /** An argument written exactly `{checkpoint}`: the source's newest checkpoint. */
+  | { readonly checkpoint: true };
+
+/** A `kind: command` source's program, `restart:` resolved (grammar 14.4). */
+export interface CommandSource {
+  /** `command:` — argv[0], interpolated at start (grammar 4.3 class 2). */
+  readonly command: readonly runtime.Interpolation[];
+  readonly args: readonly CommandArgument[];
+  /** `checkpoint:` — the event's id, and the position handed back on restart. */
+  checkpoint?(event: LineEvent): string;
+  readonly restartBackoffMs: number;
+  readonly restartMaxMs: number;
+}
+
+/** One `event_sources:` entry of the active target (grammar 14.4). */
+export interface EventSource {
+  readonly name: string;
+  readonly kind: EventSourceKind;
+  /** The program, on a `kind: command` source and no other. */
+  readonly command?: CommandSource;
 }
 
 export const httpTriggers: readonly HttpTrigger[] = [
@@ -235,4 +384,13 @@ export const httpTriggers: readonly HttpTrigger[] = [
 ];
 
 export const manualTriggers: readonly ManualTrigger[] = [
+];
+
+export const scheduleTriggers: readonly ScheduleTrigger[] = [
+];
+
+export const eventTriggers: readonly EventTrigger[] = [
+];
+
+export const eventSources: readonly EventSource[] = [
 ];

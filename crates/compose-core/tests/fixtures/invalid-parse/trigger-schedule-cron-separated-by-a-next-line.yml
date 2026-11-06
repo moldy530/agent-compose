@@ -1,0 +1,18 @@
+# rule: `cron:` fields are separated by ASCII whitespace and no other character (grammar 13.4, Decision D162)
+# code: invalid-value
+# message: `cron` takes a 5-field POSIX cron expression, found 4 field(s)
+# at: 18:11
+# help: the fields are minute, hour, day-of-month, month, and day-of-week
+#
+# `\N` is YAML's escape for U+0085, NEXT LINE. Rust's `White_Space` counts it
+# as whitespace and ECMAScript's `\s` does not, so a validator splitting on the
+# one and a scheduler splitting on the other read this as five fields and as
+# four: `validate` would pass a composition `serve` refuses to start. Both read
+# fields between ASCII whitespace only — space, tab, line feed, form feed,
+# carriage return — so `0<U+0085>3` is one field here, and there are four.
+triggers:
+  nightly:
+    type: schedule
+    flow: flow.triage
+    timezone: UTC
+    cron: "0\N3 * * *"

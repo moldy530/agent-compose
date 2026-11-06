@@ -1,0 +1,13 @@
+# rule: a `cron:` expression fires at some instant (grammar 13.4, Decision D162)
+# code: invalid-cron
+# message: `cron` "0 0 30 2 *" cannot be evaluated: never fires: the day-of-month field `30` names no day that a month in the month field `2` has
+# at: 13:11
+# help: a field is `*`, a number, a range `a-b`, a list `a,b`, or a step `*/n` or `a-b/n`; minutes run 0-59, hours 0-23, days of the month 1-31, months 1-12 or JAN-DEC, days of the week 0-7 or SUN-SAT with 0 and 7 both Sunday (grammar 13.4)
+#
+# Every field is in range on its own; together they name a day no month they
+# name has, so the trigger would wait for ever and say nothing.
+triggers:
+  never:
+    type: schedule
+    flow: flow.triage
+    cron: "0 0 30 2 *"

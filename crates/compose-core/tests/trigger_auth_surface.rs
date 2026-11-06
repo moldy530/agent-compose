@@ -771,7 +771,7 @@ fn the_auth_surface_reaches_the_generated_app_and_every_document_says_so() {
         ),
         (
             triggers.body,
-            "**The three authentication keys were on this list and have left it.**",
+            "**The three authentication keys were on that list and left it first.**",
         ),
         (
             targets.body,

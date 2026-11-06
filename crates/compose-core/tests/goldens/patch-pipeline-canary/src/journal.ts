@@ -163,6 +163,7 @@
 // meets it as a `CREATE TABLE IF NOT EXISTS` — which is what keeps
 // [`JOURNAL_VERSION`] where it is (`docs/durability.md` §3.7, §11.2).
 
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -753,6 +754,68 @@ export interface ExecutionRow {
   readonly cancelRequestedAt?: string;
 }
 
+/**
+ * One `schedule` tick that fired (PRD resolved q78, `docs/durability.md`
+ * §3.11): keyed `(trigger, scheduledAt)`, the one identity in this schema that
+ * is not an execution's (`docs/distributed.md` §8 rule 2, as amended).
+ */
+export interface FiredRow {
+  /** The `schedule` trigger's name. */
+  readonly trigger: string;
+  /**
+   * The tick's instant, as `Date.prototype.toISOString` writes it in UTC —
+   * fixed width, so the newest tick is the greatest string. The payload's
+   * `scheduled_at` is the same instant written in the trigger's zone.
+   */
+  readonly scheduledAt: string;
+  /** The execution the tick started — allocated before the claim. */
+  readonly execution: string;
+  /** When the claim was made, ISO 8601. */
+  readonly firedAt: string;
+}
+
+/**
+ * One `event` trigger's dedupe key, and the execution it admitted (PRD
+ * resolved q78 ruling e, `docs/durability.md` §3.12).
+ */
+export interface DedupeRow {
+  readonly trigger: string;
+  /** The `dedupe_key:` value, as the trigger's expression answered it. */
+  readonly key: string;
+  readonly execution: string;
+  /** When it was admitted, ISO 8601. */
+  readonly admittedAt: string;
+}
+
+/**
+ * One end of a `kind: command` source's program, and the restart that follows
+ * it (PRD resolved q78 ruling c, `docs/durability.md` §3.14).
+ */
+export interface RestartRow {
+  readonly source: string;
+  /** When the program ended, ISO 8601 — also the row's identity within the source. */
+  readonly endedAt: string;
+  /**
+   * The restart's place in its run of consecutive ones: `1` after a run that
+   * lasted longer than `restart.max`, one more after each run that did not.
+   */
+  readonly attempt: number;
+  /** The program's exit code, where it exited rather than being signalled. */
+  readonly exitCode?: number;
+  /** The signal that ended it, where one did. */
+  readonly signal?: string;
+  /** How long that run of the program lasted, in milliseconds. */
+  readonly ranMs: number;
+  /** How long the runtime waits before starting it again, in milliseconds. */
+  readonly backoffMs: number;
+}
+
+/** A page of a source's restart rows, newest first, and how many it has in all. */
+export interface RestartPage {
+  readonly rows: readonly RestartRow[];
+  readonly total: number;
+}
+
 // ---------------------------------------------------------------------------
 // The interface
 // ---------------------------------------------------------------------------
@@ -952,6 +1015,52 @@ export interface Journal {
    * effect.
    */
   effectsUnder(execution: string, site: string): Promise<readonly JournalRecord[]>;
+  /**
+   * Claim one `schedule` tick for an execution, **before** that execution
+   * starts (PRD resolved q78 ruling b, `docs/durability.md` §3.11).
+   *
+   * Idempotent on `(trigger, scheduledAt)`, and that is the whole of what makes
+   * a tick fire once: the insert that wins fires, and every other claim of the
+   * same tick — a restart racing its own previous generation, or a second hub
+   * sharing this journal — is answered with the row already there, naming the
+   * execution that holds the tick. A caller fires exactly when the row it gets
+   * back names its own execution.
+   */
+  fire(row: FiredRow): Promise<FiredRow>;
+  /** The newest tick a `schedule` trigger has fired, where it has fired one. */
+  lastFired(trigger: string): Promise<FiredRow | undefined>;
+  /** Every tick a `schedule` trigger has fired, oldest first. */
+  firedOf(trigger: string): Promise<readonly FiredRow[]>;
+  /**
+   * Claim an `event` trigger's dedupe key for an execution, when that
+   * execution is registered (PRD resolved q78 ruling e, `docs/durability.md`
+   * §3.12).
+   *
+   * Idempotent on `(trigger, key)`: the insert that wins admits, and a repeat
+   * is answered with the row already there — the execution the key first
+   * started. Rows carry no expiry in this release (PRD resolved q77's
+   * `dedupe_window:` is what will bound them).
+   */
+  claimDedupe(row: DedupeRow): Promise<DedupeRow>;
+  /**
+   * Move a dedupe key from an execution that **never began** to one that will,
+   * answering whether this call moved it — the repair for a process that died
+   * between claiming a key and journaling the execution it claimed it for
+   * (`docs/durability.md` §3.12). Conditional on the row still naming `from`, so
+   * a key another admission has since taken is left as it is.
+   */
+  retakeDedupe(trigger: string, key: string, from: string, to: string): Promise<boolean>;
+  /** The newest checkpoint a `kind: command` source's intake accepted, if any. */
+  checkpointOf(source: string): Promise<string | undefined>;
+  /**
+   * Record a source's newest checkpoint, **after** the intake accepted the event
+   * it came from (PRD resolved q78 ruling c, `docs/durability.md` §3.13).
+   */
+  recordCheckpoint(source: string, checkpoint: string): Promise<void>;
+  /** Record one end of a `kind: command` source's program and the restart it owes. */
+  recordRestart(row: RestartRow): Promise<void>;
+  /** A source's restart rows, newest first, at most `limit` of them, and how many it has. */
+  restartsOf(source: string, limit: number): Promise<RestartPage>;
   /**
    * Give the connection back, and the writer guard with it.
    *
@@ -1624,9 +1733,196 @@ class SqlJournal implements Journal {
     });
   }
 
+  fire(row: FiredRow): Promise<FiredRow> {
+    return this.#serial(async () => {
+      await this.#run(
+        `INSERT INTO fired (trigger_name, scheduled_at, execution, fired_at) VALUES (?, ?, ?, ?)
+         ${this.#conflict("(trigger_name, scheduled_at)", "trigger_name = trigger_name")}`,
+        [row.trigger, row.scheduledAt, row.execution, row.firedAt],
+      );
+      const held = await this.#one(
+        "SELECT * FROM fired WHERE trigger_name = ? AND scheduled_at = ?",
+        [row.trigger, row.scheduledAt],
+      );
+      return held === undefined ? row : firedOf(held);
+    });
+  }
+
+  lastFired(trigger: string): Promise<FiredRow | undefined> {
+    return this.#serial(async () => {
+      const held = await this.#one(
+        "SELECT * FROM fired WHERE trigger_name = ? ORDER BY scheduled_at DESC LIMIT 1",
+        [trigger],
+      );
+      return held === undefined ? undefined : firedOf(held);
+    });
+  }
+
+  firedOf(trigger: string): Promise<readonly FiredRow[]> {
+    return this.#serial(async () => {
+      const rows = await this.#all(
+        "SELECT * FROM fired WHERE trigger_name = ? ORDER BY scheduled_at ASC",
+        [trigger],
+      );
+      return rows.map((row) => firedOf(row));
+    });
+  }
+
+  claimDedupe(row: DedupeRow): Promise<DedupeRow> {
+    return this.#serial(async () => {
+      const hash = keyHash(row.key);
+      await this.#run(
+        `INSERT INTO dedupe (trigger_name, key_hash, dedupe_key, execution, admitted_at) VALUES (?, ?, ?, ?, ?)
+         ${this.#conflict("(trigger_name, key_hash)", "trigger_name = trigger_name")}`,
+        [row.trigger, hash, JSON.stringify(row.key), row.execution, row.admittedAt],
+      );
+      const held = await this.#one(
+        "SELECT * FROM dedupe WHERE trigger_name = ? AND key_hash = ?",
+        [row.trigger, hash],
+      );
+      return held === undefined ? row : dedupeOf(held);
+    });
+  }
+
+  retakeDedupe(trigger: string, key: string, from: string, to: string): Promise<boolean> {
+    return this.#serial(async () => {
+      const hash = keyHash(key);
+      await this.#run(
+        "UPDATE dedupe SET execution = ?, admitted_at = ? WHERE trigger_name = ? AND key_hash = ? AND execution = ?",
+        [to, new Date().toISOString(), trigger, hash, from],
+      );
+      const held = await this.#one(
+        "SELECT execution FROM dedupe WHERE trigger_name = ? AND key_hash = ?",
+        [trigger, hash],
+      );
+      return held !== undefined && String(held["execution"]) === to;
+    });
+  }
+
+  checkpointOf(source: string): Promise<string | undefined> {
+    return this.#serial(async () => {
+      const held = await this.#one("SELECT checkpoint_value FROM checkpoints WHERE source = ?", [
+        source,
+      ]);
+      return held === undefined ? undefined : (JSON.parse(String(held["checkpoint_value"])) as string);
+    });
+  }
+
+  recordCheckpoint(source: string, checkpoint: string): Promise<void> {
+    return this.#serial(async () => {
+      const at = new Date().toISOString();
+      // Written as JSON, like every payload this journal holds: a checkpoint is
+      // the program's own string, and SQLite's driver hands a raw one to the C
+      // API NUL-terminated — so a value carrying a NUL would come back shorter
+      // there than on either server, and a program would resume from somewhere
+      // it never was.
+      const value = JSON.stringify(checkpoint);
+      // Two statements, each atomic on its own, rather than an upsert each
+      // backend spells differently (see [`Dialect`]): the insert lands the row
+      // where there is none, and the update moves the one that is there. A
+      // process that dies between them leaves the previous checkpoint, which is
+      // an older position the program re-emits from — at-least-once, and the
+      // dedupe key catches what it repeats.
+      await this.#run(
+        `INSERT INTO checkpoints (source, checkpoint_value, recorded_at) VALUES (?, ?, ?)
+         ${this.#conflict("(source)", "source = source")}`,
+        [source, value, at],
+      );
+      await this.#run(
+        "UPDATE checkpoints SET checkpoint_value = ?, recorded_at = ? WHERE source = ?",
+        [value, at, source],
+      );
+    });
+  }
+
+  recordRestart(row: RestartRow): Promise<void> {
+    return this.#serial(() =>
+      this.#run(
+        `INSERT INTO restarts (source, ended_at, attempt, exit_code, exit_signal, ran_ms, backoff_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ${this.#conflict("(source, ended_at)", "source = source")}`,
+        [
+          row.source,
+          row.endedAt,
+          row.attempt,
+          row.exitCode ?? null,
+          row.signal ?? null,
+          row.ranMs,
+          row.backoffMs,
+        ],
+      ),
+    );
+  }
+
+  restartsOf(source: string, limit: number): Promise<RestartPage> {
+    return this.#serial(async () => {
+      // Written into the statement rather than bound: a `LIMIT` placeholder is
+      // a thing MySQL's prepared protocol reads differently from the other two,
+      // and the value is an integer this module chose.
+      const bounded = Math.max(0, Math.trunc(limit));
+      const rows = await this.#all(
+        `SELECT * FROM restarts WHERE source = ? ORDER BY ended_at DESC LIMIT ${bounded}`,
+        [source],
+      );
+      const counted = await this.#one("SELECT COUNT(*) AS total FROM restarts WHERE source = ?", [
+        source,
+      ]);
+      return {
+        rows: rows.map((row) => restartOf(row)),
+        total: Number(counted?.["total"] ?? 0),
+      };
+    });
+  }
+
   close(): Promise<void> {
     return this.#serial(() => this.#driver.close());
   }
+}
+
+/**
+ * The column a dedupe key is keyed by: its SHA-256, in lowercase hex.
+ *
+ * A key is whatever the trigger's `dedupe_key:` answered — any length, any
+ * characters — and a primary key has to be neither: MySQL will not index an
+ * unbounded column, and a key folded by a collation would be two events
+ * admitted as one. The digest is fixed-width ASCII on every backend, and the
+ * key itself is kept beside it for a reader.
+ */
+function keyHash(key: string): string {
+  return createHash("sha256").update(key, "utf8").digest("hex");
+}
+
+function firedOf(row: Row): FiredRow {
+  return {
+    trigger: String(row["trigger_name"]),
+    scheduledAt: String(row["scheduled_at"]),
+    execution: String(row["execution"]),
+    firedAt: String(row["fired_at"]),
+  };
+}
+
+function dedupeOf(row: Row): DedupeRow {
+  return {
+    trigger: String(row["trigger_name"]),
+    // JSON, for the reason a checkpoint is (see `recordCheckpoint`).
+    key: JSON.parse(String(row["dedupe_key"])) as string,
+    execution: String(row["execution"]),
+    admittedAt: String(row["admitted_at"]),
+  };
+}
+
+function restartOf(row: Row): RestartRow {
+  const code = row["exit_code"];
+  const signal = row["exit_signal"];
+  return {
+    source: String(row["source"]),
+    endedAt: String(row["ended_at"]),
+    attempt: Number(row["attempt"]),
+    ...(code === null || code === undefined ? {} : { exitCode: Number(code) }),
+    ...(signal === null || signal === undefined ? {} : { signal: String(signal) }),
+    ranMs: Number(row["ran_ms"]),
+    backoffMs: Number(row["backoff_ms"]),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1743,13 +2039,53 @@ CREATE TABLE IF NOT EXISTS cancellations (
   execution    TEXT PRIMARY KEY,
   requested_at TEXT NOT NULL
 );
+-- The intake (PRD resolved q78, Decision D162, \`docs/durability.md\` §3.11-
+-- §3.14): what decides whether an execution exists at all, keyed by the trigger
+-- or source that admits it rather than by any execution. Four tables of their
+-- own, so a journal an older build wrote grows them by \`IF NOT EXISTS\` and no
+-- probe. \`fired\` is a \`schedule\` tick, claimed before its execution starts —
+-- the insert that wins fires; \`dedupe\` an \`event\` trigger's key, claimed when
+-- its execution is registered; \`checkpoints\` a command source's newest accepted
+-- checkpoint; \`restarts\` each end of its program.
+CREATE TABLE IF NOT EXISTS fired (
+  trigger_name TEXT NOT NULL,
+  scheduled_at TEXT NOT NULL,
+  execution    TEXT NOT NULL,
+  fired_at     TEXT NOT NULL,
+  PRIMARY KEY (trigger_name, scheduled_at)
+);
+CREATE TABLE IF NOT EXISTS dedupe (
+  trigger_name TEXT NOT NULL,
+  key_hash     TEXT NOT NULL,
+  dedupe_key   TEXT NOT NULL,
+  execution    TEXT NOT NULL,
+  admitted_at  TEXT NOT NULL,
+  PRIMARY KEY (trigger_name, key_hash)
+);
+CREATE TABLE IF NOT EXISTS checkpoints (
+  source           TEXT PRIMARY KEY,
+  checkpoint_value TEXT NOT NULL,
+  recorded_at      TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS restarts (
+  source      TEXT NOT NULL,
+  ended_at    TEXT NOT NULL,
+  attempt     INTEGER NOT NULL,
+  exit_code   INTEGER,
+  exit_signal TEXT,
+  ran_ms      INTEGER NOT NULL,
+  backoff_ms  INTEGER NOT NULL,
+  PRIMARY KEY (source, ended_at)
+);
 CREATE INDEX IF NOT EXISTS effects_of_execution ON effects (execution);
 CREATE INDEX IF NOT EXISTS executions_by_status ON executions (status, started_at);
 CREATE INDEX IF NOT EXISTS deliveries_by_status ON deliveries (status, intended_at);
 -- Ordinary indexes rather than unique ones, and \`docs/distributed.md\` §8 rule 2
--- is why: every identity in this schema is execution-scoped, so a shard of
--- executions can move to another hub without arbitrating a journal-global
--- constraint. A \`dispatch_id\` is a random handle the issuing hub owns (§10.1).
+-- is why: every identity in this schema is execution-scoped — the intake's
+-- tables above excepted, by rule 2's own stated exception, because deciding
+-- once across every hub is what they are for — so a shard of executions can
+-- move to another hub without arbitrating a journal-global constraint. A
+-- \`dispatch_id\` is a random handle the issuing hub owns (§10.1).
 CREATE INDEX IF NOT EXISTS dispatches_by_id ON dispatches (id);
 CREATE INDEX IF NOT EXISTS dispatches_by_status ON dispatches (status, parked_at);
 `;

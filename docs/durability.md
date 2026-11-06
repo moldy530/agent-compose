@@ -52,8 +52,12 @@ target binds a remote provider carries that arm appended to it and no other
 3. [What is recorded](#3-what-is-recorded) — including
    [callback deliveries](#37-a-callback-delivery),
    [placement dispatches](#38-a-placement-dispatch),
-   [coding-harness runs](#39-a-coding-harness-run) and
-   [the finally boundary](#310-the-finally-boundary)
+   [coding-harness runs](#39-a-coding-harness-run),
+   [the finally boundary](#310-the-finally-boundary), and the intake's four
+   ledgers: [fired ticks](#311-a-fired-tick),
+   [dedupe claims](#312-a-dedupe-claim),
+   [checkpoints](#313-a-source-checkpoint) and
+   [restarts](#314-a-source-restart)
 4. [Keys](#4-keys)
 5. [Replay, and the frontier](#5-replay-and-the-frontier)
 6. [Recovery: `serve` and `resume`](#6-recovery-serve-and-resume)
@@ -1245,6 +1249,162 @@ long-lived `serve` accumulates nothing for such failures. A placed node's
 result that a worker posts after the hub settled is the same case on the hub
 (`docs/distributed.md` §3.4).
 
+### 3.11 A fired tick
+
+One row per tick a `schedule` trigger fired (`docs/grammar.md` §13.4, PRD
+resolved q78 ruling b), in the `fired` table: the trigger's name, the tick's
+nominal instant (`scheduled_at`, a UTC ISO string to the millisecond), the
+execution it started, and when it was written. Its key is **`(trigger,
+scheduled_at)`**, and it is written by `fire` in `src/journal.ts`, called from
+`admitTick` in `src/serve.ts`, **before** the execution is registered — so a
+tick is claimed and then started, never started and then claimed. And a tick
+is **fired** only once its execution's lifecycle row (§3.5) is down: the
+admission waits for that row before it answers the scheduler, so a claim is
+never logged as fired, nor the next tick armed past it, for an execution the
+journal does not hold.
+
+* **The insert that wins fires.** A second claim of the same tick — the same
+  scheduler after a restart, or a second hub sharing the journal — inserts
+  nothing (`INSERT … ON CONFLICT DO NOTHING`, or MySQL's no-op
+  `ON DUPLICATE KEY UPDATE`) and is answered with the row that holds it, so it
+  starts nothing and the serve log says which execution has the tick. Claims made
+  at once agree on one winner, because the backend's primary key decides.
+* **The newest row is where a starting scheduler resumes from.** `lastFired`
+  answers the greatest `scheduled_at`, whatever order the rows were written in;
+  every tick after it and before now is skipped and named in the serve log,
+  never fired (PRD resolved q78: "jobs that run can catch themselves up").
+* **A crash between the claim and the start is repaired at the next start.**
+  The row is down and names an execution the journal has no lifecycle row for,
+  so it wins every later claim of its tick and nothing would ever recover what
+  it names: honoured, the tick would fire zero times. So a scheduler starting
+  hands the newest row back to the admission before it arms a tick
+  (`admitUnbegun` in `src/serve.ts`), which starts that execution **under the
+  id the row recorded**, bound to the tick's own `payload.scheduled_at`, where
+  neither the process nor the journal has an execution of that id — and the
+  serve log names the tick. Where the journal cannot be read at start — a
+  standby's dialled journal, guarded by the `serve` that holds it — and after a
+  claim that failed in a way that may still have landed, **no tick is armed
+  until the look reaches the journal**: it is taken again with backoff, a
+  second and then doubling to thirty seconds apart (`#settle` in
+  `src/sources.ts`), and the schedule is armed after it, the ticks that fell
+  meanwhile skipped and named as fallen while the schedule was held. A tick
+  claimed past a newest row nobody looked at would make its own row the newest
+  and leave the claim below it where no look reads it — that tick would fire
+  zero times — and a look taken only as each tick falls due would reach a claim
+  a standby inherits a schedule's period late.
+* **A claim whose execution the journal will not begin is owed, and holds the
+  schedule.** The row is down, so it wins every later claim of its tick, and
+  the execution it names has no lifecycle row — the state a crash leaves,
+  reached in a live process. The admission answers `unbegun` rather than
+  `started`, and takes the execution off the process's map; the scheduler logs
+  the tick as claimed and not started, and **claims no later tick** until it has
+  started that execution under the claim, retried with backoff (`#discharge` in
+  `src/sources.ts`). Ticks that fall meanwhile are skipped and named as fallen
+  while the schedule was held. A start that cannot say whether the claim's
+  execution began is owed the same way.
+* **Only the newest row can be an owed claim**, because a scheduler claims its
+  next tick only after the one before was admitted — started, found held, or
+  refused for its own bindings — holds while one is owed, and claims nothing
+  until a look has read the newest row. That is what lets the repair read one
+  row. It also rests on §2.1's one-writer rule, as §3.12's
+  takeover does: "its execution never began" is read off the absence of a
+  lifecycle row, which says the claimer is gone only while nobody else writes
+  the journal. `docs/distributed.md` §8 rule 3 forbids a protocol that assumes
+  one writer; this one does, held today by the writer guard (§2.3), and Decision
+  D162's Status records it for the owner's ruling before that guard is lifted.
+* **It is not an effect.** No §4 key, no replay consumes it, and a recovered
+  execution a tick started is recovered by its lifecycle row like any other
+  (§6.3).
+
+This is the journal's one identity keyed by a trigger and an instant rather
+than by an execution, and `docs/distributed.md` §8 rule 2 names it as the
+exception it is.
+
+### 3.12 A dedupe claim
+
+One row per `(trigger, key)` an `event` trigger admitted (`docs/grammar.md`
+§13.5), in the `dedupe` table: the trigger's name, the SHA-256 of the key (the
+primary key's second column, so a key of any length or character is one
+bounded row), the key itself — stored JSON-encoded, so a key carrying a NUL
+comes back whole on SQLite too — the execution it started, and when it was
+admitted. Written by `claimDedupe`, called from `admitEvent` in `src/serve.ts`
+before the execution is registered.
+
+* **The first claim starts an execution, and a repeat is answered with it.**
+  The key is evaluated from the trigger's `dedupe_key:` (default `payload.id`)
+  over the payload, and a second event with the same key starts nothing; the
+  serve log names the execution that holds it. Two keys that differ in case are
+  two keys, and a key is scoped to its trigger.
+* **Rows do not expire.** PRD resolved q77's `dedupe_window:` is what will give
+  them a TTL; until it lands a key is admitted once for the life of the journal.
+* **An event starts an execution only once its lifecycle row is down.** The
+  admission waits for the row (§3.5) before it answers the consumer, so the
+  checkpoint (§3.13) never moves past an event whose execution the journal does
+  not hold. One the journal will not begin is a refusal of the admission: the
+  execution is taken off the process's map, and the consumer retries the event
+  and holds the stream, as for a claim the journal refused.
+* **A claim whose execution never began is taken over.** If `serve` died between
+  the claim and the lifecycle row, or the journal would not write that row, the
+  claim names an execution the journal has no lifecycle row for, and the next
+  event with the key would otherwise be refused for ever. So a repeat whose
+  holder exists neither in the process nor in the journal is re-claimed with a
+  conditional update — `retakeDedupe`, which moves the row only from the
+  execution it still names — and starts. Two takeovers at once agree on one, for
+  the reason two claims do. Deciding that the holder never began from the
+  absence of its row rests on §2.1's one-writer rule, as §3.11's repair does,
+  and `docs/distributed.md` §8 rule 3 is the rule it is held against there.
+
+### 3.13 A source checkpoint
+
+One row per `kind: command` event source (`docs/grammar.md` §14.4), in the
+`checkpoints` table: the source's name, its newest checkpoint — stored
+JSON-encoded, for the reason a dedupe key is — and when it was written.
+Written by `recordCheckpoint` in `src/journal.ts`, called by the consumer in
+`src/sources.ts` **after** the intake accepted the event the checkpoint names:
+some bound trigger started an execution for it — one whose lifecycle row is
+journaled, which is when the admission says so (§3.12) — or found the one it
+already had. So the checkpoint a restarted program is handed is never ahead of
+what was admitted, and what the program emitted past it before a crash is
+emitted again and answered by §3.12. An event every bound trigger refused — its
+inputs did not bind — moves nothing, and neither does one the journal would not
+admit, whether it refused the event's claim or its execution's lifecycle row:
+that event is retried and holds the stream until it is admitted.
+
+**Only a checkpoint a program can be handed is ever written.** The row is handed
+back to every later start, as an environment variable and as each
+`{checkpoint}` argument, so a value no process could be started with — one
+holding a NUL, which no argument or variable carries, or a lone UTF-16
+surrogate, which has no UTF-8 to hand over unchanged, or one longer than 64 KiB,
+against a host's bound on a single argument (128 KiB on Linux) — would refuse
+every start after it for as long as the row stood, and a `serve` restart would
+hand it back again. Such a line is refused before it is admitted, as one whose
+`checkpoint:` cannot be evaluated is (`docs/grammar.md` §14.4), so it never
+reaches this row.
+
+**A start that cannot read the row does not start the program.** No row means
+the source has never had an event accepted, and a program started that way may
+begin at its tip — skipping everything after the journaled position — or at its
+beginning, re-emitting what was admitted and moving the checkpoint backwards as
+the repeats are answered. So `checkpointOf` failing at start is retried with
+backoff, the source reads `starting` on its status route meanwhile, and the
+program is started only once the journal has said which position it holds.
+
+The write is an insert-if-absent followed by an update, two statements each
+atomic on its own rather than one upsert in three dialects; one writer at a time
+writes a project's journal (§2), so nothing interleaves them.
+
+### 3.14 A source restart
+
+One row per exit of a `kind: command` source's program, in the `restarts`
+table: the source, when the run ended — the instant the program exited, which
+is what the backoff is counted from (the primary key's second column) — the
+restart's attempt number, the exit code **or** the signal that ended it — one of
+the two, never both — how long the run lasted, and the backoff before the next
+start. Written by `recordRestart`; `restartsOf` pages them newest first with
+their total, which is what `GET /sources/:name` answers (`restart_count` and the
+newest twenty). Rows are kept; nothing reads them to decide anything, so they
+are a history rather than a counter.
+
 ## 4. Keys
 
 An effect's journal key is
@@ -1514,6 +1674,27 @@ declares is reported on stderr and left open for the same reason.
 Because recovery takes every open execution, an execution worth resuming by hand
 is one no `serve` is running — see §2 on what is outside the promise.
 
+**A start that cannot read the journal owes the recovery.** The app still
+serves — the start's failure is written on stderr — and the walk that could not
+read what it walks, the open executions or the owed deliveries, is taken again
+with backoff for as long as the process runs, and the executions' walk again
+before **every tick and every event** the process admits (PRD resolved q78):
+one of those is refused, as one the journal could not record is, while the open
+executions cannot be read, and waits for their walk once they can. The case that makes this more than a transient is a
+**standby**: a second `serve` on a dialled journal, refused it by the writer
+guard for as long as the first holds it (§2.3). When the first goes, the
+standby's scheduler and consumers start succeeding at the journal
+(`docs/distributed.md` §8), and the first thing they meet is this walk — so the
+executions the first left open, a tick's or an event's half-run execution
+among them, are resumed in the standby before it claims a tick or matches an
+event against them, rather than answering a repeat `held` by an execution
+nothing runs. The serve log says when it happens: `this project's journal can
+be read now, so the <n> executions it holds open are recovered now, before any
+tick or event is admitted`, and then one `recovered` line per execution as at a
+start. An execution this process already holds — one it started since — is
+never recovered beside itself, and a delivery it already has on its schedule
+is never put on a second one.
+
 **A stop leaves every execution where it was**, child executions included. A
 `serve` that receives `SIGINT` or `SIGTERM` closes and exits without waiting for
 the executions in flight — a parent's or a child's, running or still queued for a
@@ -1660,8 +1841,21 @@ trace file it writes carries the child's lineage head (`docs/trace.md` §1.2).
 ### 6.3 Triggers fire once
 
 Nothing in recovery reads the lifecycle row's `trigger` as an instruction. A
-recovered `http` execution is the one that existed; no request is re-delivered
-and no schedule is re-armed.
+recovered execution is the one that existed; no request is re-delivered, no
+tick is re-fired and no event is re-admitted.
+
+That is PRD resolved q28's rule, and for the two triggers `serve` fires itself
+(PRD resolved q78) it is made of rows rather than of restraint. A `schedule`
+trigger's tick is a `fired` row written before its execution starts (§3.11), so
+a restarted scheduler that meets a tick it already fired is answered with the
+execution that has it; ticks that fell while nothing ran are skipped. An
+`event` trigger's key is a `dedupe` row (§3.12), and a `kind: command` source is
+restarted from its journaled checkpoint (§3.13), so what its program emits again
+after a restart is answered by the rows the first admissions wrote. Recovery
+runs **first**: `serve` starts its schedulers and its sources' programs only
+after every open execution has been taken back, so a tick or an event never
+races a replay — and where the start could not take them back, no tick or
+event is admitted until they have been (§6.1).
 
 ## 7. Divergence
 
@@ -2193,6 +2387,22 @@ arms, re-opens it, and records a cancel of a row it holds open
 (`a_journal_without_the_cancellations_table_gains_it_on_open`), beside the
 request's round trip, its first-instant-wins rule and the settled row's absent
 `error`.
+
+**The intake's four ledgers arrived under the physical-schema clause** (§3.11–
+§3.14, PRD resolved q78): `fired`, `dedupe`, `checkpoints` and `restarts`, each a
+table of its own, so `CREATE TABLE IF NOT EXISTS` on open is the whole of the
+migration on every backend — no column of an existing table moved. None holds
+a §4 key or is consumed by a replay, so an execution open in a journal an older
+build wrote replays identically; what such a journal lacks is the rows for
+ticks and events no older build fired, which is exactly what a build that never
+fired them would leave. A first `serve` under this build therefore reads no last
+tick, reports no skipped span, and starts each program with no checkpoint.
+Executed: `journal_backend_conformance` drops the four tables from a journal on
+each of the three arms, re-opens it and claims a tick and records a checkpoint
+on it (`a_journal_without_the_intake_tables_gains_them_on_open`), beside every
+verb's contract — a tick claimed once and agreed on by claims made together, a
+dedupe key of any length claimed once and taken over only from its holder, the
+newest checkpoint, and restart rows paged newest first.
 
 ### 11.3 What requires a version bump
 

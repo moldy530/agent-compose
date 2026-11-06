@@ -1,0 +1,16 @@
+# rule: a `kind: command` source is a closed object: its keys are `command`, `args`, `checkpoint` and `restart` (grammar 14.4, PRD resolved q78)
+# code: unknown-key
+# message: unknown key `consumer_group` in event source `feed`
+# at: 16:5
+#
+# A queue kind's keys are plugin configuration and pass through unexamined
+# (Decision D46); a command source's are grammar the runtime reads, so a key it
+# does not read is a mistake reported where it was made — here a Redis key
+# carried over from the source this one replaced.
+version: "0.1"
+
+event_sources:
+  feed:
+    kind: command
+    command: ./bin/feed
+    consumer_group: agent-compose

@@ -29010,3 +29010,3610 @@ fn a_finally_node_already_running_when_the_instance_around_it_ends_is_waited_for
     );
     assert_eq!(lifecycle_row(&project, execution)["status"], "failed");
 }
+
+// ---------------------------------------------------------------------------
+// PRD §7 M3 — "Execute `schedule` and queue-backed `event` triggers" (PRD
+// resolved q78, grammar 13.4, 13.5, 14.4, Decision D162). Live.
+// ---------------------------------------------------------------------------
+
+/// The `command-source` fixture's program, wherever this checkout is.
+fn feed_program() -> String {
+    harness::projects()
+        .join("command-source")
+        .join("feed.mjs")
+        .display()
+        .to_string()
+}
+
+/// The environment the `command-source` fixture is served with: where its
+/// program is, where the program logs what it emitted and how it was started,
+/// and the knobs the case turns (`FEED_*`, read by the program and never by the
+/// composition).
+fn feed_environment(scratch: &Path, knobs: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut environment = vec![
+        ("FEED_PROGRAM".to_string(), feed_program()),
+        (
+            "FEED_LOG".to_string(),
+            scratch.join("emitted.log").display().to_string(),
+        ),
+        (
+            "FEED_STARTS".to_string(),
+            scratch.join("starts.log").display().to_string(),
+        ),
+    ];
+    for (name, value) in knobs {
+        environment.push(((*name).to_string(), (*value).to_string()));
+    }
+    environment
+}
+
+/// Poll `probe` until it answers, or fail naming what never happened.
+fn eventually<T>(budget: Duration, what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if let Some(answer) = probe() {
+            return answer;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what} did not happen within {budget:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// `GET /sources/<name>`, as JSON.
+fn source(app: &Client, name: &str) -> Value {
+    let answered = app
+        .get(&format!("/sources/{name}"))
+        .expect("the source status route answers");
+    assert_eq!(answered.status, 200, "{}", answered.text());
+    answered.json()
+}
+
+/// The lifecycle rows a trigger's executions left, each with its inputs decoded.
+fn executions_of(project: &Path, trigger: &str) -> Vec<(String, Value, String)> {
+    harness::journal_rows(
+        project,
+        &format!(
+            "SELECT id, inputs, status FROM executions WHERE trigger_kind = '{trigger}' ORDER BY started_at"
+        ),
+    )
+    .as_array()
+    .expect("rows")
+    .iter()
+    .map(|row| {
+        (
+            row["id"].as_str().expect("an id").to_string(),
+            serde_json::from_str(row["inputs"].as_str().expect("inputs")).expect("JSON inputs"),
+            row["status"].as_str().expect("a status").to_string(),
+        )
+    })
+    .collect()
+}
+
+/// How many of a trigger's executions have completed.
+fn completed_of(project: &Path, trigger: &str) -> usize {
+    executions_of(project, trigger)
+        .iter()
+        .filter(|(_, _, status)| status == "completed")
+        .count()
+}
+
+/// The event ids a trigger's executions were started for, counted.
+fn ids_of(project: &Path, trigger: &str) -> std::collections::BTreeMap<String, usize> {
+    let mut counted = std::collections::BTreeMap::new();
+    for (_, inputs, _) in executions_of(project, trigger) {
+        *counted
+            .entry(inputs["id"].as_str().expect("an id input").to_string())
+            .or_insert(0) += 1;
+    }
+    counted
+}
+
+/// The ids `1..=n`, as the program writes them.
+fn ids_through(n: usize) -> BTreeSet<String> {
+    (1..=n).map(|seq| seq.to_string()).collect()
+}
+
+/// The lines of a file the program wrote, or none.
+fn lines_of(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// PRD resolved q78's first verification clause: "a program emitting 100
+/// events, killed after 50 and restarted by the runtime, yields exactly one
+/// execution per event".
+///
+/// The program exits after its fiftieth event; the runtime journals the restart
+/// and starts it again with the newest checkpoint the intake accepted — as
+/// `AGENT_COMPOSE_CHECKPOINT` and in place of the `{checkpoint}` argument — and
+/// it resumes from fifty-one. Exactly a hundred executions, one per event id;
+/// the restart row is in the journal, on `GET /sources/feed` and in the serve
+/// log.
+#[test]
+fn a_command_source_that_exits_part_way_is_restarted_from_its_checkpoint_and_starts_one_execution_per_event()
+ {
+    let scratch = harness::Scratch::new("feed-restart");
+    let Some(project) = harness::scratch_project("feed-restart") else {
+        return;
+    };
+    let environment = feed_environment(
+        scratch.path(),
+        &[("FEED_TOTAL", "100"), ("FEED_EXIT_AFTER", "50")],
+    );
+    let Some(mut served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let status = eventually(Duration::from_secs(90), "the hundredth event", || {
+        let status = source(&app, "feed");
+        (status["checkpoint"] == "100" && completed_of(&project, "ingest") == 100).then_some(status)
+    });
+
+    let ids = ids_of(&project, "ingest");
+    assert_eq!(
+        ids.keys().cloned().collect::<BTreeSet<_>>(),
+        ids_through(100),
+        "one execution per event id"
+    );
+    assert!(
+        ids.values().all(|count| *count == 1),
+        "exactly one execution per event: {ids:?}"
+    );
+
+    // How the program was started: with nothing, then with the fiftieth event's
+    // checkpoint, in both places the runtime hands it back.
+    let starts: Vec<Value> = lines_of(&scratch.path().join("starts.log"))
+        .iter()
+        .map(|line| serde_json::from_str(line).expect("a JSON start"))
+        .collect();
+    assert_eq!(
+        starts,
+        [
+            json!({ "argument": "", "variable": null }),
+            json!({ "argument": "50", "variable": "50" })
+        ],
+        "the program was started twice, the second time from the checkpoint it last had accepted"
+    );
+
+    // The restart, on the route and in the journal.
+    assert_eq!(status["restart_count"], 1, "{status}");
+    let restart = &status["restarts"][0];
+    assert_eq!(restart["exit_code"], 0, "{status}");
+    assert_eq!(restart["signal"], Value::Null, "{status}");
+    assert_eq!(restart["attempt"], 1, "{status}");
+    assert_eq!(
+        restart["backoff_ms"], 200,
+        "`restart.backoff: 200ms` is the first delay: {status}"
+    );
+    let rows = harness::journal_rows(
+        &project,
+        "SELECT source, exit_code, attempt FROM restarts WHERE source = 'feed'",
+    );
+    assert_eq!(
+        rows,
+        json!([{ "source": "feed", "exit_code": 0, "attempt": 1 }]),
+        "the restart is a journaled row"
+    );
+
+    let said = served.stop_and_read_stderr();
+    assert!(
+        said.contains("event source `feed`: the program exited with code 0 after")
+            && said.contains("restarting it in 200ms (restart 1 in a row)"),
+        "the serve log names the restart: {said}"
+    );
+    assert!(
+        said.contains("event source `feed`: started `node`")
+            && said.contains("with checkpoint \"50\""),
+        "…and the start that resumed from the checkpoint: {said}"
+    );
+}
+
+/// The restart policy (grammar 14.4, PRD resolved q78 ruling c): a program
+/// that keeps exiting is started again after `restart.backoff`, the delay
+/// doubling per consecutive restart up to `restart.max` — and a run that lasted
+/// longer than `restart.max` starts the doubling over.
+///
+/// The fixture's `restart:` is `{ backoff: 200ms, max: 2s }`. With
+/// `FEED_EXIT_AFTER=0` the program emits nothing and exits at once, every time
+/// (nothing was accepted, so no start is a resumed one): the restart rows climb
+/// 200, 400, 800, 1600 and stop at 2000, attempts one to five. With
+/// `FEED_RUN_MS` past the ceiling every run is a long one, so every restart is
+/// the first of its run again, at the first delay.
+#[test]
+fn a_program_that_keeps_exiting_is_restarted_after_a_backoff_that_doubles_to_its_max_and_starts_over_after_a_long_run()
+ {
+    let rows = |app: &Client, want: u64| -> Vec<(u64, u64)> {
+        let status = eventually(Duration::from_secs(60), &format!("{want} restarts"), || {
+            let status = source(app, "feed");
+            (status["restart_count"].as_u64().unwrap_or(0) >= want).then_some(status)
+        });
+        let mut rows: Vec<(u64, u64)> = status["restarts"]
+            .as_array()
+            .expect("restart rows")
+            .iter()
+            .map(|row| {
+                (
+                    row["attempt"].as_u64().expect("an attempt"),
+                    row["backoff_ms"].as_u64().expect("a backoff"),
+                )
+            })
+            .collect();
+        rows.reverse();
+        rows.truncate(usize::try_from(want).expect("a count"));
+        rows
+    };
+
+    let scratch = harness::Scratch::new("feed-backoff");
+    let Some(project) = harness::scratch_project("feed-backoff") else {
+        return;
+    };
+    let environment = feed_environment(scratch.path(), &[("FEED_EXIT_AFTER", "0")]);
+    let Some(served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    assert_eq!(
+        rows(&app, 5),
+        [(1, 200), (2, 400), (3, 800), (4, 1600), (5, 2000)],
+        "the delay doubles per consecutive restart and stops at `restart.max`"
+    );
+    drop(served);
+
+    let scratch = harness::Scratch::new("feed-long-runs");
+    let Some(project) = harness::scratch_project("feed-long-runs") else {
+        return;
+    };
+    let environment = feed_environment(
+        scratch.path(),
+        &[("FEED_EXIT_AFTER", "0"), ("FEED_RUN_MS", "2500")],
+    );
+    let Some(served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    assert_eq!(
+        rows(&app, 2),
+        [(1, 200), (1, 200)],
+        "a run longer than `restart.max` starts the doubling over"
+    );
+    drop(served);
+}
+
+/// "Dedupe on `payload.id`": a program that re-emits events after its restart
+/// — the at-least-once a real source gives — starts nothing for the repeats.
+///
+/// The program exits after fifty-five and, restarted with that checkpoint,
+/// rewinds eleven and emits forty-five onwards, so forty-five through
+/// fifty-five arrive twice. Each repeat is a key the `ingest` trigger already
+/// admitted (`dedupe_key:` defaults to `payload.id`, which is the
+/// `checkpoint:` value), so it starts nothing, advances the checkpoint and is
+/// logged — and there are still exactly a hundred executions.
+#[test]
+fn a_restarted_program_that_re_emits_events_starts_nothing_for_the_repeats() {
+    let scratch = harness::Scratch::new("feed-repeats");
+    let Some(project) = harness::scratch_project("feed-repeats") else {
+        return;
+    };
+    let environment = feed_environment(
+        scratch.path(),
+        &[
+            ("FEED_TOTAL", "100"),
+            ("FEED_EXIT_AFTER", "55"),
+            ("FEED_REWIND", "11"),
+        ],
+    );
+    let Some(mut served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    eventually(Duration::from_secs(90), "the hundredth event", || {
+        (source(&app, "feed")["checkpoint"] == "100" && completed_of(&project, "ingest") == 100)
+            .then_some(())
+    });
+
+    let emitted = lines_of(&scratch.path().join("emitted.log"));
+    let repeated: Vec<&String> = emitted
+        .iter()
+        .filter(|seq| emitted.iter().filter(|other| other == seq).count() == 2)
+        .collect();
+    assert_eq!(
+        repeated.len(),
+        22,
+        "the program emitted forty-five through fifty-five twice: {emitted:?}"
+    );
+    let ids = ids_of(&project, "ingest");
+    assert_eq!(
+        ids.keys().cloned().collect::<BTreeSet<_>>(),
+        ids_through(100)
+    );
+    assert!(
+        ids.values().all(|count| *count == 1),
+        "a repeat started nothing: {ids:?}"
+    );
+    let said = served.stop_and_read_stderr();
+    assert_eq!(
+        said.matches("repeats one `ingest` already admitted as")
+            .count(),
+        11,
+        "each repeat is logged: {said}"
+    );
+}
+
+/// "Restart mid-stream": `serve` is killed while its program is emitting, and
+/// started again over the same journal.
+///
+/// The program in the killed `serve` was in the middle of its stream; the
+/// second `serve` starts it with the checkpoint the first had **accepted** —
+/// read out of the journal before the restart, which is the only place a
+/// `SIGKILL`ed process left it — and nothing is lost or doubled: across the
+/// whole run every id the program ever emitted (its own emission log is the
+/// oracle) has exactly one execution.
+#[test]
+fn a_serve_killed_mid_stream_restarts_its_program_from_the_accepted_checkpoint_and_loses_nothing() {
+    let scratch = harness::Scratch::new("feed-killed");
+    let Some(project) = harness::scratch_project("feed-killed") else {
+        return;
+    };
+    let environment = feed_environment(
+        scratch.path(),
+        &[("FEED_TOTAL", "100"), ("FEED_PACE_MS", "20")],
+    );
+    {
+        let Some(first) = harness::serve_into(&project, "command-source", &environment) else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        eventually(Duration::from_secs(60), "thirty events admitted", || {
+            let held = source(&app, "feed")["checkpoint"]
+                .as_str()
+                .map(str::to_string);
+            held.and_then(|checkpoint| checkpoint.parse::<u32>().ok())
+                .filter(|checkpoint| *checkpoint >= 30)
+        });
+        // Dropping it SIGKILLs the app mid-stream.
+    }
+    let accepted: String = {
+        let rows = harness::journal_rows(
+            &project,
+            "SELECT checkpoint_value FROM checkpoints WHERE source = 'feed'",
+        );
+        let written = rows[0]["checkpoint_value"]
+            .as_str()
+            .expect("a checkpoint row");
+        serde_json::from_str(written).expect("a checkpoint is journaled as JSON")
+    };
+    assert!(
+        accepted.parse::<u32>().expect("a sequence number") < 100,
+        "the kill landed mid-stream, at {accepted}"
+    );
+
+    let Some(mut second) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&second.base_url).expect("a client for the generated app");
+    eventually(Duration::from_secs(90), "the hundredth event", || {
+        (source(&app, "feed")["checkpoint"] == "100" && completed_of(&project, "ingest") == 100)
+            .then_some(())
+    });
+
+    let starts: Vec<Value> = lines_of(&scratch.path().join("starts.log"))
+        .iter()
+        .map(|line| serde_json::from_str(line).expect("a JSON start"))
+        .collect();
+    assert_eq!(
+        starts.last(),
+        Some(&json!({ "argument": accepted, "variable": accepted })),
+        "the second serve started the program from the checkpoint the first had accepted: {starts:?}"
+    );
+    let emitted: BTreeSet<String> = lines_of(&scratch.path().join("emitted.log"))
+        .into_iter()
+        .collect();
+    let ids = ids_of(&project, "ingest");
+    assert_eq!(
+        emitted,
+        ids_through(100),
+        "the oracle: the program emitted every id"
+    );
+    assert_eq!(
+        ids.keys().cloned().collect::<BTreeSet<_>>(),
+        emitted,
+        "no event was lost"
+    );
+    assert!(
+        ids.values().all(|count| *count == 1),
+        "no event was doubled: {ids:?}"
+    );
+    second.stop();
+}
+
+/// A line that is not a JSON object is refused: logged with the source and its
+/// line number, counted on `GET /sources/:name`, and never an execution.
+#[test]
+fn a_line_that_is_not_a_json_object_is_refused_counted_and_starts_nothing() {
+    let scratch = harness::Scratch::new("feed-garbage");
+    let Some(project) = harness::scratch_project("feed-garbage") else {
+        return;
+    };
+    let environment = feed_environment(
+        scratch.path(),
+        &[("FEED_TOTAL", "3"), ("FEED_GARBAGE", "1")],
+    );
+    let Some(mut served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let status = eventually(Duration::from_secs(60), "the third event", || {
+        let status = source(&app, "feed");
+        (status["checkpoint"] == "3" && completed_of(&project, "ingest") == 3).then_some(status)
+    });
+    assert_eq!(status["refused_lines"], 2, "{status}");
+    assert_eq!(status["accepted_events"], 3, "{status}");
+    assert_eq!(
+        ids_of(&project, "ingest")
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        ids_through(3),
+        "only the three events started executions"
+    );
+    let said = served.stop_and_read_stderr();
+    assert!(
+        said.contains("event source `feed`: line 1 is not a JSON object, so it was refused and starts nothing (1 refused so far)")
+            && said.contains("event source `feed`: line 2 is not a JSON object, so it was refused and starts nothing (2 refused so far)"),
+        "each refusal names the source and the line: {said}"
+    );
+}
+
+/// A line whose `checkpoint:` cannot be evaluated is refused like a line that
+/// is not an object — counted, logged, and never an execution (grammar 14.4,
+/// Decision D162's Status) — and the stream goes on past it.
+///
+/// The fixture's `checkpoint:` is `payload.body.cursor`, which `text()` holds
+/// to a string. Before its third event the program emits two lines that are
+/// JSON objects and still have no checkpoint: one with no `cursor` (line 3), and
+/// one whose `cursor` is the number `3` (line 4). Both are refused, counted on
+/// `GET /sources/feed` and named in the serve log by their line; neither starts
+/// an execution or moves the checkpoint; and the two events after them are each
+/// admitted and move it on to "4". A refusal that escaped the line's admission
+/// instead would leave the program's stdout paused for good, so the last two
+/// events would never arrive.
+#[test]
+fn a_line_whose_checkpoint_cannot_be_evaluated_is_refused_and_the_events_after_it_start() {
+    let scratch = harness::Scratch::new("feed-unreadable");
+    let Some(project) = harness::scratch_project("feed-unreadable") else {
+        return;
+    };
+    let environment = feed_environment(
+        scratch.path(),
+        &[("FEED_TOTAL", "4"), ("FEED_UNREADABLE_AT", "3")],
+    );
+    let Some(mut served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let status = eventually(
+        Duration::from_secs(60),
+        "the two events after the unreadable lines",
+        || {
+            let status = source(&app, "feed");
+            (status["checkpoint"] == "4" && completed_of(&project, "ingest") == 4).then_some(status)
+        },
+    );
+    assert_eq!(
+        status["refused_lines"], 2,
+        "both unreadable lines are refused and counted: {status}"
+    );
+    assert_eq!(status["accepted_events"], 4, "{status}");
+    assert_eq!(
+        status["restart_count"], 0,
+        "the program was never restarted: {status}"
+    );
+    let ids = ids_of(&project, "ingest");
+    assert_eq!(
+        ids.keys().cloned().collect::<BTreeSet<_>>(),
+        ids_through(4),
+        "the two unreadable lines started nothing"
+    );
+    assert!(
+        ids.values().all(|count| *count == 1),
+        "exactly one execution per event: {ids:?}"
+    );
+    assert_eq!(journaled_checkpoint(&project).as_deref(), Some("4"));
+    let said = served.stop_and_read_stderr();
+    for (line, why, count) in [
+        (
+            3,
+            "`payload.body.cursor` is not present: nothing has supplied it",
+            1,
+        ),
+        (
+            4,
+            "`checkpoint` of the event source `feed` answered 3 rather than a string",
+            2,
+        ),
+    ] {
+        let refusal = format!(
+            "event source `feed`: line {line}'s `checkpoint` could not be read ({why}), so it was refused and starts nothing ({count} refused so far)"
+        );
+        assert!(said.contains(&refusal), "{refusal}\n{said}");
+    }
+    for seq in 1..=4 {
+        assert!(
+            said.contains(&format!("event source `feed`: event \"{seq}\" started ")),
+            "event {seq} started an execution: {said}"
+        );
+    }
+}
+
+/// A checkpoint is handed back to every start of the program — as
+/// `AGENT_COMPOSE_CHECKPOINT` and as the `{checkpoint}` argument — so a line
+/// whose checkpoint no program could be handed back unchanged is refused before
+/// it is admitted, as one whose `checkpoint:` cannot be evaluated is (grammar
+/// 14.4, `docs/durability.md` §3.13).
+///
+/// The program emits three events and then, before it exits, three lines whose
+/// `cursor` — the fixture's `checkpoint:` — holds a NUL (no argument or
+/// environment variable carries one, so the start would throw), a lone UTF-16
+/// surrogate (it would reach the program as U+FFFD), and 65537 bytes (past the
+/// 64 KiB a checkpoint may be). Each is refused and counted, and the checkpoint
+/// stays at "3": so the restart — which, handed any of the three, would have
+/// failed every time and for good — starts the program with "3", and it goes on
+/// to emit the last two events.
+#[test]
+fn a_line_whose_checkpoint_no_program_could_be_handed_is_refused_and_the_restart_still_starts() {
+    let scratch = harness::Scratch::new("feed-unhandable");
+    let Some(project) = harness::scratch_project("feed-unhandable") else {
+        return;
+    };
+    let environment = feed_environment(
+        scratch.path(),
+        &[
+            ("FEED_TOTAL", "5"),
+            ("FEED_EXIT_AFTER", "3"),
+            ("FEED_UNHANDABLE", "1"),
+        ],
+    );
+    let Some(mut served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let status = eventually(
+        Duration::from_secs(60),
+        "the fifth event, after the restart",
+        || {
+            let status = source(&app, "feed");
+            (status["checkpoint"] == "5" && completed_of(&project, "ingest") == 5).then_some(status)
+        },
+    );
+    assert_eq!(status["refused_lines"], 3, "{status}");
+    assert_eq!(status["accepted_events"], 5, "{status}");
+    assert_eq!(
+        status["restart_count"], 1,
+        "one exit, and one start after it that did not fail: {status}"
+    );
+    let ids = ids_of(&project, "ingest");
+    assert_eq!(
+        ids.keys().cloned().collect::<BTreeSet<_>>(),
+        ids_through(5),
+        "the three refused lines started nothing"
+    );
+    assert!(
+        ids.values().all(|count| *count == 1),
+        "exactly one execution per event: {ids:?}"
+    );
+    let starts: Vec<Value> = lines_of(&scratch.path().join("starts.log"))
+        .iter()
+        .map(|line| serde_json::from_str(line).expect("a JSON start"))
+        .collect();
+    assert_eq!(
+        starts,
+        [
+            json!({ "argument": "", "variable": null }),
+            json!({ "argument": "3", "variable": "3" })
+        ],
+        "the restart was handed the last checkpoint a program can be handed"
+    );
+    assert_eq!(journaled_checkpoint(&project).as_deref(), Some("5"));
+    let said = served.stop_and_read_stderr();
+    for (line, why, count) in [
+        (
+            4,
+            "it holds a NUL character, which no program argument or environment variable can carry",
+            1,
+        ),
+        (
+            5,
+            "it holds a lone UTF-16 surrogate, which has no UTF-8 encoding to hand a program",
+            2,
+        ),
+        (
+            6,
+            "it is 65537 bytes long, and a checkpoint is at most 65536: it is handed to every start of the program as an argument and an environment variable, which a host bounds",
+            3,
+        ),
+    ] {
+        let refusal = format!(
+            "event source `feed`: line {line}'s `checkpoint` could not be handed back to the program ({why}), so it was refused and starts nothing ({count} refused so far)"
+        );
+        assert!(said.contains(&refusal), "{refusal}\n{said}");
+    }
+    assert!(
+        !said.contains("the program could not be started"),
+        "every start succeeded: {said}"
+    );
+}
+
+/// The framing of a program's two streams (grammar 14.4): a stdout line is at
+/// most 1 MiB, and one past it is refused **once** — the rest of it, up to its
+/// newline, dropped rather than read as a line of its own; a stderr line past
+/// the same bound is logged cut there, its rest dropped the same way; and a
+/// last line the program ends without a newline is admitted when its stdout
+/// closes, on either stream.
+///
+/// The program writes, on stderr, a line of 1.5 MiB and a short line after it;
+/// on stdout, event 1 (line 1), event 2 padded to exactly 1 MiB (line 2, at the
+/// bound and so admitted), an event object of 1.5 MiB (line 3, refused for its
+/// length alone), event 3 (line 4 — the line after the refused one, and not a
+/// fragment of it); then a stderr fragment and event 4 with no newline after
+/// either, and exits. Event 4 starting an execution, and the restart being
+/// handed its checkpoint, is the unterminated line's admission.
+#[test]
+fn a_programs_lines_are_bounded_at_one_mib_and_its_last_unterminated_line_is_admitted() {
+    let scratch = harness::Scratch::new("feed-framing");
+    let Some(project) = harness::scratch_project("feed-framing") else {
+        return;
+    };
+    let environment = feed_environment(
+        scratch.path(),
+        &[("FEED_TOTAL", "4"), ("FEED_FRAMING", "1")],
+    );
+    let Some(mut served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let starts_log = scratch.path().join("starts.log");
+    let status = eventually(
+        Duration::from_secs(60),
+        "the fourth event and the restart after it",
+        || {
+            let status = source(&app, "feed");
+            (status["checkpoint"] == "4"
+                && completed_of(&project, "ingest") == 4
+                && lines_of(&starts_log).len() == 2)
+                .then_some(status)
+        },
+    );
+    assert_eq!(
+        status["refused_lines"], 1,
+        "the line past the bound is refused once, and its tail is not a line: {status}"
+    );
+    assert_eq!(status["accepted_events"], 4, "{status}");
+    let ids = ids_of(&project, "ingest");
+    assert_eq!(
+        ids.keys().cloned().collect::<BTreeSet<_>>(),
+        ids_through(4),
+        "the 1 MiB event and the unterminated last one both started executions"
+    );
+    assert!(
+        ids.values().all(|count| *count == 1),
+        "exactly one execution per event: {ids:?}"
+    );
+    let starts: Vec<Value> = lines_of(&starts_log)
+        .iter()
+        .map(|line| serde_json::from_str(line).expect("a JSON start"))
+        .collect();
+    assert_eq!(
+        starts,
+        [
+            json!({ "argument": "", "variable": null }),
+            json!({ "argument": "4", "variable": "4" })
+        ],
+        "the unterminated last line was admitted before the exit, so the restart resumes after it"
+    );
+
+    let said = served.stop_and_read_stderr();
+    assert!(
+        said.contains(
+            "event source `feed`: line 3 is not a JSON object, so it was refused and starts nothing (1 refused so far)"
+        ),
+        "the over-long line is line 3, refused: {}",
+        said.lines()
+            .filter(|line| line.starts_with("event source"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert!(
+        !said.contains("(2 refused so far)"),
+        "nothing after it was refused — its tail was not read as a line"
+    );
+    for seq in 1..=4 {
+        assert!(
+            said.contains(&format!("event source `feed`: event \"{seq}\" started ")),
+            "event {seq} started an execution"
+        );
+    }
+    let cut = format!(
+        "[source feed] {} [cut: the line is longer than 1048576 bytes, and the rest of it is not logged]",
+        "e".repeat(1 << 20)
+    );
+    let long: Vec<&str> = said
+        .lines()
+        .filter(|line| line.starts_with("[source feed] e"))
+        .collect();
+    assert_eq!(
+        long.len(),
+        1,
+        "the 1.5 MiB stderr line is logged once, and its tail never as a line of its own"
+    );
+    assert!(long[0] == cut, "…cut at 1 MiB, saying so");
+    assert!(
+        said.lines()
+            .any(|line| line == "[source feed] after the long line"),
+        "the stderr line after the cut one is logged whole"
+    );
+    assert!(
+        said.lines()
+            .any(|line| line == "[source feed] the last words, unterminated"),
+        "the stderr fragment the program ended on is logged"
+    );
+}
+
+/// The checkpoint the journal holds for the `feed` source, decoded, or none.
+fn journaled_checkpoint(project: &Path) -> Option<String> {
+    let rows = harness::journal_rows(
+        project,
+        "SELECT checkpoint_value FROM checkpoints WHERE source = 'feed'",
+    );
+    rows[0]["checkpoint_value"]
+        .as_str()
+        .map(|written| serde_json::from_str(written).expect("a checkpoint is journaled as JSON"))
+}
+
+/// The checkpoint moves only once the intake has **accepted** the event (PRD
+/// resolved q78 ruling c, `docs/durability.md` §3.13): an event every bound
+/// trigger refuses leaves the journaled checkpoint at the event before it.
+///
+/// The program emits three events, then a fourth whose `seq` is not the
+/// integer `flow.ingest`'s `inputs:` asks for — so `input:` binds nothing the
+/// flow accepts and `ingest` refuses it — and then a line that is not JSON.
+/// Lines are taken in one at a time, so that last line's refusal being counted
+/// on `GET /sources/feed` is the sign the fourth event has been dealt with; at
+/// that moment the checkpoint, on the route and in the journal, is still "3". A
+/// checkpoint journaled before the intake decided would read "4", and a
+/// restarted program would be handed a position past an event nothing started.
+#[test]
+fn an_event_every_bound_trigger_refuses_leaves_the_journaled_checkpoint_where_it_was() {
+    let scratch = harness::Scratch::new("feed-unbindable");
+    let Some(project) = harness::scratch_project("feed-unbindable") else {
+        return;
+    };
+    let environment = feed_environment(
+        scratch.path(),
+        &[("FEED_TOTAL", "3"), ("FEED_UNBINDABLE", "1")],
+    );
+    let Some(mut served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let status = eventually(
+        Duration::from_secs(60),
+        "the line after the unbindable event",
+        || {
+            let status = source(&app, "feed");
+            (status["refused_lines"] == 1 && completed_of(&project, "ingest") == 3)
+                .then_some(status)
+        },
+    );
+    assert_eq!(
+        status["checkpoint"], "3",
+        "the refused event moved no checkpoint: {status}"
+    );
+    assert_eq!(status["accepted_events"], 3, "{status}");
+    assert_eq!(
+        journaled_checkpoint(&project).as_deref(),
+        Some("3"),
+        "…in the journal either"
+    );
+    assert_eq!(
+        ids_of(&project, "ingest")
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        ids_through(3),
+        "the fourth event started nothing"
+    );
+    let said = served.stop_and_read_stderr();
+    assert!(
+        said.contains(
+            "event source `feed`: event \"4\" started nothing for `ingest`: the trigger `ingest` could not bind this event:"
+        ),
+        "the refusal names the event and the trigger: {said}"
+    );
+}
+
+/// An event the **journal** will not admit holds the stream and moves no
+/// checkpoint (`docs/durability.md` §3.13, Decision D162's Status): the
+/// consumer retries the admission with backoff, reads no further line, and the
+/// checkpoint stays at the last event the intake accepted until this one is.
+///
+/// The program emits three events and waits. The case installs a SQLite trigger
+/// on the journal's `dedupe` table that refuses every claim, and lets the
+/// program go on with three more. For three seconds the fourth event's
+/// admission is refused — the serve log, read at the end, says it was, and that
+/// it was retried — and through all of it the checkpoint reads "3" on the
+/// route and in the journal. The trigger is dropped, the retry admits the
+/// fourth, and each of the last three starts one execution.
+#[test]
+fn an_event_the_journal_will_not_admit_holds_the_stream_and_moves_no_checkpoint() {
+    let scratch = harness::Scratch::new("feed-unadmitted");
+    let Some(project) = harness::scratch_project("feed-unadmitted") else {
+        return;
+    };
+    let release = scratch.path().join("release");
+    let release_path = release.display().to_string();
+    let environment = feed_environment(
+        scratch.path(),
+        &[
+            ("FEED_TOTAL", "6"),
+            ("FEED_HOLD_AT", "4"),
+            ("FEED_HOLD_FILE", release_path.as_str()),
+        ],
+    );
+    let Some(mut served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    eventually(Duration::from_secs(60), "the third event", || {
+        (source(&app, "feed")["checkpoint"] == "3" && completed_of(&project, "ingest") == 3)
+            .then_some(())
+    });
+
+    let refused = harness::journal_sql(
+        &project,
+        "CREATE TRIGGER refuse_every_claim BEFORE INSERT ON dedupe BEGIN SELECT RAISE(ABORT, 'this journal refuses the claim'); END;",
+    );
+    assert!(
+        refused.status.success(),
+        "the trigger is installed: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    std::fs::write(&release, "").expect("the scratch directory is writable");
+    let emitted = scratch.path().join("emitted.log");
+    eventually(Duration::from_secs(30), "the fourth event emitted", || {
+        lines_of(&emitted)
+            .iter()
+            .any(|seq| seq == "4")
+            .then_some(())
+    });
+    let window = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < window {
+        let status = source(&app, "feed");
+        assert_eq!(
+            status["checkpoint"], "3",
+            "an event the journal refused moved no checkpoint: {status}"
+        );
+        assert_eq!(journaled_checkpoint(&project).as_deref(), Some("3"));
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert_eq!(
+        executions_of(&project, "ingest").len(),
+        3,
+        "nothing started while the journal refused the claim"
+    );
+
+    let dropped = harness::journal_sql(&project, "DROP TRIGGER refuse_every_claim;");
+    assert!(
+        dropped.status.success(),
+        "the trigger is dropped: {}",
+        String::from_utf8_lossy(&dropped.stderr)
+    );
+    eventually(Duration::from_secs(60), "the sixth event", || {
+        (source(&app, "feed")["checkpoint"] == "6" && completed_of(&project, "ingest") == 6)
+            .then_some(())
+    });
+    let ids = ids_of(&project, "ingest");
+    assert_eq!(ids.keys().cloned().collect::<BTreeSet<_>>(), ids_through(6));
+    assert!(
+        ids.values().all(|count| *count == 1),
+        "each event started once, the held one included: {ids:?}"
+    );
+    let said = served.stop_and_read_stderr();
+    assert!(
+        said.contains(
+            "event source `feed`: event \"4\" could not be admitted to `ingest` (this journal refuses the claim); trying it again in 1000ms, and reading no further line until it is"
+        ),
+        "the window was real: the fourth event's admission was refused and retried: {said}"
+    );
+}
+
+/// An event whose **execution** the journal will not begin holds the stream,
+/// moves no checkpoint and is not lost (`docs/durability.md` §3.12, §3.13, PRD
+/// resolved q78 ruling c): the intake says an event started an execution only
+/// once that execution's lifecycle row is journaled, never as soon as its run
+/// is set going.
+///
+/// The program emits three events and waits. The case installs a SQLite
+/// trigger on the journal's `executions` table that refuses every lifecycle
+/// row, and lets the program go on with three more. The fourth event's dedupe
+/// claim lands — it is the row after it that is refused — which is the case a
+/// consumer told "started" too early loses for good: its checkpoint would read
+/// "6", the claims for 4 to 6 would name executions that never began, and a
+/// restart would hand the program "6". Here, for three seconds, the checkpoint
+/// reads "3" on the route and in the journal and nothing past the third has a
+/// lifecycle row. The trigger is dropped, the retry takes the fourth event's
+/// claim over, and each of the last three starts exactly one execution, whose
+/// id is the one its key now names.
+#[test]
+fn an_event_whose_execution_the_journal_will_not_begin_holds_the_stream_and_is_not_lost() {
+    let scratch = harness::Scratch::new("feed-unbegun");
+    let Some(project) = harness::scratch_project("feed-unbegun") else {
+        return;
+    };
+    let release = scratch.path().join("release");
+    let release_path = release.display().to_string();
+    let environment = feed_environment(
+        scratch.path(),
+        &[
+            ("FEED_TOTAL", "6"),
+            ("FEED_HOLD_AT", "4"),
+            ("FEED_HOLD_FILE", release_path.as_str()),
+        ],
+    );
+    let Some(mut served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    eventually(Duration::from_secs(60), "the third event", || {
+        (source(&app, "feed")["checkpoint"] == "3" && completed_of(&project, "ingest") == 3)
+            .then_some(())
+    });
+
+    let refused = harness::journal_sql(
+        &project,
+        "CREATE TRIGGER refuse_every_execution BEFORE INSERT ON executions BEGIN SELECT RAISE(ABORT, 'this journal refuses the execution'); END;",
+    );
+    assert!(
+        refused.status.success(),
+        "the trigger is installed: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    std::fs::write(&release, "").expect("the scratch directory is writable");
+    let emitted = scratch.path().join("emitted.log");
+    eventually(Duration::from_secs(30), "the fourth event emitted", || {
+        lines_of(&emitted)
+            .iter()
+            .any(|seq| seq == "4")
+            .then_some(())
+    });
+    // The fourth event's claim is down — the half of its admission the
+    // trigger lets through — so what the window below holds is the lifecycle
+    // row's refusal, not the claim's.
+    eventually(Duration::from_secs(30), "the fourth event's claim", || {
+        (!harness::journal_rows(
+            &project,
+            "SELECT execution FROM dedupe WHERE trigger_name = 'ingest' AND dedupe_key = '\"4\"'",
+        )
+        .as_array()
+        .expect("rows")
+        .is_empty())
+        .then_some(())
+    });
+    let window = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < window {
+        let status = source(&app, "feed");
+        assert_eq!(
+            status["checkpoint"], "3",
+            "an event whose execution never began moved no checkpoint: {status}"
+        );
+        assert_eq!(status["accepted_events"], 3, "{status}");
+        assert_eq!(journaled_checkpoint(&project).as_deref(), Some("3"));
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert_eq!(
+        executions_of(&project, "ingest").len(),
+        3,
+        "nothing past the third event has a lifecycle row"
+    );
+
+    let dropped = harness::journal_sql(&project, "DROP TRIGGER refuse_every_execution;");
+    assert!(
+        dropped.status.success(),
+        "the trigger is dropped: {}",
+        String::from_utf8_lossy(&dropped.stderr)
+    );
+    eventually(Duration::from_secs(60), "the sixth event", || {
+        (source(&app, "feed")["checkpoint"] == "6" && completed_of(&project, "ingest") == 6)
+            .then_some(())
+    });
+    let ids = ids_of(&project, "ingest");
+    assert_eq!(
+        ids.keys().cloned().collect::<BTreeSet<_>>(),
+        ids_through(6),
+        "the events whose executions the journal refused for a while were not lost"
+    );
+    assert!(
+        ids.values().all(|count| *count == 1),
+        "each event started once, the held one included: {ids:?}"
+    );
+    let fourth = executions_of(&project, "ingest")
+        .into_iter()
+        .find(|(_, inputs, _)| inputs["id"] == "4")
+        .map(|(id, _, _)| id)
+        .expect("an execution for event 4");
+    assert_eq!(
+        harness::journal_rows(
+            &project,
+            "SELECT execution FROM dedupe WHERE trigger_name = 'ingest' AND dedupe_key = '\"4\"'"
+        ),
+        json!([{ "execution": fourth }]),
+        "the fourth event's key names the execution that began, not the one refused"
+    );
+    let said = served.stop_and_read_stderr();
+    assert!(
+        said.contains("event source `feed`: event \"4\" could not be admitted to `ingest` (its execution exec_")
+            && said.contains(
+                "could not be journaled: this journal refuses the execution); trying it again in 1000ms, and reading no further line until it is"
+            ),
+        "the window was real: the fourth event's execution was refused and the admission retried: {said}"
+    );
+    assert!(
+        said.contains(&format!(
+            "event source `feed`: event \"4\" started {fourth} for `ingest`"
+        )),
+        "the start the serve log names is the one that began: {said}"
+    );
+    assert_eq!(
+        said.matches("event source `feed`: event \"4\" started ")
+            .count(),
+        1,
+        "and it is the only start the serve log claims for event 4: {said}"
+    );
+}
+
+/// A dedupe claim whose execution **never began** is taken over rather than
+/// honoured (`docs/durability.md` §3.12, Decision D162's Status).
+///
+/// A `serve` that died between claiming an event's key and journaling the
+/// execution it claimed it for leaves a row naming an execution nothing will
+/// ever recover; honoured, every later delivery of the event would be a
+/// "repeat" and the event would be lost for good. The case writes that row
+/// itself — key "1" held for an execution id the journal has no lifecycle row
+/// for — into a journal a `run` created, and serves: event 1 still starts
+/// exactly one execution, and the row now names it.
+#[test]
+fn a_dedupe_claim_whose_execution_never_began_is_taken_over_by_the_next_event_with_its_key() {
+    let scratch = harness::Scratch::new("feed-retake");
+    let Some(project) = harness::scratch_project("feed-retake") else {
+        return;
+    };
+    let environment = feed_environment(scratch.path(), &[("FEED_TOTAL", "3")]);
+    harness::run_into(
+        &project,
+        "command-source",
+        "flow.ingest",
+        &[("id", "by hand"), ("seq", "0")],
+        None,
+        &environment,
+    )
+    .succeeded();
+    // `key_hash` is the SHA-256 of the key, `src/journal.ts`'s `keyHash`; the
+    // key itself is stored JSON-encoded.
+    let seeded = harness::journal_sql(
+        &project,
+        "INSERT INTO dedupe (trigger_name, key_hash, dedupe_key, execution, admitted_at) VALUES ('ingest', '6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b', '\"1\"', 'exec_00000000-0000-4000-8000-0000000dead1', '2026-01-01T00:00:00.000Z');",
+    );
+    assert!(
+        seeded.status.success(),
+        "the stranded claim is written: {}",
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+
+    let Some(mut served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    eventually(Duration::from_secs(60), "the third event", || {
+        (source(&app, "feed")["checkpoint"] == "3" && completed_of(&project, "ingest") == 3)
+            .then_some(())
+    });
+    let ids = ids_of(&project, "ingest");
+    assert_eq!(
+        ids.keys().cloned().collect::<BTreeSet<_>>(),
+        ids_through(3),
+        "event 1 was not lost to the stranded claim"
+    );
+    assert!(ids.values().all(|count| *count == 1), "{ids:?}");
+    let first = executions_of(&project, "ingest")
+        .into_iter()
+        .find(|(_, inputs, _)| inputs["id"] == "1")
+        .map(|(id, _, _)| id)
+        .expect("an execution for event 1");
+    assert_eq!(
+        harness::journal_rows(
+            &project,
+            "SELECT execution FROM dedupe WHERE trigger_name = 'ingest' AND dedupe_key = '\"1\"'"
+        ),
+        json!([{ "execution": first }]),
+        "the key now names the execution that began"
+    );
+    let said = served.stop_and_read_stderr();
+    assert!(
+        said.contains(&format!(
+            "event source `feed`: event \"1\" started {first} for `ingest`"
+        )) && !said.contains("event \"1\" repeats one"),
+        "event 1 started, and was never answered as a repeat: {said}"
+    );
+}
+
+/// A source whose checkpoint the journal **cannot read** when `serve` starts
+/// does not have its program started as if there were none (PRD resolved q78
+/// ruling c: the checkpoint is handed back on restart).
+///
+/// A first `serve` admits three events, so the journal holds checkpoint "3".
+/// The case then makes that row unreadable — a value that is not the JSON the
+/// journal writes — and starts a second `serve`: for three seconds, across
+/// retries, the program is not started at all. The row is put right, the next
+/// retry reads it, and the program is started from "3" — never from the empty
+/// position that would have made it re-emit everything, or, for a program whose
+/// first start means "from the tip", skip what it had not yet emitted.
+#[test]
+fn a_checkpoint_the_journal_cannot_read_at_start_holds_the_program_until_it_can() {
+    let scratch = harness::Scratch::new("feed-unread");
+    let Some(project) = harness::scratch_project("feed-unread") else {
+        return;
+    };
+    let environment = feed_environment(scratch.path(), &[("FEED_TOTAL", "3")]);
+    {
+        let Some(first) = harness::serve_into(&project, "command-source", &environment) else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        eventually(Duration::from_secs(60), "the third event", || {
+            (source(&app, "feed")["checkpoint"] == "3" && completed_of(&project, "ingest") == 3)
+                .then_some(())
+        });
+    }
+    let starts = scratch.path().join("starts.log");
+    assert_eq!(
+        lines_of(&starts).len(),
+        1,
+        "the first serve started it once"
+    );
+    let spoiled = harness::journal_sql(
+        &project,
+        "UPDATE checkpoints SET checkpoint_value = 'not the JSON the journal writes' WHERE source = 'feed';",
+    );
+    assert!(
+        spoiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&spoiled.stderr)
+    );
+
+    let Some(mut second) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        lines_of(&starts).len(),
+        1,
+        "the program is not started while its checkpoint cannot be read"
+    );
+    let mended = harness::journal_sql(
+        &project,
+        "UPDATE checkpoints SET checkpoint_value = '\"3\"' WHERE source = 'feed';",
+    );
+    assert!(
+        mended.status.success(),
+        "{}",
+        String::from_utf8_lossy(&mended.stderr)
+    );
+    let restarted = eventually(
+        Duration::from_secs(30),
+        "the program's second start",
+        || {
+            let started = lines_of(&starts);
+            (started.len() == 2).then(|| started[1].clone())
+        },
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&restarted).expect("a JSON start"),
+        json!({ "argument": "3", "variable": "3" }),
+        "the program was started from the journaled checkpoint, once it could be read"
+    );
+    let app = Client::new(&second.base_url).expect("a client for the generated app");
+    let status = source(&app, "feed");
+    assert_eq!(status["checkpoint"], "3", "{status}");
+    assert_eq!(
+        ids_of(&project, "ingest")
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        ids_through(3),
+        "nothing was emitted twice"
+    );
+    let said = second.stop_and_read_stderr();
+    assert!(
+        said.contains("event source `feed`: the journal could not say its checkpoint (")
+            && said.contains("so the program is not started yet; trying again in 1000ms"),
+        "the serve log says why the program waits: {said}"
+    );
+}
+
+/// `GET /sources/:name`: `404` for a name the target does not declare, and the
+/// state of one it does — its shape pinned key for key.
+///
+/// **Open to any caller**, and that is the q32 reading one level up rather than
+/// an omission: the route enforces the `auth:` of the `event` triggers bound to
+/// the source, and grammar 13.5 gives an `event` trigger no `auth:` — so, as an
+/// execution a no-auth trigger started keeps open routes, so does its source
+/// (Decision D162's Status names the reading). The executions the source
+/// started are reported under their trigger's name on the status route, which
+/// is open on the same reading.
+#[test]
+fn the_source_status_route_answers_its_state_and_refuses_a_name_the_target_does_not_declare() {
+    let scratch = harness::Scratch::new("feed-status");
+    let Some(project) = harness::scratch_project("feed-status") else {
+        return;
+    };
+    let environment = feed_environment(scratch.path(), &[("FEED_TOTAL", "3")]);
+    let Some(served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let unknown = app.get("/sources/nope").expect("the route answers");
+    assert_eq!(unknown.status, 404, "{}", unknown.text());
+    assert_eq!(
+        unknown.json(),
+        json!({ "error": "no event source `nope` is declared under this target (grammar 14.4)" })
+    );
+
+    let status = eventually(Duration::from_secs(60), "the third event", || {
+        let status = source(&app, "feed");
+        (status["checkpoint"] == "3" && completed_of(&project, "ingest") == 3).then_some(status)
+    });
+    let keys: BTreeSet<&str> = status
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        BTreeSet::from([
+            "source",
+            "kind",
+            "triggers",
+            "state",
+            "running_since",
+            "checkpoint",
+            "accepted_events",
+            "refused_lines",
+            "restart_count",
+            "restarts",
+        ]),
+        "{status}"
+    );
+    assert_eq!(status["source"], "feed");
+    assert_eq!(status["kind"], "command");
+    assert_eq!(status["triggers"], json!(["ingest"]));
+    assert_eq!(status["state"], "running");
+    assert_eq!(status["restart_count"], 0);
+    assert_eq!(status["restarts"], json!([]));
+
+    // An execution the source started answers its status route under its
+    // trigger's name, to a caller with no credential.
+    let (execution, inputs, _) = executions_of(&project, "ingest")
+        .into_iter()
+        .next()
+        .expect("an execution");
+    let report = harness::settled(&app, &execution);
+    assert_eq!(report["trigger"], "ingest", "{report}");
+    assert_eq!(report["status"], "completed", "{report}");
+    assert_eq!(inputs, json!({ "id": "1", "seq": 1 }));
+}
+
+/// Stopping `serve` ends its program's **whole process group**, even a program
+/// that ignores `SIGTERM` and the end of its stdin (grammar 14.4, PRD resolved
+/// q78 ruling c, Decision D160's exec discipline).
+///
+/// The program is started in a group of its own, so the group a stop signals
+/// is the program's and everything it started: the fixture's `FEED_LINGER`
+/// program starts a `sleep` beside itself and refuses to go quietly, which
+/// leaves `SIGTERM` to the group unanswered and the `SIGKILL` after the grace
+/// as the only thing that can end either process. Both are gone once `serve`
+/// has exited — no orphan outlives the app that started it.
+#[test]
+fn stopping_serve_ends_its_programs_whole_process_group_even_one_that_ignores_sigterm() {
+    let scratch = harness::Scratch::new("feed-linger");
+    let Some(project) = harness::scratch_project("feed-linger") else {
+        return;
+    };
+    let lingering = scratch.path().join("linger.pids");
+    let environment = feed_environment(
+        scratch.path(),
+        &[
+            ("FEED_TOTAL", "1"),
+            ("FEED_LINGER", &lingering.display().to_string()),
+        ],
+    );
+    let Some(mut served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let pids: Vec<i32> = eventually(Duration::from_secs(60), "the program's two pids", || {
+        let held: Vec<i32> = std::fs::read_to_string(&lingering)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect();
+        (held.len() == 2).then_some(held)
+    });
+    eventually(Duration::from_secs(60), "the one event", || {
+        (completed_of(&project, "ingest") == 1).then_some(())
+    });
+    let alive = |pid: i32| {
+        // SAFETY: signal 0 delivers nothing; it asks whether `pid` exists.
+        unsafe { libc::kill(pid, 0) == 0 }
+    };
+    assert!(
+        pids.iter().all(|pid| alive(*pid)),
+        "both run before the stop"
+    );
+
+    served.signal(libc::SIGTERM);
+    let status = served.wait();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a stop that was asked for is not a failure: {status:?}"
+    );
+    let still: Vec<i32> = eventually(Duration::from_secs(10), "the group to be gone", || {
+        let still: Vec<i32> = pids.iter().copied().filter(|pid| alive(*pid)).collect();
+        still.is_empty().then_some(still)
+    });
+    assert!(still.is_empty());
+}
+
+/// What a run of a program leaves in its process group is ended when the run
+/// ends, and what the newest run left is ended by the stop even while the
+/// source is backing off (grammar 14.4, PRD resolved q78 ruling c, Decision
+/// D162).
+///
+/// The fixture's `FEED_HELPER` starts a helper beside the program on every run
+/// — a `sleep` in the program's own group that ignores `SIGTERM` and holds none
+/// of its pipes — and `FEED_EXIT_CODE` makes every run exit once it has emitted
+/// its events, so the source crash-loops under `restart: { backoff: 200ms,
+/// max: 2s }` and every run ends with its helper still running. Each earlier
+/// run's helper is gone within the grace of its run's end while `serve` keeps
+/// restarting the program — `SIGTERM` to the group and then `SIGKILL`, the
+/// stop's sequence — rather than living on beside the restart; and once `serve`
+/// has been stopped while the source backs off, with no run to stop, no helper
+/// any run started is alive.
+#[test]
+fn what_a_run_leaves_in_its_process_group_is_ended_with_it_and_by_a_stop_while_backing_off() {
+    let scratch = harness::Scratch::new("feed-helpers");
+    let Some(project) = harness::scratch_project("feed-helpers") else {
+        return;
+    };
+    let helpers = scratch.path().join("helpers.pids");
+    let environment = feed_environment(
+        scratch.path(),
+        &[
+            ("FEED_TOTAL", "1"),
+            ("FEED_EXIT_CODE", "3"),
+            ("FEED_HELPER", &helpers.display().to_string()),
+        ],
+    );
+    let Some(mut served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let four = eventually(
+        Duration::from_secs(60),
+        "four runs, each with its helper",
+        || {
+            let held = pids_listed_in(&helpers);
+            (held.len() >= 4).then_some(held)
+        },
+    );
+    let earlier = &four[..3];
+    eventually(
+        Duration::from_secs(20),
+        "the helpers of the runs that ended and were restarted to be gone",
+        || earlier.iter().all(|pid| !running(*pid)).then_some(()),
+    );
+    let status = source(&app, "feed");
+    assert_ne!(
+        status["state"], "stopped",
+        "serve is still restarting the program: {status}"
+    );
+
+    eventually(Duration::from_secs(30), "the source backing off", || {
+        (source(&app, "feed")["state"] == "backing_off").then_some(())
+    });
+    served.signal(libc::SIGTERM);
+    let exit = served.wait();
+    assert_eq!(
+        exit.code(),
+        Some(0),
+        "a stop that was asked for is not a failure: {exit:?}"
+    );
+    // The stop sent the last group its `SIGKILL` before `serve` exited; the
+    // helpers' own exits may still be under way, and a helper nothing ended
+    // would live for ten minutes.
+    let every = pids_listed_in(&helpers);
+    eventually(
+        Duration::from_secs(10),
+        "every helper any run started to be gone",
+        || every.iter().all(|pid| !running(*pid)).then_some(()),
+    );
+}
+
+/// The pids the fixture listed in `path`, one per line, in the order it
+/// started them.
+fn pids_listed_in(path: &Path) -> Vec<i32> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
+}
+
+/// Whether `pid` is running: alive, and not a zombie waiting for whoever
+/// adopted it to reap it.
+fn running(pid: i32) -> bool {
+    // SAFETY: signal 0 delivers nothing; it asks whether `pid` exists.
+    let exists = unsafe { libc::kill(pid, 0) == 0 };
+    let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit_once(") ")
+                .map(|(_, rest)| rest.starts_with('Z'))
+        })
+        .unwrap_or(false);
+    exists && !zombie
+}
+
+/// A run ends when its program exits, even while a member of its group holds
+/// the program's stdout and stderr open (grammar 14.4: an exit, any code, is
+/// journaled and restarted, and it never gives up; PRD resolved q78 ruling c,
+/// Decision D162).
+///
+/// `FEED_HELPER_STDIO=inherit` makes the helper `FEED_HELPER` leaves in the
+/// program's group on every run keep the program's stdout and stderr — what
+/// `cmd &` in a shell does, or a `Popen` left with the default stdio — and the
+/// helper ignores `SIGTERM`; `FEED_EXIT_CODE` makes every run exit. The pipes
+/// `serve` reads stay open past each exit for as long as the helper lives, so
+/// a run that ended only once they closed would never end: no `restarts` row,
+/// no restart, and the source reported `running` with its program gone. The
+/// exit takes the group with it instead — `SIGTERM`, then `SIGKILL` when the
+/// grace is up — so each exit is a `restarts` row carrying the program's own
+/// code, the program is started again, the one line it wrote before its first
+/// exit is admitted, and each ended run's helper is gone.
+#[test]
+fn a_program_that_exits_while_a_helper_in_its_group_holds_its_output_is_restarted_and_the_helper_ended()
+ {
+    let scratch = harness::Scratch::new("feed-held-output");
+    let Some(project) = harness::scratch_project("feed-held-output") else {
+        return;
+    };
+    let helpers = scratch.path().join("helpers.pids");
+    let environment = feed_environment(
+        scratch.path(),
+        &[
+            ("FEED_TOTAL", "1"),
+            ("FEED_EXIT_CODE", "3"),
+            ("FEED_HELPER", &helpers.display().to_string()),
+            ("FEED_HELPER_STDIO", "inherit"),
+        ],
+    );
+    let Some(mut served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let status = eventually(
+        Duration::from_secs(60),
+        "two exits journaled while each run's helper held its output",
+        || {
+            let status = source(&app, "feed");
+            (status["restart_count"].as_u64().unwrap_or(0) >= 2).then_some(status)
+        },
+    );
+    let restarts = status["restarts"].as_array().expect("restart rows");
+    assert!(restarts.len() >= 2, "{status}");
+    for row in restarts {
+        assert_eq!(
+            row["exit_code"], 3,
+            "every row is the program's own exit, not the helper's end: {status}"
+        );
+        assert_eq!(row["signal"], Value::Null, "{status}");
+    }
+    eventually(Duration::from_secs(30), "the one event", || {
+        (completed_of(&project, "ingest") == 1).then_some(())
+    });
+    let starts = lines_of(&scratch.path().join("starts.log"));
+    assert!(
+        starts.len() >= 2,
+        "the program was started again after it exited: {starts:?}"
+    );
+    let ended = pids_listed_in(&helpers);
+    assert!(ended.len() >= 2, "a helper per run: {ended:?}");
+    let ended = &ended[..2];
+    eventually(
+        Duration::from_secs(20),
+        "the helpers of the two runs that ended to be gone",
+        || ended.iter().all(|pid| !running(*pid)).then_some(()),
+    );
+
+    served.signal(libc::SIGTERM);
+    let exit = served.wait();
+    assert_eq!(
+        exit.code(),
+        Some(0),
+        "a stop that was asked for is not a failure: {exit:?}"
+    );
+    let every = pids_listed_in(&helpers);
+    eventually(
+        Duration::from_secs(10),
+        "every helper any run started to be gone",
+        || every.iter().all(|pid| !running(*pid)).then_some(()),
+    );
+    let said = served.stop_and_read_stderr();
+    assert!(
+        said.contains("event source `feed`: the program exited with code 3 after")
+            && said.contains("restarting it in 200ms (restart 1 in a row)"),
+        "the serve log names the exit and the restart: {said}"
+    );
+}
+
+/// A run ends once its program has exited and its group has gone, even while a
+/// process that left the group still holds the program's stdout and stderr
+/// open (grammar 14.4: an exit, any code, is journaled and restarted, and it
+/// never gives up; a descendant that left the group is not the program's, and
+/// is not followed; PRD resolved q78 ruling c, Decision D162).
+///
+/// `FEED_HELPER_STDIO=escape` makes the helper `FEED_HELPER` starts on every
+/// run keep the program's stdout and stderr and leave its process group for a
+/// session of its own, as a daemon does; `FEED_EXIT_CODE` makes every run exit.
+/// Nothing `serve` sends the group reaches such a helper, so the pipes `serve`
+/// reads stay open past the program's exit and past its group's end, for as
+/// long as the helper lives — and a run that ended only once they closed would
+/// never end: no `restarts` row, no restart, and the source reported `running`
+/// with its program gone. Once the group has gone the pipes are let go
+/// instead: each exit is a `restarts` row carrying the program's own code, the
+/// program is started again, the one line it wrote before its first exit is
+/// admitted, and the serve log says why the run ended with its pipes still
+/// open. The helpers that hold them are still alive when those ends are seen,
+/// so no end this test sees is the pipes closing.
+#[test]
+fn a_program_that_exits_while_a_process_that_left_its_group_holds_its_output_is_still_restarted() {
+    let scratch = harness::Scratch::new("feed-escaped-output");
+    let Some(project) = harness::scratch_project("feed-escaped-output") else {
+        return;
+    };
+    let helpers = scratch.path().join("helpers.pids");
+    // Nothing `serve` does reaches a process that left the group, so the test
+    // ends the helpers itself, however it ends.
+    let _helpers_ended = KilledWhenDropped(helpers.clone());
+    let environment = feed_environment(
+        scratch.path(),
+        &[
+            ("FEED_TOTAL", "1"),
+            ("FEED_EXIT_CODE", "3"),
+            ("FEED_HELPER", &helpers.display().to_string()),
+            ("FEED_HELPER_STDIO", "escape"),
+        ],
+    );
+    let Some(mut served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let status = eventually(
+        Duration::from_secs(60),
+        "two exits journaled while a process outside each run's group held its output",
+        || {
+            let status = source(&app, "feed");
+            (status["restart_count"].as_u64().unwrap_or(0) >= 2).then_some(status)
+        },
+    );
+    let restarts = status["restarts"].as_array().expect("restart rows");
+    assert!(restarts.len() >= 2, "{status}");
+    for row in restarts {
+        assert_eq!(
+            row["exit_code"], 3,
+            "every row is the program's own exit: {status}"
+        );
+        assert_eq!(row["signal"], Value::Null, "{status}");
+    }
+    let escaped = pids_listed_in(&helpers);
+    assert!(escaped.len() >= 2, "a helper per run: {escaped:?}");
+    assert!(
+        escaped[..2].iter().all(|pid| running(*pid)),
+        "the helpers of the two runs that ended are alive, still holding the pipes those runs \
+         wrote to — and not followed: {escaped:?}"
+    );
+    eventually(Duration::from_secs(30), "the one event", || {
+        (completed_of(&project, "ingest") == 1).then_some(())
+    });
+    let starts = lines_of(&scratch.path().join("starts.log"));
+    assert!(
+        starts.len() >= 2,
+        "the program was started again after it exited: {starts:?}"
+    );
+
+    served.signal(libc::SIGTERM);
+    let exit = served.wait();
+    assert_eq!(
+        exit.code(),
+        Some(0),
+        "a stop that was asked for is not a failure: {exit:?}"
+    );
+    let said = served.stop_and_read_stderr();
+    assert!(
+        said.contains("event source `feed`: the program exited with code 3 after")
+            && said.contains("restarting it in 200ms (restart 1 in a row)"),
+        "the serve log names the exit and the restart: {said}"
+    );
+    assert!(
+        said.contains(
+            "event source `feed`: the program has exited and its process group has gone, \
+             and a process outside the group still holds its stdout or stderr open"
+        ),
+        "the serve log says why the run ended with its pipes still open: {said}"
+    );
+}
+
+/// The pids listed in its file, sent `SIGKILL` when it is dropped: the
+/// processes a test's fixture starts outside the program's group, which
+/// nothing `serve` does ends.
+struct KilledWhenDropped(std::path::PathBuf);
+
+impl Drop for KilledWhenDropped {
+    fn drop(&mut self) {
+        for pid in pids_listed_in(&self.0) {
+            // SAFETY: `kill` only delivers a signal; the pid is one the
+            // fixture started and listed for this test.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// A stop gives every member of the program's group the whole grace, not only
+/// the program (grammar 14.4: stopped by `SIGTERM` to the group and, two
+/// seconds later, `SIGKILL`; PRD resolved q78 ruling c, Decision D162).
+///
+/// `FEED_CLEANER` leaves a helper in the program's group, holding none of its
+/// pipes, that answers `SIGTERM` by cleaning up for a second and then marking
+/// the cleanup done, while the program goes the moment the stop reaches it.
+/// The program's going closes its pipes at once; a stop that sent the group
+/// `SIGKILL` then would cut the helper's cleanup short, and the mark would
+/// never be written. Given the rest of the two seconds, the helper finishes —
+/// and `serve` exits only once it has, so the mark is there when it does.
+#[test]
+fn a_stop_gives_every_member_of_the_programs_group_its_grace_once_the_program_has_gone() {
+    let scratch = harness::Scratch::new("feed-cleaner");
+    let Some(project) = harness::scratch_project("feed-cleaner") else {
+        return;
+    };
+    let mark = scratch.path().join("cleaned");
+    let environment = feed_environment(
+        scratch.path(),
+        &[
+            ("FEED_TOTAL", "1"),
+            ("FEED_CLEANER", &mark.display().to_string()),
+        ],
+    );
+    let Some(mut served) = harness::serve_into(&project, "command-source", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    eventually(Duration::from_secs(60), "the one event", || {
+        (completed_of(&project, "ingest") == 1).then_some(())
+    });
+    assert_eq!(source(&app, "feed")["state"], "running");
+    assert!(
+        !mark.exists(),
+        "nothing has asked the helper to clean up yet"
+    );
+
+    served.signal(libc::SIGTERM);
+    let exit = served.wait();
+    assert_eq!(
+        exit.code(),
+        Some(0),
+        "a stop that was asked for is not a failure: {exit:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&mark).unwrap_or_default().trim(),
+        "cleaned",
+        "the helper finished its cleanup within the grace, before `serve` exited"
+    );
+}
+
+/// `GET /sources/:name` under the `auth:` of the `event` triggers bound to the
+/// source, and each execution's own routes under its own trigger's (grammar
+/// 13.5, 14.4, PRD resolved q32 one level up, Decision D162).
+///
+/// The fixture is staged with a second trigger, `mirror`, bound to the same
+/// source, and each trigger given a bearer token of its own. So the case also
+/// holds the ruling that several triggers may bind one source: each gets every
+/// event and dedupes on its own key — three events, three executions apiece.
+///
+/// The source route answers a caller either trigger verifies and refuses one
+/// neither does, naming the source; an execution's status route answers its
+/// own trigger's credential and refuses the other trigger's, which is q32's
+/// "an execution's routes enforce the auth of the trigger that started it".
+#[test]
+fn a_source_and_its_executions_enforce_the_auth_of_the_event_triggers_bound_to_it() {
+    let local =
+        std::fs::read_to_string(harness::projects().join("command-source/deploy/local.yml"))
+            .expect("the fixture's deploy file");
+    let (staged, entrypoint) =
+        harness::staged_with_deploy("feed-auth", "command-source", "local", &local);
+    let composition = std::fs::read_to_string(&entrypoint).expect("the staged entrypoint");
+    let guarded = composition.replace(
+        "      seq: \"payload.body.seq\"\n",
+        "      seq: \"payload.body.seq\"\n    auth:\n      bearer:\n        token: ${FEED_INGEST_TOKEN}\n  mirror:\n    type: event\n    flow: flow.ingest\n    source: feed\n    input:\n      id: \"payload.id\"\n      seq: \"payload.body.seq\"\n    auth:\n      bearer:\n        token: ${FEED_MIRROR_TOKEN}\n",
+    );
+    assert_ne!(
+        guarded, composition,
+        "the staged composition gained its guards"
+    );
+    std::fs::write(&entrypoint, guarded).expect("the staged entrypoint is writable");
+    let Some(project) = harness::scratch_project("feed-auth") else {
+        return;
+    };
+    let mut environment = feed_environment(staged.path(), &[("FEED_TOTAL", "3")]);
+    environment.push(("FEED_INGEST_TOKEN".to_string(), "ingest-token".to_string()));
+    environment.push(("FEED_MIRROR_TOKEN".to_string(), "mirror-token".to_string()));
+    let Some(served) = harness::serve_entrypoint_into(&project, &entrypoint, &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let bearer = |token: &str, path: &str| {
+        app.send(Request::get(path).header("Authorization", format!("Bearer {token}")))
+            .expect("the route answers")
+    };
+
+    // Each trigger gets every event, and dedupes on its own key.
+    eventually(
+        Duration::from_secs(60),
+        "three executions per trigger",
+        || {
+            (completed_of(&project, "ingest") == 3 && completed_of(&project, "mirror") == 3)
+                .then_some(())
+        },
+    );
+    assert_eq!(ids_of(&project, "ingest"), ids_of(&project, "mirror"));
+
+    // The source route: neither credential refused, either one answered.
+    let anonymous = app.get("/sources/feed").expect("the route answers");
+    assert_eq!(anonymous.status, 401, "{}", anonymous.text());
+    let refused = anonymous.json();
+    assert_eq!(refused["source"], "feed", "{refused}");
+    let said = refused["error"].as_str().expect("an error sentence");
+    assert!(
+        said.starts_with("the event source `feed` refused this request: it enforces the `auth:` of the triggers bound to it, and none of them verified it"),
+        "{said}"
+    );
+    assert!(
+        said.contains("`ingest`") && said.contains("`mirror`"),
+        "{said}"
+    );
+    let wrong = bearer("not-a-token", "/sources/feed");
+    assert_eq!(wrong.status, 401, "{}", wrong.text());
+    for token in ["ingest-token", "mirror-token"] {
+        let answered = bearer(token, "/sources/feed");
+        assert_eq!(answered.status, 200, "{token}: {}", answered.text());
+        let status = answered.json();
+        assert_eq!(status["triggers"], json!(["ingest", "mirror"]), "{status}");
+    }
+    // The unknown name is still the existence check's, ahead of the guard.
+    assert_eq!(app.get("/sources/nope").expect("answers").status, 404);
+
+    // An execution's own routes: its trigger's credential, and only that one.
+    let (execution, _, _) = executions_of(&project, "ingest")
+        .into_iter()
+        .next()
+        .expect("an `ingest` execution");
+    let path = format!("/executions/{execution}");
+    let unauthenticated = app.get(&path).expect("the status route answers");
+    assert_eq!(unauthenticated.status, 401, "{}", unauthenticated.text());
+    assert_eq!(unauthenticated.json()["trigger"], "ingest");
+    let other = bearer("mirror-token", &path);
+    assert_eq!(other.status, 401, "{}", other.text());
+    let own = bearer("ingest-token", &path);
+    assert_eq!(own.status, 200, "{}", own.text());
+    assert_eq!(own.json()["trigger"], "ingest");
+    drop(served);
+}
+
+/// The composition [`an_empty_session_key_refuses_its_tick_or_event_as_a_binding_failure_and_the_next_one_starts`]
+/// serves beside the `command-source` fixture's program: two flows that each
+/// write a `scope: session` store, so neither can run without a session
+/// identity; an `event` trigger on the `feed` source whose `session_key:`
+/// answers the empty string for event "2" alone; and an every-minute schedule
+/// whose `session_key:` answers it for a tick on an even minute.
+const EMPTY_SESSION_KEYS: &str = r#"version: "0.1"
+
+store.memory:
+  kind: kv
+  scope: session
+  description: What each session was last started for.
+  value_schema:
+    id: { type: string }
+
+flow.ingest:
+  inputs:
+    id: { type: string }
+  outputs: {}
+  nodes:
+    note:
+      store: store.memory
+      op: set
+      key: "execution.session_key"
+      value:
+        id: "input.id"
+  edges:
+    - { from: start, to: note }
+    - { from: note, to: end }
+
+flow.tick:
+  inputs:
+    scheduled_at: { type: string }
+  outputs: {}
+  nodes:
+    note:
+      store: store.memory
+      op: set
+      key: "execution.session_key"
+      value:
+        id: "input.scheduled_at"
+  edges:
+    - { from: start, to: note }
+    - { from: note, to: end }
+
+triggers:
+  ingest:
+    type: event
+    flow: flow.ingest
+    source: feed
+    session_key: 'payload.id == "2" ? "" : "feed/" + payload.id'
+    input:
+      id: "payload.id"
+  every_minute:
+    type: schedule
+    flow: flow.tick
+    cron: "* * * * *"
+    timezone: UTC
+    session_key: 'payload.scheduled_at.matches("[02468]:00[+]00:00$") ? "" : "ticks"'
+    input:
+      scheduled_at: "payload.scheduled_at"
+"#;
+
+/// The sentence a run of `flow` with no session identity is refused with, for
+/// [`EMPTY_SESSION_KEYS`]'s one session-scoped store.
+fn session_refusal(flow: &str) -> String {
+    format!(
+        "`{flow}` reaches `store.memory`, which is `scope: session`, so this run needs a session identity and arrived with none: pass `--session <key>` to `agent-compose run`, or declare `session_key:` on the trigger that starts it — and where one is declared, it answered the empty string for this invocation (grammar 11.3, 13.2)"
+    )
+}
+
+/// A tick or an event whose `session_key:` answers the empty string, for a
+/// flow that reaches a `scope: session` store, is refused as a binding failure
+/// for its trigger — logged, never retried — and the next one starts (grammar
+/// 11.3, Decision D162's Status).
+///
+/// The run would refuse it before journaling anything, and a gated admission
+/// reads a run that never reached its lifecycle row as the journal's failure:
+/// an event retried with backoff and holding the stream, a tick claimed and
+/// owed, holding the schedule — for good, since no retry supplies a key. So the
+/// admission asks first.
+///
+/// [`EMPTY_SESSION_KEYS`] is served with the fixture's program emitting three
+/// events, and its schedule ticking once a second
+/// (`AGENT_COMPOSE_SCHEDULE_CLOCK_RATE=60`). Event "2" starts nothing, is
+/// logged naming the store, and is never offered again; events "1" and "3"
+/// start, each under its own session, and move the checkpoint to "3". A tick
+/// on an even minute is logged the same way and leaves no `fired` row; the
+/// ticks on odd minutes fire, those after a refused one included.
+#[test]
+fn an_empty_session_key_refuses_its_tick_or_event_as_a_binding_failure_and_the_next_one_starts() {
+    let local =
+        std::fs::read_to_string(harness::projects().join("command-source/deploy/local.yml"))
+            .expect("the fixture's deploy file");
+    let (staged, entrypoint) =
+        harness::staged_with_deploy("empty-session-keys", "command-source", "local", &local);
+    std::fs::write(&entrypoint, EMPTY_SESSION_KEYS).expect("the staged entrypoint is writable");
+    let Some(project) = harness::scratch_project("empty-session-keys") else {
+        return;
+    };
+    let mut environment = feed_environment(staged.path(), &[("FEED_TOTAL", "3")]);
+    environment.push((
+        "AGENT_COMPOSE_SCHEDULE_CLOCK_RATE".to_string(),
+        "60".to_string(),
+    ));
+    let Some(mut served) = harness::serve_entrypoint_into(&project, &entrypoint, &environment)
+    else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let status = eventually(
+        Duration::from_secs(60),
+        "the events either side of the refused one, and two ticks",
+        || {
+            let status = source(&app, "feed");
+            (status["checkpoint"] == "3"
+                && completed_of(&project, "ingest") == 2
+                && completed_of(&project, "every_minute") >= 2)
+                .then_some(status)
+        },
+    );
+    let said = served.stop_and_read_stderr();
+
+    // The event: refused for `ingest`, never retried, and the stream went on.
+    assert_eq!(
+        status["accepted_events"], 2,
+        "event 2 was accepted by no trigger: {status}"
+    );
+    assert_eq!(
+        status["refused_lines"], 0,
+        "it was a line the source read, and its trigger refused: {status}"
+    );
+    let event_refusal = format!(
+        "event source `feed`: event \"2\" started nothing for `ingest`: the trigger `ingest` could not bind this event: {}",
+        session_refusal("flow.ingest")
+    );
+    assert_eq!(
+        said.matches(&event_refusal).count(),
+        1,
+        "the refusal is logged once, naming the store: {event_refusal}\n{said}"
+    );
+    assert!(
+        !said.contains("could not be admitted to `ingest`"),
+        "the event was never retried as a refused admission: {said}"
+    );
+    let sessions: std::collections::BTreeMap<String, String> = harness::journal_rows(
+        &project,
+        "SELECT inputs, session_key FROM executions WHERE trigger_kind = 'ingest'",
+    )
+    .as_array()
+    .expect("rows")
+    .iter()
+    .map(|row| {
+        let inputs: Value =
+            serde_json::from_str(row["inputs"].as_str().expect("inputs")).expect("JSON inputs");
+        (
+            inputs["id"].as_str().expect("an id").to_string(),
+            row["session_key"]
+                .as_str()
+                .expect("a session key")
+                .to_string(),
+        )
+    })
+    .collect();
+    assert_eq!(
+        sessions,
+        std::collections::BTreeMap::from([
+            ("1".to_string(), "feed/1".to_string()),
+            ("3".to_string(), "feed/3".to_string()),
+        ]),
+        "events 1 and 3 started, each under the session its key answered"
+    );
+    assert_eq!(journaled_checkpoint(&project).as_deref(), Some("3"));
+
+    // The ticks: one on an even minute refused before its claim, and the
+    // schedule went on past it.
+    let tick_refusal = format!(
+        " tick started nothing: the trigger `every_minute` could not bind this tick: {}",
+        session_refusal("flow.tick")
+    );
+    let refused: Vec<i64> = said
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("schedule `every_minute`: the ")?
+                .strip_suffix(tick_refusal.as_str())
+        })
+        .map(minute_of)
+        .collect();
+    let fired: Vec<i64> = harness::journal_rows(
+        &project,
+        "SELECT scheduled_at FROM fired WHERE trigger_name = 'every_minute' ORDER BY scheduled_at",
+    )
+    .as_array()
+    .expect("rows")
+    .iter()
+    .map(|row| minute_of(row["scheduled_at"].as_str().expect("an instant")))
+    .collect();
+    assert!(
+        refused.iter().all(|minute| minute % 2 == 0),
+        "only a tick on an even minute is refused: {refused:?}"
+    );
+    assert!(
+        fired.iter().all(|minute| minute % 2 != 0),
+        "a refused tick is refused before its claim, so it leaves no `fired` row: {fired:?}"
+    );
+    let last_fired = *fired.last().expect("ticks fired");
+    assert!(
+        refused.iter().any(|minute| *minute < last_fired),
+        "a tick fired after one was refused — the schedule was not held by it: refused {refused:?}, fired {fired:?}\n{said}"
+    );
+    assert!(
+        !said.contains("no later tick is claimed"),
+        "no refused tick was left owed: {said}"
+    );
+    let tick_sessions: Vec<String> = harness::journal_rows(
+        &project,
+        "SELECT session_key FROM executions WHERE trigger_kind = 'every_minute'",
+    )
+    .as_array()
+    .expect("rows")
+    .iter()
+    .map(|row| {
+        row["session_key"]
+            .as_str()
+            .expect("a session key")
+            .to_string()
+    })
+    .collect();
+    assert_eq!(
+        tick_sessions.len(),
+        fired.len(),
+        "one execution per fired row: {tick_sessions:?}"
+    );
+    assert!(
+        tick_sessions.iter().all(|key| key == "ticks"),
+        "every tick that fired ran under the session its key answered: {tick_sessions:?}"
+    );
+}
+
+/// PRD resolved q78's second verification clause: "a cron fires at its times
+/// under an injected clock and skips a simulated outage".
+///
+/// `AGENT_COMPOSE_SCHEDULE_CLOCK_RATE=60` makes the fixture's every-minute cron
+/// tick once a real second. Three ticks fire, each one `fired` row and one
+/// execution, the execution's `scheduled_at` input the tick's own instant
+/// written in the trigger's zone. Then `serve` stops; it is started again with
+/// the scheduler's clock moved more than ten minutes past where the first left
+/// it (`AGENT_COMPOSE_SCHEDULE_CLOCK_OFFSET_MS`), so the ticks in between fell
+/// while nothing ran: none of them is fired, the serve log names the span, and
+/// the next tick after the restart fires.
+#[test]
+fn a_schedule_fires_each_tick_once_at_its_time_and_skips_the_ticks_an_outage_missed() {
+    let Some(project) = harness::scratch_project("ticks") else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    let fast = vec![(
+        "AGENT_COMPOSE_SCHEDULE_CLOCK_RATE".to_string(),
+        "60".to_string(),
+    )];
+    let fired = |project: &Path| -> Vec<(String, String)> {
+        harness::journal_rows(
+            project,
+            "SELECT scheduled_at, execution FROM fired WHERE trigger_name = 'every_minute' ORDER BY scheduled_at",
+        )
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| {
+            (
+                row["scheduled_at"].as_str().expect("an instant").to_string(),
+                row["execution"].as_str().expect("an execution").to_string(),
+            )
+        })
+        .collect()
+    };
+    let first_run = {
+        let Some(mut first) = harness::serve_into(&project, "schedules", &fast) else {
+            return;
+        };
+        let ticks = eventually(Duration::from_secs(60), "three ticks", || {
+            let ticks = fired(&project);
+            (ticks.len() >= 3).then_some(ticks)
+        });
+        // A tick's execution answers its status route to a caller with no
+        // credential: a `schedule` trigger takes no `auth:` (grammar 13.4), so
+        // the routes of what it started are open, as a no-auth `http`
+        // trigger's are (Decision D162).
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        let answered = app
+            .get(&format!("/executions/{}", ticks[0].1))
+            .expect("the status route answers");
+        assert_eq!(answered.status, 200, "{}", answered.text());
+        assert_eq!(answered.json()["trigger"], "every_minute");
+        let said = first.stop_and_read_stderr();
+        assert!(
+            said.contains(
+                "schedule `every_minute` (`* * * * *` in UTC): last fired never, next tick"
+            ),
+            "the scheduler's start is logged: {said}"
+        );
+        assert!(
+            said.contains(&format!(
+                "schedule `every_minute`: fired the {} tick as {}",
+                ticks[0].0.replace(".000Z", "+00:00"),
+                ticks[0].1
+            )),
+            "…and each tick it fired: {said}"
+        );
+        ticks
+    };
+    // Every tick a minute after the one before, and one execution each, started
+    // for that tick's instant — read again now the first `serve` has gone, so a
+    // tick it fired after the three counts too.
+    assert!(first_run.len() >= 3);
+    let first_run = fired(&project);
+    let minutes: Vec<i64> = first_run
+        .iter()
+        .map(|(at, _)| {
+            let time = &at[11..16];
+            i64::from(time[..2].parse::<u8>().expect("hours")) * 60
+                + i64::from(time[3..].parse::<u8>().expect("minutes"))
+        })
+        .collect();
+    for pair in minutes.windows(2) {
+        assert!(
+            pair[1] - pair[0] == 1 || pair[0] - pair[1] == 23 * 60 + 59,
+            "consecutive ticks: {first_run:?}"
+        );
+    }
+    let executions = executions_of(&project, "every_minute");
+    for (at, execution) in &first_run {
+        let started: Vec<&(String, Value, String)> = executions
+            .iter()
+            .filter(|(id, _, _)| id == execution)
+            .collect();
+        assert_eq!(started.len(), 1, "one execution for the {at} tick");
+        assert_eq!(
+            started[0].1,
+            json!({ "scheduled_at": at.replace(".000Z", "+00:00"), "trigger": "every_minute" }),
+            "the execution is bound to the tick's nominal instant and the trigger's name"
+        );
+    }
+    assert_eq!(
+        executions.len(),
+        fired(&project).len(),
+        "one execution per fired row, and nothing else"
+    );
+
+    // The outage: the second start's clock is ten minutes past anything the
+    // first one's accelerated clock reached.
+    let ahead = u64::try_from(started.elapsed().as_millis()).expect("a duration") * 60 + 600_000;
+    let later = vec![
+        (
+            "AGENT_COMPOSE_SCHEDULE_CLOCK_RATE".to_string(),
+            "60".to_string(),
+        ),
+        (
+            "AGENT_COMPOSE_SCHEDULE_CLOCK_OFFSET_MS".to_string(),
+            ahead.to_string(),
+        ),
+    ];
+    let before = fired(&project);
+    let Some(mut second) = harness::serve_into(&project, "schedules", &later) else {
+        return;
+    };
+    let after = eventually(Duration::from_secs(60), "a tick after the restart", || {
+        let ticks = fired(&project);
+        (ticks.len() > before.len()).then_some(ticks)
+    });
+    let said = second.stop_and_read_stderr();
+    assert!(
+        said.contains("schedule `every_minute`: skipped ")
+            && said.contains("which fell while no serve was running: a tick is never back-filled"),
+        "the serve log names the span it skipped: {said}"
+    );
+    let last_before = &before.last().expect("ticks before").0;
+    let first_after = &after[before.len()].0;
+    let gap = minutes_between(last_before, first_after);
+    assert!(
+        gap >= 10,
+        "no tick that fell in the outage fired: {last_before} then {first_after}"
+    );
+    assert!(
+        said.contains(&format!(
+            "last fired {}",
+            last_before.replace(".000Z", "+00:00")
+        )),
+        "the scheduler read the last fired tick back out of the journal: {said}"
+    );
+    assert!(
+        !said.contains("by a serve that stopped before starting it"),
+        "a tick whose execution began is not started again: {said}"
+    );
+}
+
+/// The epoch minute of an instant the scheduler rendered, `YYYY-MM-DDTHH:MM:SS+00:00`.
+fn minute_of(rendered: &str) -> i64 {
+    let field = |range: std::ops::Range<usize>| -> i64 {
+        rendered[range]
+            .parse()
+            .unwrap_or_else(|_| panic!("a rendered instant: {rendered}"))
+    };
+    let day = compose_core::cron::days_from_civil(
+        field(0..4),
+        u32::try_from(field(5..7)).expect("a month"),
+        u32::try_from(field(8..10)).expect("a day"),
+    );
+    day * 1440 + field(11..13) * 60 + field(14..16)
+}
+
+/// Now, in epoch milliseconds, floored to the minute.
+fn this_minute() -> i64 {
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_millis(),
+    )
+    .expect("a millisecond count");
+    now - now % 60_000
+}
+
+/// A tick a `serve` claimed and never started is started by the next one
+/// (`docs/durability.md` §3.11, Decision D162's Status).
+///
+/// A process killed between journaling a tick's `fired` row and journaling the
+/// execution it allocated leaves a row that wins every later claim of the tick
+/// and names an execution with no lifecycle row: honoured, the tick fires zero
+/// times. The case writes that row itself — the tick two minutes ago, claimed
+/// for an execution id the journal has never seen — into a journal a `run`
+/// created, and serves. The scheduler hands the row back to the admission
+/// before it arms anything, and the execution runs under the recorded id, bound
+/// to the tick's own `scheduled_at`. Its status route answers a caller with no
+/// credential, as every tick's does, and the serve log names the tick.
+#[test]
+fn a_tick_claimed_by_a_serve_that_stopped_before_starting_it_is_started_by_the_next_serve() {
+    let Some(project) = harness::scratch_project("ticks-unbegun") else {
+        return;
+    };
+    harness::run_into(
+        &project,
+        "schedules",
+        "flow.tick",
+        &[("scheduled_at", "by hand"), ("trigger", "none")],
+        None,
+        &[],
+    )
+    .succeeded();
+    let tick = this_minute() - 120_000;
+    let claimed = compose_core::cron::render_utc(tick).replace('Z', ".000Z");
+    let nominal = compose_core::cron::render(tick, &compose_core::cron::Utc);
+    let lost = "exec_00000000-0000-4000-8000-00000000d1ed";
+    let seeded = harness::journal_sql(
+        &project,
+        &format!(
+            "INSERT INTO fired (trigger_name, scheduled_at, execution, fired_at) VALUES ('every_minute', '{claimed}', '{lost}', '{claimed}');"
+        ),
+    );
+    assert!(
+        seeded.status.success(),
+        "the stranded claim is written: {}",
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+
+    let Some(mut served) = harness::serve_into(&project, "schedules", &[]) else {
+        return;
+    };
+    let inputs = eventually(
+        Duration::from_secs(30),
+        "the claimed tick's execution",
+        || {
+            executions_of(&project, "every_minute")
+                .into_iter()
+                .find(|(id, _, status)| id == lost && status == "completed")
+                .map(|(_, inputs, _)| inputs)
+        },
+    );
+    assert_eq!(
+        inputs,
+        json!({ "scheduled_at": nominal, "trigger": "every_minute" }),
+        "the execution is the tick's: its nominal instant, under the id the row recorded"
+    );
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let answered = app
+        .get(&format!("/executions/{lost}"))
+        .expect("the status route answers");
+    assert_eq!(answered.status, 200, "{}", answered.text());
+    assert_eq!(answered.json()["trigger"], "every_minute");
+    assert_eq!(
+        harness::journal_rows(
+            &project,
+            &format!(
+                "SELECT execution FROM fired WHERE trigger_name = 'every_minute' AND scheduled_at = '{claimed}'"
+            ),
+        ),
+        json!([{ "execution": lost }]),
+        "the tick is still the one row, naming the execution that ran"
+    );
+    let said = served.stop_and_read_stderr();
+    assert!(
+        said.contains(&format!(
+            "schedule `every_minute`: the {nominal} tick was claimed as {lost} by a serve that stopped before starting it, so it starts now"
+        )),
+        "the serve log names the tick it started: {said}"
+    );
+}
+
+/// A tick whose **execution** the journal will not begin holds the schedule
+/// until that execution starts under the tick's claim (`docs/durability.md`
+/// §3.11): the admission says a tick fired only once its execution's lifecycle
+/// row is journaled, and the scheduler claims no later tick while one it
+/// claimed is owed — so the owed claim stays the newest row, which is the one
+/// row a repair reads.
+///
+/// `AGENT_COMPOSE_SCHEDULE_CLOCK_RATE=60` makes the every-minute cron tick once
+/// a real second. Once a tick has run, the case installs a SQLite trigger on
+/// the journal's `executions` table that refuses every lifecycle row. The next
+/// tick's `fired` row lands naming an execution the journal has no row for,
+/// and for the three seconds after — three ticks' worth — no later tick is
+/// claimed. The trigger is dropped; the execution the row names runs under
+/// that id, bound to the tick's own instant; the schedule goes on; and the
+/// serve log never says the held tick fired.
+#[test]
+fn a_tick_whose_execution_the_journal_will_not_begin_holds_the_schedule_until_it_starts_under_its_claim()
+ {
+    let Some(project) = harness::scratch_project("ticks-refused-begin") else {
+        return;
+    };
+    let fast = vec![(
+        "AGENT_COMPOSE_SCHEDULE_CLOCK_RATE".to_string(),
+        "60".to_string(),
+    )];
+    let fired = |project: &Path| -> Vec<(String, String)> {
+        harness::journal_rows(
+            project,
+            "SELECT scheduled_at, execution FROM fired WHERE trigger_name = 'every_minute' ORDER BY scheduled_at",
+        )
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| {
+            (
+                row["scheduled_at"].as_str().expect("an instant").to_string(),
+                row["execution"].as_str().expect("an execution").to_string(),
+            )
+        })
+        .collect()
+    };
+    let began = |project: &Path, execution: &str| -> bool {
+        !harness::journal_rows(
+            project,
+            &format!("SELECT id FROM executions WHERE id = '{execution}'"),
+        )
+        .as_array()
+        .expect("rows")
+        .is_empty()
+    };
+    let Some(mut served) = harness::serve_into(&project, "schedules", &fast) else {
+        return;
+    };
+    eventually(Duration::from_secs(60), "a first tick's execution", || {
+        (completed_of(&project, "every_minute") >= 1).then_some(())
+    });
+
+    let refused = harness::journal_sql(
+        &project,
+        "CREATE TRIGGER refuse_every_execution BEFORE INSERT ON executions BEGIN SELECT RAISE(ABORT, 'this journal refuses the execution'); END;",
+    );
+    assert!(
+        refused.status.success(),
+        "the trigger is installed: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    // A claim whose execution is still unbegun a second after it was seen: not
+    // one whose lifecycle row was merely in flight when the rows were read.
+    let (held_at, held) = eventually(
+        Duration::from_secs(30),
+        "a tick claimed for an execution the journal refused",
+        || {
+            let candidate = fired(&project)
+                .into_iter()
+                .find(|(_, execution)| !began(&project, execution))?;
+            std::thread::sleep(Duration::from_millis(1_000));
+            (!began(&project, &candidate.1)).then_some(candidate)
+        },
+    );
+    let claimed = fired(&project).len();
+    let window = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < window {
+        let ticks = fired(&project);
+        assert_eq!(
+            ticks.len(),
+            claimed,
+            "no tick is claimed past one whose execution never began: {ticks:?}"
+        );
+        assert_eq!(
+            ticks.last().map(|(_, execution)| execution.as_str()),
+            Some(held.as_str()),
+            "the owed claim is the newest row: {ticks:?}"
+        );
+        assert!(!began(&project, &held));
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    let dropped = harness::journal_sql(&project, "DROP TRIGGER refuse_every_execution;");
+    assert!(
+        dropped.status.success(),
+        "the trigger is dropped: {}",
+        String::from_utf8_lossy(&dropped.stderr)
+    );
+    let nominal = held_at.replace(".000Z", "+00:00");
+    let inputs = eventually(
+        Duration::from_secs(60),
+        "the held tick's execution, under its claim",
+        || {
+            executions_of(&project, "every_minute")
+                .into_iter()
+                .find(|(id, _, status)| *id == held && status == "completed")
+                .map(|(_, inputs, _)| inputs)
+        },
+    );
+    assert_eq!(
+        inputs,
+        json!({ "scheduled_at": nominal, "trigger": "every_minute" }),
+        "the execution is the held tick's: its nominal instant, under the id its row recorded"
+    );
+    let after = eventually(Duration::from_secs(60), "a tick after the held one", || {
+        let ticks = fired(&project);
+        (ticks.len() > claimed + 1).then_some(ticks)
+    });
+    // Every claim but the newest — which may be in flight as the case reads —
+    // names an execution that began.
+    for (at, execution) in &after[..after.len() - 1] {
+        assert!(
+            began(&project, execution),
+            "the {at} tick's claim names an execution that began: {after:?}"
+        );
+    }
+    let said = served.stop_and_read_stderr();
+    assert!(
+        said.contains(&format!(
+            "schedule `every_minute`: the {nominal} tick was claimed as {held}, whose execution could not be journaled (this journal refuses the execution): no later tick is claimed until it starts"
+        )),
+        "the serve log says the held tick's execution was refused: {said}"
+    );
+    assert!(
+        said.contains(&format!(
+            "schedule `every_minute`: the {nominal} tick was claimed as {held} by this scheduler, and could not be started then, so it starts now"
+        )),
+        "…and names it when it starts: {said}"
+    );
+    assert!(
+        !said.contains(&format!("fired the {nominal} tick as {held}")),
+        "a tick whose execution was refused is never logged as fired: {said}"
+    );
+    assert!(
+        said.contains(
+            "which fell while this scheduler was holding the schedule for a claimed tick's start"
+        ),
+        "the ticks the hold skipped are named as such: {said}"
+    );
+}
+
+/// A schedule claims no tick while its look at the newest claim cannot reach
+/// the journal, and takes the look again on its own backoff
+/// (`docs/durability.md` §3.11, PRD resolved q78 ruling b, Decision D162).
+///
+/// The look reads only the newest `fired` row, so a tick claimed before it
+/// would bury a claim whose execution never began under a row of its own, and
+/// that tick would fire zero times. Nothing a test can do to a real journal
+/// refuses that one read and admits the claim after it, so
+/// `schedule-look.mjs` holds the journal's `lastFired` and stands in for the
+/// admission, recording every call it receives:
+///
+/// * **bypass** — ticking once a second, with the newest row a claim nothing
+///   started and the first two looks refused: the claim is handed back for its
+///   start before any tick is claimed, and the schedule goes on after it.
+/// * **standby** — at the clock's own rate, with the newest row a claim a dead
+///   `serve` made and the first two looks refused as a standby's are: the
+///   claim starts on the look's backoff, seconds in, with no tick claimed — not
+///   at the next tick's look, a schedule's period later.
+#[test]
+fn a_schedule_claims_no_tick_until_its_look_at_the_newest_claim_reaches_the_journal() {
+    let Some((project, built)) = harness::build_under_toolchain("schedules", "schedule-look")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the schedules fixture builds: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let (calls, said) = schedule_look(&project, &["bypass", "standby"]);
+    let refused = json!([{ "look": 1, "refused": true }, { "look": 2, "refused": true }]);
+
+    let bypass = calls["bypass"].as_array().expect("the bypass case's calls");
+    assert_eq!(
+        json!(bypass[..2]),
+        refused,
+        "the start's look and its first retry are refused: {bypass:?}"
+    );
+    assert_eq!(
+        bypass[2],
+        json!({ "look": 3, "refused": false }),
+        "nothing is asked of the admission between the refused looks and the one that reads: {bypass:?}"
+    );
+    assert_eq!(
+        bypass[3]["unbegun"], "exec_stranded_by_a_stopped_serve",
+        "the first thing the admission is asked is the stranded claim's start: {bypass:?}"
+    );
+    assert_eq!(bypass[3]["begun"], false, "{bypass:?}");
+    assert!(
+        bypass[4]["tick"].is_string(),
+        "…and the schedule goes on after it: {bypass:?}"
+    );
+    assert!(
+        said.contains("schedule `every_minute`: the journal still could not say whether the tick it last claimed was ever started (this journal refuses look 2), so no tick is claimed yet; looking again in 2000ms"),
+        "the serve log says the schedule is held for the look: {said}"
+    );
+    assert!(
+        said.contains("was claimed as exec_stranded_by_a_stopped_serve and was never started, so it starts now"),
+        "…and names the claim it starts: {said}"
+    );
+    assert!(
+        said.contains("which fell while this scheduler was holding the schedule until the journal could say whether the tick it last claimed was ever started"),
+        "…and the ticks the hold skipped: {said}"
+    );
+
+    let standby = calls["standby"]
+        .as_array()
+        .expect("the standby case's calls");
+    assert_eq!(json!(standby[..2]), refused, "{standby:?}");
+    assert_eq!(
+        json!(standby[2..]),
+        json!([
+            { "look": 3, "refused": false },
+            {
+                "unbegun": "exec_claimed_by_a_dead_primary",
+                "begun": false,
+                "scheduled_at": standby[3]["scheduled_at"],
+            },
+        ]),
+        "the dead serve's claim starts on the look's own backoff, and no tick is claimed: {standby:?}"
+    );
+    assert!(
+        said.contains(
+            "was claimed as exec_claimed_by_a_dead_primary and was never started, so it starts now"
+        ),
+        "the serve log names it: {said}"
+    );
+}
+
+/// Run `schedule-look.mjs` over the built `schedules` fixture at `project` for
+/// `cases`, answering the calls each case's admission received, by case, and
+/// the serve log the scheduler wrote.
+fn schedule_look(project: &Path, cases: &[&str]) -> (Value, String) {
+    let mut runner = harness::toolchain::runner("schedule-look.mjs");
+    runner.arg(project).args(cases).current_dir(project);
+    let output =
+        harness::toolchain::output_within(&mut runner, Duration::from_secs(90), "schedule-look");
+    let said = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(output.status.success(), "the runner failed: {said}");
+    let calls: Value = serde_json::from_slice(&output.stdout).expect("one JSON object");
+    (calls, said)
+}
+
+/// A tick whose claim failed in a way that may still have landed is looked at
+/// again before the next tick is claimed (`docs/durability.md` §3.11, PRD
+/// resolved q78 ruling b, Decision D162).
+///
+/// A dialled journal can commit a claim's insert and lose the answer, so the
+/// scheduler cannot tell a claim that failed from one that is down naming an
+/// execution nothing started. The look reads only the newest `fired` row, and
+/// the next tick's own row would be the newest: claimed first, it would bury
+/// the landed claim where no look reads it, and that tick would fire zero
+/// times. `schedule-look.mjs`'s **landed** case has the first claim's row land
+/// and its admission throw: the next thing the scheduler does is look, the look
+/// finds that claim and hands it back for its start under the id it recorded,
+/// and only then is a second tick claimed.
+#[test]
+fn a_tick_claim_that_failed_after_it_may_have_landed_is_looked_at_before_the_next_tick_is_claimed()
+{
+    let Some((project, built)) = harness::build_under_toolchain("schedules", "schedule-landed")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the schedules fixture builds: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let (calls, said) = schedule_look(&project, &["landed"]);
+    let landed = calls["landed"].as_array().expect("the landed case's calls");
+    let call = |at: usize| landed.get(at).cloned().unwrap_or(Value::Null);
+    assert_eq!(
+        call(0),
+        json!({ "look": 1, "refused": false }),
+        "the start's look reads an empty table: {landed:?}"
+    );
+    let first = call(1)["tick"].clone();
+    assert!(first.is_string(), "{landed:?}");
+    assert_eq!(
+        call(1),
+        json!({ "tick": first, "execution": "exec_landed_claim_1", "answered": false }),
+        "the first tick's claim lands and its answer is lost: {landed:?}"
+    );
+    assert_eq!(
+        json!([call(2), call(3)]),
+        json!([
+            { "look": 2, "refused": false },
+            { "unbegun": "exec_landed_claim_1", "begun": false, "scheduled_at": first },
+        ]),
+        "the next thing the scheduler does is look, and the landed claim is started under its own id and tick: {landed:?}"
+    );
+    assert_eq!(
+        call(4)["execution"],
+        "exec_landed_claim_2",
+        "…and only then is the next tick claimed: {landed:?}"
+    );
+    assert!(
+        call(4)["tick"].as_str() > first.as_str(),
+        "a later tick: {landed:?}"
+    );
+    assert!(
+        said.contains(
+            "could not be journaled, so it did not fire: the answer to claim 1 never arrived"
+        ),
+        "the serve log says the claim failed: {said}"
+    );
+    assert!(
+        said.contains("was claimed as exec_landed_claim_1 and was never started, so it starts now"),
+        "…and names the claim the look found: {said}"
+    );
+}
+
+/// A `restart.backoff:` longer than a timer can hold is waited out, not fired
+/// at once (grammar 14.4, PRD resolved q78 ruling c).
+///
+/// A timer's delay is a signed 32-bit count of milliseconds in Node and Bun
+/// alike, and one past it — some 24.8 days — fires after a millisecond. The
+/// fixture is staged with `restart: { backoff: 600h, max: 600h }`, 2,160,000,000
+/// milliseconds, and a program that exits after its first event. For three
+/// seconds after the exit the source reads `backing_off` until a moment 600
+/// hours out, with one restart row and one start of the program: the backoff
+/// is armed in steps rather than whole, so it neither restarts the program at
+/// once nor warns that its timeout overflowed.
+#[test]
+fn a_restart_backoff_longer_than_a_timer_can_hold_is_waited_out_rather_than_fired_at_once() {
+    let local =
+        std::fs::read_to_string(harness::projects().join("command-source/deploy/local.yml"))
+            .expect("the fixture's deploy file");
+    let long = local.replace(
+        "      backoff: 200ms\n      max: 2s\n",
+        "      backoff: 600h\n      max: 600h\n",
+    );
+    assert_ne!(
+        long, local,
+        "the staged deploy file gained its long backoff"
+    );
+    let (staged, entrypoint) =
+        harness::staged_with_deploy("feed-long-backoff", "command-source", "local", &long);
+    let Some(project) = harness::scratch_project("feed-long-backoff") else {
+        return;
+    };
+    let environment = feed_environment(
+        staged.path(),
+        &[("FEED_TOTAL", "3"), ("FEED_EXIT_AFTER", "1")],
+    );
+    let Some(mut served) = harness::serve_entrypoint_into(&project, &entrypoint, &environment)
+    else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let status = eventually(Duration::from_secs(60), "the program's first exit", || {
+        let status = source(&app, "feed");
+        (status["restart_count"] == 1).then_some(status)
+    });
+    assert_eq!(
+        status["restarts"][0]["backoff_ms"], 2_160_000_000_u64,
+        "the backoff is the one declared: {status}"
+    );
+    let window = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < window {
+        let status = source(&app, "feed");
+        assert_eq!(status["state"], "backing_off", "{status}");
+        assert_eq!(status["restart_count"], 1, "no second exit: {status}");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let held = source(&app, "feed");
+    let until = held["backing_off_until"]
+        .as_str()
+        .expect("a backing-off source says until when");
+    let ended = held["restarts"][0]["ended_at"]
+        .as_str()
+        .expect("the restart row says when the run ended");
+    assert_eq!(
+        epoch_ms_of(until) - epoch_ms_of(ended),
+        2_160_000_000,
+        "the backoff ends 600 hours after the exit: {held}"
+    );
+    let starts = lines_of(&staged.path().join("starts.log"));
+    assert_eq!(
+        starts.len(),
+        1,
+        "the program was started once, and not again: {starts:?}"
+    );
+    let said = served.stop_and_read_stderr();
+    assert!(
+        said.contains("restarting it in 2160000000ms (restart 1 in a row)"),
+        "the serve log names the backoff: {said}"
+    );
+    assert!(
+        !said.contains("TimeoutOverflowWarning"),
+        "no timer was armed past what a timer holds: {said}"
+    );
+    assert_eq!(
+        said.matches("event source `feed`: started `node`").count(),
+        1,
+        "one start in the serve log: {said}"
+    );
+}
+
+/// Epoch milliseconds of an instant `toISOString` wrote,
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+fn epoch_ms_of(written: &str) -> i64 {
+    let field = |range: std::ops::Range<usize>| -> i64 {
+        written[range]
+            .parse()
+            .unwrap_or_else(|_| panic!("an ISO instant: {written}"))
+    };
+    let day = compose_core::cron::days_from_civil(
+        field(0..4),
+        u32::try_from(field(5..7)).expect("a month"),
+        u32::try_from(field(8..10)).expect("a day"),
+    );
+    ((day * 24 + field(11..13)) * 60 + field(14..16)) * 60_000
+        + field(17..19) * 1_000
+        + field(20..23)
+}
+
+/// Past the ten thousand ticks the serve log counts, a skipped span still ends
+/// where the outage did: at the newest tick at or before the start, not at the
+/// ten-thousandth one after the last fired.
+///
+/// The case journals an every-minute trigger's last tick thirty days ago —
+/// claimed for the `run`'s own execution, one that began, so nothing is owed —
+/// and serves. Forty-three thousand ticks fell since; the line counts "at least
+/// 10000" and ends one minute before the tick the scheduler arms next.
+#[test]
+fn a_skipped_span_past_the_counted_ticks_ends_at_the_last_tick_before_the_start() {
+    let Some(project) = harness::scratch_project("ticks-month-outage") else {
+        return;
+    };
+    harness::run_into(
+        &project,
+        "schedules",
+        "flow.tick",
+        &[("scheduled_at", "by hand"), ("trigger", "none")],
+        None,
+        &[],
+    )
+    .succeeded();
+    let began = harness::journal_rows(&project, "SELECT id FROM executions")[0]["id"]
+        .as_str()
+        .expect("the run's execution")
+        .to_string();
+    let started = this_minute();
+    let last = started - 30 * 24 * 3_600_000;
+    let claimed = compose_core::cron::render_utc(last).replace('Z', ".000Z");
+    let seeded = harness::journal_sql(
+        &project,
+        &format!(
+            "INSERT INTO fired (trigger_name, scheduled_at, execution, fired_at) VALUES ('every_minute', '{claimed}', '{began}', '{claimed}');"
+        ),
+    );
+    assert!(
+        seeded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+    let Some(mut served) = harness::serve_into(&project, "schedules", &[]) else {
+        return;
+    };
+    let said = served.stop_and_read_stderr();
+    let skipped = said
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("schedule `every_minute`: skipped at least 10000 ticks from ")
+        })
+        .unwrap_or_else(|| panic!("the span is counted as at least 10000 ticks: {said}"));
+    let (from, rest) = skipped
+        .split_once(" through ")
+        .expect("the span's two ends");
+    let (through, _) = rest
+        .split_once(", which fell while no serve was running")
+        .expect("why they were skipped");
+    let next = said
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("schedule `every_minute` (`* * * * *` in UTC): last fired ")
+        })
+        .and_then(|line| line.rsplit_once(", next tick "))
+        .map(|(_, next)| next)
+        .unwrap_or_else(|| panic!("the scheduler's start: {said}"));
+    assert_eq!(
+        from,
+        compose_core::cron::render(last + 60_000, &compose_core::cron::Utc),
+        "the span opens at the first tick after the last fired"
+    );
+    assert_eq!(
+        minute_of(next) - minute_of(through),
+        1,
+        "the span closes at the tick before the next one armed: through {through}, next {next}"
+    );
+    assert!(
+        minute_of(through) >= started / 60_000,
+        "…which is now, not ten thousand minutes after the last fired: {through}"
+    );
+    assert!(
+        !said.contains("by a serve that stopped before starting it"),
+        "a tick whose execution began is not started again: {said}"
+    );
+}
+
+/// Whole minutes from one journaled instant to a later one.
+fn minutes_between(from: &str, to: &str) -> i64 {
+    let minutes = |at: &str| -> i64 {
+        let day: i64 = at[8..10].parse().expect("a day");
+        let hour: i64 = at[11..13].parse().expect("an hour");
+        let minute: i64 = at[14..16].parse().expect("a minute");
+        let month: i64 = at[5..7].parse().expect("a month");
+        ((month * 31 + day) * 24 + hour) * 60 + minute
+    };
+    minutes(to) - minutes(from)
+}
+
+/// An `event` trigger whose source `deploy/local.yml` does not declare keeps
+/// Decision D87's vacuous satisfaction under `local` (grammar 13.5, as amended
+/// by D162): it validates, `serve` starts, and what it costs is said — the
+/// serve log names the trigger and the source nothing consumes for, no program
+/// runs, and the source's status route does not know the name.
+#[test]
+fn an_event_trigger_whose_source_local_does_not_declare_is_served_with_nothing_consuming_for_it() {
+    let (staged, entrypoint) = harness::staged_with_deploy(
+        "feed-unbound",
+        "command-source",
+        "local",
+        "version: \"0.1\"\n",
+    );
+    let validated = harness::validate_entrypoint(&entrypoint, "local");
+    assert!(
+        validated.status.success(),
+        "`local` satisfies the binding vacuously: {}",
+        String::from_utf8_lossy(&validated.stdout)
+    );
+    let Some(project) = harness::scratch_project("feed-unbound") else {
+        return;
+    };
+    let environment = feed_environment(staged.path(), &[]);
+    let Some(mut served) = harness::serve_entrypoint_into(&project, &entrypoint, &environment)
+    else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    assert_eq!(
+        app.get("/sources/feed").expect("the route answers").status,
+        404,
+        "no source `feed` is declared under `local` here"
+    );
+    let said = served.stop_and_read_stderr();
+    assert!(
+        said.contains(
+            "event trigger `ingest`: no event source `feed` is bound under this target, so nothing consumes for it"
+        ),
+        "the serve log says what the vacuous binding costs: {said}"
+    );
+    assert!(
+        !staged.path().join("starts.log").exists(),
+        "no program was started"
+    );
+}
+
+/// "`run` fires neither": a `run` of a flow in a composition declaring a
+/// `schedule` trigger journals no `fired` row, and one in a composition
+/// declaring a `kind: command` source starts no program.
+#[test]
+fn a_run_fires_no_tick_and_starts_no_program() {
+    let Some(project) = harness::scratch_project("run-no-ticks") else {
+        return;
+    };
+    let ran = harness::run_into(
+        &project,
+        "schedules",
+        "flow.tick",
+        &[("scheduled_at", "by hand"), ("trigger", "none")],
+        None,
+        &[],
+    );
+    ran.succeeded();
+    assert_eq!(
+        harness::journal_rows(&project, "SELECT COUNT(*) AS n FROM fired"),
+        json!([{ "n": 0 }]),
+        "a run journals no fired row"
+    );
+    assert_eq!(
+        harness::journal_rows(&project, "SELECT trigger_kind FROM executions"),
+        json!([{ "trigger_kind": "manual" }]),
+        "the one execution is the run's own"
+    );
+
+    let scratch = harness::Scratch::new("run-no-program");
+    let Some(project) = harness::scratch_project("run-no-program") else {
+        return;
+    };
+    let environment = feed_environment(scratch.path(), &[]);
+    let ran = harness::run_into(
+        &project,
+        "command-source",
+        "flow.ingest",
+        &[("id", "x"), ("seq", "1")],
+        None,
+        &environment,
+    );
+    ran.succeeded();
+    assert!(
+        !scratch.path().join("starts.log").exists(),
+        "a run starts no consumer, so the program never ran"
+    );
+    assert_eq!(
+        harness::journal_rows(
+            &project,
+            "SELECT (SELECT COUNT(*) FROM checkpoints) + (SELECT COUNT(*) FROM restarts) + (SELECT COUNT(*) FROM dedupe) AS n"
+        ),
+        json!([{ "n": 0 }]),
+        "…and the intake recorded nothing"
+    );
+}
+
+/// `serve` refuses a target declaring a `redis_streams`, `sqs` or `nats`
+/// source, naming the source and its kind — exit `2`, the q63 posture — while
+/// `validate` and `build` accept the same target, since the vocabulary is
+/// unchanged.
+#[test]
+fn serve_refuses_a_target_declaring_a_queue_source_and_validate_and_build_accept_it() {
+    for (kind, body) in [
+        (
+            "redis_streams",
+            "    url: ${QUEUE_URL}\n    stream: reports\n    consumer_group: agent-compose\n",
+        ),
+        (
+            "sqs",
+            "    queue_url: ${QUEUE_URL}\n    region: eu-west-1\n",
+        ),
+        ("nats", "    url: ${QUEUE_URL}\n    subject: reports\n"),
+    ] {
+        let (_scratch, entrypoint) = harness::staged_with_deploy(
+            "queue-source",
+            "command-source",
+            "queue",
+            &format!("version: \"0.1\"\nevent_sources:\n  feed:\n    kind: {kind}\n{body}"),
+        );
+        let validated = harness::validate_entrypoint(&entrypoint, "queue");
+        assert!(
+            validated.status.success(),
+            "validate accepts a `{kind}` source: {}",
+            String::from_utf8_lossy(&validated.stdout)
+        );
+        let Some(out) = harness::scratch_project("queue-source") else {
+            return;
+        };
+        let refused = harness::serve_refused_target(
+            &out,
+            &entrypoint,
+            "queue",
+            &[("QUEUE_URL".to_string(), "redis://127.0.0.1:1".to_string())],
+        );
+        assert_eq!(
+            refused.status.code(),
+            Some(2),
+            "serve refuses to start: {}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        let said = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            said.contains(&format!(
+                "the event source `feed` is `kind: {kind}`, which this release of agent-compose does not implement: `serve` runs a consumer for `kind: command` only, so it refuses to start rather than serve a trigger nothing would ever feed. Bind the source to a `kind: command` program, or serve a target that does not declare it (grammar 14.4, PRD resolved q78)"
+            )),
+            "the refusal names the source and its kind: {said}"
+        );
+        // `serve` built the project before it refused, which is `build`'s answer.
+        assert!(
+            out.join("src/triggers.ts").is_file(),
+            "the target built: `build` accepts a `{kind}` source"
+        );
+    }
+}
+
+/// A `timezone:` the runtime's timezone database does not know refuses `serve`
+/// **at start** — exit `2`, naming the trigger and the zone (grammar 13.4) —
+/// rather than letting the app listen and the scheduler fail inside it.
+/// `Mars/Olympus` is IANA-shaped, so `validate` accepts it: only the runtime's
+/// `Intl` can say it names no zone.
+#[test]
+fn serve_refuses_at_start_a_schedule_whose_timezone_the_runtime_does_not_know() {
+    let (_scratch, entrypoint) =
+        harness::staged_with_deploy("unknown-zone", "schedules", "local", "version: \"0.1\"\n");
+    let composition = std::fs::read_to_string(&entrypoint).expect("the staged entrypoint");
+    assert!(composition.contains("    timezone: UTC\n"));
+    std::fs::write(
+        &entrypoint,
+        composition.replace("    timezone: UTC\n", "    timezone: Mars/Olympus\n"),
+    )
+    .expect("the staged entrypoint is writable");
+    let validated = harness::validate_entrypoint(&entrypoint, "local");
+    assert!(
+        validated.status.success(),
+        "the zone is IANA-shaped, so `validate` accepts it: {}",
+        String::from_utf8_lossy(&validated.stdout)
+    );
+    let Some(out) = harness::scratch_project("unknown-zone") else {
+        return;
+    };
+    let refused = harness::serve_refused_target(&out, &entrypoint, "local", &[]);
+    let said = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(
+        refused.status.code(),
+        Some(2),
+        "serve refuses to start: {said}"
+    );
+    assert!(
+        said.contains(
+            "the schedule trigger `every_minute` names the timezone `Mars/Olympus`, which this runtime's timezone database does not know: give it an IANA name such as `UTC` or `Europe/Berlin` (grammar 13.4)"
+        ),
+        "the refusal names the trigger and the zone: {said}"
+    );
+}
+
+/// The scheduler's two clock hooks are read once, when `serve` starts, and a
+/// value that is not one refuses the start — exit `2`, naming the variable and
+/// what it was set to (`src/sources.ts`, Decision D50's posture on an
+/// environment variable): a test that believes it moved the clock and did not
+/// would pass for the wrong reason.
+#[test]
+fn serve_refuses_at_start_a_schedule_clock_variable_that_is_not_a_whole_number() {
+    for (variable, written, refusal) in [
+        (
+            "AGENT_COMPOSE_SCHEDULE_CLOCK_OFFSET_MS",
+            "soon",
+            "`AGENT_COMPOSE_SCHEDULE_CLOCK_OFFSET_MS` is set to \"soon\", which is not a whole number: it is a test's hook on the clock `serve`'s scheduler reads (PRD resolved q78), so give it an integer or unset it",
+        ),
+        (
+            "AGENT_COMPOSE_SCHEDULE_CLOCK_OFFSET_MS",
+            "1.5",
+            "`AGENT_COMPOSE_SCHEDULE_CLOCK_OFFSET_MS` is set to \"1.5\", which is not a whole number: it is a test's hook on the clock `serve`'s scheduler reads (PRD resolved q78), so give it an integer or unset it",
+        ),
+        (
+            "AGENT_COMPOSE_SCHEDULE_CLOCK_RATE",
+            "fast",
+            "`AGENT_COMPOSE_SCHEDULE_CLOCK_RATE` is set to \"fast\", which is not a whole number of at least 1: it is a test's hook on the clock `serve`'s scheduler reads (PRD resolved q78), so give it an integer or unset it",
+        ),
+        (
+            "AGENT_COMPOSE_SCHEDULE_CLOCK_RATE",
+            "0",
+            "`AGENT_COMPOSE_SCHEDULE_CLOCK_RATE` is set to \"0\", which is not a whole number of at least 1: it is a test's hook on the clock `serve`'s scheduler reads (PRD resolved q78), so give it an integer or unset it",
+        ),
+    ] {
+        let Some(refused) = harness::serve_refused_with(
+            "schedule-clock",
+            "schedules",
+            &[(variable.to_string(), written.to_string())],
+        ) else {
+            return;
+        };
+        let said = String::from_utf8_lossy(&refused.stderr);
+        assert_eq!(
+            refused.status.code(),
+            Some(2),
+            "`{variable}={written}` refuses the start: {said}"
+        );
+        assert!(said.contains(refusal), "{refusal}\n{said}");
+    }
+}
+
+/// The generated cron evaluator answers the shared corpus as the validator's
+/// does, under Bun (the Node column is gate 15 of `generated_code_gates.rs`).
+#[test]
+fn the_generated_cron_evaluator_agrees_with_the_validator_on_the_conformance_corpus() {
+    let Some(mut bun) = harness::bun_command() else {
+        return;
+    };
+    let built = harness::build("schedules", "local");
+    built.succeeded();
+    let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/")
+        .join("compose-core/tests/fixtures/cron-conformance");
+    let driver = harness::toolchain::root().join("cron-conformance.mjs");
+    let output = bun
+        .arg(&driver)
+        .arg(built.root())
+        .arg(&corpus)
+        .output()
+        .expect("bun runs the generated evaluator");
+    assert!(
+        output.status.success(),
+        "the conformance driver failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "[]",
+        "the two cron evaluators must not diverge (Decision D162)"
+    );
+}
+
+/// The one database the dialled-journal cases serve on. Its writer guard is
+/// per database (`docs/durability.md` §2.3), so two of them running at once
+/// would make each other's hubs standbys: they take turns.
+static DIALLED_JOURNAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// PRD resolved q78 ruling b on a **dialled** journal: two `serve` processes
+/// over one Postgres journal, with the same schedule, fire one row and one
+/// execution per tick.
+///
+/// What holds it today is two things, and the test is about the outcome rather
+/// than which: the journal's writer guard admits one hub at a time to a dialled
+/// journal (`docs/durability.md` §2.3), so the second `serve` is a standby whose
+/// schedulers claim no tick while the journal refuses them; and the `fired`
+/// row's identity — `(trigger, scheduled_at)`, the insert that wins fires — is
+/// what keeps a tick once when hubs share a journal without that guard
+/// (`docs/distributed.md` §8). Skipped, with a notice, where
+/// `AGENT_COMPOSE_TEST_POSTGRES_URL` is unset — like the journal conformance
+/// suite's remote arms.
+#[test]
+fn two_serves_on_one_postgres_journal_fire_each_tick_once() {
+    let Ok(url) = std::env::var("AGENT_COMPOSE_TEST_POSTGRES_URL") else {
+        eprintln!(
+            "notice: skipping the two-hub schedule case: AGENT_COMPOSE_TEST_POSTGRES_URL is unset"
+        );
+        return;
+    };
+    let _turn = DIALLED_JOURNAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let trigger = format!(
+        "pg_ticks_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_millis()
+    );
+    let (scratch, entrypoint) = harness::staged_with_deploy(
+        "pg-ticks",
+        "schedules",
+        "pg",
+        "version: \"0.1\"\njournal:\n  provider: postgres\n  url: ${AGENT_COMPOSE_JOURNAL_URL}\n",
+    );
+    let composition = std::fs::read_to_string(&entrypoint).expect("the staged entrypoint");
+    std::fs::write(
+        &entrypoint,
+        composition.replace("  every_minute:", &format!("  {trigger}:")),
+    )
+    .expect("the staged entrypoint is writable");
+    let environment = vec![
+        ("AGENT_COMPOSE_JOURNAL_URL".to_string(), url.clone()),
+        (
+            "AGENT_COMPOSE_SCHEDULE_CLOCK_RATE".to_string(),
+            "60".to_string(),
+        ),
+    ];
+    let (Some(one), Some(two)) = (
+        harness::scratch_project("pg-ticks-one"),
+        harness::scratch_project("pg-ticks-two"),
+    ) else {
+        return;
+    };
+    let Some(mut first) = harness::serve_target_into(&one, &entrypoint, "pg", &environment) else {
+        return;
+    };
+    let Some(mut second) = harness::serve_target_into(&two, &entrypoint, "pg", &environment) else {
+        return;
+    };
+    let query = |sql: &str| -> Vec<Value> {
+        postgres_rows(&one, &url, sql)
+            .as_array()
+            .expect("rows")
+            .clone()
+    };
+    // A snapshot of the shared journal taken while both hubs run: the executions
+    // first and then the ticks, so every execution read has its `fired` row read
+    // too (the row is claimed before the execution is registered), and the
+    // snapshot is taken once every tick read has its execution.
+    let (ticks, started) = eventually(
+        Duration::from_secs(60),
+        "three ticks on the shared journal, each with its execution",
+        || {
+            let started: BTreeSet<String> = query(&format!(
+                "SELECT id FROM executions WHERE trigger_kind = '{trigger}'"
+            ))
+            .iter()
+            .map(|row| row["id"].as_str().expect("an id").to_string())
+            .collect();
+            let ticks = query(&format!(
+                "SELECT scheduled_at, execution FROM fired WHERE trigger_name = '{trigger}' ORDER BY scheduled_at"
+            ));
+            let fired_for: BTreeSet<String> = ticks
+                .iter()
+                .map(|row| row["execution"].as_str().expect("an execution").to_string())
+                .collect();
+            (ticks.len() >= 3 && fired_for == started).then_some((ticks, started))
+        },
+    );
+    let one_said = first.stop_and_read_stderr();
+    let two_said = second.stop_and_read_stderr();
+    let instants: BTreeSet<&str> = ticks
+        .iter()
+        .map(|row| row["scheduled_at"].as_str().expect("an instant"))
+        .collect();
+    assert_eq!(instants.len(), ticks.len(), "one fired row per tick");
+    assert_eq!(
+        started.len(),
+        ticks.len(),
+        "one execution per tick, and no other: {ticks:?}"
+    );
+    // Neither log claims a tick the other also fired.
+    let claimed = |said: &str| -> BTreeSet<String> {
+        said.lines()
+            .filter_map(|line| {
+                line.split_once(" tick as ")
+                    .map(|(head, _)| head.to_string())
+            })
+            .filter_map(|head| head.rsplit_once("fired the ").map(|(_, at)| at.to_string()))
+            .collect()
+    };
+    let (a, b) = (claimed(&one_said), claimed(&two_said));
+    assert!(
+        a.is_disjoint(&b),
+        "two hubs fired one tick: {a:?} and {b:?}\n{one_said}\n{two_said}"
+    );
+    assert!(
+        a.len() + b.len() >= ticks.len(),
+        "every tick the journal held was fired by one hub or the other: {one_said}\n{two_said}"
+    );
+    drop(scratch);
+}
+
+/// Rows of a dialled Postgres journal, read through the `pg` driver the built
+/// project pins — the same one its journal arm opens it with.
+fn postgres_rows(project: &Path, url: &str, sql: &str) -> Value {
+    let script = project.join("postgres-rows.mjs");
+    std::fs::write(
+        &script,
+        "import pg from \"pg\";\nconst client = new pg.Client({ connectionString: process.env.ROWS_URL });\nawait client.connect();\ntry {\n  const answer = await client.query(process.env.ROWS_SQL);\n  process.stdout.write(JSON.stringify(answer.rows));\n} finally {\n  await client.end();\n}\n",
+    )
+    .expect("the project is writable");
+    let mut command = harness::bun_command().expect("bun, since a project was built");
+    command
+        .arg(&script)
+        .env("ROWS_URL", url)
+        .env("ROWS_SQL", sql)
+        .current_dir(project);
+    let output = command.output().expect("bun runs");
+    assert!(
+        output.status.success(),
+        "the Postgres query failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("JSON rows")
+}
+
+/// A standby takes a dialled journal over **with** what the hub it replaces
+/// left open (`docs/durability.md` §6.1, `docs/distributed.md` §8): a second
+/// `serve` on a Postgres journal another holds cannot read it at start, so it
+/// owes the recovery, and pays it before it claims a tick or admits an event
+/// once the journal opens to it.
+///
+/// The schedule's flow sleeps six seconds, so the first `serve` — ticking once
+/// a second under `AGENT_COMPOSE_SCHEDULE_CLOCK_RATE=60` — always has several
+/// executions running. A second `serve` starts over the same journal as a
+/// standby; the first is `SIGKILL`ed, and its executions are left open with
+/// nothing running them. The standby, once the server has let the first's
+/// session go, recovers every one of them before it fires a tick of its own —
+/// the serve log says so, and every `fired` line it writes follows its
+/// `recovered` lines — and each runs to `completed`. A recovery the start
+/// could not do, run nowhere, would leave them `open` for good. Skipped,
+/// with a notice, where `AGENT_COMPOSE_TEST_POSTGRES_URL` is unset.
+#[test]
+fn a_standby_serve_recovers_what_the_serve_it_takes_over_from_left_open_before_it_fires() {
+    let Ok(url) = std::env::var("AGENT_COMPOSE_TEST_POSTGRES_URL") else {
+        eprintln!(
+            "notice: skipping the standby takeover case: AGENT_COMPOSE_TEST_POSTGRES_URL is unset"
+        );
+        return;
+    };
+    let _turn = DIALLED_JOURNAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let trigger = format!(
+        "pg_takeover_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_millis()
+    );
+    let (scratch, entrypoint) = harness::staged_with_deploy(
+        "pg-takeover",
+        "schedules",
+        "pg",
+        "version: \"0.1\"\njournal:\n  provider: postgres\n  url: ${AGENT_COMPOSE_JOURNAL_URL}\n",
+    );
+    let composition = std::fs::read_to_string(&entrypoint).expect("the staged entrypoint");
+    assert!(composition.contains("      exec: { command: \"true\" }\n"));
+    std::fs::write(
+        &entrypoint,
+        composition
+            .replace("  every_minute:", &format!("  {trigger}:"))
+            .replace(
+                "      exec: { command: \"true\" }\n",
+                "      exec: { command: \"sleep\", args: [\"6\"] }\n",
+            ),
+    )
+    .expect("the staged entrypoint is writable");
+    let environment = vec![
+        ("AGENT_COMPOSE_JOURNAL_URL".to_string(), url.clone()),
+        (
+            "AGENT_COMPOSE_SCHEDULE_CLOCK_RATE".to_string(),
+            "60".to_string(),
+        ),
+    ];
+    let (Some(one), Some(two)) = (
+        harness::scratch_project("pg-takeover-one"),
+        harness::scratch_project("pg-takeover-two"),
+    ) else {
+        return;
+    };
+    let open = |sql_trigger: &str| -> BTreeSet<String> {
+        postgres_rows(
+            &one,
+            &url,
+            &format!(
+                "SELECT id FROM executions WHERE trigger_kind = '{sql_trigger}' AND status = 'open'"
+            ),
+        )
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row["id"].as_str().expect("an id").to_string())
+        .collect()
+    };
+    let Some(mut first) = harness::serve_target_into(&one, &entrypoint, "pg", &environment) else {
+        return;
+    };
+    eventually(
+        Duration::from_secs(60),
+        "three executions running under the first serve",
+        || (open(&trigger).len() >= 3).then_some(()),
+    );
+    // The standby: the first holds the writer guard, so this one's start cannot
+    // read the journal, and it serves anyway.
+    let Some(mut second) = harness::serve_target_into(&two, &entrypoint, "pg", &environment) else {
+        return;
+    };
+    let before = open(&trigger);
+    first.stop();
+    // What the first left running, and nothing else: an execution the standby
+    // started itself, once it had the journal, is not one it recovered.
+    let stranded: BTreeSet<String> = open(&trigger).intersection(&before).cloned().collect();
+    assert!(
+        !stranded.is_empty(),
+        "the first serve was stopped with executions running: {before:?}"
+    );
+    eventually(
+        Duration::from_secs(90),
+        "every execution the first serve left running to complete under the standby",
+        || {
+            let rows = postgres_rows(
+                &one,
+                &url,
+                &format!("SELECT id, status FROM executions WHERE trigger_kind = '{trigger}'"),
+            );
+            let completed: BTreeSet<String> = rows
+                .as_array()
+                .expect("rows")
+                .iter()
+                .filter(|row| row["status"] == "completed")
+                .map(|row| row["id"].as_str().expect("an id").to_string())
+                .collect();
+            stranded.is_subset(&completed).then_some(())
+        },
+    );
+    let said = second.stop_and_read_stderr();
+    assert!(
+        said.contains("this project's journal could not be read: "),
+        "the standby's start could not read the journal: {said}"
+    );
+    assert!(
+        said.contains("this project's journal can be read now, so the "),
+        "the standby names the recovery it runs late: {said}"
+    );
+    let lines: Vec<&str> = said.lines().collect();
+    let last_recovered = stranded
+        .iter()
+        .map(|id| {
+            let recovered = format!("recovered {id} (flow.tick)");
+            lines
+                .iter()
+                .position(|line| *line == recovered)
+                .unwrap_or_else(|| panic!("the standby recovered {id}: {said}"))
+        })
+        .max()
+        .expect("at least one stranded execution");
+    if let Some(first_fired) = lines
+        .iter()
+        .position(|line| line.starts_with(&format!("schedule `{trigger}`: fired the ")))
+    {
+        assert!(
+            first_fired > last_recovered,
+            "the standby fired a tick before it had recovered what the first serve left open: {said}"
+        );
+    }
+    drop(scratch);
+}
+
+/// The body of the first fenced block in `document` whose info string is
+/// exactly `info` and whose first line is `first`, or the last such block when
+/// `first` is `None`.
+fn documented_block(document: &str, info: &str, first: Option<&str>) -> String {
+    let mut found = Vec::new();
+    let mut lines = document.lines();
+    while let Some(line) = lines.next() {
+        if line.trim_end() != info {
+            continue;
+        }
+        let mut body = String::new();
+        for line in lines.by_ref() {
+            if line.trim_end() == "```" {
+                break;
+            }
+            body.push_str(line);
+            body.push('\n');
+        }
+        if first.is_none_or(|first| body.lines().next() == Some(first)) {
+            found.push(body);
+        }
+    }
+    match first {
+        Some(first) => found
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("no `{info}` block opening `{first}`")),
+        None => found.pop().unwrap_or_else(|| panic!("no `{info}` block")),
+    }
+}
+
+/// `agent-compose docs triggers` writes out a whole `kind: command` program, in
+/// `sh`, and this runs **that program**: the topic's own composition, its own
+/// `deploy/local.yml` and its own script, served, with lines appended to the
+/// file the script follows.
+///
+/// Documentation a reader copies is the one example nothing else executes, and
+/// a program is exactly the part of a source the compiler cannot check. So the
+/// claims the topic makes about it are asserted here: each appended line is one
+/// execution, its text bound through `payload.body.text` — quotes and
+/// backslashes included, which is what the script's escaping is for — and a
+/// `serve` started again over the same journal hands the script the checkpoint
+/// it last accepted, so the lines before it start nothing a second time.
+#[test]
+fn the_shell_program_the_triggers_topic_documents_feeds_its_trigger_under_serve() {
+    let topic = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("the repository root")
+            .join("docs/topics/triggers.md"),
+    )
+    .expect("the triggers topic is readable");
+    let spec = documented_block(&topic, "```yaml spec", None);
+    let deploy = documented_block(&topic, "```yaml", Some("# deploy/local.yml"));
+    let script = documented_block(&topic, "```sh", Some("#!/bin/sh"));
+    assert!(
+        spec.contains("source: reports") && script.contains("AGENT_COMPOSE_CHECKPOINT"),
+        "the topic's last spec is the event example, and its script reads the checkpoint"
+    );
+
+    let scratch = harness::Scratch::new("topic-feed");
+    std::fs::write(scratch.path().join("main.yml"), &spec).expect("the scratch area is writable");
+    std::fs::create_dir_all(scratch.path().join("deploy")).expect("the scratch area is writable");
+    std::fs::write(scratch.path().join("deploy/local.yml"), &deploy)
+        .expect("the scratch area is writable");
+    let program = scratch.path().join("feed.sh");
+    std::fs::write(&program, &script).expect("the scratch area is writable");
+    let log = scratch.path().join("reports.log");
+    let lines = [
+        "the build is red",
+        r#"a "quoted" report with a \ in it"#,
+        "a third report",
+        "one after the restart",
+    ];
+    let append = |line: &str| {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .expect("the log is writable");
+        writeln!(file, "{line}").expect("the log is writable");
+    };
+    append(lines[0]);
+    append(lines[1]);
+    let environment = vec![
+        ("REPORTS_FEED".to_string(), program.display().to_string()),
+        ("REPORTS_LOG".to_string(), log.display().to_string()),
+    ];
+    let Some(project) = harness::scratch_project("topic-feed") else {
+        return;
+    };
+    let entrypoint = scratch.path().join("main.yml");
+    let reports = |project: &Path| -> Vec<String> {
+        executions_of(project, "reports")
+            .into_iter()
+            .map(|(_, inputs, _)| inputs["report"].as_str().expect("a report").to_string())
+            .collect()
+    };
+    {
+        let Some(mut served) = harness::serve_entrypoint_into(&project, &entrypoint, &environment)
+        else {
+            return;
+        };
+        let app = Client::new(&served.base_url).expect("a client for the generated app");
+        eventually(
+            Duration::from_secs(60),
+            "the two lines already in the file",
+            || (completed_of(&project, "reports") == 2).then_some(()),
+        );
+        append(lines[2]);
+        let status = eventually(
+            Duration::from_secs(60),
+            "the line appended while serving",
+            || {
+                let status = source(&app, "reports");
+                (status["checkpoint"] == "3" && completed_of(&project, "reports") == 3)
+                    .then_some(status)
+            },
+        );
+        assert_eq!(status["state"], "running", "{status}");
+        assert_eq!(
+            status["refused_lines"], 0,
+            "the script wrote only JSON objects: {status}"
+        );
+        served.stop();
+    }
+    assert_eq!(
+        reports(&project),
+        lines[..3],
+        "one execution per line, its text intact"
+    );
+
+    append(lines[3]);
+    let Some(mut again) = harness::serve_entrypoint_into(&project, &entrypoint, &environment)
+    else {
+        return;
+    };
+    eventually(
+        Duration::from_secs(60),
+        "the line appended across the restart",
+        || (completed_of(&project, "reports") == 4).then_some(()),
+    );
+    let said = again.stop_and_read_stderr();
+    assert_eq!(
+        reports(&project),
+        lines,
+        "the restarted script resumed after the accepted checkpoint, so nothing ran twice"
+    );
+    assert!(
+        said.contains("event source `reports`: started `sh`")
+            && said.contains("with checkpoint \"3\""),
+        "the second serve handed the script the checkpoint the first accepted: {said}"
+    );
+}

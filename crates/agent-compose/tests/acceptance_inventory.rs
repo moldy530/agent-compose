@@ -72,6 +72,10 @@ enum Bullet {
     /// PRD §7 M3's fourth bullet: "**HTTP-native events** (resolved q32–q36):
     /// …".
     HttpEvents,
+    /// PRD §7 M3's bullet after it: "Execute `schedule` and queue-backed
+    /// `event` triggers — the sources HTTP cannot speak for (the clock; pubsub
+    /// consumer loops) — …", which PRD resolved q78 ships.
+    Sources,
 }
 
 /// Whether a criterion's tests run today.
@@ -2338,6 +2342,255 @@ const EVENTS: &[Criterion] = &[
     },
 ];
 
+/// PRD §7 M3's schedule and event triggers bullet, whose two parenthesised
+/// sources are the two claims PRD resolved q78 makes: the clock, which `serve`
+/// fires a `schedule` trigger from, and the consumer loop, which `serve` runs
+/// for a `kind: command` event source and refuses to pretend to run for a queue
+/// kind this release does not implement.
+///
+/// One sentence rather than an enumeration, so its phrases are held to it by
+/// containment, like `EVENTS`.
+const SOURCES: &[Criterion] = &[
+    Criterion {
+        bullet: Bullet::Sources,
+        phrase: "the clock",
+        tests: &[
+            // Each tick once, at its time, under an injected clock — and an
+            // outage's ticks skipped and named in the serve log.
+            (
+                "a_schedule_fires_each_tick_once_at_its_time_and_skips_the_ticks_an_outage_missed",
+                Status::Live,
+            ),
+            // …once per tick across two hubs on one dialled journal.
+            (
+                "two_serves_on_one_postgres_journal_fire_each_tick_once",
+                Status::Live,
+            ),
+            // …and a standby that takes the journal over recovers what the hub
+            // it replaces left open before it claims a tick of its own.
+            (
+                "a_standby_serve_recovers_what_the_serve_it_takes_over_from_left_open_before_it_fires",
+                Status::Live,
+            ),
+            // …and once, not never, for a tick a `serve` claimed and died
+            // before starting: the next start runs it under the recorded id.
+            (
+                "a_tick_claimed_by_a_serve_that_stopped_before_starting_it_is_started_by_the_next_serve",
+                Status::Live,
+            ),
+            // …and for a tick whose execution the journal would not begin:
+            // the schedule holds, claiming nothing past it, until it starts.
+            (
+                "a_tick_whose_execution_the_journal_will_not_begin_holds_the_schedule_until_it_starts_under_its_claim",
+                Status::Live,
+            ),
+            // …and no tick is claimed past a newest claim nobody has looked
+            // at: the look is retried on its own backoff, so a claim a dead
+            // `serve` left starts as the journal opens, not a period later.
+            (
+                "a_schedule_claims_no_tick_until_its_look_at_the_newest_claim_reaches_the_journal",
+                Status::Live,
+            ),
+            // …and a claim that failed after it may have landed is looked at
+            // before the next tick's row can bury it.
+            (
+                "a_tick_claim_that_failed_after_it_may_have_landed_is_looked_at_before_the_next_tick_is_claimed",
+                Status::Live,
+            ),
+            // …with a skipped span past the counted ticks still named through
+            // the last tick before the start.
+            (
+                "a_skipped_span_past_the_counted_ticks_ends_at_the_last_tick_before_the_start",
+                Status::Live,
+            ),
+            // …by an evaluator that agrees with the validator's, over the
+            // shared corpus and its daylight-saving cases.
+            (
+                "the_generated_cron_evaluator_agrees_with_the_validator_on_the_conformance_corpus",
+                Status::Live,
+            ),
+            // …in a zone the runtime knows, under a clock hook that is one: each
+            // refuses `serve` at start rather than failing once it listens.
+            (
+                "serve_refuses_at_start_a_schedule_whose_timezone_the_runtime_does_not_know",
+                Status::Live,
+            ),
+            (
+                "serve_refuses_at_start_a_schedule_clock_variable_that_is_not_a_whole_number",
+                Status::Live,
+            ),
+            // …and by `serve` alone: `run` fires no tick and starts no program.
+            ("a_run_fires_no_tick_and_starts_no_program", Status::Live),
+        ],
+    },
+    Criterion {
+        bullet: Bullet::Sources,
+        phrase: "pubsub consumer loops",
+        tests: &[
+            // A program that exits part-way is restarted from its checkpoint,
+            // and every event is one execution.
+            (
+                "a_command_source_that_exits_part_way_is_restarted_from_its_checkpoint_and_starts_one_execution_per_event",
+                Status::Live,
+            ),
+            // …after a backoff that doubles to its ceiling and starts over
+            // after a long run.
+            (
+                "a_program_that_keeps_exiting_is_restarted_after_a_backoff_that_doubles_to_its_max_and_starts_over_after_a_long_run",
+                Status::Live,
+            ),
+            // …and a backoff longer than a timer can hold is waited out
+            // rather than fired at once.
+            (
+                "a_restart_backoff_longer_than_a_timer_can_hold_is_waited_out_rather_than_fired_at_once",
+                Status::Live,
+            ),
+            // …a re-emitted window starts nothing for its repeats (dedupe).
+            (
+                "a_restarted_program_that_re_emits_events_starts_nothing_for_the_repeats",
+                Status::Live,
+            ),
+            // …a `serve` killed mid-stream loses and doubles nothing.
+            (
+                "a_serve_killed_mid_stream_restarts_its_program_from_the_accepted_checkpoint_and_loses_nothing",
+                Status::Live,
+            ),
+            // …a line that is not an object is refused and counted.
+            (
+                "a_line_that_is_not_a_json_object_is_refused_counted_and_starts_nothing",
+                Status::Live,
+            ),
+            // …and so is one whose `checkpoint:` cannot be evaluated, and the
+            // events after it still start…
+            (
+                "a_line_whose_checkpoint_cannot_be_evaluated_is_refused_and_the_events_after_it_start",
+                Status::Live,
+            ),
+            // …and one whose checkpoint no program could be handed back, so the
+            // restart after it still starts.
+            (
+                "a_line_whose_checkpoint_no_program_could_be_handed_is_refused_and_the_restart_still_starts",
+                Status::Live,
+            ),
+            // …lines are bounded at 1 MiB on both streams, refused or cut once,
+            // and a last line without a newline is admitted.
+            (
+                "a_programs_lines_are_bounded_at_one_mib_and_its_last_unterminated_line_is_admitted",
+                Status::Live,
+            ),
+            // …the checkpoint moves only for an event the intake accepted: not
+            // for one every trigger refuses, nor one the journal will not yet
+            // admit, which holds the stream instead.
+            (
+                "an_event_every_bound_trigger_refuses_leaves_the_journaled_checkpoint_where_it_was",
+                Status::Live,
+            ),
+            (
+                "an_event_the_journal_will_not_admit_holds_the_stream_and_moves_no_checkpoint",
+                Status::Live,
+            ),
+            // …but an event — or a tick — whose `session_key:` answers the
+            // empty string is its trigger's binding failure, refused and never
+            // retried, so neither the stream nor the schedule is held by it.
+            (
+                "an_empty_session_key_refuses_its_tick_or_event_as_a_binding_failure_and_the_next_one_starts",
+                Status::Live,
+            ),
+            // …including one whose claim landed and whose execution the
+            // journal would not begin: never counted as started, never lost.
+            (
+                "an_event_whose_execution_the_journal_will_not_begin_holds_the_stream_and_is_not_lost",
+                Status::Live,
+            ),
+            // …a key claimed for an execution that never began is taken over,
+            // so the event is not lost to a dead process's claim.
+            (
+                "a_dedupe_claim_whose_execution_never_began_is_taken_over_by_the_next_event_with_its_key",
+                Status::Live,
+            ),
+            // …and a checkpoint the journal cannot read at start holds the
+            // program back rather than starting it from no position.
+            (
+                "a_checkpoint_the_journal_cannot_read_at_start_holds_the_program_until_it_can",
+                Status::Live,
+            ),
+            // …the source's state is on `GET /sources/:name`.
+            (
+                "the_source_status_route_answers_its_state_and_refuses_a_name_the_target_does_not_declare",
+                Status::Live,
+            ),
+            // …under the `auth:` of the triggers bound to the source, each of
+            // which gets every event and dedupes on its own key.
+            (
+                "a_source_and_its_executions_enforce_the_auth_of_the_event_triggers_bound_to_it",
+                Status::Live,
+            ),
+            // …and a stop ends the program's whole process group, a program
+            // that ignores `SIGTERM` included.
+            (
+                "stopping_serve_ends_its_programs_whole_process_group_even_one_that_ignores_sigterm",
+                Status::Live,
+            ),
+            // …and what each run leaves in its group is ended with the run, and
+            // by a stop that finds the source backing off.
+            (
+                "what_a_run_leaves_in_its_process_group_is_ended_with_it_and_by_a_stop_while_backing_off",
+                Status::Live,
+            ),
+            // …a run ends at its program's exit, even while a helper in its
+            // group holds the program's output open, so it is still restarted.
+            (
+                "a_program_that_exits_while_a_helper_in_its_group_holds_its_output_is_restarted_and_the_helper_ended",
+                Status::Live,
+            ),
+            // …and even while a process that left the group holds it: once the
+            // group has gone, the pipes are let go and the run still ends.
+            (
+                "a_program_that_exits_while_a_process_that_left_its_group_holds_its_output_is_still_restarted",
+                Status::Live,
+            ),
+            // …and a stop gives the whole group its grace, not only the program.
+            (
+                "a_stop_gives_every_member_of_the_programs_group_its_grace_once_the_program_has_gone",
+                Status::Live,
+            ),
+            // …the `sh` program `docs triggers` writes out runs as written.
+            (
+                "the_shell_program_the_triggers_topic_documents_feeds_its_trigger_under_serve",
+                Status::Live,
+            ),
+            // …a trigger whose source `local` does not declare is served with
+            // nothing consuming for it, and the serve log says so.
+            (
+                "an_event_trigger_whose_source_local_does_not_declare_is_served_with_nothing_consuming_for_it",
+                Status::Live,
+            ),
+            // …and a queue kind no consumer exists for refuses `serve` rather
+            // than serving a trigger nothing feeds.
+            (
+                "serve_refuses_a_target_declaring_a_queue_source_and_validate_and_build_accept_it",
+                Status::Live,
+            ),
+        ],
+    },
+];
+
+/// The schedule and event rows are phrases of PRD §7 M3's bullet about them.
+///
+/// Containment and normalization, for the reason the siblings below give.
+#[test]
+fn the_source_rows_transcribe_the_prd_m3_bullet() {
+    let bullet = distribution_bullet("Execute `schedule`");
+    let flattened = bullet.split_whitespace().collect::<Vec<_>>().join(" ");
+    for criterion in SOURCES {
+        assert!(
+            flattened.contains(criterion.phrase),
+            "`{}` is not a phrase of PRD §7 M3's schedule and event triggers bullet: {flattened}",
+            criterion.phrase
+        );
+    }
+}
+
 /// The http-native events rows are phrases of PRD §7 M3's fourth bullet.
 ///
 /// Containment and normalization, for the reason the two siblings above give:
@@ -2365,6 +2618,7 @@ fn rows() -> impl Iterator<Item = &'static Criterion> {
         .chain(DURABILITY)
         .chain(BUILTINS)
         .chain(EVENTS)
+        .chain(SOURCES)
 }
 
 fn repository() -> PathBuf {
@@ -2778,6 +3032,11 @@ fn every_bullet_contributes_criteria() {
             Bullet::HttpEvents,
             5,
             "the http-native events bullet's five claims",
+        ),
+        (
+            Bullet::Sources,
+            2,
+            "the schedule and event triggers bullet's two sources",
         ),
     ] {
         let count = rows()

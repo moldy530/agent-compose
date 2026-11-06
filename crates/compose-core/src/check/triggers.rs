@@ -37,8 +37,10 @@ use crate::ir::trigger::{HttpTrigger, Trigger, TriggerKind};
 use super::model::default_of;
 use super::{Ctx, expr, field_names, text};
 
-/// Check every declared trigger (grammar 13).
+/// Check every declared trigger (grammar 13), and the checkpoint of every
+/// `kind: command` event source they can bind (grammar 14.4).
 pub(crate) fn check(ctx: &mut Ctx) {
+    checkpoints(ctx);
     let ir = ctx.ir;
     let Some(triggers) = ir.triggers.as_ref() else {
         return;
@@ -48,6 +50,87 @@ pub(crate) fn check(ctx: &mut Ctx) {
     }
     routes(ctx);
     manual_session_keys(ctx);
+}
+
+/// Every `kind: command` source's `checkpoint:`, typed over the event it is
+/// evaluated against (grammar 14.4, PRD resolved q78).
+///
+/// The checkpoint runs **before** the event has an id: where a source declares
+/// one, its value *is* `payload.id`, which is what an `event` trigger's
+/// `dedupe_key:` reads by default. So the scope is the event payload without
+/// that member — `body`, `source`, `attributes` — and a read of `payload.id` is
+/// refused by name (`circular-checkpoint`) rather than as a field the payload
+/// lacks, because the field is spelled right: it is the expression's own
+/// answer. The result must be a string, which is what the runtime journals and
+/// hands back as `AGENT_COMPOSE_CHECKPOINT`.
+fn checkpoints(ctx: &mut Ctx) {
+    let Some(sources) = ctx.ir.deploy.event_sources.as_ref() else {
+        return;
+    };
+    for source in sources.entries.values() {
+        let Some(command) = source.command.as_ref() else {
+            continue;
+        };
+        let Some(checkpoint) = command.checkpoint.as_ref() else {
+            continue;
+        };
+        let name = text(&source.name);
+        let scope = checkpoint_scope(format!("the `checkpoint:` of the event source `{name}`"));
+        let analysis = crate::cel::analyze(checkpoint.value.as_str(), &scope);
+        if let Some(read) = analysis
+            .reads
+            .iter()
+            .find(|read| read.root == "payload" && read.path.first().is_some_and(|f| f == "id"))
+        {
+            ctx.push(
+                Diagnostic::error(
+                    DiagnosticCode::CircularCheckpoint,
+                    checkpoint.span.clone(),
+                    format!(
+                        "the `checkpoint:` of the event source `{name}` reads `{}`, which is the checkpoint's own value",
+                        read.spelling()
+                    ),
+                )
+                .with_help(
+                    "where a source declares a `checkpoint:`, its value is the event's `payload.id`, so the expression is evaluated before there is an id to read: read the position out of the line itself — `payload.body.seq`, an offset, a cursor — or declare no `checkpoint:` and the id is the SHA-256 of the line (grammar 14.4)",
+                ),
+            );
+            continue;
+        }
+        expr::report(ctx, checkpoint, &analysis);
+        expr::expect(
+            ctx,
+            checkpoint,
+            &analysis,
+            &Type::String,
+            &format!("the `checkpoint:` of the event source `{name}`"),
+        );
+    }
+}
+
+/// The scope a command source's `checkpoint:` is evaluated in: one event as
+/// its line decoded it, before it has an id (grammar 14.4).
+///
+/// The same members, with the same types, as the `event` trigger payload of
+/// [`expr::trigger_scope`] — `body` a decoded JSON object, `attributes` a map of
+/// strings (`{}` for a command source), `source` the logical name — minus
+/// `id`, which is this expression's own answer.
+fn checkpoint_scope(surface: String) -> crate::cel::Scope {
+    let property = |name: &str, ty: Type| crate::cel::ty::Property {
+        name: name.to_string(),
+        ty,
+        optional: false,
+        defaulted: false,
+    };
+    let payload = Type::object(
+        crate::cel::ty::Origin::Payload("event"),
+        vec![
+            property("body", Type::Map(std::sync::Arc::new(Type::Dyn))),
+            property("attributes", Type::Map(std::sync::Arc::new(Type::String))),
+            property("source", Type::String),
+        ],
+    );
+    crate::cel::Scope::new(surface, vec![("payload".to_string(), payload)])
 }
 
 /// Two `manual` triggers naming one flow that disagree about `session_key:`
@@ -209,7 +292,7 @@ fn routes(ctx: &mut Ctx) {
                     ),
                 )
                 .with_help(format!(
-                    "a generated app mounts `status`, `resume` and `cancel` for itself, beside each trigger's `start` (grammar 13.3) — {} — and cannot dispatch one method and path two ways: give the trigger its own `path:`",
+                    "a generated app mounts `status`, `resume` and `cancel` for each execution and `sources` for each event source for itself, beside each trigger's `start` (grammar 13.3, 14.4) — {} — and cannot dispatch one method and path two ways: give the trigger its own `path:`",
                     crate::parse::reader::list(
                         crate::codegen::serve::RESERVED_ROUTES
                             .iter()

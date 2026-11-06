@@ -904,6 +904,12 @@ function kvWrite(store: StoreBinding, op: StoreOp): boolean {
  * time with it set. A value that is not an integer is refused rather than read
  * as `0`, which is D50's posture on an environment variable: a test that believes
  * it moved the clock and did not would pass for the wrong reason.
+ *
+ * It moves the **stores'** clock only. The scheduler `serve` runs for `schedule`
+ * triggers reads a clock of its own, moved by its own two hooks —
+ * `AGENT_COMPOSE_SCHEDULE_CLOCK_OFFSET_MS` and `AGENT_COMPOSE_SCHEDULE_CLOCK_RATE`
+ * (`./sources.ts`) — so a test of expiry does not fire ticks, and a test of
+ * ticks does not expire keys.
  */
 export const STORE_CLOCK_OFFSET = "AGENT_COMPOSE_STORE_CLOCK_OFFSET_MS";
 

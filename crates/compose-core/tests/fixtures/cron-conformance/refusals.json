@@ -1,0 +1,107 @@
+[
+  {
+    "name": "a-minute-past-fifty-nine",
+    "cron": "60 * * * *",
+    "error": "the minute field `60` names 60, outside 0-59"
+  },
+  {
+    "name": "an-hour-past-twenty-three",
+    "cron": "* 24 * * *",
+    "error": "the hour field `24` names 24, outside 0-23"
+  },
+  {
+    "name": "a-day-of-the-month-of-zero",
+    "cron": "* * 0 * *",
+    "error": "the day-of-month field `0` names 0, outside 1-31"
+  },
+  {
+    "name": "a-thirteenth-month",
+    "cron": "* * * 13 *",
+    "error": "the month field `13` names 13, outside 1-12"
+  },
+  {
+    "name": "a-day-of-the-week-past-seven",
+    "cron": "* * * * 8",
+    "error": "the day-of-week field `8` names 8, outside 0-7"
+  },
+  {
+    "name": "a-step-over-a-single-value",
+    "cron": "5/15 * * * *",
+    "error": "the minute field `5/15` steps the single value `5`: a step needs a range, so write `5-59/15` or `*/15`"
+  },
+  {
+    "name": "a-step-of-zero",
+    "cron": "*/0 * * * *",
+    "error": "the minute field `*/0` steps by 0, and a step is at least 1"
+  },
+  {
+    "name": "a-step-that-is-not-a-number",
+    "cron": "*/x * * * *",
+    "error": "the minute field `*/x` steps by `x`, which is not a whole number"
+  },
+  {
+    "name": "a-range-that-runs-backwards",
+    "cron": "22-2 * * * *",
+    "error": "the minute field `22-2` has the range `22-2`, which runs backwards: write the smaller end first"
+  },
+  {
+    "name": "an-empty-list-entry",
+    "cron": "1,,2 * * * *",
+    "error": "the minute field `1,,2` has an empty entry in its list"
+  },
+  {
+    "name": "a-question-mark",
+    "cron": "? * * * *",
+    "error": "the minute field `?` holds `?`, which is not a number, a name, `*`, a range or a step"
+  },
+  {
+    "name": "a-name-where-none-is-taken",
+    "cron": "* MON * * *",
+    "error": "the hour field `MON` names `MON`, and only the month and day-of-week fields take names"
+  },
+  {
+    "name": "a-name-a-field-does-not-know",
+    "cron": "* * * * MOO",
+    "error": "the day-of-week field `MOO` names `MOO`, which is not one of SUN, MON, TUE, WED, THU, FRI, SAT"
+  },
+  {
+    "name": "a-range-missing-its-start",
+    "cron": "-5 * * * *",
+    "error": "the minute field `-5` is missing a value on one side of a `-`"
+  },
+  {
+    "name": "a-run-of-digits-too-long-for-any-field",
+    "cron": "00007 * * * *",
+    "error": "the minute field `00007` names 00007, outside 0-59"
+  },
+  {
+    "name": "february-the-thirtieth-never-fires",
+    "cron": "0 0 30 2 *",
+    "error": "never fires: the day-of-month field `30` names no day that a month in the month field `2` has"
+  },
+  {
+    "name": "four-fields",
+    "cron": "0 3 * *",
+    "error": "a cron expression has 5 fields, and this one has 4"
+  },
+  {
+    "name": "six-fields",
+    "cron": "0 0 3 * * *",
+    "error": "a cron expression has 5 fields, and this one has 6"
+  },
+  {
+    "name": "a-next-line-character-separates-no-fields",
+    "cron": "0\u00853 * * *",
+    "error": "a cron expression has 5 fields, and this one has 4"
+  },
+  {
+    "name": "a-no-break-space-separates-no-fields",
+    "cron": "0 3 * * *",
+    "error": "a cron expression has 5 fields, and this one has 4"
+  },
+  {
+    "name": "a-range-of-names-that-runs-backwards",
+    "cron": "0 0 * * FRI-SUN",
+    "error": "the day-of-week field `FRI-SUN` has the range `FRI-SUN`, which runs backwards: write the smaller end first"
+  }
+]

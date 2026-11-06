@@ -1,0 +1,11 @@
+# rule: a command source's `args:` is a list of strings (grammar 14.4, PRD resolved q78)
+# code: wrong-type
+# message: expected a string for each entry of `args`, found an integer
+# at: 11:23
+version: "0.1"
+
+event_sources:
+  feed:
+    kind: command
+    command: ./bin/feed
+    args: ["--after", 10]

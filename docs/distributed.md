@@ -1683,7 +1683,24 @@ protocol equally.
    than a definition. The Postgres backend (resolved q27's slot) **MUST** offer
    per-execution or per-shard leases before multi-hub exists.
 2. **Effect-record identity is execution-scoped**, and MUST stay so. No key, no
-   index, and no uniqueness constraint may be journal-global.
+   index, and no uniqueness constraint may be journal-global — **with one stated
+   exception**, the intake's (PRD resolved q78, grammar Decision D162). A
+   `schedule` trigger's tick is a `fired` row keyed `(trigger, scheduled_at)`
+   (`docs/durability.md` §3.11), and that key is journal-global on purpose:
+   deciding **once, across every hub on the journal**, whether a tick has an
+   execution is the row's whole job, so it is the one identity in the schema
+   keyed by a trigger and an instant rather than by an execution. The other
+   intake tables are the same kind of row and are named with it — `dedupe`,
+   keyed `(trigger, key)` (§3.12); `checkpoints`, keyed by source (§3.13); and
+   `restarts`, keyed `(source, ended_at)` (§3.14). None is a counter: each is
+   one row per thing that happened, claimed by an insert that either wins or is
+   answered with the row that did. One read spans executions — `lastFired`, a
+   trigger's newest `fired` row, which is the "last fired time recorded" PRD
+   resolved q78 ruling b keeps and where a starting scheduler resumes from —
+   and the tick repair also reads it to find a claim nobody started, which is
+   the reading the two-hub paragraph below holds against rule 3.
+   `src/journal.ts`'s schema comment names the exception beside the indexes
+   rule 2 governs.
 3. **No schema or protocol may assume one writer per journal.** Concretely: no
    monotonic counter shared across executions, no "last row wins" read that spans
    them, no dispatch state held anywhere but the journal.
@@ -1698,6 +1715,43 @@ The assumption these forbid is the one that would make resolved q37's
 execution-sharded scale-out a *migration* instead of "run more hubs". Keeping it
 out is cheap now and expensive later, which is why it is an invariant rather than
 a plan.
+
+**Two hubs and one tick.** The exception above is what makes rule 1's future
+safe for a tick's *claim*: when two hubs share a journal and both wake for the
+same tick, both claim it, the backend's primary key admits one insert, and the
+other claim is answered with the execution the winner named — so a tick is
+claimed once however many schedulers evaluate it, and a dedupe key once however
+many consumers see its event. Today the journal's writer guard
+(`docs/durability.md` §2.3) is the stronger rule on a dialled journal: one
+`serve` holds it, and a second over the same journal is a standby the journal
+refuses — its schedulers claim no tick, holding each schedule and looking again
+with backoff, and take the schedule over when the first goes. Before it claims
+a tick or admits an event there it
+recovers what the first left open — the recovery its own start could not do,
+owed until the journal opens to it (`docs/durability.md` §6.1) — so a dead
+hub's executions are resumed rather than stranded, and a tick or an event is
+never answered by one of them that nothing runs; then it starts a tick the
+first claimed and died before starting (§3.11 there). A consumer's checkpoint is the
+same shape at a source's granularity: one row per source, written by whichever
+hub admitted the event it names — and a standby's consumer, which cannot read
+it, holds its program back until it can rather than starting it from no
+position (§3.13 there).
+
+**What the row does not settle without the guard is a claim nobody started.**
+The tick repair (`docs/durability.md` §3.11) and the dedupe takeover (§3.12)
+decide that a claim's holder is gone from the absence of the lifecycle row the
+claim names, and the repair finds the claim by reading the newest `fired` row
+across executions. Both are true only while one process writes the journal: a
+second hub on the same journal, without the guard, would find a live hub's
+claim between its insert and its execution's row, take it for a dead one's, and
+run the execution beside it — two generations of one id on two hubs, or one
+event executed twice. That is a protocol assuming one writer, which rule 3
+forbids, and this release does not amend rule 3: it records the conflict in
+Decision D162's Status, for the owner to rule either a named exception to rule
+3 or a criterion that holds across hubs — a claim held by the execution-set
+lease rule 1 requires, so that "its holder is gone" is the lease's answer
+rather than an inference from a missing row — before the writer guard is
+lifted for multi-hub.
 
 **Ingress obeys the same discipline** (resolved q44's fourth invariant): URLs
 derive from a configurable public base — `hub.public_url:`, grammar §14.2 — and

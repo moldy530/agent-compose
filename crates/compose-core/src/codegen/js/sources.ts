@@ -1,0 +1,1566 @@
+//
+// What `serve` runs beside its routes: the scheduler for every `schedule`
+// trigger and a consumer for every `kind: command` event source (PRD resolved
+// q78, grammar 13.4, 13.5, 14.4, Decision D162).
+//
+// PRD resolved q37 made the hub the owner of triggers, so both live here, in
+// the process `serve` starts and in no other: `agent-compose run` fires no tick
+// and starts no consumer. Neither decides whether an execution starts. A tick
+// and an event are handed to `./serve.ts`'s admission — the one function every
+// trigger kind's start passes through, an `http` request's included — through
+// the [`Intake`] it passes in, so what this module owns is *when* a tick is due
+// and *what* a program printed, and nothing about what an execution is.
+//
+// It is byte-identical in every project this compiler release builds, like
+// `./serve.ts`: what differs between two projects is `./triggers.ts`.
+//
+// # Schedules
+//
+// One scheduler per `schedule` trigger. On start it reads the newest tick the
+// trigger has fired (the journal's `fired` row, `docs/durability.md` §3.11) and
+// takes the next tick **strictly after now** — never one before it. Ticks that
+// fell while no `serve` was running are **skipped, never back-filled** (PRD
+// resolved q78 ruling b): the serve log names the span, and a job catches
+// itself up from `payload.scheduled_at`, which is the nominal tick it was
+// started for. A scheduler that wakes late for the tick it was waiting for —
+// the process stalled, or the machine slept — fires that one tick and skips
+// the rest of what fell while it could not see them, on the same rule.
+//
+// Firing is a claim: the fired row is journaled, keyed `(trigger,
+// scheduled_at)`, **before** the execution starts, and only the claim that wins
+// starts one. So a tick fires once across restarts, and across hubs sharing a
+// journal (`docs/distributed.md` §8). A claim a `serve` died holding — the row
+// down, the execution it names never journaled — is the one the next start
+// owes: before it arms its first tick, the scheduler hands the newest row back
+// to the admission, which starts that execution under the id the row recorded
+// where no lifecycle row has it, and the serve log names the tick. A claim this
+// scheduler won whose execution the journal would not begin is owed the same
+// way, and sooner: the admission answers `started` only once the lifecycle row
+// is down, so the scheduler knows, and it claims no later tick until that
+// execution has started under the claim — retried with backoff, logged, never
+// counted as fired.
+//
+// # Command sources
+//
+// One consumer per `kind: command` source that some `event` trigger binds. It
+// starts the program after recovery, in a **process group of its own** (the
+// exec discipline of Decision D160: `SIGTERM` to the group on stop, `SIGKILL`
+// to it after a grace), with:
+//
+//  * **stdout** read one JSON object per line. A line is admitted to every
+//    `event` trigger bound to the source, **sequentially** — the consumer
+//    awaits each event's intake before it reads the next line, so a slow start
+//    is backpressure on the program's stdout rather than a queue in this
+//    process. A line that is not a JSON object is refused: logged with the
+//    source and its line number, counted on the source's status, and never an
+//    execution.
+//  * **stderr** copied to the serve log, each line tagged with the source —
+//    a line longer than stdout's bound is logged cut there, the rest dropped.
+//  * **stdin** a pipe this process holds open and never writes: it reaches
+//    end-of-file when `serve` exits, however it exits, which is the one signal
+//    a `SIGKILL`ed `serve` can still give its program.
+//  * the newest **checkpoint** the intake accepted, as `AGENT_COMPOSE_CHECKPOINT`
+//    in its environment and in place of any argument written exactly
+//    `{checkpoint}` — unset, and the empty string, before there is one. A
+//    journal that cannot say which holds the program back, retried with
+//    backoff, rather than starting it as if there were none. A line whose
+//    checkpoint no program could be handed back — a NUL in it, a lone
+//    surrogate, more than 64 KiB — is refused with the line, as one whose
+//    `checkpoint:` cannot be evaluated is: journaled, it would be the position
+//    every later start was handed, and every one of them would fail.
+//
+// An exit, with any code or by any signal, restarts the program after a
+// backoff that doubles per consecutive restart up to `restart.max` and starts
+// over after a run that lasted longer than `restart.max`; each restart is a
+// journaled row (§3.14) that the serve log and `GET /sources/:name` show.
+
+import { type ChildProcess, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import process from "node:process";
+
+import { type Cron, type Zone, nextAfter, parseCron, render, zoneOf } from "./cron.ts";
+import { type FiredRow, type RestartRow, openJournal } from "./journal.ts";
+import { interpolate } from "./runtime.ts";
+import {
+  type CommandSource,
+  type EventPayload,
+  type EventSource,
+  type EventTrigger,
+  IMPLEMENTED_SOURCE_KINDS,
+  type LineEvent,
+  type SchedulePayload,
+  type ScheduleTrigger,
+  eventSources,
+  eventTriggers,
+  scheduleTriggers,
+} from "./triggers.ts";
+
+// ---------------------------------------------------------------------------
+// What a tick and an event become
+// ---------------------------------------------------------------------------
+
+/** What `./serve.ts`'s admission did with one tick or one event. */
+export type Admitted =
+  /**
+   * An execution started: its lifecycle row is journaled, so it is one a
+   * restart recovers (`docs/durability.md` §3.5).
+   */
+  | { readonly outcome: "started"; readonly execution: string }
+  /** The tick was already fired, or the event's key already admitted, by `execution`. */
+  | { readonly outcome: "held"; readonly execution: string }
+  /** Nothing started, for a reason the trigger's own expressions or flow gave. */
+  | { readonly outcome: "refused"; readonly reason: string };
+
+/**
+ * What a tick's admission did: one of [`Admitted`]'s, or **`unbegun`** — the
+ * tick's `fired` row is down, naming an execution the journal would not begin.
+ * The tick is claimed, so the row wins every later claim of it, and nothing
+ * will ever recover the execution it names: the scheduler owes it a start
+ * under that claim and claims no later tick until it has one
+ * (`docs/durability.md` §3.11).
+ *
+ * Only a tick is answered this way. An event whose execution the journal would
+ * not begin is a **rejection** of [`Intake.event`], retried and holding the
+ * stream like any the journal refused, and the retry takes the claim over
+ * (§3.12).
+ */
+export type TickAdmitted =
+  | Admitted
+  | { readonly outcome: "unbegun"; readonly fired: FiredRow; readonly reason: string };
+
+/**
+ * The admission this module hands its ticks and events to — `./serve.ts`'s,
+ * which is the one every trigger kind's start passes through.
+ *
+ * It answers `started` only once the execution's lifecycle row is journaled,
+ * never as soon as the run is set going: a checkpoint journaled past an event,
+ * or a schedule armed past a tick, whose execution the journal never held
+ * would lose that event or that tick for good.
+ *
+ * A promise that **rejects** is a journal that could not be written — or one
+ * whose open executions this process has not yet recovered, which it never
+ * admits a tick or an event beside (a standby's, until the journal opens to
+ * it: `docs/distributed.md` §8) — so the tick did not fire, or the event was
+ * not admitted, and the caller says so rather than counting it either way.
+ */
+export interface Intake {
+  tick(trigger: ScheduleTrigger, at: number, payload: SchedulePayload): Promise<TickAdmitted>;
+  /**
+   * Start the execution a tick's `fired` row already names, where that
+   * execution **never began** — a `serve` that stopped between claiming the
+   * tick and journaling the execution it claimed it for, or a claim whose
+   * execution the journal would not begin (`docs/durability.md` §3.11).
+   * `undefined` where it did begin, which is every row but that one: nothing
+   * is owed for it.
+   */
+  unbegun(trigger: ScheduleTrigger, fired: FiredRow, payload: SchedulePayload): Promise<TickAdmitted | undefined>;
+  event(trigger: EventTrigger, payload: EventPayload): Promise<Admitted>;
+}
+
+/** One line of the serve log. */
+function say(line: string): void {
+  process.stderr.write(`${line}\n`);
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+// ---------------------------------------------------------------------------
+// The scheduler's clock
+// ---------------------------------------------------------------------------
+
+/**
+ * The variable that shifts the clock every scheduler in this process reads, in
+ * whole milliseconds.
+ *
+ * A **test's hook**, documented beside `./stores.ts`'s
+ * `AGENT_COMPOSE_STORE_CLOCK_OFFSET_MS` and for its reason: it is how the
+ * acceptance suite makes a cron's ticks due without waiting for them, and how
+ * it simulates an outage — stop `serve`, restart it with a larger offset, and
+ * the ticks in between fell while nothing was running. Read once, when `serve`
+ * starts. A value that is not an integer refuses the start, which is D50's
+ * posture on an environment variable: a test that believes it moved the clock
+ * and did not would pass for the wrong reason.
+ */
+export const SCHEDULE_CLOCK_OFFSET = "AGENT_COMPOSE_SCHEDULE_CLOCK_OFFSET_MS";
+
+/**
+ * The variable that makes the scheduler's clock run **faster** than the
+ * process's: a whole number of scheduler milliseconds per real one, from the
+ * moment `serve` started. Test-only, like [`SCHEDULE_CLOCK_OFFSET`]: at `60`,
+ * an every-minute cron ticks once a second. Unset, it is `1`.
+ */
+export const SCHEDULE_CLOCK_RATE = "AGENT_COMPOSE_SCHEDULE_CLOCK_RATE";
+
+/** What a malformed clock variable, timezone or cron refuses `serve` with. */
+export class ScheduleError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ScheduleError";
+  }
+}
+
+interface Clock {
+  /** Now, as the schedulers read it, in epoch milliseconds. */
+  now(): number;
+  /** How many real milliseconds `span` scheduler milliseconds take. */
+  real(span: number): number;
+}
+
+function wholeNumber(variable: string, minimum: number, fallback: number): number {
+  const written = process.env[variable];
+  if (written === undefined) return fallback;
+  if (!/^-?[0-9]+$/.test(written.trim()) || Number(written.trim()) < minimum) {
+    throw new ScheduleError(
+      `\`${variable}\` is set to ${JSON.stringify(written)}, which is not a whole number${minimum > Number.MIN_SAFE_INTEGER ? ` of at least ${minimum}` : ""}: it is a test's hook on the clock \`serve\`'s scheduler reads (PRD resolved q78), so give it an integer or unset it`,
+    );
+  }
+  return Number(written.trim());
+}
+
+function scheduleClock(): Clock {
+  const offset = wholeNumber(SCHEDULE_CLOCK_OFFSET, Number.MIN_SAFE_INTEGER, 0);
+  const rate = wholeNumber(SCHEDULE_CLOCK_RATE, 1, 1);
+  const origin = Date.now();
+  return {
+    now: () => origin + offset + (Date.now() - origin) * rate,
+    real: (span) => Math.max(0, Math.ceil(span / rate)),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Refusing at start what would fail later
+// ---------------------------------------------------------------------------
+
+/**
+ * An `event_sources:` entry of a kind this release runs no consumer for.
+ *
+ * `redis_streams`, `sqs` and `nats` keep their vocabulary — `validate` and
+ * `build` accept them — and a `serve` whose target declares one refuses to
+ * start, naming the source and its kind (PRD resolved q78, the q63 posture): a
+ * consumer that consumed nothing would be a trigger that never fires and says
+ * nothing.
+ */
+export class UnimplementedSourceError extends Error {
+  constructor(source: EventSource) {
+    super(
+      `the event source \`${source.name}\` is \`kind: ${source.kind}\`, which this release of agent-compose does not implement: \`serve\` runs a consumer for ${IMPLEMENTED_SOURCE_KINDS.map((kind) => `\`kind: ${kind}\``).join(", ")} only, so it refuses to start rather than serve a trigger nothing would ever feed. Bind the source to a \`kind: command\` program, or serve a target that does not declare it (grammar 14.4, PRD resolved q78)`,
+    );
+    this.name = "UnimplementedSourceError";
+  }
+}
+
+/**
+ * Everything this module would otherwise fail on after the app is listening,
+ * checked before it is: a source of a kind this release does not run, a
+ * schedule whose `timezone:` the runtime's database does not know or whose
+ * `cron:` this evaluator cannot read, and a clock variable that is not one.
+ */
+export function preflightSources(): void {
+  for (const source of eventSources) {
+    if (!IMPLEMENTED_SOURCE_KINDS.includes(source.kind)) throw new UnimplementedSourceError(source);
+  }
+  for (const trigger of scheduleTriggers) {
+    try {
+      zoneOf(trigger.timezone);
+    } catch {
+      throw new ScheduleError(
+        `the schedule trigger \`${trigger.name}\` names the timezone \`${trigger.timezone}\`, which this runtime's timezone database does not know: give it an IANA name such as \`UTC\` or \`Europe/Berlin\` (grammar 13.4)`,
+      );
+    }
+    try {
+      parseCron(trigger.cron);
+    } catch (error) {
+      throw new ScheduleError(
+        `the schedule trigger \`${trigger.name}\`'s \`cron\` cannot be evaluated: ${messageOf(error)} (grammar 13.4)`,
+      );
+    }
+  }
+  scheduleClock();
+}
+
+// ---------------------------------------------------------------------------
+// Running them
+// ---------------------------------------------------------------------------
+
+/** What [`startSources`] started, by name. */
+const schedulers = new Map<string, Scheduler>();
+const consumers = new Map<string, Consumer>();
+
+/**
+ * Start a scheduler for every `schedule` trigger and a consumer for every
+ * `kind: command` source an `event` trigger binds.
+ *
+ * Called by `./serve.ts` **after** recovery, so an execution a tick or an
+ * event starts is never one the replays are racing, and a program is never
+ * handed a checkpoint older than one the process that died had accepted.
+ */
+export async function startSources(intake: Intake): Promise<void> {
+  const clock = scheduleClock();
+  for (const trigger of scheduleTriggers) {
+    if (schedulers.has(trigger.name)) continue;
+    const scheduler = new Scheduler(trigger, intake, clock);
+    schedulers.set(trigger.name, scheduler);
+    await scheduler.start();
+  }
+  for (const trigger of eventTriggers) {
+    if (!eventSources.some((source) => source.name === trigger.source)) {
+      // Grammar 13.5 under `local` (Decision D87): a source the zero-infra
+      // target does not bind is satisfied vacuously, and that is what it
+      // costs — nothing consumes for this trigger here.
+      say(
+        `event trigger \`${trigger.name}\`: no event source \`${trigger.source}\` is bound under this target, so nothing consumes for it`,
+      );
+    }
+  }
+  for (const source of eventSources) {
+    if (source.command === undefined || consumers.has(source.name)) continue;
+    const bound = eventTriggers.filter((trigger) => trigger.source === source.name);
+    if (bound.length === 0) {
+      // Not registered either, so its status route reads `stopped` — the
+      // truth — rather than a `starting` nothing will ever finish.
+      say(
+        `event source \`${source.name}\`: no event trigger binds it, so its program is not started`,
+      );
+      continue;
+    }
+    const consumer = new Consumer(source, source.command, bound, intake);
+    consumers.set(source.name, consumer);
+    await consumer.start();
+  }
+}
+
+/**
+ * Stop every scheduler and every program: no tick is armed after this, and each
+ * program's group — and whatever an earlier run of it left in its own — is sent
+ * `SIGTERM` and, after a grace, `SIGKILL`. Resolves when every program has
+ * exited.
+ */
+export async function stopSources(): Promise<void> {
+  for (const scheduler of schedulers.values()) scheduler.stop();
+  schedulers.clear();
+  const stopping = [...consumers.values()].map((consumer) => consumer.stop());
+  consumers.clear();
+  await Promise.all(stopping);
+}
+
+/** Whether `name` is an event source this target declares (`GET /sources/:name`'s 404). */
+export function declaresSource(name: string): boolean {
+  return eventSources.some((source) => source.name === name);
+}
+
+/** The `event` triggers bound to one source, by name. */
+export function triggersOf(source: string): readonly EventTrigger[] {
+  return eventTriggers.filter((trigger) => trigger.source === source);
+}
+
+/** How many restart rows `GET /sources/:name` shows, newest first. */
+export const RESTARTS_SHOWN = 20;
+
+/**
+ * What `GET /sources/:name` answers about one source: its program's state, its
+ * newest checkpoint, its restart rows and the lines it refused. `undefined` for
+ * a name this target does not declare.
+ */
+export async function sourceStatus(name: string): Promise<Record<string, unknown> | undefined> {
+  const source = eventSources.find((one) => one.name === name);
+  if (source === undefined) return undefined;
+  const consumer = consumers.get(name);
+  const journal = await openJournal();
+  const page = await journal.restartsOf(name, RESTARTS_SHOWN);
+  const checkpoint = consumer?.checkpoint ?? (await journal.checkpointOf(name));
+  return {
+    source: name,
+    kind: source.kind,
+    triggers: triggersOf(name).map((trigger) => trigger.name),
+    state: consumer?.state ?? "stopped",
+    ...(consumer?.runningSince === undefined ? {} : { running_since: consumer.runningSince }),
+    ...(consumer?.backingOffUntil === undefined
+      ? {}
+      : { backing_off_until: consumer.backingOffUntil }),
+    checkpoint: checkpoint ?? null,
+    accepted_events: consumer?.accepted ?? 0,
+    refused_lines: consumer?.refused ?? 0,
+    restart_count: page.total,
+    restarts: page.rows.map((row) => restartReport(row)),
+  };
+}
+
+function restartReport(row: RestartRow): Record<string, unknown> {
+  return {
+    ended_at: row.endedAt,
+    attempt: row.attempt,
+    exit_code: row.exitCode ?? null,
+    signal: row.signal ?? null,
+    ran_ms: row.ranMs,
+    backoff_ms: row.backoffMs,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// One schedule
+// ---------------------------------------------------------------------------
+
+/** The longest one timer sleeps before the scheduler looks at the clock again. */
+const LONGEST_SLEEP_MS = 60_000;
+
+/** How many skipped ticks the serve log counts before saying "at least". */
+const SKIPPED_COUNTED = 10_000;
+
+/**
+ * The longest a scheduler holding a claimed tick's start, or a consumer
+ * holding an event the journal refused, waits between attempts.
+ */
+const LONGEST_INTAKE_RETRY_MS = 30_000;
+
+/**
+ * How long a scheduler whose look at its newest claim could not reach the
+ * journal waits before the first retry ([`Scheduler.#settle`]), doubling to
+ * [`LONGEST_INTAKE_RETRY_MS`].
+ */
+const FIRST_LOOK_RETRY_MS = 1_000;
+
+/** Who claimed a tick a starting scheduler finds unbegun, for the serve log. */
+const STOPPED_BEFORE_STARTING = "by a serve that stopped before starting it";
+
+/**
+ * The same, for the look a scheduler holds its schedule for — a standby's, once
+ * the journal reads, or one after a claim that failed — where the claimer may be
+ * another `serve` or this one.
+ */
+const NEVER_STARTED = "and was never started";
+
+/** Who claimed a tick this scheduler owes a start, for the serve log. */
+const OWED_BY_THIS_SCHEDULER = "by this scheduler, and could not be started then";
+
+/** What the ticks a held schedule skipped fell during, for the serve log. */
+const HELD_FOR_A_CLAIM = "this scheduler was holding the schedule for a claimed tick's start";
+
+/** The same, for a schedule held for its look at the newest claim ([`Scheduler.#settle`]). */
+const HELD_FOR_A_LOOK =
+  "this scheduler was holding the schedule until the journal could say whether the tick it last claimed was ever started";
+
+class Scheduler {
+  readonly #trigger: ScheduleTrigger;
+  readonly #intake: Intake;
+  readonly #clock: Clock;
+  readonly #cron: Cron;
+  readonly #zone: Zone;
+  #timer: ReturnType<typeof setTimeout> | undefined;
+  /** Ends the wait [`#rest`] is in, where it is in one, so a stop is not held by it. */
+  #wake: (() => void) | undefined;
+  #stopped = false;
+  /**
+   * Whether this scheduler has looked at the newest `fired` row for a claim
+   * whose execution never began ([`#repair`]) since it last had reason to: at
+   * start, and after a tick's claim failed in a way that may still have landed.
+   * While it has not — the journal could not be read, as a standby's cannot
+   * until the `serve` holding it goes (`docs/distributed.md` §8) — **no tick is
+   * armed**: the look is retried with backoff until one reaches the journal
+   * ([`#settle`]), and only then is the schedule armed again.
+   */
+  #repaired = false;
+  /**
+   * The newest `fired` row, where it is a claim **this scheduler owes a start**:
+   * its execution could not be journaled, or the journal could not say whether
+   * it had been. No later tick is claimed while one is owed ([`#discharge`]),
+   * which is what keeps the owed claim the newest row — the one row the repair
+   * looks at (`docs/durability.md` §3.11).
+   */
+  #owed: FiredRow | undefined;
+  /** Who claimed [`#owed`] and why it was not started then, for the serve log. */
+  #owedBy = OWED_BY_THIS_SCHEDULER;
+  /**
+   * The instant of the newest `fired` row a look read ([`#repair`]), where it
+   * read one: on a standby, the last tick the `serve` it took over from
+   * claimed, which is where the ticks nobody fired begin.
+   */
+  #newestClaim: number | undefined;
+
+  constructor(trigger: ScheduleTrigger, intake: Intake, clock: Clock) {
+    this.#trigger = trigger;
+    this.#intake = intake;
+    this.#clock = clock;
+    this.#cron = parseCron(trigger.cron);
+    this.#zone = zoneOf(trigger.timezone);
+  }
+
+  /** `schedule \`<name>\``, for the serve log. */
+  get #named(): string {
+    return `schedule \`${this.#trigger.name}\``;
+  }
+
+  /** The payload of the tick at `at`. */
+  #payloadOf(at: number): SchedulePayload {
+    return { scheduled_at: render(at, this.#zone), trigger: this.#trigger.name };
+  }
+
+  async start(): Promise<void> {
+    const now = this.#clock.now();
+    let last: number | undefined;
+    try {
+      const fired = await (await openJournal()).lastFired(this.#trigger.name);
+      if (fired !== undefined) last = Date.parse(fired.scheduledAt);
+      await this.#repair(fired, STOPPED_BEFORE_STARTING);
+    } catch (error) {
+      say(`${this.#named}: the journal could not say when it last fired (${messageOf(error)}), so no skipped span is reported, and no tick is claimed until it can say whether the tick it last claimed was ever started; looking again in ${FIRST_LOOK_RETRY_MS}ms`);
+    }
+    if (last !== undefined) {
+      const first = nextAfter(this.#cron, last, this.#zone);
+      if (first !== undefined && first <= now) this.#skipped(first, now, "no serve was running");
+    }
+    const next = nextAfter(this.#cron, now, this.#zone);
+    say(
+      `${this.#named} (\`${this.#trigger.cron}\` in ${this.#trigger.timezone}): last fired ${last === undefined ? "never" : render(last, this.#zone)}, next tick ${next === undefined ? "none" : render(next, this.#zone)}`,
+    );
+    if (!this.#repaired || this.#owed !== undefined) {
+      // The look the start could not take, or the claim its repair could not
+      // start, holds the schedule, as one this scheduler made would
+      // ([`#due`]). Not awaited, so a journal that keeps refusing it holds
+      // this trigger and not the app.
+      void this.#settleThenArm(now);
+      return;
+    }
+    if (next !== undefined) this.#arm(next);
+  }
+
+  stop(): void {
+    this.#stopped = true;
+    if (this.#timer !== undefined) clearTimeout(this.#timer);
+    this.#timer = undefined;
+    this.#wake?.();
+  }
+
+  /**
+   * Start the execution `fired` names, where it never began
+   * (`docs/durability.md` §3.11) — `claimed` saying, for the serve log, who
+   * claimed it and why its execution was not started then.
+   *
+   * A `serve` that stops between claiming a tick and journaling the execution
+   * it claimed it for leaves a row that wins every later claim of that tick
+   * and names an execution nothing will ever recover: honoured, the tick would
+   * fire zero times. So does a claim whose execution the journal would not
+   * begin. Only the newest row can be that claim — a scheduler claims its next
+   * tick only after the one before was admitted, and holds while one is owed
+   * ([`#discharge`]) — and only the admission can say whether its execution
+   * began, so the row is handed back to it, which starts the execution under
+   * the id the row recorded and with the payload the tick would have had. One
+   * process at a time writes a project's journal (`docs/durability.md` §2.1),
+   * and this one has claimed no tick past this row, so nothing is admitting
+   * that claim beside this.
+   *
+   * Leaves [`#owed`] set where the start is still owed: the execution could
+   * not be journaled again, or the journal could not say whether it began.
+   */
+  async #repair(fired: FiredRow | undefined, claimed: string): Promise<void> {
+    this.#repaired = true;
+    if (fired === undefined) {
+      this.#owed = undefined;
+      return;
+    }
+    const claimedAt = Date.parse(fired.scheduledAt);
+    if (Number.isFinite(claimedAt)) this.#newestClaim = claimedAt;
+    const payload = this.#payloadOf(claimedAt);
+    const tick = `the ${payload.scheduled_at} tick`;
+    const named = `${tick} was claimed as ${fired.execution} ${claimed}`;
+    try {
+      const admitted = await this.#intake.unbegun(this.#trigger, fired, payload);
+      this.#owed = admitted?.outcome === "unbegun" ? fired : undefined;
+      this.#owedBy = claimed;
+      if (admitted === undefined) return;
+      if (admitted.outcome === "started") say(`${this.#named}: ${named}, so it starts now`);
+      else if (admitted.outcome === "held") say(`${this.#named}: ${tick} was already fired, as ${admitted.execution}`);
+      else if (admitted.outcome === "unbegun") {
+        say(
+          `${this.#named}: ${tick}, claimed as ${fired.execution}, still could not be started: its execution could not be journaled (${admitted.reason}); no later tick is claimed until it starts`,
+        );
+      } else say(`${this.#named}: ${named}, and starts nothing: ${admitted.reason}`);
+    } catch (error) {
+      this.#owed = fired;
+      this.#owedBy = claimed;
+      say(
+        `${this.#named}: whether ${tick}, claimed as ${fired.execution}, was ever started could not be read (${messageOf(error)}); no later tick is claimed until it is`,
+      );
+    }
+  }
+
+  /**
+   * Start the claim this scheduler owes ([`#owed`]), retried with backoff until
+   * its execution has started or the journal says it began. `false` where the
+   * scheduler was stopped first; `true` at once where nothing is owed.
+   */
+  async #discharge(): Promise<boolean> {
+    let delay = 1_000;
+    while (this.#owed !== undefined) {
+      if (!(await this.#rest(delay))) return false;
+      await this.#repair(this.#owed, this.#owedBy);
+      delay = Math.min(delay * 2, LONGEST_INTAKE_RETRY_MS);
+    }
+    return !this.#stopped;
+  }
+
+  /**
+   * Take the look at the newest `fired` row ([`#repair`]) until one reaches the
+   * journal — retried with backoff, and logged each time it cannot — and then
+   * start what that look leaves owed ([`#discharge`]). `false` where the
+   * scheduler was stopped first; `true` at once where nothing is owed.
+   *
+   * Nothing is armed while the look is owed, so **no tick is claimed past a
+   * newest row nobody has looked at**. Claimed, the tick's own row would become
+   * the newest, and the one below it — a claim whose execution never began, as
+   * a `serve` that stopped between a claim and its execution leaves, or as this
+   * scheduler's own claim that failed after its insert may have landed does —
+   * would never be read by a look again: that tick would fire zero times
+   * (`docs/durability.md` §3.11). And a look retried on its own backoff rather
+   * than at the next tick reaches a claim a standby inherits as soon as the
+   * journal opens to it, not a schedule's period later.
+   */
+  async #settle(): Promise<boolean> {
+    let delay = FIRST_LOOK_RETRY_MS;
+    while (!this.#repaired) {
+      if (!(await this.#rest(delay))) return false;
+      delay = Math.min(delay * 2, LONGEST_INTAKE_RETRY_MS);
+      try {
+        const fired = await (await openJournal()).lastFired(this.#trigger.name);
+        await this.#repair(fired, NEVER_STARTED);
+      } catch (error) {
+        say(
+          `${this.#named}: the journal still could not say whether the tick it last claimed was ever started (${messageOf(error)}), so no tick is claimed yet; looking again in ${delay}ms`,
+        );
+      }
+    }
+    return this.#discharge();
+  }
+
+  /**
+   * [`#settle`], then arm the first tick after `from` — or after the newest
+   * claim the look read, where that is later — naming any the hold skipped.
+   */
+  async #settleThenArm(from: number): Promise<void> {
+    const looking = !this.#repaired;
+    if (!(await this.#settle())) return;
+    // A standby's look reads what the `serve` holding the journal claimed
+    // while this scheduler held its schedule: the ticks up to the newest of
+    // those were that `serve`'s, and only the ones after it fell with nobody
+    // firing them.
+    const after = Math.max(from, this.#newestClaim ?? from);
+    this.#armAfter(after, looking ? HELD_FOR_A_LOOK : HELD_FOR_A_CLAIM);
+  }
+
+  /** Wait `ms` real milliseconds, or until a stop: `false` for a stop. */
+  #rest(ms: number): Promise<boolean> {
+    if (this.#stopped) return Promise.resolve(false);
+    return new Promise<boolean>((resolve) => {
+      this.#wake = () => {
+        this.#wake = undefined;
+        resolve(false);
+      };
+      this.#timer = setTimeout(() => {
+        this.#timer = undefined;
+        this.#wake = undefined;
+        resolve(!this.#stopped);
+      }, ms);
+      this.#timer.unref?.();
+    });
+  }
+
+  /** Say which ticks fell between `first` and `now` without firing. */
+  #skipped(first: number, now: number, why: string): void {
+    let count = 0;
+    let latest = first;
+    for (let at: number | undefined = first; at !== undefined && at <= now; ) {
+      count += 1;
+      latest = at;
+      if (count >= SKIPPED_COUNTED) break;
+      at = nextAfter(this.#cron, at, this.#zone);
+    }
+    const capped = count >= SKIPPED_COUNTED;
+    // Past the count the span still ends where the outage did — at the newest
+    // tick at or before now — rather than at the tick the count stopped on.
+    if (capped) latest = this.#lastThrough(latest, now);
+    const counted = capped ? `at least ${SKIPPED_COUNTED} ticks` : `${count} tick${count === 1 ? "" : "s"}`;
+    say(
+      `${this.#named}: skipped ${counted} from ${render(first, this.#zone)} through ${render(latest, this.#zone)}, which fell while ${why}: a tick is never back-filled, and a job catches itself up from \`payload.scheduled_at\``,
+    );
+  }
+
+  /**
+   * The newest tick at or before `now`, given `from`, a tick at or before it —
+   * found by bisecting for the latest instant whose next tick is still not
+   * after `now`, so it costs some forty evaluations however many ticks lie
+   * between the two.
+   */
+  #lastThrough(from: number, now: number): number {
+    // The next tick after `low` is never after `now`, and the next after `high`
+    // always is: `from - 1`'s is `from` itself, and `now`'s is past it.
+    let low = from - 1;
+    let high = now;
+    while (high - low > 1) {
+      const middle = Math.floor((low + high) / 2);
+      const next = nextAfter(this.#cron, middle, this.#zone);
+      if (next !== undefined && next <= now) low = middle;
+      else high = middle;
+    }
+    return nextAfter(this.#cron, low, this.#zone) ?? from;
+  }
+
+  #arm(at: number): void {
+    if (this.#stopped) return;
+    const wait = Math.min(this.#clock.real(at - this.#clock.now()), LONGEST_SLEEP_MS);
+    this.#timer = setTimeout(() => {
+      void this.#due(at);
+    }, wait);
+    this.#timer.unref?.();
+  }
+
+  /**
+   * Arm the first tick after `at` — or, where that one is already past, name
+   * the ticks that fell since (`why` says while what) and arm the first after
+   * now.
+   */
+  #armAfter(at: number, why: string): void {
+    if (this.#stopped) return;
+    const now = this.#clock.now();
+    let next = nextAfter(this.#cron, at, this.#zone);
+    if (next !== undefined && next <= now) {
+      this.#skipped(next, now, why);
+      next = nextAfter(this.#cron, now, this.#zone);
+    }
+    if (next !== undefined) this.#arm(next);
+  }
+
+  async #due(at: number): Promise<void> {
+    if (this.#stopped) return;
+    if (this.#clock.now() < at) {
+      this.#arm(at);
+      return;
+    }
+    // Nothing arms a tick while a look is owed ([`#settle`]), so this one is
+    // claimed after a look reached the journal. A claim still owed is started
+    // before this tick is claimed, and so is one this tick's own claim leaves
+    // owed — and the look a claim that failed asks for is taken before the
+    // next tick is armed: the newest row stays the one the repair looks at, and
+    // no tick is claimed past a claim nothing started, or past one nobody
+    // looked at.
+    let held = this.#owed !== undefined;
+    if (!(await this.#settle())) return;
+    await this.#fire(at);
+    const looking = !this.#repaired;
+    held ||= this.#owed !== undefined;
+    if (!(await this.#settle())) return;
+    this.#armAfter(
+      at,
+      looking
+        ? HELD_FOR_A_LOOK
+        : held
+          ? HELD_FOR_A_CLAIM
+          : "this scheduler could not see them (the process stalled or the machine slept)",
+    );
+  }
+
+  async #fire(at: number): Promise<void> {
+    const payload = this.#payloadOf(at);
+    const tick = `the ${payload.scheduled_at} tick`;
+    try {
+      const admitted = await this.#intake.tick(this.#trigger, at, payload);
+      if (admitted.outcome === "started") say(`${this.#named}: fired ${tick} as ${admitted.execution}`);
+      else if (admitted.outcome === "held") say(`${this.#named}: ${tick} was already fired, as ${admitted.execution}`);
+      else if (admitted.outcome === "unbegun") {
+        // Claimed, so owed: the row is down and wins every later claim of this
+        // tick, and nothing will ever recover the execution it names.
+        this.#owed = admitted.fired;
+        this.#owedBy = OWED_BY_THIS_SCHEDULER;
+        say(
+          `${this.#named}: ${tick} was claimed as ${admitted.fired.execution}, whose execution could not be journaled (${admitted.reason}): no later tick is claimed until it starts`,
+        );
+      } else say(`${this.#named}: ${tick} started nothing: ${admitted.reason}`);
+    } catch (error) {
+      // A claim that failed may still have landed — a dialled journal can
+      // commit an insert whose answer never arrives — so the newest row is
+      // looked at again before the next tick is armed ([`#settle`]).
+      this.#repaired = false;
+      say(`${this.#named}: ${tick} could not be journaled, so it did not fire: ${messageOf(error)}`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// One command source
+// ---------------------------------------------------------------------------
+
+/** The variable a program finds its newest accepted checkpoint in. */
+export const CHECKPOINT_VARIABLE = "AGENT_COMPOSE_CHECKPOINT";
+
+/** How long a stopped program's group has after `SIGTERM` before `SIGKILL`. */
+const STOP_GRACE_MS = 2_000;
+
+/**
+ * How long a run's pipes are read on, once its program has exited and its
+ * group has gone, before they are let go where they have still not closed:
+ * nothing of the program's is left to write to them by then, and whatever
+ * holds them open left the group — `setsid`, a daemon — and is not the
+ * program's (grammar 14.4). Counted only while reading is not held for an
+ * admission ([`Consumer.#letGoAfter`]), so a slow intake drops nothing the
+ * program wrote.
+ */
+const LET_GO_MS = STOP_GRACE_MS;
+
+/** One of a run's output streams, as it is read. */
+interface Reading {
+  /** Whether reading is held while lines already read are admitted. */
+  holding(): boolean;
+  /**
+   * Stop reading for good, as if the stream had ended: what it was in the
+   * middle of — a line no newline has ended yet — is taken as its last line,
+   * and the stream is destroyed.
+   */
+  letGo(): void;
+}
+
+/** A stream the runtime gave the run none of. */
+const NOT_READ: Reading = { holding: () => false, letGo: () => {} };
+
+/**
+ * The longest a line may be, on either of the program's output streams. A
+ * program that writes without a newline would otherwise grow this process's
+ * buffer for as long as it wrote: a stdout line past this is refused like any
+ * line that is not a JSON object, and a stderr line past it is logged cut here.
+ */
+const LONGEST_LINE_BYTES = 1 << 20;
+
+/**
+ * The longest a checkpoint may be, in UTF-8 bytes.
+ *
+ * A checkpoint is handed back to **every** start of the program — as
+ * [`CHECKPOINT_VARIABLE`] and as each `{checkpoint}` argument — so one no
+ * process could be started with would be journaled, handed back, and refuse
+ * every start after it: Linux will not `exec` a process one of whose arguments
+ * or environment strings is longer than 128 KiB (`MAX_ARG_STRLEN`), and every
+ * host bounds argv and the environment together. A checkpoint is a position
+ * rather than a payload, so it is held to half that one-string limit, which
+ * leaves the variable's name and the rest of the program's argv room.
+ */
+const LONGEST_CHECKPOINT_BYTES = 1 << 16;
+
+/** A UTF-16 surrogate that is not half of a pair. */
+const LONE_SURROGATE = /\p{Cs}/u;
+
+/**
+ * Why `checkpoint` could not be handed to the program **as it was journaled**,
+ * or `undefined` where it can be.
+ *
+ * A NUL ends a C string, so no argument or environment variable carries one —
+ * Node and Bun refuse the start outright — and a lone surrogate has no UTF-8
+ * encoding, so the program would be handed U+FFFD in its place and resume from
+ * a position nobody wrote. Either, like a checkpoint past
+ * [`LONGEST_CHECKPOINT_BYTES`], is refused with its line (grammar 14.4): once
+ * journaled it would be the position every later start was handed, and every
+ * one of those starts would fail, or resume from somewhere else, for good.
+ */
+function unhandable(checkpoint: string): string | undefined {
+  if (checkpoint.includes("\u0000")) {
+    return "it holds a NUL character, which no program argument or environment variable can carry";
+  }
+  if (LONE_SURROGATE.test(checkpoint)) {
+    return "it holds a lone UTF-16 surrogate, which has no UTF-8 encoding to hand a program";
+  }
+  const bytes = Buffer.byteLength(checkpoint, "utf8");
+  if (bytes > LONGEST_CHECKPOINT_BYTES) {
+    return `it is ${bytes} bytes long, and a checkpoint is at most ${LONGEST_CHECKPOINT_BYTES}: it is handed to every start of the program as an argument and an environment variable, which a host bounds`;
+  }
+  return undefined;
+}
+
+class Consumer {
+  readonly #source: EventSource;
+  readonly #command: CommandSource;
+  readonly #triggers: readonly EventTrigger[];
+  readonly #intake: Intake;
+
+  state: "starting" | "running" | "backing_off" | "stopped" = "starting";
+  runningSince: string | undefined;
+  backingOffUntil: string | undefined;
+  checkpoint: string | undefined;
+  accepted = 0;
+  refused = 0;
+
+  #child: ChildProcess | undefined;
+  #startedAt = 0;
+  #attempt = 0;
+  #timer: ReturnType<typeof setTimeout> | undefined;
+  #stopping = false;
+  /** Resolves when the running program's stdio has closed. */
+  #closed: Promise<void> = Promise.resolve();
+  /**
+   * The process groups of runs that have ended and still had members when they
+   * did, by group id, each with the [`#reap`] that empties it.
+   */
+  readonly #reaping = new Map<number, Promise<void>>();
+
+  constructor(
+    source: EventSource,
+    command: CommandSource,
+    triggers: readonly EventTrigger[],
+    intake: Intake,
+  ) {
+    this.#source = source;
+    this.#command = command;
+    this.#triggers = triggers;
+    this.#intake = intake;
+  }
+
+  get #named(): string {
+    return `event source \`${this.#source.name}\``;
+  }
+
+  /**
+   * Read the source's checkpoint out of the journal and start the program with
+   * it — **only** with it.
+   *
+   * A journal that cannot say is not a source with no checkpoint: started
+   * without one, a program whose first start means "from the tip" would skip
+   * every event between the journaled position and the tip, and one whose
+   * first start means "from the beginning" would re-emit everything, moving
+   * the journaled checkpoint backwards as each repeat was admitted. So the
+   * read is retried with backoff — as an event the journal will not admit is
+   * (see [`#admit`]) — and the program waits, `starting`, until it answers.
+   * The first attempt is awaited; the retries are not, so a journal that is
+   * down holds this source and not the app (a standby `serve` on a dialled
+   * journal is one: `docs/distributed.md` §8).
+   */
+  async start(): Promise<void> {
+    await this.#readCheckpoint(1_000);
+  }
+
+  async #readCheckpoint(delay: number): Promise<void> {
+    if (this.#stopping) return;
+    try {
+      this.checkpoint = await (await openJournal()).checkpointOf(this.#source.name);
+    } catch (error) {
+      if (this.#stopping) return;
+      say(
+        `${this.#named}: the journal could not say its checkpoint (${messageOf(error)}), so the program is not started yet; trying again in ${delay}ms`,
+      );
+      this.#timer = setTimeout(() => {
+        this.#timer = undefined;
+        void this.#readCheckpoint(Math.min(delay * 2, LONGEST_INTAKE_RETRY_MS));
+      }, delay);
+      this.#timer.unref?.();
+      return;
+    }
+    this.#spawn();
+  }
+
+  #spawn(): void {
+    if (this.#stopping) return;
+    this.backingOffUntil = undefined;
+    let program: string;
+    let args: string[];
+    try {
+      program = interpolate(this.#command.command);
+      args = this.#command.args.map((arg) =>
+        "checkpoint" in arg ? (this.checkpoint ?? "") : interpolate(arg.text),
+      );
+    } catch (error) {
+      say(`${this.#named}: the program could not be started: ${messageOf(error)}`);
+      this.#ended(undefined, undefined);
+      return;
+    }
+    const environment: NodeJS.ProcessEnv = { ...process.env };
+    if (this.checkpoint === undefined) delete environment[CHECKPOINT_VARIABLE];
+    else environment[CHECKPOINT_VARIABLE] = this.checkpoint;
+    this.#startedAt = Date.now();
+    let child: ChildProcess;
+    try {
+      child = spawn(program, args, {
+        env: environment,
+        detached: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch (error) {
+      say(`${this.#named}: the program could not be started: ${messageOf(error)}`);
+      this.#ended(undefined, undefined);
+      return;
+    }
+    this.#child = child;
+    this.state = "running";
+    this.runningSince = new Date(this.#startedAt).toISOString();
+    say(
+      `${this.#named}: started \`${program}\`${child.pid === undefined ? "" : ` (pid ${child.pid})`} with ${this.checkpoint === undefined ? "no checkpoint" : `checkpoint ${JSON.stringify(this.checkpoint)}`}`,
+    );
+    // One end per run, whichever way the runtime reports it: a program that
+    // could not be started is an `error` with no pid, which some runtimes
+    // follow with a `close` and some do not, and one that ran ends at `close`
+    // — once its stdio has drained and every line it wrote has been admitted —
+    // or, where something outside its group holds that stdio open, when the
+    // pipes are let go ([`#letGoAfter`]).
+    let over = false;
+    // When the program exited, where it has: the instant its run ended, which
+    // the `close` after it can trail by as long as its group takes to go.
+    let exitedAt: number | undefined;
+    let resolveClosed: () => void = () => {};
+    this.#closed = new Promise<void>((resolve) => {
+      resolveClosed = resolve;
+    });
+    const end = (code: number | undefined, signal: NodeJS.Signals | undefined): void => {
+      if (over) return;
+      over = true;
+      resolveClosed();
+      void this.#lines.then(() => this.#ended(code, signal, child, exitedAt));
+    };
+    // The program's exit takes its group with it, at once ([`#reap`]): a
+    // member that inherited its stdout or stderr — a helper started with
+    // `cmd &`, or by a `Popen` left with the default stdio — holds the pipe
+    // open, and `close` waits for every holder, so a run waiting on `close`
+    // alone would never end while that helper lived: never journaled, never
+    // restarted, and reported `running` with its program gone (grammar 14.4:
+    // an exit, any code, is restarted, and it never gives up). Ended, the
+    // group lets go of the pipes, what is left in them is read and admitted,
+    // and `close` ends the run. During a stop, [`#stopRun`] is already ending
+    // the group, and this is the same reap. A process that left the group —
+    // `setsid`, a daemon — is not reached by it and can hold the pipes past
+    // it, so once the group has gone they are read on for a bound and then
+    // let go, and the run ends with the exit's code or signal.
+    const stderr = this.#tagStderr(child);
+    const stdout = this.#readStdout(child);
+    child.on("exit", (code, signal) => {
+      exitedAt = Date.now();
+      const reaped = child.pid === undefined ? undefined : this.#reap(child.pid);
+      void this.#letGoAfter(reaped, stdout, () => over, () => {
+        if (!this.#stopping) {
+          say(
+            `${this.#named}: the program has exited and its process group has gone, and a process outside the group still holds its stdout or stderr open: one that left the group is not the program's, so the pipes are let go and the run ends`,
+          );
+        }
+        stdout.letGo();
+        stderr.letGo();
+        end(code ?? undefined, signal ?? undefined);
+      });
+    });
+    child.on("error", (error) => {
+      if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
+        // An error about a process that is running — a signal it could not
+        // be sent — is not an end; its `close` still comes.
+        say(`${this.#named}: ${error.message}`);
+        return;
+      }
+      if (child.pid === undefined) {
+        say(`${this.#named}: the program could not be started: ${error.message}`);
+        end(undefined, undefined);
+      }
+    });
+    child.on("close", (code, signal) => {
+      end(code ?? undefined, signal ?? undefined);
+    });
+    // The pipe this process holds and never writes: a program that has gone
+    // makes it `EPIPE` on the stop that ends it, which is not news.
+    child.stdin?.on("error", () => {});
+  }
+
+  /** The chain every line of the current run is admitted on, in order. */
+  #lines: Promise<void> = Promise.resolve();
+
+  /**
+   * Copy the program's stderr to the serve log, one tagged line per line it
+   * wrote — held to stdout's bound, for stdout's reason: a program that writes
+   * to stderr without a newline (a progress bar redrawn with `\r`, a binary
+   * blob, a diagnostic it never ends) would otherwise grow this process's
+   * buffer for as long as it wrote. A line past [`LONGEST_LINE_BYTES`] is
+   * logged cut there, saying so, and the rest of it is dropped up to its
+   * newline. Never held: the log takes a line as it comes.
+   */
+  #tagStderr(child: ChildProcess): Reading {
+    const stderr = child.stderr;
+    if (stderr === null) return NOT_READ;
+    const tag = `[source ${this.#source.name}]`;
+    let held = Buffer.alloc(0);
+    // Set while the rest of a line already cut for its length is arriving.
+    let skipping = false;
+    // Set once the stream has ended or been let go, so its last line is
+    // logged once.
+    let done = false;
+    // One line of the log for one line of stderr — cut at the bound wherever
+    // its newline fell: one that arrives in the chunk that took it past the
+    // bound is as long as one that has not ended yet.
+    const log = (line: Buffer): void => {
+      say(
+        line.length > LONGEST_LINE_BYTES
+          ? `${tag} ${line.subarray(0, LONGEST_LINE_BYTES).toString("utf8")} [cut: the line is longer than ${LONGEST_LINE_BYTES} bytes, and the rest of it is not logged]`
+          : `${tag} ${line.toString("utf8")}`,
+      );
+    };
+    stderr.on("data", (chunk: Buffer) => {
+      held = Buffer.concat([held, chunk]);
+      let newline = held.indexOf(0x0a);
+      while (newline >= 0) {
+        if (skipping) skipping = false;
+        else log(held.subarray(0, newline));
+        held = held.subarray(newline + 1);
+        newline = held.indexOf(0x0a);
+      }
+      if (skipping) {
+        held = Buffer.alloc(0);
+      } else if (held.length > LONGEST_LINE_BYTES) {
+        log(held);
+        held = Buffer.alloc(0);
+        skipping = true;
+      }
+    });
+    const last = (): void => {
+      if (done) return;
+      done = true;
+      if (held.length > 0 && !skipping) log(held);
+    };
+    stderr.on("end", last);
+    return {
+      holding: () => false,
+      letGo: () => {
+        last();
+        stderr.destroy();
+      },
+    };
+  }
+
+  /**
+   * Read the program's stdout one line at a time, admitting each before the
+   * next: the stream is paused while a batch of lines is admitted, so a program
+   * whose events start slowly is held at its own `write` rather than queued
+   * here (PRD resolved q78 ruling c's backpressure).
+   */
+  #readStdout(child: ChildProcess): Reading {
+    const stdout = child.stdout;
+    if (stdout === null) return NOT_READ;
+    let held = Buffer.alloc(0);
+    let number = 0;
+    // Set while the rest of a line already refused for its length is arriving:
+    // that rest is the same line, so it is dropped up to its newline rather
+    // than read — and counted — as a line of its own.
+    let skipping = false;
+    // The batches of lines read and not yet admitted: reading is held while
+    // there is one.
+    let admitting = 0;
+    // Set once the stream has ended or been let go, so its last line is taken
+    // once.
+    let done = false;
+    this.#lines = Promise.resolve();
+    stdout.on("data", (chunk: Buffer) => {
+      held = Buffer.concat([held, chunk]);
+      const lines: Buffer[] = [];
+      let newline = held.indexOf(0x0a);
+      while (newline >= 0) {
+        if (skipping) skipping = false;
+        else lines.push(held.subarray(0, newline));
+        held = held.subarray(newline + 1);
+        newline = held.indexOf(0x0a);
+      }
+      if (skipping) {
+        held = Buffer.alloc(0);
+      } else if (held.length > LONGEST_LINE_BYTES) {
+        lines.push(held);
+        held = Buffer.alloc(0);
+        skipping = true;
+      }
+      if (lines.length === 0) return;
+      stdout.pause();
+      admitting += 1;
+      this.#lines = this.#lines.then(async () => {
+        try {
+          for (const line of lines) {
+            number += 1;
+            await this.#line(line, number);
+          }
+        } finally {
+          admitting -= 1;
+        }
+        if (!this.#stopping && !done) stdout.resume();
+      });
+    });
+    const last = (): void => {
+      if (done) return;
+      done = true;
+      if (held.length === 0 || skipping) return;
+      const tail = held;
+      held = Buffer.alloc(0);
+      this.#lines = this.#lines.then(async () => {
+        number += 1;
+        await this.#line(tail, number);
+      });
+    };
+    stdout.on("end", last);
+    return {
+      holding: () => admitting > 0,
+      letGo: () => {
+        last();
+        stdout.destroy();
+      },
+    };
+  }
+
+  /** Admit one line to every bound trigger, then journal its checkpoint. */
+  async #line(bytes: Buffer, number: number): Promise<void> {
+    const text = bytes.toString("utf8");
+    let body: unknown;
+    try {
+      if (bytes.length > LONGEST_LINE_BYTES) throw new Error("longer than a line may be");
+      body = JSON.parse(text);
+    } catch {
+      body = undefined;
+    }
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      this.refused += 1;
+      say(
+        `${this.#named}: line ${number} is not a JSON object, so it was refused and starts nothing (${this.refused} refused so far)`,
+      );
+      return;
+    }
+    const event: LineEvent = {
+      body: body as Record<string, unknown>,
+      attributes: {},
+      source: this.#source.name,
+    };
+    let id: string;
+    try {
+      id =
+        this.#command.checkpoint === undefined
+          ? createHash("sha256").update(bytes).digest("hex")
+          : this.#command.checkpoint(event);
+    } catch (error) {
+      this.refused += 1;
+      say(
+        `${this.#named}: line ${number}'s \`checkpoint\` could not be read (${messageOf(error)}), so it was refused and starts nothing (${this.refused} refused so far)`,
+      );
+      return;
+    }
+    // Refused before it is admitted, so it never becomes the checkpoint every
+    // later start is handed (see [`unhandable`]).
+    const unfit = this.#command.checkpoint === undefined ? undefined : unhandable(id);
+    if (unfit !== undefined) {
+      this.refused += 1;
+      say(
+        `${this.#named}: line ${number}'s \`checkpoint\` could not be handed back to the program (${unfit}), so it was refused and starts nothing (${this.refused} refused so far)`,
+      );
+      return;
+    }
+    const payload: EventPayload = { id, ...event };
+    let accepted = false;
+    for (const trigger of this.#triggers) {
+      const admitted = await this.#admit(trigger, payload);
+      if (admitted === undefined) return;
+      if (admitted.outcome === "started") {
+        accepted = true;
+        say(`${this.#named}: event ${JSON.stringify(id)} started ${admitted.execution} for \`${trigger.name}\``);
+      } else if (admitted.outcome === "held") {
+        accepted = true;
+        say(
+          `${this.#named}: event ${JSON.stringify(id)} repeats one \`${trigger.name}\` already admitted as ${admitted.execution}, so it started nothing`,
+        );
+      } else {
+        say(`${this.#named}: event ${JSON.stringify(id)} started nothing for \`${trigger.name}\`: ${admitted.reason}`);
+      }
+    }
+    if (!accepted) return;
+    this.accepted += 1;
+    if (this.#command.checkpoint === undefined) return;
+    // **After** the intake accepted the event — started an execution, whose
+    // lifecycle row is journaled by the time it says so, or found the one it
+    // already had — so a checkpoint handed back on restart is never ahead of
+    // what was admitted (PRD resolved q78 ruling c). An event whose execution
+    // the journal would not begin is a rejection, retried above and holding
+    // the stream, and never reaches this line until it has begun.
+    this.checkpoint = id;
+    try {
+      await (await openJournal()).recordCheckpoint(this.#source.name, id);
+    } catch (error) {
+      say(
+        `${this.#named}: checkpoint ${JSON.stringify(id)} could not be journaled (${messageOf(error)}): a restart of serve hands the program an older one, and the events it repeats are deduplicated`,
+      );
+    }
+  }
+
+  /**
+   * Admit one event to one trigger, retrying while the journal refuses it —
+   * an event the journal could not record is not one this consumer may count
+   * as admitted or skip past, so it holds the stream until it is admitted.
+   * `undefined` when the consumer was stopped first.
+   */
+  async #admit(trigger: EventTrigger, payload: EventPayload): Promise<Admitted | undefined> {
+    let delay = 1_000;
+    for (;;) {
+      if (this.#stopping) return undefined;
+      try {
+        return await this.#intake.event(trigger, payload);
+      } catch (error) {
+        say(
+          `${this.#named}: event ${JSON.stringify(payload.id)} could not be admitted to \`${trigger.name}\` (${messageOf(error)}); trying it again in ${delay}ms, and reading no further line until it is`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay).unref?.());
+        delay = Math.min(delay * 2, LONGEST_INTAKE_RETRY_MS);
+      }
+    }
+  }
+
+  /**
+   * The program ended — or could not be started. Journal it, end what is left
+   * of its group, and restart it. `exitedAt` is when the program exited, where
+   * it ran: the run's end, which the restart's backoff is counted from.
+   */
+  #ended(
+    code: number | undefined,
+    signal: NodeJS.Signals | undefined,
+    child?: ChildProcess,
+    exitedAt?: number,
+  ): void {
+    this.#child = undefined;
+    this.runningSince = undefined;
+    if (this.#stopping) {
+      // [`stop`] is ending this run's group itself.
+      this.state = "stopped";
+      return;
+    }
+    // A member of the group that outlived its leader — a helper the program
+    // started and never waited for — is still the program's, and the restart
+    // starts a group of its own beside it: left alone, every restart of a
+    // program that crashes after starting one would leave one more behind,
+    // and none of them would end when `serve` does. The program's exit began
+    // ending it already; this is that same reap, for a runtime that reported
+    // no exit. Where one was reported, the group is not signalled from here:
+    // its reap is under way or done, and once the group has gone its id — the
+    // program's pid — may name another process's group.
+    if (exitedAt === undefined && child?.pid !== undefined) void this.#reap(child.pid);
+    const endedAt = exitedAt ?? Date.now();
+    const ran = this.#startedAt === 0 ? 0 : endedAt - this.#startedAt;
+    this.#attempt = ran > this.#command.restartMaxMs ? 1 : this.#attempt + 1;
+    const backoff = Math.min(
+      this.#command.restartBackoffMs * 2 ** (this.#attempt - 1),
+      this.#command.restartMaxMs,
+    );
+    const how =
+      signal !== undefined ? `was ended by ${signal}` : code !== undefined ? `exited with code ${code}` : "could not be started";
+    say(
+      `${this.#named}: the program ${how} after ${(ran / 1000).toFixed(1)}s; restarting it in ${backoff}ms (restart ${this.#attempt} in a row)`,
+    );
+    const row: RestartRow = {
+      source: this.#source.name,
+      endedAt: new Date(endedAt).toISOString(),
+      attempt: this.#attempt,
+      ...(code === undefined ? {} : { exitCode: code }),
+      ...(signal === undefined ? {} : { signal }),
+      ranMs: ran,
+      backoffMs: backoff,
+    };
+    void openJournal()
+      .then((journal) => journal.recordRestart(row))
+      .catch((error: unknown) => {
+        say(`${this.#named}: the restart could not be journaled: ${messageOf(error)}`);
+      });
+    this.state = "backing_off";
+    this.backingOffUntil = new Date(endedAt + backoff).toISOString();
+    this.#restartAt(endedAt + backoff);
+  }
+
+  /**
+   * Start the program again at `at`, in epoch milliseconds — armed in steps no
+   * longer than [`LONGEST_SLEEP_MS`], as the scheduler's ticks are.
+   *
+   * A timer's delay is a signed 32-bit count of milliseconds in Node and Bun
+   * alike, and one past it — some 24.8 days, which nothing bounds `restart:` to
+   * (grammar 14.4) — is clamped to one millisecond: armed whole, the doubling
+   * up to `restart.max` would turn into a restart every millisecond, each one a
+   * journaled row and a line of the serve log.
+   */
+  #restartAt(at: number): void {
+    const wait = Math.max(0, at - Date.now());
+    this.#timer = setTimeout(() => {
+      this.#timer = undefined;
+      if (Date.now() < at) this.#restartAt(at);
+      else this.#spawn();
+    }, Math.min(wait, LONGEST_SLEEP_MS));
+    this.#timer.unref?.();
+  }
+
+  /**
+   * Let a run's pipes go where they outlive its group, and end the run.
+   *
+   * Once the program has exited and `reaped` has emptied its group, nothing
+   * of the program's is left to write to its stdout or stderr, and a process
+   * still holding either open left the group — `setsid`, a daemon — and is not
+   * the program's (grammar 14.4). Its hold would keep `close`, and with it the
+   * run's end, from ever coming: never journaled, never restarted, reported
+   * `running` with its program gone — and a stop would one day signal the
+   * group id of a program long gone, which may by then name someone else's
+   * group. So the pipes are read on for [`LET_GO_MS`], counted only while
+   * `stdout` is not held for an admission — a slow intake drops nothing the
+   * program wrote — and `letGo` is called then, unless `over` says the run
+   * has ended first, as it does at once where nothing outside the group holds
+   * the pipes. Not unref'd, as [`#reap`]'s poll is not: a stop waits on the
+   * run's end, and this is bounded.
+   */
+  async #letGoAfter(
+    reaped: Promise<void> | undefined,
+    stdout: Reading,
+    over: () => boolean,
+    letGo: () => void,
+  ): Promise<void> {
+    await reaped;
+    let read = 0;
+    while (!over()) {
+      if (read >= LET_GO_MS) {
+        letGo();
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, GROUP_POLL_MS));
+      if (!stdout.holding()) read += GROUP_POLL_MS;
+    }
+  }
+
+  /**
+   * End the process group `group`: `SIGTERM` to it at once, and `SIGKILL` once
+   * the grace is up where anything is still in it — the stop's sequence
+   * (grammar 14.4), every member given the whole grace, not only the program.
+   * Begun when the program exits, for whatever its run left in the group, and
+   * by [`#stopRun`] for a run being stopped: one reap per group, so a group
+   * both reach is asked once and told once. Not awaited by the restart, which
+   * starts a group of its own; awaited by [`stop`], so nothing a run left
+   * behind outlives the stop. `undefined` where the group has no member to end
+   * — or the host has no process groups.
+   */
+  #reap(group: number): Promise<void> | undefined {
+    const reaping = this.#reaping.get(group);
+    if (reaping !== undefined) return reaping;
+    if (!groupLives(group)) return undefined;
+    signalGroupId(group, "SIGTERM");
+    const reaped = (async () => {
+      const deadline = Date.now() + STOP_GRACE_MS;
+      while (groupLives(group) && Date.now() < deadline) {
+        // Not unref'd: a stop waits on this, and a timer that did not hold the
+        // event loop open would let the process exit before the `SIGKILL`.
+        await new Promise((resolve) => setTimeout(resolve, GROUP_POLL_MS));
+      }
+      if (groupLives(group)) signalGroupId(group, "SIGKILL");
+    })().finally(() => {
+      this.#reaping.delete(group);
+    });
+    this.#reaping.set(group, reaped);
+    return reaped;
+  }
+
+  /**
+   * Stop the program, group and all: `SIGTERM`, then `SIGKILL` after a grace —
+   * and what earlier runs left in their groups with it ([`#reap`]).
+   */
+  async stop(): Promise<void> {
+    this.#stopping = true;
+    if (this.#timer !== undefined) clearTimeout(this.#timer);
+    this.#timer = undefined;
+    const child = this.#child;
+    if (child !== undefined) await this.#stopRun(child);
+    // A consumer stopped while it backs off has no run to stop, and the groups
+    // its earlier runs left may still hold members: each was sent `SIGTERM`
+    // when its program exited and is sent `SIGKILL` when its grace is up, and
+    // the stop waits for both.
+    await Promise.all(this.#reaping.values());
+    this.state = "stopped";
+  }
+
+  /** Stop the run `child` leads, group and all. */
+  async #stopRun(child: ChildProcess): Promise<void> {
+    // Its stdin ends first — the signal a program that reads it gets however
+    // `serve` stops — and then the group is asked, then told: `SIGTERM` now,
+    // and `SIGKILL` two seconds after it to whatever is still in the group
+    // ([`#reap`]). The program going first cuts nobody else's grace short: a
+    // helper still cleaning up when its leader exits on the `SIGTERM` has the
+    // rest of the two seconds. Where there is no group to end — a host
+    // without process groups — the program alone is asked and told. A program
+    // whose exit was already seen is neither: its group's reap began at that
+    // exit, and is the one waited for here, and once the group has gone its
+    // id — the program's pid — may name another process's group.
+    child.stdin?.end();
+    const exited = child.exitCode !== null || child.signalCode !== null;
+    const reaped =
+      child.pid === undefined
+        ? undefined
+        : exited
+          ? this.#reaping.get(child.pid)
+          : this.#reap(child.pid);
+    let kill: ReturnType<typeof setTimeout> | undefined;
+    if (reaped === undefined && !exited) {
+      signalGroup(child, "SIGTERM");
+      kill = setTimeout(() => signalGroup(child, "SIGKILL"), STOP_GRACE_MS);
+      kill.unref?.();
+    }
+    // What it printed and this consumer has not read is dropped rather than
+    // admitted: the stream is held paused while a batch is admitted, and a
+    // paused stream never closes. Nothing is lost by it — the checkpoint did
+    // not move past those lines, so the next start hands the program the
+    // position before them.
+    child.stdout?.destroy();
+    // Bounded: a descendant that left the group can hold the program's stderr
+    // open past the group's death, and a stop that waited on it would hold
+    // `serve` open for as long as that process lived.
+    let bound: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      this.#closed,
+      new Promise<void>((resolve) => {
+        bound = setTimeout(resolve, STOP_GRACE_MS * 2);
+        bound.unref?.();
+      }),
+    ]);
+    if (bound !== undefined) clearTimeout(bound);
+    // The rest of the grace, for a member of the group that outlived its
+    // leader: still the program's, and ended with it. A reap sends whatever
+    // is still in the group `SIGKILL` itself once the grace is up; with none,
+    // the program is told here where it has not exited.
+    await reaped;
+    if (kill !== undefined) clearTimeout(kill);
+    if (reaped === undefined && child.exitCode === null && child.signalCode === null) {
+      signalGroup(child, "SIGKILL");
+    }
+    child.stderr?.destroy();
+  }
+}
+
+/** How often a group [`Consumer.#reap`] is ending is looked at for members. */
+const GROUP_POLL_MS = 50;
+
+/**
+ * Whether the process group `group` has a member: signal 0 to it, which
+ * delivers nothing. `EPERM` is a member this process may not signal — still a
+ * member — and anything else (`ESRCH`, or a host without process groups) is
+ * none.
+ */
+function groupLives(group: number): boolean {
+  try {
+    process.kill(-group, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** `signal` to the process group `group`, where it still has members. */
+function signalGroupId(group: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-group, signal);
+  } catch {
+    // Already empty.
+  }
+}
+
+/** `signal` to `child`'s process group, or to `child` alone where there are none. */
+function signalGroup(child: ChildProcess, signal: NodeJS.Signals): void {
+  const pid = child.pid;
+  if (pid !== undefined) {
+    try {
+      process.kill(-pid, signal);
+      return;
+    } catch {
+      // Already gone, or a host without process groups.
+    }
+  }
+  try {
+    child.kill(signal);
+  } catch {
+    // Already gone.
+  }
+}

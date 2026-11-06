@@ -42,9 +42,9 @@ pub use definition::{
     StoreKind, StoreScope, ToolDef, ToolImplementation,
 };
 pub use deploy::{
-    BackendAlias, BackendConfig, BackendDefault, BackendProvider, ConnectionField, EventSource,
-    EventSourceKind, EventSourcesSection, HubSection, Placement, PlacementsSection, SECRET_FIELDS,
-    StorageBackendsSection, TraceSinkFormat, TraceSinkSection,
+    BackendAlias, BackendConfig, BackendDefault, BackendProvider, CommandSource, ConnectionField,
+    EventSource, EventSourceKind, EventSourcesSection, HubSection, Placement, PlacementsSection,
+    RestartPolicy, SECRET_FIELDS, StorageBackendsSection, TraceSinkFormat, TraceSinkSection,
 };
 pub use document::{
     Channel, DEPLOY_SECTIONS, DeployFile, Document, DocumentKind, ImportPath, ImportsSection,

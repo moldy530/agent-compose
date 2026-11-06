@@ -201,7 +201,7 @@ import {
 } from "./stores.ts";
 import type { HistoryEntry, OperatorTarget, StoreBinding, StoreParams } from "./stores.ts";
 import { publicUrl } from "./deployment.ts";
-import { httpTriggers, manualTriggers } from "./triggers.ts";
+import { eventTriggers, httpTriggers, manualTriggers, scheduleTriggers } from "./triggers.ts";
 
 /** What a `--format` selects. */
 type Format = "human" | "json";
@@ -1522,10 +1522,16 @@ async function serveVerb(argv: readonly string[]): Promise<number> {
   // HTTP framework and a project used as a library never loads it at all. Only
   // the app: `./triggers.ts` is the composition's own table and is imported
   // above, because `run` reads it too.
-  const { BlankCredentialError, serve } = await import("./serve.ts");
-  if (httpTriggers.length === 0) {
+  const { BlankCredentialError, ScheduleError, UnimplementedSourceError, serve } = await import(
+    "./serve.ts"
+  );
+  // A `schedule` or `event` trigger is something to serve as well as a route
+  // is (PRD resolved q78): the scheduler and the consumers run in this
+  // process and nowhere else. A composition with none of the three has nothing
+  // a served app would do.
+  if (httpTriggers.length === 0 && scheduleTriggers.length === 0 && eventTriggers.length === 0) {
     throw new UsageError(
-      "this composition declares no `http` triggers, so the generated app exposes no routes: declare one in `triggers:` (grammar 13.3)",
+      "this composition declares no `http`, `schedule` or `event` triggers, so a served app would expose no routes and fire nothing: declare one in `triggers:` (grammar 13.3, 13.4, 13.5)",
     );
   }
   const host = options.single["host"] ?? "127.0.0.1";
@@ -1564,6 +1570,13 @@ async function serveVerb(argv: readonly string[]): Promise<number> {
     // the environment's to fix, like a missing variable, so it is a `2` and a
     // sentence naming what to set.
     if (error instanceof BlankCredentialError) throw new UsageError(error.message);
+    // And the two PRD resolved q78 adds: an event source of a kind this release
+    // runs no consumer for, named with its kind — the q63 posture, a refusal
+    // rather than a trigger nothing feeds — and a schedule whose timezone the
+    // runtime does not know, or a scheduler clock variable that is not one.
+    // Each is the deployment's to fix before anything runs, so each is a `2`.
+    if (error instanceof UnimplementedSourceError) throw new UsageError(error.message);
+    if (error instanceof ScheduleError) throw new UsageError(error.message);
     if ((error as { code?: unknown } | null)?.code === "FST_ERR_DUPLICATED_ROUTE") {
       throw new UsageError(
         `the app could not mount its routes: ${describe(error)}. Two routes of this composition are one route to the router — an \`http\` trigger's \`path:\` and \`method:\`, or one of the app's own \`GET /executions/:id\` and \`POST /executions/:id/resume\` — so give one of them a path the other cannot be read as (grammar 13.3)`,

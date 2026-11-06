@@ -605,6 +605,38 @@ const GRAMMAR: &[Check] = &[
         evidence: Evidence::Fixture,
     },
     Check {
+        // The validator's half of a cron expression's two readers (PRD resolved
+        // q78): `validate` holds `cron:` to the grammar `serve`'s scheduler
+        // evaluates — the field values, the step and range forms, an expression
+        // that never fires — and `timezone:` to the shape of an IANA name, whose
+        // existence the runtime's `Intl` answers at `serve` start. The shared
+        // corpus under `tests/fixtures/cron-conformance/` holds the two readers
+        // to one reading; these fixtures hold the refusal to its sentence.
+        rule: "a `schedule` trigger's `cron:` is five POSIX fields the scheduler can evaluate and that fire, in a `timezone:` that is an IANA name (13.4, D162)",
+        pass: "parse/section.rs",
+        codes: &["invalid-cron", "invalid-value"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        // A command source's `checkpoint:` is evaluated over the event before
+        // it has an id — the id *is* the checkpoint — so a read of `payload.id`
+        // is refused by name, and the answer is the string the runtime journals
+        // and hands back to the program.
+        rule: "a `kind: command` source's `checkpoint:` answers a string and does not read `payload.id`, its own value (14.4, D162)",
+        pass: "check/triggers.rs",
+        codes: &["circular-checkpoint", "type-mismatch"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        // Decision D87 as amended by D162: the zero-infra target runs a
+        // program on its own machine and no queue, so a `kind: command` source
+        // is the one kind `deploy/local.yml` may declare.
+        rule: "`deploy/local.yml` declares `event_sources` of `kind: command` only (14, 14.4, D87 as amended by D162)",
+        pass: "resolve/target.rs",
+        codes: &["invalid-value"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
         rule: "every CEL surface: roots, paths, constructs, and result type (4.1)",
         pass: "cel/mod.rs, over check/expr.rs",
         codes: &[

@@ -313,7 +313,7 @@ fn trigger(name: Spanned<crate::ast::common::Ident>, node: &Node, cx: &mut Cx) -
         }
         Some("http") => Some(TriggerKind::Http(http_trigger(&mut fields, &subject, cx))),
         Some("schedule") => Some(TriggerKind::Schedule(schedule_trigger(&mut fields, cx))),
-        Some("event") => Some(TriggerKind::Event(event_trigger(&mut fields, cx))),
+        Some("event") => Some(TriggerKind::Event(event_trigger(&mut fields, &subject, cx))),
         Some(other) => {
             let span = type_name
                 .as_ref()
@@ -1070,7 +1070,8 @@ fn schedule_trigger(fields: &mut Fields<'_>, cx: &mut Cx) -> ScheduleTrigger {
         .filter(|cron| cron_shape(cron, cx));
     let timezone = fields
         .take("timezone")
-        .and_then(|node| lexical::non_empty_text(node, "`timezone`", cx));
+        .and_then(|node| lexical::non_empty_text(node, "`timezone`", cx))
+        .filter(|timezone| timezone_shape(timezone, cx));
     let input = trigger_input(fields, cx);
     ScheduleTrigger {
         cron,
@@ -1079,16 +1080,23 @@ fn schedule_trigger(fields: &mut Fields<'_>, cx: &mut Cx) -> ScheduleTrigger {
     }
 }
 
-/// Whether `cron` has the shape grammar 13.4 fixes: five whitespace-separated
-/// fields and nothing around them (Decision D46).
+/// Whether `cron` has the shape grammar 13.4 fixes: five fields separated by
+/// ASCII whitespace and nothing around them (Decision D46).
 ///
-/// The published schema spells the same shape as `^\S+(\s+\S+){4}$`, and the
-/// anchors are the load-bearing part. Counting the fields alone would accept
-/// `"0 3 * * * "`, which the schema rejects — and cron shape is not on PRD §7
-/// M0's static-check list, so no later pass would recover it, leaving this pass
+/// The published schema spells the same shape as
+/// `^[^ \t\n\f\r]+([ \t\n\f\r]+[^ \t\n\f\r]+){4}$`, and the anchors are the
+/// load-bearing part. Counting the fields alone would accept `"0 3 * * * "`,
+/// which the schema rejects — and cron shape is not on PRD §7 M0's
+/// static-check list, so no later pass would recover it, leaving this pass
 /// looser than the schema on a rule it owns (Appendix B).
+///
+/// **ASCII** whitespace, here and in both evaluators (`compose_core::cron`, the
+/// emitted `src/cron.ts`): Unicode's is read two ways — Rust's `White_Space`
+/// has U+0085, ECMAScript's `\s` does not — and a separator one reader takes
+/// and the other refuses is an expression `validate` passes and `serve` cannot
+/// evaluate. Any other character is part of a field, which then refuses it.
 fn cron_shape(cron: &Spanned<String>, cx: &mut Cx) -> bool {
-    if cron.value.trim() != cron.value {
+    if cron.value.trim_matches(|c: char| c.is_ascii_whitespace()) != cron.value {
         cx.push(
             Diagnostic::error(
                 DiagnosticCode::InvalidValue,
@@ -1104,9 +1112,9 @@ fn cron_shape(cron: &Spanned<String>, cx: &mut Cx) -> bool {
         );
         return false;
     }
-    let fields_count = cron.value.split_whitespace().count();
+    let fields_count = cron.value.split_ascii_whitespace().count();
     if fields_count == 5 {
-        return true;
+        return cron_fields(cron, cx);
     }
     cx.push(
         Diagnostic::error(
@@ -1119,7 +1127,76 @@ fn cron_shape(cron: &Spanned<String>, cx: &mut Cx) -> bool {
     false
 }
 
-fn event_trigger(fields: &mut Fields<'_>, cx: &mut Cx) -> EventTrigger {
+/// Whether `timezone` is spelled like an IANA zone name: `UTC`, or `/`-joined
+/// segments of letters, digits, `_`, `+` and `-` beginning with a letter
+/// (grammar 13.4).
+///
+/// The **spelling** only. Which names exist is the timezone database's, and the
+/// one `serve` evaluates a schedule against is the runtime's own (`Intl`), so a
+/// name it does not know is refused when `serve` starts, naming the trigger —
+/// a list frozen into the compiler would disagree with it the first time the
+/// database moved. What this refuses is a value no database has ever held: a
+/// space, an empty segment, a path.
+fn timezone_shape(timezone: &Spanned<String>, cx: &mut Cx) -> bool {
+    let segment = |part: &str| {
+        part.chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic())
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '-'))
+    };
+    if timezone.value.split('/').all(segment) {
+        return true;
+    }
+    cx.push(
+        Diagnostic::error(
+            DiagnosticCode::InvalidValue,
+            timezone.span.clone(),
+            format!(
+                "`timezone` {:?} is not an IANA zone name",
+                timezone.value
+            ),
+        )
+        .with_help(
+            "an IANA name is `UTC` or `/`-joined segments such as `Europe/Berlin` or `America/Argentina/Buenos_Aires`; whether the runtime's timezone database knows the name is checked when `serve` starts (grammar 13.4)",
+        ),
+    );
+    false
+}
+
+/// Whether each of a five-field `cron`'s fields is one the runtime's evaluator
+/// can read, and whether the expression ever fires (grammar 13.4, PRD resolved
+/// q78, Decision D162).
+///
+/// The shape above is the schema's; this is the evaluator's. `serve` evaluates
+/// every `schedule` trigger with the emitted `src/cron.ts`, which reads exactly
+/// [`crate::cron::Cron::parse`]'s grammar — the conformance corpus under
+/// `tests/fixtures/cron-conformance/` holds the two to one reading — so a field
+/// refused here is one the scheduler would otherwise have had to guess at, and
+/// refusing it at `validate` is what keeps a schedule from failing for the
+/// first time at the start of a `serve`.
+fn cron_fields(cron: &Spanned<String>, cx: &mut Cx) -> bool {
+    match crate::cron::Cron::parse(&cron.value) {
+        Ok(_) => true,
+        Err(error) => {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidCron,
+                    cron.span.clone(),
+                    format!(
+                        "`cron` {:?} cannot be evaluated: {}",
+                        cron.value, error.message
+                    ),
+                )
+                .with_help(crate::cron::GRAMMAR_HELP),
+            );
+            false
+        }
+    }
+}
+
+fn event_trigger(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> EventTrigger {
     let source = fields
         .require("source", cx)
         .and_then(|node| expect_string(node, "`source`", cx))
@@ -1128,10 +1205,16 @@ fn event_trigger(fields: &mut Fields<'_>, cx: &mut Cx) -> EventTrigger {
     let dedupe_key = fields
         .take("dedupe_key")
         .and_then(|node| lexical::cel(node, "`dedupe_key`", cx));
+    // Grammar 13.3's block, read by the same function: nobody calls an `event`
+    // trigger, so it authenticates no start — it guards the routes about this
+    // trigger's work, its executions' and its source's (grammar 13.5, PRD
+    // resolved q32 one level up, Decision D162).
+    let auth = inbound_auth(fields, subject, cx);
     EventTrigger {
         source,
         input,
         dedupe_key,
+        auth,
     }
 }
 

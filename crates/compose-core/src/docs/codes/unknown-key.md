@@ -44,7 +44,11 @@ diagnostic says which one. Otherwise look the construct up: `agent-compose docs
 
 The two places a key is genuinely open are a model's `settings:` and the config
 objects under `storage_backends` and `event_sources`, and even there the keys
-are checked against the plugin's published schema.
+are checked against the plugin's published schema. An event source of `kind:
+command` is the exception inside the exception: its keys — `command`, `args`,
+`checkpoint`, `restart` — are read by `serve` itself rather than handed to a
+plugin, so they are a closed set, and a queue key carried over from another
+kind is reported here.
 
-Grammar: `docs/grammar.md` §1.5, §11.4, §12.1, Decisions D50, D106. Topic:
+Grammar: `docs/grammar.md` §1.5, §11.4, §12.1, §14.4, Decisions D50, D106, D162. Topic:
 `agent-compose docs getting-started`.

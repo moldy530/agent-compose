@@ -12,9 +12,22 @@
 // | status | `GET /executions/:id` | the execution's state, its outputs once it has them, and any pause it is holding |
 // | resume | `POST /executions/:id/resume` | delivers a human's answer to an interrupted execution |
 // | cancel | `POST /executions/:id/cancel` | cancels an open execution, and every open child execution in its lineage |
+// | source status | `GET /sources/:name` | a `kind: command` event source's program, checkpoint, restarts and refused lines |
 //
 // It is byte-identical in every project this compiler release builds, like
 // `./runtime.ts`: what differs between two projects is `./triggers.ts`.
+//
+// # Admission: one function every trigger kind's start passes through
+//
+// An execution starts in one place, [`admit`], whatever started it: an `http`
+// request after its auth, its body and its `input:`; a `schedule` tick the
+// scheduler found due; an `event` a `kind: command` source printed (PRD
+// resolved q78, `./sources.ts`). Each arrives with its inputs bound and its
+// flow's `inputs:` checked, and with the **gate** its kind keeps — a tick's
+// `fired` row, claimed before the execution starts so a tick fires once across
+// restarts and hubs; an event's dedupe key, claimed when the execution is
+// registered so a repeat starts nothing (`docs/durability.md` §3.11, §3.12).
+// PRD resolved q77's intake ledger lands on the same seam.
 //
 // # Why Fastify
 //
@@ -39,7 +52,7 @@
 // Executions are tracked **in this process**: a `Map` from id to the run's state
 // and the promise it settles. The *record* is this process's; the **run** is
 // not — every execution is journaled as it goes (`./journal.ts`, PRD resolved
-// q26-q29), and [`recover`] puts every one the journal holds open back on this
+// q26-q29), and [`Recovery`] puts every one the journal holds open back on this
 // map before the app accepts a connection. So a restart loses the reports of
 // executions that had already finished and keeps the ones that had not, which is
 // the half that matters: a status route answers `404` for an id neither this
@@ -178,8 +191,20 @@ import {
   sinkConfigured,
   workDelivery,
 } from "./delivery.ts";
-import { type CompiledFlow, type FlowRun, flows, runChildFlow, runFlow } from "./graph.ts";
+import { type CompiledFlow, type FlowRun, flows, runChildFlow, runFlow, sessionRefusal } from "./graph.ts";
+import { type FiredRow, type Journal, openJournal } from "./journal.ts";
 import { mountWorkerRoutes, placementWaits, watchPlacementWaits } from "./mesh.ts";
+import {
+  type Admitted,
+  type Intake,
+  type TickAdmitted,
+  declaresSource,
+  preflightSources,
+  sourceStatus,
+  startSources,
+  stopSources,
+  triggersOf,
+} from "./sources.ts";
 import { drainStores, sweepBoundStores } from "./stores.ts";
 import {
   cancelExecution,
@@ -204,7 +229,19 @@ import {
   watchQuiescence,
 } from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
-import { type HttpTrigger, httpTriggers } from "./triggers.ts";
+import {
+  type EventPayload,
+  type EventTrigger,
+  type HttpTrigger,
+  type InboundAuth,
+  type SchedulePayload,
+  type ScheduleTrigger,
+  eventTriggers,
+  httpTriggers,
+  scheduleTriggers,
+} from "./triggers.ts";
+
+export { ScheduleError, UnimplementedSourceError } from "./sources.ts";
 
 /** What an execution this process started is doing (PRD 5.11). */
 export type ExecutionStatus = "running" | "completed" | "failed" | "interrupted" | "cancelled";
@@ -226,7 +263,7 @@ interface Execution {
    */
   status: Exclude<ExecutionStatus, "interrupted">;
   /**
-   * Whether this is an execution [`recover`] picked up whose replay is **still
+   * Whether this is an execution [`Recovery`] picked up whose replay is **still
    * running**.
    *
    * `false` for every execution a request started, and for a recovered one from
@@ -393,6 +430,11 @@ export function createApp(): FastifyInstance {
   // (see [`blankCredentials`]).
   const blank = blankCredentials();
   if (blank.length > 0) throw new BlankCredentialError(blank);
+  // And what the scheduler and the consumers would otherwise fail on after the
+  // app is listening: an event source of a kind this release runs no consumer
+  // for — refused by name, PRD resolved q78's q63 posture — a timezone the
+  // runtime's database does not know, a clock variable that is not one.
+  preflightSources();
   decodeBodies(app);
 
   // The worker protocol's five routes, on a target that declares `placements:`
@@ -431,8 +473,24 @@ export function createApp(): FastifyInstance {
   // `listen` resolves therefore finds its wait, which is the whole promise —
   // the wait id is deterministic (node path + ordinal), so it is the same id the
   // caller was given by the process that died.
+  const recovery = new Recovery(executions);
   app.addHook("onReady", async () => {
-    await recover(executions);
+    await recovery.atStart();
+    // **After** recovery (PRD resolved q78 ruling c): the schedules start
+    // taking ticks and each `kind: command` source's program starts with the
+    // newest checkpoint the process that died had accepted — and no execution
+    // a tick or an event starts is one a replay is racing. A recovery this
+    // start could not finish — a standby's, on a journal another `serve` is
+    // writing — is finished before any tick or event is admitted
+    // ([`Recovery.before`]), so that ordering holds for a takeover too.
+    await startSources(intake(executions, recovery));
+  });
+  // The programs go with the app: `SIGTERM` to each group, `SIGKILL` after a
+  // grace (Decision D160's exec discipline), and no tick armed after it — nor
+  // a recovery retry.
+  app.addHook("onClose", async () => {
+    recovery.stop();
+    await stopSources();
   });
 
   app.get("/executions/:id", async (request, reply) => {
@@ -604,6 +662,39 @@ export function createApp(): FastifyInstance {
     });
   });
 
+  app.get("/sources/:name", async (request, reply) => {
+    const name = (request.params as { name: string }).name;
+    // The existence check first, as on the execution routes: a name this
+    // target does not declare is a different mistake from a caller the route
+    // refuses.
+    if (!declaresSource(name)) {
+      return reply.code(404).send({
+        error: `no event source \`${name}\` is declared under this target (grammar 14.4)`,
+      });
+    }
+    // …and the guard second, on the reading PRD resolved q32 takes one level
+    // up: the route enforces the `auth:` of the `event` triggers bound to the
+    // source. Where any of them declares one, a caller must satisfy one of
+    // them; where none does, the route is open, exactly as an execution a
+    // no-auth trigger started keeps open routes (Decision D162, whose Status
+    // names the reading).
+    const refusal = sourceGuard(name, request);
+    if (refusal !== undefined) {
+      return reply.code(401).send({
+        source: name,
+        ...(refusal.scheme === undefined ? {} : { scheme: refusal.scheme }),
+        error: `the event source \`${name}\` refused this request: ${refusal.detail}`,
+      });
+    }
+    const status = await sourceStatus(name);
+    if (status === undefined) {
+      return reply.code(404).send({
+        error: `no event source \`${name}\` is declared under this target (grammar 14.4)`,
+      });
+    }
+    return reply.code(200).send(status);
+  });
+
   return app;
 }
 
@@ -652,7 +743,10 @@ function refuse(reply: FastifyReply, trigger: string, refusal: Refusal): unknown
  * A trigger declaring no `auth:` refuses nothing, which is grammar 13.3's own
  * default: absent leaves the route open.
  */
-function verified(trigger: HttpTrigger, request: FastifyRequest): Refusal | undefined {
+function verified(
+  trigger: { readonly auth?: InboundAuth },
+  request: FastifyRequest,
+): Refusal | undefined {
   const auth = trigger.auth;
   if (auth === undefined) return undefined;
   const sent = headerValues(request, auth.header);
@@ -746,6 +840,13 @@ function blankCredentials(): readonly string[] {
     if (delivery?.bearer !== undefined) named(delivery.bearer.tokenEnv);
     if (delivery?.hmac !== undefined) named(delivery.hmac.secretEnv);
   }
+  // An `event` trigger's `auth:` guards the routes about its work (grammar
+  // 13.5, Decision D162), and an empty credential would open them as surely.
+  for (const trigger of eventTriggers) {
+    const auth = trigger.auth;
+    if (auth?.scheme === "bearer") named(auth.tokenEnv);
+    if (auth?.scheme === "hmac") named(auth.secretEnv);
+  }
   for (const variable of blankSinkCredentials()) named(variable);
   return blank;
 }
@@ -791,9 +892,51 @@ export class BlankCredentialError extends Error {
 function guarded(execution: Execution, request: FastifyRequest): Refusal | undefined {
   const trigger = httpTriggers.find((one) => one.name === execution.trigger);
   if (trigger !== undefined) return verified(trigger, request);
+  // An `event` trigger enforces its own `auth:` on the routes of the
+  // executions it started, on PRD resolved q32's coverage clause — nobody
+  // called it, but somebody may poll, resume or cancel what it began
+  // (grammar 13.5, Decision D162).
+  const event = eventTriggers.find((one) => one.name === execution.trigger);
+  if (event !== undefined) return verified(event, request);
   if (execution.trigger === MANUAL) return undefined;
+  // A `schedule` trigger is a declared trigger with no `auth:` — grammar 13.4
+  // gives it none, since nobody calls a clock — so the routes of an execution
+  // one started are open, PRD resolved q32's "an execution a no-auth trigger
+  // started keeps open routes" (Decision D162).
+  if (scheduleTriggers.some((one) => one.name === execution.trigger)) return undefined;
   return {
     detail: `it was started by the trigger \`${execution.trigger}\`, which this build does not declare, so the authentication that trigger required cannot be read`,
+  };
+}
+
+/**
+ * The refusal `GET /sources/:name` has for this request (grammar 14.4, PRD
+ * resolved q32 one level up, Decision D162).
+ *
+ * The route reports on a source, and a source belongs to the `event` triggers
+ * bound to it, so it enforces theirs: where none declares an `auth:` it is
+ * open; where some do, a request any one of them verifies is answered — each
+ * of those triggers may already read what the source started through its own
+ * executions' routes, so none of them learns more here than it could there.
+ */
+function sourceGuard(source: string, request: FastifyRequest): Refusal | undefined {
+  const guarding = triggersOf(source).filter((trigger) => trigger.auth !== undefined);
+  if (guarding.length === 0) return undefined;
+  const refusals: { readonly trigger: string; readonly refusal: Refusal }[] = [];
+  for (const trigger of guarding) {
+    const refusal = verified(trigger, request);
+    if (refusal === undefined) return undefined;
+    refusals.push({ trigger: trigger.name, refusal });
+  }
+  const only = refusals.length === 1 ? refusals[0] : undefined;
+  if (only !== undefined) {
+    return {
+      ...(only.refusal.scheme === undefined ? {} : { scheme: only.refusal.scheme }),
+      detail: `it enforces the \`auth:\` of the trigger \`${only.trigger}\` bound to it, and ${only.refusal.detail}`,
+    };
+  }
+  return {
+    detail: `it enforces the \`auth:\` of the triggers bound to it, and none of them verified it (${refusals.map(({ trigger, refusal }) => `\`${trigger}\`: ${refusal.detail}`).join("; ")})`,
   };
 }
 
@@ -1021,7 +1164,32 @@ async function start(
     });
   }
 
-  const execution = register(executions, flow, trigger, inputs, sessionKey, payload);
+  // The caller's own trace, where the caller named one (PRD resolved q51), and
+  // the completion webhook this request asked for — both read here, when the
+  // request arrived, and journaled on the lifecycle row: the export that adopts
+  // the trace and the delivery that calls back happen at settle, which may be
+  // in another process. Header names are case-insensitive and this framework
+  // lowercases them, so the lookup is the lowercase spelling W3C writes anyway.
+  const callback = callbackOf(trigger, payload);
+  const traceparent = (payload.headers["traceparent"] ?? "").trim();
+  const admitted = await admit(executions, {
+    trigger: trigger.name,
+    flow,
+    inputs,
+    sessionKey,
+    ...(callback === undefined ? {} : { callback }),
+    ...(traceparent === "" ? {} : { traceparent }),
+  });
+  // An `http` admission keeps no gate in this release, so nothing can already
+  // hold it; PRD resolved q77's `dedupe_key:` is what will make this branch
+  // reachable, answering the first execution's id.
+  if (admitted.outcome !== "started") {
+    return reply.code(202).send({
+      execution_id: admitted.execution,
+      status_url: `/executions/${admitted.execution}`,
+    });
+  }
+  const execution = admitted.record;
 
   if (trigger.respond === "sync") {
     const budget = trigger.timeoutMs ?? DEFAULT_SYNC_TIMEOUT_MS;
@@ -1046,6 +1214,324 @@ async function start(
 
 /** The `60s` grammar 13.3 defaults a sync trigger's response budget to. */
 const DEFAULT_SYNC_TIMEOUT_MS = 60_000;
+
+// ---------------------------------------------------------------------------
+// Admission (PRD resolved q78 ruling e)
+// ---------------------------------------------------------------------------
+
+/**
+ * One execution about to start, from whichever trigger started it — its inputs
+ * bound and already held to its flow's `inputs:`.
+ */
+interface Admission {
+  /** The trigger's name, as the lifecycle row records it. */
+  readonly trigger: string;
+  readonly flow: CompiledFlow;
+  readonly inputs: Record<string, unknown>;
+  readonly sessionKey: string;
+  /** An `http` trigger's resolved `callback:`, where the request yielded one. */
+  readonly callback?: string;
+  /** The `traceparent` an `http` request carried. */
+  readonly traceparent?: string;
+  /**
+   * The gate this trigger kind keeps, where it keeps one: a `schedule` tick's
+   * `fired` row, or an `event` trigger's dedupe key.
+   */
+  readonly gate?:
+    | { readonly kind: "tick"; readonly scheduledAt: string }
+    | { readonly kind: "dedupe"; readonly key: string };
+  /**
+   * The id a gate's row already names for this execution, where a process
+   * died holding the row: a tick's `fired` row whose execution never began
+   * ([`admitUnbegun`]). Absent, a fresh id is allocated.
+   */
+  readonly execution?: string;
+}
+
+/**
+ * What [`admit`] did: the execution it started, the one its gate already held,
+ * or — for a gated admission only — a gate it claimed for an execution the
+ * journal would not begin.
+ */
+type AdmitAnswer =
+  | { readonly outcome: "started"; readonly record: Execution }
+  | { readonly outcome: "held"; readonly execution: string }
+  | {
+      readonly outcome: "unbegun";
+      readonly execution: string;
+      /** The tick's `fired` row, where the gate was a tick's. */
+      readonly fired?: FiredRow;
+      readonly reason: string;
+    };
+
+/**
+ * Start one execution — **the** start, for every trigger kind (PRD resolved
+ * q78 ruling e).
+ *
+ * The execution's id is allocated first, so the gate's row can name it:
+ *
+ *  * **a tick's `fired` row**, claimed before the execution exists. The insert
+ *    that wins fires; a tick some earlier generation of this process or another
+ *    hub sharing the journal already fired is answered with that execution and
+ *    starts nothing (`docs/durability.md` §3.11). The one row it is handed
+ *    back is a claim no execution began under — `admission.execution` names
+ *    the id it recorded — and that starts under the id only where no execution
+ *    of it began, which is the tick's repair: honoured, the tick would never
+ *    fire.
+ *  * **an event's dedupe key**, claimed as the execution is registered. A key
+ *    already held by an execution that exists — in this process, or anywhere in
+ *    the journal — is a repeat and starts nothing. A key held by one that
+ *    **never began** is a claim no execution began under, and is taken over
+ *    rather than honoured: honoured, the event would be lost (§3.12).
+ *
+ * **A gated admission answers `started` only once the lifecycle row is down**
+ * — `runFlow`'s `opened` hook, [`register`]'s `begun` — and never as soon as
+ * the run is set going. What its caller does next is only safe for an
+ * execution the journal holds: a consumer journals the event's checkpoint, a
+ * scheduler claims its next tick. A run the journal would not begin is
+ * answered `unbegun` instead, and taken off this process's map, so the claim
+ * it leaves names an execution that exists nowhere: the scheduler holds its
+ * schedule and starts it under the claim ([`admitUnbegun`]), and an event's
+ * retry takes the key over.
+ *
+ * An `http` request keeps no gate in this release, and is answered as soon as
+ * its run is set going, as it always was: a run that fails before its row is
+ * reported by the status route and the completion webhook ([`settling`]).
+ * PRD resolved q77 gives it `dedupe_key:` on this same seam.
+ */
+async function admit(
+  executions: Map<string, Execution>,
+  admission: Admission,
+): Promise<AdmitAnswer> {
+  const id = admission.execution ?? `exec_${globalThis.crypto.randomUUID()}`;
+  const gate = admission.gate;
+  let claim: FiredRow | undefined;
+  if (gate?.kind === "tick") {
+    const journal = await openJournal();
+    const held = await journal.fire({
+      trigger: admission.trigger,
+      scheduledAt: gate.scheduledAt,
+      execution: id,
+      firedAt: new Date().toISOString(),
+    });
+    if (held.execution !== id) return { outcome: "held", execution: held.execution };
+    if (admission.execution !== undefined && (await begun(executions, journal, id))) {
+      return { outcome: "held", execution: id };
+    }
+    claim = held;
+  }
+  if (gate?.kind === "dedupe") {
+    const journal = await openJournal();
+    const held = await journal.claimDedupe({
+      trigger: admission.trigger,
+      key: gate.key,
+      execution: id,
+      admittedAt: new Date().toISOString(),
+    });
+    if (held.execution !== id) {
+      if (await begun(executions, journal, held.execution)) {
+        return { outcome: "held", execution: held.execution };
+      }
+      if (!(await journal.retakeDedupe(admission.trigger, gate.key, held.execution, id))) {
+        const now = await journal.claimDedupe({
+          trigger: admission.trigger,
+          key: gate.key,
+          execution: id,
+          admittedAt: new Date().toISOString(),
+        });
+        if (now.execution !== id) return { outcome: "held", execution: now.execution };
+      }
+    }
+  }
+  const { record, begun: lifecycle } = register(executions, admission, id);
+  if (gate === undefined) return { outcome: "started", record };
+  try {
+    await lifecycle;
+  } catch (error) {
+    // Never begun, so never this process's either: off the map, the claim
+    // names an execution [`begun`] finds nowhere, which is what the repair and
+    // the takeover look for — and a repeat of this event in this process is
+    // not answered with an execution that does not exist.
+    if (executions.get(id) === record) executions.delete(id);
+    return {
+      outcome: "unbegun",
+      execution: id,
+      ...(claim === undefined ? {} : { fired: claim }),
+      reason: message(error),
+    };
+  }
+  return { outcome: "started", record };
+}
+
+/**
+ * Whether `id` names an execution that began: one this process holds — its
+ * lifecycle row may still be in flight, and a gated admission whose row the
+ * journal refused is taken off the map ([`admit`]) — or one the journal has a
+ * lifecycle row for. What a gate's row names and this answers `false` for is
+ * a claim no execution began under: a process died holding it, or the journal
+ * would not begin its execution.
+ */
+async function begun(
+  executions: Map<string, Execution>,
+  journal: Journal,
+  id: string,
+): Promise<boolean> {
+  return executions.has(id) || (await journal.execution(id)) !== undefined;
+}
+
+/**
+ * The [`Intake`] `./sources.ts` hands its ticks and events to: each bound to
+ * its flow's inputs and held to its flow's `inputs:` here, then [`admit`]ted —
+ * and none of them before `recovery` is done ([`Recovery.before`]), which
+ * rejects while it cannot be, as a journal that could not be written does.
+ */
+function intake(executions: Map<string, Execution>, recovery: Recovery): Intake {
+  return {
+    tick: async (trigger, at, payload) => {
+      await recovery.before();
+      return admitTick(executions, trigger, at, payload);
+    },
+    unbegun: async (trigger, fired, payload) => {
+      await recovery.before();
+      return admitUnbegun(executions, trigger, fired, payload);
+    },
+    event: async (trigger, payload) => {
+      await recovery.before();
+      return admitEvent(executions, trigger, payload);
+    },
+  };
+}
+
+/** Bind one tick and admit it under its `fired` gate. */
+async function admitTick(
+  executions: Map<string, Execution>,
+  trigger: ScheduleTrigger,
+  at: number,
+  payload: SchedulePayload,
+): Promise<TickAdmitted> {
+  return admitTickAs(executions, trigger, new Date(at).toISOString(), payload, undefined);
+}
+
+/**
+ * Start the execution a tick's `fired` row names, where it never began — the
+ * repair `./sources.ts`'s scheduler asks for at start, and for a claim of its
+ * own whose execution the journal would not begin (`docs/durability.md`
+ * §3.11). `undefined`, and nothing bound, where the execution did begin: that
+ * is every row a `serve` that stopped cleanly leaves.
+ */
+async function admitUnbegun(
+  executions: Map<string, Execution>,
+  trigger: ScheduleTrigger,
+  fired: FiredRow,
+  payload: SchedulePayload,
+): Promise<TickAdmitted | undefined> {
+  if (await begun(executions, await openJournal(), fired.execution)) return undefined;
+  return admitTickAs(executions, trigger, fired.scheduledAt, payload, fired.execution);
+}
+
+/**
+ * The refusal `runFlow` would raise before journaling anything for a run with
+ * no session identity whose flow reaches a `scope: session` store (grammar
+ * 11.3), asked here first.
+ *
+ * A gated admission waits for the lifecycle row and treats a run that never
+ * reached it as the journal's failure — retried, holding the schedule or the
+ * stream — so nothing the run refuses on its own account may be left to
+ * refuse it there: a tick or an event whose `session_key:` answered the empty
+ * string would be retried for ever. It is the trigger's binding that failed,
+ * and it is refused as one.
+ */
+function refusesSession(flow: CompiledFlow, sessionKey: string): void {
+  if (sessionKey === "" && flow.sessionStores.length > 0) {
+    throw new Error(sessionRefusal(flow.address, flow.sessionStores));
+  }
+}
+
+/** Bind one tick and admit it under the `fired` row for `scheduledAt`. */
+async function admitTickAs(
+  executions: Map<string, Execution>,
+  trigger: ScheduleTrigger,
+  scheduledAt: string,
+  payload: SchedulePayload,
+  execution: string | undefined,
+): Promise<TickAdmitted> {
+  const flow = flows[trigger.flow];
+  if (flow === undefined) {
+    return { outcome: "refused", reason: `\`${trigger.flow}\` is not a flow of this composition` };
+  }
+  let inputs: Record<string, unknown>;
+  let sessionKey = "";
+  try {
+    inputs = trigger.input(payload);
+    if (trigger.sessionKey !== undefined) sessionKey = trigger.sessionKey(payload);
+    flow.parse(inputs);
+    refusesSession(flow, sessionKey);
+  } catch (error) {
+    return { outcome: "refused", reason: `the trigger \`${trigger.name}\` could not bind this tick: ${message(error)}` };
+  }
+  const admitted = await admit(executions, {
+    trigger: trigger.name,
+    flow,
+    inputs,
+    sessionKey,
+    gate: { kind: "tick", scheduledAt },
+    ...(execution === undefined ? {} : { execution }),
+  });
+  if (admitted.outcome === "started") return { outcome: "started", execution: admitted.record.id };
+  if (admitted.outcome === "held") return admitted;
+  // A tick's gate is its `fired` row, and [`admit`] carries it back with the
+  // failure. Were it ever missing, a rejection is still the safe answer: the
+  // scheduler looks at the newest row again before it claims another tick.
+  if (admitted.fired === undefined) {
+    throw new Error(`its execution ${admitted.execution} could not be journaled: ${admitted.reason}`);
+  }
+  return { outcome: "unbegun", fired: admitted.fired, reason: admitted.reason };
+}
+
+/**
+ * Bind one event and admit it under its trigger's dedupe key.
+ *
+ * An event whose execution the journal would not begin **rejects**: the
+ * consumer retries it with backoff and reads no further line until it is
+ * admitted, so the source's checkpoint never moves past it, and the retry
+ * finds the key naming an execution that exists nowhere and takes it over
+ * (`docs/durability.md` §3.12, §3.13).
+ */
+async function admitEvent(
+  executions: Map<string, Execution>,
+  trigger: EventTrigger,
+  payload: EventPayload,
+): Promise<Admitted> {
+  const flow = flows[trigger.flow];
+  if (flow === undefined) {
+    return { outcome: "refused", reason: `\`${trigger.flow}\` is not a flow of this composition` };
+  }
+  let inputs: Record<string, unknown>;
+  let sessionKey = "";
+  let key: string;
+  try {
+    key = trigger.dedupeKey(payload);
+    inputs = trigger.input(payload);
+    if (trigger.sessionKey !== undefined) sessionKey = trigger.sessionKey(payload);
+    flow.parse(inputs);
+    refusesSession(flow, sessionKey);
+  } catch (error) {
+    return { outcome: "refused", reason: `the trigger \`${trigger.name}\` could not bind this event: ${message(error)}` };
+  }
+  const admitted = await admit(executions, {
+    trigger: trigger.name,
+    flow,
+    inputs,
+    sessionKey,
+    gate: { kind: "dedupe", key },
+  });
+  if (admitted.outcome === "unbegun") {
+    throw new Error(`its execution ${admitted.execution} could not be journaled: ${admitted.reason}`);
+  }
+  return admitted.outcome === "started"
+    ? { outcome: "started", execution: admitted.record.id }
+    : admitted;
+}
 
 /**
  * Put every execution this project's journal holds open back on the board
@@ -1083,14 +1569,140 @@ const DEFAULT_SYNC_TIMEOUT_MS = 60_000;
  * lock and breaks a stale one — so a start that let one failure carry the other
  * would leave every `pending` row unattempted for the life of the process while
  * the file it could not read a moment ago answers every other query.
+ *
+ * **A start that cannot read the journal owes the recovery, and pays it the
+ * first time the journal opens.** A second `serve` on a dialled journal is the
+ * case that makes this more than a transient: the writer guard refuses it the
+ * journal for as long as the first holds it (`docs/durability.md` §2.3), and
+ * when the first goes, this one's scheduler and consumers start succeeding at
+ * the journal (`docs/distributed.md` §8). What the first left open — an
+ * execution an event or a tick had started, a run parked on a wait — is only
+ * ever put back on a board by this walk, and it ran once, at a start that
+ * could not read it. So a half that could not read what it walks stays owed:
+ * it is taken again with backoff, and again before every tick and every event
+ * this process admits ([`before`], awaited by [`intake`]), so those are never
+ * matched against an execution the journal holds open and nothing runs — a
+ * repeat answered `held` by a dead hub's execution, a tick repaired as begun
+ * — and the ordering ruling a gives a start holds for a takeover too.
  */
-async function recover(executions: Map<string, Execution>): Promise<void> {
-  await recoverExecutions(executions);
-  await resumeDeliveries();
+class Recovery {
+  readonly #executions: Map<string, Execution>;
+  /** Whether [`recoverExecutions`] has read the open executions and walked them. */
+  #executionsRead = false;
+  /** Whether [`resumeDeliveries`] has read the owed deliveries and walked them. */
+  #deliveriesRead = false;
+  /** Why the newest attempt could not read the journal, for [`before`]'s refusal. */
+  #failure = "";
+  /** The attempt under way, which a tick, an event and a retry share. */
+  #attempt: Promise<boolean> | undefined;
+  #timer: ReturnType<typeof setTimeout> | undefined;
+  #stopped = false;
+
+  constructor(executions: Map<string, Execution>) {
+    this.#executions = executions;
+  }
+
+  /** Whether both halves have read what they walk. */
+  get done(): boolean {
+    return this.#executionsRead && this.#deliveriesRead;
+  }
+
+  /**
+   * The recovery `onReady` runs before the server accepts a connection — and,
+   * where it could not read the journal, the retries that finish it once the
+   * journal opens.
+   */
+  async atStart(): Promise<void> {
+    await this.#once(false);
+    if (!this.done) this.#retryIn(1_000);
+  }
+
+  /**
+   * Resolve once the open executions are back on the board — taking the walk
+   * again first, where it is still owed — and reject, saying why, where the
+   * journal still cannot be read. Awaited before every tick and every event is
+   * admitted, so the first time the journal opens in a process whose start
+   * could not read it, the executions it holds open are recovered before the
+   * scheduler claims a tick or a consumer matches an event against them. The
+   * deliveries half is not waited for: no tick or event is answered by one,
+   * and the retries pick it up.
+   */
+  async before(): Promise<void> {
+    if (this.#executionsRead) return;
+    await this.#once(true);
+    if (this.#executionsRead) return;
+    throw new Error(
+      `the executions this project's journal holds open are not recovered yet, and no tick or event is admitted before they are (\`docs/durability.md\` §6.1): ${this.#failure}`,
+    );
+  }
+
+  /** No retry after this: the app is closing. */
+  stop(): void {
+    this.#stopped = true;
+    if (this.#timer !== undefined) clearTimeout(this.#timer);
+    this.#timer = undefined;
+  }
+
+  /**
+   * One attempt at whatever is still owed, shared by everyone who asks while it
+   * runs. `late` is every attempt but the start's: it says nothing about a
+   * journal that still cannot be read — the start already did, and a tick
+   * that cannot be admitted says so itself — and names the recovery when one
+   * runs, since nothing else in the serve log would say why executions are
+   * being recovered by a process that has been serving for a while.
+   */
+  #once(late: boolean): Promise<boolean> {
+    if (this.done) return Promise.resolve(true);
+    this.#attempt ??= (async () => {
+      try {
+        if (!this.#executionsRead) {
+          const failure = await recoverExecutions(this.#executions, late);
+          this.#executionsRead = failure === undefined;
+          if (failure !== undefined) this.#failure = failure;
+        }
+        if (!this.#deliveriesRead) {
+          const failure = await resumeDeliveries(late);
+          this.#deliveriesRead = failure === undefined;
+          if (failure !== undefined) this.#failure = failure;
+        }
+      } catch (error) {
+        // Neither half throws for a journal it cannot read; this is anything
+        // else, and it leaves the halves that did not finish owed.
+        this.#failure = message(error);
+      } finally {
+        this.#attempt = undefined;
+      }
+      return this.done;
+    })();
+    return this.#attempt;
+  }
+
+  /** Take the recovery again in `delay` milliseconds, backing off while it fails. */
+  #retryIn(delay: number): void {
+    if (this.#stopped || this.done) return;
+    this.#timer = setTimeout(() => {
+      this.#timer = undefined;
+      if (this.#stopped) return;
+      void this.#once(true).then((done) => {
+        if (!done) this.#retryIn(Math.min(delay * 2, LONGEST_RECOVERY_RETRY_MS));
+      });
+    }, delay);
+    this.#timer.unref?.();
+  }
 }
 
-/** The half of [`recover`] that puts open executions back on the board. */
-async function recoverExecutions(executions: Map<string, Execution>): Promise<void> {
+/** The longest a recovery the start could not finish waits between attempts. */
+const LONGEST_RECOVERY_RETRY_MS = 30_000;
+
+/**
+ * The half of [`Recovery`] that puts open executions back on the board:
+ * `undefined` once it has read and walked them, and what stopped it where the
+ * journal could not be read.
+ */
+async function recoverExecutions(
+  executions: Map<string, Execution>,
+  late: boolean,
+): Promise<string | undefined> {
   let open: readonly runtime.ExecutionRow[];
   try {
     open = await openExecutions();
@@ -1098,15 +1710,22 @@ async function recoverExecutions(executions: Map<string, Execution>): Promise<vo
     // A journal that cannot be opened is a project that cannot recover, and it
     // is not a reason to refuse to serve: the app starts, new executions
     // journal (or fail loudly when they cannot), and this says what happened.
-    process.stderr.write(`this project's journal could not be read: ${message(error)}\n`);
-    return;
+    if (!late) process.stderr.write(`this project's journal could not be read: ${message(error)}\n`);
+    return message(error);
+  }
+  if (late) {
+    process.stderr.write(
+      `this project's journal can be read now, so the ${open.length} execution${open.length === 1 ? "" : "s"} it holds open ${open.length === 1 ? "is" : "are"} recovered now, before any tick or event is admitted\n`,
+    );
   }
   const stillOpen = new Set(open.map((row) => row.id));
   for (const row of open) {
-    // One generation of one execution per process. Nothing can be running yet —
-    // this hook is what runs before the first connection — so the guard is a
-    // statement rather than a fix: an execution this process is already replaying
-    // is never replayed a second time beside itself.
+    // One generation of one execution per process. At start nothing can be
+    // running yet — this hook is what runs before the first connection — so the
+    // guard is a statement there; a recovery the start could not finish runs in
+    // a process that has been serving since, and there it is a fix: an
+    // execution this process started, or is already replaying, is never
+    // replayed a second time beside itself.
     if (executions.has(row.id)) continue;
     const flow = flows[row.flow];
     if (flow === undefined) {
@@ -1155,6 +1774,7 @@ async function recoverExecutions(executions: Map<string, Execution>): Promise<vo
     resumeInto(executions, flow, row, await announced(row.id));
     process.stderr.write(`recovered ${row.id} (${row.flow})\n`);
   }
+  return undefined;
 }
 
 /**
@@ -1288,27 +1908,24 @@ function trackChild(
   return run;
 }
 
-/** Start the run, and record what it does when it stops. */
+/**
+ * Start the run, and record what it does when it stops.
+ *
+ * Answers the execution's record and **`begun`**: resolved once the run's
+ * lifecycle row is journaled — `runFlow`'s `opened` hook — and rejected with
+ * whatever stopped the run before it was. What a gated [`admit`] waits for
+ * before it says the execution started.
+ */
 function register(
   executions: Map<string, Execution>,
-  flow: CompiledFlow,
-  trigger: HttpTrigger,
-  inputs: Record<string, unknown>,
-  sessionKey: string,
-  payload: Payload,
-): Execution {
-  const id = `exec_${globalThis.crypto.randomUUID()}`;
-  const callback = callbackOf(trigger, payload);
-  // The caller's own trace, where the caller named one (PRD resolved q51). Read
-  // here for [`callbackOf`]'s reason and journaled for the same: the export that
-  // adopts it happens at settle, which may be in another process. Header names
-  // are case-insensitive and this framework lowercases them, so the lookup is
-  // the lowercase spelling W3C writes anyway.
-  const traceparent = (payload.headers["traceparent"] ?? "").trim();
+  admission: Admission,
+  id: string,
+): { readonly record: Execution; readonly begun: Promise<void> } {
+  const { flow, inputs, sessionKey, callback, traceparent } = admission;
   const execution: Execution = {
     id,
     flow: flow.address,
-    trigger: trigger.name,
+    trigger: admission.trigger,
     status: "running",
     // This request is the execution's first generation, so there is nothing for
     // it to catch up to: a pause it has not reached yet is one nobody has been
@@ -1327,36 +1944,46 @@ function register(
     settled: Promise.resolve(),
   };
   const unwatch = watchPauses(execution);
+  let opened: () => void = () => {};
+  const journaled = new Promise<void>((resolve) => {
+    opened = resolve;
+  });
   // `resumable: true` is what makes a `human` node a *pause* rather than the end
   // of the run: this app mounts the route that answers one (grammar 8.7,
   // PRD 5.11), which `agent-compose run` does not.
-  execution.settled = settling(
-    execution,
-    runFlow(flow.address, inputs, {
-      executionId: id,
-      sessionKey,
-      resumable: true,
-      // Which trigger started it, for the journal's lifecycle row. Recorded so a
-      // reader of the journal can tell an `http` execution from a `run`, and so
-      // the resume and status routes of this execution can enforce the auth of
-      // the trigger that started it after a restart (grammar 13.3); never
-      // re-fired on recovery (PRD resolved q28).
-      trigger: trigger.name,
-      // And where its lifecycle webhooks go, on the same row and for the
-      // reason [`resumeInto`] reads it back: the process that finishes this
-      // execution may not be this one.
-      ...(callback === undefined ? {} : { callback }),
-      // …and the caller's trace, on the row for the same reason. Carried as it
-      // arrived and validated where it is read (`./otlp.ts`'s
-      // `parseTraceparent`), so a malformed header costs the execution nothing
-      // — which is the W3C trace-context behaviour and PRD resolved q51's.
-      ...(traceparent === "" ? {} : { traceparent }),
-      // The `settled` webhook, journaled before the row closes — see [`closed`].
-      closing: (produced, error) => closed(execution, produced, error),
-    }),
-  ).finally(unwatch);
+  const run = runFlow(flow.address, inputs, {
+    executionId: id,
+    sessionKey,
+    resumable: true,
+    // Which trigger started it, for the journal's lifecycle row. Recorded so a
+    // reader of the journal can tell an `http` execution from a `run`, and so
+    // the resume and status routes of this execution can enforce the auth of
+    // the trigger that started it after a restart (grammar 13.3); never
+    // re-fired on recovery (PRD resolved q28).
+    trigger: admission.trigger,
+    // And where its lifecycle webhooks go, on the same row and for the
+    // reason [`resumeInto`] reads it back: the process that finishes this
+    // execution may not be this one.
+    ...(callback === undefined ? {} : { callback }),
+    // …and the caller's trace, on the row for the same reason. Carried as it
+    // arrived and validated where it is read (`./otlp.ts`'s
+    // `parseTraceparent`), so a malformed header costs the execution nothing
+    // — which is the W3C trace-context behaviour and PRD resolved q51's.
+    ...(traceparent === undefined ? {} : { traceparent }),
+    // The `settled` webhook, journaled before the row closes — see [`closed`].
+    closing: (produced, error) => closed(execution, produced, error),
+    // The lifecycle row is down: what a gated admission waits for.
+    opened,
+  });
+  execution.settled = settling(execution, run).finally(unwatch);
   executions.set(id, execution);
-  return execution;
+  // A run resolves only after its row opened, so the race is decided by the
+  // hook — or by the run's own rejection, where it stopped before the row.
+  const lifecycle = Promise.race([journaled, run.then(() => undefined)]);
+  // Nobody waits on it for an `http` start: a run that fails before its row is
+  // the status route's and the webhook's to report ([`settling`]).
+  lifecycle.catch(() => {});
+  return { record: execution, begun: lifecycle };
 }
 
 /**
@@ -1977,7 +2604,7 @@ function credentialed(url: string): boolean {
  * Pick up every delivery the journal still holds pending
  * (`docs/durability.md` §6.1).
  *
- * Beside the executions [`recover`] replays, and separately from them: a
+ * Beside the executions [`Recovery`] replays, and separately from them: a
  * delivery reports on an execution that may have **ended** in the process that
  * died, so there is nothing to recover and something still to send. Its
  * remaining schedule is computed from the recorded intent, so a delivery whose
@@ -1993,16 +2620,24 @@ function credentialed(url: string): boolean {
  * picked up inside its own guard, in the posture [`recoverExecutions`] takes for
  * the read it guards and §3.7 takes for a webhook — a courtesy the status route
  * backstops, and one the next start picks up again.
+ *
+ * `undefined` once it has read the owed rows and walked them; what stopped it
+ * where the journal could not be read, which leaves the walk owed
+ * ([`Recovery`]). A row this process has already put on its schedule is never
+ * put on a second one ([`resumeDelivery`]), so a walk a standby takes late
+ * leaves alone a delivery it started itself.
  */
-async function resumeDeliveries(): Promise<void> {
+async function resumeDeliveries(late: boolean): Promise<string | undefined> {
   let pending: readonly runtime.DeliveryRecord[];
   try {
     pending = await undeliveredDeliveries();
   } catch (error) {
-    process.stderr.write(
-      `this project's undelivered deliveries could not be read: ${message(error)}\n`,
-    );
-    return;
+    if (!late) {
+      process.stderr.write(
+        `this project's undelivered deliveries could not be read: ${message(error)}\n`,
+      );
+    }
+    return message(error);
   }
   for (const record of pending) {
     try {
@@ -2016,6 +2651,7 @@ async function resumeDeliveries(): Promise<void> {
       );
     }
   }
+  return undefined;
 }
 
 /** One owed delivery, put back on its schedule. See [`resumeDeliveries`]. */

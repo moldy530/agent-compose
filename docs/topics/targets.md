@@ -157,7 +157,9 @@ unconditionally. Four consequences:
   reasoning — there is nothing in it for `local` to override, and the project
   built on the laptop is the project whose harness runs there. `trace_sink:` is
   live here because a laptop's `run` settles executions like any other target,
-  and `event_sources:` is reserved grammar carried into the IR.
+  and `event_sources:` is live here for `kind: command` only: a program on this
+  machine is local infrastructure, so `serve` runs it, while a queue is not —
+  a `redis_streams`, `sqs` or `nats` source in `deploy/local.yml` is an error.
 - It **must not** declare `storage_backends:`, and it **must not** declare
   `journal:`. Both are *active* grammar which `local` overrides unconditionally —
   it substitutes local storage for every store, and it binds the SQLite journal
@@ -170,7 +172,8 @@ unconditionally. Four consequences:
 
 Under `local` the two target-dependent binding checks are satisfied
 **vacuously**: a store's `backend:` alias needs no definition, and an `event`
-trigger's `source:` needs no `event_sources:` entry. That is the
+trigger's `source:` needs no `event_sources:` entry — nothing consumes for it
+there, and `serve` says so at start. That is the
 zero-infrastructure guarantee — production infrastructure in
 `deploy/staging.yml` and a project that still validates and runs on a laptop.
 
@@ -573,25 +576,49 @@ the hub served, and its effects are journaled by the hub. The wire is normative
 in `docs/distributed.md`, and `agent-compose docs cli` is where the verb's flags
 are.
 
-## `event_sources` — reserved
+## `event_sources`
 
-Maps the logical `source:` names of `event` triggers to infrastructure. `kind:`
-is `redis_streams`, `sqs`, or `nats`, plus per-plugin keys such as `url`,
-`stream`, `consumer_group`, `queue_url`, `subject`.
+Maps the logical `source:` names of `event` triggers to what feeds them. The
+kind `serve` runs is **`kind: command`** — a long-running program on this
+machine, one JSON object per line of its stdout — and it is the one kind
+`deploy/local.yml` may declare:
 
-## What "reserved" means
+```yaml deploy local
+# deploy/local.yml
+version: "0.1"
+event_sources:
+  bug_reports:
+    kind: command
+    command: ${BUG_REPORTS_FEED}       # argv[0]; never a shell
+    args: ["--after", "{checkpoint}"]  # `{checkpoint}`: the newest accepted one
+    checkpoint: "payload.body.cursor"  # CEL over the line, to a string
+    restart: { backoff: 500ms, max: 2m }
+```
 
-Reserved constructs are **fully specified, parsed, type-checked, and carried
-into the IR**, and execute as no-ops in v0. Using one is never an error; relying
-on its runtime effect is a documented no-op.
+Its keys are a closed set: `command`, `args`, `checkpoint` and `restart`
+(`backoff` defaults to `1s`, `max` to `1m`). `serve` starts the program after
+recovery in a process group of its own, in the built project's directory, and
+hands it the newest checkpoint the intake accepted — as
+`AGENT_COMPOSE_CHECKPOINT` and in place of a `{checkpoint}` argument — every
+time it starts it. Each exit is a journaled restart row, and
+`GET /sources/bug_reports` reports the program's state. `agent-compose docs
+triggers` has a whole program, written in `sh`.
 
-| Construct | Status in v0 |
-|---|---|
-| `event_sources` | parsed + validated, no-op |
-| `triggers.<t>.type: schedule` | parsed + validated, no-op |
-| `triggers.<t>.type: event` | parsed + validated, no-op |
+`redis_streams`, `sqs` and `nats` keep their vocabulary — `url`, `stream`,
+`consumer_group`, `queue_url`, `region`, `subject` — and `validate` and `build`
+accept them, as `deploy/staging.yml` above does. This release runs no consumer
+for them, so **`serve` refuses a target that declares one**, exit `2`, naming
+the source and its kind, rather than serving a trigger nothing would ever feed.
 
-`human` nodes were on this list and have left it: the runtime landed, so a
+## What "reserved" meant
+
+Reserved constructs were **fully specified, parsed, type-checked, and carried
+into the IR**, and executed by nothing. None is left in the deploy layer:
+`event_sources:` left the list when `serve` began running `kind: command`
+programs, and the `schedule` and `event` triggers left it with it — the queue
+kinds stay as vocabulary `serve` refuses by name.
+
+`human` nodes were on that list and left it earlier: the runtime landed, so a
 compiled project really pauses and resumes — and their durability has left it
 too: a wait that a restart interrupted comes back with its id intact, because
 the wait id is the node's instance path and the journal is what a resumed
@@ -608,8 +635,8 @@ every rule above is enforced, a build emits the hub, the `worker` verb joins it,
 and `docs/distributed.md` is what both halves are held to.
 
 An `http` trigger's `auth:`, `callback_auth:` and `callback_allow:` have left it
-as well, and they were the rows worth reading twice while they were here: a
-no-op `schedule` is visible the first morning it does not fire, while a no-op
+as well, and they were the rows worth reading twice while they were there: a
+no-op `schedule` was visible the first morning it did not fire, while a no-op
 `auth:` would serve every caller and look exactly like a guarded route. The
 generated app verifies callers, signs deliveries and refuses a callback URL
 outside the list — see `agent-compose docs triggers`. What that adds to a

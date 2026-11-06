@@ -392,7 +392,8 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
     },
-    /// Serve the project's `http` triggers (validates, builds, then launches the app)
+    /// Serve the project's triggers: `http` routes, `schedule` ticks, `kind: command` event
+    /// sources (validates, builds, then launches the app)
     Serve {
         /// Path to the spec entrypoint (conventionally `main.yml`)
         path: PathBuf,

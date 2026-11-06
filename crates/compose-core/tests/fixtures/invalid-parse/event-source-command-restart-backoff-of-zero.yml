@@ -1,0 +1,17 @@
+# rule: a restart waits before it starts the program again, so `restart.backoff` is positive (grammar 14.4, PRD resolved q78)
+# code: invalid-duration
+# message: `0s` is not a valid duration for `backoff`
+# at: 17:16
+# help: durations are a positive integer followed by `ms`, `s`, `m`, or `h`, e.g. `30s`; compound forms like `1m30s` are not supported
+#
+# A zero backoff is a program that exits at once restarted in a busy loop — the
+# failure a backoff exists to prevent. Grammar 4.4's durations are positive, so
+# the duration reader is what refuses it, before the restart rule is asked.
+version: "0.1"
+
+event_sources:
+  feed:
+    kind: command
+    command: ./bin/feed
+    restart:
+      backoff: 0s

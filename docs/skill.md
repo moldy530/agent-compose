@@ -51,8 +51,9 @@ compiled project.
    the fastest way to see what a flow you did not write actually does.
 7. **Compile and run.** `agent-compose build main.yml` emits the TypeScript
    project; `agent-compose run main.yml flow.<name> --input k=v` builds and
-   runs one flow; `agent-compose serve main.yml` starts the app for `http`
-   triggers.
+   runs one flow; `agent-compose serve main.yml` starts the app: its `http`
+   routes, its `schedule` ticks, and the programs its `event` triggers are fed
+   by.
 
 ## Verbs
 
@@ -64,7 +65,7 @@ compiled project.
 | `build <path>` | emit the TypeScript project; `--check` reports drift instead of writing |
 | `run <path> <flow>` | build, then run one flow; `--input k=v`, `--session <key>` |
 | `resume <path> <execution>` | build, then carry on a journaled execution — replaying its recorded effects rather than re-issuing them |
-| `serve <path>` | build, then serve the project's `http` triggers |
+| `serve <path>` | build, then serve the project's triggers: `http` routes, `schedule` ticks, and `kind: command` event sources |
 | `cancel <path> <execution>` | stop an execution a `serve` is running, and every open child execution it started; `--url <base>` (or the target's `hub.public_url`), `--header 'Name: value'` for the starting trigger's `auth:` |
 | `store <sub-verb> <path> <store>` | build, then read or write one `kv` store through the target's own backend with no flow: `get`, `set`, `delete`, `list`, `count`, `export`, `import`, `log`; `--session <key>` or `--execution <id>` names the partition |
 | `worker --hub <url> --claim <name> --token-env <VAR>` | join a hub and run the nodes placed on the names it claims; takes no spec |
@@ -132,6 +133,22 @@ call, a command, a harness run, a placed dispatch — each open instance ends
 is cancelled too, and the status route then reports `cancelled`. A cancelled
 execution is ended for good: `resume` refuses it. A `run` is stopped with
 `Ctrl-C` instead, which leaves it open for `resume`.
+
+## Schedules and event sources
+
+`serve` fires `schedule` triggers and runs the program behind each `event`
+trigger's source; `run` does neither. A `cron:` is five POSIX fields in a
+`timezone:` (default `UTC`), each tick fires once — journaled before it starts,
+so a restart or a second hub never repeats it — and ticks that fell while
+nothing was serving are skipped, never back-filled: a flow catches itself up
+from `payload.scheduled_at`. An event source of `kind: command` is a program
+printing one JSON object per line; its `checkpoint:` is handed back on every
+restart as `AGENT_COMPOSE_CHECKPOINT` and as a `{checkpoint}` argument, and
+`dedupe_key:` (default `payload.id`) keeps a re-emitted event from starting a
+second execution. `GET /sources/<name>` reports the program, under the
+`auth:` an `event` trigger bound to it may declare. `redis_streams`,
+`sqs` and `nats` validate, but `serve` refuses them by name. See
+`agent-compose docs triggers` and `agent-compose explain invalid-cron`.
 
 ## Looking inside a store
 

@@ -1,0 +1,28 @@
+# rule: `deploy/local.yml` may declare `event_sources` of `kind: command` only (Decision D87, as amended by D162)
+# code: invalid-value
+# message: `deploy/local.yml` may declare `event_sources` of `kind: command` only, and `feed` is `kind: redis_streams`
+# at: deploy/local.yml:5:11
+# help: `local` is the zero-infra target: a program on this machine is local infrastructure and runs there, while a queue is not, so `local` starts no consumer for one; bind the queue under a `--target` of its own and leave the trigger's source unbound here, which `local` satisfies vacuously (grammar 14, 14.4, Decision D87 as amended by D162)
+#
+# The zero-infra target runs on one machine with nothing installed beside it,
+# so a source it may declare is a program on that machine; a queue is
+# infrastructure, and belongs to a named target.
+version: "0.1"
+
+flow.ingest:
+  inputs:
+    report: { type: string }
+  outputs: {}
+  nodes:
+    store:
+      exec: { command: "true" }
+  edges:
+    - { from: start, to: store }
+    - { from: store, to: end }
+
+triggers:
+  reports:
+    type: event
+    flow: flow.ingest
+    source: feed
+    input: { report: "payload.body.text" }

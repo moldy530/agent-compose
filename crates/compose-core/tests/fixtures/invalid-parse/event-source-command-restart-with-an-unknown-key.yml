@@ -1,0 +1,17 @@
+# rule: a command source's `restart:` takes `backoff` and `max` and nothing else (grammar 14.4, PRD resolved q78)
+# code: unknown-key
+# message: unknown key `attempts` in `restart` of event source `feed`
+# at: 17:7
+#
+# The block is the runtime's own, read whole, so a key it does not read is a
+# limit the author believes the program has and it does not: restarts never
+# give up (grammar 14.4).
+version: "0.1"
+
+event_sources:
+  feed:
+    kind: command
+    command: ./bin/feed
+    restart:
+      backoff: 1s
+      attempts: 5

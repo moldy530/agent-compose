@@ -147,7 +147,7 @@ pub struct DeployFile {
     /// `trace_sink:` — where every settled execution's trace ships
     /// (grammar 14.5).
     pub trace_sink: Option<TraceSinkSection>,
-    /// `event_sources:` — reserved grammar.
+    /// `event_sources:` (grammar 14.4).
     pub event_sources: Option<EventSourcesSection>,
     /// The document root's span.
     pub span: Span,

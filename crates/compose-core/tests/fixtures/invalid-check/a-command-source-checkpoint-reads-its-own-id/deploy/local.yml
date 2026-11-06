@@ -1,0 +1,7 @@
+version: "0.1"
+
+event_sources:
+  feed:
+    kind: command
+    command: ./bin/feed
+    checkpoint: "payload.id"

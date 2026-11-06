@@ -25,8 +25,8 @@
 //! (Decision D80) rather than a constraint of its own, and `section.rs`
 //! enforces exactly that charset, so a relative path carrying a space is
 //! refused by both. And `cron:` is anchored here the way the schema anchors it
-//! (`^\S+(\s+\S+){4}$`), so a trailing space is refused rather than swallowed
-//! by a field count that ignores it.
+//! (`^[^ \t\n\f\r]+([ \t\n\f\r]+[^ \t\n\f\r]+){4}$`), so a trailing space is
+//! refused rather than swallowed by a field count that ignores it.
 //!
 //! Where the schema is tighter than this pass, the rule belongs to a later one
 //! by Appendix B's own assignment, and `settings:` is the case to know. The

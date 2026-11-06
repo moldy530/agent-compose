@@ -1,0 +1,38 @@
+# Acceptance fixture: a `schedule` trigger that `serve` fires (grammar 13.4,
+# PRD resolved q78).
+#
+# One flow and one trigger, every minute in UTC, binding both members of the
+# schedule payload into the flow's inputs — so an execution's lifecycle row
+# carries the nominal tick it was started for (`payload.scheduled_at`) and the
+# trigger that started it, which is what a test reads back to say "this tick
+# fired, once, with the right instant". The flow does nothing else: what is
+# under test is the scheduler, the `fired` row and the skipped span, and a
+# richer flow would make each tick slower to settle and prove nothing more.
+#
+# The acceptance suite runs it under `AGENT_COMPOSE_SCHEDULE_CLOCK_RATE` (the
+# test-only hook `src/sources.ts` documents), so an every-minute cron ticks
+# once a second, and under `AGENT_COMPOSE_SCHEDULE_CLOCK_OFFSET_MS` to make an
+# outage of several ticks without waiting for one.
+version: "0.1"
+
+flow.tick:
+  inputs:
+    scheduled_at: { type: string }
+    trigger: { type: string }
+  outputs: {}
+  nodes:
+    note:
+      exec: { command: "true" }
+  edges:
+    - { from: start, to: note }
+    - { from: note, to: end }
+
+triggers:
+  every_minute:
+    type: schedule
+    flow: flow.tick
+    cron: "* * * * *"
+    timezone: UTC
+    input:
+      scheduled_at: "payload.scheduled_at"
+      trigger: "payload.trigger"
