@@ -270,13 +270,32 @@ export function journalLocation(): string {
  * own rather than a `model` because what a resume consumes is different in
  * kind: a `model` record holds one completion, and this one holds a whole agent
  * loop's answer, with the loop's own transcript as its private payload.
+ *
+ * `finally` is not a call to the world at all: it is the **boundary** an
+ * instance crosses when it ends and its `finally:` node begins (grammar 7.9,
+ * PRD resolved q76, `docs/durability.md` §3.10) — one record per instance that
+ * ended, at the finally node's own site, holding how the instance ended. It goes
+ * through the same seam because what it needs is the seam's: a key a resumed
+ * generation derives again, and a recorded value it compares and reads back.
  */
-export type EffectKind = "model" | "tool" | "store" | "human" | "harness";
+export type EffectKind = "model" | "tool" | "store" | "human" | "harness" | "finally";
 
 /** How one recorded effect ended. */
 export type JournalOutcome =
   | { readonly kind: "value"; readonly value: unknown }
-  | { readonly kind: "error"; readonly name: string; readonly message: string };
+  | {
+      readonly kind: "error";
+      readonly name: string;
+      readonly message: string;
+      /**
+       * On a **placement dispatch's** settled failure only: what a `finally:`
+       * node that ran inside the dispatched node raised, where one did
+       * (grammar 7.9, `docs/distributed.md` §3.4, `docs/durability.md` §3.8).
+       * Kept on the row so a hub restarted before the execution settles reads it
+       * back with the failure it travelled beside. Never on an effect record.
+       */
+      readonly finallyError?: string;
+    };
 
 /** One effect, as the journal holds it. */
 export interface JournalRecord {
@@ -700,6 +719,15 @@ export interface ExecutionRow {
   readonly endedAt?: string;
   /** Why it failed, for a reader of the journal. Absent on the other two. */
   readonly error?: string;
+  /**
+   * What a flow's `finally:` node raised after its own retries, where one did
+   * (grammar 7.9, PRD resolved q76) — the first such failure in the execution,
+   * naming the flow and the node — on a row whose `status` it did not change:
+   * a `completed` row with one is a run that answered, and whose cleanup did
+   * not. Absent on every row whose finally nodes completed, and on every row of
+   * an execution that had none.
+   */
+  readonly finallyError?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -726,8 +754,16 @@ export interface ExecutionRow {
 export interface Journal {
   /** Record that an execution has begun. Idempotent on the id. */
   begin(row: ExecutionRow): Promise<void>;
-  /** Record how it ended. */
-  end(id: string, status: Exclude<ExecutionStatus, "open">, error?: string): Promise<void>;
+  /**
+   * Record how it ended — and, where a `finally:` node failed, what it raised,
+   * beside the outcome it did not change (grammar 7.9, [`ExecutionRow.finallyError`]).
+   */
+  end(
+    id: string,
+    status: Exclude<ExecutionStatus, "open">,
+    error?: string,
+    finallyError?: string,
+  ): Promise<void>;
   /** One execution's lifecycle row. */
   execution(id: string): Promise<ExecutionRow | undefined>;
   /** Every execution the journal holds open, oldest first. */
@@ -1146,14 +1182,17 @@ class SqlJournal implements Journal {
     });
   }
 
-  end(id: string, status: Exclude<ExecutionStatus, "open">, error?: string): Promise<void> {
+  end(
+    id: string,
+    status: Exclude<ExecutionStatus, "open">,
+    error?: string,
+    finallyError?: string,
+  ): Promise<void> {
     return this.#serial(() =>
-      this.#run("UPDATE executions SET status = ?, ended_at = ?, error = ? WHERE id = ?", [
-        status,
-        new Date().toISOString(),
-        error ?? null,
-        id,
-      ]),
+      this.#run(
+        "UPDATE executions SET status = ?, ended_at = ?, error = ?, finally_error = ? WHERE id = ?",
+        [status, new Date().toISOString(), error ?? null, finallyError ?? null, id],
+      ),
     );
   }
 
@@ -1481,7 +1520,11 @@ class SqlJournal implements Journal {
     const payload =
       outcome.kind === "value"
         ? canonical(outcome.value)
-        : canonical({ name: outcome.name, message: outcome.message });
+        : canonical({
+            name: outcome.name,
+            message: outcome.message,
+            ...(outcome.finallyError === undefined ? {} : { finallyError: outcome.finallyError }),
+          });
     return this.#serial(async () => {
       // **Read first, and the read is what answers.** The `WHERE` clause is still
       // the guard — a row already ended keeps the outcome it has — but a status
@@ -1582,7 +1625,8 @@ CREATE TABLE IF NOT EXISTS executions (
   journal_version INTEGER NOT NULL,
   started_at      TEXT NOT NULL,
   ended_at        TEXT,
-  error           TEXT
+  error           TEXT,
+  finally_error   TEXT
 );
 CREATE TABLE IF NOT EXISTS effects (
   execution   TEXT NOT NULL,
@@ -1780,9 +1824,9 @@ async function migrated(
       // the lifecycle row has to be writable in one too — an `INSERT` naming a
       // column the file lacks would fail every new execution in it.
       //
-      // The two remote arms carry no such probes and need none: their schema is
-      // created whole on first open by a build that already has every column,
-      // because no journal older than they are exists (§11.2).
+      // The two remote arms carry the probes for the columns grown **after**
+      // them — `finally_error` is the first — and none for the ones before,
+      // which every remote journal was created with whole (§11.2).
       const columns = database.all("PRAGMA table_info(executions)") as Row[];
       if (!columns.some((column) => column["name"] === "callback")) {
         database.exec("ALTER TABLE executions ADD COLUMN callback TEXT;");
@@ -1793,6 +1837,13 @@ async function migrated(
       // started without one carries none either (PRD resolved q51).
       if (!columns.some((column) => column["name"] === "traceparent")) {
         database.exec("ALTER TABLE executions ADD COLUMN traceparent TEXT;");
+      }
+      // What a `finally:` node raised, added to the lifecycle row after both
+      // (grammar 7.9, PRD resolved q76): nullable, because a row written before
+      // it had no finally node that could fail, and `null` is what a row whose
+      // finally nodes completed holds too.
+      if (!columns.some((column) => column["name"] === "finally_error")) {
+        database.exec("ALTER TABLE executions ADD COLUMN finally_error TEXT;");
       }
       const effects = database.all("PRAGMA table_info(effects)") as Row[];
       if (!effects.some((column) => column["name"] === "refused")) {
@@ -1946,11 +1997,16 @@ function deliveryOf(row: Row): DeliveryRecord {
 
 /** One error outcome, read back off its stored payload. */
 function errorOutcome(payload: string): JournalOutcome {
-  const held = JSON.parse(payload) as { name?: unknown; message?: unknown };
+  const held = JSON.parse(payload) as {
+    name?: unknown;
+    message?: unknown;
+    finallyError?: unknown;
+  };
   return {
     kind: "error",
     name: typeof held.name === "string" ? held.name : "Error",
     message: typeof held.message === "string" ? held.message : payload,
+    ...(typeof held.finallyError === "string" ? { finallyError: held.finallyError } : {}),
   };
 }
 
@@ -1959,6 +2015,10 @@ function executionOf(row: Row): ExecutionRow {
   const held = row;
   const endedAt = held["ended_at"];
   const error = held["error"];
+  // Absent from a row an older build wrote and a probe has since grown the
+  // column on, which reads `null` — the same answer as a run whose finally node
+  // did not fail, or that had none (`docs/durability.md` §3.5, §11.2).
+  const finallyError = held["finally_error"];
   const callback = held["callback"];
   const traceparent = held["traceparent"];
   const parent = held["lineage_parent"];
@@ -1994,6 +2054,9 @@ function executionOf(row: Row): ExecutionRow {
     startedAt: String(held["started_at"]),
     ...(endedAt === null || endedAt === undefined ? {} : { endedAt: String(endedAt) }),
     ...(error === null || error === undefined ? {} : { error: String(error) }),
+    ...(finallyError === null || finallyError === undefined
+      ? {}
+      : { finallyError: String(finallyError) }),
   };
 }
 
@@ -2478,6 +2541,20 @@ export function closeSession(execution: string): void {
   sessions.delete(execution);
   latched.delete(execution);
   marks.delete(execution);
+}
+
+/**
+ * Whether this process is keeping `execution`'s record: true from
+ * [`openSession`] until [`closeSession`].
+ *
+ * The question a write that belongs **on** that record asks before it lands —
+ * what a `finally:` node raised (`src/runtime.ts`'s `endInstance`) — because a
+ * detached delivery's work runs on past the execution's settle (grammar 8.6
+ * rule 7), and a write after the record has closed reaches nothing a reader
+ * will read.
+ */
+export function journaling(execution: string): boolean {
+  return sessions.has(execution);
 }
 
 /**
@@ -3089,18 +3166,22 @@ export async function journaled<T>(
 import { Client } from "pg";
 
 /**
- * The schema, created on first open and never migrated.
+ * The schema, created on first open, and grown by the `DO` block at its end
+ * where a database an earlier build created lacks a column.
  *
  * `IF NOT EXISTS` throughout, so a second open of a journal this build already
- * created does nothing — which is the whole of what `docs/durability.md` §11.2
- * asks of a physical schema, and all it can ask of this one: a remote journal is
- * created by this release or a later one, so there is no older file whose
- * columns have to be probed for. (The SQLite arm's `PRAGMA table_info` walks
- * exist because there *are* older files.) A column added here in a later release
- * is the case to read §11.2 twice for, exactly as it is there. A **table** added
- * in one is not: `lineage` (PRD resolved q65) arrived after this schema first
- * shipped, and `IF NOT EXISTS` is the whole of its migration into a database an
- * earlier build created.
+ * created does nothing. (The SQLite arm's `PRAGMA table_info` walks probe for
+ * every column grown since its first release, because files that old exist.) A
+ * **table** added since is no work: `lineage` (PRD resolved q65) arrived after
+ * this schema first shipped, and `IF NOT EXISTS` is the whole of its migration
+ * into a database an earlier build created. A **column** added since is the case §11.2 is read twice for,
+ * and `finally_error` (PRD resolved q76) is the first: a database an earlier
+ * build created holds `executions` without it, and `CREATE TABLE IF NOT EXISTS`
+ * leaves that table as it is. So the `DO` block below probes `pg_attribute` and
+ * adds the column only where it is missing — the probe because `ALTER TABLE …
+ * ADD COLUMN IF NOT EXISTS` takes `ACCESS EXCLUSIVE` before it looks, so as a
+ * bare statement every open would queue behind every reader of the table. This
+ * runs under the writer guard, so one opener does it.
  *
  * **`COLLATE "C"` on every column a statement compares or orders by**, and that
  * is a correctness choice rather than a preference. A journal key is
@@ -3127,8 +3208,19 @@ CREATE TABLE IF NOT EXISTS executions (
   journal_version INTEGER NOT NULL,
   started_at      TEXT COLLATE "C" NOT NULL,
   ended_at        TEXT,
-  error           TEXT
+  error           TEXT,
+  finally_error   TEXT
 );
+DO $migrate$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_attribute
+    WHERE attrelid = 'executions'::regclass AND attname = 'finally_error' AND NOT attisdropped
+  ) THEN
+    ALTER TABLE executions ADD COLUMN IF NOT EXISTS finally_error TEXT;
+  END IF;
+END
+$migrate$;
 CREATE TABLE IF NOT EXISTS effects (
   execution   TEXT COLLATE "C" NOT NULL,
   "key"       TEXT COLLATE "C" NOT NULL,

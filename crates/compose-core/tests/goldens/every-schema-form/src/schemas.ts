@@ -240,6 +240,15 @@ export const flowCondenseNodeReduceOutput = z.object({
 }).strict();
 export type FlowCondenseNodeReduceOutput = z.infer<typeof flowCondenseNodeReduceOutput>;
 
+/**
+ * `flow.condense` node `note` — what the subprocess produces (grammar 8.2), which it does not declare, so this is the kind default.
+ */
+export const flowCondenseNodeNoteOutput = z.object({
+  exit_code: z.number().int(),
+  stdout: z.string(),
+}).strict();
+export type FlowCondenseNodeNoteOutput = z.infer<typeof flowCondenseNodeNoteOutput>;
+
 /** `flow.shape` — the module's parameters (grammar 7.5). */
 export const flowShapeInputs = z.object({
   goal: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),

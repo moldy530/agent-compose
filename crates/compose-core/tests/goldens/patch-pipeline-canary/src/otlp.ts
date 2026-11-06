@@ -293,6 +293,12 @@ export function exportRequest(
       text("agentcompose.status", document.status),
       integer("agentcompose.trace_version", document.trace_version),
       ...(document.error === undefined ? [] : [text("agentcompose.error", document.error)]),
+      // What a `finally:` node raised, beside a status it did not change
+      // (grammar 7.9): an attribute, never the span's status, because the run's
+      // outcome is what the status says (`docs/trace.md` §12.4, §12.5).
+      ...(document.finally_error === undefined
+        ? []
+        : [text("agentcompose.finally_error", document.finally_error)]),
       // The envelope's lineage head, read onto the root span: how a collector
       // tells a child execution from one a trigger started, and the pair it
       // joins the child to its parent's stub dispatch record on.

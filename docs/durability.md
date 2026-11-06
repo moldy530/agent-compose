@@ -51,8 +51,9 @@ target binds a remote provider carries that arm appended to it and no other
    [Postgres and MySQL](#23-postgres-and-mysql)
 3. [What is recorded](#3-what-is-recorded) — including
    [callback deliveries](#37-a-callback-delivery),
-   [placement dispatches](#38-a-placement-dispatch) and
-   [coding-harness runs](#39-a-coding-harness-run)
+   [placement dispatches](#38-a-placement-dispatch),
+   [coding-harness runs](#39-a-coding-harness-run) and
+   [the finally boundary](#310-the-finally-boundary)
 4. [Keys](#4-keys)
 5. [Replay, and the frontier](#5-replay-and-the-frontier)
 6. [Recovery: `serve` and `resume`](#6-recovery-serve-and-resume)
@@ -341,7 +342,8 @@ Every effect, and completeness is the invariant: **an effect that is not
 journaled is one a replay re-executes.** A reader verifies it the way the
 implementation enforces it — by finding the call sites. Every effect goes
 through `journaled(…)` or `EffectRecorder.claim(…)` in the emitted sources, and
-there are exactly nine of them, in five kinds:
+there are exactly nine of them, in five kinds — and one site more, of a sixth
+kind, that records a **boundary** rather than an effect:
 
 | kind | site in the emitted project | what the record holds |
 |---|---|---|
@@ -350,13 +352,17 @@ there are exactly nine of them, in five kinds:
 | `store` | `runStoreOp` in `src/stores.ts` | §3.3 |
 | `human` | `runHuman` in `src/runtime.ts` | §3.4 |
 | `harness` | `runCoder` in `src/runtime.ts` | §3.9 |
+| `finally` | `endInstance` in `src/runtime.ts` | §3.10 |
 
 Three constructs record nothing of their own, and need none: a `flow:` node, a
 `map` dispatch, and a flow-as-tool call are *instantiations*, not effects. What
 they run is a graph whose nodes reach the sites above under the
 instantiation's own instance path — which is exactly how they trace
 (`docs/trace.md` §8) — so their effects are journaled without a record for the
-boundary itself.
+boundary itself. The **end** of an instance whose flow declares `finally:` is the
+one boundary that is recorded (§3.10), because what it decides — how the
+instance ended, which its finally node reads — is a value a resumed generation
+has to be handed back rather than derive again.
 
 That inventory is held **mechanically**, and by two tests in
 `crates/compose-core/src/codegen/journal.rs` that read it from opposite ends.
@@ -776,6 +782,7 @@ One row per execution, written before the graph is streamed:
 | `status` | `open`, `completed` or `failed` — §3.6 |
 | `journalVersion` | the version at the head of this document |
 | `startedAt`, `endedAt`, `error` | when, and why it failed |
+| `finallyError` | what a flow's `finally:` node raised after its own retries, where one did (`docs/grammar.md` §7.9, PRD resolved q76): the **first** such failure in the execution — a subflow instance's finally node and the root's can both fail — as `<flow> node \`<id>\` failed: <error>`. Beside a `status` it does not change: a `completed` row carrying one is a run that produced its answer and whose cleanup did not. Absent on every row whose finally nodes completed, on every row of an execution that had none, and for a failure raised after the row was written (§3.10). The column is `finally_error`, nullable, and added to a journal an older build created by a probe on every backend (§11.2) |
 
 ### 3.6 What `status` means
 
@@ -1002,7 +1009,7 @@ holding what a worker is handed and how the wait ended:
 | `inputs`, `itemIndex`, `history`, `policy` | the dispatch payload: what the node's input phase built, plus the three facts about the node execution the hub holds that a worker cannot derive. On the row rather than in memory, so a hub restarted mid-dispatch hands over what its predecessor would have |
 | `status` | `parked`, `dispatched`, `settled` or `superseded` — the vocabulary below |
 | `session`, `parkedAt`, `dispatchedAt`, `settledAt`, `detail` | which worker session is holding it while one is, and the three instants of the wait, for the reason §3.4 keeps all three of a human wait's |
-| `outcome` | what the worker answered, once one did: a value or a failure, in the shape §3.1's outcomes take — or, on a dispatch a **pause** ended, the wait itself (`docs/distributed.md` §3.4) |
+| `outcome` | what the worker answered, once one did: a value or a failure, in the shape §3.1's outcomes take — or, on a dispatch a **pause** ended, the wait itself (`docs/distributed.md` §3.4). Any of the three may carry `finallyError` beside it: what a `finally:` node that ran inside the placed node raised, which a resumed generation reading the row holds as the execution's own `finallyError` (§3.5), exactly as the live one did when the result came home |
 
 **What `status` means** is the same kind of statement §3.6 makes about an
 execution, and the four are not interchangeable:
@@ -1154,6 +1161,81 @@ prompt, its `env:`, or its `output:` therefore diverges a resume, which is the
 answer §7 gives everywhere: the recorded answer is an answer to a question this
 build is no longer asking.
 
+### 3.10 The finally boundary
+
+One record per flow instance that **ended** and whose flow declares a `finally:`
+node (`docs/grammar.md` §7.9, PRD resolved q76): the root instance of an
+execution, each `flow:` node's instance, each joined `map` dispatch's, each
+flow-as-tool call's — and a child execution's root, which is an execution of its
+own. It is written by `endInstance` in `src/runtime.ts`, **before** the finally
+node runs, and it is the record of the instance crossing from its body into its
+finally node.
+
+* **Its key** is the finally node's own site — the instance's path with the
+  node's frame `<finally id>/0` appended, since an instance runs its finally node
+  once — and the kind `finally`: `cleanup/0#finally/0` for a root instance's
+  `cleanup`, `sub/0/cleanup/0#finally/0` inside a `flow:` node `sub`. A `retry:`
+  that re-runs a `flow:` node's whole instance ends it again at the same site,
+  and the next ordinal records that end (§4).
+* **Its identity** is the finally node's id, alone. The outcome is not part of
+  it, because the outcome is what the record **answers** rather than something
+  a replay is compared against (below).
+* **Its outcome** is a value: how the instance ended — `completed`, `failed`, or
+  `cancelled`, the last of which nothing produces until PRD resolved q75's
+  cancel exists — and, on an instance that did not complete, the body's error in
+  `docs/trace.md` §3's shape: what the finally node reads as `execution.outcome`
+  and `execution.error`.
+
+What a resumed generation does with it is §5's rule applied: the body replays —
+every effect answered out of the journal — and reaches the end again; the claim
+**finds** the record and hands the finally node the **recorded** outcome and
+error. So a restart that finds the body settled and the boundary down runs the
+finally node alone, once: its own effects are ordinary records at its site
+(§3.1–§3.9), so an effect that landed before the crash is replayed rather than
+re-applied, and one that had not is issued live — the frontier, exactly as
+anywhere else.
+
+**The record is the end.** A replayed body can reach a different end than the
+one recorded, because not everything that decides an end is an effect: a
+`timeout:` that ended a `retry:` ladder in the generation that recorded the
+boundary runs against the resumed generation's clock, and the attempt that
+deadline never let it make is made — live, past the frontier — and may succeed.
+The instance still ends where the record says: the finally node reads the
+recorded `failed`, and the instance settles on it — a subflow instance fails its
+node, and an execution's root closes its row `failed` — with a
+`RecordedEnding` error carrying the recorded error. A comparison would make every
+such resume diverge the same way, for ever, and the finally node would never
+finish. The one end a record cannot stand for is a **completion** the replay did
+not reach: what a completed instance answers is its body's outputs, which no
+record holds, so a recorded `completed` under a replay that failed is the first
+divergence of §7, raised before the finally node runs. Only nondeterminism the
+journal does not hold — a jittered backoff that outlasts a deadline it fit
+inside the first time — can produce it, and the next resume draws again.
+
+What is **not** an end records nothing: a `human` pause the run parks at —
+and every other instance still waiting on a person when it parks — and a
+divergence (`docs/grammar.md` §7.9). The resumed generation runs the body on
+from there, and the boundary is written when the instance does end. An
+instance that was waiting on a person when the end of the instance around it
+stopped it **has** ended: its boundary records `failed`, and its finally node
+runs.
+
+The record is read nowhere else. What the finally node **raised**, if it failed
+after its own retries, is not on this record — the boundary is down before the
+node runs — but on the lifecycle row, as `finallyError` (§3.5).
+
+**An end past the record writes neither.** A detached delivery runs on after
+the run that issued it has closed the execution's record — settled, or parked
+(`docs/grammar.md` §8.6 rule 7) — and an instance its model begins from its
+`tools:` can end after that. No session is open to claim its boundary in, so
+none is written; and what its finally node raises is not `finallyError`,
+because the row has been written and the envelope has shipped. The process
+says it on stderr — `warning: a finally node of execution … failed after this
+process had closed the execution's record …` — and holds nothing for it, so a
+long-lived `serve` accumulates nothing for such failures. A placed node's
+result that a worker posts after the hub settled is the same case on the hub
+(`docs/distributed.md` §3.4).
+
 ## 4. Keys
 
 An effect's journal key is
@@ -1167,8 +1249,9 @@ An effect's journal key is
   id, which is a column of its own. A node's activity uses the node's own path;
   a `map` dispatch uses the dispatch's, `<node>/<traversal>/<index>`; anything
   inside a `flow:` node or a flow-as-tool call uses that instance's.
-* `<kind>` is one of `model`, `tool`, `store`, `human`, `harness` — §3's five,
-  and the whole vocabulary a key can carry.
+* `<kind>` is one of `model`, `tool`, `store`, `human`, `harness`, `finally` —
+  §3's five effect kinds and its one boundary (§3.10), and the whole vocabulary a
+  key can carry.
 * `<ordinal>` counts effects of that kind at that site, from `0`.
 
 `#` separates the two halves because it appears in neither: a node id is an
@@ -1210,6 +1293,17 @@ site consults the journal first:
 concurrent branches needs: a `map` whose third item had run and whose fourth had
 not resumes with three items replayed and the fourth live, and neither branch
 has to know about the other.
+
+**An instance's end replays like an effect.** A flow with a `finally:` node
+(`docs/grammar.md` §7.9) records the boundary into it before the node runs
+(§3.10), so a resumed execution that finds the body settled and the boundary
+recorded replays the body, reaches the end, reads how the instance ended off the
+record, and runs the finally node **once**: what of its own effects landed before
+the crash is answered out of the journal like any node's, and what had not is the
+frontier. Killed after the body settled but before the boundary went down, the
+resumed generation records it then, live; killed after the finally node's effects
+landed but before the row closed, everything replays and only the row's own
+closing is left to do.
 
 **What is not consumed** is everything that is not an effect: the graph is
 re-executed, so routers run again, guards are evaluated again, reducers fold
@@ -1731,13 +1825,21 @@ statically over the whole golden corpus, so a generated module may name neither
 `bun:sqlite` nor `node:sqlite`; the shared driver is also one fewer pinned
 dependency.
 
-**Schema creation is idempotent, and only SQLite migrates.** Every backend
-creates its tables on first open with `IF NOT EXISTS`, so a second open of a
-journal this release wrote does nothing. SQLite additionally *probes* for the
-columns §11.2 records as later arrivals, because files written by earlier
-releases exist; the two remote arms carry no such probes and need none, since no
-journal older than they are exists. A column added to a remote schema in a later
-release is the case to read §11.2 twice for, exactly as it is on the file.
+**Schema creation is idempotent, and a column grown since is probed for.** Every
+backend creates its tables on first open with `IF NOT EXISTS`, so a second open
+of a journal this release wrote does nothing, and a **table** added since —
+`lineage` (PRD resolved q65) — needs nothing more on any of them. A **column**
+added to a table that already existed is not covered by that, so it is probed
+for and added where it is missing. SQLite probes for every column §11.2 records
+as a later arrival, because files written by earlier releases exist. The two
+remote arms probe for the one column grown since they shipped, `finally_error`
+(PRD resolved q76, §11.2): `pg_attribute` on Postgres and `information_schema` on
+MySQL, then an `ALTER TABLE … ADD COLUMN` only where it is missing. So the first
+open of an existing Postgres or MySQL journal by a build that carries the column
+alters `executions` once, under the writer guard (§2.3), and every open after it
+finds the column and alters nothing. A column added to a remote schema in a later
+release joins that probe, and is the case to read §11.2 twice for, exactly as it
+is on the file.
 
 **A column holds the same values on all three.** The types differ — that is what
 a per-backend schema is for — but what fits does not. SQLite and Postgres spell
@@ -1982,6 +2084,31 @@ moves a real child's records onto its parent's under the dispatch's path, delete
 the child's rows and drops the `lineage` table — the journal an older build would
 have left — and resumes the parent: the provider is asked nothing, the records
 are on the child, and it settles and ships.
+
+**The finally boundary and `finallyError` arrived under the first two clauses**
+(§3.5, §3.10, PRD resolved q76): a new `EffectKind`, `finally`, and a nullable
+column on an existing table. The kind is the one the second clause names
+outright: an execution open in a journal an older build wrote has no `finally`
+record — no build before this one had a `finally:` key to write one for — so a
+resumed generation that reaches the end of an instance finds the frontier there,
+records the boundary live and runs the finally node live, which is what an older
+build would have done with the run had it known the key. Nothing a replay used to
+consume moves. The column is the case `CREATE TABLE IF NOT EXISTS` does not
+cover, and it is the first column grown on a table the **remote** arms created
+too, so it is probed on all three backends rather than on SQLite alone: `PRAGMA
+table_info` on SQLite, `pg_attribute` on Postgres (the probe, because `ALTER TABLE
+… ADD COLUMN IF NOT EXISTS` takes `ACCESS EXCLUSIVE` before it looks), and
+`information_schema` on MySQL (which has no `IF NOT EXISTS` for a column) — each
+under the writer guard, so one opener adds it. Nullable for every column's reason:
+no row written before it held a finally failure. Executed:
+`a_journal_written_before_the_finally_boundary_opens_and_records_one_under_this_build`
+kills a real `run` while its body's model call is held — before the instance
+ended, so the journal holds no `finally` record at all — rebuilds the lifecycle
+table without the column, and `resume`s the execution over it: the probe grows
+the column back, the resumed generation records the boundary live and runs the
+finally node, and the failure that node raises lands in the column this build
+added. `journal_backend_conformance` carries the column's migration and the new
+record kind on all three arms.
 
 ### 11.3 What requires a version bump
 

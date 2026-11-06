@@ -490,6 +490,36 @@ const CODEGEN: &[Criterion] = &[
                 "an_inline_nodes_parameters_reach_the_process_and_the_wire",
                 Status::Live,
             ),
+            // PRD resolved q76: a flow's `finally:` node is a node fn the graph
+            // never routes to — run once when the instance ends, on every
+            // outcome, reading how it ended (grammar 7.9) — and its failure
+            // after its own retries changes nothing the run produced.
+            (
+                "a_finally_node_runs_once_on_every_outcome_and_reads_how_its_instance_ended",
+                Status::Live,
+            ),
+            (
+                "a_finally_node_that_fails_after_its_retries_changes_no_outcome",
+                Status::Live,
+            ),
+            // …and grammar 9.3's chain reaching it from the two levels a finally
+            // node does not declare itself: an instantiating `flow:` node's
+            // `policy:` (level 1) and the composition's `defaults:` (level 3),
+            // each a `retry:` that re-runs it and a `timeout:` that ends it.
+            (
+                "a_flow_nodes_policy_reaches_the_finally_node_of_the_instance_it_starts",
+                Status::Live,
+            ),
+            (
+                "the_composition_defaults_reach_a_finally_node",
+                Status::Live,
+            ),
+            // …and a finally node that is a `map`: every item's own binding
+            // reads how the instance ended, as the map's configuration does.
+            (
+                "a_finally_map_hands_every_item_how_its_instance_ended",
+                Status::Live,
+            ),
         ],
     },
     Criterion {
@@ -773,7 +803,108 @@ const CODEGEN: &[Criterion] = &[
                 Status::Live,
             ),
             (
-                "a_node_deadline_that_abandons_a_tool_call_records_neither_half_of_it",
+                "a_node_deadline_that_stops_a_tool_call_records_both_halves_once_its_instance_ends",
+                Status::Live,
+            ),
+            // …and the end of every instance a subgraph is: a nested instance's
+            // `finally:` node runs before its caller's, every dispatched
+            // instance runs its own, and a detached child execution runs its
+            // own under its own id (grammar 7.9, PRD resolved q76).
+            (
+                "a_nested_instances_finally_node_runs_before_the_one_that_instantiated_it",
+                Status::Live,
+            ),
+            (
+                "every_dispatched_instance_runs_its_own_finally_node",
+                Status::Live,
+            ),
+            (
+                "a_detached_child_execution_runs_its_own_finally_node",
+                Status::Live,
+            ),
+            // …on the failing paths too: a subflow and a fan-out item whose body
+            // failed still end, and their finally nodes run before the caller
+            // settles — as does a flow a model called as a tool.
+            (
+                "a_failing_subflow_runs_its_finally_node_before_its_callers",
+                Status::Live,
+            ),
+            (
+                "every_item_of_a_failed_fan_out_runs_its_finally_node_before_the_maps_flow",
+                Status::Live,
+            ),
+            (
+                "a_flow_called_as_a_tool_runs_its_finally_node_before_the_agent_settles",
+                Status::Live,
+            ),
+            // …and on a deadline: a `flow:` node or `map` whose own `timeout:`
+            // ran out stops its instances and fails only once each has ended,
+            // finally node run — and begins none it had not begun.
+            (
+                "a_flow_node_whose_timeout_ran_out_waits_for_its_instances_finally_node",
+                Status::Live,
+            ),
+            (
+                "a_map_whose_timeout_ran_out_waits_for_the_instances_it_began_and_begins_no_more",
+                Status::Live,
+            ),
+            // …and on a sibling's failure: a body node that fails while other
+            // branches are still running subflow instances ends those first —
+            // each stopped, its finally node run — before its own flow's.
+            (
+                "a_failing_body_node_ends_the_instances_its_siblings_are_still_running_first",
+                Status::Live,
+            ),
+            // …one that is waiting on a person among them: its pause is
+            // abandoned, and it ends `failed` and runs its finally node too.
+            (
+                "a_sibling_waiting_on_a_person_when_the_body_fails_ends_and_runs_its_finally_node",
+                Status::Live,
+            ),
+            // The finally node of an instance the failure stopped may begin
+            // instances of its own — a `flow:` node's, a `map`'s, a `flow.*`
+            // tool's — and each runs to its end; one already running when the
+            // failure came is waited for, never stopped.
+            (
+                "a_stopped_instances_finally_node_begins_and_ends_instances_of_its_own",
+                Status::Live,
+            ),
+            (
+                "a_finally_node_already_running_when_the_instance_around_it_ends_is_waited_for",
+                Status::Live,
+            ),
+            // And nothing begins inside an instance that has ended, after its
+            // end is over too: a queued `map` item, a `retry:` attempt and a
+            // `flow.*` tool call its let-go siblings would make are refused.
+            (
+                "an_ended_instance_whose_end_is_over_still_begins_nothing_inside_it",
+                Status::Live,
+            ),
+            // …nor what begins no instance at all: an `exec:` node's next
+            // `retry:` attempt, a queued `map` item of a `tool.*`, and an
+            // item's next `on_item_error` attempt.
+            (
+                "an_ended_instance_begins_no_attempt_and_no_item_that_is_not_an_instance",
+                Status::Live,
+            ),
+            // …nor a let-go agent's next tool call — an `exec:` tool, a store
+            // write — or its next model turn, while the instance is still
+            // ending as well as after; a tool already running runs on.
+            (
+                "a_let_go_agent_begins_no_tool_call_and_no_model_turn_after_its_body_ends",
+                Status::Live,
+            ),
+            // A detached delivery is off the instance that issued it: the
+            // instances its agent's model begins from its `tools:` are neither
+            // stopped, waited for nor refused by that instance's end.
+            (
+                "an_instances_end_stops_waits_for_and_refuses_nothing_a_detached_delivery_began",
+                Status::Live,
+            ),
+            // An input a finally node cannot build — an unasked absent read —
+            // is its own failure, `finally_error`, not the execution's.
+            (
+                "a_finally_node_whose_input_cannot_be_built_fails_without_failing_the_run",
                 Status::Live,
             ),
         ],
@@ -1252,6 +1383,13 @@ const COMMANDS: &[Criterion] = &[
                 "an_agent_nodes_budget_does_not_run_while_a_pause_below_its_tool_call_is_open",
                 Status::Live,
             ),
+            // …and the status route's report of an execution whose `finally:`
+            // node failed: `finally_error` beside the outcome and outputs it did
+            // not change (`docs/trace.md` §1.3, PRD resolved q76).
+            (
+                "a_served_executions_status_reports_its_finally_error",
+                Status::Live,
+            ),
         ],
     },
     // The committed half of this criterion — "goldens are reviewed in PRs like
@@ -1471,6 +1609,13 @@ const DURABILITY: &[Criterion] = &[
             // own.
             (
                 "a_resumed_run_answers_a_history_read_out_of_the_record",
+                Status::Live,
+            ),
+            // …and PRD resolved q76's boundary is a compatible change to that
+            // record: a journal written before the lifecycle row could carry a
+            // `finally_error` opens, resumes, and takes one.
+            (
+                "a_journal_written_before_the_finally_boundary_opens_and_records_one_under_this_build",
                 Status::Live,
             ),
         ],
@@ -1700,6 +1845,48 @@ const DURABILITY: &[Criterion] = &[
             // driver's lock directory behind, and nothing else removes it.
             (
                 "a_lock_a_killed_writer_left_behind_does_not_seal_the_journal",
+                Status::Live,
+            ),
+            // …and the end of an instance survives one too (grammar 7.9, PRD
+            // resolved q76): killed after its `finally:` node's boundary was
+            // journaled and before the node's effect landed, a resume runs the
+            // node once; killed after the effect landed and before the row
+            // closed, a resume replays it — on a completed run and a failed one
+            // alike.
+            (
+                "a_completed_run_killed_before_its_finally_effect_landed_runs_it_once_on_resume",
+                Status::Live,
+            ),
+            (
+                "a_failed_run_killed_before_its_finally_effect_landed_runs_it_once_on_resume",
+                Status::Live,
+            ),
+            (
+                "a_completed_run_killed_after_its_finally_effect_landed_replays_it_on_resume",
+                Status::Live,
+            ),
+            (
+                "a_failed_run_killed_after_its_finally_effect_landed_replays_it_on_resume",
+                Status::Live,
+            ),
+            // …and the window before either: a generation that died after the
+            // body's last effect and before the boundary leaves no boundary, and
+            // the resume records it live and runs the finally node once.
+            (
+                "a_restart_before_the_finally_boundary_records_it_and_runs_the_node_once",
+                Status::Live,
+            ),
+            // …and the stop that is not an end: a run parked at a pause runs no
+            // finally node, and the resume that answers it runs each once.
+            (
+                "a_parked_run_runs_no_finally_node_and_its_resume_runs_each_once",
+                Status::Live,
+            ),
+            // …and a replay that reaches another end than its boundary records —
+            // a deadline that ended the body in one generation and not the next
+            // — runs the finally node alone, once, and ends on the recorded end.
+            (
+                "a_resumed_run_whose_replay_completes_settles_on_the_end_its_boundary_records",
                 Status::Live,
             ),
         ],

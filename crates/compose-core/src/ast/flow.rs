@@ -26,6 +26,11 @@ pub struct FlowDef {
     /// `edges:` — at least one, in declaration order (which is semantic:
     /// grammar 7.3 evaluates them in it).
     pub edges: Vec<Edge>,
+    /// `finally:` — the node of this flow that runs once when an instance of
+    /// it ends, whatever the outcome (grammar 7.9, Decision D159, PRD resolved
+    /// q76). A node id rather than an address: it names a node of the same
+    /// flow, which the resolver checks exactly as it checks an edge's ends.
+    pub finally: Option<Spanned<Ident>>,
 }
 
 /// One node of a flow (grammar 7.1).

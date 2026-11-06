@@ -105,6 +105,8 @@ export interface SettledTrace {
   readonly flow: string;
   readonly status: "completed" | "failed" | "interrupted";
   readonly error?: string;
+  /** The envelope's `finally_error` (grammar 7.9, `docs/trace.md` §2). */
+  readonly finallyError?: string;
   readonly entries: readonly runtime.TraceEntry[];
 }
 

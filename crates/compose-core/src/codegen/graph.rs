@@ -1543,7 +1543,15 @@ fn flow(
 
     for node in &flow.nodes {
         let id = node.id.value.as_str();
-        let resolved = policy::resolve(ir, node);
+        // A `finally:` node is a descriptor like any other — its input, its
+        // activity, its writes — and is *not* a node of the compiled graph: it
+        // has no edges, so it is handed to the runtime beside the graph and run
+        // once when an instance ends (grammar 7.9, `runtime.endInstance`).
+        let resolved = if flow.is_finally(node) {
+            policy::resolve_finally(ir, node)
+        } else {
+            policy::resolve(ir, node)
+        };
         let output = output_path(ir, address, node);
         let output_shape = output
             .as_ref()
@@ -1619,7 +1627,7 @@ fn flow(
         "function {}() {{\n  return new StateGraph(State)\n",
         names.value(address)
     ));
-    for node in &flow.nodes {
+    for node in flow.nodes.iter().filter(|node| !flow.is_finally(node)) {
         let id = node.id.value.as_str();
         let descriptor = names.value(&format!("{address}.node.{id}"));
         let mut ends: Vec<String> = Vec::new();
@@ -1709,6 +1717,9 @@ fn flow(
             .join(", ")
     ));
     text.push_str(&format!("  recursionLimit: {},\n", recursion_limit(flow)));
+    if let Some(finally) = finally_descriptor(names, address, flow) {
+        text.push_str(&format!("  finally: {finally},\n"));
+    }
     text.push_str(&format!(
         "  stream: (initial, options) =>\n    \
          {compiled}.stream(initial, {{\n      \
@@ -1719,6 +1730,14 @@ fn flow(
     ));
     text.push_str("};\n");
     text
+}
+
+/// The emitted name of a flow's `finally:` node's descriptor, where it declares
+/// one (grammar 7.9) — what both the flow's module binding and its registry
+/// entry hand the runtime, so an instance ends the same way whichever started it.
+fn finally_descriptor<'n>(names: &'n Names, address: &str, flow: &Flow) -> Option<&'n str> {
+    let node = flow.finally_node()?;
+    Some(names.value(&format!("{address}.node.{}", node.id.value)))
 }
 
 /// The nodes of this flow whose result a `map.over` reads (grammar 8.6 rule 11).
@@ -2542,6 +2561,11 @@ fn activity(
             // aborted runs to quiescence after the node has already failed
             // (grammar 9.2, and see `runtime.runSubflow`).
             text.push_str("      signal: context.signal,\n");
+            // And the end of the body this node is a task of: a `retry:`
+            // attempt LangGraph's let-go task would make after that body has
+            // ended begins no instance (grammar 7.9, and see
+            // `runtime.RunChannel.bodyEnded`).
+            text.push_str("      bodyEnded: context.bodyEnded,\n");
             // Grammar 9.3 level 1, with D79's outermost-wins: what already
             // reached this instance beats what this site declares, per field.
             text.push_str(&format!(
@@ -3470,15 +3494,18 @@ fn dispatch_run(
             //
             // The dispatch's clock does cross: `context.signal` is the map
             // node's, so its `timeout:` ends the instance rather than only the
-            // wait for it (`runtime.runSubflow`). A detached dispatch never
-            // reaches here — see the arm above.
+            // wait for it (`runtime.runSubflow`). So does the end of the body
+            // the map node belongs to, so an item begun after that body has
+            // ended is refused (grammar 7.9). A detached dispatch never reaches
+            // here — see the arm above.
             format!(
                 "{indent}run: async (input, context, site) =>\n{indent}  \
                  runtime.runSubflow({binding}, {{\n{indent}    \
                  inputs: input as Record<string, unknown>,\n{indent}    \
                  execution: site.execution,\n{indent}    \
                  path: site.path,\n{indent}    \
-                 signal: context.signal,\n{indent}  \
+                 signal: context.signal,\n{indent}    \
+                 bodyEnded: context.bodyEnded,\n{indent}  \
                  }}),\n"
             )
         }
@@ -4114,6 +4141,9 @@ fn registry_source(
                 .join(", ")
         ));
         text.push_str(&format!("    recursionLimit: {},\n", recursion_limit(flow)));
+        if let Some(finally) = finally_descriptor(names, address, flow) {
+            text.push_str(&format!("    finally: {finally},\n"));
+        }
         text.push_str(&match &flow.inputs {
             Some(_) => {
                 let schema = names.value(&format!("{address}.inputs")).to_string();
@@ -4275,6 +4305,12 @@ export interface CompiledFlow {
   readonly sessionStores: readonly string[];
   /** The superstep ceiling a run of it takes by default. */
   readonly recursionLimit: number;
+  /**
+   * The node its `finally:` names, where it declares one: run once when a run
+   * of it ends — completed, failed, or cancelled — beside the graph rather than
+   * in it, since no edge reaches it (grammar 7.9, `runtime.endInstance`).
+   */
+  readonly finally?: runtime.NodeDescriptor;
   /** Parse an invocation's inputs against the flow's own schema (grammar 13.2). */
   parse(inputs: unknown): Record<string, unknown>;
   /**
@@ -4307,10 +4343,23 @@ const RUN_FLOW: &str = r#"
 export interface FlowRun {
   /** The flow's `outputs:`, materialized from state at quiescence (grammar 7.6.3). */
   readonly outputs: Record<string, unknown>;
-  /** Every routing decision the run made, in step order (PRD 5.3). */
+  /**
+   * Every routing decision the run made, in step order (PRD 5.3) — and last, the
+   * entry of the flow's `finally:` node where it declares one (grammar 7.9).
+   */
   readonly trace: readonly runtime.TraceEntry[];
-  /** The whole state at quiescence. */
+  /**
+   * The whole state at quiescence, with the `finally:` node's writes applied
+   * after the outputs above were read from it.
+   */
   readonly state: GraphState;
+  /**
+   * What a `finally:` node of this execution raised after its own retries,
+   * where one did (grammar 7.9, PRD resolved q76): `finally_error` on the
+   * execution's record. A run that carries one still completed — its outputs
+   * are what its body produced.
+   */
+  readonly finallyError?: string;
 }
 
 /**
@@ -4741,66 +4790,117 @@ async function quiesceFlow(
   // run's own failure rather than throwing it, so the release reads that error
   // on the settled path and the thrown one on the other — the same outcome
   // either way, which is what a `finally` could not have been told.
-  const { state, error } = await runtime
-    .quiesce(
-      flow,
-      {
-        $run: {
-          ...runtime.emptyRun(),
-          input: parsed,
-          execution: identity,
-        },
-      },
-      ceiling,
-    )
-    .then(
-      async (reached) => {
-        await release(reached.error);
-        return reached;
-      },
-      async (thrown: unknown) => {
-        await release(thrown);
-        throw thrown;
-      },
-    );
-  if (error !== undefined) {
-    throw new runtime.FlowFailure(
-      address,
-      "did not run to quiescence",
-      runtime.failedTrace(state, error),
-      error,
-    );
+  const initial = {
+    $run: {
+      ...runtime.emptyRun(),
+      input: parsed,
+      execution: identity,
+    },
+  };
+  let reached: { state?: GraphState; error?: unknown };
+  try {
+    reached = await runtime.quiesce(flow, initial, ceiling);
+  } catch (thrown) {
+    await release(thrown);
+    throw thrown;
   }
-  if (state === undefined) {
+  const { state, error } = reached;
+  if (error === undefined && state === undefined) {
     // Unreachable: `streamMode: "values"` emits the state the run started from
     // before any node has run. A run with no state at all is still not one this
     // function can answer for, and saying so beats reading `undefined` as empty.
+    await release(undefined);
     throw new Error(`\`${address}\` produced no state`);
   }
-  const quiesced = state;
 
+  // What the body answered, decided **before** the flow's `finally:` node runs:
+  // a run's outputs are what its body produced, whatever its finally node then
+  // does (grammar 7.9). A run that failed carries every entry that landed and
+  // the aborting node's own; a run that reached quiescence and could not
+  // materialize an output carries every step it took, which is the routing
+  // record a reader wants most when the flow cannot say what it produced
+  // (PRD 5.3).
+  let trace: readonly runtime.TraceEntry[] =
+    error === undefined ? (state?.$run.trace ?? []) : runtime.failedTrace(state, error);
+  let ended: unknown = error;
+  let what = "did not run to quiescence";
   const outputs: Record<string, unknown> = {};
-  try {
-    for (const field of flow.outputs) {
-      outputs[field] = runtime.channelValue(
-        quiesced as unknown as Record<string, unknown>,
-        field,
-        `\`${address}\`'s output field \`${field}\``,
-      );
+  if (ended === undefined) {
+    try {
+      for (const field of flow.outputs) {
+        outputs[field] = runtime.channelValue(
+          state as unknown as Record<string, unknown>,
+          field,
+          `\`${address}\`'s output field \`${field}\``,
+        );
+      }
+    } catch (cause) {
+      ended = cause;
+      what = "reached quiescence without an output";
     }
-  } catch (error) {
-    // Inside the same record as every other way a run fails to answer: the run
-    // got all the way here, so `$run.trace` holds every step it took, and that
-    // is the routing record a reader wants most when the flow cannot say what it
-    // produced (PRD 5.3).
-    throw new runtime.FlowFailure(
-      address,
-      "reached quiescence without an output",
-      quiesced.$run.trace,
-      error,
-    );
   }
-  return { outputs, trace: quiesced.$run.trace, state: quiesced };
+
+  // The end of the run's root instance, and its `finally:` node, once: before
+  // the release, because what the node works with — this run's `scope:
+  // execution` stores, its workspace — is what the release lets go of (grammar
+  // 7.9, PRD resolved q76). A pause the run parks at is not an end, and neither
+  // is a divergence: the row stays open, and the generation that resumes it
+  // runs the body on (`runtime.instanceEnding`).
+  //
+  // A resumed generation waits for its detached deliveries first, for the
+  // release's own reason: a divergence one of them latches is what keeps the
+  // row open, and it has to be read before the end is — a finally node run
+  // past a record that stopped describing this run is effects the record does
+  // not hold (PRD resolved q29).
+  //
+  // And every instance still running inside the root ends before the root's
+  // own finally node runs — innermost first: a body node's failure leaves a
+  // sibling branch's subflow instance where it stood, and that one is stopped
+  // and its own finally node run (`runtime.endInstancesInside`).
+  if (options.resume === true) await runtime.settleDetached(executionId);
+  const ending = runtime.instanceEnding(executionId, ended);
+  let closing: runtime.FinallyRun | undefined;
+  try {
+    const inside = await runtime.endInstancesInside(
+      executionId,
+      "",
+      address,
+      ending,
+      ended,
+      flow.finally,
+    );
+    try {
+      closing = await runtime.endInstance(
+        flow.finally,
+        (state ?? initial) as runtime.GraphStateLike,
+        ending,
+        trace,
+      );
+    } finally {
+      inside();
+    }
+  } catch (thrown) {
+    await release(thrown);
+    throw thrown;
+  }
+  if (closing !== undefined) trace = [...trace, closing.entry];
+  // A resumed run settles on the end its boundary records where its body,
+  // replayed, reached another (grammar 7.9, `docs/durability.md` §3.10).
+  if (ended === undefined && closing !== undefined && closing.ending.outcome !== "completed") {
+    ended = new runtime.RecordedEnding(closing.ending);
+    what = "ended as its journal records";
+  }
+  await release(ended);
+  const finallyError = runtime.finallyErrorOf(executionId);
+  if (ended !== undefined) {
+    throw new runtime.FlowFailure(address, what, trace, ended, finallyError);
+  }
+  return {
+    outputs,
+    trace,
+    state: (closing?.state ?? state) as GraphState,
+    ...(finallyError === undefined ? {} : { finallyError }),
+  };
 }
 
 /**

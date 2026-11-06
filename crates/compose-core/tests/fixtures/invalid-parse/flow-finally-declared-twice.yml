@@ -1,0 +1,16 @@
+# rule: a flow names at most one `finally:` node, and a second key never wins (grammar 1.1, 7.9, Decision D159)
+# code: duplicate-key
+# message: duplicate key `finally`
+# at: 16:3
+# help: keys are declared once; the second declaration never wins
+flow.demo:
+  outputs: {}
+  nodes:
+    work: { exec: { command: "true" } }
+    first: { exec: { command: "true" } }
+    second: { exec: { command: "true" } }
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: first
+  finally: second

@@ -40,6 +40,31 @@ pub struct Flow {
     /// `edges:` — in declaration order, **which is semantic**: grammar 7.3
     /// evaluates a node's outgoing edges in it.
     pub edges: Vec<Edge>,
+    /// `finally:` — the node an instance of this flow runs once when it ends,
+    /// whatever its outcome (grammar 7.9, Decision D159, PRD resolved q76).
+    ///
+    /// Resolved against `nodes` like an edge's ends, and **excluded from
+    /// routing**: nothing transfers control to it and it transfers control to
+    /// nothing, so it is a node of the flow that no edge names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finally: Option<Spanned<Ident>>,
+}
+
+impl Flow {
+    /// The node `finally:` names, where the flow declares one.
+    #[must_use]
+    pub fn finally_node(&self) -> Option<&Node> {
+        let named = self.finally.as_ref()?;
+        self.nodes.iter().find(|node| node.id.value == named.value)
+    }
+
+    /// Whether this node is the flow's `finally:` node.
+    #[must_use]
+    pub fn is_finally(&self, node: &Node) -> bool {
+        self.finally
+            .as_ref()
+            .is_some_and(|named| named.value == node.id.value)
+    }
 }
 
 /// One node of a flow (grammar 7.1).

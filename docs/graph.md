@@ -213,6 +213,7 @@ Four small records the rest of the document is built from.
 | `human` | [human](#57-a-wait) | `human` nodes | The wait (grammar §8.7). |
 | `map` | [map](#7-fan-out) | `map` nodes | The fan-out (grammar §8.6). |
 | `dispatch` | [dispatch](#71-a-satellite) | satellites | Which map dispatched this node, and on what. |
+| `finally` | `true` | on the node its flow's `finally:` names (grammar §7.9, PRD resolved q76); absent on every other node | The node an instance runs once when it ends — completed, failed or cancelled. No edge reaches it and none leaves it (§6), so a renderer draws it apart and labels it, rather than leaving it to read as a node the validator should have refused for being unreachable. Its `policy` is the chain codegen resolves for it: `retry` and `timeout` through all four levels, and `on_error` as `fail` at `built_in` whatever `defaults:` or an instantiating `policy:` says, because no level applies a strategy to the node — the `fail` it shows ends the node and not the instance, and the failure is `finally_error` (grammar §7.9, §9.3). |
 
 `kind` is one of `"start"`, `"end"`, `"agent"`, `"coder"`, `"function"`,
 `"exec"`, `"http"`, `"human"`, `"store"`, `"flow"`, `"map"` — grammar §7.1's
@@ -559,7 +560,10 @@ Compatible, and made **without** a version bump:
   is worth naming because it looks like the one case §9.3 does cover: it carries
   a **new** closed vocabulary rather than a member added to one §9.1 already
   names, and a reader written against the previous version ignores a key it does
-  not recognize;
+  not recognize. [`GraphNode.finally`](#5-nodes) arrived the same way for PRD
+  resolved q76, and nothing that used to be drawn is drawn differently: no
+  composition written before a flow could name a `finally:` node has one, so the
+  key is absent from every document such a composition produces;
 * adding a new record type reachable from an existing one —
   [`ConnectionView`](#581-a-connection-fact-that-crosses), which arrived with it;
 * carrying a field in a case this document's presence column **already** names

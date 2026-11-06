@@ -1,0 +1,282 @@
+{
+  "name": "finally-error-on-a-completed-run",
+  "about": "A run whose body completed and whose `finally:` node failed after its retries (grammar 7.9, PRD resolved q76). The root span stays OK — a finally node's failure changes no outcome — and carries the envelope's `finally_error` as `agentcompose.finally_error`; the finally node's own entry, the instance's last at traversal 0 with no routing, is the ERROR span with its own message.",
+  "context": {
+    "target": "production",
+    "artifact": "sha256:00000000000000000000000000000000000000000000000000000000000000f1",
+    "compiler": "0.0.0-dev",
+    "startedAt": "2026-11-02T09:00:00.000Z",
+    "endedAt": "2026-11-02T09:00:03.000Z"
+  },
+  "document": {
+    "trace_version": 6,
+    "flow": "flow.leased",
+    "execution_id": "exec_untidy",
+    "status": "completed",
+    "finally_error": "flow.leased node `release` failed: NodeFailure: `release` exited 1",
+    "entries": [
+      {
+        "step": 1,
+        "flow": "flow.leased",
+        "node": "work",
+        "traversal": 0,
+        "outcome": "completed",
+        "attempts": 1,
+        "writes": [
+          "worked"
+        ]
+      },
+      {
+        "step": 2,
+        "flow": "flow.leased",
+        "node": "release",
+        "traversal": 0,
+        "outcome": "failed",
+        "attempts": 3,
+        "error": "NodeFailure: `release` exited 1"
+      }
+    ]
+  },
+  "expected": {
+    "resourceSpans": [
+      {
+        "resource": {
+          "attributes": [
+            {
+              "key": "service.name",
+              "value": {
+                "stringValue": "flow.leased"
+              }
+            },
+            {
+              "key": "service.namespace",
+              "value": {
+                "stringValue": "production"
+              }
+            },
+            {
+              "key": "service.version",
+              "value": {
+                "stringValue": "sha256:00000000000000000000000000000000000000000000000000000000000000f1"
+              }
+            },
+            {
+              "key": "deployment.environment.name",
+              "value": {
+                "stringValue": "production"
+              }
+            },
+            {
+              "key": "telemetry.sdk.name",
+              "value": {
+                "stringValue": "agent-compose"
+              }
+            },
+            {
+              "key": "telemetry.sdk.language",
+              "value": {
+                "stringValue": "nodejs"
+              }
+            },
+            {
+              "key": "telemetry.sdk.version",
+              "value": {
+                "stringValue": "0.0.0-dev"
+              }
+            }
+          ]
+        },
+        "scopeSpans": [
+          {
+            "scope": {
+              "name": "agent-compose",
+              "version": "0.0.0-dev"
+            },
+            "spans": [
+              {
+                "traceId": "a627627e58f7714fa3a49b97043b951f",
+                "spanId": "a613b0889bdb8fa4",
+                "name": "flow.leased",
+                "kind": 1,
+                "startTimeUnixNano": "1793610000000000000",
+                "endTimeUnixNano": "1793610003000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.execution.id",
+                    "value": {
+                      "stringValue": "exec_untidy"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.leased"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.status",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.trace_version",
+                    "value": {
+                      "intValue": "6"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.finally_error",
+                    "value": {
+                      "stringValue": "flow.leased node `release` failed: NodeFailure: `release` exited 1"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "a627627e58f7714fa3a49b97043b951f",
+                "spanId": "8d2fb103bf81f07c",
+                "parentSpanId": "a613b0889bdb8fa4",
+                "name": "work",
+                "kind": 1,
+                "startTimeUnixNano": "1793610000000000000",
+                "endTimeUnixNano": "1793610003000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_untidy/work/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.leased"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "work"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "worked"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "a627627e58f7714fa3a49b97043b951f",
+                "spanId": "675d0067bac74388",
+                "parentSpanId": "a613b0889bdb8fa4",
+                "name": "release",
+                "kind": 1,
+                "startTimeUnixNano": "1793610000000000000",
+                "endTimeUnixNano": "1793610003000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_untidy/release/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.leased"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "release"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "2"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "failed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "3"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.error",
+                    "value": {
+                      "stringValue": "NodeFailure: `release` exited 1"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 2,
+                  "message": "NodeFailure: `release` exited 1"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

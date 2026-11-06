@@ -270,6 +270,99 @@ fn every_root_status_arm_has_a_fixture() {
     );
 }
 
+/// **A `finally:` node's failure is a root attribute, never the root's status**
+/// (`docs/trace.md` §12.4, §12.5, grammar §7.9, PRD resolved q76).
+///
+/// `agentcompose.finally_error` is the one root attribute that sits beside a
+/// status it does not describe: a run whose body completed and whose cleanup
+/// failed afterwards is a completed run, so its root is OK and the failure is
+/// said in the attribute — the reading a collector needs to see a cleanup that
+/// did not happen on a run that otherwise looks fine. The runner above pins the
+/// bytes of the one fixture that carries the field; this holds the rule over
+/// every fixture, so an expectation regenerated against an exporter that dropped
+/// the attribute, renamed it, or turned the root ERROR fails here whatever the
+/// runner said:
+///
+///  * an envelope carrying `finally_error` puts exactly that text on its root as
+///    `agentcompose.finally_error`, once;
+///  * its root's status is the one `status` alone decides — OK for `completed`;
+///  * an envelope without the field puts no such attribute anywhere;
+///  * and the corpus holds one on a **completed** envelope, the case the
+///    attribute exists for.
+///
+/// The root is found by what makes it the root — the one span naming no parent
+/// in the export — rather than by position, for the reason
+/// `trace_sink_acceptance.rs`'s `root_span` gives.
+#[test]
+fn a_finally_error_is_a_root_attribute_beside_the_status_it_did_not_change() {
+    let mut on_a_completed_run: Vec<String> = Vec::new();
+    for (file, fixture) in fixtures() {
+        let spans = fixture["expected"]["resourceSpans"][0]["scopeSpans"][0]["spans"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let emitted: BTreeSet<&str> = spans
+            .iter()
+            .filter_map(|span| span["spanId"].as_str())
+            .collect();
+        let root = spans
+            .iter()
+            .find(|span| {
+                span["parentSpanId"]
+                    .as_str()
+                    .is_none_or(|parent| !emitted.contains(parent))
+            })
+            .unwrap_or_else(|| panic!("{file}: an export has a root span"));
+        let carried = |span: &Value| -> Vec<Value> {
+            span["attributes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|attribute| attribute["key"] == "agentcompose.finally_error")
+                .map(|attribute| attribute["value"].clone())
+                .collect()
+        };
+        let document = &fixture["document"];
+        match document.get("finally_error") {
+            Some(finally_error) => {
+                let text = finally_error
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{file}: `finally_error` is a string"));
+                assert_eq!(
+                    carried(root),
+                    [serde_json::json!({ "stringValue": text })],
+                    "{file}: the envelope's `finally_error` is not its root's \
+                     `agentcompose.finally_error` (`docs/trace.md` §12.5)"
+                );
+                if document["status"] == "completed" {
+                    assert_eq!(
+                        root["status"],
+                        serde_json::json!({ "code": 1 }),
+                        "{file}: a completed run whose finally node failed is still OK at the \
+                         root — the failure changes no outcome (grammar §7.9, \
+                         `docs/trace.md` §12.4)"
+                    );
+                    on_a_completed_run.push(file.clone());
+                }
+            }
+            None => {
+                for span in &spans {
+                    assert!(
+                        carried(span).is_empty(),
+                        "{file}: `agentcompose.finally_error` on an export whose envelope \
+                         carries no `finally_error`: {span:#}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        !on_a_completed_run.is_empty(),
+        "no fixture carries a `finally_error` on a completed envelope, so nothing holds \
+         `agentcompose.finally_error` (`docs/trace.md` §12.5) or the OK root beside it"
+    );
+}
+
 /// Every fixture carries an input **and** the bytes it expects.
 ///
 /// A fixture with no expectation is one the runner would answer with a

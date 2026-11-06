@@ -147,32 +147,61 @@ fn flow_input(flow: &Flow, address: &str) -> Type {
 /// dispatch target at one instantiation and a root instance at another — so
 /// grammar 4.1 and Decision D115 make an absent index a runtime failure, not a
 /// static one.
-fn execution() -> Type {
-    let member = |name: &str, ty: Type| Property {
+///
+/// `outcome` and `error` are the other way round, and that is why they are a
+/// *scope* rather than a presence question: they describe how an instance
+/// ended, so they exist exactly inside the one node that runs after it has —
+/// the flow's `finally:` node — and are members of this root there and nowhere
+/// else (grammar 4.1, 7.9, Decision D159). Read anywhere else, the CEL
+/// front-end refuses them by name ([`crate::cel`]). `outcome` is a closed enum,
+/// so a comparison against a value it can never hold is a compile error rather
+/// than a silent false; `error` is optional, absent on an instance that
+/// completed, and `has(execution.error)` is how a finally node asks. A read
+/// that does not ask is the one absent read that does not fail the execution
+/// (Decision D110): the finally node's input is built after its instance has
+/// ended, so what it cannot evaluate is that node's own failure — the
+/// execution's `finally_error`, its outcome unchanged (grammar 4.1, 7.9).
+fn execution(finally: bool) -> Type {
+    let member = |name: &str, ty: Type, optional: bool| Property {
         name: name.to_string(),
         ty,
-        optional: false,
+        optional,
         defaulted: false,
     };
-    Type::object(
-        Origin::Execution,
-        vec![
-            member("id", Type::String),
-            member("session_key", Type::String),
-            member("item_index", Type::Int),
-        ],
-    )
+    let mut members = vec![
+        member("id", Type::String, false),
+        member("session_key", Type::String, false),
+        member("item_index", Type::Int, false),
+    ];
+    if finally {
+        members.push(member(
+            "outcome",
+            Type::Enum(std::sync::Arc::new(
+                FINALLY_OUTCOMES.iter().map(ToString::to_string).collect(),
+            )),
+            false,
+        ));
+        members.push(member("error", Type::String, true));
+    }
+    Type::object(Origin::Execution, members)
 }
 
+/// The values `execution.outcome` holds inside a `finally:` node: how the
+/// instance that declared it ended (grammar 4.1, 7.9, Decision D159). `cancelled`
+/// is one of them before anything produces it — PRD resolved q75's cancel is
+/// what will — so a finally node written against it is checked today.
+pub(crate) const FINALLY_OUTCOMES: &[&str] = &["completed", "failed", "cancelled"];
+
 /// `input`, `state`, `execution` — the roots every flow-scoped surface but
-/// `map.over` exposes.
+/// `map.over` exposes. Inside the flow's `finally:` node, `execution` carries
+/// the instance's `outcome` and `error` as well ([`FlowCx::finally`]).
 pub(crate) fn flow_scope(ctx: &Ctx, cx: &FlowCx, surface: impl Into<String>) -> Scope {
     Scope::new(
         surface,
         vec![
             ("input".to_string(), flow_input(cx.flow, cx.address)),
             ("state".to_string(), ctx.state_type()),
-            ("execution".to_string(), execution()),
+            ("execution".to_string(), execution(cx.finally)),
         ],
     )
 }

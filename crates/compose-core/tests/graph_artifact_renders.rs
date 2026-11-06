@@ -635,6 +635,15 @@ fn panes(project: &str) -> &'static [Pane] {
                     "attached by the `tools:` shorthand, under its default bounds",
                 ],
             },
+            // A flow's `finally:` node (grammar 7.9, PRD resolved q76), which no
+            // edge reaches and none leaves: labelled, so a node drawn apart
+            // reads as the one an instance runs when it ends rather than as one
+            // the validator should have refused for being unreachable.
+            Pane {
+                flow: "flow.condense",
+                node: "note",
+                facts: &["EXEC · finally", "run once when an instance ends"],
+            },
         ],
         "examples/patch-pipeline" => &[
             // The coder node's own pane: the harness named, the containment

@@ -285,6 +285,42 @@ its schema creation is not idempotent: ${error instanceof Error ? error.message 
   const ended = await handle.execution(execution);
   results.a_large_error_round_trips = ended?.error === LARGE && ended?.status === "failed";
 
+  // …and the **end of an instance** (§3.5, grammar §7.9, PRD resolved q76). The
+  //  boundary a `finally:` node's start leaves is an ordinary record of its own
+  //  kind, claimed under the node and read back with the end it holds; and `finally_error`
+  //  is a column of the lifecycle row beside an outcome it does not change —
+  //  `LONGTEXT` on MySQL for `error`'s reason, since what a finally node raised
+  //  is as long as what any node raises — and absent on a row that has none,
+  //  whichever way that row ended.
+  const ending = `${execution}-ending`;
+  await handle.begin({
+    id: ending,
+    flow: "flow.review",
+    trigger: "manual",
+    inputs: {},
+    sessionKey: "",
+    status: "open",
+    journalVersion: journal.JOURNAL_VERSION,
+    startedAt: new Date().toISOString(),
+  });
+  await handle.append({
+    ...record(ending, "close/0#finally/0", "close/0", { outcome: "failed", error: UNICODE }),
+    kind: "finally",
+    request: journal.canonical({ node: "close" }),
+  });
+  const boundary = await handle.lookup(ending, "close/0#finally/0");
+  results.a_finally_boundary_round_trips =
+    boundary?.kind === "finally" &&
+    boundary?.request === journal.canonical({ node: "close" }) &&
+    boundary?.outcome?.value?.outcome === "failed" &&
+    boundary?.outcome?.value?.error === UNICODE;
+  await handle.end(ending, "completed", undefined, LARGE);
+  const tidied = await handle.execution(ending);
+  results.a_finally_error_round_trips_beside_its_outcome =
+    tidied?.status === "completed" && tidied?.error === undefined && tidied?.finallyError === LARGE;
+  results.a_row_with_no_finally_error_reads_none =
+    ended?.finallyError === undefined && (await handle.execution(child))?.finallyError === undefined;
+
   // 6. **A refusal is marked on the record**, which is resolved q29's second
   //    divergence told apart from an ordinary mismatch (§7).
   await handle.refuse(execution, "review/0#model/0");
@@ -492,6 +528,25 @@ its schema creation is not idempotent: ${error instanceof Error ? error.message 
     (await handle.settleDispatch(dispatch(1), { kind: "value", value: { ok: "again" } })) === false;
   results.a_settled_dispatch_keeps_its_outcome =
     (await handle.dispatchOf(dispatch(1)))?.outcome?.value?.ok === UNICODE;
+  // …and a settled **failure** keeps what a `finally:` node raised beside it on
+  // the worker (`docs/distributed.md` §3.4, `docs/durability.md` §3.8): the one
+  // field a failure carries beyond its name and message, kept on the row so a
+  // hub restarted before the execution settles reads it back. The value is the
+  // long one, for `error`'s reason: a finally node's failure is as long as its
+  // subprocess made it.
+  await handle.claimDispatch(dispatch(11), "session-d");
+  await handle.settleDispatch(dispatch(11), {
+    kind: "error",
+    name: "NodeFailure",
+    message: UNICODE,
+    finallyError: LARGE,
+  });
+  const failedHere = (await handle.dispatchOf(dispatch(11)))?.outcome;
+  results.a_settled_failure_keeps_its_finally_error =
+    failedHere?.kind === "error" &&
+    failedHere.name === "NodeFailure" &&
+    failedHere.message === UNICODE &&
+    failedHere.finallyError === LARGE;
   // …and the *other* ending, which is the hub's rather than a result's: a
   // session that fell outside the liveness window, or a dispatch issued under an
   // artifact that has been replaced (§3.8, `docs/distributed.md` §5, §6.3). The
@@ -623,6 +678,86 @@ function secondOpener() {
     return JSON.parse(ran.stdout);
   } finally {
     rmSync(script, { force: true });
+  }
+}
+
+/**
+ * Take the lifecycle row's `finally_error` column away, from outside the
+ * journal, so the file or database is the shape a build before PRD resolved q76
+ * wrote (`docs/durability.md` §11.2).
+ *
+ * The one column a release after the schema's creation added to all three
+ * backends, so the one whose probe is driven on each: SQLite's `PRAGMA
+ * table_info`, Postgres' `pg_attribute` and MySQL's `information_schema` each
+ * have to find it gone and put it back. Answers `true` once it is dropped.
+ */
+async function dropTheFinallyErrorColumn(provider, url) {
+  const statement = "ALTER TABLE executions DROP COLUMN finally_error";
+  if (provider === "sqlite") {
+    const { Database } = await import("node-sqlite3-wasm");
+    const database = new Database(journal.journalPath());
+    try {
+      database.exec(`${statement};`);
+      return !database
+        .all("PRAGMA table_info(executions)")
+        .some((column) => column.name === "finally_error");
+    } finally {
+      database.close();
+    }
+  }
+  if (provider === "postgres") {
+    const { Client } = await import("pg");
+    const client = new Client({ connectionString: url });
+    await client.connect();
+    try {
+      await client.query(statement);
+      return true;
+    } finally {
+      await client.end().catch(() => undefined);
+    }
+  }
+  const { createConnection } = await import("mysql2/promise");
+  const connection = await createConnection({ uri: url });
+  try {
+    await connection.query(statement);
+    return true;
+  } finally {
+    await connection.end().catch(() => undefined);
+  }
+}
+
+// 8. **A journal written before the end of an instance was recorded opens, and
+//    takes one** (§3.5, §11.2, PRD resolved q76). `CREATE TABLE IF NOT EXISTS`
+//    leaves an older table exactly as it is, so a column the lifecycle row grew
+//    later exists only where a probe on open adds it — and an `UPDATE` naming a
+//    column the table lacks would fail every row's close in that journal.
+{
+  const url = process.env[journal.journalBinding.urlEnv ?? ""] ?? "";
+  const dropped = await dropTheFinallyErrorColumn(journal.journalBinding.provider, url).catch(
+    (error) => (error instanceof Error ? error.message : String(error)),
+  );
+  try {
+    handle = await opened(journal);
+    const later = `exec_${Math.random().toString(16).slice(2)}${Date.now().toString(16)}-later`;
+    await handle.begin({
+      id: later,
+      flow: "flow.review",
+      trigger: "manual",
+      inputs: {},
+      sessionKey: "",
+      status: "open",
+      journalVersion: journal.JOURNAL_VERSION,
+      startedAt: new Date().toISOString(),
+    });
+    await handle.end(later, "failed", "the body failed", UNSERIALIZED);
+    const row = await handle.execution(later);
+    results.a_journal_without_the_finally_error_column_gains_it_on_open =
+      dropped === true &&
+      row?.status === "failed" &&
+      row?.error === "the body failed" &&
+      row?.finallyError === UNSERIALIZED;
+  } finally {
+    await journal.releaseJournal().catch(() => undefined);
   }
 }
 

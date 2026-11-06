@@ -1128,6 +1128,10 @@
             "properties": { "from": { "const": "start" } },
             "not": { "required": ["when"] }
           }
+        },
+        "finally": {
+          "description": "The id of one node of this flow that runs once when an instance of the flow ends - completed, failed or cancelled - with `execution.outcome` and `execution.error` readable inside it and nowhere else. The node is any kind but `human`, reaches no `human` node, and has no edges in or out: nothing routes to it, and it is reachable because it is `finally:`. Its own `retry:` and `timeout:` apply; `on_error:` does not, because its failure has one meaning - `finally_error` on the execution's record, with the outcome unchanged. That the id names a node of this flow, and every rule about that node, needs the whole flow and so is the validator's (grammar 7.9 / Decision D159).",
+          "$ref": "#/$defs/nodeId"
         }
       },
       "additionalProperties": false

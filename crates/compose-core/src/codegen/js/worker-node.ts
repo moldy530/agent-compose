@@ -133,6 +133,7 @@ import { type PlacedAnswer, executeLocally } from "./mesh.ts";
 import type * as runtime from "./runtime.ts";
 import {
   dispatchPausesHome,
+  finallyErrorOf,
   refuseChildExecutions,
   releaseWorkspaces,
   remotePauseOf,
@@ -234,6 +235,7 @@ class DispatchJournal implements Journal {
     _id: string,
     _status: Exclude<ExecutionStatus, "open">,
     _error?: string,
+    _finallyError?: string,
   ): Promise<void> {
     throw new WorkerJournalReach("close an execution");
   }
@@ -671,6 +673,13 @@ async function main(): Promise<void> {
         ? { type: "result", error: named(error) }
         : { type: "result", paused };
   }
+  // A `finally:` node that ran here and failed after its retries — a flow-as-tool
+  // instance's, which grammar 14.1 rule 4 runs in this placed agent's process —
+  // goes home beside whichever ending the node had (§3.4's `finally_error`). The
+  // execution's record is the hub's to write, and this process is the only one
+  // that saw it.
+  const finallyError = finallyErrorOf(dispatch.execution_id);
+  if (finallyError !== undefined) line["finally_error"] = finallyError;
   closeSession(dispatch.execution_id);
   // The workspace a built-in tool of this dispatch was given, where it took the
   // default (grammar 6.1, PRD resolved q54). This process runs one node and

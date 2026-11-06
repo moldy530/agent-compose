@@ -235,6 +235,24 @@ const GRAMMAR: &[Check] = &[
         evidence: Evidence::Fixture,
     },
     Check {
+        rule: "a flow's `finally:` node is outside routing: no edge, fallback or `on_timeout:` names it, and it declares no `on_error:` (7.9, D159)",
+        pass: "check/finally.rs",
+        codes: &["routed-finally"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "a flow's `finally:` node is no `human` node and reaches none (7.9, 8.7, 7.7, D159)",
+        pass: "check/finally.rs, over check/reach.rs",
+        codes: &["finally-interrupt"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "`execution.outcome` and `execution.error` are read only inside the flow's `finally:` node (4.1, 7.9, D159)",
+        pass: "check/expr.rs, cel/mod.rs",
+        codes: &["outcome-outside-finally"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
         rule: "a detached dispatch's key is not part of its sink's declared input (9.4, D66)",
         pass: "check/maps.rs",
         codes: &["conflicting-keys"],

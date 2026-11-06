@@ -1,0 +1,37 @@
+# rule: a flow's `finally:` node reaches no `human` node through a `flow:` node it is (grammar 7.9, 7.7, 8.7, Decision D159)
+# code: finally-interrupt
+# message: `wrap_up`, the `finally:` node of `flow.f`, reaches the `human` node `sign` of `flow.sign_off`
+# at: main.yml:37:12
+# label: main.yml:16:5 the `human` node is declared here
+# help: a finally node runs once when its instance ends, and a step that must always finish cannot park on a question: it may be no `human` node and reach none — through a `flow:` node, a `map`'s dispatch targets, or the `flow.*` tools of an agent it calls. Take the pause out of what it runs (grammar 7.9, 8.7, 7.7, Decision D159)
+#
+# The pause is one flow away, which is grammar 7.7's relation: the finally node
+# instantiates a flow that holds it.
+version: "0.1"
+flow.sign_off:
+  inputs:
+    text: { type: string }
+  outputs: {}
+  nodes:
+    sign:
+      human:
+        input:
+          text: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input: { text: "input.text" }
+  edges:
+    - { from: start, to: sign }
+    - { from: sign, to: end }
+flow.f:
+  outputs: {}
+  nodes:
+    work:
+      exec: { command: "true" }
+    wrap_up:
+      flow: flow.sign_off
+      input: { text: "'the work is done'" }
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: wrap_up

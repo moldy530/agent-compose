@@ -97,6 +97,7 @@ import {
   effectKey,
   journalExists,
   journaled,
+  journaling,
   latchDivergence,
   latchedDivergence,
   openJournal,
@@ -888,6 +889,25 @@ export interface RunContext {
    * subtracts `Date.now()` in the same expression ([`requestBudget`]).
    */
   readonly deadline?: number;
+  /**
+   * The end of the body this node execution is a task of
+   * ([`RunChannel.bodyEnded`], grammar 7.9) — never aborted while that body is
+   * still running, because LangGraph has not let go of the task by then.
+   *
+   * [`signal`]'s other half, and deliberately not part of it: `signal` stops
+   * the work a node is doing, and a sibling's failure stops no activity that
+   * is already running (grammar 7.6.3). What this stops is what the node would
+   * **begin** next — another `retry:` attempt ([`runActivity`]), a `map` item
+   * still queued for a permit or due another `on_item_error` attempt
+   * ([`runMap`]), an agent's next tool call or model turn ([`callAgent`]), an
+   * instance of any flow ([`Instantiation.bodyEnded`]) — because the body that
+   * would have read the result is over.
+   *
+   * Absent on a detached `map` delivery's context, which is off the instance
+   * the way it is off [`signal`]'s clock (grammar 8.6 rule 7, D94), and on a
+   * placed node's worker, whose body is the hub's.
+   */
+  readonly bodyEnded?: AbortSignal;
   /** How this attempt is addressed, for a message. */
   readonly node: string;
   /**
@@ -1068,21 +1088,50 @@ function abortReason(signal: AbortSignal): Error {
   return signal.reason instanceof Error ? signal.reason : new Error("aborted");
 }
 
-const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
+/**
+ * Whether `signal` is there and has aborted.
+ *
+ * A call rather than an inline `signal?.aborted === true`, because the inline
+ * form is narrowed by the compiler: a ladder that checked it before an `await`
+ * would be told the same check after it can never be true, which is exactly
+ * when it can.
+ */
+function isAborted(signal: AbortSignal | undefined): boolean {
+  return signal?.aborted === true;
+}
+
+/**
+ * Wait `ms`, or reject with the reason of whichever of `signal` and `also`
+ * aborts first.
+ *
+ * `also` is a ladder's [`RunContext.bodyEnded`]: a backoff is the wait before
+ * an attempt **begins**, so the end of the body the node belongs to ends it as
+ * surely as the node's own deadline does.
+ */
+const sleep = (ms: number, signal: AbortSignal, also?: AbortSignal): Promise<void> =>
   new Promise((resolve, reject) => {
-    if (signal.aborted) {
-      reject(abortReason(signal));
+    const first = (): AbortSignal | undefined =>
+      signal.aborted ? signal : also?.aborted === true ? also : undefined;
+    const already = first();
+    if (already !== undefined) {
+      reject(abortReason(already));
       return;
     }
-    const timer = setTimeout(() => {
+    const detach = (): void => {
       signal.removeEventListener("abort", onAbort);
+      also?.removeEventListener("abort", onAbort);
+    };
+    const timer = setTimeout(() => {
+      detach();
       resolve();
     }, ms);
-    const onAbort = () => {
+    const onAbort = (): void => {
       clearTimeout(timer);
-      reject(abortReason(signal));
+      detach();
+      reject(abortReason(first() ?? signal));
     };
     signal.addEventListener("abort", onAbort, { once: true });
+    also?.addEventListener("abort", onAbort, { once: true });
   });
 
 /**
@@ -1147,6 +1196,38 @@ export function backoffFor(policy: RetryPolicy, attempt: number): number {
  * supersteps — leaving one abandoned activity inside it, exactly as above,
  * rather than every node the instance had left to run.
  *
+ * # An instance ends before its node does
+ *
+ * Stopping an instance is not the same as it having ended. Once LangGraph has
+ * stopped scheduling it, the instance still has its end to reach — its
+ * `finally:` node, which grammar 7.9 runs once on every outcome, a deadline's
+ * included — and "the node that instantiated it settles after it has" (PRD
+ * resolved q76) is a statement about **this** way out as much as any other. So
+ * when the deadline wins the race the node does not settle at once: it waits
+ * until every instance at or under its own site has ended ([`instancesEnded`]),
+ * and only then fails with the [`NodeTimeout`] — every instance save a
+ * detached delivery's, which the node resolved at dispatch and no deadline of
+ * its waits for (grammar 8.6 rule 7, [`offInstance`]). The wait is the instances'
+ * finally nodes and nothing else — the instance's own supersteps stop when the
+ * signal aborts, and an instance a node had not yet begun is never begun
+ * ([`runSubflow`]) — so it is bounded by those nodes' own grammar 9.3 budgets.
+ * The same wait runs between two attempts, so one attempt's finally node never
+ * runs beside the next attempt.
+ *
+ * # No attempt begins once the body has ended
+ *
+ * `bodyEnded` is the end of the body this node is a task of
+ * ([`RunChannel.bodyEnded`]), handed to the activity as
+ * [`RunContext.bodyEnded`]. It aborts while the node is still running only
+ * where LangGraph has let go of it — a sibling's failure ended its superstep,
+ * or its instance was stopped — and then nothing is left to read what the node
+ * answers. The attempt in flight runs on, as one a deadline abandoned does; but
+ * no further attempt begins, and a backoff it is sleeping out ends at once,
+ * because a second attempt would be new work inside an instance that has ended
+ * (grammar 7.9) — for a `flow:` node, a whole new instance of it. The node
+ * leaves on the end's own [`InstanceStopped`], which every ladder and policy
+ * above it lets through ([`stoppedOf`]).
+ *
  * # The budget does not run while a human is thinking
  *
  * Decision D102 withholds `timeout` from a `human` node at every level of
@@ -1189,6 +1270,7 @@ export async function runActivity<T>(
   innerTraces?: TraceEntry[],
   toolDispatches?: DispatchRecord[],
   harnessRuns?: HarnessRecord[],
+  bodyEnded?: AbortSignal,
 ): Promise<{ value: T; attempts: number }> {
   const attempts = 1 + (policy.retry?.max ?? 0);
   const controller = new AbortController();
@@ -1267,9 +1349,17 @@ export async function runActivity<T>(
     let last: unknown;
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       if (expired) break;
+      // See *No attempt begins once the body has ended*.
+      if (isAborted(bodyEnded)) throw abortReason(bodyEnded!);
       made = attempt;
+      // This attempt's activity, and what it went on to settle with after the
+      // deadline had answered for it — read once the instances under this site
+      // have ended, for the one error that must still travel
+      // (see *An instance ends before its node does*).
+      let running: Promise<T> | undefined;
+      const late: { settled: boolean; error?: unknown } = { settled: false };
       try {
-        const running = activity({
+        running = activity({
           execution,
           signal: controller.signal,
           // A getter rather than a field: the budget it reports is held still
@@ -1279,6 +1369,7 @@ export async function runActivity<T>(
             return deadline();
           },
           node,
+          ...(bodyEnded === undefined ? {} : { bodyEnded }),
           ...(storeRecords === undefined ? {} : { storeRecords }),
           ...(modelCalls === undefined ? {} : { modelCalls }),
           ...(harnessRuns === undefined ? {} : { harnessRuns }),
@@ -1290,7 +1381,12 @@ export async function runActivity<T>(
         // the node — and in Node an unhandled rejection ends the process. This
         // is the handler that keeps an abandoned activity from taking the run
         // down with it.
-        if (expiry !== undefined) running.catch(() => {});
+        if (expiry !== undefined) {
+          running.catch((error: unknown) => {
+            late.settled = true;
+            late.error = error;
+          });
+        }
         const value =
           expiry === undefined ? await running : await Promise.race([running, expiry]);
         return { value, attempts: attempt };
@@ -1329,8 +1425,10 @@ export async function runActivity<T>(
         // second attempt would re-open a pause under a node that has already
         // ended — parked for ever on a board no watcher is left to hold. Thrown
         // on bare rather than wrapped in a [`NodeFailure`]: by construction
-        // there is nothing to report it to, which is what the class means.
-        if (abandonedOf(error) !== undefined) throw error;
+        // there is nothing to report it to, which is what the class means. The
+        // same goes for an instance the end around it stopped, for the same
+        // reason (see [`stoppedOf`]).
+        if (abandonedOf(error) !== undefined || stoppedOf(error) !== undefined) throw error;
         // A journal that does not describe this run is not an activity outcome
         // either, and it is the one failure a `retry:` could make *worse*: every
         // attempt would consume the next ordinal at this site, so a ladder of
@@ -1344,7 +1442,47 @@ export async function runActivity<T>(
         // `ItemFailure`. A check on the class alone would let exactly those two
         // be retried.
         if (divergenceOf(error) !== undefined) throw error;
-        if (expired) break;
+        if (expired) {
+          // **The deadline answered; the instances it stopped have not ended
+          // yet.** Wait for them before this node settles — each one's
+          // `finally:` node runs now, inside this node execution, so the order
+          // grammar 7.9 promises holds on this way out too (see
+          // [`openInstances`]). Asked synchronously first, so a node that began
+          // no instance leaves on exactly the turn it always did.
+          if (instancesOpenUnder(execution.id, site)) {
+            // A pause left open below is abandoned first, so an instance
+            // parked on one ends rather than waiting on a person.
+            abandonPausesUnder(execution.id, site);
+            await instancesEnded(execution.id, site);
+            // …and one turn of the event loop for the continuations they leave
+            // behind: a `map` item's dispatch record, a flow-as-tool call's,
+            // and the activity's own settlement. An activity made of instances
+            // — a `flow:` node, a joined `map` — settles inside that turn; one
+            // that is not, such as an agent waiting on a host function, is left
+            // where it stands, exactly as before.
+            //
+            // What the stopped instance ran is **not** added to this entry's
+            // `inner`: `docs/trace.md` §3 makes that key absent on a `flow:`
+            // node its own `timeout:` ended, and widening a presence cell is a
+            // format version (§10.3). Its effects are journaled and its finally
+            // node's failure is `finally_error`, which is what the order above
+            // buys.
+            if (running !== undefined) {
+              await Promise.race([
+                running.then(
+                  () => undefined,
+                  () => undefined,
+                ),
+                new Promise<void>((resolve) => setTimeout(resolve, 0)),
+              ]);
+            }
+            // A record the instance did not match is un-absorbable on this
+            // path too — its finally boundary is where one most likely
+            // surfaces (PRD resolved q29).
+            if (late.settled && divergenceOf(late.error) !== undefined) throw late.error;
+          }
+          break;
+        }
         if (attempt === attempts) break;
         // This attempt is over, so every pause it left open below it is one
         // nothing will read the answer of — the same statement the `finally`
@@ -1358,10 +1496,19 @@ export async function runActivity<T>(
         // also what gives back the `map` permits and store handles the parked
         // instance is holding, before the next attempt queues for them.
         abandonPausesUnder(execution.id, site);
+        // And every instance the attempt began has ended before the next one
+        // begins — its `finally:` node included — so two attempts' finally
+        // nodes never run at once, and each claims its boundary at the site in
+        // the order the attempts ran (grammar 7.9, `docs/durability.md` §4).
+        if (instancesOpenUnder(execution.id, site)) await instancesEnded(execution.id, site);
         const delay = backoffFor(policy.retry!, attempt);
         try {
-          await sleep(delay, controller.signal);
-        } catch {
+          await sleep(delay, controller.signal, bodyEnded);
+        } catch (stopped) {
+          // The body's end, rather than the deadline: no attempt follows, and
+          // the node leaves on the end itself (see *No attempt begins once the
+          // body has ended*).
+          if (!expired && isAborted(bodyEnded)) throw stopped;
           break;
         }
       }
@@ -5291,6 +5438,10 @@ export async function callSubflowTool(
       // The calling node's deadline, inside the boundary — a `flow:` node's
       // reason exactly (grammar 9.2, and see [`Instantiation.signal`]).
       signal: context.signal,
+      // …and the end of the body it belongs to: a model that asks for a tool
+      // after that body has ended is a task LangGraph let go of, and begins no
+      // instance ([`Instantiation.bodyEnded`]).
+      bodyEnded: context.bodyEnded,
       ...(site.policy === undefined ? {} : { policy: site.policy }),
     });
     filed({
@@ -5396,6 +5547,27 @@ const CLOSING_TURN: Turn = { role: "user", text: "Now produce the structured res
  * exchange is closed with one fixed user turn before the output tool is pinned.
  * The tool-less path composes a request that already ends on the user turn and
  * is untouched.
+ *
+ * **A let-go agent begins nothing more** (grammar 7.9, Decision D159). An agent
+ * node is a task of its instance's body, and LangGraph lets go of it when a
+ * sibling's failure ends that body, or the instance is stopped
+ * ([`RunContext.bodyEnded`]). The model call or tool call in flight at that
+ * moment runs on — a sibling's failure cuts nothing short (grammar 7.6.3), and
+ * a model call answers through its whole route — but the loop begins nothing
+ * after it: no further tool call of any kind, and no further model turn, the
+ * pinned one included. Each would be new work inside an instance that has
+ * ended — a subprocess spawned, a request sent, a store write landed, an
+ * instance begun — and a store write is where that shows: one landing after a
+ * `finally:` node released a lease takes the lease again until its TTL (PRD
+ * resolved q69, q76). So [`leaveEnded`] is read before every model call and
+ * before every tool is invoked, and the node leaves on the end's own
+ * [`InstanceStopped`], as a `retry:` ladder does between attempts
+ * ([`runActivity`]). A call naming a tool the agent does not offer (D119)
+ * begins nothing and is still answered; the turn it would lead to is what is
+ * refused — while a call to a tool it does offer is refused before its
+ * arguments are even read, since reading them is the tool's first step. A
+ * finally node's agent reads its own end, which comes only once it has settled
+ * ([`endInstance`]), and a detached delivery's has none to read ([`runMap`]).
  */
 export async function callAgent(
   agent: AgentBinding,
@@ -5422,6 +5594,14 @@ export async function callAgent(
     // that a `return` alone would not release ([`endShellSessions`]).
     endShellSessions(context);
   }
+}
+
+/**
+ * Leave a let-go agent's loop on the end of the body it belongs to, where that
+ * body has ended — see *A let-go agent begins nothing more* on [`callAgent`].
+ */
+function leaveEnded(context: RunContext): void {
+  if (isAborted(context.bodyEnded)) throw abortReason(context.bodyEnded!);
 }
 
 /** [`callAgent`]'s loop, with the sessions it opens released around it. */
@@ -5483,6 +5663,9 @@ async function agentLoop(
     // ever saw would say the opposite of what happened.
     let refusal: string | undefined;
     for (;;) {
+      // Before the bound, so a let-go loop leaves on the end it is let go by
+      // rather than on a bound it would have reached only by turning again.
+      leaveEnded(context);
       if (iterations >= agent.maxToolIterations) {
         throw new Error(
           `\`${agent.address}\` reached its \`max_tool_iterations\` bound of ${agent.maxToolIterations} without answering (Decision D51)${
@@ -5563,6 +5746,11 @@ async function agentLoop(
           );
           continue;
         }
+        // Every tool begins something — a subprocess, a request, a store write,
+        // an instance — so a let-go loop stops here, between one call and the
+        // next, as well as between turns. The refusal above begins nothing, and
+        // is answered whatever the body's state.
+        leaveEnded(context);
         // Claimed here and **handed back** where the contract refuses the call:
         // grammar §9.4's ordinal counts how many times this tool has already
         // been *invoked*, and a refusal never reaches the tool. Claiming it up
@@ -5657,6 +5845,7 @@ async function agentLoop(
     }
   }
 
+  leaveEnded(context);
   const { answer: final, served: finalServed } = await callModel(
     agent.model,
     {
@@ -9597,6 +9786,17 @@ export interface TraceDocument {
    */
   readonly error?: string;
   /**
+   * What a `finally:` node of this execution raised after its own retries, where
+   * one did (grammar 7.9, PRD resolved q76, `docs/trace.md` §2): the first such
+   * failure, naming the flow and the node, as [`finallyErrorOf`] holds it.
+   *
+   * Beside a `status` it does **not** change — a `"completed"` run with one is a
+   * run that produced its answer and whose cleanup failed afterwards — and on
+   * any status a finally node can run under. Absent on every other envelope,
+   * never empty. The failed node's own entry carries its `error` too.
+   */
+  readonly finally_error?: string;
+  /**
    * Every entry the run recorded, ordered by `(step, node)` — the order
    * [`mergeRun`] folds them in.
    *
@@ -10006,10 +10206,13 @@ function traceOf(error: unknown): readonly TraceEntry[] | undefined {
  * [`ItemFailure`] ever arrives. The plan is [`runNode`]'s own object — it built
  * it, outside the policy — and the map writes each dispatch into it as that
  * dispatch resolves, so what survives here is every detached delivery (resolved
- * at dispatch, D94) and every joined instance that had settled. An instance
- * still in flight when the budget ran out has no outcome yet and so no record;
- * the entry's own `error`, which names the node and its budget, is what accounts
- * for it.
+ * at dispatch, D94) and every joined instance that had settled — which, for a
+ * `flow.*` instance, is every one the map had begun: a node settles only once
+ * the instances under it have ended, their `finally:` nodes included
+ * ([`runActivity`]'s *An instance ends before its node does*), so each one's
+ * record is here, failed on the deadline. An `agent.*` item still in flight
+ * when the budget ran out has no outcome yet and so no record; the entry's own
+ * `error`, which names the node and its budget, is what accounts for it.
  *
  * Recognised by its **brand** rather than by its shape, because `runNode` holds
  * every node's input as `unknown` and reaches here for *any* node that failed.
@@ -10068,15 +10271,32 @@ export function abortedEntry(error: unknown): TraceEntry | undefined {
 export class FlowFailure extends Error {
   /** The flow that was running. */
   readonly flow: string;
-  /** What landed, plus the entry of the node the run aborted at. */
+  /**
+   * What landed, plus the entry of the node the run aborted at — and, after it,
+   * the entry of the flow's `finally:` node where it declares one, which ran
+   * once the body had failed (grammar 7.9).
+   */
   readonly trace: readonly TraceEntry[];
+  /**
+   * What a `finally:` node of this execution raised after its own retries, where
+   * one did (grammar 7.9, PRD resolved q76): `finally_error` on the execution's
+   * record, beside a failure it does not change. See [`finallyErrorOf`].
+   */
+  readonly finallyError?: string;
 
-  constructor(flow: string, what: string, trace: readonly TraceEntry[], cause: unknown) {
+  constructor(
+    flow: string,
+    what: string,
+    trace: readonly TraceEntry[],
+    cause: unknown,
+    finallyError?: string,
+  ) {
     super(`\`${flow}\` ${what}: ${describe(cause)}`);
     this.name = "FlowFailure";
     this.flow = flow;
     this.trace = trace;
     this.cause = cause;
+    if (finallyError !== undefined) this.finallyError = finallyError;
   }
 }
 
@@ -10187,6 +10407,33 @@ export interface RunChannel {
   /** Level 1 of grammar 9.3, if a `flow:` node instantiated this instance. */
   readonly policy?: InstancePolicy;
   readonly trace: readonly TraceEntry[];
+  /**
+   * Aborted the moment this instance's **body** has ended — its graph has
+   * stopped, whichever way — with an [`InstanceStopped`] naming its flow; and
+   * absent where nothing ran the graph through [`quiesce`] (grammar 7.9).
+   *
+   * One signal per instance **generation**, which is the whole point of it: the
+   * instance path does not say which generation a task belongs to, because a
+   * `flow:` node's `retry:` and a `map` item's `on_item_error` retry re-run the
+   * same path. What reads it is a task of this body that LangGraph has let go
+   * of — a sibling's failure ended the superstep it was in, or the instance's
+   * own stop was pulled — and that is still running: a `map` with items queued
+   * for a permit, a `retry:` ladder sleeping out its backoff, an agent whose
+   * model answers with another tool call or whose tool call answers into
+   * another turn. None of them may begin anything once the body is over
+   * (grammar 7.9: nothing new begins inside an instance that is ending), and
+   * none of them has anything else to learn that from: the instance's own stop
+   * is the instantiating node's clock, and the task's own clock is its node's.
+   * [`runActivity`] hands it on as [`RunContext.bodyEnded`], the agent loop
+   * leaves through it ([`callAgent`]), and [`runSubflow`] refuses through it
+   * ([`Instantiation.bodyEnded`]).
+   *
+   * It never **stops** anything — an activity in flight runs on, exactly as one
+   * a deadline abandoned does (see [`Instantiation.signal`]) — it only refuses
+   * what would begin. And an instance's `finally:` node is not a task of its
+   * body: it runs under a signal of its own ([`endInstance`]).
+   */
+  readonly bodyEnded?: AbortSignal;
 }
 
 /** The empty run channel a flow instance starts at. */
@@ -10213,14 +10460,16 @@ export function emptyRun(): RunChannel {
  * `(step, node)` — the canonical write order of grammar 7.6.4, read for the one
  * channel whose order is otherwise the scheduler's.
  *
- * `path` and `policy` are the instance's own identity rather than anything a
- * node contributes: they are set once, in the state a flow instance is started
- * from, and a partial update that carries neither leaves them alone.
+ * `path`, `policy` and `bodyEnded` are the instance's own identity rather than
+ * anything a node contributes: they are set once, in the state a flow instance
+ * is started from, and a partial update that carries none of them leaves them
+ * alone.
  */
 export function mergeRun(left: RunChannel, right: Partial<RunChannel>): RunChannel {
   const trace = [...left.trace, ...(right.trace ?? [])];
   trace.sort((a, b) => a.step - b.step || (a.node < b.node ? -1 : a.node > b.node ? 1 : 0));
   const policy = right.policy ?? left.policy;
+  const bodyEnded = right.bodyEnded ?? left.bodyEnded;
   return {
     step: Math.max(left.step, right.step ?? 0),
     input: right.input ?? left.input,
@@ -10234,6 +10483,7 @@ export function mergeRun(left: RunChannel, right: Partial<RunChannel>): RunChann
     path: right.path ?? left.path,
     ...(policy === undefined ? {} : { policy }),
     trace,
+    ...(bodyEnded === undefined ? {} : { bodyEnded }),
   };
 }
 
@@ -10395,6 +10645,8 @@ export function applyWrite(previous: unknown, value: unknown, reduce: Reduce): u
  * is [`Instantiation.signal`].
  */
 export interface Quiescible<S> {
+  /** Its typed address (grammar 2.2): what [`RunChannel.bodyEnded`] names. */
+  readonly address: string;
   stream(
     initial: Record<string, unknown>,
     options: { recursionLimit: number; signal?: AbortSignal },
@@ -10415,6 +10667,14 @@ export interface Quiescible<S> {
  * `signal` is the caller's deadline, when the caller has one: a `flow:` node and
  * a joined `map` dispatch each run their instance inside a node budget, and a
  * top-level run has no clock above it to pass. See [`Instantiation.signal`].
+ *
+ * **The body's end is announced here**, because this is where it happens: the
+ * instance is seeded with a [`RunChannel.bodyEnded`] of its own, and that signal
+ * aborts the moment the stream has finished — whichever way, before the caller
+ * runs anything at the instance's end. LangGraph lets go of a superstep's other
+ * tasks when one of them fails, and the stream also ends when the instance's
+ * stop is pulled; every task it let go of reads this to begin nothing more
+ * (grammar 7.9).
  */
 export async function quiesce<S extends { $run: RunChannel }>(
   graph: Quiescible<S>,
@@ -10422,17 +10682,25 @@ export async function quiesce<S extends { $run: RunChannel }>(
   recursionLimit: number,
   signal?: AbortSignal,
 ): Promise<{ state?: S; error?: unknown }> {
+  const body = new AbortController();
+  const seeded: Record<string, unknown> = {
+    ...initial,
+    $run: { ...(initial["$run"] as Partial<RunChannel> | undefined), bodyEnded: body.signal },
+  };
   let state: S | undefined;
   try {
-    const supersteps = await graph.stream(initial, { recursionLimit, signal });
+    const supersteps = await graph.stream(seeded, { recursionLimit, signal });
     for await (const superstep of supersteps) {
       // An interrupt is announced as a chunk of its own rather than as a state,
       // and reading it as one would lose the run's.
       if (!isInterrupted(superstep)) state = superstep;
     }
   } catch (error) {
-    return { state, error: restateCeiling(recursionLimit, error) };
+    const restated = restateCeiling(recursionLimit, error);
+    body.abort(new InstanceStopped(graph.address, restated));
+    return { state, error: restated };
   }
+  body.abort(new InstanceStopped(graph.address, undefined));
   return { state };
 }
 
@@ -10481,6 +10749,12 @@ export interface SubflowBinding extends Quiescible<GraphStateLike> {
   readonly outputs: readonly string[];
   /** The superstep ceiling one instance of it takes. */
   readonly recursionLimit: number;
+  /**
+   * The node its `finally:` names, where it declares one: run once when an
+   * instance of it ends, outside the compiled graph — no node of the graph has
+   * an edge to it (grammar 7.9, [`endInstance`]).
+   */
+  readonly finally?: NodeDescriptor;
 }
 
 /** What one instantiation supplies to the instance it starts (grammar 7.5). */
@@ -10522,6 +10796,19 @@ export interface Instantiation {
    * (Decision D118).
    */
   readonly signal?: AbortSignal;
+  /**
+   * The end of the body the instantiating node belongs to — its
+   * [`RunContext.bodyEnded`], passed beside its clock (grammar 7.9).
+   *
+   * Aborted, it means the node asking is a task of an instance whose body is
+   * already over, which LangGraph let go of and which is still running: the
+   * instance is refused, not begun, because nothing new begins inside an
+   * instance that has ended. It is the one way to tell such a task from a
+   * fresh generation's, because both name the same instance path. Absent is a
+   * body that never ends here — a detached delivery, which is off the
+   * instance (grammar 8.6 rule 7), or a caller outside [`quiesce`].
+   */
+  readonly bodyEnded?: AbortSignal;
   /** Level 1 of grammar 9.3 for every node inside it. */
   readonly policy?: InstancePolicy;
   /**
@@ -10555,6 +10842,73 @@ export async function runSubflow(
   binding: SubflowBinding,
   instance: Instantiation,
 ): Promise<NodeAnswer> {
+  // **An instance whose clock has already run out is not started.** What
+  // reaches here with an aborted signal is work the instantiating node had
+  // stopped waiting for before it began — a `map` item still queued for a
+  // permit when the map node's `timeout:` fired, a `flow.*` tool a model asked
+  // for after its agent node's budget was spent — so nothing of the instance
+  // runs: no node, no effect, and no `finally:` node, because an instance that
+  // never began has nothing to end (grammar 7.9).
+  if (instance.signal?.aborted === true) {
+    throw new SubflowFailure(
+      binding.address,
+      "was not started",
+      [],
+      abortReason(instance.signal),
+    );
+  }
+  // **Nor is one inside an instance that has ended, or is ending.** What asks
+  // for one there is a task of that instance LangGraph has already let go of —
+  // a `flow:` node's next `retry:` attempt, a `map`'s next queued item, a
+  // flow-as-tool call — running on after a sibling's failure ended the
+  // instance it belongs to. Its own body's end says so for as long as the task
+  // runs ([`RunChannel.bodyEnded`]); the table of ends under way says so of
+  // every instance inside one that is ending, from the moment that end begins
+  // until its finally node has run ([`endInstancesInside`]).
+  if (isAborted(instance.bodyEnded)) {
+    throw new SubflowFailure(
+      binding.address,
+      "was not started",
+      [],
+      abortReason(instance.bodyEnded!),
+    );
+  }
+  const execution = instance.execution.id;
+  const path = instance.path.join("/");
+  // The detached delivery it is begun under, if any: the work of that delivery
+  // is nobody's outside it (see [`openInstances`]).
+  const detached = deliveryAround(execution, path);
+  const stopping = endingAround(execution, path, detached);
+  if (stopping !== undefined) {
+    throw new SubflowFailure(binding.address, "was not started", [], stopping);
+  }
+  // Its own stop, which follows the instantiating node's clock and is also
+  // what the instance it runs inside pulls when that one ends first.
+  const stop = new AbortController();
+  const clock = instance.signal;
+  const follow = (): void => stop.abort(clock?.reason);
+  clock?.addEventListener("abort", follow, { once: true });
+  const ended = runInstance(binding, instance, stop.signal).finally(() =>
+    clock?.removeEventListener("abort", follow),
+  );
+  instanceBegun(execution, path, ended, stop, detached);
+  return ended;
+}
+
+/**
+ * One instance, from its first superstep to the end of its `finally:` node —
+ * the whole of [`runSubflow`] once it has decided to start one, and the promise
+ * [`instancesEnded`] waits on.
+ *
+ * `signal` is the instance's own: [`Instantiation.signal`] followed, and pulled
+ * as well by [`endInstancesInside`] when the instance this one runs inside ends
+ * before it does.
+ */
+async function runInstance(
+  binding: SubflowBinding,
+  instance: Instantiation,
+  signal: AbortSignal,
+): Promise<NodeAnswer> {
   const seeded = instance.history ?? [];
   const initial: Record<string, unknown> = {
     $run: {
@@ -10567,51 +10921,85 @@ export async function runSubflow(
     ...(instance.history === undefined ? {} : { messages: [...seeded] }),
   };
 
-  const { state, error } = await quiesce(
-    binding,
-    initial,
-    binding.recursionLimit,
-    instance.signal,
-  );
-  const trace = state?.$run.trace ?? [];
-  if (error !== undefined) {
-    // The node that stopped the instance is part of the account of it, and it is
-    // the part a reader looks for first: it never reached the reducer, so the
-    // committed state does not have it. [`failedTrace`] recovers it from the
-    // error the way [`runFlow`] does for a top-level run — the boundary is a
-    // module boundary, not a reason to report less about what happened inside
-    // it (grammar 8.5, PRD 5.3).
-    throw new SubflowFailure(
-      binding.address,
-      "did not run to quiescence",
-      failedTrace(state, error),
-      error,
-    );
-  }
-  if (state === undefined) {
+  const reached = await quiesce(binding, initial, binding.recursionLimit, signal);
+  const { state } = reached;
+  // An instance the one around it stopped ended **because** that one did, and
+  // that is what its `finally:` node reads as `execution.error` — not the
+  // `Abort` LangGraph's stream raises to say only that it stopped.
+  const error = stoppedBy(signal, reached.error);
+  if (error === undefined && state === undefined) {
     // Unreachable: `streamMode: "values"` emits the state the instance started
     // from before any node has run.
     throw new SubflowFailure(
       binding.address,
       "produced no state",
-      trace,
+      [],
       new Error("the instance emitted no superstep"),
     );
   }
 
-  const held = state as unknown as Record<string, unknown>;
+  // The body's answer, decided **before** the instance's `finally:` node runs:
+  // what an instance produced is what its body produced, whatever its finally
+  // node then does (grammar 7.9). A failure that stopped the instance carries
+  // the node that stopped it — it never reached the reducer, so the committed
+  // state does not have it, and [`failedTrace`] recovers it from the error the
+  // way [`runFlow`] does for a top-level run (grammar 8.5, PRD 5.3).
+  let trace: readonly TraceEntry[] =
+    error === undefined ? (state?.$run.trace ?? []) : failedTrace(state, error);
+  let ended: unknown = error;
+  let what = "did not run to quiescence";
+  const held = (state ?? {}) as unknown as Record<string, unknown>;
   const output: Record<string, unknown> = {};
-  try {
-    for (const field of binding.outputs) {
-      output[field] = channelValue(
-        held,
-        field,
-        `\`${binding.address}\`'s output field \`${field}\``,
-      );
+  if (ended === undefined) {
+    try {
+      for (const field of binding.outputs) {
+        output[field] = channelValue(
+          held,
+          field,
+          `\`${binding.address}\`'s output field \`${field}\``,
+        );
+      }
+    } catch (cause) {
+      ended = cause;
+      what = "reached quiescence without an output";
     }
-  } catch (cause) {
-    throw new SubflowFailure(binding.address, "reached quiescence without an output", trace, cause);
   }
+
+  // The instance has ended — unless what stopped it is a pause the run parks
+  // at, or a record this run does not match, neither of which is an end
+  // ([`instanceEnding`]). Every instance still running inside it ends first,
+  // its own finally node run ([`endInstancesInside`]); then its own `finally:`
+  // node runs, once: this is inside the `flow:` node's (or the dispatch's) own
+  // activity, so the node that instantiated it settles only after it has
+  // (grammar 7.9, PRD resolved q76). Its entry is the instance's last.
+  const ending = instanceEnding(instance.execution.id, ended);
+  const inside = await endInstancesInside(
+    instance.execution.id,
+    instance.path.join("/"),
+    binding.address,
+    ending,
+    ended,
+    binding.finally,
+  );
+  let closing: FinallyRun | undefined;
+  try {
+    closing = await endInstance(
+      binding.finally,
+      (state ?? initial) as GraphStateLike,
+      ending,
+      trace,
+    );
+  } finally {
+    inside();
+  }
+  if (closing !== undefined) trace = [...trace, closing.entry];
+  // A resumed instance settles on the end its boundary records where its body,
+  // replayed, reached another (grammar 7.9, `docs/durability.md` §3.10).
+  if (ended === undefined && closing !== undefined && closing.ending.outcome !== "completed") {
+    ended = new RecordedEnding(closing.ending);
+    what = "ended as its journal records";
+  }
+  if (ended !== undefined) throw new SubflowFailure(binding.address, what, trace, ended);
 
   // On `context: inherit`, what the instance *added* is what goes back to the
   // caller's channel: the seeded turns are already there, and appending them
@@ -10624,6 +11012,868 @@ export async function runSubflow(
     ...(added.length === 0 ? {} : { history: added }),
     inner: trace,
   };
+}
+
+// ---------------------------------------------------------------------------
+// The end of an instance: a flow's `finally:` node (grammar 7.9)
+// ---------------------------------------------------------------------------
+
+/**
+ * Every flow instance this process has begun and not yet ended, by execution:
+ * the promise of each one's end, and its instance path, flattened
+ * (grammar 9.4).
+ *
+ * What makes "the node that instantiated it settles after it has" (grammar 7.9,
+ * PRD resolved q76) true of a node whose **deadline** answered for it. A
+ * `timeout:` is raced ([`runActivity`]), so the node's wait for its activity
+ * ends the moment the budget does — while the instance it started is still
+ * stopping: LangGraph has been told to schedule no further superstep, and the
+ * instance has yet to run its `finally:` node. Left there, that finally node
+ * would run after the node had failed, after the instance above had ended and
+ * run its own, and after a one-shot `run` had closed the row and exited — out
+ * of order, unjournaled, and cut off part-way. So the node waits here, for every
+ * instance at or under its own site, before it settles ([`instancesEnded`]).
+ *
+ * The same holds of an instance whose **own body** ended while an instance
+ * inside it was still running — a sibling branch's `flow:` node, `map` item or
+ * flow-as-tool call, which LangGraph lets go of the moment another task of the
+ * superstep fails. The instance that ended stops each of those and waits for
+ * them here before its own finally node runs ([`endInstancesInside`]), so the
+ * innermost still end first.
+ *
+ * An instance is entered by [`runSubflow`] — a `flow:` node's, a joined `map`
+ * dispatch's and a flow-as-tool call's alike — and leaves when its promise
+ * settles, which is after its finally node has run. Each is held with its own
+ * stop, what [`endInstancesInside`] pulls. A detached dispatch's child
+ * execution is not here: it is an execution of its own (PRD resolved q65), on no
+ * node's clock.
+ *
+ * **A detached `agent.*` delivery's instances are here, and are nobody's
+ * outside it.** Its sink runs under this execution's id, and so does every
+ * instance its model begins from its `tools:` — at a path under the delivery's
+ * own, and so under the `map` node that issued it and every instance around
+ * that node. By the prefix alone each would be inside all of them; but the
+ * delivery was resolved when its record was written, and "nothing it does can
+ * delay the enclosing flow instance" (grammar 8.6 rule 7, Decision D94) is a
+ * statement about every end around it: none of them stops one of these
+ * instances, waits for it, or refuses it a beginning, and neither does the
+ * `map` node's deadline or its `retry:` ladder. So each instance carries the
+ * innermost delivery it was begun under ([`OpenInstance.detached`]), and an end
+ * or a node at or around that delivery leaves it alone ([`offInstance`]). What
+ * it does inside the delivery is its own: the instances *it* begins are inside
+ * it like any others, and its own end stops and waits for them.
+ */
+const openInstances = new Map<string, Map<Promise<unknown>, OpenInstance>>();
+
+/** One instance on the books: where it is, and what stops it. */
+interface OpenInstance {
+  /** Its instance path, flattened (grammar 9.4). */
+  readonly path: string;
+  /** What its supersteps run under: pulled to stop it ([`endInstancesInside`]). */
+  readonly stop: AbortController;
+  /**
+   * The innermost **detached** delivery it runs under — the instance path that
+   * delivery's sink runs at ([`detaching`]) — or absent for one that runs under
+   * none. Read when it begins ([`deliveryAround`]) and kept, so that what the
+   * instance is part of does not depend on when it is asked.
+   */
+  readonly detached?: string;
+}
+
+/** Put one instance on the books until `ending` settles. */
+function instanceBegun(
+  execution: string,
+  path: string,
+  ending: Promise<unknown>,
+  stop: AbortController,
+  detached: string | undefined,
+): void {
+  let open = openInstances.get(execution);
+  if (open === undefined) {
+    open = new Map();
+    openInstances.set(execution, open);
+  }
+  const held = open;
+  held.set(ending, { path, stop, ...(detached === undefined ? {} : { detached }) });
+  const ended = (): void => {
+    held.delete(ending);
+    if (held.size === 0 && openInstances.get(execution) === held) openInstances.delete(execution);
+  };
+  ending.then(ended, ended);
+}
+
+/**
+ * Whether any instance at or under `site` is still running — the synchronous
+ * half of [`instancesEnded`], so a node that began none settles on the turn it
+ * always did.
+ */
+function instancesOpenUnder(execution: string, site: string): boolean {
+  const open = openInstances.get(execution);
+  if (open === undefined) return false;
+  for (const one of open.values()) {
+    if (under(one.path, site) && !offInstance(one.detached, site)) return true;
+  }
+  return false;
+}
+
+/**
+ * The innermost **detached** delivery `path` lies under in `execution` — the
+ * instance path its sink runs at — or `undefined` where it lies under none
+ * (grammar 8.6 rule 7, and see [`openInstances`]).
+ *
+ * Read off the marks [`runMap`] puts down for as long as each delivery runs
+ * ([`detaching`]), which cover every instance that matters here: an
+ * instance is begun by its delivery's sink while the sink is running, and an
+ * `agent.*` sink answers only once every `flow.*` tool call it made has — its
+ * loop awaits each call, and a call answers only after its instance's
+ * `finally:` node has run. Innermost because deliveries nest: an instance a
+ * delivery began may run a `map` that detaches one of its own.
+ */
+function deliveryAround(execution: string, path: string): string | undefined {
+  const sites = detachedSites.get(execution);
+  if (sites === undefined) return undefined;
+  let innermost: string | undefined;
+  for (const root of sites.keys()) {
+    if (!under(path, root)) continue;
+    if (innermost === undefined || root.length > innermost.length) innermost = root;
+  }
+  return innermost;
+}
+
+/**
+ * Whether an instance whose innermost detached delivery is `detached`
+ * ([`OpenInstance.detached`]) is that delivery's work rather than `around`'s:
+ * the delivery lies at or inside `around` (grammar 8.6 rule 7, Decision D94).
+ *
+ * `around` is an instance that is ending, or the site of a node waiting out
+ * the instances it began. Neither stops, waits for or refuses the work of a
+ * delivery issued inside it: the `map` that issued it resolved it at dispatch.
+ * An instance its sink began is still around the instances *it* begins — the
+ * delivery is around both, not between them — so its own end stops and waits
+ * for them as any end does.
+ */
+function offInstance(detached: string | undefined, around: string): boolean {
+  return detached !== undefined && under(detached, around);
+}
+
+/**
+ * Why an instance ended before its body did: the instance it runs inside had
+ * ended first (grammar 7.9).
+ *
+ * LangGraph runs a superstep's tasks side by side and, when one of them fails,
+ * stops waiting for the rest — so a body node's failure ends its instance while
+ * a sibling branch may still be running an instance of its own: a `flow:`
+ * node's, a `map` item's, a flow-as-tool call's. That instance has nothing left
+ * to answer to, and "innermost first when a cancel or failure ends several at
+ * once" (PRD resolved q76) makes it one of the several: [`endInstancesInside`]
+ * stops it, and this is what its own `finally:` node then reads as
+ * `execution.error`, beside an `execution.outcome` of `failed` — the same
+ * outcome an instance its node's deadline stopped ends on.
+ *
+ * It is also the reason a body's end is announced with
+ * ([`RunChannel.bodyEnded`]), and so what a let-go task of that body leaves on
+ * when it is refused the next thing it would begin: an instance, an attempt, a
+ * `map` item.
+ */
+export class InstanceStopped extends Error {
+  /** The flow whose instance ended around it. */
+  readonly flow: string;
+
+  constructor(flow: string, cause: unknown) {
+    super(
+      cause === undefined
+        ? `the instance of \`${flow}\` it ran inside had already ended`
+        : `the instance of \`${flow}\` it ran inside failed: ${describe(cause)}`,
+    );
+    this.name = "InstanceStopped";
+    this.flow = flow;
+  }
+}
+
+/**
+ * What an instance ended on: what its supersteps raised — or, where its own stop
+ * was pulled, the stop (grammar 7.9).
+ *
+ * Pulled by the instance around it ending ([`endInstancesInside`]), the reason
+ * is an [`InstanceStopped`] saying why, in place of the bare `Abort` LangGraph's
+ * stream raises when its signal fires. And an instance whose stop was pulled
+ * while it was **waiting on a person** ended on that stop too, not on the
+ * abandonment of its pause that its supersteps raise: the end around it, or the
+ * instantiating node's deadline in the one tick a pause can open after it ran
+ * out ([`runActivity`]), is what ended it — so it is an end, `failed`, and runs
+ * its finally node like any stopped instance. An abandoned pause is no end only
+ * where nothing stopped its instance ([`instanceEnding`]). A pause the run
+ * parks at and a divergence keep their own meaning whatever stopped the stream,
+ * because neither is an end either.
+ */
+function stoppedBy(signal: AbortSignal, error: unknown): unknown {
+  if (error === undefined || !signal.aborted) return error;
+  if (divergenceOf(error) !== undefined || interruptOf(error) !== undefined) return error;
+  const reason: unknown = signal.reason;
+  if (reason instanceof InstanceStopped || abandonedOf(error) !== undefined) return reason;
+  return error;
+}
+
+/**
+ * The [`InstanceStopped`] on this error's `cause` chain, if it came out of one:
+ * the failure of an instance the end around it stopped, or of one that end
+ * would not let begin ([`endingAround`]) — or a ladder that ended because the
+ * body it belongs to had ([`RunChannel.bodyEnded`]), and the refusal of what it
+ * would have begun.
+ *
+ * Read beside [`abandonedOf`] by the ladders and policies an abandonment passes
+ * through untouched, and for its reason: what reaches them is a task inside the
+ * ending instance that LangGraph has already let go of, so nothing is reading
+ * its result. A `retry:` acting on it would sleep out its backoff and begin the
+ * instance again after the end that stopped it had finished — in a `serve`
+ * process, inside an execution whose row has closed — and `skip` or a
+ * `fallback:` would route a graph that is no longer running.
+ */
+function stoppedOf(error: unknown): InstanceStopped | undefined {
+  for (let held: unknown = error; held !== undefined && held !== null; ) {
+    if (held instanceof InstanceStopped) return held;
+    held = (held as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+/**
+ * The instances that are ending, by execution: each one's instance path, the
+ * site of its own `finally:` node, and why it is ending — what [`runSubflow`]
+ * refuses to begin an instance inside, through [`endingAround`].
+ *
+ * Held from the start of an end to the end of its finally node, and keyed by
+ * path, which every generation of an instance shares — so it is what refuses
+ * the tasks of instances **inside** one that is ending, whose own bodies may
+ * not have stopped yet. The ending instance's own let-go tasks are refused for
+ * longer, by its body's own end ([`RunChannel.bodyEnded`]), which outlasts the
+ * release.
+ */
+const endingInstances = new Map<string, Set<EndingInstance>>();
+
+/** One instance between the end of its body and the end of its finally node. */
+interface EndingInstance {
+  readonly path: string;
+  /** Its finally node's site, under which instances may still begin. */
+  readonly finallySite?: string;
+  readonly reason: InstanceStopped;
+}
+
+/**
+ * Why an instance at `path` may not begin, where one around it is ending — the
+ * [`InstanceStopped`] that ending raises — or `undefined` where it may.
+ *
+ * Strictly inside: an instance at the ending one's **own** path is the next
+ * attempt of the node that ran it, which begins only once this one has ended.
+ * And never under a finally node that is part of that end
+ * ([`underClosingFinally`]): the ending instance's own, and that of every
+ * instance ending inside it — one its end stopped, or one whose body had ended
+ * already — because each of those is how an instance the end is waiting for
+ * ends, and its `flow:` node, `map` or `flow.*` tool begins instances of its
+ * own to do it (grammar 7.9: the stopped instance runs its own finally node
+ * before the instance around it runs its).
+ *
+ * Nor inside an end it is off: `detached` is the innermost detached delivery
+ * the new instance is begun under ([`deliveryAround`]), and an end at or
+ * around that delivery refuses none of its work ([`offInstance`]) — the
+ * delivery's `agent.*` sink calls its `flow.*` tools whatever became of the
+ * instance that issued it (grammar 8.6 rule 7).
+ */
+function endingAround(
+  execution: string,
+  path: string,
+  detached: string | undefined,
+): InstanceStopped | undefined {
+  const ending = endingInstances.get(execution);
+  if (ending === undefined) return undefined;
+  for (const one of ending) {
+    if (path === one.path || !under(path, one.path)) continue;
+    if (offInstance(detached, one.path)) continue;
+    if (underClosingFinally(ending, one.path, path)) continue;
+    return one.reason;
+  }
+  return undefined;
+}
+
+/**
+ * Whether `path` lies under the finally node of an instance that is ending **at
+ * or inside** `around` — the work an end at `around` waits for rather than
+ * refuses ([`endingAround`]) or stops ([`endInstancesInside`]).
+ *
+ * At or inside, and no further out: the finally node of an instance ending
+ * *around* `around` is that outer end's work, not one `around`'s end waits for —
+ * so where `around` is itself an instance that finally node began, and is
+ * ending, what begins inside `around` is refused like anything else.
+ */
+function underClosingFinally(
+  ending: ReadonlySet<EndingInstance>,
+  around: string,
+  path: string,
+): boolean {
+  for (const other of ending) {
+    if (other.finallySite === undefined || !under(other.path, around)) continue;
+    if (under(path, other.finallySite)) return true;
+  }
+  return false;
+}
+
+/**
+ * End every instance still running **inside** one whose body has ended, before
+ * that one's own `finally:` node runs (grammar 7.9: innermost first, PRD
+ * resolved q76) — and answer the release the caller makes once its finally
+ * node has run.
+ *
+ * `path` is the ending instance's own (`""` for an execution's root), `flow` its
+ * flow's address, `ending` how it ended ([`instanceEnding`]), `cause` the error
+ * its body ended on, and `finallyNode` its finally node, where it declares one.
+ *
+ * What is still running inside an instance whose body has ended is the work of a
+ * task LangGraph let go of: a superstep whose one task failed is over the moment
+ * that task's error is in, and the sibling branches it ran beside are left where
+ * they stand — a `flow:` node's instance among them, or a `map`'s, or a
+ * flow-as-tool call's. Nothing will read what any of them answers. So each is
+ * **stopped** — its own stop pulled, exactly as a node's deadline pulls it —
+ * every pause under the ending instance is abandoned, because the task that
+ * would read its answer is gone, and the instance waits for every one of them
+ * to end, each one's own finally node run, which by the same rule runs only
+ * after anything inside *it* has ended. One that was waiting on a person is
+ * stopped like the rest: its pause goes with the others, and the stop is how
+ * it ended — `failed`, reading this instance's failure as `execution.error`
+ * ([`stoppedBy`]) — so it runs its finally node too.
+ *
+ * What is **not** stopped is an end already under way inside it: an instance
+ * whose own body has ended — stopped by an end further in, or ended on its own
+ * — and is running its finally node, and every instance that finally node has
+ * begun ([`underClosingFinally`]). Pulling their stops would cut short the very
+ * cleanup this wait is for, so they are waited for, bounded by their finally
+ * nodes' own §9.3 budgets, exactly as a deadline's stop leaves them. Nor is the
+ * work of a **detached** delivery issued inside it — the instances an
+ * `agent.*` sink's model begins from its `tools:` — which this end neither
+ * stops nor waits for, because the delivery was resolved at dispatch and
+ * nothing it does can delay the instance that issued it (grammar 8.6 rule 7,
+ * [`offInstance`]). Until the
+ * release, nothing new may begin inside the ending instance ([`endingAround`])
+ * — a let-go `flow:` node's next `retry:` attempt, a `map`'s next item — except
+ * under one of those finally nodes, or its own.
+ *
+ * The release lets a **new generation** begin at the ending instance's own path
+ * — the next attempt of the node that ran it — and inside it. It does not let
+ * the ended generation's let-go tasks begin anything: those still run after
+ * the release — a `map` with items queued for a permit, a ladder sleeping out a
+ * backoff — and are refused by their own body's end, which aborted before this
+ * was called and stays aborted for as long as they run
+ * ([`RunChannel.bodyEnded`]). The table covers what that signal cannot: the
+ * tasks of an instance running **inside** the ending one, between this end
+ * beginning and that instance's own body stopping.
+ *
+ * Nothing at all where `ending` is `undefined` — a pause the run parks at, or a
+ * divergence, neither of which is an end — and nothing to wait for where no
+ * instance is open inside, which is every instance whose body completed: a
+ * body node settles only after the instances it began have ended (see
+ * [`runActivity`]'s *An instance ends before its node does*).
+ */
+export async function endInstancesInside(
+  execution: string,
+  path: string,
+  flow: string,
+  ending: InstanceEnding | undefined,
+  cause: unknown,
+  finallyNode: NodeDescriptor | undefined,
+): Promise<() => void> {
+  if (ending === undefined) return () => {};
+  const reason = new InstanceStopped(flow, cause);
+  const entry: EndingInstance = {
+    path,
+    ...(finallyNode === undefined
+      ? {}
+      : { finallySite: [path, `${finallyNode.node}/0`].filter((part) => part !== "").join("/") }),
+    reason,
+  };
+  let table = endingInstances.get(execution);
+  if (table === undefined) {
+    table = new Set();
+    endingInstances.set(execution, table);
+  }
+  const held = table;
+  held.add(entry);
+  const release = (): void => {
+    held.delete(entry);
+    if (held.size === 0 && endingInstances.get(execution) === held) {
+      endingInstances.delete(execution);
+    }
+  };
+  // Strictly inside, and not the work of a detached delivery issued inside it,
+  // which no end around the delivery stops or waits for ([`offInstance`]).
+  const inside = (open: OpenInstance): boolean =>
+    open.path !== path && under(open.path, path) && !offInstance(open.detached, path);
+  // An end already under way inside this one, read afresh on every round
+  // because ends begin while this one waits: an instance this round stops ends
+  // its body, and its finally node then begins instances the next round must
+  // leave alone.
+  const closing = (open: OpenInstance): boolean =>
+    [...held].some((other) => other.path === open.path) ||
+    underClosingFinally(held, path, open.path);
+  const open = openInstances.get(execution);
+  if (open === undefined || ![...open.values()].some(inside)) return release;
+  try {
+    abandonPausesUnder(execution, path);
+    for (;;) {
+      const now = openInstances.get(execution);
+      if (now === undefined) break;
+      const running = [...now].filter(([, one]) => inside(one));
+      if (running.length === 0) break;
+      for (const [, one] of running) {
+        if (!closing(one)) one.stop.abort(reason);
+      }
+      await Promise.allSettled(running.map(([promise]) => promise));
+    }
+  } catch (error) {
+    release();
+    throw error;
+  }
+  return release;
+}
+
+/**
+ * Wait until no instance at or under `site` is still running — each one has
+ * ended, its `finally:` node included (grammar 7.9).
+ *
+ * The prefix relation instance paths already carry (grammar 9.4): a `flow:`
+ * node's instance is at the node's own site, a joined `map` item's and a
+ * flow-as-tool call's are under it, and so is every instance nested in any of
+ * them. Asked again after each wait, because an instance that was running when
+ * the wait began may begin another before it ends; nothing new can begin under
+ * a node whose clock has run out, which [`runSubflow`] refuses. Save the work of
+ * a detached delivery the node issued, which it never waits for
+ * ([`offInstance`]).
+ *
+ * Callers ask [`instancesOpenUnder`] first, because an `await` here costs a
+ * turn even where nothing is open.
+ */
+async function instancesEnded(execution: string, site: string): Promise<void> {
+  for (;;) {
+    const open = openInstances.get(execution);
+    if (open === undefined) return;
+    const running = [...open]
+      .filter(([, one]) => under(one.path, site) && !offInstance(one.detached, site))
+      .map(([ending]) => ending);
+    if (running.length === 0) return;
+    await Promise.allSettled(running);
+  }
+}
+
+/**
+ * How one flow instance ended (grammar 7.9, PRD resolved q76): what a
+ * `finally:` node reads as `execution.outcome`.
+ *
+ * `cancelled` is one of the three before anything produces it. PRD resolved
+ * q75's cancel is what will, through [`endInstance`] like the other two, and
+ * the value is here now so that a finally node written against it checks and
+ * runs today rather than at the release that adds the route.
+ */
+export type InstanceOutcome = "completed" | "failed" | "cancelled";
+
+/** What an instance's `finally:` node is told about the end it runs at. */
+export interface InstanceEnding {
+  readonly outcome: InstanceOutcome;
+  /**
+   * The error that ended the body, in `docs/trace.md` §3's shape — the aborting
+   * entry's own `error` — and absent on an instance that completed:
+   * `execution.error` inside the finally node, under grammar 4.1's absent-value
+   * rule.
+   */
+  readonly error?: string;
+}
+
+/** What running an instance's `finally:` node left behind. */
+export interface FinallyRun {
+  /**
+   * Its trace entry: an ordinary one, `node` its id, carrying `outcome`,
+   * `writes` and `error` like any — and **no `routing`**, because it has no
+   * edges to decide (`docs/trace.md` §3). It is the instance's last entry.
+   */
+  readonly entry: TraceEntry;
+  /** The instance's state with the finally node's writes applied. */
+  readonly state: GraphStateLike;
+  /**
+   * The end the node ran at, and so the end the instance **settles on**: the one
+   * it was handed — or, on a resumed generation that found the boundary already
+   * recorded, the recorded one, which may not be the end this generation's
+   * replayed body reached (`docs/durability.md` §3.10). A caller whose body
+   * completed reads a recorded `failed` here and fails the instance with
+   * [`RecordedEnding`].
+   */
+  readonly ending: InstanceEnding;
+}
+
+/**
+ * What a resumed instance fails with when its `finally` boundary records an end
+ * its replayed body did not reach (grammar 7.9, `docs/durability.md` §3.10).
+ *
+ * A restart that finds the body settled and the boundary recorded runs the
+ * finally node alone, once, at the end the record holds (PRD resolved q76) —
+ * and the instance ends there too. The way a replay comes to complete where the
+ * generation that recorded the boundary failed is a clock: a `timeout:` that
+ * ended a `retry:` ladder in that generation runs against this one's, and an
+ * attempt the deadline never let it make is made now. That body's answer is not
+ * the instance's; the recorded failure is, and this carries it — `outcome` and
+ * `error` as the boundary holds them.
+ */
+export class RecordedEnding extends Error {
+  readonly ending: InstanceEnding;
+
+  constructor(ending: InstanceEnding) {
+    super(
+      ending.error === undefined
+        ? `the journal records this instance as ${ending.outcome}`
+        : `the journal records this instance as ${ending.outcome}: ${ending.error}`,
+    );
+    this.name = "RecordedEnding";
+    this.ending = ending;
+  }
+}
+
+/**
+ * Whether what stopped an instance is an **end** of it, and which.
+ *
+ * `undefined` — no end at all — for the outcomes after which the execution's
+ * row stays open ([`staysOpen`]): a `human` pause the run parks at (exit `3`,
+ * `status: "interrupted"`), which the resumed run runs on from, and a replay
+ * divergence, after which nothing this generation does is in the record. A
+ * pause nobody is waiting for any more ([`HumanAbandoned`]) with nothing having
+ * stopped the instance holding it is not one either: what abandons a pause
+ * that way is the release of an execution that parked or diverged
+ * ([`releaseHumanWaits`]), whose row stays open for a resumed generation to run
+ * the instance on from. An instance whose own stop was pulled — the end of the
+ * instance around it, or its node's deadline — arrives here with the stop
+ * instead of the abandonment ([`stoppedBy`]), and has ended. Every other way
+ * out is an end: no error is `completed` — a body that ended through
+ * `on_error: skip` or a `fallback:` to `end` included (Decision D97) — and an
+ * error is `failed`.
+ */
+export function instanceEnding(execution: string, error: unknown): InstanceEnding | undefined {
+  if (staysOpen(execution, error) || abandonedOf(error) !== undefined) return undefined;
+  if (error === undefined) return { outcome: "completed" };
+  return { outcome: "failed", error: describe(error) };
+}
+
+/** The `execution` root inside a `finally:` node (grammar 4.1, 7.9). */
+const FINALLY_EXECUTION_SHAPE = {
+  properties: {
+    id: "string",
+    session_key: "string",
+    item_index: "int",
+    outcome: "string",
+    error: "string",
+  },
+} as const;
+
+/**
+ * The `execution` root an expression reads, bound (grammar 4.1): the run
+ * identity alone — or, inside a `finally:` node, with how its instance ended
+ * beside it, `execution.outcome` and `execution.error` (grammar 7.9).
+ *
+ * One function for both, because the finally node's roots are built in two
+ * places: once for the node's own configuration ([`endInstance`]), and again
+ * for each item of a `map` that **is** the finally node ([`mapPlan`]), whose
+ * per-item bindings re-derive `execution` to give it the item's `item_index`.
+ * A rebuild that forgot the end would drop the two fields the checker lets
+ * every one of those bindings read.
+ */
+function executionRoot(execution: ExecutionIdentity, ending?: InstanceEnding): CelValue {
+  if (ending === undefined) return bindRoot(execution, EXECUTION_SHAPE);
+  return bindRoot(
+    {
+      ...execution,
+      outcome: ending.outcome,
+      ...(ending.error === undefined ? {} : { error: ending.error }),
+    },
+    FINALLY_EXECUTION_SHAPE,
+  );
+}
+
+/**
+ * The first failure a `finally:` node of each execution raised after its own
+ * retries — `finally_error` on the execution's record (grammar 7.9, PRD
+ * resolved q76).
+ *
+ * The **first**, because an execution has one record and several finally nodes
+ * may fail in it — a subflow's, then the root's — and the first is the one the
+ * rest ran after. Every one of them is also on its own trace entry, failed, with
+ * its own `error`, so nothing a second one said is lost. Read by
+ * [`settleExecution`] for the lifecycle row and by the run for the envelope, and
+ * released with the execution ([`closeExecution`]).
+ *
+ * Written only while this process is keeping the execution's record
+ * ([`journaling`]), through [`keepFinallyFailure`]: see there for the one
+ * failure that arrives after it has closed.
+ */
+const finallyFailures = new Map<string, string>();
+
+/**
+ * Put one finally node's failure on its execution's record — or, where that
+ * record has already closed, say on stderr that it could not.
+ *
+ * This process closes the record at [`closeExecution`] — the run settled, or
+ * parked — and something of the execution can still end after that: a
+ * detached `agent.*` or `tool.*` delivery runs on past it by design (grammar
+ * 8.6 rule 7), and so does an instance its model begins from its `tools:`,
+ * which ends on its own (grammar 7.9); and a worker can post a placed node's
+ * result after the hub settled (`docs/distributed.md` §3.4). A failure a
+ * finally node raises then has no row to go on and no envelope to ride in: the
+ * row has been written and the trace has shipped. Held here regardless, it
+ * would be read by nobody and released by nothing — [`closeExecution`] has
+ * already run — so it would stay for the life of a `serve` process, one entry
+ * per such execution. So it is not held: the line on stderr is its account,
+ * naming the execution, the node and the error. (Its boundary is journaled
+ * nowhere either: [`recorderFor`] answers nothing once the session is gone.)
+ */
+function keepFinallyFailure(execution: string, failure: string): void {
+  if (!journaling(execution)) {
+    process.stderr.write(
+      `warning: a finally node of execution \`${execution}\` failed after this process had closed the execution's record, which therefore does not hold it: ${failure} (grammar 7.9)\n`,
+    );
+    return;
+  }
+  if (!finallyFailures.has(execution)) finallyFailures.set(execution, failure);
+}
+
+/** What `finally_error` holds for this execution, where a finally node failed. */
+export function finallyErrorOf(execution: string): string | undefined {
+  return finallyFailures.get(execution);
+}
+
+/**
+ * Hold a `finally:` node's failure that another process ran into on this
+ * execution's behalf — a placed node's worker, whose flow-as-tool instance ran
+ * its finally node there (grammar 14.1 rule 4, `docs/distributed.md` §3.4) —
+ * as this process's own, under [`finallyFailures`]' rule: the first one stands.
+ *
+ * The worker cannot write it anywhere itself: the lifecycle row is the hub's
+ * (§3.3's single writer), so it travels home on the dispatch's result and lands
+ * here, where [`settleExecution`] and the run's envelope read it like one this
+ * process raised.
+ */
+export function holdFinallyError(execution: string, error: string): void {
+  keepFinallyFailure(execution, error);
+}
+
+/**
+ * The end-of-instance seam: run a flow instance's `finally:` node, once, now
+ * that the instance has ended (grammar 7.9, PRD resolved q76).
+ *
+ * Every instance ends here — the root instance of an execution (`src/graph.ts`'s
+ * run), each `flow:` node's and each joined `map` dispatch's ([`runSubflow`]),
+ * and a child execution's root, which is a run of its own — and this is the one
+ * place what that means is written down:
+ *
+ * 1. **The boundary is journaled first** (`docs/durability.md` §3.10): a
+ *    `finally` record at the finally node's own site, claimed under the node's
+ *    id and holding how the instance ended. A resumed generation that replays
+ *    the body reaches this point again and finds it — and the **record** is the
+ *    end: the node reads the outcome and error the first generation recorded,
+ *    and the instance settles on them ([`FinallyRun.ending`]), whatever end the
+ *    replayed body reached. The one end a record cannot stand for is a
+ *    completion the replay failed to reach: the instance's answer is its body's,
+ *    and is on no record, so that is a [`ReplayDivergence`] raised before the
+ *    node runs. The node's own effects are ordinary journaled effects at that
+ *    site: a restart before they landed runs them live, once, and a restart
+ *    after replays them.
+ * 2. **The node runs under its own grammar 9.3 policy** — its `retry:` and
+ *    `timeout:`, levels 1–4 as any node — with `execution.outcome` and
+ *    `execution.error` in its roots, and nothing else differs from a node of
+ *    the body: its input is built from the instance's `input` and `state`, its
+ *    activity is the one its kind runs, its writes land through their channels'
+ *    reduce policies.
+ * 3. **Its failure changes nothing it ran after.** Once its retries are spent —
+ *    or where its input could not even be built — the error is
+ *    `finally_error` on the execution's record ([`finallyErrorOf`]) — or on
+ *    stderr, where this process has already closed that record
+ *    ([`keepFinallyFailure`]) — and on its own entry, and the instance ends
+ *    with the outcome it already had: a
+ *    completed run stays completed, its outputs and exit code what they were.
+ *    No `on_error:` applies at any level; a divergence is the one error that
+ *    still travels, because it is un-absorbable everywhere (PRD resolved q29).
+ *
+ * `undefined` where there is nothing to run: an instance of a flow with no
+ * `finally:`, and an `ending` of `undefined` — a stop that is not an end
+ * ([`instanceEnding`]).
+ *
+ * **The cancelled arm.** `ending.outcome` may be `"cancelled"`, and that is the
+ * whole of what PRD resolved q75's cancel will need from this seam: it is
+ * journaled, read and run exactly as the other two. Nothing in this release
+ * produces it — there is no cancel route yet — so the one caller that passes it
+ * is the test that drives this function directly.
+ */
+export async function endInstance(
+  descriptor: NodeDescriptor | undefined,
+  state: GraphStateLike,
+  ending: InstanceEnding | undefined,
+  body: readonly TraceEntry[],
+): Promise<FinallyRun | undefined> {
+  if (descriptor === undefined || ending === undefined) return undefined;
+  const run = state.$run;
+  // After every entry of the body, the aborting one included: the finally entry
+  // is the instance's last (`docs/trace.md` §9).
+  const step = 1 + body.reduce((latest, entry) => Math.max(latest, entry.step), run.step);
+  // Grammar 9.4's frame for the node, `<node id>/<traversal ordinal>`: the
+  // ordinal is always `0`, because the instance runs its finally node once and
+  // no edge can bring it round again — the same site [`instancePath`] derives
+  // for a body node's first traversal.
+  const traversal = 0;
+  const site = [...run.path, `${descriptor.node}/${traversal}`].join("/");
+  const policy = effectivePolicy(descriptor.policy, false, run.policy);
+
+  // 1. The boundary, recorded before the node runs — and on a resumed
+  // generation, read: the recorded end is the instance's, so the identity is the
+  // node alone, and the outcome is what the record answers rather than what it
+  // is compared against (grammar 7.9, PRD resolved q76).
+  let held: InstanceEnding = ending;
+  const recorder = recorderFor(run.execution.id, site);
+  if (recorder !== undefined) {
+    const slot = await recorder.claim("finally", { node: descriptor.node });
+    if (slot.held?.kind === "value") {
+      held = slot.held.value as InstanceEnding;
+      // A completion the replay did not reach is the one end the record cannot
+      // settle the instance on: what a completed instance answers is its body's
+      // outputs, which no record holds (`docs/durability.md` §3.10).
+      if (held.outcome === "completed" && ending.outcome !== "completed") {
+        throw new ReplayDivergence(
+          slot,
+          `the journal records this instance as completed, and its body replayed to ${
+            ending.outcome
+          }${ending.error === undefined ? "" : `: ${ending.error}`}`,
+        );
+      }
+    } else if (slot.held === undefined) {
+      held = (await slot.keep({
+        outcome: ending.outcome,
+        ...(ending.error === undefined ? {} : { error: ending.error }),
+      })) as InstanceEnding;
+    }
+  }
+
+  // 2. The node, with the end in its `execution` root — and on its view, for a
+  // `map` finally node's per-item bindings to carry into theirs.
+  const configuration: Roots = {
+    input: bindRoot(run.input, descriptor.shapes.input),
+    state: bindRoot(declared(state, descriptor.shapes.state), descriptor.shapes.state),
+    execution: executionRoot(run.execution, held),
+  };
+  const view: NodeView = { state, run, roots: configuration, ending: held };
+  const storeRecords: StoreRecord[] = [];
+  const modelCalls: ModelCall[] = [];
+  const innerTraces: TraceEntry[] = [];
+  const toolDispatched: DispatchRecord[] = [];
+  const harnessRuns: HarnessRecord[] = [];
+  // What the node did, whichever way it ended — read off the collectors exactly
+  // as [`runNode`] reads them, for its reason: an attempt that failed still
+  // made its calls and its writes (PRD 5.3, 5.8, 5.9).
+  const recorded = (): Partial<TraceEntry> => ({
+    ...(toolDispatched.length === 0 ? {} : { toolDispatches: [...toolDispatched] }),
+    ...(innerTraces.length === 0 ? {} : { inner: [...innerTraces] }),
+    ...(storeRecords.length === 0 ? {} : { stores: [...storeRecords] }),
+    ...(modelCalls.length === 0 ? {} : { models: settled(modelCalls) }),
+    ...(harnessRuns.length === 0 ? {} : { harness: [...harnessRuns] }),
+  });
+
+  // Its own end, not the body's: the body's has already come — it is why this
+  // node is running — and what this node begins (the instances a `flow:` node,
+  // a `map` or a `flow.*` tool of it starts, its own `retry:` attempts) is how
+  // the instance ends rather than new work inside one that has (grammar 7.9).
+  // Aborted once the node has settled, so nothing it let go of begins after.
+  const own = new AbortController();
+  let attempts = 0;
+  try {
+    // Inside the `try`, unlike a body node's: an input that cannot be built is
+    // still this node failing, and a finally node's failure has one meaning
+    // (grammar 7.9) — where a body node's would fail the execution past its
+    // `on_error:` (Decision D110), this one leaves the execution's outcome
+    // where the body left it.
+    const input = descriptor.input(configuration, view);
+    const answer = await runActivity(
+      descriptor.flow,
+      descriptor.node,
+      site,
+      policy,
+      run.execution,
+      (context) => descriptor.run(input, context, view),
+      storeRecords,
+      modelCalls,
+      innerTraces,
+      toolDispatched,
+      harnessRuns,
+      own.signal,
+    );
+    attempts = answer.attempts;
+    const update: Record<string, unknown> = {};
+    const written: string[] = [];
+    const fields = (answer.value.output ?? {}) as Record<string, unknown>;
+    for (const write of descriptor.writes) {
+      const value = fields[write.field];
+      // A field the result does not carry performs no write (Decision D110).
+      if (value === undefined) continue;
+      update[write.channel] = applyWrite(state[write.channel], value, write.reduce);
+      written.push(write.channel);
+    }
+    for (const batch of answer.value.channels ?? []) {
+      if (batch.values.length === 0) continue;
+      update[batch.channel] = batch.values.reduce(
+        (folded, value) => applyWrite(folded, value, batch.reduce),
+        state[batch.channel],
+      );
+      written.push(batch.channel);
+    }
+    const entry: TraceEntry = {
+      step,
+      flow: descriptor.flow,
+      node: descriptor.node,
+      traversal,
+      outcome: "completed",
+      attempts,
+      writes: written,
+      ...recorded(),
+      ...(answer.value.dispatches === undefined ? {} : { dispatches: answer.value.dispatches }),
+      ...(answer.value.inner === undefined
+        ? {}
+        : { inner: joined(innerTraces, answer.value.inner) }),
+      ...(answer.value.models === undefined
+        ? {}
+        : { models: settled(merged(modelCalls, answer.value.models)) }),
+    };
+    // What an agent finally node said is not added to the conversation the
+    // instance hands back on `context: inherit`: that is the body's, read before
+    // this node ran, like the outputs (grammar 7.9, 10.4).
+    return { entry, state: { ...state, ...update } as GraphStateLike, ending: held };
+  } catch (error) {
+    // The one error a finally node does not absorb: a record this run does not
+    // match is un-absorbable by any policy at any depth (PRD resolved q29).
+    if (divergenceOf(error) !== undefined) throw error;
+    attempts = error instanceof NodeFailure ? error.attempts : attempts;
+    // Named by the node whichever way it failed: [`runActivity`]'s
+    // `NodeFailure` already reads `<flow> node \`<id>\` failed: …`, and an input
+    // that could not be built is said in the same words.
+    const failure =
+      error instanceof NodeFailure
+        ? error.message
+        : `${descriptor.flow} node \`${descriptor.node}\` failed: ${describe(error)}`;
+    keepFinallyFailure(run.execution.id, failure);
+    const dispatched = dispatchesOf(error);
+    const entry: TraceEntry = {
+      step,
+      flow: descriptor.flow,
+      node: descriptor.node,
+      traversal,
+      outcome: "failed",
+      attempts,
+      ...recorded(),
+      ...(dispatched === undefined ? {} : { dispatches: dispatched }),
+      error: describe(error),
+    };
+    return { entry, state, ending: held };
+  } finally {
+    own.abort(new InstanceStopped(descriptor.flow, undefined));
+  }
 }
 
 /**
@@ -11008,7 +12258,10 @@ export function mapPlan(map: MapDescriptor, view: NodeView): MapPlan {
     };
     const roots: Roots = {
       ...view.roots,
-      execution: bindRoot(execution, EXECUTION_SHAPE),
+      // The item's own `item_index`, and — where this map is a flow's
+      // `finally:` node — the end it runs at, which the configuration's root
+      // carried and this rebuild must not drop (grammar 7.9).
+      execution: executionRoot(execution, view.ending),
       [map.as]: bindRoot(item, route.itemShape),
     };
     const variant = variantOf(map, item);
@@ -11327,6 +12580,12 @@ export async function runMap(
         ...scoped,
         signal: new AbortController().signal,
         deadline: undefined,
+        // …and off the instance's end, for the same reason: the delivery was
+        // issued when its record was written, and the instance ending around
+        // it neither withdraws it nor refuses what it goes on to do. The
+        // instances its model begins from its `tools:` are off that end too:
+        // the mark below is what says so ([`deliveryAround`], [`offInstance`]).
+        bodyEnded: undefined,
         storeRecords: undefined,
         modelCalls: undefined,
         toolDispatches: undefined,
@@ -11452,6 +12711,20 @@ export async function runMap(
         admitted();
         let attempts = 0;
         try {
+          // **An item still queued when the node's deadline ran out is never
+          // begun.** The node has stopped waiting for its fan-out, so this item
+          // has no outcome and files no record — which `docs/trace.md` §5.2
+          // reads as "no outcome resolved for this item" — and, for a `flow.*`
+          // target, no instance: nothing that never began has an end to run a
+          // `finally:` node at (grammar 7.9). The permits it just took go
+          // straight back, in the `finally` below.
+          //
+          // Nor is one still queued when the body this map node belongs to
+          // ended — a sibling's failure, or the instance's own stop — for the
+          // same reason one step further out: LangGraph has let go of the map
+          // node, nothing will read its fan-out, and nothing new begins inside
+          // an instance that has ended ([`RunContext.bodyEnded`]).
+          if (scoped.signal.aborted || isAborted(scoped.bodyEnded)) return;
           const answer = await attemptItem(map, instance, scoped);
           attempts = answer.attempts;
           landed.push({
@@ -11498,8 +12771,9 @@ export async function runMap(
           // any more, so `skip` recording it as an item the fan-out absorbed
           // would put a dispatch record on a trace entry for an outcome that
           // never happened — and would carry the fan-out past a human for the
-          // reason above (see [`abandonedOf`]).
-          if (abandonedOf(cause) !== undefined) throw error;
+          // reason above (see [`abandonedOf`]) — and nor is an instance the end
+          // around it stopped, for the same one ([`stoppedOf`]).
+          if (abandonedOf(cause) !== undefined || stoppedOf(cause) !== undefined) throw error;
           // Nor is a journal that does not describe this run. `skip` would carry
           // the fan-out past an effect the record claims to hold, which is the
           // one thing resolved q29 refuses outright — and it would do so while
@@ -12232,6 +13506,7 @@ export function traceDocument(settled: {
   readonly flow: string;
   readonly status: "completed" | "failed" | "interrupted";
   readonly error?: string;
+  readonly finallyError?: string;
   readonly entries: readonly TraceEntry[];
   readonly lineage?: Lineage;
 }): TraceDocument {
@@ -12249,6 +13524,7 @@ export function traceDocument(settled: {
     execution_id: settled.execution,
     status: settled.status,
     ...(settled.error === undefined ? {} : { error: settled.error }),
+    ...(settled.finallyError === undefined ? {} : { finally_error: settled.finallyError }),
     entries: settled.entries,
   };
 }
@@ -12367,6 +13643,11 @@ async function attemptItem(
   const busy = working(context.execution.id, instance.site.path.join("/"));
   try {
     for (let attempt = 1; attempt <= allowed; attempt += 1) {
+      // No attempt begins once the body the map node belongs to has ended —
+      // the backoff below ends on it too ([`RunContext.bodyEnded`]).
+      if (isAborted(context.bodyEnded)) {
+        throw new ItemAttempts(made, abortReason(context.bodyEnded!));
+      }
       made = attempt;
       try {
         return {
@@ -12384,7 +13665,10 @@ async function attemptItem(
         // And the same rule for a pause this instance is no longer being waited
         // on for: re-executing it would re-open the pause under a node that has
         // stopped waiting, on top of repeating every effect the instance issued.
-        if (abandonedOf(error) !== undefined) throw new ItemAttempts(made, error);
+        // Nor for an instance the end around it stopped ([`stoppedOf`]).
+        if (abandonedOf(error) !== undefined || stoppedOf(error) !== undefined) {
+          throw new ItemAttempts(made, error);
+        }
         // And a journal that does not describe this run, for [`runActivity`]'s
         // reason: a second attempt would walk the next recorded effect forward
         // and report a disagreement one step past the one that really happened.
@@ -12400,8 +13684,15 @@ async function attemptItem(
         // `finally` does for every instance this fan-out dispatched.
         abandonPausesUnder(context.execution.id, instance.site.path.join("/"));
         try {
-          await sleep(backoffFor(retry!, attempt), context.signal);
-        } catch {
+          await sleep(backoffFor(retry!, attempt), context.signal, context.bodyEnded);
+        } catch (stopped) {
+          // The end of the body the map node belongs to, rather than its
+          // deadline: the next attempt would be new work inside an instance
+          // that has ended, so the item leaves on that end, which the fan-out
+          // and the node's own ladder let through ([`stoppedOf`]).
+          if (!context.signal.aborted && isAborted(context.bodyEnded)) {
+            throw new ItemAttempts(made, stopped);
+          }
           break;
         }
       }
@@ -13073,7 +14364,8 @@ export function releaseHumanWaits(execution: string): void {
 
 /** Whether `id` names a pause at, or inside, the node instance at `site`. */
 function under(id: string, site: string): boolean {
-  return id === site || id.startsWith(`${site}/`);
+  // `""` is an execution's root instance, which every site is inside.
+  return site === "" || id === site || id.startsWith(`${site}/`);
 }
 
 /**
@@ -13180,6 +14472,10 @@ const quietWatchers = new Map<string, Set<() => void>>();
  * Counted for [`working`]'s reason and one of its own: a node `retry:` that
  * re-executes a `map` issues the next attempt's deliveries at the very paths the
  * failed attempt's are still being delivered at, and nothing cancels those.
+ *
+ * Read for one more reason, by [`deliveryAround`]: an instance a delivery's
+ * model begins is that delivery's work, and no end of an instance around it
+ * stops, waits for or refuses it (see [`openInstances`]).
  */
 const detachedSites = new Map<string, Map<string, number>>();
 
@@ -14515,10 +15811,13 @@ export async function settleExecution(execution: string, error?: unknown): Promi
   if (journal === undefined) return;
   if (staysOpen(execution, error)) return;
   await childrenBegun(execution);
+  // What a `finally:` node raised goes on the row beside the outcome it did not
+  // change (grammar 7.9, `docs/durability.md` §3.5).
+  const finallyError = finallyErrorOf(execution);
   if (error === undefined) {
-    await journal.end(execution, "completed");
+    await journal.end(execution, "completed", undefined, finallyError);
   } else {
-    await journal.end(execution, "failed", describe(error));
+    await journal.end(execution, "failed", describe(error), finallyError);
   }
   // **After** the row has closed, never before: a crash between the two leaves
   // ledger rows nothing will ask for again, and the other order could leave an
@@ -14724,6 +16023,7 @@ export function closeExecution(execution: string): void {
   settledJournals.delete(execution);
   openedExecutions.delete(execution);
   executionSessions.delete(execution);
+  finallyFailures.delete(execution);
   closeSession(execution);
 }
 
@@ -14871,6 +16171,12 @@ export interface ReportedExecution {
   readonly placements?: readonly unknown[];
   readonly outputs?: Record<string, unknown>;
   readonly error?: string;
+  /**
+   * What a `finally:` node raised after its own retries, beside a `status` it
+   * did not change (grammar 7.9, PRD resolved q76): the report's
+   * `finally_error`.
+   */
+  readonly finallyError?: string;
   readonly trace?: readonly TraceEntry[];
 }
 
@@ -14942,6 +16248,7 @@ export async function executionReport(
     ...(delivered.length === 0 ? {} : { deliveries: delivered.map(reportedDelivery) }),
     ...(execution.outputs === undefined ? {} : { outputs: execution.outputs }),
     ...(execution.error === undefined ? {} : { error: execution.error }),
+    ...(execution.finallyError === undefined ? {} : { finally_error: execution.finallyError }),
     ...(execution.trace === undefined
       ? {}
       : { trace_version: TRACE_VERSION, trace: execution.trace }),
@@ -14992,6 +16299,14 @@ export interface NodeView {
    * the producing node's result.
    */
   readonly roots: Roots;
+  /**
+   * How the instance ended, on the view of its `finally:` node and no other
+   * (grammar 7.9): what `execution.outcome` and `execution.error` read there.
+   * Carried beside `roots` for the one construct that re-derives `execution`
+   * — a `map`'s per-item bindings ([`mapPlan`]) — so a map that is the finally
+   * node hands each item the same end its own configuration read.
+   */
+  readonly ending?: InstanceEnding;
 }
 
 /** Everything `./graph.ts` says about one node (grammar 7.1, 8, 9). */
@@ -15402,6 +16717,7 @@ export async function runNode(
       innerTraces,
       toolDispatched,
       harnessRuns,
+      run.bodyEnded,
     );
     attempts = answer.attempts;
     output = answer.value.output;
@@ -15462,8 +16778,9 @@ export async function runNode(
     // it would do so inside an instance whose result was already discarded. It
     // carries **no trace entry**, for the reason it carries no strategy: the
     // entry would belong to a task nothing is left to read (see
-    // [`abandonPausesUnder`], [`HumanAbandoned`]).
-    if (abandonedOf(error) !== undefined) throw error;
+    // [`abandonPausesUnder`], [`HumanAbandoned`]). An instance the end around
+    // it stopped leaves the same way, for the same reason ([`stoppedOf`]).
+    if (abandonedOf(error) !== undefined || stoppedOf(error) !== undefined) throw error;
     // A fourth is not an outcome either, and is the one an `on_error:` must not
     // be allowed to absorb: a journal that does not describe this run
     // (resolved q29). `skip` would carry this graph past an effect the record

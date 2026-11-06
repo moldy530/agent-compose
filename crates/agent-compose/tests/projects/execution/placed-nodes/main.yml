@@ -54,6 +54,13 @@
 #     answer. Two of them run at once, so one can reach its question while the
 #     other's node is still out at a worker — the one shape in which "parked" and
 #     "running somewhere else" answer differently.
+#   * `flow.tidied` is the end of an instance reached on a worker (grammar §7.9,
+#     PRD resolved q76): a placed agent attaching a `flow.*` with a `finally:`
+#     node that fails. The attached flow's instance runs in the agent's
+#     placement, so it **ends on the worker** — its finally boundary is
+#     journaled from there over `/workers/effects`, and what its finally node
+#     raised comes home on the dispatch's result as `finally_error`
+#     (`docs/distributed.md` §3.3, §3.4).
 #
 # `agent.signer` attaches `tool.sign` and both are members of `mac`, which is
 # grammar §14.1 rule 4's second row: the same answer written twice. `tool.sign`'s
@@ -216,6 +223,16 @@ triggers:
       path: "payload.body.path"
     respond: async
 
+  # A finally node run on a worker — see `flow.tidied`.
+  on_tidied:
+    type: http
+    flow: flow.tidied
+    path: /tidyings
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
   # `session_key:` is here for `docs/distributed.md` §3.2's payload: the
   # execution identity a placed node runs under is the hub's to derive, and this
   # is the trigger that gives one an identity to derive.
@@ -372,6 +389,48 @@ agent.escalator:
     approval:
       type: string
       min_length: 1
+
+# Placed, and what it attaches is a flow with a `finally:` node — the one shape
+# in which a flow instance **ends on a worker** (grammar §7.9, §14.1 rule 4).
+agent.tidier:
+  description: Look a release over, and tidy up after it, on the machine that holds it.
+  model: model.smart
+  prompt: |
+    Look the path you are given over, and report what you found.
+  tools: [flow.tidying]
+  input:
+    path:
+      type: string
+  output:
+    signature:
+      type: string
+      min_length: 1
+
+# Attached, never triggered: its instance runs inside `agent.tidier`'s loop on
+# the worker, and its finally node fails there on every run — so the boundary
+# `/workers/effects` journals and the `finally_error` `/workers/result` carries
+# are both on the wire whenever it is called (`docs/distributed.md` §3.3, §3.4).
+flow.tidying:
+  description: Look one release over, and tidy up after it — which never works.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    look:
+      exec:
+        command: "${OPS_BIN}/sh"
+        args: ["-c", "test -n \"$LOOKED_AT\""]
+      input:
+        looked_at: "input.path"
+    tidy_up:
+      exec:
+        command: "${OPS_BIN}/false"
+  edges:
+    - { from: start, to: look }
+    - { from: look, to: end }
+  finally: tidy_up
 
 # Attached rather than triggered, and never reached any other way here: what it
 # is for is being **inside** a placed agent's tool loop.
@@ -535,6 +594,31 @@ flow.impatient:
   edges:
     - { from: start, to: escalate }
     - { from: escalate, to: end }
+
+# The end of an instance on a worker, made observable: `tidy` is placed, its
+# model calls `flow.tidying`, and that instance ends on the worker — where its
+# finally node fails. The run completes all the same (grammar §7.9: a finally
+# node changes no outcome), and the failure is this execution's `finally_error`
+# on the hub.
+flow.tidied:
+  description: A placed agent whose attached flow's finally node fails on the worker.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+  nodes:
+    tidy:
+      agent: agent.tidier
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+  edges:
+    - { from: start, to: tidy }
+    - { from: tidy, to: end }
 
 flow.release:
   description: Sign a release on a worker, and notarize it on the hub.

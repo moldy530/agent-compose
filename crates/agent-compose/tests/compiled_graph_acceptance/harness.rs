@@ -139,6 +139,14 @@ pub const FIXTURES: &[&str] = &[
     "child-executions",
     "durability",
     "fanout",
+    // A flow's `finally:` node (grammar §7.9, PRD resolved q76): one flow per
+    // claim the construct makes — every outcome, nesting, fan-out, a detached
+    // child, both restart windows, and a finally node that fails.
+    "finally",
+    // …and the one claim that fixture cannot hold: grammar §9.3's level 3, the
+    // composition's `defaults:`, reaching a finally node — which, applying to
+    // every node, needs a composition of its own.
+    "finally-defaults",
     "flow-as-tool",
     "http-events",
     "http-trigger",

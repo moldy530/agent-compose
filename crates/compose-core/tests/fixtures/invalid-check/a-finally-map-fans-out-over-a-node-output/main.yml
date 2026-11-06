@@ -1,0 +1,43 @@
+# rule: nothing dominates a flow's `finally:` node, so a finally `map` does not fan out over a node output (grammar 7.9, 8.6 rule 11, Decisions D76, D159)
+# code: non-dominating-source
+# message: `over` of the `map` of node `close_out` in `flow.f` reads `plan`, and nothing dominates a flow's `finally:` node
+# at: main.yml:36:15
+# label: main.yml:33:5 the producer is declared here
+# help: the finally node runs however its instance ended — which may be before the producer ran at all — so a node output is never guaranteed to exist there: fan out over a state channel, which holds its `default:` or the last value written (grammar 7.9, 8.6 rule 11, Decisions D76, D159)
+#
+# The finally node runs however the instance ended - before `plan` ran, if
+# `plan` is what failed - so `plan.output.tasks` is never guaranteed there.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.planner:
+  model: model.m
+  prompt: Plan.
+  output:
+    tasks:
+      type: array
+      max_items: 3
+      items: { type: string }
+agent.closer:
+  model: model.m
+  prompt: Close one task.
+  output:
+    closed: { type: boolean }
+flow.f:
+  outputs: {}
+  nodes:
+    plan: { agent: agent.planner, input: "'go'" }
+    close_out:
+      map:
+        over: "plan.output.tasks"
+        node: agent.closer
+        max_concurrency: 2
+        input: "item"
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: end }
+  finally: close_out

@@ -135,6 +135,41 @@ every node of the instantiated subflow and everything it instantiates in turn.
 "Retry, then give up" stays expressible at both levels, because `retry` is a
 field of its own.
 
+## A `finally:` node
+
+A flow's `finally:` node — the one an instance runs once when it ends — takes
+`retry` and `timeout` through all four levels like any node, so it is as
+bounded and as patient as the composition says. It takes **no** `on_error`, at
+any level: declaring one on the node is a compile error (`routed-finally`), and
+a strategy `defaults:` or a `policy:` would deliver is not applied to it.
+
+That is because its failure has exactly one meaning. Once its retries are spent,
+the error is recorded as `finally_error` on the execution's record — the journal
+row and the trace envelope, and one line on `run`'s stderr — and
+the instance ends with the outcome it already had: a run that completed stays
+completed, with its outputs and exit code `0`; a run that failed stays failed
+for its own reason.
+
+```yaml spec
+version: "0.1"
+defaults:
+  timeout: 60s
+  on_error: skip          # every node but `report` — a finally node takes none
+flow.job:
+  outputs: {}
+  nodes:
+    work:
+      exec: { command: "true" }
+    report:
+      exec: { command: "true" }
+      input: { outcome: "execution.outcome" }
+      retry: { max: 3, backoff: 2s }
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: report
+```
+
 ## Where policy does not live
 
 Tool definitions carry **no** policy keys. Policy is a property of a use site,

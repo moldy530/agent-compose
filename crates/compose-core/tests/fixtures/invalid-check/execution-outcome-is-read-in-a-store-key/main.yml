@@ -1,0 +1,25 @@
+# rule: `execution.outcome` is read only inside the flow's `finally:` node, never in another node's store-op parameters (grammar 4.1, 7.9, Decision D159)
+# code: outcome-outside-finally
+# message: `execution.outcome` is readable only inside its flow's `finally:` node, and this is a store-op parameter of node `record`
+# at: main.yml:18:12
+# help: `execution.outcome` says how the instance ended, so it exists in the one node that runs once it has — the node a flow's `finally:` names — and in no edge guard or other node, which all run before the end: move the read into the finally node, or route on the node output or channel that decided it (grammar 4.1, 7.9, Decision D159)
+version: "0.1"
+store.runs:
+  kind: kv
+  scope: global
+  value_schema:
+    note: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    record:
+      store: store.runs
+      op: set
+      key: "execution.id + '/' + execution.outcome"
+      value: { note: "'started'" }
+    cleanup:
+      exec: { command: "true" }
+  edges:
+    - { from: start, to: record }
+    - { from: record, to: end }
+  finally: cleanup
