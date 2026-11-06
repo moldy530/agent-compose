@@ -1119,10 +1119,12 @@ mod tests {
             //    `effort`, `fast` and `agents` among the others the same text
             //    reaches, none of them audited. That is a hole the driver does
             //    not close: turning the option on for every run also drops the
-            //    first turn's `CLAUDE.md`, skill and tool listings, so whether
-            //    the adapter owns it is a PRD question — one question, with both
-            //    halves in it — rather than this audit's. `harness-cc.ts` says
-            //    all of it.
+            //    first turn's `CLAUDE.md`, skill and tool listings, so PRD
+            //    resolved q67 rules it off — both halves, as a stated exemption
+            //    from resolved q57(c)'s containment (grammar D164) — and leaves
+            //    the repair to the author: a node whose `input:` carries text
+            //    the composition did not write sets `verbatimPrompts: true`
+            //    itself. `harness-cc.ts` says all of it.
             Harness::Cc => (
                 "0.3.284",
                 &[

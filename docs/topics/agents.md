@@ -334,6 +334,20 @@ to `codex` — named in the run's instructions, with the sandbox as the thing th
 actually holds; a `plan` report and a `visualize` canvas both say which of the
 two a node is.
 
+**On `cc`, the prompt is read before any of that binds — a stated exemption.**
+The CLI the Agent SDK drives treats a run's input as its own syntax first: an
+`@path` mention is expanded into that file's contents on the first request — a
+file from outside `workspace:`, with no tool call, so `allow_tools:`, the
+permission callback and the mode never see it — and an input opening with a
+slash command is dispatched as one of the CLI's commands, so `/model <id>`
+switches away from the model `model:` chose. The SDK's `verbatimPrompts` option
+turns both off, and the adapter leaves it off on purpose: on, it also drops the
+first turn's `CLAUDE.md`, skill and tool listings, which are the context a
+harness is for. So when a node's `input:` carries text you did not write — a
+trigger's payload, a model's answer — set `settings: { verbatimPrompts: true }`
+on that node. `validate` warns that the key travels unverified, which is
+expected; the node gives up its first-turn context in exchange.
+
 **`permission_mode:` is the second axis, on the one harness that has one.**
 `access:` says how far a run may reach; a permission mode says how a call inside
 that reach gets approved, and the Agent SDK has six of them —

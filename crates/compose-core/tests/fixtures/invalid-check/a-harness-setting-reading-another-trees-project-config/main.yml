@@ -37,10 +37,10 @@
 # among the other commands the same text reaches (both halves observed at this
 # pin and at 0.3.272). The adapter does not turn the option on for every run,
 # because that also drops the first turn's `CLAUDE.md`, skill and tool
-# listings; whether it should is one question for the PRD, covering both
-# halves, and until then a node whose `input:` carries text it did not write
-# can set `settings: { verbatimPrompts: true }` itself (`harness-cc.ts`,
-# `CC_RESERVED`).
+# listings; PRD resolved q67 rules it off, both halves, as a stated exemption
+# from resolved q57(c)'s containment (D164); the repair is the author's: a node
+# whose `input:` carries text the composition did not write sets
+# `settings: { verbatimPrompts: true }` itself (`harness-cc.ts`, `CC_RESERVED`).
 version: "0.1"
 provider.p:
   kind: anthropic

@@ -165,14 +165,15 @@ const CC_SETTINGS: readonly string[] = [
  *    prompt went to the model as text, on the mapped id. The driver does not
  *    turn the option on itself, because on is also the first turn without its
  *    `CLAUDE.md`, skill and tool listings — the harness's own context, which
- *    is what PRD resolved q57 adopts a harness for — so whether the adapter
- *    owns `verbatimPrompts: true` is a question for the PRD rather than for
- *    this audit, and it is one question with both halves in it: file
- *    mentions reaching past `workspace:` and the tool bounds, and command
- *    dispatch reaching past `model:` and whatever else a command sets. Until
- *    it is answered, a node whose `input:` carries text it did not write can
- *    set `settings: { verbatimPrompts: true }` itself, which is the direction
- *    the open key narrows in.
+ *    is what PRD resolved q57 adopts a harness for. PRD resolved q67 rules it
+ *    off, both halves together — file mentions reaching past `workspace:` and
+ *    the tool bounds, and command dispatch reaching past `model:` and
+ *    whatever else a command sets — as a stated exemption from resolved
+ *    q57(c)'s containment (grammar §8.9, D164). The repair is the author's,
+ *    per node: a node whose `input:` carries text the composition did not
+ *    write sets `settings: { verbatimPrompts: true }` itself, closing both
+ *    halves at the cost of its first-turn context — the direction the open
+ *    key narrows in, which is why it stays off this list.
  */
 const CC_RESERVED: readonly string[] = [
   // Options that spell a bound another key states.
