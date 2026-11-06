@@ -1,0 +1,11 @@
+# rule: `history_retention` bounds the rows `history: true` records, so on a store that records none it bounds nothing (grammar 11.1, PRD resolved q74)
+# code: missing-key
+# message: `history_retention` is not legal on store definition `store.notes` without `history: true`
+# at: 11:3
+# help: `history_retention:` is how long the history rows `history: true` records are kept, and this store records none: declare `history: true` beside it, or drop `history_retention:` (grammar 11.1, PRD resolved q74)
+store.notes:
+  kind: kv
+  scope: global
+  value_schema:
+    body: { type: string }
+  history_retention: 24h

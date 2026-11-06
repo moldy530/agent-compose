@@ -697,6 +697,19 @@ fn stores(ir: &Ir, names: &Names, imported: &mut Vec<String>) -> String {
         if let Some(ttl) = &store.default_ttl {
             text.push_str(&format!("  defaultTtl: {},\n", ttl_millis(&ttl.value)));
         }
+        // `history: true`, and its `history_retention:` in milliseconds (PRD
+        // resolved q74): whether every write records a history row in its own
+        // transaction, and how long a row is kept — absent, for good. Written
+        // only where declared, so a store without history binds as it did.
+        if store.history {
+            text.push_str("  history: true,\n");
+            if let Some(retention) = &store.history_retention {
+                text.push_str(&format!(
+                    "  historyRetention: {},\n",
+                    ttl_millis(&retention.value)
+                ));
+            }
+        }
         if let Some(embed) = &store.embed {
             text.push_str("  embed: {\n");
             text.push_str(&format!("    store: {},\n", names::string(address)));
@@ -1354,10 +1367,14 @@ fn store_tools(
                 "      schema: {},\n",
                 json_literal(&schema::json_field_map(arguments.as_ref()), "      ")
             ));
+            // `site` is the call's place in the agent's loop: what the history
+            // row a `history: true` store records names a tool's write by — the
+            // agent execution's instance path and this call's frame (PRD
+            // resolved q74).
             text.push_str(&format!(
-                "      invoke: async (args, context) =>\n        stores.runStoreTool(\n          \
+                "      invoke: async (args, context, site) =>\n        stores.runStoreTool(\n          \
                  {},\n          {},\n          runtime.parseToolArguments({schema_name}, args, {}) as Record<string, unknown>,\n          \
-                 context,\n        ),\n",
+                 context,\n          site,\n        ),\n",
                 names.value(&address),
                 names::string(op.as_str()),
                 names::string(&format!("the arguments `{name}` was called with"))
@@ -1401,6 +1418,9 @@ fn store_tool_description(
         // Nor this one, at any level (PRD resolved q71): a `batch` is a node's
         // alone.
         crate::ast::flow::StoreOp::Batch => "Write or delete several keys at once in",
+        // Nor this one (PRD resolved q74): a key's history is not exposed to
+        // agents at any access level.
+        crate::ast::flow::StoreOp::History => "Read the history of writes to one key in",
     };
     match &store.description {
         Some(description) => format!("{what} `{address}`. {}", description.value.trim()),
@@ -2576,16 +2596,23 @@ fn activity(
         // resolved q73). `<store>` is the store's declared name, the one
         // `StoreBinding.name` carries and a dialled ledger's `store` column
         // holds, so it is one rule on every arm; the key is the string the
-        // input phase evaluated. `view` is unread on that arm, which is the
-        // point: an authored key names no instance.
+        // input phase evaluated. An authored key names no instance, so the
+        // site's `path` — the node's grammar 9.4 instance path, which the
+        // history row a `history: true` store records names its writer by
+        // (PRD resolved q74) — is carried beside it on every node, derived key
+        // or authored: one writer, one actor, whichever key its ledger holds.
         NodeKind::Store { store, op, params } => {
+            let path = format!(
+                "runtime.instancePath(view, {}).join(\"/\")",
+                names::string(id)
+            );
             let site = match &params.idempotency_key {
                 None => format!(
-                    "{{ via: \"node\", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, {})].join(\"/\") }}",
+                    "{{ via: \"node\", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, {})].join(\"/\"), path: {path} }}",
                     names::string(id)
                 ),
                 Some(_) => format!(
-                    "{{ via: \"node\", idempotencyKey: stores.authoredKey({}, (input as stores.StoreParams).idempotencyKey) }}",
+                    "{{ via: \"node\", idempotencyKey: stores.authoredKey({}, (input as stores.StoreParams).idempotencyKey), path: {path} }}",
                     names::string(store_name(&store.value.to_string()))
                 ),
             };
@@ -6045,16 +6072,112 @@ flow.f:
         assert!(emitted.contains("  metadata: false,\n"), "{emitted}");
 
         // The store-op node evaluates its parameters in the input phase and
-        // carries the idempotency key of grammar 9.4 to the backend.
+        // carries the idempotency key of grammar 9.4 to the backend — and,
+        // beside it, the node's instance path, which a `history: true` store's
+        // history row names its writer by (PRD resolved q74).
         assert!(
             emitted.contains("    key: String(runtime.toJson(runtime.evaluate(\"'k'\", roots))),"),
             "{emitted}"
         );
         assert!(
             emitted.contains(
-                "{ via: \"node\", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, \"load\")].join(\"/\") }"
+                "{ via: \"node\", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, \"load\")].join(\"/\"), path: runtime.instancePath(view, \"load\").join(\"/\") }"
             ),
             "{emitted}"
+        );
+    }
+
+    /// A store's `history: true` reaches its binding as `history: true`, and
+    /// its `history_retention:` as `historyRetention:` **in milliseconds** —
+    /// the unit the runtime's cut-off subtracts from its clock (PRD resolved
+    /// q74). A store that keeps no history binds neither field, and one that
+    /// keeps every row for good binds no retention, so the runtime keeps it.
+    #[test]
+    fn a_stores_history_and_its_retention_in_milliseconds_reach_its_binding() {
+        let emitted = emit(
+            r#"version: "0.1"
+
+state:
+  found: { type: boolean, default: false }
+
+store.plain:
+  kind: kv
+  scope: global
+  description: Keeps no history.
+  value_schema:
+    text: { type: string }
+
+store.forever:
+  kind: kv
+  scope: global
+  history: true
+  description: Keeps every row for good.
+  value_schema:
+    text: { type: string }
+
+store.quarter:
+  kind: kv
+  scope: global
+  history: true
+  history_retention: 2160h
+  description: Keeps a row for ninety days.
+  value_schema:
+    text: { type: string }
+
+store.brief:
+  kind: kv
+  scope: session
+  history: true
+  history_retention: 90m
+  description: Keeps a row for an hour and a half.
+  value_schema:
+    text: { type: string }
+
+flow.f:
+  inputs: {}
+  outputs: {}
+  nodes:
+    look:
+      store: store.plain
+      op: get
+      key: "'k'"
+      writes: { found: found }
+  edges:
+    - { from: start, to: look }
+    - { from: look, to: end }
+"#,
+        );
+        let binding = |name: &str| -> String {
+            emitted
+                .split(&format!("const {name}: stores.StoreBinding = {{\n"))
+                .nth(1)
+                .unwrap_or_else(|| panic!("`{name}` is emitted: {emitted}"))
+                .split("\n};")
+                .next()
+                .expect("the binding closes")
+                .to_string()
+        };
+        let plain = binding("storePlain");
+        assert!(
+            !plain.contains("\n  history"),
+            "a store without `history: true` binds neither field, as it did: {plain}"
+        );
+        let forever = binding("storeForever");
+        assert!(forever.contains("\n  history: true,\n"), "{forever}");
+        assert!(
+            !forever.contains("\n  historyRetention"),
+            "no `history_retention:` is no cut-off — every row is kept: {forever}"
+        );
+        let quarter = binding("storeQuarter");
+        assert!(quarter.contains("\n  history: true,\n"), "{quarter}");
+        assert!(
+            quarter.contains("\n  historyRetention: 7776000000,\n"),
+            "2160h is 7_776_000_000 ms: {quarter}"
+        );
+        let brief = binding("storeBrief");
+        assert!(
+            brief.contains("\n  history: true,\n  historyRetention: 5400000,\n"),
+            "90m is 5_400_000 ms: {brief}"
         );
     }
 

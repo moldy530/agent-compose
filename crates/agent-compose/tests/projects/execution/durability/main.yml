@@ -97,6 +97,13 @@
 #     the generations: the ledger answers that one as a duplicate, while the
 #     resumed generation answers its own write out of the record, `deduped:
 #     false` as its first generation was answered (PRD resolved q73, q29).
+#   * `flow.audited` — two writes to one key of a store that keeps **history**,
+#     a `history` read of it and a route on how many rows the read found, ahead
+#     of a model call — with `flow.credited` writing the key once more between
+#     the generations: a resumed generation answers the read out of the record,
+#     so it routes on the two rows its first generation read rather than the
+#     three the live history holds, and its replayed writes record no row of
+#     their own (PRD resolved q74, q29).
 #   * `flow.fanned` — a **detached** `map` whose sink calls a *model*, which
 #     `flow.parceled`'s subprocess sink cannot decide. A delivery runs with the
 #     node execution's collectors detached (Decision D94), so its record holds
@@ -192,6 +199,18 @@ store.ledger:
   value_schema:
     entry:
       type: string
+
+# A store that keeps per-key history (PRD resolved q74): every write that lands
+# records a row — its op, the value before and after, the version, who wrote it
+# and when — in the write's own transaction, and `flow.audited` reads one key's.
+store.accounts:
+  kind: kv
+  scope: global
+  history: true
+  description: Every topic's account, with who moved it and when.
+  value_schema:
+    balance:
+      type: integer
 
 # The other lifetime, and the one a resume cannot reconstruct: `scope: execution`
 # rows live in an in-memory database opened per execution (`src/stores.ts`), so
@@ -1178,6 +1197,81 @@ flow.peeked:
     - { from: start, to: opened }
     - { from: opened, to: closed }
     - { from: closed, to: end }
+
+# PRD resolved q74's per-key history across a resume. `flow.audited` opens the
+# topic's account and credits it — two writes, two history rows — reads the
+# key's history and routes on how many rows it read, `two_writes` exactly when
+# it read its own two, and then calls a model, so a crash during that call
+# leaves the read behind the frontier. `flow.credited` writes the account once
+# more while the execution is down: a resumed generation reading the live
+# history would read three rows and take `more_writes`; replay answers the
+# recorded page instead (PRD resolved q29).
+flow.credited:
+  description: Credit the topic's account once.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    credit:
+      store: store.accounts
+      op: incr
+      key: "'acct/' + input.topic"
+      field: balance
+      by: "1"
+  edges:
+    - { from: start, to: credit }
+    - { from: credit, to: end }
+
+flow.audited:
+  description: Open and credit the topic's account, read its history, route on how long it is, then call a model.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+  outputs:
+    note:
+      type: string
+  nodes:
+    open:
+      store: store.accounts
+      op: set
+      key: "'acct/' + input.topic"
+      value:
+        balance: "0"
+    credit:
+      store: store.accounts
+      op: incr
+      key: "'acct/' + input.topic"
+      field: balance
+      by: "5"
+    page:
+      store: store.accounts
+      op: history
+      key: "'acct/' + input.topic"
+      limit: 10
+    two_writes:
+      exec:
+        command: "true"
+    more_writes:
+      exec:
+        command: "true"
+    ask:
+      agent: agent.noter
+      input:
+        topic: "input.topic"
+      writes:
+        note: note
+  edges:
+    - { from: start, to: open }
+    - { from: open, to: credit }
+    - { from: credit, to: page }
+    - { from: page, to: two_writes, when: "size(page.output.entries) == 2" }
+    - { from: page, to: more_writes, else: true }
+    - { from: two_writes, to: ask }
+    - { from: more_writes, to: ask }
+    - { from: ask, to: end }
 
 triggers:
   gate:

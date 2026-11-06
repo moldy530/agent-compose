@@ -8,6 +8,9 @@ Two keys that may not appear together both appear. The pairs are not arbitrary
 - `when:` and `else:` on one edge; `metadata_schema:` on a `blob` store, which
   no `blob` op and no synthesized `blob` tool reads; `default_ttl:` on a
   `vector` or `blob` store, which no op of either kind leaves a key to expire;
+  `history:` or `history_retention:` on a `vector` or `blob` store, whose writes
+  are none of the `kv` writes a history row records; `history_retention:` beside
+  `history: false`, which records no row for it to keep;
 - `node:` and `route_by:` on one `map`, which are the two dispatch forms;
 - a map-level `input:`/`writes:`/`detach:` on a `route_by:` map, where each
   belongs per route;
@@ -41,5 +44,5 @@ most of these one of the two is the one you meant — the other arrived by
 copy-paste from a construct that does take it.
 
 Grammar: `docs/grammar.md` §6, §7.2, §8.3, §8.6, §11.1, §13.3, Decisions D113,
-D153.
+D153, D158.
 Topics: `agent-compose docs stores`, `agent-compose docs maps`.

@@ -1,0 +1,7 @@
+# rule: `history_retention:` is a kv key too — it bounds the history a kv store records (grammar 11.1, PRD resolved q74)
+# at: /store.artifacts/history_retention
+# via: /$defs/storeDef/allOf/2/then/properties/history_retention
+store.artifacts:
+  kind: blob
+  scope: global
+  history_retention: 24h

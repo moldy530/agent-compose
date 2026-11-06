@@ -796,6 +796,12 @@ pub(crate) fn http_default_output(span: &Span) -> FieldMap {
 /// absent after a `delete` that applied, since the key then holds nothing), and
 /// `deduped` says the answer is a first attempt's, handed back by the
 /// idempotency ledger rather than performed again.
+///
+/// A `history` page (PRD resolved q74) carries five more optional fields under
+/// the same posture: the page's `next`, absent on the last page, and an
+/// entry's `old_value`, `new_value` and `version`, each absent where the key
+/// held nothing on that side of the write, and its actor's `execution` and
+/// `path`, absent on an operator's write.
 pub(crate) fn store_output(
     kind: StoreKind,
     op: StoreOp,
@@ -931,6 +937,50 @@ pub(crate) fn store_output(
             ],
             span,
         ),
+        // One page of one key's history rows, oldest first, past an exclusive
+        // cursor (PRD resolved q74): bounded by the node's `limit:` as a `list`
+        // page is, with the `next` cursor present exactly when more rows
+        // remain. A row's `old_value` is absent where the key held nothing
+        // before the write, its `new_value` and `version` where it holds
+        // nothing after it — a `delete` — and the actor is a tagged object, the
+        // one shape that types every writer at once: `kind` says which, and
+        // `execution` and `path` are there exactly when a node or a tool wrote,
+        // absent on an operator's `cli` write.
+        (StoreKind::Kv, StoreOp::History) => field_map(
+            vec![
+                (
+                    "entries",
+                    array_node(
+                        object_node(
+                            vec![
+                                ("seq", scalar_node(ScalarKind::Integer, span)),
+                                ("op", string()),
+                                ("old_value", stored()),
+                                ("new_value", stored()),
+                                ("version", version()),
+                                (
+                                    "actor",
+                                    object_node(
+                                        vec![
+                                            ("kind", enum_node(HISTORY_ACTOR_KINDS, span)),
+                                            ("execution", string()),
+                                            ("path", string()),
+                                        ],
+                                        span,
+                                    ),
+                                ),
+                                ("at", scalar_node(ScalarKind::Integer, span)),
+                            ],
+                            span,
+                        ),
+                        bound,
+                        span,
+                    ),
+                ),
+                ("next", string()),
+            ],
+            span,
+        ),
         (_, StoreOp::List) => field_map(vec![("keys", array_node(string(), bound, span))], span),
         (StoreKind::Vector, StoreOp::Search) => {
             let mut properties = vec![
@@ -960,6 +1010,11 @@ pub(crate) fn store_output(
         _ => field_map(Vec::new(), span),
     }
 }
+
+/// Who made the write a history row records (PRD resolved q74): a store-op
+/// node, a synthesized tool an agent called, or an operator at the project's
+/// command line — the `actor.kind` of a `history` entry, in that order.
+pub(crate) const HISTORY_ACTOR_KINDS: &[&str] = &["node", "tool", "cli"];
 
 /// Whether a store of this kind takes this op — grammar 11.4's table, read
 /// by row through [`StoreKind::operations`], which is the one place it is
@@ -1021,7 +1076,9 @@ pub(crate) fn numeric_fields(value_schema: Option<&FieldMap>) -> Vec<&Field> {
 ///
 /// No level offers a `batch` (PRD resolved q71): the ruling withholds it from
 /// agents at every access level, so it is a store-op node's alone, and the
-/// unit tests below pin that no row here ever names it.
+/// unit tests below pin that no row here ever names it. Nor a `history` (PRD
+/// resolved q74), on the same terms: a key's history is not exposed to agents,
+/// whatever `agent_access:` says.
 ///
 /// `full` is a `kv` level alone: the ruling defines it by `kv`'s tools, and the
 /// parser refuses it on a `vector` or `blob` store (`parse::definition`), so no
@@ -1925,6 +1982,149 @@ mod tests {
                 StoreOp::Delete
             ],
             "`full` keeps the six tools it grants"
+        );
+    }
+
+    /// A key's history is offered to no agent, at any access level and on any
+    /// kind (PRD resolved q74), and no level's set changes to make room for it:
+    /// `full` on a `history: true` store is the six tools it always was.
+    #[test]
+    fn a_history_read_is_offered_to_no_agent_at_any_access_level() {
+        for kind in StoreKind::ALL {
+            for access in [AgentAccess::Read, AgentAccess::ReadWrite, AgentAccess::Full] {
+                assert!(
+                    !store_tools(*kind, access).contains(&StoreOp::History),
+                    "`{}` at {access:?} synthesizes a `history` tool",
+                    kind.as_str()
+                );
+            }
+        }
+        assert_eq!(
+            store_tools(StoreKind::Kv, AgentAccess::Full).len(),
+            6,
+            "`full` keeps the six tools it grants"
+        );
+    }
+
+    /// `history` is a `kv` read whose row is `list`'s paging over one key:
+    /// `key` and `limit` required, `after` the optional cursor — three
+    /// parameters the catalogue already had, so the op adds a row and no
+    /// parameter (PRD resolved q74).
+    #[test]
+    fn a_history_read_is_a_kv_read_that_pages_one_key() {
+        assert!(kind_takes(StoreKind::Kv, StoreOp::History));
+        assert!(!kind_takes(StoreKind::Vector, StoreOp::History));
+        assert!(!kind_takes(StoreKind::Blob, StoreOp::History));
+        assert!(!StoreOp::History.writes(), "a history read is a read");
+        assert_eq!(StoreOp::History.required_parameters(), &["key", "limit"]);
+        assert_eq!(StoreOp::History.optional_parameters(), &["after"]);
+        assert_eq!(StoreOp::History.as_str(), "history");
+        assert!(StoreOp::ALL.contains(&StoreOp::History));
+        let every: Vec<&str> = StoreOp::ALL
+            .iter()
+            .filter(|op| **op != StoreOp::History)
+            .flat_map(|op| {
+                op.required_parameters()
+                    .iter()
+                    .chain(op.optional_parameters())
+                    .copied()
+            })
+            .collect();
+        for parameter in StoreOp::History
+            .required_parameters()
+            .iter()
+            .chain(StoreOp::History.optional_parameters())
+        {
+            assert!(
+                every.contains(parameter),
+                "`{parameter}` is a parameter another row already takes"
+            );
+        }
+    }
+
+    /// A `history` page's derived row: `entries` bounded by the node's
+    /// `limit:`, each `{ seq, op, old_value, new_value, version, actor, at }`
+    /// with `old_value`/`new_value` typed as `V` and the actor a tagged object
+    /// whose `kind` is one of `node`, `tool` and `cli`; and the page's `next`
+    /// cursor (PRD resolved q74).
+    #[test]
+    fn a_history_page_derives_entries_with_a_tagged_actor_and_next() {
+        let value = field_map(
+            vec![("body", scalar_node(ScalarKind::String, &span()))],
+            &span(),
+        );
+        let page = store_output(
+            StoreKind::Kv,
+            StoreOp::History,
+            Some(&value),
+            None,
+            Some(50),
+            false,
+            &span(),
+        );
+        assert_eq!(names(&page), ["entries", "next"]);
+        assert_eq!(
+            items(&page, "entries"),
+            (
+                vec![
+                    "seq".into(),
+                    "op".into(),
+                    "old_value".into(),
+                    "new_value".into(),
+                    "version".into(),
+                    "actor".into(),
+                    "at".into()
+                ],
+                Some(50)
+            ),
+            "one row per write, bounded like a page"
+        );
+        let TypeForm::Array(entries) = &page.fields[0].ty.form else {
+            panic!("`entries` is an array");
+        };
+        let TypeForm::Object(entry) = &entries.items.form else {
+            panic!("an entry is an object");
+        };
+        let field = |name: &str| {
+            entry
+                .properties
+                .fields
+                .iter()
+                .find(|field| field.name.value.as_str() == name)
+                .map(|field| &field.ty.form)
+                .unwrap_or_else(|| panic!("no `{name}`"))
+        };
+        for side in ["old_value", "new_value"] {
+            let TypeForm::Object(stored) = field(side) else {
+                panic!("`{side}` is `V`");
+            };
+            assert_eq!(names(&stored.properties), ["body"], "`{side}` is `V`");
+        }
+        let TypeForm::Object(actor) = field("actor") else {
+            panic!("the actor is an object");
+        };
+        assert_eq!(names(&actor.properties), ["kind", "execution", "path"]);
+        let TypeForm::Enum(kind) = &actor.properties.fields[0].ty.form else {
+            panic!("the actor's `kind` is an enum");
+        };
+        let variants: Vec<&str> = kind
+            .variants
+            .iter()
+            .map(|variant| variant.value.as_str())
+            .collect();
+        assert_eq!(variants, ["node", "tool", "cli"]);
+        assert!(
+            names(&store_output(
+                StoreKind::Blob,
+                StoreOp::History,
+                None,
+                None,
+                Some(50),
+                false,
+                &span()
+            ))
+            .is_empty(),
+            "a `blob` store takes no history, so there is no row to derive"
         );
     }
 

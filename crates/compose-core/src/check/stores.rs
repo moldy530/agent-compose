@@ -63,6 +63,15 @@
 //! that is the same for every item of a `map` dedupes the items against each
 //! other, which is what the author wrote (Decision D67).
 //!
+//! # A key's history (PRD resolved q74)
+//!
+//! A `history` read pages the rows a store records only when its definition
+//! declares `history: true`, which is the store's to answer: the op on a store
+//! that keeps no history is refused against the store, naming it. `key:` and
+//! `after:` are string expressions like a `get`'s and a `list`'s; the cursor
+//! is the last `seq` of the page before, which the page's own `next` hands
+//! back as a string.
+//!
 //! # Keying a write inside a fan-out
 //!
 //! A store write performed inside a `map`-dispatched instance must have an
@@ -137,6 +146,26 @@ pub(crate) fn store_node<'a>(
             )),
         );
         return;
+    }
+    // PRD resolved q74's `history` reads the rows a `history: true` store
+    // records, and a store that does not declare it records none — so the read
+    // would be a page that is always empty, which is refused against the store
+    // the way an op its kind does not take is.
+    if op == StoreOp::History && !definition.history {
+        ctx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidValue,
+                store.span.clone(),
+                format!(
+                    "{subject} reads the history of a key in `{}`, which keeps none: its definition does not declare `history: true`",
+                    store.value
+                ),
+            )
+            .with_help(format!(
+                "a `kv` store records a history row for every write only when its definition declares `history: true`, so a store that does not has no rows to read — declare `history: true` on `{}`, or read the key's current value with `get` (grammar 11.1, 11.4, PRD resolved q74)",
+                store.value
+            )),
+        );
     }
     if definition.kind != StoreKind::Kv
         && let Some(version) = &params.if_version

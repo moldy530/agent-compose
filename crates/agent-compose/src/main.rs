@@ -98,7 +98,9 @@
 //! `run` does and launches the emitted command line's own `store` verb, which
 //! opens the store the way a flow of that build would. What an operator writes
 //! there is **not an effect** — no execution, no idempotency key, no journal
-//! row — and the `cli` topic says it is recorded nowhere. See [`store`].
+//! row — and the `cli` topic says it is recorded only in the history of a store
+//! that declares `history: true`, as actor `cli`, and otherwise nowhere. See
+//! [`store`].
 //!
 //! The ninth takes no spec at all, and is the other half of a distributed
 //! deployment (`docs/distributed.md`, PRD 5.10):
@@ -458,7 +460,9 @@ enum Command {
 /// partition the same way ([`StoreTarget`]) and the op's own parameters as
 /// flags spelled after grammar 11.4's: `--if` and `--if-version` are `if:` and
 /// `if_version:`, `--ttl` is `ttl:`, `--after` and `--values` are a `list`'s
-/// `after:` and `include_values:`. Nothing about a store is checked here beyond
+/// `after:` and `include_values:` — and `log` is the `history` op (PRD resolved
+/// q74), its `--limit` and `--after` that op's `limit:` and `after:`. Nothing
+/// about a store is checked here beyond
 /// the shape of the arguments — which store an address names, which partition
 /// its scope wants, and whether a value fits its `value_schema` are the emitted
 /// command line's to decide, because that is where the composition and the
@@ -547,6 +551,20 @@ enum StoreOperation {
         /// Read the entries from this file rather than from standard input
         #[arg(long, value_name = "PATH")]
         file: Option<PathBuf>,
+    },
+    /// Read one page of a key's history, oldest first, on a store that declares `history: true`
+    Log {
+        #[command(flatten)]
+        target: StoreTarget,
+        /// The key whose history to read
+        #[arg(value_name = "KEY")]
+        key: String,
+        /// How many history rows one page holds, 1 to 1000 [default: 100]
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..=1000))]
+        limit: Option<u16>,
+        /// Start after this row — the `next` the page before answered
+        #[arg(long, value_name = "SEQ")]
+        after: Option<String>,
     },
 }
 
@@ -858,6 +876,16 @@ fn store(operation: StoreOperation) -> ExitCode {
                 }),
             );
             ("import", target, Vec::new())
+        }
+        StoreOperation::Log {
+            target,
+            key,
+            limit,
+            after,
+        } => {
+            flag(&mut options, "limit", limit.map(|held| held.to_string()));
+            flag(&mut options, "after", after);
+            ("log", target, vec![key])
         }
     };
     let StoreTarget {

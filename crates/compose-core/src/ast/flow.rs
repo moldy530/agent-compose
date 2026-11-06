@@ -472,6 +472,9 @@ pub enum StoreOp {
     /// `kv`: apply a literal list of `set` and `delete` entries to one store in
     /// one transaction — all of them or none (PRD resolved q71).
     Batch,
+    /// `kv`: read one page of the history rows a `history: true` store recorded
+    /// for one key, oldest first, past an exclusive cursor (PRD resolved q74).
+    History,
 }
 
 /// The most keys one `kv` `get_many` reads (grammar 11.4, PRD resolved q70).
@@ -493,7 +496,8 @@ pub const BATCH_MAX_ENTRIES: usize = 100;
 impl StoreOp {
     /// Every op: grammar 11.4's original seven in the order its table first
     /// listed them, then the three partial updates PRD resolved q68 added, then
-    /// the two reads PRD resolved q70 added, then q71's `batch`.
+    /// the two reads PRD resolved q70 added, then q71's `batch`, then q74's
+    /// `history`.
     pub const ALL: &'static [Self] = &[
         Self::Get,
         Self::Set,
@@ -508,6 +512,7 @@ impl StoreOp {
         Self::Count,
         Self::GetMany,
         Self::Batch,
+        Self::History,
     ];
 
     /// The keyword that names this op.
@@ -527,6 +532,7 @@ impl StoreOp {
             Self::Count => "count",
             Self::GetMany => "get_many",
             Self::Batch => "batch",
+            Self::History => "history",
         }
     }
 
@@ -535,7 +541,8 @@ impl StoreOp {
     /// replayed like `get` and `list` and carrying no key (PRD resolved q70).
     /// A `batch` is a write — **one** effect, carrying the node's one key, its
     /// whole answer one ledger row however many entries it holds (PRD resolved
-    /// q71).
+    /// q71). A `history` is a read of the rows the writes recorded, and records
+    /// nothing itself (PRD resolved q74).
     #[must_use]
     pub const fn writes(self) -> bool {
         matches!(
@@ -566,6 +573,9 @@ impl StoreOp {
             Self::Count => &[],
             Self::GetMany => &["keys"],
             Self::Batch => &["ops"],
+            // `list`'s posture on `limit:` (PRD resolved q70): a page's bound is
+            // the node's to write down, so it is required here too.
+            Self::History => &["key", "limit"],
         }
     }
 
@@ -602,10 +612,17 @@ impl StoreOp {
     /// row has it. `delete` is one op of three kinds, so a `vector`/`blob`
     /// `delete` naming one is refused against its store by the validator, as
     /// `if_version:` is.
+    ///
+    /// PRD resolved q74's `history` pages one key's history rows exactly as a
+    /// `list` pages a partition's keys: `key:` and `limit:` are required and
+    /// `after:` is the exclusive cursor — here the last `seq` of the page
+    /// before. It reuses those three parameters as they are, so the catalogue
+    /// gains a row and no parameter.
     #[must_use]
     pub const fn optional_parameters(self) -> &'static [&'static str] {
         match self {
             Self::Get => &[],
+            Self::History => &["after"],
             Self::Batch => &["idempotency_key"],
             Self::Delete => &["if_version", "idempotency_key"],
             Self::Set | Self::Merge => &["if", "if_version", "ttl", "idempotency_key"],

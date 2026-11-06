@@ -1,0 +1,16 @@
+# rule: a `history` reads one key's rows, so it takes `key`, `limit` and `after` and no `value` (grammar 11.4, PRD resolved q74)
+# at: /flow.demo/nodes/log/value
+# via: /$defs/storeNode/allOf/17/then/properties/value
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    log:
+      store: store.memory
+      op: history
+      key: "'k'"
+      limit: 10
+      value: "'v'"
+  edges:
+    - { from: start, to: log }
+    - { from: log, to: end }

@@ -1,0 +1,17 @@
+# rule: a `history` reads one key's rows, so it takes `key`, `limit` and `after` and no `prefix` (grammar 11.4, PRD resolved q74)
+# code: invalid-value
+# message: `prefix` is not a parameter of the `history` op
+# at: 13:7
+# help: `history` takes `key`, `limit`, `after`
+flow.demo:
+  outputs: {}
+  nodes:
+    log:
+      store: store.notes
+      op: history
+      key: "'k'"
+      prefix: "'k'"
+      limit: 10
+  edges:
+    - { from: start, to: log }
+    - { from: log, to: end }

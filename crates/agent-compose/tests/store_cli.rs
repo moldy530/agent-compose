@@ -145,7 +145,8 @@ const MEMORY: Arm = Arm {
 /// The composition every arm is driven against, with its stores named `suffix`.
 ///
 /// One store per scope a `kv` store may declare, one more declaring a
-/// `default_ttl:`, a `blob` store the command must refuse, one flow that reads what an operator left — in the global
+/// `default_ttl:`, two keeping history — one for good, one for a
+/// `history_retention:` — a `blob` store the command must refuse, one flow that reads what an operator left — in the global
 /// store and in one session's — which is how "a flow sees the operator's values"
 /// is asked of the runtime rather than of this command, and one that writes its
 /// own execution's partition and parks there, which is how "the command reads
@@ -200,6 +201,25 @@ store.files_{suffix}:
   kind: blob
   scope: global
   description: Not a kv store, so not one the store command reaches.
+
+store.audits_{suffix}:
+  kind: kv
+  scope: global
+  history: true
+  description: Every write to it is kept, with who made it and when.
+  backend: cli_db
+  value_schema:
+    text: {{ type: string }}
+
+store.trail_{suffix}:
+  kind: kv
+  scope: global
+  history: true
+  history_retention: 1h
+  description: Every write to it is kept for an hour, and no longer.
+  backend: cli_db
+  value_schema:
+    text: {{ type: string }}
 
 flow.recall:
   description: Read what an operator left, globally and in this session.
@@ -286,12 +306,16 @@ struct Project {
     /// it deletes them.
     dialled: bool,
     environment: Vec<(String, String)>,
-    /// The run-unique names of the five stores, without `store.`.
+    /// The run-unique names of the six stores, without `store.`.
     notes: String,
     leases: String,
     visits: String,
     scratch: String,
     files: String,
+    /// …the one that keeps history for good (PRD resolved q74).
+    audits: String,
+    /// …and the one that keeps it for its `history_retention:` and no longer.
+    trail: String,
 }
 
 impl Project {
@@ -362,6 +386,8 @@ impl Project {
             visits: format!("visits_{suffix}"),
             scratch: format!("scratch_{suffix}"),
             files: format!("files_{suffix}"),
+            audits: format!("audits_{suffix}"),
+            trail: format!("trail_{suffix}"),
         })
     }
 
@@ -618,6 +644,33 @@ impl Project {
         }
         held
     }
+
+    /// The history rows one of this project's stores holds **in storage** —
+    /// a row past its retention that no sweep has removed yet among them —
+    /// on any arm: `store_history` on a server, the store file's `history`
+    /// table under `--target local`.
+    fn history_rows(&self, store: &str) -> u64 {
+        if let Some(rows) = self.server(
+            "SELECT COUNT(*) AS n FROM store_history WHERE store = ?",
+            &json!([store]),
+        ) {
+            return count(&rows);
+        }
+        let file = self
+            .out
+            .join(".agent-compose/stores")
+            .join(format!("{store}.sqlite"));
+        assert!(
+            file.is_file(),
+            "a written store has its file: {}",
+            file.display()
+        );
+        count(&sqlite_rows(
+            &self.out,
+            &file,
+            "SELECT COUNT(*) AS n FROM history",
+        ))
+    }
 }
 
 /// Every row this project's stores wrote is gone when the case ends: the build
@@ -626,13 +679,28 @@ impl Drop for Project {
     fn drop(&mut self) {
         if self.dialled {
             let script = self.script();
-            for table in ["store_entries", "store_applied", "store_sequences"] {
-                let sql = format!("DELETE FROM {table} WHERE store IN (?, ?, ?, ?)");
+            for table in [
+                "store_entries",
+                "store_applied",
+                "store_history",
+                "store_sequences",
+            ] {
+                let sql = format!("DELETE FROM {table} WHERE store IN (?, ?, ?, ?, ?, ?)");
                 let mut command = bun();
                 command
                     .arg(&script)
                     .args([self.provider, STORE_URL, &sql])
-                    .arg(json!([self.notes, self.leases, self.visits, self.scratch]).to_string());
+                    .arg(
+                        json!([
+                            self.notes,
+                            self.leases,
+                            self.visits,
+                            self.scratch,
+                            self.audits,
+                            self.trail
+                        ])
+                        .to_string(),
+                    );
                 seal(&mut command, &self.environment);
                 let _ = command.output();
             }
@@ -1847,6 +1915,341 @@ fn drive(arm: &Arm) {
             )
             .exits(1);
     }
+
+    history(&project, &notes);
+}
+
+/// **`store log` reads one key's history** on a store that declares
+/// `history: true`, and an operator's write is recorded there as actor `cli`
+/// (PRD resolved q74, q72).
+///
+/// A set, a declined conditional set, a conditional set that applies and a
+/// delete record three rows — the declined one none — oldest first, each with
+/// the value before and after, the version it left and the actor `cli`, which
+/// names no execution. The table shows each row; `--format json` answers the
+/// `history` op's own page; `--limit` and `--after` page it as a `list` pages
+/// keys, with `next` absent on the last page; a store with no
+/// `history_retention:` keeps every row however far its clock moves, and one
+/// with an hour's keeps a row for that hour — compiled to the milliseconds the
+/// runtime counts — and then neither answers it nor holds it once a command's
+/// sweep has run; a key with no history answers an empty page and exits `0`,
+/// as a `list` of no keys does; and a store without history, a cursor that is
+/// not one — digits past the largest safe integer among them — and a page
+/// size out of range are usage errors, `2`.
+fn history(project: &Project, notes: &str) {
+    let audits = format!("store.{}", project.audits);
+    project
+        .store("set", &[&audits, "acct", r#"{"text":"opened"}"#])
+        .exits(0);
+    project
+        .store(
+            "set",
+            &[&audits, "acct", r#"{"text":"again"}"#, "--if", "absent"],
+        )
+        .exits(1);
+    project
+        .store(
+            "set",
+            &[&audits, "acct", r#"{"text":"moved"}"#, "--if-version", "1"],
+        )
+        .exits(0);
+    project.store("delete", &[&audits, "acct"]).exits(0);
+
+    let page = project
+        .store("log", &[&audits, "acct", "--format", "json"])
+        .exits(0)
+        .json();
+    let rows = page["entries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a log answers the history op's page: {page}"));
+    assert_eq!(
+        rows.len(),
+        3,
+        "three writes landed, and the declined one recorded nothing: {page}"
+    );
+    assert!(page.get("next").is_none(), "one page holds them: {page}");
+    let ops: Vec<&str> = rows.iter().filter_map(|row| row["op"].as_str()).collect();
+    assert_eq!(ops, ["set", "set", "delete"], "{page}");
+    for row in rows {
+        assert_eq!(
+            row["actor"],
+            json!({ "kind": "cli" }),
+            "an operator's write is recorded as actor `cli`, naming no execution: {page}"
+        );
+        assert!(row["at"].as_u64().is_some_and(|at| at > 0), "{page}");
+    }
+    assert!(
+        rows[0]["seq"].as_u64() < rows[1]["seq"].as_u64()
+            && rows[1]["seq"].as_u64() < rows[2]["seq"].as_u64(),
+        "oldest first: {page}"
+    );
+    // No `history_retention:` is no cut-off: with the store's clock moved
+    // ten years on, every row is still read.
+    assert_eq!(
+        project
+            .store_with(
+                "log",
+                &[&audits, "acct", "--format", "json"],
+                Given {
+                    environment: &[(CLOCK_OFFSET, "315360000000")],
+                    ..Given::default()
+                },
+            )
+            .exits(0)
+            .json(),
+        page,
+        "a store that declares no retention keeps every row for good"
+    );
+    assert!(rows[0].get("old_value").is_none(), "{page}");
+    assert_eq!(rows[0]["new_value"], json!({ "text": "opened" }), "{page}");
+    assert_eq!(rows[0]["version"], json!(1), "{page}");
+    assert_eq!(rows[1]["old_value"], json!({ "text": "opened" }), "{page}");
+    assert_eq!(rows[1]["new_value"], json!({ "text": "moved" }), "{page}");
+    assert_eq!(rows[1]["version"], json!(2), "{page}");
+    assert_eq!(rows[2]["old_value"], json!({ "text": "moved" }), "{page}");
+    assert!(
+        rows[2].get("new_value").is_none() && rows[2].get("version").is_none(),
+        "a delete leaves no value and no version: {page}"
+    );
+
+    let shown = project.store("log", &[&audits, "acct"]).exits(0).stdout();
+    let header = shown.lines().next().unwrap_or_default();
+    for column in [
+        "seq",
+        "at",
+        "op",
+        "version",
+        "actor",
+        "old_value",
+        "new_value",
+    ] {
+        assert!(
+            header.split_whitespace().any(|title| title == column),
+            "the table names `{column}`:\n{shown}"
+        );
+    }
+    assert_eq!(
+        shown.lines().count(),
+        4,
+        "a header and three rows:\n{shown}"
+    );
+    assert!(
+        shown.contains(r#"{"text":"opened"}"#) && shown.contains(r#"{"text":"moved"}"#),
+        "the table shows the values:\n{shown}"
+    );
+    assert!(
+        shown.lines().skip(1).all(|line| line.contains(" cli ")),
+        "every row names the operator:\n{shown}"
+    );
+
+    // Paged, as `list` pages keys.
+    let first = project
+        .store(
+            "log",
+            &[&audits, "acct", "--limit", "2", "--format", "json"],
+        )
+        .exits(0)
+        .json();
+    let next = first["next"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a page with more after it names its cursor: {first}"))
+        .to_string();
+    assert_eq!(first["entries"], json!(rows[..2]), "{first}");
+    assert_eq!(next, rows[1]["seq"].to_string(), "{first}");
+    let second = project
+        .store(
+            "log",
+            &[
+                &audits, "acct", "--limit", "2", "--after", &next, "--format", "json",
+            ],
+        )
+        .exits(0)
+        .json();
+    assert_eq!(
+        second,
+        json!({ "entries": [rows[2]] }),
+        "the last page carries no cursor"
+    );
+    let paged = project
+        .store("log", &[&audits, "acct", "--limit", "2"])
+        .exits(0)
+        .stdout();
+    assert!(
+        paged.contains(&format!("next: {next}")),
+        "the table names the cursor of the page after it:\n{paged}"
+    );
+
+    // An import's writes are an operator's too: each line it writes is a `set`
+    // recorded as actor `cli`, and the history the export did not carry is
+    // not written back — the imported key's history begins at the import.
+    let imported = project.store_with(
+        "import",
+        &[&audits, "--format", "json"],
+        Given {
+            input: Some(&format!(
+                "{}\n",
+                json!({ "key": "restored", "value": { "text": "back" }, "version": 7 })
+            )),
+            ..Given::default()
+        },
+    );
+    assert_eq!(
+        imported.exits(0).json(),
+        json!({ "read": 1, "written": 1, "skipped": 0, "expired": 0, "present": 0 })
+    );
+    let restored = project
+        .store("log", &[&audits, "restored", "--format", "json"])
+        .exits(0)
+        .json();
+    let restored = restored["entries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a log answers the history op's page: {restored}"));
+    assert_eq!(restored.len(), 1, "one line, one row: {restored:?}");
+    assert_eq!(restored[0]["op"], "set", "{restored:?}");
+    assert_eq!(
+        restored[0]["actor"],
+        json!({ "kind": "cli" }),
+        "{restored:?}"
+    );
+    assert_eq!(
+        restored[0]["new_value"],
+        json!({ "text": "back" }),
+        "{restored:?}"
+    );
+    assert!(
+        restored[0].get("old_value").is_none(),
+        "an import writes no history back, so its row is the key's first: {restored:?}"
+    );
+
+    // A `history_retention:` keeps a row for that long by the store's clock
+    // and no longer (PRD resolved q74), and reaches the runtime in the
+    // milliseconds its clock counts. With the clock moved half an hour —
+    // inside the hour — the row is read, which a retention bound in seconds
+    // (an hour read as 3.6 s) would already have hidden; moved two hours, past
+    // it, the read answers no row, and the command's own store-wide sweep has
+    // removed it from storage by the time the command exits — that store's
+    // rows only, never another store's.
+    let trail = format!("store.{}", project.trail);
+    project
+        .store("set", &[&trail, "acct", r#"{"text":"brief"}"#])
+        .exits(0);
+    let fresh = project
+        .store("log", &[&trail, "acct", "--format", "json"])
+        .exits(0)
+        .json();
+    let fresh_rows = fresh["entries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a log answers the history op's page: {fresh}"));
+    assert_eq!(fresh_rows.len(), 1, "{fresh}");
+    assert_eq!(
+        fresh_rows[0]["new_value"],
+        json!({ "text": "brief" }),
+        "{fresh}"
+    );
+    assert_eq!(
+        project
+            .store_with(
+                "log",
+                &[&trail, "acct", "--format", "json"],
+                Given {
+                    environment: &[(CLOCK_OFFSET, "1800000")],
+                    ..Given::default()
+                },
+            )
+            .exits(0)
+            .json(),
+        fresh,
+        "half an hour on, the row is inside its hour's retention"
+    );
+    assert_eq!(
+        project.history_rows(&project.trail),
+        1,
+        "a read inside the retention sweeps nothing"
+    );
+    let audited = project.history_rows(&project.audits);
+    assert_eq!(
+        project
+            .store_with(
+                "log",
+                &[&trail, "acct", "--format", "json"],
+                Given {
+                    environment: &[(CLOCK_OFFSET, "7200000")],
+                    ..Given::default()
+                },
+            )
+            .exits(0)
+            .json(),
+        json!({ "entries": [] }),
+        "two hours on, the row is past its retention and no read answers it"
+    );
+    assert_eq!(
+        project.history_rows(&project.trail),
+        0,
+        "…and the command's sweep removed it from storage before it exited"
+    );
+    assert_eq!(
+        project.history_rows(&project.audits),
+        audited,
+        "a store with no retention loses no row to another store's sweep"
+    );
+
+    // A key with no history is an empty page, not a failure.
+    let none = project.store("log", &[&audits, "nobody"]);
+    none.exits(0);
+    assert!(none.stdout().is_empty(), "{}", none.stdout());
+    assert!(
+        none.stderr().contains("has no history"),
+        "{}",
+        none.stderr()
+    );
+    assert_eq!(
+        project
+            .store("log", &[&audits, "nobody", "--format", "json"])
+            .exits(0)
+            .json(),
+        json!({ "entries": [] })
+    );
+
+    // What the command cannot do is usage.
+    let kept_none = project.store("log", &[notes, "acct"]);
+    assert!(
+        kept_none.exits(2).stderr().contains("keeps no history"),
+        "{}",
+        kept_none.stderr()
+    );
+    // A cursor is a whole number the op can hold, so digits past the largest
+    // safe integer are refused as usage before the op runs, as a word or a
+    // fraction is — never the op's own failure, which would exit `1`.
+    for cursor in ["seven", "1.5", "99999999999999999999", "9007199254740992"] {
+        let malformed = project.store("log", &[&audits, "acct", "--after", cursor]);
+        let stderr = malformed.exits(2).stderr();
+        assert!(
+            stderr.contains("is not a history cursor")
+                && stderr.contains(&format!("`--after {cursor}`")),
+            "`--after {cursor}`: {stderr}"
+        );
+    }
+    // The largest safe integer is a cursor: past every row, an empty page.
+    assert_eq!(
+        project
+            .store(
+                "log",
+                &[
+                    &audits,
+                    "acct",
+                    "--after",
+                    "9007199254740991",
+                    "--format",
+                    "json"
+                ],
+            )
+            .exits(0)
+            .json(),
+        json!({ "entries": [] })
+    );
+    project
+        .store("log", &[&audits, "acct", "--limit", "0"])
+        .exits(2);
 }
 
 /// A command whose standard output will not take its answer, on one arm — and
@@ -2255,6 +2658,7 @@ fn the_store_help_pages_are_pinned() {
         &["store", "count"],
         &["store", "export"],
         &["store", "import"],
+        &["store", "log"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_agent-compose"))
             .args(command)

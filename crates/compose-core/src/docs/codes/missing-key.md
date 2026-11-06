@@ -4,7 +4,8 @@
 
 A required key is absent. Which keys are required is usually decided by a
 sibling: a `kv` store must declare `value_schema:`, a `vector` store must
-declare `embed:`, a `human:` block with a `timeout:` must declare `on_timeout:`,
+declare `embed:`, a `kv` store with a `history_retention:` must declare
+`history: true`, a `human:` block with a `timeout:` must declare `on_timeout:`,
 a route form must declare `route:`.
 
 Sometimes what is required is a **choice**: a `tool.*` declares exactly one of

@@ -256,13 +256,14 @@ impl StoreKind {
     }
 
     /// The ops this kind serves (grammar 11.4) — on `kv`, PRD resolved q68's
-    /// three partial updates, q70's two reads and q71's `batch` among them.
+    /// three partial updates, q70's two reads, q71's `batch` and q74's
+    /// `history` among them.
     #[must_use]
     pub const fn operations(self) -> &'static [&'static str] {
         match self {
             Self::Kv => &[
                 "get", "set", "delete", "list", "merge", "append", "incr", "count", "get_many",
-                "batch",
+                "batch", "history",
             ],
             Self::Vector => &["search", "upsert", "delete"],
             Self::Blob => &["put", "get", "delete", "list"],
@@ -344,6 +345,14 @@ pub struct StoreDef {
     /// no `ttl:` leaves lives (grammar 11.1, PRD resolved q69). Absent means a
     /// key such a write leaves never expires.
     pub default_ttl: Option<Spanned<Duration>>,
+    /// `history:` — a `kv` key alone: whether every write to the store records
+    /// a history row beside the entry it leaves, in the write's own transaction
+    /// (grammar 11.1, PRD resolved q74). Absent means `false`.
+    pub history: Option<Spanned<bool>>,
+    /// `history_retention:` — a `kv` key alone, and legal only beside
+    /// `history: true`: how long a history row is kept. Absent means every row
+    /// is kept for good (grammar 11.1, PRD resolved q74).
+    pub history_retention: Option<Spanned<Duration>>,
 }
 
 /// A vector store's `embed:` block (grammar 11.2, Decision D36).

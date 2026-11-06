@@ -1,0 +1,9 @@
+# rule: `history_retention` is a `kv` key too: it bounds the history a `kv` store records (grammar 11.1, PRD resolved q74)
+# code: conflicting-keys
+# message: `history_retention` is not legal on a `blob` store
+# at: 9:3
+# help: per-key history is a `kv` store's: `history: true` records every write to one `kv` key — its op, the value before and after, the version it left, who wrote it and when — and a `vector` or `blob` write is none of those (grammar 11.1, PRD resolved q74)
+store.artifacts:
+  kind: blob
+  scope: global
+  history_retention: 24h

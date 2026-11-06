@@ -1,0 +1,20 @@
+# rule: `history` is a `kv` op, decided against the definition the node names (grammar 11.4, PRD resolved q74)
+# code: invalid-value
+# message: node `log` asks `store.artifacts` for a `history`, which a `blob` store does not take
+# at: main.yml:14:14
+# help: a `blob` store takes `put`, `get`, `delete`, `list` (grammar 11.4)
+version: "0.1"
+store.artifacts:
+  kind: blob
+  scope: global
+flow.f:
+  outputs: {}
+  nodes:
+    log:
+      store: store.artifacts
+      op: history
+      key: "'k'"
+      limit: 10
+  edges:
+    - { from: start, to: log }
+    - { from: log, to: end }

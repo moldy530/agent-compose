@@ -10,10 +10,11 @@ Single-segment is deliberate. One spelling per duration means a diff never shows
 number a generated project uses.
 
 Used by `timeout:`, `retry.backoff`, `retry.max_backoff`, `human.timeout`, a
-sync trigger's `timeout:`, a `kv` store's `default_ttl:` and a `kv` write's
+sync trigger's `timeout:`, a `kv` store's `default_ttl:` and `history_retention:`, and a `kv` write's
 `ttl:` — which alone also takes `never`, a key that does not expire. A
 `default_ttl: never` is refused here: a store with no `default_ttl:` already
-keeps every key a write leaves without a `ttl:`.
+keeps every key a write leaves without a `ttl:`, and a store with no
+`history_retention:` keeps every history row it records.
 
 ## A spec that triggers it
 

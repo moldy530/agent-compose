@@ -871,12 +871,13 @@ const agentShaper: runtime.AgentBinding = {
         ],
         "type": "object"
       },
-      invoke: async (args, context) =>
+      invoke: async (args, context, site) =>
         stores.runStoreTool(
           storeLedger,
           "get",
           runtime.parseToolArguments(storeLedgerToolGetInput, args, "the arguments `ledger_get` was called with") as Record<string, unknown>,
           context,
+          site,
         ),
     },
     {
@@ -932,12 +933,13 @@ const agentShaper: runtime.AgentBinding = {
         ],
         "type": "object"
       },
-      invoke: async (args, context) =>
+      invoke: async (args, context, site) =>
         stores.runStoreTool(
           storeLedger,
           "set",
           runtime.parseToolArguments(storeLedgerToolSetInput, args, "the arguments `ledger_set` was called with") as Record<string, unknown>,
           context,
+          site,
         ),
     },
     {
@@ -990,12 +992,13 @@ const agentShaper: runtime.AgentBinding = {
         ],
         "type": "object"
       },
-      invoke: async (args, context) =>
+      invoke: async (args, context, site) =>
         stores.runStoreTool(
           storeLedger,
           "merge",
           runtime.parseToolArguments(storeLedgerToolMergeInput, args, "the arguments `ledger_merge` was called with") as Record<string, unknown>,
           context,
+          site,
         ),
     },
     {
@@ -1043,12 +1046,13 @@ const agentShaper: runtime.AgentBinding = {
         ],
         "type": "object"
       },
-      invoke: async (args, context) =>
+      invoke: async (args, context, site) =>
         stores.runStoreTool(
           storeLedger,
           "append",
           runtime.parseToolArguments(storeLedgerToolAppendInput, args, "the arguments `ledger_append` was called with") as Record<string, unknown>,
           context,
+          site,
         ),
     },
     {
@@ -1092,12 +1096,13 @@ const agentShaper: runtime.AgentBinding = {
         ],
         "type": "object"
       },
-      invoke: async (args, context) =>
+      invoke: async (args, context, site) =>
         stores.runStoreTool(
           storeLedger,
           "incr",
           runtime.parseToolArguments(storeLedgerToolIncrInput, args, "the arguments `ledger_incr` was called with") as Record<string, unknown>,
           context,
+          site,
         ),
     },
     {
@@ -1122,12 +1127,13 @@ const agentShaper: runtime.AgentBinding = {
         ],
         "type": "object"
       },
-      invoke: async (args, context) =>
+      invoke: async (args, context, site) =>
         stores.runStoreTool(
           storeLedger,
           "delete",
           runtime.parseToolArguments(storeLedgerToolDeleteInput, args, "the arguments `ledger_delete` was called with") as Record<string, unknown>,
           context,
+          site,
         ),
     },
   ],
@@ -1456,7 +1462,7 @@ const flowShapeNodeRecall: runtime.NodeDescriptor = {
       "search",
       input as stores.StoreParams,
       context,
-      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "recall")].join("/") },
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "recall")].join("/"), path: runtime.instancePath(view, "recall").join("/") },
     ),
   }),
   writes: [],
@@ -1548,7 +1554,7 @@ const flowShapeNodeClaim: runtime.NodeDescriptor = {
       "set",
       input as stores.StoreParams,
       context,
-      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "claim")].join("/") },
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "claim")].join("/"), path: runtime.instancePath(view, "claim").join("/") },
     ),
   }),
   writes: [],
@@ -1579,7 +1585,7 @@ const flowShapeNodeStamp: runtime.NodeDescriptor = {
       "append",
       input as stores.StoreParams,
       context,
-      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "stamp")].join("/") },
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "stamp")].join("/"), path: runtime.instancePath(view, "stamp").join("/") },
     ),
   }),
   writes: [],
@@ -1609,7 +1615,7 @@ const flowShapeNodeTick: runtime.NodeDescriptor = {
       "incr",
       input as stores.StoreParams,
       context,
-      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "tick")].join("/") },
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "tick")].join("/"), path: runtime.instancePath(view, "tick").join("/") },
     ),
   }),
   writes: [],
@@ -1640,7 +1646,7 @@ const flowShapeNodeTidy: runtime.NodeDescriptor = {
       "merge",
       input as stores.StoreParams,
       context,
-      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "tidy")].join("/") },
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "tidy")].join("/"), path: runtime.instancePath(view, "tidy").join("/") },
     ),
   }),
   writes: [],
@@ -1668,7 +1674,7 @@ const flowShapeNodeDrop: runtime.NodeDescriptor = {
       "delete",
       input as stores.StoreParams,
       context,
-      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "drop")].join("/") },
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "drop")].join("/"), path: runtime.instancePath(view, "drop").join("/") },
     ),
   }),
   writes: [],
@@ -1698,7 +1704,7 @@ const flowShapeNodePage: runtime.NodeDescriptor = {
       "list",
       input as stores.StoreParams,
       context,
-      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "page")].join("/") },
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "page")].join("/"), path: runtime.instancePath(view, "page").join("/") },
     ),
   }),
   writes: [],
@@ -1725,7 +1731,7 @@ const flowShapeNodeTally: runtime.NodeDescriptor = {
       "count",
       input as stores.StoreParams,
       context,
-      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "tally")].join("/") },
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "tally")].join("/"), path: runtime.instancePath(view, "tally").join("/") },
     ),
   }),
   writes: [],
@@ -1752,7 +1758,7 @@ const flowShapeNodeFetch: runtime.NodeDescriptor = {
       "get_many",
       input as stores.StoreParams,
       context,
-      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "fetch")].join("/") },
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "fetch")].join("/"), path: runtime.instancePath(view, "fetch").join("/") },
     ),
   }),
   writes: [],
@@ -1807,7 +1813,7 @@ const flowShapeNodeShift: runtime.NodeDescriptor = {
       "batch",
       input as stores.StoreParams,
       context,
-      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "shift")].join("/") },
+      { via: "node", idempotencyKey: [view.run.execution.id, ...runtime.instancePath(view, "shift")].join("/"), path: runtime.instancePath(view, "shift").join("/") },
     ),
   }),
   writes: [],
@@ -1838,7 +1844,7 @@ const flowShapeNodeRecord: runtime.NodeDescriptor = {
       "set",
       input as stores.StoreParams,
       context,
-      { via: "node", idempotencyKey: stores.authoredKey("events", (input as stores.StoreParams).idempotencyKey) },
+      { via: "node", idempotencyKey: stores.authoredKey("events", (input as stores.StoreParams).idempotencyKey), path: runtime.instancePath(view, "record").join("/") },
     ),
   }),
   writes: [],
@@ -1878,7 +1884,7 @@ const flowShapeNodeClose: runtime.NodeDescriptor = {
       "batch",
       input as stores.StoreParams,
       context,
-      { via: "node", idempotencyKey: stores.authoredKey("events", (input as stores.StoreParams).idempotencyKey) },
+      { via: "node", idempotencyKey: stores.authoredKey("events", (input as stores.StoreParams).idempotencyKey), path: runtime.instancePath(view, "close").join("/") },
     ),
   }),
   writes: [],

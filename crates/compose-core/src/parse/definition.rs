@@ -9,7 +9,7 @@ use crate::ast::definition::{
 };
 use crate::ast::schema::{FieldMap, Surface};
 use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
-use crate::yaml::{Node, Yaml};
+use crate::yaml::{Entry, Node, Yaml};
 
 use super::binding;
 use super::flow;
@@ -679,6 +679,8 @@ fn store(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> StoreDef {
         (_, Some(entry)) => default_ttl(&entry.value, cx),
     };
 
+    let (history, history_retention) = history_keys(fields, kind.as_ref(), subject, cx);
+
     let backend = fields
         .string("backend", cx)
         .and_then(|text| lexical::identifier(&text, "backend alias", cx));
@@ -720,7 +722,97 @@ fn store(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> StoreDef {
         description,
         agent_access,
         default_ttl,
+        history,
+        history_retention,
     }
+}
+
+/// What a `history:` or a `history_retention:` on a `vector` or `blob` store is
+/// told beside the refusal (grammar 11.1, PRD resolved q74).
+const HISTORY_KV_ONLY_HELP: &str = "per-key history is a `kv` store's: `history: true` records every write to one `kv` key — its op, the value before and after, the version it left, who wrote it and when — and a `vector` or `blob` write is none of those (grammar 11.1, PRD resolved q74)";
+
+/// A `kv` store's `history:` and `history_retention:` (grammar 11.1, PRD
+/// resolved q74).
+///
+/// Both are `kv` keys, refused by name on the other two kinds as `default_ttl:`
+/// is: a history row is what one `kv` write did to one key. `history:` is a
+/// literal boolean. `history_retention:` is grammar 4.4's duration, and it
+/// bounds the rows `history: true` records — so beside a `history:` that is
+/// absent or `false` it bounds nothing, and is refused rather than read as a
+/// second way to turn history on. Its own absence is a choice the ruling makes
+/// for the author and the stores topic states: every row is kept, for good.
+fn history_keys(
+    fields: &mut Fields<'_>,
+    kind: Option<&Spanned<StoreKind>>,
+    subject: &str,
+    cx: &mut Cx,
+) -> (Option<Spanned<bool>>, Option<Spanned<Duration>>) {
+    let history_entry = kv_history_key(fields, kind, "history", cx);
+    let retention_entry = kv_history_key(fields, kind, "history_retention", cx);
+
+    let history = history_entry.and_then(|entry| match &entry.value.value {
+        Yaml::Bool(value) => Some(Spanned::new(*value, entry.value.span.clone())),
+        _ => {
+            cx.wrong_type(&entry.value, "`history`", "a boolean");
+            None
+        }
+    });
+    let retention = retention_entry.and_then(|entry| {
+        lexical::duration(&entry.value, "`history_retention`", cx).map(|duration| (entry, duration))
+    });
+    let Some((entry, duration)) = retention else {
+        return (history, None);
+    };
+    match &history {
+        Some(on) if on.value => (history, Some(duration)),
+        // A `history:` that did not parse has already been reported, and the
+        // retention beside it is not a second error about the same key.
+        None if history_entry.is_some() => (history, None),
+        held => {
+            let mut diagnostic = Diagnostic::error(
+                if held.is_some() {
+                    DiagnosticCode::ConflictingKeys
+                } else {
+                    DiagnosticCode::MissingKey
+                },
+                entry.key.span.clone(),
+                format!("`history_retention` is not legal on {subject} without `history: true`"),
+            );
+            if let Some(off) = held {
+                diagnostic = diagnostic.with_label(off.span.clone(), "history is turned off here");
+            }
+            cx.push(diagnostic.with_help(
+                "`history_retention:` is how long the history rows `history: true` records are kept, and this store records none: declare `history: true` beside it, or drop `history_retention:` (grammar 11.1, PRD resolved q74)",
+            ));
+            (history, None)
+        }
+    }
+}
+
+/// One of the two history keys, taken — or refused by name on a store whose
+/// kind is not `kv` ([`history_keys`]).
+fn kv_history_key<'a>(
+    fields: &mut Fields<'a>,
+    kind: Option<&Spanned<StoreKind>>,
+    key: &'static str,
+    cx: &mut Cx,
+) -> Option<&'a Entry> {
+    let entry = fields.take_entry(key)?;
+    if let Some(kind) = kind
+        && kind.value != StoreKind::Kv
+    {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::ConflictingKeys,
+                entry.key.span.clone(),
+                format!("`{key}` is not legal on a `{}` store", kind.value.as_str()),
+            )
+            .with_label(kind.span.clone(), "the kind is declared here")
+            .with_help(HISTORY_KV_ONLY_HELP),
+        );
+        return None;
+    }
+    Some(entry)
 }
 
 /// A `kv` store's `default_ttl:` — grammar 4.4's duration, and nothing else.

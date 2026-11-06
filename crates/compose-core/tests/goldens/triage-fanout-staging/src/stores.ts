@@ -372,6 +372,82 @@
 // exits ([`releaseStores`]); a `serve` lets its prunes finish in the background
 // while it serves and makes the same wait when it is stopped, which is the one
 // exit it has (`./serve.ts`).
+//
+// # Per-key history (PRD resolved q74)
+//
+// A `kv` store whose definition declares `history: true` records every write
+// that lands as a **history row** beside the entry it leaves — `{ seq, op,
+// old_value, new_value, version, actor, at }` — in a side table keyed by the
+// partition and the key: a store file's `history`, a dialled server's
+// `store_history`. The row is inserted **inside the write's own transaction**,
+// after the entry's own statement and by the clock that write read, by every
+// write path on every arm ([`historyRow`]): so a write that commits has its
+// row, and one that does not — a schema-refused partial update, a statement the
+// server failed, a crash before the `COMMIT` — has none, by construction.
+//
+// **What records a row is what lands.** A write whose condition did not hold
+// (`applied: false`) changed nothing and records nothing; a write the ledger
+// answered (`deduped: true`, a retry or an authored key's second execution)
+// wrote nothing and records nothing; a replayed write is answered out of the
+// journal and reaches no store at all (PRD resolved q29) — its row is the one
+// the first attempt recorded. Every write that applied records one: a `set`,
+// a `merge`, an `append`, an `incr` and a `delete` that removed the key; a
+// `delete` that applied to a key holding nothing, with no value on either
+// side; and an `append` with `unique: true` whose item was already there,
+// which changes neither value nor version — its row holds the same value on
+// both sides and the version the key kept, because it applied and refreshed
+// its key's expiry, which is a write the ruling's "every write" names. A
+// `batch` is one write of many keys (PRD resolved q71) and records one row per
+// entry, each with the entry's own op, values and version, all inside the
+// batch's transaction — and an entry whose condition declines the batch rolls
+// back to the savepoint the rows were written under, so a declined batch
+// records none.
+//
+// **The actor is a tagged object**, the one shape that types every writer in a
+// derived row: `{ kind: "node", execution, path }` for a store-op node, whose
+// `path` is the node's grammar 9.4 instance path — the site carries it on every
+// node, derived key or authored, so an authored write (PRD resolved q73) names
+// the same writer its derived one would; `{ kind: "tool", execution, path }`
+// for a synthesized tool an agent called, whose `path` is the agent
+// execution's instance path and the call's own frame (`<tool name>/<call
+// ordinal>`, [`runtime.toolInstancePath`]); and `{ kind: "cli" }` for an
+// operator's write at the project's command line (PRD resolved q72), which
+// belongs to no execution.
+//
+// **`seq` is the row's place in its key's history**, and it is an order, not a
+// count: an integer the table assigns as the row is inserted — SQLite's
+// `AUTOINCREMENT`, a Postgres `BIGSERIAL`, a MySQL `AUTO_INCREMENT` — so it is
+// never handed out twice, rows a retention sweep removed included, and two rows
+// of one key may skip the numbers other keys' rows took between them. Every
+// write to a key holds its partition's sequence lock (SQLite's serialized
+// writer locally), so a key's rows are inserted, and take their `seq`, in the
+// order their writes commit — which is what lets a page past a cursor never
+// miss a row committed after it was read.
+//
+// **The `history` read pages one key exactly as a `list` pages a partition**
+// ([`historyRead`]): the first `limit` rows after an exclusive cursor, asked for
+// as `limit + 1` so the extra row says whether more remain; `next` is present
+// exactly then, and is the page's last `seq` as a decimal string — the `after:`
+// the page after it takes. The empty string is the cursor before the first
+// row, as `list`'s `after: ""` is before every key. It is a read: recorded,
+// answered out of the record on a replay, carrying no key.
+//
+// **Retention is `history_retention:`**, a duration on the definition, and a
+// row older than it — its `at` at least that far behind the store's clock — is
+// invisible to every `history` read at once and leaves storage on q69's
+// schedule: inside a write to its partition, at most [`SWEEP_PER_WRITE`] rows
+// before the write reads its key, and at the next process start, a batch of at
+// most [`SWEEP_PER_BATCH`] at a time behind the ops. The cut-off is computed at
+// the read and the sweep from the store's retention as it is declared then, so
+// a changed `history_retention:` applies to every row, old ones included. A
+// store that declares none keeps every row, for good — one per write — which
+// is the trade the stores topic states. An operator's `export` and `import`
+// carry no history: an export is the entries, and an import's writes are an
+// operator's, recorded as `cli` like any other.
+//
+// History is a side table, not a query surface (PRD 5.8): it is read one key
+// at a time, by `history` and `agent-compose store log`, and offered to no
+// agent at any access level.
 
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -496,6 +572,17 @@ export interface StoreBinding {
    * never expires.
    */
   readonly defaultTtl?: number;
+  /**
+   * `history: true` — on a `kv` store that declares it: every write that lands
+   * records a history row in its own transaction (PRD resolved q74). Absent
+   * means it keeps none.
+   */
+  readonly history?: boolean;
+  /**
+   * `history_retention:`, in milliseconds — beside `history: true`: how long a
+   * history row is kept. Absent means every row is kept for good.
+   */
+  readonly historyRetention?: number;
   /** The backend the active target resolved (grammar 11.3, 14.2). */
   readonly backend: BackendBinding;
 }
@@ -506,9 +593,9 @@ export interface StoreBinding {
 
 /**
  * The ops of grammar 11.4's catalog — its seven, PRD resolved q68's three
- * partial updates, q70's two reads, and q71's `batch`.
+ * partial updates, q70's two reads, q71's `batch`, and q74's `history`.
  */
-export type StoreOp = "get" | "set" | "delete" | "list" | "search" | "upsert" | "put" | "merge" | "append" | "incr" | "count" | "get_many" | "batch";
+export type StoreOp = "get" | "set" | "delete" | "list" | "search" | "upsert" | "put" | "merge" | "append" | "incr" | "count" | "get_many" | "batch" | "history";
 
 /** The literal conditions a `kv` write's `if:` takes (grammar 11.4). */
 export type StoreCondition = "absent" | "present";
@@ -561,7 +648,8 @@ export interface StoreParams {
   readonly ttl?: number | "never";
   /**
    * `after:` — a `kv` `list`'s exclusive cursor: the last key of the page
-   * before, as its `next` answered it (PRD resolved q70).
+   * before, as its `next` answered it (PRD resolved q70) — or a `history`'s:
+   * the last `seq` of the page before, in decimal (PRD resolved q74).
    */
   readonly after?: string;
   /** `include_values:` — a `kv` `list` that answers its keys' values too. */
@@ -622,6 +710,49 @@ export interface StoreSite {
    * q73, [`authoredKey`]).
    */
   readonly idempotencyKey?: string;
+  /**
+   * Where the op was issued from, as grammar 9.4's instance path joined with
+   * `/` — a store-op node's own, or an agent execution's and its tool call's
+   * frame — which is how the history row a `history: true` store records names
+   * its writer (PRD resolved q74, [`HistoryActor`]). Carried on every node
+   * whatever its ledger key is, since an authored key names no instance.
+   */
+  readonly path?: string;
+}
+
+/**
+ * Who made the write one history row records (PRD resolved q74): a store-op
+ * node or a synthesized tool, by its execution's id and the instance path its
+ * site carries, or an operator at the project's command line, who belongs to
+ * no execution.
+ *
+ * A tagged object rather than a bare `{ execution, path }` beside the string
+ * `cli`, because it is a field of a derived output row and a row's field has
+ * one type: `kind` says which writer it was, and `execution` and `path` are
+ * there exactly when a node or a tool wrote — `path` only where its site
+ * carried one, which every site this compiler emits does.
+ */
+export interface HistoryActor {
+  readonly kind: "node" | "tool" | "cli";
+  readonly execution?: string;
+  readonly path?: string;
+}
+
+/** One history row, as a `history` read answers it (PRD resolved q74). */
+export interface HistoryEntry {
+  /** Its place in its key's history: monotonic per key, never reused. */
+  readonly seq: number;
+  /** The write it records: `set`, `delete`, `merge`, `append` or `incr`. */
+  readonly op: string;
+  /** What the key held before the write — absent where it held nothing. */
+  readonly old_value?: unknown;
+  /** What it held after — absent where it holds nothing, after a `delete`. */
+  readonly new_value?: unknown;
+  /** The version the write left — absent where the key holds nothing. */
+  readonly version?: number;
+  readonly actor: HistoryActor;
+  /** When, in epoch milliseconds by the store's clock — the write's own. */
+  readonly at: number;
 }
 
 /**
@@ -739,8 +870,9 @@ type Issuer = StoreSite["via"] | "operator";
  * The ops that write, which are the ones a key and a dedupe apply to.
  *
  * Every other op is a **read**: recorded, answered out of the record on a
- * replay, and carrying no idempotency key — a `list` page and PRD resolved
- * q70's `count` and `get_many` exactly as a `get` (PRD resolved q29). A
+ * replay, and carrying no idempotency key — a `list` page, PRD resolved q70's
+ * `count` and `get_many` and q74's `history` exactly as a `get` (PRD resolved
+ * q29). A
  * `batch` is a write, and **one**: its entries are one effect under the node's
  * one key, answered by one ledger row (PRD resolved q71).
  */
@@ -991,6 +1123,22 @@ function handleKey(store: StoreBinding, execution: runtime.ExecutionIdentity): s
  *
  * A file an earlier release created has `entries` without one column or both,
  * or an `applied` without its `expires_at`, and [`migrateStoreFile`] adds them.
+ *
+ * `history` is the per-key history a `history: true` store records (PRD
+ * resolved q74), one row per write that landed, in every store file whether or
+ * not its store keeps any — a store that does not leaves it empty. `seq` is
+ * `INTEGER PRIMARY KEY AUTOINCREMENT`, so it is the row's rowid and no value
+ * it ever held is handed out again, a swept row's included; the values are the
+ * JSON this module wrote, `NULL` where the key held nothing on that side of the
+ * write; and `at` is the write's own clock. Its three indexes are what reads
+ * it: `history_key` a page of one key's rows past a cursor, `history_partition_at`
+ * a write's bounded sweep of its own partition's rows past the store's
+ * retention, and `history_at` the store-wide sweep at open. A file from before
+ * PRD resolved q74 has no `history` table, and **`CREATE TABLE IF NOT EXISTS`
+ * is the whole of its migration**: a table that is not there has no rows to
+ * bring forward and no column to add, so creating it on open — every open
+ * runs this schema — is what the earlier release's file needs, with nothing
+ * for [`migrateStoreFile`] to do.
  */
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS entries (
@@ -1013,6 +1161,22 @@ CREATE TABLE IF NOT EXISTS sequences (
   scope_key TEXT PRIMARY KEY,
   last      INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS history (
+  seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope_key       TEXT NOT NULL,
+  key             TEXT NOT NULL,
+  op              TEXT NOT NULL,
+  old_value       TEXT,
+  new_value       TEXT,
+  version         INTEGER,
+  actor_kind      TEXT NOT NULL,
+  actor_execution TEXT,
+  actor_path      TEXT,
+  at              INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS history_key ON history (scope_key, key, seq);
+CREATE INDEX IF NOT EXISTS history_partition_at ON history (scope_key, at);
+CREATE INDEX IF NOT EXISTS history_at ON history (at);
 `;
 
 /**
@@ -1109,6 +1273,37 @@ function sweepLocalLedger(database: Database, now: number): void {
 }
 
 /**
+ * The instant at or before which a history row of `store` is past its
+ * `history_retention:` by the clock `now` — or `undefined` on a store that
+ * keeps every row (PRD resolved q74).
+ *
+ * Computed from the retention the store declares **now**, rather than written
+ * on each row as it is recorded, so a retention changed in the composition
+ * applies to every row the store already holds.
+ */
+function historyCutoff(store: StoreBinding, now: number): number | undefined {
+  if (store.history !== true || store.historyRetention === undefined) return undefined;
+  return now - store.historyRetention;
+}
+
+/**
+ * Remove at most [`SWEEP_PER_WRITE`] history rows past the store's retention
+ * from one partition — a write's half of the cleanup schedule, read on the
+ * history (PRD resolved q74), run inside its transaction beside the entries'
+ * sweep. Through `history_partition_at`, so it reads the rows past the cut-off
+ * and nothing else. A store that keeps every row sweeps nothing.
+ */
+function sweepLocalHistory(database: Database, store: StoreBinding, scopeKey: string, now: number): void {
+  const cutoff = historyCutoff(store, now);
+  if (cutoff === undefined) return;
+  database.run(
+    "DELETE FROM history WHERE seq IN (SELECT seq FROM history WHERE scope_key = ? " +
+      `AND at <= ? LIMIT ${SWEEP_PER_WRITE})`,
+    [scopeKey, cutoff],
+  );
+}
+
+/**
  * The store-wide sweeps in flight on every backend, so [`drainStores`] can
  * let each finish before the process goes.
  */
@@ -1139,6 +1334,8 @@ function holdSweep(sweeping: Promise<void>): void {
  * **The ledger's expired rows go the same way** (PRD resolved q73): once the
  * entries are swept, the authored ledger rows whose store's `default_ttl:` has
  * run out by `now` leave in batches of the same size, through `applied_expiry`.
+ * **And so do the history rows past the store's `history_retention:`** (PRD
+ * resolved q74), last, through `history_at` — on a store that declares one.
  *
  * **Never an op's failure.** Every read and condition already treats an
  * expired row as absent, so a batch the file refused is said on stderr and the
@@ -1149,13 +1346,19 @@ function startLocalSweep(database: Database, store: StoreBinding, now: number): 
   holdSweep(
     (async () => {
       try {
-        for (const table of ["entries", "applied"]) {
+        const cutoff = historyCutoff(store, now);
+        const passes: readonly { readonly table: string; readonly expired: string; readonly by: number }[] = [
+          { table: "entries", expired: "expires_at IS NOT NULL AND expires_at <= ?", by: now },
+          { table: "applied", expired: "expires_at IS NOT NULL AND expires_at <= ?", by: now },
+          ...(cutoff === undefined ? [] : [{ table: "history", expired: "at <= ?", by: cutoff }]),
+        ];
+        for (const { table, expired, by } of passes) {
           for (;;) {
             await new Promise((resolve) => setTimeout(resolve, 0));
             const removed = database.run(
               `DELETE FROM ${table} WHERE rowid IN (SELECT rowid FROM ${table} WHERE ` +
-                `expires_at IS NOT NULL AND expires_at <= ? LIMIT ${SWEEP_PER_BATCH})`,
-              [now],
+                `${expired} LIMIT ${SWEEP_PER_BATCH})`,
+              [by],
             );
             if (removed.changes < SWEEP_PER_BATCH) break;
           }
@@ -1829,6 +2032,9 @@ export async function runStoreOp(
   // resolved q71).
   if (op === "get_many") getManyKeys(store, params);
   if (op === "batch") batchEntries(store, params);
+  // A `history` read of a store that keeps none, and a cursor that is not
+  // one, are refused at the same point for the same reason (PRD resolved q74).
+  if (op === "history") historyCursor(store, params);
 
   // At-least-once, deduped on the key (grammar 9.4). Asked before the effect and
   // recorded with it in one transaction, so an attempt that failed half way
@@ -1872,6 +2078,14 @@ export async function runStoreOp(
         idempotencyKey,
         site.via,
         context.signal,
+        // Who a history row this write records names (PRD resolved q74): the
+        // surface that ran it, its execution, and the instance path its site
+        // carries.
+        {
+          kind: site.via,
+          execution: execution.id,
+          ...(site.path === undefined ? {} : { path: site.path }),
+        },
       );
     },
     (slot) => inProcessState(store, op, execution, slot),
@@ -2389,6 +2603,7 @@ async function perform(
   idempotencyKey: string | undefined,
   via: Issuer,
   signal: AbortSignal,
+  actor: HistoryActor,
 ): Promise<Applied> {
   if (store.kind === "blob") {
     return blobOp(store, op, params, scopeKey, idempotencyKey);
@@ -2398,7 +2613,7 @@ async function perform(
     // 14.3's capability check refuses a `postgres`/`mysql` binding on either
     // kind at compile time, and [`supported`] above has already refused every
     // other networked provider.
-    return await dialled(store, op, params, scopeKey, idempotencyKey, via);
+    return await dialled(store, op, params, scopeKey, idempotencyKey, via, actor);
   }
   const database = await open(store, execution);
   // A `vector` write and a `vector` search both need a vector, and computing one
@@ -2448,7 +2663,7 @@ async function perform(
     }
     const row =
       store.kind === "kv"
-        ? localKv(store, op, params, scopeKey, database, via, now ?? localNow())
+        ? localKv(store, op, params, scopeKey, database, via, now ?? localNow(), actor)
         : tabular(store, op, params, scopeKey, database, vector);
     if (idempotencyKey !== undefined) {
       database.run(
@@ -2477,7 +2692,9 @@ async function perform(
  * The clock is read once, inside the transaction, and is the op's whole notion
  * of now (PRD resolved q69): what is alive to its read, what its sweep removes,
  * and when the key it leaves expires. [`perform`] reads it, so the ledger row
- * an authored write leaves is dated by the same instant (PRD resolved q73).
+ * an authored write leaves is dated by the same instant (PRD resolved q73) —
+ * and so is the history row a `history: true` store's write records, after the
+ * entry's own statement and inside the same transaction (PRD resolved q74).
  */
 function localKv(
   store: StoreBinding,
@@ -2487,7 +2704,18 @@ function localKv(
   database: Database,
   via: Issuer,
   now: number,
+  actor: HistoryActor,
 ): Record<string, unknown> {
+  // A history row, written in this transaction — or nothing, on a store that
+  // keeps none ([`historyRow`]).
+  const history = (write: HistoryWrite): void => {
+    const row = historyRow(store, write, actor, now);
+    if (row === undefined) return;
+    database.run(`INSERT INTO history (scope_key, ${row.columns}) VALUES (?, ${row.placeholders})`, [
+      scopeKey,
+      ...row.bound,
+    ]);
+  };
   switch (op) {
     case "get": {
       const key = required(params.key, "key", store);
@@ -2514,6 +2742,16 @@ function localKv(
         read.query === undefined ? [] : (database.all(read.query.sql, [...read.query.bound]) as Row[]),
       );
     }
+    // One page of one key's history (PRD resolved q74), as the statement
+    // every arm shares ([`historyRead`]), judged by the op's clock, bound.
+    case "history": {
+      const read = historyRead(store, params, {
+        from: "history WHERE scope_key = ?",
+        bound: [scopeKey],
+        now: { sql: "?", bound: [now] },
+      });
+      return read.answer(database.all(read.query.sql, [...read.query.bound]) as Row[]);
+    }
     case "set":
     case "delete":
     case "merge":
@@ -2522,14 +2760,19 @@ function localKv(
       const key = required(params.key, "key", store);
       // A write to a partition is the first half of the cleanup schedule: at
       // most a hundred of its expired rows leave storage, before the key is
-      // read so that one of them may be this key (PRD resolved q69).
+      // read so that one of them may be this key (PRD resolved q69) — and, on
+      // a store with a `history_retention:`, at most a hundred of its history
+      // rows past it (PRD resolved q74).
       sweepLocalPartition(database, scopeKey, now);
-      const decision = decideKvWrite(store, op, params, localHeld(database, scopeKey, key, now), via);
+      sweepLocalHistory(database, store, scopeKey, now);
+      const held = localHeld(database, scopeKey, key, now);
+      const decision = decideKvWrite(store, op, params, held, via);
       switch (decision.effect) {
         case "none":
           return { ...decision.answer, deduped: false };
         case "remove":
           database.run("DELETE FROM entries WHERE scope_key = ? AND key = ?", [scopeKey, key]);
+          history({ op, key, before: held, after: undefined });
           return { ...decision.answer, deduped: false };
         case "touch":
           database.run("UPDATE entries SET expires_at = ? WHERE scope_key = ? AND key = ?", [
@@ -2537,6 +2780,7 @@ function localKv(
             scopeKey,
             key,
           ]);
+          history({ op, key, before: held, after: held });
           return { ...decision.answer, deduped: false };
         case "write": {
           const version = nextLocalVersion(database, scopeKey);
@@ -2546,13 +2790,14 @@ function localKv(
               "version = excluded.version, expires_at = excluded.expires_at",
             [scopeKey, key, JSON.stringify(decision.value), version, expiryOf(store, params, now)],
           );
+          history({ op, key, before: held, after: { value: decision.value, version } });
           return { ...decision.answer(version), deduped: false };
         }
       }
       break;
     }
     case "batch":
-      return localBatch(store, params, scopeKey, database, now);
+      return localBatch(store, params, scopeKey, database, now, history);
     default:
       break;
   }
@@ -2569,7 +2814,10 @@ function localKv(
  * not hold takes every earlier entry back with it while the ledger row the
  * decline is answered by still commits. Each entry that lands is written at
  * once — [`nextLocalVersion`] numbers them in entry order — so a later entry
- * naming the same key reads what the earlier one left.
+ * naming the same key reads what the earlier one left. On a `history: true`
+ * store each entry that lands records its own history row as it lands, under
+ * the same savepoint, so the decline that takes the entries back takes their
+ * rows with them (PRD resolved q74).
  */
 function localBatch(
   store: StoreBinding,
@@ -2577,13 +2825,16 @@ function localBatch(
   scopeKey: string,
   database: Database,
   now: number,
+  history: (write: HistoryWrite) => void,
 ): Record<string, unknown> {
   const entries = batchEntries(store, params);
   sweepLocalPartition(database, scopeKey, now);
+  sweepLocalHistory(database, store, scopeKey, now);
   database.exec("SAVEPOINT batch_entries");
   const results: Record<string, unknown>[] = [];
   for (const [index, entry] of entries.entries()) {
-    const step = batchStep(store, entry, localHeld(database, scopeKey, entry.key, now));
+    const held = localHeld(database, scopeKey, entry.key, now);
+    const step = batchStep(store, entry, held);
     if (step.effect === "none") {
       database.exec("ROLLBACK TO SAVEPOINT batch_entries");
       database.exec("RELEASE SAVEPOINT batch_entries");
@@ -2591,6 +2842,7 @@ function localBatch(
     }
     if (step.effect === "remove") {
       database.run("DELETE FROM entries WHERE scope_key = ? AND key = ?", [scopeKey, entry.key]);
+      history({ op: entry.op, key: entry.key, before: held, after: undefined });
       results.push({ key: entry.key });
       continue;
     }
@@ -2601,6 +2853,7 @@ function localBatch(
         "version = excluded.version, expires_at = excluded.expires_at",
       [scopeKey, entry.key, JSON.stringify(step.value), version, expiryOf(store, entry, now)],
     );
+    history({ op: entry.op, key: entry.key, before: held, after: { value: step.value, version } });
     results.push({ key: entry.key, version });
   }
   database.exec("RELEASE SAVEPOINT batch_entries");
@@ -2960,6 +3213,176 @@ function partitionRead(
 }
 
 // ---------------------------------------------------------------------------
+// One key's history (PRD resolved q74)
+// ---------------------------------------------------------------------------
+//
+// What a history row holds and how a page of them is read, written once for
+// every `kv` arm: the local backend's `history` table and a dialled server's
+// `store_history` differ in their name, the columns that select a partition,
+// and the clock a read judges retention by — which is exactly what
+// [`PartitionRows`] carries — and in nothing else. The module header says what
+// records a row and what does not.
+
+/** One write that landed, as its history row records it (PRD resolved q74). */
+interface HistoryWrite {
+  /** The write: a single op, or a `batch` entry's own `set` or `delete`. */
+  readonly op: StoreOp;
+  readonly key: string;
+  /** What the key held before the write, read under its lock — `undefined` where it held nothing. */
+  readonly before: Held | undefined;
+  /** What it holds after — `undefined` where the write left it holding nothing. */
+  readonly after: Held | undefined;
+}
+
+/**
+ * The columns a history row is inserted into after the ones that name its
+ * partition, in the order [`historyRow`] binds them. `"key"` is quoted because
+ * it is a keyword on one server and an identifier on all three.
+ */
+const HISTORY_COLUMNS = [
+  '"key"',
+  "op",
+  "old_value",
+  "new_value",
+  "version",
+  "actor_kind",
+  "actor_execution",
+  "actor_path",
+  "at",
+] as const;
+
+/**
+ * One write's history row, as the columns it is inserted into after its
+ * partition's own, their placeholders and what they bind — or `undefined` on a
+ * store that keeps no history, whose writes record nothing (PRD resolved q74).
+ *
+ * The values are the JSON this module writes into the entry itself, `NULL`
+ * where the key held nothing on that side of the write; the version is the one
+ * the write left, `NULL` where it left the key holding nothing; and `at` is the
+ * write's own clock, the one it judged its key by and dated the entry with.
+ */
+function historyRow(
+  store: StoreBinding,
+  write: HistoryWrite,
+  actor: HistoryActor,
+  now: number,
+): { readonly columns: string; readonly placeholders: string; readonly bound: readonly Bound[] } | undefined {
+  if (store.history !== true) return undefined;
+  return {
+    columns: HISTORY_COLUMNS.join(", "),
+    placeholders: HISTORY_COLUMNS.map(() => "?").join(", "),
+    bound: [
+      write.key,
+      write.op,
+      write.before === undefined ? null : JSON.stringify(write.before.value),
+      write.after === undefined ? null : JSON.stringify(write.after.value),
+      write.after === undefined ? null : write.after.version,
+      actor.kind,
+      actor.execution ?? null,
+      actor.path ?? null,
+      now,
+    ],
+  };
+}
+
+/**
+ * A `history` read's cursor, held to what one is: the empty string or nothing
+ * for the first page, else a page's `next` — the last `seq` of that page, a
+ * whole number in decimal — and refused on a store that keeps no history (PRD
+ * resolved q74).
+ *
+ * The compiler refuses a `history` on a store without `history: true`, so the
+ * store refusal is for a caller that is not the compiler. A cursor is CEL, so
+ * what it evaluates to is a run-time fact: one that is not a cursor fails the
+ * node by name before anything is read, as a `get_many` past its bound does.
+ */
+function historyCursor(store: StoreBinding, params: StoreParams): number {
+  if (store.kind !== "kv" || store.history !== true) {
+    throw new Error(
+      `\`${store.address}\` keeps no history: its definition does not declare \`history: true\`, so no write to it has recorded a row for a \`history\` read to answer (grammar 11.1, PRD resolved q74)`,
+    );
+  }
+  const after = params.after;
+  if (after === undefined || after === "") return 0;
+  if (!/^[0-9]+$/.test(after) || !Number.isSafeInteger(Number(after))) {
+    throw new Error(
+      `the \`after\` of a \`history\` on \`${store.address}\` evaluated to ${JSON.stringify(after)}, which is not a history cursor: a cursor is the \`next\` a page answered — the last \`seq\` of that page, a whole number in decimal — or the empty string for the first page (PRD resolved q74)`,
+    );
+  }
+  return Number(after);
+}
+
+/**
+ * One page of one key's history, as the statement an arm runs over `rows` and
+ * the answer its result is (PRD resolved q74) — the `list` page's shape over a
+ * key's rows rather than a partition's keys.
+ *
+ * The first `limit` rows after the cursor, oldest first, asked for as
+ * `limit + 1` so the extra row says whether more remain: `next` is present
+ * exactly then, and is the page's last `seq`. A row past the store's
+ * `history_retention:` by the op's clock is not read, by the cut-off
+ * [`historyCutoff`] sweeps by — the server's own clock on a dialled arm, the
+ * one the rows were dated with.
+ */
+function historyRead(
+  store: StoreBinding,
+  params: StoreParams,
+  rows: PartitionRows,
+): { readonly query: Query; readonly answer: (found: readonly Row[]) => Record<string, unknown> } {
+  const key = required(params.key, "key", store);
+  const limit = required(params.limit, "limit", store);
+  const after = historyCursor(store, params);
+  const retained: Query =
+    store.historyRetention === undefined
+      ? { sql: "1 = 1", bound: [] }
+      : { sql: `at > ${rows.now.sql} - ?`, bound: [...rows.now.bound, store.historyRetention] };
+  return {
+    query: {
+      sql:
+        `SELECT seq, op, old_value, new_value, version, actor_kind, actor_execution, actor_path, at ` +
+        `FROM ${rows.from} AND "key" = ? AND seq > ? AND ${retained.sql} ORDER BY seq LIMIT ?`,
+      bound: [...rows.bound, key, after, ...retained.bound, limit + 1],
+    },
+    answer: (found) => {
+      const page = found.slice(0, limit);
+      const last = page[page.length - 1];
+      return {
+        entries: page.map(historyEntry),
+        // The cursor of the page after this one, there exactly when the extra
+        // row was — so the last page answers none, and writes nothing
+        // (Decision D110).
+        ...(found.length > limit && last !== undefined ? { next: String(Number(last["seq"])) } : {}),
+      };
+    },
+  };
+}
+
+/** One stored history row, as a `history` read answers it. */
+function historyEntry(row: Row): HistoryEntry {
+  const text = (held: unknown): string | undefined =>
+    held === null || held === undefined ? undefined : String(held);
+  const before = text(row["old_value"]);
+  const after = text(row["new_value"]);
+  const version = text(row["version"]);
+  const execution = text(row["actor_execution"]);
+  const path = text(row["actor_path"]);
+  return {
+    // `BIGINT` arrives as a string from `pg` and a number elsewhere.
+    seq: Number(row["seq"]),
+    op: String(row["op"]),
+    ...(before === undefined ? {} : { old_value: JSON.parse(before) as unknown }),
+    ...(after === undefined ? {} : { new_value: JSON.parse(after) as unknown }),
+    ...(version === undefined ? {} : { version: Number(version) }),
+    actor: {
+      kind: String(row["actor_kind"]) as HistoryActor["kind"],
+      ...(execution === undefined ? {} : { execution }),
+      ...(path === undefined ? {} : { path }),
+    },
+    at: Number(row["at"]),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // The dialled `kv` backends: Postgres and MySQL (PRD resolved q63)
 // ---------------------------------------------------------------------------
 //
@@ -3082,8 +3505,10 @@ type Bound = string | number | null;
  * first three are PRD resolved q63's; the next three are q69's, because an
  * expiry needs the one thing a statement cannot carry portably — the server's
  * own clock — and a bounded `DELETE`, which the two servers spell differently;
- * and the seventh is that bounded `DELETE` read on the ledger, whose authored
- * rows expire too (PRD resolved q73).
+ * the seventh is that bounded `DELETE` read on the ledger, whose authored rows
+ * expire too (PRD resolved q73); and the eighth is the same `DELETE` read on
+ * the per-key history, whose rows a `history_retention:` bounds (PRD resolved
+ * q74).
  * The schema is not here for the same reason it is not a statement: a DDL is
  * how a backend spells the *shape* these statements need, which really is
  * per-backend, so each arm holds its own and runs it at open.
@@ -3146,6 +3571,19 @@ interface StoreDialect {
    * cannot be half of a deadlock with one.
    */
   readonly sweepLedger: (limit: number) => string;
+  /**
+   * A `DELETE` of at most `limit` history rows of **one** partition at or
+   * before a cut-off — those past the store's `history_retention:` (PRD
+   * resolved q74). Binds the store, the partition and the cut-off, in that
+   * order.
+   *
+   * [`sweepPartition`]'s statement read on the history, and run under the same
+   * lock for the same reason: only ever inside a transaction that holds the
+   * partition's sequence row — a write's, which inserts the partition's history
+   * rows under it, or a store-wide sweep batch's, which takes it first — so no
+   * other statement writing those rows is in flight beside it.
+   */
+  readonly sweepHistory: (limit: number) => string;
   /**
    * An idempotency key as this server's ledger column holds it — a spelling,
    * not a different key (PRD resolved q73).
@@ -3404,9 +3842,10 @@ async function dialled(
   scopeKey: string,
   idempotencyKey: string | undefined,
   via: Issuer,
+  actor: HistoryActor,
 ): Promise<Applied> {
   const connection = await connectionFor(store);
-  return await connection.apply(store, op, params, scopeKey, idempotencyKey, via);
+  return await connection.apply(store, op, params, scopeKey, idempotencyKey, via, actor);
 }
 
 /**
@@ -3467,14 +3906,15 @@ class RemoteKv {
     scopeKey: string,
     idempotencyKey: string | undefined,
     via: Issuer,
+    actor: HistoryActor,
   ): Promise<Applied> {
-    return this.#serial(() => this.#apply(store, op, params, scopeKey, idempotencyKey, via));
+    return this.#serial(() => this.#apply(store, op, params, scopeKey, idempotencyKey, via, actor));
   }
 
   /**
    * Delete one execution-scoped partition, when its run has ended — its
-   * entries, its ledger, and its version sequence, which nothing will address
-   * again.
+   * entries, its ledger, its history (PRD resolved q74) and its version
+   * sequence, which nothing will address again.
    *
    * One transaction, under the partition's sequence lock taken first, as a
    * write and a sweep batch take it ([`#sweepBatch`]): another process's
@@ -3491,7 +3931,7 @@ class RemoteKv {
           "SELECT last FROM store_sequences WHERE store = ? AND scope_key = ? FOR UPDATE",
           [store, scopeKey],
         );
-        for (const table of ["store_entries", "store_applied", "store_sequences"]) {
+        for (const table of ["store_entries", "store_applied", "store_history", "store_sequences"]) {
           await this.#run(`DELETE FROM ${table} WHERE store = ? AND scope_key = ?`, [
             store,
             scopeKey,
@@ -3603,6 +4043,7 @@ class RemoteKv {
     scopeKey: string,
     idempotencyKey: string | undefined,
     via: Issuer,
+    actor: HistoryActor,
   ): Promise<Applied> {
     // The first op on a store over this connection starts its store-wide
     // sweep — **behind** this op, at the tail of the queue it is running on,
@@ -3615,8 +4056,8 @@ class RemoteKv {
     for (;;) {
       const answered =
         op === "batch"
-          ? await this.#batch(store, params, scopeKey, idempotencyKey)
-          : await this.#write(store, op, params, scopeKey, idempotencyKey, via);
+          ? await this.#batch(store, params, scopeKey, idempotencyKey, actor)
+          : await this.#write(store, op, params, scopeKey, idempotencyKey, via, actor);
       if (!("missing" in answered)) return answered;
       // A row the write locks was not there: the partition's sequence row, or
       // the store's authored lock (PRD resolved q73). Each is created on the
@@ -3755,6 +4196,14 @@ class RemoteKv {
    * and this is where the second waits for the first's commit — and then finds
    * its ledger row. The ledger is read by the store's clock, so an authored row
    * whose `default_ttl:` has run out answers nothing ([`#ledgerAnswer`]).
+   *
+   * **On a `history: true` store the write's history row is inserted here
+   * too** (PRD resolved q74), after the entry's own statement and before the
+   * ledger claim, dated by the same server clock — inside the transaction, so
+   * a claim that conflicts and rolls back, a decision that throws, and a
+   * connection that dies before the `COMMIT` all take it with them. The rows
+   * are inserted under the partition's sequence lock, which is what orders one
+   * key's rows by its writes' commits.
    */
   async #write(
     store: StoreBinding,
@@ -3763,6 +4212,7 @@ class RemoteKv {
     scopeKey: string,
     idempotencyKey: string | undefined,
     via: Issuer,
+    actor: HistoryActor,
   ): Promise<Applied | { readonly missing: string }> {
     const key = required(params.key, "key", store);
     await this.#run("BEGIN", []);
@@ -3791,6 +4241,7 @@ class RemoteKv {
         scopeKey,
         now,
       ]);
+      await this.#sweepHistory(store, scopeKey, now, SWEEP_PER_WRITE);
       const found = await this.#all(
         'SELECT value, version, expires_at FROM store_entries WHERE store = ? AND scope_key = ? AND "key" = ? FOR UPDATE',
         [store.name, scopeKey, key],
@@ -3806,6 +4257,7 @@ class RemoteKv {
             'DELETE FROM store_entries WHERE store = ? AND scope_key = ? AND "key" = ?',
             [store.name, scopeKey, key],
           );
+          await this.#history(store, scopeKey, { op, key, before: held, after: undefined }, actor, now);
           row = { ...decision.answer, deduped: false };
           break;
         case "touch":
@@ -3813,6 +4265,7 @@ class RemoteKv {
             'UPDATE store_entries SET expires_at = ? WHERE store = ? AND scope_key = ? AND "key" = ?',
             [expiryOf(store, params, now), store.name, scopeKey, key],
           );
+          await this.#history(store, scopeKey, { op, key, before: held, after: held }, actor, now);
           row = { ...decision.answer, deduped: false };
           break;
         case "write": {
@@ -3836,6 +4289,13 @@ class RemoteKv {
               version,
               expiryOf(store, params, now),
             ],
+          );
+          await this.#history(
+            store,
+            scopeKey,
+            { op, key, before: held, after: { value: decision.value, version } },
+            actor,
+            now,
           );
           row = { ...decision.answer(version), deduped: false };
           break;
@@ -3879,12 +4339,18 @@ class RemoteKv {
    * the sweep with it. A connection that dies between two entries — the
    * process killed, the session ended by the server — is a transaction that
    * never reached its `COMMIT`, which the server rolls back the same way.
+   *
+   * On a `history: true` store each entry that lands records its own history
+   * row as it lands, under the savepoint (PRD resolved q74) — so a declined
+   * batch's rollback to the savepoint takes the rows with the entries, and a
+   * batch that never commits leaves none.
    */
   async #batch(
     store: StoreBinding,
     params: StoreParams,
     scopeKey: string,
     idempotencyKey: string | undefined,
+    actor: HistoryActor,
   ): Promise<Applied | { readonly missing: string }> {
     const entries = batchEntries(store, params);
     await this.#run("BEGIN", []);
@@ -3908,6 +4374,7 @@ class RemoteKv {
         scopeKey,
         now,
       ]);
+      await this.#sweepHistory(store, scopeKey, now, SWEEP_PER_WRITE);
       await this.#run("SAVEPOINT batch_entries", []);
       let last = first;
       let failed: number | undefined;
@@ -3917,7 +4384,8 @@ class RemoteKv {
           'SELECT value, version, expires_at FROM store_entries WHERE store = ? AND scope_key = ? AND "key" = ? FOR UPDATE',
           [store.name, scopeKey, entry.key],
         );
-        const step = batchStep(store, entry, heldRow(found[0], now));
+        const held = heldRow(found[0], now);
+        const step = batchStep(store, entry, held);
         if (step.effect === "none") {
           failed = index;
           break;
@@ -3926,6 +4394,13 @@ class RemoteKv {
           await this.#run(
             'DELETE FROM store_entries WHERE store = ? AND scope_key = ? AND "key" = ?',
             [store.name, scopeKey, entry.key],
+          );
+          await this.#history(
+            store,
+            scopeKey,
+            { op: entry.op, key: entry.key, before: held, after: undefined },
+            actor,
+            now,
           );
           results.push({ key: entry.key });
           continue;
@@ -3946,6 +4421,13 @@ class RemoteKv {
             last,
             expiryOf(store, entry, now),
           ],
+        );
+        await this.#history(
+          store,
+          scopeKey,
+          { op: entry.op, key: entry.key, before: held, after: { value: step.value, version: last } },
+          actor,
+          now,
         );
         results.push({ key: entry.key, version: last });
       }
@@ -3976,6 +4458,39 @@ class RemoteKv {
     }
     await this.#run("COMMIT", []);
     return { row, deduped: false };
+  }
+
+  /**
+   * Record one write's history row, inside the transaction the write holds
+   * open — or nothing, on a store that keeps no history ([`historyRow`], PRD
+   * resolved q74). `seq` is the server's (`BIGSERIAL`, `AUTO_INCREMENT`),
+   * taken here, under the partition's sequence lock the write holds.
+   */
+  async #history(
+    store: StoreBinding,
+    scopeKey: string,
+    write: HistoryWrite,
+    actor: HistoryActor,
+    now: number,
+  ): Promise<void> {
+    const row = historyRow(store, write, actor, now);
+    if (row === undefined) return;
+    await this.#run(
+      `INSERT INTO store_history (store, scope_key, ${row.columns}) VALUES (?, ?, ${row.placeholders})`,
+      [store.name, scopeKey, ...row.bound],
+    );
+  }
+
+  /**
+   * Remove at most `limit` of one partition's history rows past the store's
+   * `history_retention:` by `now` — on a store that declares one (PRD resolved
+   * q74). Called only under the partition's sequence lock: a write's half of
+   * the schedule, beside the entries' own sweep.
+   */
+  async #sweepHistory(store: StoreBinding, scopeKey: string, now: number, limit: number): Promise<void> {
+    const cutoff = historyCutoff(store, now);
+    if (cutoff === undefined) return;
+    await this.#run(this.#driver.dialect.sweepHistory(limit), [store.name, scopeKey, cutoff]);
   }
 
   /**
@@ -4075,6 +4590,17 @@ class RemoteKv {
           now: clock,
         });
         return read.answer(read.query === undefined ? [] : await this.#all(read.query.sql, read.query.bound));
+      }
+      // One page of one key's history (PRD resolved q74), as the statement
+      // every arm shares ([`historyRead`]), judging retention by the clock
+      // the rows were dated with.
+      case "history": {
+        const read = historyRead(store, params, {
+          from: "store_history WHERE store = ? AND scope_key = ?",
+          bound: [store.name, scopeKey],
+          now: clock,
+        });
+        return read.answer(await this.#all(read.query.sql, read.query.bound));
       }
       default:
         throw new Error(`\`${store.address}\` is \`kind: ${store.kind}\` and takes no \`${op}\``);
@@ -4199,8 +4725,35 @@ class RemoteKv {
       "SELECT idempotency_key FROM store_applied WHERE store = ? AND expires_at <= ? ORDER BY expires_at LIMIT 1",
       [store.name, now],
     );
-    if (ledger.length === 0) return undefined;
-    return { scopeKey: AUTHORED_LOCK, removed: await this.#sweepLedgerBatch(store, now) };
+    if (ledger.length > 0) {
+      return { scopeKey: AUTHORED_LOCK, removed: await this.#sweepLedgerBatch(store, now) };
+    }
+    // The ledger is done too: then the history rows past the store's
+    // `history_retention:` (PRD resolved q74), on a store that declares one —
+    // the partition holding the oldest found by a read that locks nothing,
+    // through `store_history_at`, and a batch of its rows removed under that
+    // partition's sequence lock, exactly as an entries batch is.
+    const cutoff = historyCutoff(store, now);
+    if (cutoff === undefined) return undefined;
+    const history = await this.#all(
+      "SELECT scope_key FROM store_history WHERE store = ? AND at <= ? ORDER BY at LIMIT 1",
+      [store.name, cutoff],
+    );
+    const partition = history[0]?.["scope_key"];
+    if (partition === undefined || partition === null) return undefined;
+    const scopeKey = String(partition);
+    return {
+      // Labelled apart from the same partition's entries batch, so a stalled
+      // history batch is told from a stalled entries one: no real partition
+      // begins `history:` ([`partition`]).
+      scopeKey: `history:${scopeKey}`,
+      removed: await this.#sweepBatch(
+        store,
+        scopeKey,
+        cutoff,
+        this.#driver.dialect.sweepHistory(SWEEP_PER_BATCH),
+      ),
+    };
   }
 
   /**
@@ -4245,8 +4798,18 @@ class RemoteKv {
    * way to find none is a race with [`forget`], which takes the same lock and
    * deletes the entries in the same transaction as the row — so a batch that
    * finds none removes nothing, and the next step asks again.
+   *
+   * `statement` is the bounded `DELETE` the batch makes — the entries' own by
+   * default, or the history's past a retention cut-off (PRD resolved q74),
+   * which binds the cut-off where the entries' binds `now`: a history row is
+   * only ever written under the same lock, so the same argument holds of it.
    */
-  async #sweepBatch(store: StoreBinding, scopeKey: string, now: number): Promise<number> {
+  async #sweepBatch(
+    store: StoreBinding,
+    scopeKey: string,
+    now: number,
+    statement: string = this.#driver.dialect.sweepPartition(SWEEP_PER_BATCH),
+  ): Promise<number> {
     await this.#run("BEGIN", []);
     try {
       const sequence = await this.#all(
@@ -4257,11 +4820,7 @@ class RemoteKv {
         await this.#run("ROLLBACK", []);
         return 0;
       }
-      const removed = await this.#run(this.#driver.dialect.sweepPartition(SWEEP_PER_BATCH), [
-        store.name,
-        scopeKey,
-        now,
-      ]);
+      const removed = await this.#run(statement, [store.name, scopeKey, now]);
       await this.#run("COMMIT", []);
       return removed;
     } catch (error) {
@@ -4375,9 +4934,11 @@ export async function releaseStores(): Promise<void> {
 // idempotency key — so a write is never deduped and leaves no ledger row — owns
 // no partition for [`releaseExecution`] to release ([`remember`]), and is
 // asked no replay question ([`inProcessState`]). A write is therefore recorded
-// **nowhere**: there is no execution to have made it and no history yet to
-// keep it in (PRD resolved q74's per-key history is where it will be recorded,
-// as actor `cli`, once that ships).
+// in one place only: on a store that declares `history: true`, its history row
+// (PRD resolved q74), written in its own transaction like every write's, with
+// the actor `{ kind: "cli" }` — no execution made it, so the row names none.
+// On a store that keeps no history it is recorded nowhere. An operator also
+// reads that history, one key at a time, with the `history` op (`store log`).
 //
 // Two kinds of store cannot be reached this way, and [`operatorRefusal`] says
 // so by name rather than answering out of the wrong place: a `vector` or
@@ -4395,8 +4956,11 @@ export interface OperatorTarget {
   readonly execution?: string;
 }
 
-/** The ops an operator issues one at a time: grammar 11.4's `kv` rows the command line mirrors. */
-export type OperatorOp = "get" | "set" | "delete" | "list" | "count";
+/**
+ * The ops an operator issues one at a time: grammar 11.4's `kv` rows the
+ * command line mirrors — `history` is `store log`'s (PRD resolved q74).
+ */
+export type OperatorOp = "get" | "set" | "delete" | "list" | "count" | "history";
 
 /** One page of an operator's walk of a partition — what `export` reads. */
 export interface OperatorPageParams {
@@ -4479,7 +5043,8 @@ function operatorScope(target: OperatorTarget): {
  * condition is decided against what the key holds as it commits and it takes
  * the partition's next version — and a `set` is held to nothing here: the
  * command line holds its value to the store's `value_schema` before it gets
- * this far, as a node's `value:` is held to it at `validate`.
+ * this far, as a node's `value:` is held to it at `validate`. On a store that
+ * keeps history the write records its row as actor `cli` (PRD resolved q74).
  */
 export async function runOperatorOp(
   target: OperatorTarget,
@@ -4498,6 +5063,7 @@ export async function runOperatorOp(
     // Nothing aborts an operator's op: the signal is a `vector` op's, for the
     // embedding a `kv` op never computes.
     new AbortController().signal,
+    { kind: "cli" },
   );
   return answer.row;
 }
@@ -4834,12 +5400,19 @@ function record(context: RunContext, entry: StoreRecord): void {
  * `item` naming other than one field, is refused here and goes back to the
  * model (Decision D119) — before the store sees it, so it leaves no store
  * record.
+ *
+ * `site` is the call's place in the agent's loop, which a `history: true`
+ * store's history row names a tool's write by (PRD resolved q74): the agent
+ * execution's instance path and the call's own frame — `<tool name>/<call
+ * ordinal>`, grammar 9.4's spelling of a tool frame ([`runtime.toolInstancePath`]).
+ * A caller that hands none records a row with no path.
  */
 export async function runStoreTool(
   store: StoreBinding,
   op: StoreOp,
   args: Record<string, unknown>,
   context: RunContext,
+  site?: runtime.ToolCallSite,
 ): Promise<Record<string, unknown>> {
   const condition = args["if"] === undefined || args["if"] === "" ? undefined : String(args["if"]);
   const version =
@@ -4888,8 +5461,13 @@ export async function runStoreTool(
     ...(condition === undefined ? {} : { condition: condition as StoreCondition }),
     ...(version === undefined ? {} : { ifVersion: version }),
   };
+  const path =
+    site === undefined ? undefined : runtime.toolInstancePath(site, `${store.name}_${op}`).join("/");
   try {
-    return await runStoreOp(store, op, params, context, { via: "tool" });
+    return await runStoreOp(store, op, params, context, {
+      via: "tool",
+      ...(path === undefined ? {} : { path }),
+    });
   } catch (error) {
     // A refusal the journal replayed comes back as a plain `Error` carrying the
     // class's name (`./journal.ts`'s `replayedFailure`), and the agent loop
@@ -5054,6 +5632,24 @@ const POSTGRES_CONCURRENT_CREATOR: readonly string[] = ["23505", "42P07", "42710
  * it handed out — and its row is also the lock every write to the partition
  * takes first (`RemoteKv`'s `#write`). `BIGINT` on both sides of it, because a
  * sequence that only counts up should not be the thing that runs out.
+ *
+ * `store_history` is the per-key history a `history: true` store records (PRD
+ * resolved q74), one row per write that landed, inserted by the write in its
+ * own transaction under the partition's sequence lock. `seq` is a `BIGSERIAL`:
+ * the server hands each row the next value of a sequence no rollback gives
+ * back, so a value is never seen twice, and one key's rows take theirs in the
+ * order their writes commit — every write to a key holds its partition's lock.
+ * The values are text for `value`'s reason, `NULL` where the key held nothing
+ * on that side of the write. Its three indexes are what reads it —
+ * `store_history_key` a page of one key's rows past a cursor,
+ * `store_history_partition_at` a write's and a sweep batch's bounded `DELETE`
+ * of a partition's rows past the store's retention, and `store_history_at` the
+ * read, locking nothing, by which a store-wide sweep finds the partition
+ * holding the oldest of them. A database from before PRD resolved q74 has no
+ * `store_history`, and `CREATE TABLE IF NOT EXISTS` is the whole of its
+ * migration — a table that is not there has no rows to bring forward — while
+ * the indexes are probed in a `DO` block as the entries' are, so an open of a
+ * database that already has them takes no lock on the table.
  */
 const POSTGRES_STORE_SCHEMA = `
 BEGIN;
@@ -5121,6 +5717,33 @@ CREATE TABLE IF NOT EXISTS store_sequences (
   last      BIGINT NOT NULL,
   PRIMARY KEY (store, scope_key)
 );
+CREATE TABLE IF NOT EXISTS store_history (
+  seq             BIGSERIAL PRIMARY KEY,
+  store           TEXT COLLATE "C" NOT NULL,
+  scope_key       TEXT COLLATE "C" NOT NULL,
+  "key"           TEXT COLLATE "C" NOT NULL,
+  op              TEXT NOT NULL,
+  old_value       TEXT,
+  new_value       TEXT,
+  version         BIGINT,
+  actor_kind      TEXT NOT NULL,
+  actor_execution TEXT,
+  actor_path      TEXT,
+  at              BIGINT NOT NULL
+);
+DO $migrate_history$
+BEGIN
+  IF to_regclass('store_history_key') IS NULL THEN
+    CREATE INDEX IF NOT EXISTS store_history_key ON store_history (store, scope_key, "key", seq);
+  END IF;
+  IF to_regclass('store_history_partition_at') IS NULL THEN
+    CREATE INDEX IF NOT EXISTS store_history_partition_at ON store_history (store, scope_key, at);
+  END IF;
+  IF to_regclass('store_history_at') IS NULL THEN
+    CREATE INDEX IF NOT EXISTS store_history_at ON store_history (store, at);
+  END IF;
+END
+$migrate_history$;
 COMMIT;
 `;
 
@@ -5240,6 +5863,20 @@ function postgresLedgerSweep(limit: number): string {
   );
 }
 
+/**
+ * …and over one partition's history: its rows at or before a retention
+ * cut-off (PRD resolved q74), through the index over `(store, scope_key, at)`.
+ *
+ * Run only under the partition's sequence lock (`StoreDialect.sweepHistory`),
+ * and `FOR UPDATE SKIP LOCKED` for [`postgresSweep`]'s reason.
+ */
+function postgresHistorySweep(limit: number): string {
+  return (
+    "DELETE FROM store_history WHERE ctid = ANY(ARRAY(SELECT ctid FROM store_history " +
+    `WHERE store = ? AND scope_key = ? AND at <= ? LIMIT ${limit} FOR UPDATE SKIP LOCKED))`
+  );
+}
+
 /** Postgres speaks the standard upsert in both of its forms. */
 const POSTGRES_STORE_DIALECT: StoreDialect = {
   bind: numberedStoreBind,
@@ -5248,6 +5885,7 @@ const POSTGRES_STORE_DIALECT: StoreDialect = {
   clock: POSTGRES_STORE_CLOCK,
   sweepPartition: postgresSweep,
   sweepLedger: postgresLedgerSweep,
+  sweepHistory: postgresHistorySweep,
   // A `TEXT COLLATE "C"` column holds any string a key is, so every key is
   // spelled as it is.
   ledgerKey: (idempotencyKey) => idempotencyKey,

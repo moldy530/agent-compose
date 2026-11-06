@@ -51,12 +51,16 @@ const stores = await import(pathToFileURL(path.resolve(project, "src/stores.ts")
  */
 const HOLD_MS = 60_000;
 
+// It keeps history (PRD resolved q74), so the parent also finds that the batch
+// it killed recorded none: a history row is written in the batch's own
+// transaction, entry by entry, and the kill takes it with the entries.
 const store = {
   address: `store.${name}`,
   name,
   kind: "kv",
   scope: "global",
   metadata: false,
+  history: true,
   value: z.object({ n: z.number().int() }).strict(),
   backend: {
     provider,

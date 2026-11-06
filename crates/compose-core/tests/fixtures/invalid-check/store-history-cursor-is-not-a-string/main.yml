@@ -1,0 +1,23 @@
+# rule: a `history`'s `after` is one expression whose result is a string — the `next` the page before answered (grammar 11.4, PRD resolved q74)
+# code: type-mismatch
+# message: `after` of node `log` must evaluate to a string, found an integer
+# at: main.yml:20:14
+version: "0.1"
+store.notes:
+  kind: kv
+  scope: global
+  history: true
+  value_schema:
+    body: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    log:
+      store: store.notes
+      op: history
+      key: "'k'"
+      limit: 10
+      after: "3"
+  edges:
+    - { from: start, to: log }
+    - { from: log, to: end }

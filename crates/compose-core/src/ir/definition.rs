@@ -141,6 +141,16 @@ pub struct Store {
     /// q69).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_ttl: Option<Spanned<Duration>>,
+    /// `history:` — `kv` only: whether every write records a history row in
+    /// its own transaction (PRD resolved q74). Absent and `false` are one
+    /// declaration, so only `true` is serialized.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub history: bool,
+    /// `history_retention:` — `kv` only, beside `history: true`: how long a
+    /// history row is kept. Absent means every row is kept for good (PRD
+    /// resolved q74).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_retention: Option<Spanned<Duration>>,
 }
 
 /// A vector store's `embed:` block (grammar 11.2).
