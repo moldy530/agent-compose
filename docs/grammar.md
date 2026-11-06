@@ -14123,71 +14123,20 @@ Ratified by the owner (2026-11-06, PRD resolved q77 as amended):
   of them — so arrivals are not held back by runs. This was the reading most
   worth the owner's eye — ruling e says "a flow some trigger's group covers"
   without saying which — and the owner ratified it.
-- **What a crash between a row and its execution leaves.** A `started` row is
-  written before its execution is registered, as a tick's `fired` row is. At
-  the next start, a row that **waited** — its arrival was answered with its
-  intake id — and whose execution has no lifecycle row starts under the id it
-  recorded, once, **as the lease allows**: where its group has no free slot —
-  the execution the dead process was running is recovered and holds it — the
-  row goes back on the queue at the place it was admitted in, and starts when a
-  slot frees, never beside what holds it. A row that did not wait was answered
-  with nothing yet, so it is taken back and its arrival's source re-delivers
-  it. A start the journal
-  would not begin is undone the same two ways at once: a waited row goes back on
-  the queue, and an unwaited one is taken back and its arrival refused — a
-  `503` on `http` — as any admission the journal would not take is. **A
-  refused start of a waited row is not a settle**: the arrival is owed its
-  execution under the id it recorded, so no `settled` webhook is pushed for
-  it — pushed `failed`, it would be the only one the caller ever heard, since
-  the start that does run the execution finds that push journaled and
-  announces nothing — and the webhook goes where the start that reaches its
-  row closes it, as for any run (a debounce's close and a restart's repair
-  alike). An arrival that waited and is then dropped — superseded, or no
-  longer bound by the serving build — never began, and is pushed nothing;
-  its intake answers it. **Nor is a refused start of an unwaited row**, nor
-  of any arrival a gate keeps — a dedupe key's, a tick's: each is answered
-  only once its lifecycle row is down, so its caller is told nothing started
-  (on `http` the `503` that says the request may be sent again) and holds no
-  `202` naming the execution; a `failed` push for it would be a settle of an
-  execution nobody was told of, beside the one the resend starts. Only a start
-  no gate keeps — an `http` request with no `dedupe_key:` and no
-  `concurrency:`, answered `202` as it is set going — is pushed the failure of
-  a run that stopped before its row. **A start whose lifecycle row is down
-  although the journal answered a failure has begun**: a dialled journal can
-  commit an insert and lose the answer. Undone, its arrival would start twice
-  — a waited row begun again under its id beside the execution the next start
-  recovers, an unwaited one refused while that execution runs anyway — so its
-  row stays `started`, holding its slot as the open execution's, and the
-  execution runs at once in this process as a recovery would run it, from its
-  row: its generation recorded nothing, so the replay is its first run, and
-  the start is answered as the start it was. A start a gate keeps reads its
-  row the same way. **A waited row whose execution has begun already** —
-  this process runs it, after a recovery, or the journal holds its row, which
-  a start whose read of its own row missed the commit leaves — is moved to
-  `started` and never begun again: begun again it would be refused beside the
-  recovered generation, taking that one's place on the board as it went, and
-  run whole a second time once that one settled. A journal
-  that refuses the move back onto the queue too leaves the waited row
-  `started`, naming an execution that never began, which no drain of the queue
-  reads; the process keeps the start owed and tries the move again at every look
-  at the trigger's queue until it lands, and the next start finds the row either
-  way. **An owed start holds its group's slot** meanwhile: every look at the
-  queue reads it as a lease, so no later row of its group — nor one that would
-  take the trigger's last `max_running:` — starts into the slot its arrival was
-  answered for. And the unwaited row such a refusal leaves behind where it
-  cannot be taken back either is one more `started` row naming an execution its
-  source admits again under the same id: the lease is one slot per execution,
-  however many rows name it. A trigger counts as looked at after a start only
-  once the whole look is done — repairs, every pending row armed, the queue
-  drained — so a look the journal cut short is made again, whole, before the
-  trigger's next decision, and a pending row a dead process left is never left
-  unarmed.
 
 The following remain the implementation's readings, recorded for the owner —
-save where one states what becomes of a start the journal refused (when it
-is tried again, under "Queue order and progress"; a newcomer the journal
-refuses, under "`supersede` cancels every running execution of the group"),
-which is the seam ratified above:
+save where one states what becomes of a start the journal refused, which is
+the seam ratified above (when it is tried again, under "Queue order and
+progress"; a newcomer the journal refuses, under "`supersede` cancels every
+running execution of the group"; and, under "What a crash between a row and
+its execution leaves", its sentences from "A start the journal would not
+begin" through "however many rows name it": the undoing, the not-a-settle
+and push rules, a start whose lifecycle row is down although the journal
+answered a failure, a waited row whose execution has begun already, and an
+owed start's move back onto the queue and the slot it holds). The rest of
+that bullet — the crash repair itself, a waited row started as the lease
+allows and an unwaited one taken back for its source to re-deliver, and when
+a trigger counts as looked at — stays the implementation's reading:
 
 - **Which journal lets a `run` see the lease.** Ruling e's "it shares the
   journal, so it sees the lease" holds where a run can open the journal beside
@@ -14283,9 +14232,8 @@ which is the seam ratified above:
   execution — it was replaced, not turned away — so its intake, and a repeat of
   its dedupe key, answer as an arrival that never began. A group under
   `supersede` therefore holds at most one queued arrival, its newest. A start
-  the process owes because the journal refused it (above, "What a crash
-  between a row and its execution leaves") is not a queued row, and is started
-  as owed.
+  the process owes because the journal refused it (below) is not a queued row,
+  and is started as owed.
 - **What `drop` answers.** `202`, the group's oldest running execution — or the
   trigger's, where it is `max_running:` that is full — its status URL, and the
   dropped row's `intake_id`; never a `409` or `429`, since the ruling answers a
@@ -14358,6 +14306,65 @@ which is the seam ratified above:
   claim a crash left before the count, and is taken over — a dedupe key — or
   repaired — a tick — like any claim no admission began under, so the arrival
   is counted when it comes again rather than lost.
+- **What a crash between a row and its execution leaves.** A `started` row is
+  written before its execution is registered, as a tick's `fired` row is. At
+  the next start, a row that **waited** — its arrival was answered with its
+  intake id — and whose execution has no lifecycle row starts under the id it
+  recorded, once, **as the lease allows**: where its group has no free slot —
+  the execution the dead process was running is recovered and holds it — the
+  row goes back on the queue at the place it was admitted in, and starts when a
+  slot frees, never beside what holds it. A row that did not wait was answered
+  with nothing yet, so it is taken back and its arrival's source re-delivers
+  it. A start the journal
+  would not begin is undone the same two ways at once: a waited row goes back on
+  the queue, and an unwaited one is taken back and its arrival refused — a
+  `503` on `http` — as any admission the journal would not take is. **A
+  refused start of a waited row is not a settle**: the arrival is owed its
+  execution under the id it recorded, so no `settled` webhook is pushed for
+  it — pushed `failed`, it would be the only one the caller ever heard, since
+  the start that does run the execution finds that push journaled and
+  announces nothing — and the webhook goes where the start that reaches its
+  row closes it, as for any run (a debounce's close and a restart's repair
+  alike). An arrival that waited and is then dropped — superseded, or no
+  longer bound by the serving build — never began, and is pushed nothing;
+  its intake answers it. **Nor is a refused start of an unwaited row**, nor
+  of any arrival a gate keeps — a dedupe key's, a tick's: each is answered
+  only once its lifecycle row is down, so its caller is told nothing started
+  (on `http` the `503` that says the request may be sent again) and holds no
+  `202` naming the execution; a `failed` push for it would be a settle of an
+  execution nobody was told of, beside the one the resend starts. Only a start
+  no gate keeps — an `http` request with no `dedupe_key:` and no
+  `concurrency:`, answered `202` as it is set going — is pushed the failure of
+  a run that stopped before its row. **A start whose lifecycle row is down
+  although the journal answered a failure has begun**: a dialled journal can
+  commit an insert and lose the answer. Undone, its arrival would start twice
+  — a waited row begun again under its id beside the execution the next start
+  recovers, an unwaited one refused while that execution runs anyway — so its
+  row stays `started`, holding its slot as the open execution's, and the
+  execution runs at once in this process as a recovery would run it, from its
+  row: its generation recorded nothing, so the replay is its first run, and
+  the start is answered as the start it was. A start a gate keeps reads its
+  row the same way. **A waited row whose execution has begun already** —
+  this process runs it, after a recovery, or the journal holds its row, which
+  a start whose read of its own row missed the commit leaves — is moved to
+  `started` and never begun again: begun again it would be refused beside the
+  recovered generation, taking that one's place on the board as it went, and
+  run whole a second time once that one settled. A journal
+  that refuses the move back onto the queue too leaves the waited row
+  `started`, naming an execution that never began, which no drain of the queue
+  reads; the process keeps the start owed and tries the move again at every look
+  at the trigger's queue until it lands, and the next start finds the row either
+  way. **An owed start holds its group's slot** meanwhile: every look at the
+  queue reads it as a lease, so no later row of its group — nor one that would
+  take the trigger's last `max_running:` — starts into the slot its arrival was
+  answered for. And the unwaited row such a refusal leaves behind where it
+  cannot be taken back either is one more `started` row naming an execution its
+  source admits again under the same id: the lease is one slot per execution,
+  however many rows name it. A trigger counts as looked at after a start only
+  once the whole look is done — repairs, every pending row armed, the queue
+  drained — so a look the journal cut short is made again, whole, before the
+  trigger's next decision, and a pending row a dead process left is never left
+  unarmed.
 - **A deploy that removes a trigger's `concurrency:` block.** The rows an
   earlier build's intake accepted under it — queued and pending arrivals,
   answered `202` with an intake id — are owed a start all the same (ruling f),
