@@ -576,14 +576,15 @@ Carries the session. Long-polls for up to one hold (§2).
   nobody asked for. Unrecorded, the effect is the next attempt's frontier, and
   that attempt performs it.
 
-  **The `stop` list is the implementation's reading, and is provisional.** PRD
+  **The `stop` list is ratified, and protocol `3` is frozen with it.** PRD
   resolved q75's ruling b gives the poll response "a `cancel` list", and no
-  ruling names a second one: the list above is what this implementation ships
-  to keep a deadline from reaching the worker as a cancel (grammar D161,
-  whose status says so), and it awaits the owner's ruling. A peer built
-  against §3.2 should treat the `stop` field — its name, its being a list
-  apart from `cancel`, and that a deadline stops a worker's runner at all — as
-  unratified until that ruling is recorded.
+  ruling named a second one: the list above is what this implementation
+  shipped to keep a deadline from reaching the worker as a cancel, and the
+  owner ratified it with the rest of what a worker does when the hub stops
+  waiting for a dispatch (PRD resolved q75 and q79 as amended 2026-11-06;
+  grammar D160 and D161). A peer built against §3.2 can rely on the `stop`
+  field — its name, its being a list apart from `cancel`, and that a deadline
+  stops a worker's runner at all — as part of protocol `3`.
 
   A `200` carrying **only** the two lists — no `dispatch_id` and none of the
   fields after it — hands nothing over. The hub answers a held poll that way
@@ -1428,8 +1429,9 @@ cancel and writing the poll answer that names it. Telling the worker the
 cancel across the restart — a restarted hub naming, on the first answer under
 the new session, every row it left `dispatched` for a cancel's frontier, and a
 worker that holds back its orphan stops until that answer — is a protocol
-choice this implementation does not make, and awaits the owner's ruling
-(grammar D160's status).
+choice this implementation does not make, and the limitation is accepted as
+one of protocol `3` (PRD resolved q75 as amended 2026-11-06; grammar D160's
+status): a later protocol may close it.
 
 This is the mechanism behind §4's "redeployment is automatic on the next join",
 and without it there would be no next join to be automatic on: a worker that has
@@ -2115,7 +2117,7 @@ or a second implementation of this document.
 |---|---|
 | **1** | this document, as the runtime that landed with it speaks it |
 | **2** | §3.4's **paused** result (PRD resolved q46, 2026-08-31). A result may settle a dispatch with the wait a `human:` node opened, and a peer of `1` would read one as a node that answered with no output — a node that "quietly means something else", which is §10.3's first row exactly, and its third: `paused` changes what a result *is*. The same release also **enforces** §3.3's effect-key derivation at `/workers/effects`: a record carrying a `key` its own `site`, `kind` and `ordinal` do not derive is `400` where it was journaled before. That is not what the bump is for and needs none of its own — the derivation is the rule §3.3 and grammar §9.4 already stated, so a conforming `1` peer sends what it always sent, and one that spelled a key its own fields do not derive is now *refused* rather than left to write into another node's slot, which is what §10 says a protocol check is for. It is recorded here because this table is where a second implementation reads what moved |
-| **3** | PRD resolved q75 and q79, one bump for both (2026-11-04). The poll's `200` gains **`cancel`** (§3.2) — the dispatches this session holds that the hub has cancelled — and **`stop`** — those it has stopped waiting for, which the worker stops without a cancel — and may be those lists alone; the result gains its fourth ending, **`status: "cancelled"`** (§3.4); and the hub may hand a session **more than one** unsettled dispatch of a placement, up to its `max_running:` (§2), so the poll answer's "`204` while a dispatch is unsettled" sentence is gone. A peer of `2` would be *wrong* rather than refused on each: it ignores a `cancel` list and a `stop` list, so a cancelled node, or one whose budget ran out on the hub, runs on to its end and its process is never stopped — the dispatch holds its session's capacity for as long as the node takes rather than for the moments a stop takes, and since that worker goes on polling, the liveness window never ends it; it never posts the cancelled ending, but posts its ordinary result once the node finishes — and that result is what the cancel waits for, because the hub keeps a cancelled placed node open at its site until that dispatch's result comes home (§3.4), so the cancel completes only when the node ends by itself, not within the moments a stop takes: until then the execution stays open, it does not settle `cancelled`, and no finally node around the cancelled one runs — for a `coder:` node, hours past the ten seconds PRD resolved q75 sets; it reads a `200` carrying only the lists — no `dispatch_id`, none of a dispatch's fields — as a dispatch handed over, and tries to run it; and it queues a second dispatch behind the first, where the hub counted on both running. That is §10.3's first and second rows, and a protocol `2` worker is refused at the join with `409` naming both versions. The `stop` list is the implementation's reading of the two rulings, not something either names, and is **provisional** until the owner rules on it (§3.2, grammar D161) |
+| **3** | PRD resolved q75 and q79, one bump for both (2026-11-04). The poll's `200` gains **`cancel`** (§3.2) — the dispatches this session holds that the hub has cancelled — and **`stop`** — those it has stopped waiting for, which the worker stops without a cancel — and may be those lists alone; the result gains its fourth ending, **`status: "cancelled"`** (§3.4); and the hub may hand a session **more than one** unsettled dispatch of a placement, up to its `max_running:` (§2), so the poll answer's "`204` while a dispatch is unsettled" sentence is gone. A peer of `2` would be *wrong* rather than refused on each: it ignores a `cancel` list and a `stop` list, so a cancelled node, or one whose budget ran out on the hub, runs on to its end and its process is never stopped — the dispatch holds its session's capacity for as long as the node takes rather than for the moments a stop takes, and since that worker goes on polling, the liveness window never ends it; it never posts the cancelled ending, but posts its ordinary result once the node finishes — and that result is what the cancel waits for, because the hub keeps a cancelled placed node open at its site until that dispatch's result comes home (§3.4), so the cancel completes only when the node ends by itself, not within the moments a stop takes: until then the execution stays open, it does not settle `cancelled`, and no finally node around the cancelled one runs — for a `coder:` node, hours past the ten seconds PRD resolved q75 sets; it reads a `200` carrying only the lists — no `dispatch_id`, none of a dispatch's fields — as a dispatch handed over, and tries to run it; and it queues a second dispatch behind the first, where the hub counted on both running. That is §10.3's first and second rows, and a protocol `2` worker is refused at the join with `409` naming both versions. The `stop` list was the implementation's reading of the two rulings, not something either named, and the owner ratified it, freezing protocol `3` with it (PRD resolved q75 and q79 as amended 2026-11-06; §3.2, grammar D161) |
 
 **The bumps to 2 and to 3 cost nothing in practice, and saying so is the point
 of recording them.** A worker and the hub it talks to are built from one compiler
