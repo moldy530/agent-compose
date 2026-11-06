@@ -1,0 +1,22 @@
+# rule: a cursor and the values beside a page's keys are a `kv` page's, so a `blob` `list` naming `after:` is refused against its store (grammar 11.4, PRD resolved q70)
+# code: invalid-value
+# message: `after` is not a parameter of a `blob` `list`: a cursor and the values beside its keys are a `kv` page's, and `store.artifacts` is `kind: blob`
+# at: main.yml:19:14
+# help: a `blob` `list` answers one prefix of a store's keys up to its `limit:`; to page through a store, keep the records in a `kv` store (grammar 11.4, PRD resolved q70)
+version: "0.1"
+store.artifacts:
+  kind: blob
+  scope: global
+flow.f:
+  inputs:
+    cursor: { type: string }
+  outputs: {}
+  nodes:
+    listing:
+      store: store.artifacts
+      op: list
+      limit: 10
+      after: "input.cursor"
+  edges:
+    - { from: start, to: listing }
+    - { from: listing, to: end }

@@ -82,6 +82,11 @@
 #     unreleased subprocess of `flow.held`. It is the shape that decides whether
 #     the catching-up window is per pause or per execution — with one pause, a
 #     window closed on the first pause the board sees looks right.
+#   * `flow.surveyed` — a `count` and a `get_many` ahead of a model call, with
+#     `flow.stocked` writing another key between the generations: a resumed
+#     generation answers both reads out of the record, so the count it reports
+#     is the first generation's and the key written while it was down is not
+#     found (PRD resolved q70, q29).
 #   * `flow.fanned` — a **detached** `map` whose sink calls a *model*, which
 #     `flow.parceled`'s subprocess sink cannot decide. A delivery runs with the
 #     node execution's collectors detached (Decision D94), so its record holds
@@ -138,6 +143,10 @@ state:
     description: What `flow.papered` read back out of its own blob store.
     type: string
     default: nothing yet
+  surveyed:
+    description: How many entries `flow.surveyed`'s `count` found under `survey/`.
+    type: integer
+    default: -1
 
 provider.mock:
   kind: anthropic
@@ -964,6 +973,67 @@ flow.fanned:
     - { from: start, to: notify }
     - { from: notify, to: wrap }
     - { from: wrap, to: end }
+
+# PRD resolved q70's reads across a resume. `flow.surveyed` counts what
+# earlier runs wrote under `survey/` and fetches two keys of it in one
+# `get_many`, then calls a model — so a crash during that call leaves both
+# reads recorded behind the frontier. `flow.stocked` is what moves the world
+# between the generations: another key under `survey/`, written by a run of
+# its own while the execution is down, which a resumed generation reading the
+# live store would count and find. Replay answers both out of the record
+# instead (PRD resolved q29), so the count the resumed run reports is the one
+# the first generation read.
+flow.stocked:
+  description: Write one entry under `survey/`.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    put:
+      store: store.ledger
+      op: set
+      key: "'survey/' + input.topic"
+      value:
+        entry: "input.topic"
+  edges:
+    - { from: start, to: put }
+    - { from: put, to: end }
+
+flow.surveyed:
+  description: Count and fetch what earlier runs wrote under `survey/`, then call a model.
+  inputs:
+    topic:
+      type: string
+      min_length: 1
+  outputs:
+    surveyed:
+      type: integer
+    note:
+      type: string
+  nodes:
+    census:
+      store: store.ledger
+      op: count
+      prefix: "'survey/'"
+      writes:
+        count: surveyed
+    fetch:
+      store: store.ledger
+      op: get_many
+      keys: "['survey/' + input.topic, 'survey/later']"
+    ask:
+      agent: agent.noter
+      input:
+        topic: "input.topic"
+      writes:
+        note: note
+  edges:
+    - { from: start, to: census }
+    - { from: census, to: fetch }
+    - { from: fetch, to: ask }
+    - { from: ask, to: end }
 
 triggers:
   gate:

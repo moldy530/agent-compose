@@ -558,6 +558,442 @@ if (provider !== "sqlite") {
     (await get(store, "note", other)).found === false;
 }
 
+// --- Reading at scale: pages, counts and `get_many` (PRD resolved q70) -------
+
+/** Two keys in UTF-8 byte order, which is the order every arm pages in. */
+const byBytes = (left, right) => Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+
+/** One page of a `kv` `list`, through a store-op node's surface. */
+const page = (store, run, { limit, prefix, after, includeValues, site } = {}) =>
+  stores.runStoreOp(
+    store,
+    "list",
+    {
+      limit,
+      ...(prefix === undefined ? {} : { prefix }),
+      ...(after === undefined ? {} : { after }),
+      ...(includeValues === undefined ? {} : { includeValues }),
+    },
+    run,
+    node(site),
+  );
+
+/**
+ * Every page of a walk: the first page with no cursor, and each one after it
+ * taking the `next` the page before answered — what a flow paging a store
+ * does, one store-op node run per page.
+ */
+async function walk(store, run, options) {
+  const pages = [];
+  let after = options.after;
+  for (;;) {
+    const answered = await page(store, run, { ...options, after });
+    pages.push(answered);
+    if (!("next" in answered)) return pages;
+    // A walk that does not move is a cursor that does not advance, which the
+    // assertions below would read as a hang rather than a failure.
+    if (answered.next === after || pages.length > 1_000_000) return pages;
+    after = answered.next;
+  }
+}
+
+/**
+ * Lay `seeded` into one partition of `store` in bulk, beside the store rather
+ * than through it — a 100,000-key store seeded one `set` at a time is a
+ * hundred thousand transactions, and what is under test is how the store
+ * reads, not how fast it writes. The store has already been opened once, so
+ * the schema the rows go into is the one this release created; each row
+ * carries the version its write would have taken.
+ */
+async function bulkSeed(store, scopeKey, seeded) {
+  const BATCH = 1000;
+  if (provider === "sqlite") {
+    const module = await import("node-sqlite3-wasm");
+    const { Database } = module.default ?? module;
+    const file = new Database(path.join(data, "stores", `${stores.encodeKey(store.name)}.sqlite`));
+    try {
+      file.exec("PRAGMA busy_timeout = 5000;");
+      file.exec("BEGIN IMMEDIATE");
+      for (let start = 0; start < seeded.length; start += BATCH) {
+        const batch = seeded.slice(start, start + BATCH);
+        file.run(
+          `INSERT INTO entries (scope_key, key, value, version) VALUES ${batch.map(() => "(?, ?, ?, ?)").join(", ")}`,
+          batch.flatMap((row) => [scopeKey, row.key, JSON.stringify(row.value), row.version]),
+        );
+      }
+      file.exec("COMMIT");
+    } finally {
+      file.close();
+    }
+    return;
+  }
+  const seeder = await openServer(process.env[URL_ENV]);
+  try {
+    await begin(seeder);
+    for (let start = 0; start < seeded.length; start += BATCH) {
+      const batch = seeded.slice(start, start + BATCH);
+      let next = 0;
+      const tuple = () =>
+        provider === "postgres"
+          ? `($${++next}, $${++next}, $${++next}, $${++next}, $${++next})`
+          : "(?, ?, ?, ?, ?)";
+      await rows(
+        seeder,
+        `INSERT INTO store_entries (store, scope_key, ${provider === "postgres" ? '"key"' : "`key`"}, value, version) VALUES ${batch
+          .map(tuple)
+          .join(", ")}`,
+        batch.flatMap((row) => [store.name, scopeKey, row.key, JSON.stringify(row.value), row.version]),
+      );
+    }
+    await rows(seeder, "COMMIT");
+  } finally {
+    await seeder.end().catch(() => undefined);
+  }
+}
+
+/**
+ * Take every row of `store` back off the server — or its file off the disk —
+ * and answer whether none is left.
+ *
+ * [`bulkSeed`]'s other half. Every store this runner names is run-unique, so
+ * no later run reads what this one left; but nothing deletes it either, and the
+ * server a developer points this suite at keeps it: a hundred thousand rows a
+ * run, per dialled arm, accumulating until the disk is full. So the walk hands
+ * its rows back when it is done, whether its cases passed or not. Only this
+ * run's store, by its run-unique name, because the server is shared with
+ * whatever else is pointed at it.
+ *
+ * The SQLite arm's file is removed rather than emptied: the store's own handle
+ * is still open on it, and an unlinked file is one nothing reaches again.
+ */
+async function forget(store) {
+  if (provider === "sqlite") {
+    const file = path.join(data, "stores", `${stores.encodeKey(store.name)}.sqlite`);
+    for (const left of [file, `${file}-journal`, `${file}.lock`]) {
+      fs.rmSync(left, { recursive: true, force: true });
+    }
+    return !fs.existsSync(file);
+  }
+  return await sweep("=", store.name);
+}
+
+/**
+ * Delete the server's rows of every store whose name stands in `relation` to
+ * `operand` — in every table a store keeps rows in, entries, ledger and
+ * version sequence alike — and answer whether none is left.
+ *
+ * MySQL's `REPEATABLE READ` default would have each `DELETE` take next-key
+ * locks over the range it scans and the gap past it, and that gap is between
+ * this run's stores and whatever another suite sharing the server is writing
+ * beside them. `READ COMMITTED` locks the rows deleted and nothing else, which
+ * is all a cleanup needs; Postgres takes no gap locks at any level.
+ */
+async function sweep(relation, operand) {
+  const admin = await openServer(process.env[URL_ENV]);
+  const placeholder = provider === "postgres" ? "$1" : "?";
+  try {
+    if (provider === "mysql") await rows(admin, "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED");
+    let left = 0;
+    for (const table of ["store_entries", "store_applied", "store_sequences"]) {
+      await rows(admin, `DELETE FROM ${table} WHERE store ${relation} ${placeholder}`, [operand]);
+      const [held] = await rows(admin, `SELECT COUNT(*) AS n FROM ${table} WHERE store ${relation} ${placeholder}`, [
+        operand,
+      ]);
+      left += Number(held?.n);
+    }
+    return left === 0;
+  } finally {
+    await admin.end().catch(() => undefined);
+  }
+}
+
+/**
+ * How many keys the large walk seeds — on every arm, because PRD resolved
+ * q70's verification is "a flow reads every key of a 100,000-key store page
+ * by page on each arm and sees each key once". Reported, so the Rust side
+ * holds the number as well as the verdict.
+ */
+const WALK_KEYS = 100_000;
+answer.walk_keys = WALK_KEYS;
+
+/** The marks a seeded key's tail is drawn from: case, accents, CJK, astral. */
+const MIXED = ["a", "B", "z", "É", "é", "Ω", "中", "😀", "＀", "A b"];
+
+/** The large walk's store, named outside its case so the `finally` can forget it. */
+const WALKED = kv("walk", "global");
+
+try {
+  // **A walk of a large store, page by page.** Half the keys sit under `p/`
+  // and half under `q/`, and every one carries a mark from [`MIXED`], so the
+  // byte order the pages come back in is not the order the keys were written
+  // in, and a page boundary falls between keys whose order a UTF-16 or a
+  // case-folding comparison would answer differently.
+  const store = WALKED;
+  const run = ctx(execution("walk"));
+  // Opened through the store first, so the rows go into this release's schema.
+  answer.a_fresh_store_counts_nothing = (await stores.runStoreOp(store, "count", {}, run, node())).count === 0;
+  const seeded = Array.from({ length: WALK_KEYS }, (_, index) => ({
+    key: `${index % 2 === 0 ? "p" : "q"}/${MIXED[index % MIXED.length]}${index}`,
+    value: { text: `value ${index}` },
+    version: index + 1,
+  }));
+  const started = Date.now();
+  await bulkSeed(store, "global", seeded);
+  answer.walk_seed_ms = Date.now() - started;
+  const expected = seeded.map((row) => row.key).sort(byBytes);
+  const byKey = new Map(seeded.map((row) => [row.key, row]));
+
+  const walked = Date.now();
+  const pages = await walk(store, run, { limit: 1000 });
+  answer.walk_ms = Date.now() - walked;
+  answer.walk_pages = pages.length;
+  const seen = pages.flatMap((answered) => answered.keys);
+  // Gapless, duplicate-free and in order, as one comparison: the pages laid
+  // end to end are the sorted key set, so a key a page boundary skipped, a key
+  // two pages both answered and a page in the wrong order all fail it.
+  answer.a_walk_sees_every_key_exactly_once_in_byte_order = same(seen, expected);
+  answer.a_walk_answers_no_key_twice = new Set(seen).size === seen.length && seen.length === WALK_KEYS;
+  // Every page but the last is full, and its `next` is its own last key —
+  // which is the cursor the next page took.
+  answer.every_page_but_the_last_is_full_and_its_next_is_its_last_key = pages
+    .slice(0, -1)
+    .every((answered) => answered.keys.length === 1000 && answered.next === answered.keys.at(-1));
+  // 100,000 is a multiple of 1000, so the last page is as full as the rest and
+  // still answers no `next`: "more remain" is asked of the store, not read off
+  // a page that came back full.
+  const last = pages.at(-1);
+  answer.the_last_page_answers_no_next = last !== undefined && !("next" in last);
+  answer.a_full_last_page_answers_no_next =
+    WALK_KEYS % 1000 !== 0 || (last?.keys.length === 1000 && !("next" in last));
+  answer.a_page_without_include_values_answers_no_entries = pages.every((answered) => !("entries" in answered));
+
+  // …under a prefix, at a limit that divides nothing.
+  const prefixed = await walk(store, run, { prefix: "p/", limit: 777 });
+  const underP = expected.filter((key) => key.startsWith("p/"));
+  answer.a_walk_under_a_prefix_sees_every_prefixed_key_exactly_once = same(
+    prefixed.flatMap((answered) => answered.keys),
+    underP,
+  );
+  answer.a_prefixed_walks_last_page_is_short_and_answers_no_next =
+    !("next" in prefixed.at(-1)) && prefixed.at(-1).keys.length === underP.length % 777;
+
+  // `count` agrees with the walk: the whole partition, one prefix, and none.
+  const counted = await stores.runStoreOp(store, "count", {}, run, node());
+  const countedP = await stores.runStoreOp(store, "count", { prefix: "p/" }, run, node());
+  const countedNone = await stores.runStoreOp(store, "count", { prefix: "nothing/" }, run, node());
+  answer.count_agrees_with_the_walk =
+    counted.count === seen.length && countedP.count === underP.length && countedNone.count === 0;
+  answer.count_answers_an_integer = Number.isInteger(counted.count);
+
+  // A walk carrying its values: every entry is its page's key, in its order,
+  // with the value and the version that key holds.
+  const valued = await walk(store, run, { prefix: "q/", limit: 1000, includeValues: true });
+  answer.include_values_entries_carry_each_keys_value_and_version = valued.every(
+    (answered) =>
+      Array.isArray(answered.entries) &&
+      answered.entries.length === answered.keys.length &&
+      answered.entries.every(
+        (entry, index) =>
+          entry.key === answered.keys[index] &&
+          same(entry.value, byKey.get(entry.key)?.value) &&
+          entry.version === byKey.get(entry.key)?.version,
+      ),
+  );
+  answer.a_valued_walk_sees_every_key_once = same(
+    valued.flatMap((answered) => answered.keys),
+    expected.filter((key) => key.startsWith("q/")),
+  );
+
+  // `get_many` of 1000 keys: present ones spread across the whole store, keys
+  // it does not hold, and two asked for twice, in an order nothing sorted.
+  const present = Array.from({ length: 990 }, (_, index) => seeded[(index * 97) % WALK_KEYS].key);
+  const missing = Array.from({ length: 8 }, (_, index) => `missing/${index}`);
+  const asked = [...present.slice(0, 500), ...missing, present[3], ...present.slice(500), present[700]].reverse();
+  answer.get_many_asked = asked.length;
+  const many = await stores.runStoreOp(store, "get_many", { keys: asked }, run, node());
+  answer.get_many_of_1000_keys_answers_one_entry_per_key_in_order =
+    Array.isArray(many.entries) &&
+    many.entries.length === 1000 &&
+    many.entries.every((entry, index) => entry.key === asked[index]);
+  answer.get_many_answers_found_with_value_and_version_or_neither = many.entries.every((entry) => {
+    const held = byKey.get(entry.key);
+    return held === undefined
+      ? entry.found === false && !("value" in entry) && !("version" in entry)
+      : entry.found === true && same(entry.value, held.value) && entry.version === held.version;
+  });
+  answer.get_many_answers_a_key_asked_twice_twice =
+    many.entries.filter((entry) => entry.key === present[3]).length === 2;
+  answer.get_many_of_no_keys_answers_no_entries = same(
+    await stores.runStoreOp(store, "get_many", { keys: [] }, run, node()),
+    { entries: [] },
+  );
+
+  // …and 1001 is refused, by name and before anything was read or recorded:
+  // the node fails, and its own `retry:`/`on_error:` decide what happens.
+  const before = run.storeRecords.length;
+  try {
+    await stores.runStoreOp(store, "get_many", { keys: [...asked, "one-too-many"] }, run, node());
+    answer.get_many_refusal = null;
+  } catch (error) {
+    answer.get_many_refusal = String(error?.message ?? error).replaceAll(store.address, "<store>");
+  }
+  answer.a_refused_get_many_files_no_record = run.storeRecords.length === before;
+} finally {
+  // A hundred thousand rows are given back however the walk went, and a
+  // cleanup that failed says so beside the cases rather than in place of them.
+  try {
+    answer.the_walk_gives_its_rows_back = await forget(WALKED);
+  } catch (error) {
+    answer.walk_cleanup_error = String(error?.message ?? error);
+  }
+}
+
+{
+  // **The order, the same on every arm**, for a set whose byte order differs
+  // from every other order a comparison could answer in: case, a space, the
+  // accents, two-, three- and four-byte characters. Written in an order
+  // nothing sorted, and walked three at a time — so the cursor, not one
+  // `ORDER BY`, is what has to agree.
+  const store = kv("paged_order", "global");
+  const run = ctx(execution("paged_order"));
+  const mixed = ["é", "Z", "😀", "a b", "B", "ab", "中", "a", "ß", "z", "Ω", "A", "＀", "aB", "É", "b"];
+  for (const [index, key] of mixed.entries()) await set(store, key, { n: index }, run, `po/${index}`);
+  answer.paged_order = (await walk(store, run, { limit: 3 })).flatMap((answered) => answered.keys);
+  // A cursor is a position in the order, not a key the store has to hold.
+  answer.after_a_key_the_store_does_not_hold = (await page(store, run, { limit: 3, after: "aA" })).keys;
+  answer.after_the_last_key_answers_an_empty_last_page = same(await page(store, run, { limit: 3, after: "😀" }), {
+    keys: [],
+  });
+}
+
+{
+  // **A write landing mid-walk** moves no page the walk has yet to read: a key
+  // added behind the cursor is not seen, one added ahead of it is, one deleted
+  // ahead of it is not, and nothing already answered comes back — which is
+  // what a keyset cursor gives and an offset would not.
+  const store = kv("moving_walk", "global");
+  const run = ctx(execution("moving_walk"));
+  const keys = Array.from({ length: 10 }, (_, index) => `k${String(index + 1).padStart(2, "0")}`);
+  for (const [index, key] of keys.entries()) await set(store, key, { n: index }, run, `mw/${index}`);
+  const first = await page(store, run, { limit: 3 });
+  await set(store, "k00", { n: -1 }, run, "mw/behind");
+  await set(store, "k055", { n: 55 }, run, "mw/ahead");
+  await stores.runStoreOp(store, "delete", { key: "k07" }, run, node("mw/deleted"));
+  const rest = await walk(store, run, { limit: 3, after: first.next });
+  // `walk` starts from no cursor; this one starts from the first page's.
+  const seen = [...first.keys, ...rest.flatMap((answered) => answered.keys)];
+  answer.a_write_mid_walk_moves_no_later_page = same(seen, [
+    "k01",
+    "k02",
+    "k03",
+    "k04",
+    "k05",
+    "k055",
+    "k06",
+    "k08",
+    "k09",
+    "k10",
+  ]);
+}
+
+{
+  // **The trace.** A page, a `count` and a `get_many` are reads: each files a
+  // record with `effect: "read"` and the answer a replay consumes, and none of
+  // them addresses one key or carries an idempotency key — not even from a
+  // node site that hands one to every op it runs, which the emitted graph does
+  // (PRD resolved q29, q70; `docs/trace.md` §6).
+  const store = kv("read_records", "global");
+  const run = ctx(execution("read_records"));
+  await set(store, "r1", { n: 1 }, run, "rr/1");
+  run.storeRecords.length = 0;
+  const listed = await page(store, run, { limit: 5, after: "r0", includeValues: true, site: "rr/list" });
+  const counted = await stores.runStoreOp(store, "count", { prefix: "r" }, run, node("rr/count"));
+  const fetched = await stores.runStoreOp(store, "get_many", { keys: ["r1", "r2"] }, run, node("rr/many"));
+  const [listRecord, countRecord, manyRecord] = run.storeRecords;
+  const isRead = (record, op, answered) =>
+    record?.op === op &&
+    record?.effect === "read" &&
+    record?.via === "node" &&
+    same(record?.answer, answered) &&
+    !("key" in record) &&
+    !("idempotencyKey" in record) &&
+    !("deduped" in record) &&
+    !("applied" in record);
+  answer.a_list_page_record_is_a_read_with_no_key = isRead(listRecord, "list", listed);
+  answer.a_count_record_is_a_read_with_no_key = isRead(countRecord, "count", counted);
+  answer.a_get_many_record_is_a_read_with_no_key = isRead(manyRecord, "get_many", fetched);
+  answer.the_reads_wrote_no_ledger_row =
+    (await set(store, "r1", { n: 2 }, run, "rr/count")).deduped === false &&
+    (await set(store, "r1", { n: 3 }, run, "rr/many")).deduped === false;
+}
+
+{
+  // **Replay.** A resumed generation answers a page, a `count` and a
+  // `get_many` out of the record rather than out of the live store, exactly as
+  // it answers a `get` (PRD resolved q29) — so the world moving between the
+  // two generations changes nothing the replay hands the graph.
+  const handle = await journal.openJournal();
+  const store = kv("replayed_reads", "global");
+  const id = execution("replay_reads");
+  await handle.begin({
+    id,
+    flow: "flow.probe",
+    trigger: "manual",
+    inputs: {},
+    sessionKey: "",
+    status: "open",
+    journalVersion: journal.JOURNAL_VERSION,
+    startedAt: new Date().toISOString(),
+  });
+  const live = ctx(id);
+  const reads = async () => ({
+    counted: await stores.runStoreOp(
+      store,
+      "count",
+      { prefix: "r/" },
+      ctx(id, "", journal.recorderFor(id, "flow.probe/0#count")),
+      node(),
+    ),
+    fetched: await stores.runStoreOp(
+      store,
+      "get_many",
+      { keys: ["r/1", "r/2"] },
+      ctx(id, "", journal.recorderFor(id, "flow.probe/0#many")),
+      node(),
+    ),
+    paged: await page(store, ctx(id, "", journal.recorderFor(id, "flow.probe/0#page")), {
+      limit: 1,
+      prefix: "r/",
+      includeValues: true,
+    }),
+  });
+
+  journal.openSession(id, handle, false);
+  await set(store, "r/1", { generation: "first" }, live, "rp/seed/1");
+  const recorded = await reads();
+  journal.closeSession(id);
+
+  // The world moves under it, out of band and with nothing recording: a key
+  // the `count` would now count, the `get_many` find, and the page answer as
+  // its `next`.
+  await set(store, "r/2", { generation: "moved" }, live, "rp/seed/2");
+  await set(store, "r/0", { generation: "moved" }, live, "rp/seed/0");
+
+  journal.openSession(id, handle, true);
+  const replayed = await reads();
+  journal.closeSession(id);
+
+  answer.a_replayed_count_answers_out_of_the_record =
+    recorded.counted.count === 1 &&
+    same(replayed.counted, recorded.counted) &&
+    (await stores.runStoreOp(store, "count", { prefix: "r/" }, live, node())).count === 3;
+  answer.a_replayed_get_many_answers_out_of_the_record =
+    recorded.fetched.entries[1]?.found === false && same(replayed.fetched, recorded.fetched);
+  answer.a_replayed_page_answers_out_of_the_record =
+    same(recorded.paged.keys, ["r/1"]) && !("next" in recorded.paged) && same(replayed.paged, recorded.paged);
+  await journal.releaseJournal();
+}
+
 // --- Scope: three partitions, keyed as the local backend keys them -----------
 
 {
@@ -1641,6 +2077,19 @@ if (provider !== "sqlite") {
       (await get(store, "before", run)).value?.held === "first";
   } catch (error) {
     answer.redial_error = String(error?.message ?? error);
+  }
+}
+
+// **Every other row this run wrote**, on a server, for [`forget`]'s reason at
+// a smaller scale: a few hundred rows a run, one of them past 64 KiB, that no
+// later run reads and nothing else deletes. Every store this file names starts
+// with [`RUN`], which is hex after a letter and so holds no `LIKE` wildcard.
+// The SQLite arm's files are in the data directory its caller throws away.
+if (provider !== "sqlite") {
+  try {
+    answer.the_run_gives_its_rows_back = await sweep("LIKE", `${RUN}%`);
+  } catch (error) {
+    answer.run_cleanup_error = String(error?.message ?? error);
   }
 }
 

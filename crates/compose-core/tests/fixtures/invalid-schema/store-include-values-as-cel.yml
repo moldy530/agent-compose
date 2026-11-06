@@ -1,0 +1,15 @@
+# rule: a `list`'s `include_values` is a literal boolean, not CEL — it decides whether the page's derived output carries `entries` (grammar 8.8, 11.4, PRD resolved q70)
+# at: /flow.work/nodes/page/include_values
+# via: /$defs/storeNode/properties/include_values/type
+flow.work:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    page:
+      store: store.notes
+      op: list
+      limit: 100
+      include_values: "state.wanted"
+  edges:
+    - { from: start, to: page }
+    - { from: page, to: end }

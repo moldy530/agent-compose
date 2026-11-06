@@ -565,6 +565,19 @@ const CODEGEN: &[Criterion] = &[
                 "a_run_that_reaches_the_superstep_ceiling_says_which_bound_was_missing",
                 Status::Live,
             ),
+            // …and both clauses on the cycle PRD resolved q70 makes ordinary: a
+            // walk of a `kv` store a page at a time. A budgeted back-edge reads
+            // as many pages as it declares, past the ceiling's allowance for a
+            // guard alone, and ends through its `else:` when the budget runs
+            // out; the same walk on its guard alone is stopped by the ceiling.
+            (
+                "a_walk_with_a_budgeted_back_edge_reads_as_many_pages_as_it_declares",
+                Status::Live,
+            ),
+            (
+                "a_walk_bounded_by_its_guard_alone_stops_at_the_superstep_ceiling",
+                Status::Live,
+            ),
         ],
     },
     Criterion {
@@ -868,6 +881,14 @@ const CODEGEN: &[Criterion] = &[
             // on every `kv` store `full` attaches, whatever its `V` declares.
             (
                 "a_partial_update_the_store_refuses_goes_back_to_the_model",
+                Status::Live,
+            ),
+            // PRD resolved q70 on the node surface: a flow pages through a
+            // `kv` store with `list` and `after:`, counts it, and reads two
+            // keys in one `get_many` — and every one of them is a read the
+            // trace files with its answer and no key.
+            (
+                "a_flow_pages_through_a_kv_store_counts_it_and_reads_many_keys_at_once",
                 Status::Live,
             ),
         ],
@@ -1360,6 +1381,13 @@ const DURABILITY: &[Criterion] = &[
             // out of one composition (`docs/durability.md` §11.1).
             (
                 "a_replayed_store_read_is_the_row_the_recording_generation_went_on_with",
+                Status::Live,
+            ),
+            // …and PRD resolved q70's two reads, across a store that moved
+            // while the execution was down: a resumed `count` and `get_many`
+            // answer what the first generation read.
+            (
+                "a_resumed_run_answers_a_count_and_a_get_many_out_of_the_record",
                 Status::Live,
             ),
         ],

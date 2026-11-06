@@ -1,0 +1,20 @@
+# rule: a `blob` `list` keeps its one shape, so `include_values:` there is refused against its store — the values beside a page's keys are a `kv` page's (grammar 11.4, PRD resolved q70)
+# code: invalid-value
+# message: `include_values` is not a parameter of a `blob` `list`: a cursor and the values beside its keys are a `kv` page's, and `store.artifacts` is `kind: blob`
+# at: main.yml:17:23
+# help: a `blob` `list` answers one prefix of a store's keys up to its `limit:`; to page through a store, keep the records in a `kv` store (grammar 11.4, PRD resolved q70)
+version: "0.1"
+store.artifacts:
+  kind: blob
+  scope: global
+flow.f:
+  outputs: {}
+  nodes:
+    listing:
+      store: store.artifacts
+      op: list
+      limit: 10
+      include_values: true
+  edges:
+    - { from: start, to: listing }
+    - { from: listing, to: end }

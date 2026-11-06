@@ -1,0 +1,13 @@
+# rule: a `get_many` takes its `keys` (grammar 11.4, PRD resolved q70)
+# at: /flow.work/nodes/fetch
+# via: /$defs/storeNode/allOf/13/then/required
+flow.work:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    fetch:
+      store: store.notes
+      op: get_many
+  edges:
+    - { from: start, to: fetch }
+    - { from: fetch, to: end }

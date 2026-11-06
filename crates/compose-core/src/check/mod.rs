@@ -456,6 +456,10 @@ impl<'a> Ctx<'a> {
                     definition.value_schema.as_ref(),
                     definition.metadata_schema.as_ref(),
                     params.top_k.or(params.limit),
+                    params
+                        .include_values
+                        .as_ref()
+                        .is_some_and(|include| include.value),
                     &node.span,
                 ))
             }),
