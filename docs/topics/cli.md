@@ -1,6 +1,6 @@
 # cli
 
-One static binary. Eight verbs act on a composition; five teach you about
+One static binary. Nine verbs act on a composition; five teach you about
 compositions in general and take no spec at all.
 
 ```
@@ -14,6 +14,8 @@ agent-compose resume <path> <execution> [--target <name>] [--out <dir>]
                                         [--format human|json]
 agent-compose serve <path> [--host <host>] [--port <port>]
                            [--target <name>] [--out <dir>] [--format human|json]
+agent-compose store <sub-verb> <path> <store> [operands] [--session <key> | --execution <id>]
+                    [--target <name>] [--out <dir>] [--format human|json]
 agent-compose worker --hub <url> --claim <name>... --token-env <VAR>
                      [--data-dir <dir>]
 
@@ -237,6 +239,118 @@ It does not wait for those replays, so an answer can arrive while one is still o
 its way back to its pause: that request is refused with `recovering: true` and
 told to send it again, rather than told there is nothing waiting for it.
 
+## `store`
+
+Reads and writes one `kv` store through the target's own backend, with no flow
+written. Same build as `run`, then the emitted project's own `store` verb opens
+the store exactly as a flow of that build would — the compiler carries no
+database driver, so it delegates — which is why `--target local` reads the
+SQLite files under the build directory and a named target reaches the `postgres`
+or `mysql` server its deploy file binds, with the target's environment variables,
+as `run` would. It checks `run`'s two preconditions first, and the first is the
+whole composition's: every `${ENV}` reference has a value — a provider's
+credential as much as the store's address — and the pinned dependency set is
+installed.
+
+```sh
+agent-compose store set main.yml store.notes greeting '{"text":"hello"}'
+agent-compose store get main.yml store.notes greeting
+agent-compose store set main.yml store.notes greeting '{"text":"hi"}' --if-version 1
+agent-compose store delete main.yml store.notes greeting --if-version 2
+agent-compose store list main.yml store.visits --session user-42 --prefix 2026- --values
+agent-compose store count main.yml store.visits --session user-42
+agent-compose store export main.yml store.notes > notes.jsonl
+agent-compose store import main.yml store.notes --if-absent < notes.jsonl
+```
+
+| sub-verb | flags | answers |
+|---|---|---|
+| `get <key>` | — | `{ value, found, version }`; exit `1` when the key holds nothing |
+| `set <key> <value>` | `--if absent\|present` or `--if-version <n>`, `--ttl <duration>\|never` | `{ key, applied, version, deduped }`; exit `1` when the condition declined, naming the version the key holds; exit `2` when `value_schema` refuses the value |
+| `delete <key>` | `--if-version <n>` | `{ deleted, applied, version, deduped }`; exit `1` when the condition declined |
+| `list` | `--prefix <p>`, `--limit <n>` (1 to 1000, default 100), `--after <key>`, `--values` | one page, `{ keys, next, entries }`: `next` when more remain, `entries` under `--values` |
+| `count` | `--prefix <p>` | `{ count }` |
+| `export` | `--prefix <p>` | JSON Lines on stdout, one entry per line |
+| `import` | `--if-absent`, `--file <path>` | `{ read, written, skipped, expired, present }`; exit `2`, writing nothing, when any line is refused |
+
+**The partition is named by the scope the store declares.** `--session <key>`
+for a `scope: session` store — the session identity itself, which is what a
+run's `--session` supplies or what its trigger's `session_key:` turns that into
+— `--execution <id>` for a `scope: execution` store, the id a run prints as
+`execution: exec_…`, and neither for a `scope: global` one. The partition is
+derived exactly as the runtime derives it, so the command reads what a flow in
+that partition reads. A flag the scope does not take, a missing one, an address
+naming no store, a `vector` or `blob` store, and a sub-verb that does not exist
+are all usage errors and exit `2`; so is a store whose rows live only in the
+memory of the process running each execution — every `scope: execution` store
+under `--target local`, and any store bound to `provider: memory` — since this
+command is another process. A target binding the store to a server reaches it.
+For the same reason, under `--target local` a `store` command run beside a live
+`run` or `serve` is a second process on the same SQLite files: the one-process
+boundary the `targets` topic describes applies to it, and a write that contends
+with a running node waits and then fails with `database is locked`.
+A write to the partition of an execution that has already ended is a row
+nothing will delete, because the run released that partition when it settled.
+
+**A value is JSON**, on the command line or, as `-`, on standard input. A
+`set`'s value and every `import` line are held to the store's `value_schema` by
+the emitted Zod before anything is written; a refused value exits `2` naming the
+issues — nothing was read or written, and the value is what is to fix, as with a
+`run --input` that does not fit its type — so a supervisor retrying on `1` never
+retries a write that cannot land. `--ttl` is `ttl:`'s spelling — `250ms`, `30s`,
+`5m`, `24h`, or `never` to override a store's `default_ttl:` — and a `set` with
+none takes the default, exactly as a node's would. A key whose time is up is
+absent to `get`, `list`, `count`, `export` and every condition
+(`agent-compose docs stores`).
+
+**`export` and `import` move a partition as JSON Lines.** `export` writes one
+`{"key": …, "value": …, "version": …, "expires_at": …}` per live key, in the
+byte order a `list` pages in; `expires_at` is an ISO 8601 UTC instant, absent
+for a key that does not expire. `import` reads the same shape from standard
+input or `--file` and checks every line before it writes any, so a file with a
+line the schema refuses writes nothing and names each such line. Each line is
+then written at the partition's **next** version — the exported `version` is not
+restored, since a version is the partition's sequence — and an `expires_at`
+still ahead becomes the `ttl` that leaves the key expiring then, to within the
+moment its write takes; a line already past it is skipped and counted as
+`expired`; a line with none writes a key that does not expire, whatever the
+store's default. `--if-absent` writes under `if: absent`, so a key the partition
+already holds is kept and counted as `present`. A backend failure part-way says
+which line it stopped at and how many were written before it.
+
+**The output is a table** for a person, on stdout, with what went wrong on
+stderr. `--format json` answers one JSON document on stdout instead: the op's
+own answer row for `get`, `set`, `delete`, `list` and `count` — the row a
+store-op node's output carries — and the summary for `import`. `export`'s lines
+are its stdout under both formats, so its summary — `{"written": n}` under
+`--format json` — goes to stderr, and so does its failure, as
+`{"error": …, "written": n}` counting the lines already out, and so does the
+report of a composition the compiler refuses: a failure is never written among
+the lines a redirect is collecting for an import. A failure under
+`--format json` is otherwise `{"error": …}` on stdout, with `lines` naming each
+refused line of an import — a refused value is answered so too, though it exits
+`2`, so the issues it names reach a script reading the document; any other usage
+error is a sentence on stderr under either format, as every verb's is.
+
+**A reader that leaves early is not a failure**, here as for every verb (see
+[Exit codes](#exit-codes)). When the reader of a pipe goes before the answer
+reaches it — `| head -1` with its line, a `jq` that failed — what is left of the
+answer is dropped and the exit code is still the op's own: a `get` that found
+its key and a `set` that applied end `0`, so a supervisor retrying on `1` never
+re-issues a write that landed. An answer that was itself a failure, the
+`{"error": …}` of `--format json`, is said on stderr instead. An `export` stops
+at the page the pipe refused, reading nothing more from the store, and ends `0`
+with a summary saying where — `{"written": n, "stopped": …}` under
+`--format json`. A standard output that fails under a reader still there — a
+full disk under `> entries.jsonl` — is said on stderr; for an `export` it is the
+export failing, exit `1`, since that file does not hold the partition.
+
+**An operator's write is not an effect, and is recorded nowhere.** It belongs to
+no execution, carries no idempotency key — so `deduped` is always `false` — and
+writes no journal row, no ledger row and no trace record. Until per-key history
+ships (PRD resolved q74), nothing keeps who changed a key or when: a flow that
+reads it afterwards finds the value, and that is all.
+
 ## `worker`
 
 The other half of a distributed deployment (`docs/distributed.md`). It takes no
@@ -308,9 +422,9 @@ dropped would leave you believing something had been installed under `$HOME`.
 
 | code | meaning |
 |---|---|
-| `0` | clean: nothing was reported, or nothing but **warnings** was, or a `plan` was produced, or a document was printed |
-| `1` | **errors** were reported, `build --check` found drift, a `run` produced no answer, a `resume` diverged from its journal, a `plan`'s spec did not resolve, or a discovery verb found something already there and would not replace it |
-| `2` | the command could not run: bad usage, an unreadable entrypoint, an unwritable output directory, a missing or malformed environment variable, an uninstalled dependency set, no JavaScript runtime to launch, or a `resume` naming an execution the journal does not hold open |
+| `0` | clean: nothing was reported, or nothing but **warnings** was, or a `plan` was produced, or a document was printed, or a `store` op found or applied |
+| `1` | **errors** were reported, `build --check` found drift, a `run` produced no answer, a `resume` diverged from its journal, a `store` op found nothing, declined its condition or met a failing backend, a `store export` could not write its lines (a full disk, never a reader that left), a `plan`'s spec did not resolve, or a discovery verb found something already there and would not replace it |
+| `2` | the command could not run: bad usage, an unreadable entrypoint, an unwritable output directory, a missing or malformed environment variable, an uninstalled dependency set, no JavaScript runtime to launch, a `resume` naming an execution the journal does not hold open, a `store` address, sub-verb or partition flag the composition does not take, or a `store` value its `value_schema` refuses |
 | `3` | a `run` or `resume` with nobody to ask stopped at a `human` pause |
 
 The split between `1` and `2` is *the answer is no* versus *the command could

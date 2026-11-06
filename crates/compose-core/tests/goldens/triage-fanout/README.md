@@ -158,12 +158,13 @@ bun src/index.ts
 `bun src/index.ts` with no arguments starts nothing: loading the project is the
 environment check, and there is nothing else a bare launch could mean. With a
 verb it is this project's command line, which is exactly what `agent-compose
-run` and `agent-compose serve` launch:
+run`, `agent-compose serve` and `agent-compose store` launch:
 
 ```sh
 bun src/index.ts run flow.<name> --input goal=... [--session <key>] [--format json]
 bun src/index.ts resume <execution-id> [--format json]
 bun src/index.ts serve --port 8787
+bun src/index.ts store get store.<name> <key> [--session <key> | --execution <id>] [--format json]
 ```
 
 `run` prints the flow's `outputs:` as one JSON object on **stdout** and its
@@ -188,6 +189,27 @@ effect **consumed** — the model answers it got, the results its tools produced
 what its stores read, what a person answered — and only the frontier, the first
 effect the journal does not hold, reaches the network. It takes no `--input` and
 no `--session`: the invocation it replays is the one the journal recorded.
+
+`store` reads and writes one `kv` store of this composition through this
+target's own backend, with no flow written: `get <key>`, `set <key> <json>`
+(`-` reads the value from standard input; `--if absent|present` or
+`--if-version <n>`, and `--ttl <duration>|never`), `delete <key>`
+(`--if-version <n>`), `list` (`--prefix`, `--limit`, `--after`, `--values`),
+`count` (`--prefix`), `export` — every live entry as JSON Lines of
+`{ key, value, version, expires_at }` on stdout — and `import`, which reads the
+same from standard input or `--file`, writes each line at a fresh version,
+honours a remaining `expires_at` as a `ttl`, skips a line already expired, and
+with `--if-absent` keeps a key the store already holds. The partition is the one
+the store's scope names: `--session` for `scope: session`, `--execution` for
+`scope: execution`, neither for `scope: global`. A value is held to the store's
+`value_schema` before it is written. The answer is a table, or one JSON document
+under `--format json`; the exit code is `0` for a key found or a write applied,
+`1` for a key that holds nothing, a condition that declined or a backend that
+failed, and `2` for a command line it does not take — a value `value_schema`
+refuses among it, since nothing was written and the value is what is to fix.
+**An operator's write is not an effect**: it belongs to no execution, carries no
+idempotency key, and writes no journal row, no ledger row and no trace record,
+so it is recorded nowhere.
 
 `serve` starts the app over the composition's declared `http` triggers and
 announces where it is listening as one JSON line on stdout. Beside them it
@@ -499,8 +521,10 @@ rather than the operating system's — so two `agent-compose run`s sharing a
 `session` or `global` store contend for it, and the loser waits and then fails
 the node with `SQLite3Error: database is locked`. It fails loudly rather than
 corrupting anything, and a `serve` process — which runs its executions in **one**
-process — is not affected. `--target local` means one process, which is the same
-boundary the target draws everywhere else. A deployment that really has two is a
+process — is not affected by its own executions, but an `agent-compose store`
+command run beside a live `run` or `serve` is a second process on the same
+files and contends the same way. `--target local` means one process, which is
+the same boundary the target draws everywhere else. A deployment that really has two is a
 named target binding a **dialled** backend: a `kv` store on `postgres` or
 `mysql` is a connection rather than a file, every process reaching it reaches the
 same rows, and nothing else about the store changes — same ops, same scopes, same

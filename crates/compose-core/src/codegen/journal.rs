@@ -1802,6 +1802,15 @@ mod tests {
         //  * `writeTrace` — the run's own trace document, written by the command
         //    after the run (`docs/trace.md`). A resumed generation writes a fresh
         //    whole one, which is §9's promise rather than a repeat.
+        //  * `operatorPage` and `readImportFile` — an operator at the project's
+        //    command line reading a store's partition for `store export`, and the
+        //    file `store import --file` names (PRD resolved q72). Neither belongs
+        //    to an execution: there is no graph issuing them and no journal row a
+        //    replay could consume or re-issue, which is the ruling's own posture
+        //    for every op an operator makes. The operator's single-key ops and
+        //    writes reach the store through `perform`, the function every
+        //    store-op node's op runs, so they are read under that seam's name
+        //    rather than exempted here.
         //  * the journal's **own** storage: the three drivers, the open paths
         //    that create and migrate each backend's schema, the lock a killed
         //    writer leaves behind (§2), and `journalExists`. These are the record
@@ -1809,13 +1818,15 @@ mod tests {
         //    its own journal, which is what a replay *is*. The two remote arms
         //    are read here like every other emitted module, so a driver call
         //    that ever escaped one of them fails this test rather than nothing.
-        const NOT_AN_EFFECT: [(&str, &str); 15] = [
+        const NOT_AN_EFFECT: [(&str, &str); 17] = [
             ("src/stores.ts", "releaseExecution"),
             ("src/stores.ts", "pruneStore"),
             ("src/stores.ts", "pruneBlobLedger"),
+            ("src/stores.ts", "operatorPage"),
             ("src/runtime.ts", "releaseWorkspaces"),
             ("src/delivery.ts", "attemptDelivery"),
             ("src/cli.ts", "writeTrace"),
+            ("src/cli.ts", "readImportFile"),
             ("src/journal.ts", "SqliteDriver"),
             ("src/journal.ts", "openSqlite"),
             ("src/journal.ts", "breakStaleLock"),

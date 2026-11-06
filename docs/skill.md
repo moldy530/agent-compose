@@ -65,6 +65,7 @@ compiled project.
 | `run <path> <flow>` | build, then run one flow; `--input k=v`, `--session <key>` |
 | `resume <path> <execution>` | build, then carry on a journaled execution — replaying its recorded effects rather than re-issuing them |
 | `serve <path>` | build, then serve the project's `http` triggers |
+| `store <sub-verb> <path> <store>` | build, then read or write one `kv` store through the target's own backend with no flow: `get`, `set`, `delete`, `list`, `count`, `export`, `import`; `--session <key>` or `--execution <id>` names the partition |
 | `worker --hub <url> --claim <name> --token-env <VAR>` | join a hub and run the nodes placed on the names it claims; takes no spec |
 | `docs [<topic>]` | the topic index, or one topic |
 | `explain <code>` | the expanded account of one diagnostic code |
@@ -73,14 +74,14 @@ compiled project.
 | `skill [--agent <name>] [--global]` | print this document, or install it; `--global` installs under `$HOME` |
 
 Add `--format json` to any verb that reports — `validate`, `plan`, `build`,
-`run`, `resume`, `serve` — when a script is reading the output. `visualize`'s
+`run`, `resume`, `serve`, `store` — when a script is reading the output. `visualize`'s
 `--format` is the odd one out: it names the **artifact** (`html` or `json`, the
 page or the document the page renders) rather than the shape of a report, and
 its diagnostics are `validate`'s either way. Add
-`--target <name>` to the five verbs that resolve a composition against an
-environment — `validate`, `build`, `run`, `resume`, `serve` — to select a
-`deploy/<name>.yml`; the built-in `local` target needs no deploy file and is
-what those five resolve when none is named. `plan` takes no `--target`: it
+`--target <name>` to the six verbs that resolve a composition against an
+environment — `validate`, `build`, `run`, `resume`, `serve`, `store` — to select
+a `deploy/<name>.yml`; the built-in `local` target needs no deploy file and is
+what those six resolve when none is named. `plan` takes no `--target`: it
 answers what changed in the composition.
 
 ## Exit codes
@@ -120,6 +121,16 @@ work it had not yet done reaches the network. It takes no `--input` and no
 `--session`: the invocation it replays is the one the journal recorded. `serve`
 needs no such command; it recovers every open execution on start. See
 `agent-compose docs targets`.
+
+## Looking inside a store
+
+`agent-compose store get main.yml store.<name> <key>` reads what a flow would
+read, through the same backend; `set`, `delete`, `list`, `count`, `export` and
+`import` are the rest of the surface, and a value is held to the store's
+`value_schema` before it is written. Use it to seed a store before a run, or to
+see what a run left, rather than writing a flow to do either. A write made this
+way is not an effect of any execution and is recorded nowhere. See
+`agent-compose docs cli`.
 
 ## The topics
 

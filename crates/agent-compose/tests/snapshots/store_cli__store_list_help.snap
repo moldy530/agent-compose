@@ -1,0 +1,53 @@
+---
+source: crates/agent-compose/tests/store_cli.rs
+expression: "String::from_utf8(output.stdout).expect(\"help is UTF-8\")"
+---
+List one page of keys, in byte order
+
+Usage: agent-compose store list [OPTIONS] <PATH> <STORE>
+
+Arguments:
+  <PATH>
+          Path to the spec entrypoint (conventionally `main.yml`)
+
+  <STORE>
+          The store, as a typed address (`store.<name>`)
+
+Options:
+      --session <KEY>
+          The session whose partition to address, for a `scope: session` store
+
+      --execution <ID>
+          The execution whose partition to address, for a `scope: execution` store
+
+      --target <NAME>
+          Deploy target whose backend the store is opened on
+          
+          [default: local]
+
+      --out <DIR>
+          Where to write the generated project [default: <project>/build/<target>]
+
+      --format <FORMAT>
+          How the store answers, and how a refused composition is reported
+
+          Possible values:
+          - human: A table on stdout, for a person; what went wrong on stderr
+          - json:  One JSON document on stdout — the op's answer row, or an import's summary (an export's lines are its stdout either way, and its summary or failure goes to stderr)
+          
+          [default: human]
+
+      --prefix <PREFIX>
+          Only the keys that begin with this
+
+      --limit <N>
+          How many keys one page holds, 1 to 1000 [default: 100]
+
+      --after <KEY>
+          Start after this key — the `next` the page before answered
+
+      --values
+          Show each key's value and version too
+
+  -h, --help
+          Print help (see a summary with '-h')

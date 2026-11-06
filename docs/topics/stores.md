@@ -171,6 +171,14 @@ trigger whose flow **reaches** a session-scoped store must declare
 `session_key: "payload.session"` by default and satisfy the check statically;
 supplying `--session` is then a run-time requirement.
 
+**Looking inside a store needs no flow.**
+`agent-compose store get main.yml store.<name> <key>` and its siblings — `set`,
+`delete`, `list`, `count`, `export`, `import` — reach a `kv` store through the
+backend the target binds and the partition a flow would address, named by
+`--session <key>` or `--execution <id>` as the store's scope asks. A value
+written that way is held to `value_schema` like any other, and is not an effect
+of any execution: nothing records it. `agent-compose docs cli` has the flags.
+
 ## Ops
 
 `V` is the store's `value_schema`; `M` is its `metadata_schema`.
