@@ -244,11 +244,15 @@ store.notes:
 # `<name>_append` and the field enum of `<name>_incr` — and the nodes in
 # `flow.shape` below that reach every conditional and partial-update row. The
 # binding's `value:` is the emitted Zod the partial updates validate against.
+# PRD resolved q69's `default_ttl:` is the binding's `defaultTtl`, in
+# milliseconds — what a write naming no `ttl:` and every synthesized tool's
+# write give the key they leave.
 store.ledger:
   kind: kv
   scope: execution
   description: Who holds what, and how often it was touched.
   agent_access: full
+  default_ttl: 24h
   value_schema:
     owner: { type: string }
     marks:
@@ -440,12 +444,14 @@ flow.shape:
     # Every conditional and partial-update row of grammar 11.4 (PRD resolved
     # q68): the literal `if:`, the CEL `if_version:`, `fields:`, the literal
     # `field:` and `unique:`, an `append`'s item as a value rather than a string,
-    # and an `incr`'s `by:`.
+    # and an `incr`'s `by:` — and PRD resolved q69's literal `ttl:` in both its
+    # spellings, a duration emitted as milliseconds and `never`.
     claim:
       store: store.ledger
       op: set
       key: "input.goal"
       if: absent
+      ttl: 90s
       value:
         owner: "'shaper'"
         marks: "[]"
@@ -457,12 +463,14 @@ flow.shape:
       field: marks
       value: "state.latest"
       unique: true
+      ttl: never
     tick:
       store: store.ledger
       op: incr
       key: "input.goal"
       field: hits
       by: "2"
+      ttl: 5m
     tidy:
       store: store.ledger
       op: merge

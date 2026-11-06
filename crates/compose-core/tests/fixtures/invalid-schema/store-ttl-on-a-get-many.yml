@@ -1,0 +1,15 @@
+# rule: `ttl:` is a parameter of the four `kv` writes that leave a key holding a value, and a `get_many` reads — it writes nothing to expire (grammar 11.4, PRD resolved q69, q70)
+# at: /flow.work/nodes/fetch/ttl
+# via: /$defs/storeNode/allOf/13/then/properties/ttl
+flow.work:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    fetch:
+      store: store.notes
+      op: get_many
+      keys: "['a', 'b']"
+      ttl: 30s
+  edges:
+    - { from: start, to: fetch }
+    - { from: fetch, to: end }

@@ -561,18 +561,23 @@ impl StoreOp {
     /// so a `vector`/`blob` `delete` naming one is refused against its store by
     /// the validator rather than here (grammar 11.4).
     ///
-    /// The paging of PRD resolved q70 is the same shape on `list`: `after:` and
-    /// `include_values:` are a `kv` page's, and `list` is one op of two kinds,
-    /// so a `blob` `list` naming either is refused against its store by the
-    /// validator too.
+    /// So is PRD resolved q69's `ttl:`, on exactly the four writes that leave a
+    /// key holding a value — `set`, `merge`, `append`, `incr`. Each is a `kv` op
+    /// alone, so the row is the whole rule: a `delete` leaves nothing to
+    /// expire, and a read writes nothing to give an expiry to.
+    ///
+    /// The paging of PRD resolved q70 takes `delete`'s shape on `list`: `after:`
+    /// and `include_values:` are a `kv` page's, and `list` is one op of two
+    /// kinds, so a `blob` `list` naming either is refused against its store by
+    /// the validator too.
     #[must_use]
     pub const fn optional_parameters(self) -> &'static [&'static str] {
         match self {
             Self::Get => &[],
             Self::Delete => &["if_version"],
-            Self::Set | Self::Merge => &["if", "if_version"],
-            Self::Append => &["unique", "if", "if_version"],
-            Self::Incr => &["by", "if", "if_version"],
+            Self::Set | Self::Merge => &["if", "if_version", "ttl"],
+            Self::Append => &["unique", "if", "if_version", "ttl"],
+            Self::Incr => &["by", "if", "if_version", "ttl"],
             Self::List => &["prefix", "after", "include_values"],
             Self::Count => &["prefix"],
             Self::GetMany => &[],
@@ -600,6 +605,31 @@ impl StoreCondition {
         match self {
             Self::Absent => "absent",
             Self::Present => "present",
+        }
+    }
+}
+
+/// How long the key a `kv` write leaves lives (grammar 11.4, PRD resolved q69).
+///
+/// A literal, never CEL: §4.4's duration, or the keyword `never`. A key's
+/// expiry is an absolute instant its write computes — the store's clock plus
+/// this — so every write refreshes it, and `never` is the one spelling that
+/// clears it on a store whose `default_ttl:` would otherwise set one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StoreTtl {
+    /// `ttl: never` — the key does not expire, whatever the store's default.
+    Never,
+    /// `ttl: <duration>` — the key expires this long after the write.
+    After(Duration),
+}
+
+impl StoreTtl {
+    /// The literal as written: the keyword, or the duration's own text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Never => "never",
+            Self::After(duration) => duration.as_str(),
         }
     }
 }
@@ -661,6 +691,8 @@ pub struct StoreOpParams {
     pub condition: Option<Spanned<StoreCondition>>,
     /// `if_version:` — the version the key must hold.
     pub if_version: Option<Spanned<Cel>>,
+    /// `ttl:` — how long the key a `kv` write leaves lives (PRD resolved q69).
+    pub ttl: Option<Spanned<StoreTtl>>,
     /// `after:` — a `kv` `list`'s exclusive cursor: the last key of the page
     /// before (PRD resolved q70).
     pub after: Option<Spanned<Cel>>,

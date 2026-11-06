@@ -375,10 +375,23 @@ pub(crate) fn address(
     ))
 }
 
-const DURATION_RULE: &str = "durations are a positive integer followed by `ms`, `s`, `m`, or `h`, e.g. `30s`; compound forms like `1m30s` are not supported";
+pub(crate) const DURATION_RULE: &str = "durations are a positive integer followed by `ms`, `s`, `m`, or `h`, e.g. `30s`; compound forms like `1m30s` are not supported";
 
 /// Read a duration (grammar 4.4).
 pub(crate) fn duration(node: &Node, subject: &str, cx: &mut Cx) -> Option<Spanned<Duration>> {
+    duration_with_help(node, subject, DURATION_RULE, cx)
+}
+
+/// Read a duration, refusing a malformed one with `help` rather than the bare
+/// rule — for a position that takes one more spelling beside §4.4's and says
+/// so where the author is looking (a `kv` write's `ttl: never`, PRD resolved
+/// q69). The diagnostic is the same one: the code and the message do not move.
+pub(crate) fn duration_with_help(
+    node: &Node,
+    subject: &str,
+    help: &str,
+    cx: &mut Cx,
+) -> Option<Spanned<Duration>> {
     let Yaml::String(text) = &node.value else {
         cx.push(
             Diagnostic::error(
@@ -389,7 +402,7 @@ pub(crate) fn duration(node: &Node, subject: &str, cx: &mut Cx) -> Option<Spanne
                     node.description()
                 ),
             )
-            .with_help(DURATION_RULE),
+            .with_help(help),
         );
         return None;
     };
@@ -403,7 +416,7 @@ pub(crate) fn duration(node: &Node, subject: &str, cx: &mut Cx) -> Option<Spanne
                     node.span.clone(),
                     format!("`{text}` is not a valid duration for {subject}"),
                 )
-                .with_help(DURATION_RULE),
+                .with_help(help),
             );
             None
         }

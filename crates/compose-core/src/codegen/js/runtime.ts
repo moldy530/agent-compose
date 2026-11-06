@@ -11603,6 +11603,11 @@ function holdDelivery(execution: string, delivery: Promise<void>): void {
  * which is not a crash and not §2's one-statement window — it is a second
  * delivery every time.
  *
+ * A run that ended does not wait here; the prune of its idempotency ledger does
+ * — it is started behind this ([`settleExecution`], PRD resolved q69), and
+ * nothing waits for either but a command on its way out — because a delivery
+ * still running is still writing, and retrying, under the execution's id.
+ *
  * Called after the wait board is released, so a delivery holding a pause of its
  * own is already abandoned rather than something this could wait on for ever.
  * The loop re-reads the map because a delivery may dispatch a fan-out of its
@@ -11615,6 +11620,15 @@ export async function settleDetached(execution: string): Promise<void> {
     if (held === undefined || held.size === 0) return;
     await Promise.all([...held]);
   }
+}
+
+/**
+ * Whether any detached delivery of an execution is still in flight — the
+ * question [`settleExecution`] asks before it prunes the execution's ledger,
+ * which must wait for [`settleDetached`] whenever this is true.
+ */
+function deliveriesInFlight(execution: string): boolean {
+  return (detachedDeliveries.get(execution)?.size ?? 0) > 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -14386,6 +14400,7 @@ export async function openExecution(opening: ExecutionOpening): Promise<Lineage 
     }
     openSession(opening.execution, journal, resuming);
     settledJournals.set(opening.execution, journal);
+    executionSessions.set(opening.execution, opening.sessionKey);
     return lineage;
   } catch (error) {
     openedExecutions.delete(opening.execution);
@@ -14439,9 +14454,177 @@ export async function settleExecution(execution: string, error?: unknown): Promi
   await childrenBegun(execution);
   if (error === undefined) {
     await journal.end(execution, "completed");
-    return;
+  } else {
+    await journal.end(execution, "failed", describe(error));
   }
-  await journal.end(execution, "failed", describe(error));
+  // **After** the row has closed, never before: a crash between the two leaves
+  // ledger rows nothing will ask for again, and the other order could leave an
+  // execution the journal still holds open without the rows its resume needs.
+  const identity: ExecutionIdentity = {
+    id: execution,
+    session_key: executionSessions.get(execution) ?? "",
+  };
+  // …and after the detached `agent.*` and `tool.*` deliveries this execution
+  // started have finished too. They outlive the run by design (grammar 8.6 rule
+  // 7) and every effect they make is this execution's, under its id — a flow an
+  // agent calls as a tool included — so a delivery still retrying a keyed write
+  // its first attempt applied would find no row to answer it and apply it a
+  // second time, and one writing after the prune would leave a row nothing
+  // prunes. A run that resumed already waited for them (`runFlow`'s release),
+  // and most runs dispatch none; where some are still in flight the prune is
+  // handed the end of them to start behind.
+  //
+  // **Started, never awaited.** The prune visits every store the composition
+  // binds, the ones this execution never reached included, and a settlement
+  // that waited for it would make this run's answer wait on whether every one
+  // of those servers answers — a store a flow never touched, on a host that
+  // accepts a connection and says nothing, would hold `runFlow`, a `run` and
+  // a `serve` sync trigger for as long as the socket lived. So the outcome is
+  // the row's alone: `src/stores.ts` holds the prune, and a command waits for
+  // it on its way out (`drainStores` — a `run` or a `resume` as it exits, a
+  // `serve` when it is stopped), starting then the ones still waiting on
+  // deliveries the exit is about to cut off.
+  //
+  // **Never under a placed node a worker may still be running**
+  // ([`placedRunnerMayOutlive`]): the hub superseding a dispatch ends the
+  // attempt, not the worker's node runner, which goes on writing dialled stores
+  // under this execution's keys — and the rows are what answer it. Asked here,
+  // with the journal this settlement has just written to, rather than when the
+  // prune starts: a `run` or a `resume` lets go of its journal before its
+  // stores on the way out (`./cli.ts`), so a prune its exit starts could not
+  // ask. Only a process that hands placed nodes out ([`handsOut`]) can have
+  // handed one of this execution's over since, from a delivery still in
+  // flight, so only there is the question asked again as the prune starts.
+  if (await placedRunnerMayOutlive(journal, execution)) return;
+  const deliveries = deliveriesInFlight(execution) ? settleDetached(execution) : undefined;
+  pruneLedgers(
+    identity,
+    deliveries,
+    deliveries !== undefined && handsOut
+      ? () => placedRunnerMayOutlive(journal, execution)
+      : undefined,
+  );
+}
+
+/**
+ * Whether a worker may still be running a placed node of this execution — and
+ * so may still make a keyed store write under the execution's id — which holds
+ * the execution's ledger prune back **for good** (PRD resolved q69, grammar
+ * D153).
+ *
+ * Read off the journal's dispatch rows, the one place dispatch state is held
+ * (`docs/distributed.md` §8 rule 3): a dispatch a session was handed
+ * (`dispatchedAt`) that no result has ended. A **superseded** one is the case
+ * this exists for — the session holding it fell outside the liveness window,
+ * the artifact it was issued under was replaced, its node's deadline ran out,
+ * or the hub that handed it over was replaced (§3.4, §5, §6.3) — and a
+ * supersession ends the *attempt*, not the runner: the worker does not stop a
+ * node runner when its session ends (it joins again and re-sends what the
+ * runner streams, §3.3), and the runner writes a dialled store directly
+ * (grammar 14.1 rule 5, D131), under the grammar 9.4 key the retry that
+ * replaced it wrote under too. That write is answered from the retry's ledger
+ * row — PRD resolved q63's "applies once even when the two attempts are two
+ * processes" — for exactly as long as the row is there, and nothing tells the
+ * hub when, or whether, the runner finishes; a `409` on its late result says
+ * only that the result was refused. So the rows stay. One still `dispatched`
+ * is a runner the hub has not ended at all. A dispatch that never left the
+ * board had no runner, and one a result settled had one that has finished: the
+ * result is a runner's last line (§3.4).
+ *
+ * A journal that cannot answer is read as "it may": a row kept costs storage,
+ * and a row pruned under a runner still writing is a write applied twice.
+ */
+async function placedRunnerMayOutlive(journal: Journal, execution: string): Promise<boolean> {
+  try {
+    return (await journal.dispatchesOf(execution)).some(
+      (row) => row.dispatchedAt !== undefined && row.status !== "settled",
+    );
+  } catch (failure) {
+    process.stderr.write(
+      `warning: the placed dispatches of execution \`${execution}\` could not be read (${describe(failure)}), so the ledger rows its keyed store writes left are kept: a worker may still be running one of its nodes under them (PRD resolved q69)\n`,
+    );
+    return true;
+  }
+}
+
+/**
+ * Whether this process hands placed nodes to workers — set by `./mesh.ts` as
+ * it mounts the worker routes ([`handsOutPlacedNodes`]), so in a `serve` whose
+ * target places something and nowhere else.
+ *
+ * What it decides is whether a settled execution's prune, waiting behind
+ * detached deliveries, asks [`placedRunnerMayOutlive`] again as it starts
+ * ([`settleExecution`]): a delivery still in flight can reach a placed node,
+ * and only a process that hands them out can have handed one over since the
+ * settlement asked. One that hands none out has nothing new to find — and is a
+ * `run` or a `resume`, whose journal is closed by the time its exit starts the
+ * prune.
+ */
+let handsOut = false;
+
+/** Mark this process as one that hands placed nodes to workers. See [`handsOut`]. */
+export function handsOutPlacedNodes(): void {
+  handsOut = true;
+}
+
+/**
+ * Each open execution's session key, so [`settleExecution`] can hand the
+ * ledger prune the identity whose partition a `blob` store's ledger is in.
+ * Set by [`openExecution`], dropped by [`closeExecution`].
+ */
+const executionSessions = new Map<string, string>();
+
+/**
+ * What prunes the idempotency ledger an execution's keyed store writes left —
+ * `src/stores.ts`'s `pruneLedger`, registered as that module loads.
+ *
+ * A registration rather than an import because the emitted import graph has
+ * one direction: `src/stores.ts` imports this module, and this module imports
+ * nothing that imports it. Called once an execution's row has closed
+ * `completed` or `failed`, with the end of its detached deliveries where any
+ * are still in flight — every grammar 9.4 key begins with the execution's id,
+ * and a settled execution never resumes (PRD resolved q65), so its rows answer
+ * nothing again (PRD resolved q69). An execution that does not settle is never
+ * handed to it, and nor is one a worker may still be running a placed node of
+ * ([`placedRunnerMayOutlive`]); `held`, where it is given, asks that again as
+ * the prune starts, and a `true` from it leaves the rows. It returns at once:
+ * the prune is the store module's to hold and its command's to wait for, never
+ * the settlement's.
+ */
+let ledgerPrune: LedgerPrune | undefined;
+
+/** The shape of [`ledgerPrune`]. */
+export type LedgerPrune = (
+  execution: ExecutionIdentity,
+  after: Promise<void> | undefined,
+  held: (() => Promise<boolean>) | undefined,
+) => void;
+
+/** Register [`ledgerPrune`]. See there. */
+export function settlesLedgers(prune: LedgerPrune): void {
+  ledgerPrune = prune;
+}
+
+/**
+ * Hand [`ledgerPrune`] a settled execution, which is **never** the execution's
+ * outcome: the row has already closed, and rows that could not be pruned are
+ * rows nothing reads. The prune says so per store on its own; this is what
+ * stops anything it did not catch from becoming the run's failure.
+ */
+function pruneLedgers(
+  execution: ExecutionIdentity,
+  after: Promise<void> | undefined,
+  held: (() => Promise<boolean>) | undefined,
+): void {
+  const prune = ledgerPrune;
+  if (prune === undefined) return;
+  try {
+    prune(execution, after, held);
+  } catch (failure) {
+    process.stderr.write(
+      `warning: the store ledger execution \`${execution.id}\` left could not be pruned (${describe(failure)}); its rows stay and answer nothing (PRD resolved q69)\n`,
+    );
+  }
 }
 
 /**
@@ -14477,6 +14660,7 @@ const settledJournals = new Map<string, Journal>();
 export function closeExecution(execution: string): void {
   settledJournals.delete(execution);
   openedExecutions.delete(execution);
+  executionSessions.delete(execution);
   closeSession(execution);
 }
 

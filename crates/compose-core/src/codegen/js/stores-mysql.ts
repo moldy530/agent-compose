@@ -123,6 +123,19 @@ import type { Connection, ResultSetHeader, RowDataPacket } from "mysql2/promise"
  * — the last version it handed out — and its row is also the lock every write
  * to the partition takes first (`RemoteKv`'s `#write`). Its key is the
  * ledger's arithmetic again: `store` and an ASCII `scope_key`, 2176 bytes.
+ *
+ * `expires_at` is the epoch millisecond a key expires at, `NULL` for one that
+ * does not (PRD resolved q69), and the two indexes over it are what the sweeps
+ * read through: `store_entries_partition_expiry` is every `DELETE` of expired
+ * rows — a write's sweep of its own partition, and each batch of a store-wide
+ * one, both under the partition's sequence lock — by the partition's **hash**,
+ * the one exact, index-sized handle on a partition this table has, since
+ * `store_entries_partition` holds a prefix of `scope_key` and a prefix cannot
+ * be followed by a range; and `store_entries_expiry` is the read, locking
+ * nothing, by which a store-wide sweep finds the partition holding the store's
+ * oldest expired row. MySQL has no partial index, so a key that never expires
+ * has an entry in both under `NULL`, which sorts first and which no sweep's
+ * range reaches.
  */
 const MYSQL_STORE_SCHEMA = [
   `CREATE TABLE IF NOT EXISTS store_entries (
@@ -131,10 +144,13 @@ const MYSQL_STORE_SCHEMA = [
   \`key\`      VARCHAR(2048) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL,
   value      LONGTEXT NOT NULL,
   version    BIGINT NOT NULL DEFAULT 0,
+  expires_at BIGINT NULL,
   scope_hash BINARY(32) AS (UNHEX(SHA2(scope_key, 256))) STORED NOT NULL,
   key_hash   BINARY(32) AS (UNHEX(SHA2(\`key\`, 256))) STORED NOT NULL,
   PRIMARY KEY (store, scope_hash, key_hash),
-  KEY store_entries_partition (store, scope_key(255), \`key\`(191))
+  KEY store_entries_partition (store, scope_key(255), \`key\`(191)),
+  KEY store_entries_partition_expiry (store, scope_hash, expires_at),
+  KEY store_entries_expiry (store, expires_at)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
   `CREATE TABLE IF NOT EXISTS store_applied (
   store           VARCHAR(128)  CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
@@ -154,24 +170,50 @@ const MYSQL_STORE_SCHEMA = [
 ];
 
 /**
- * The one migration: the `version` column PRD resolved q68 gave every `kv` key,
- * on a `store_entries` the previous release created without it.
+ * The migrations, in the order they apply, on a `store_entries` an earlier
+ * release created: the `version` column PRD resolved q68 gave every `kv` key,
+ * then the `expires_at` column and the two indexes PRD resolved q69 did.
  *
- * Probed rather than attempted, because MySQL has no `ADD COLUMN IF NOT
- * EXISTS`; and a concurrent opener that added it between the probe and the
- * `ALTER` is answered with [`MYSQL_DUPLICATE_COLUMN`], which is the column
- * being there. Its rows take `0`, which no write of this release hands out —
- * a partition's sequence starts past what it holds.
+ * Each is probed rather than attempted, because MySQL has no `ADD COLUMN IF NOT
+ * EXISTS` and no `ADD INDEX IF NOT EXISTS`; and a concurrent opener that added
+ * one between the probe and the `ALTER` is answered with
+ * [`MYSQL_DUPLICATE_COLUMN`] or [`MYSQL_DUPLICATE_KEY`], which is the column or
+ * the index being there. A `version` added here gives its rows `0`, which no
+ * write of this release hands out — a partition's sequence starts past what it
+ * holds — and an `expires_at` gives them `NULL`, a key that never expires.
  */
-const MYSQL_STORE_VERSION_COLUMN = {
-  probe:
-    "SELECT COUNT(*) AS held FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() " +
-    "AND TABLE_NAME = 'store_entries' AND COLUMN_NAME = 'version'",
-  add: "ALTER TABLE store_entries ADD COLUMN version BIGINT NOT NULL DEFAULT 0 AFTER value",
-};
+const MYSQL_STORE_MIGRATIONS: readonly { readonly probe: string; readonly add: string }[] = [
+  {
+    probe:
+      "SELECT COUNT(*) AS held FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() " +
+      "AND TABLE_NAME = 'store_entries' AND COLUMN_NAME = 'version'",
+    add: "ALTER TABLE store_entries ADD COLUMN version BIGINT NOT NULL DEFAULT 0 AFTER value",
+  },
+  {
+    probe:
+      "SELECT COUNT(*) AS held FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() " +
+      "AND TABLE_NAME = 'store_entries' AND COLUMN_NAME = 'expires_at'",
+    add: "ALTER TABLE store_entries ADD COLUMN expires_at BIGINT NULL AFTER version",
+  },
+  {
+    probe:
+      "SELECT COUNT(*) AS held FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() " +
+      "AND TABLE_NAME = 'store_entries' AND INDEX_NAME = 'store_entries_partition_expiry'",
+    add: "ALTER TABLE store_entries ADD KEY store_entries_partition_expiry (store, scope_hash, expires_at)",
+  },
+  {
+    probe:
+      "SELECT COUNT(*) AS held FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() " +
+      "AND TABLE_NAME = 'store_entries' AND INDEX_NAME = 'store_entries_expiry'",
+    add: "ALTER TABLE store_entries ADD KEY store_entries_expiry (store, expires_at)",
+  },
+];
 
 /** MySQL's "that column is already there" — `ER_DUP_FIELDNAME`. */
 const MYSQL_DUPLICATE_COLUMN = 1060;
+
+/** …and "that index is already there" — `ER_DUP_KEYNAME`. */
+const MYSQL_DUPLICATE_KEY = 1061;
 
 /**
  * MySQL's "that table is already there" — the one error a concurrent creator
@@ -245,11 +287,40 @@ function duplicateKeyNoop(_target: string, noop: string): string {
   return `ON DUPLICATE KEY UPDATE ${noop}`;
 }
 
+/**
+ * The server's clock in epoch milliseconds (PRD resolved q69).
+ *
+ * `NOW(3)` is the session's time zone's wall clock, which [`MYSQL_STORE_TIME_ZONE`]
+ * pins to UTC so that `UNIX_TIMESTAMP` has no ambiguous hour to resolve when a
+ * server's zone leaves daylight saving; floored like `Date.now()`, and cast so
+ * `mysql2` hands back a number rather than a `DECIMAL`'s string.
+ */
+const MYSQL_STORE_CLOCK = "CAST(FLOOR(UNIX_TIMESTAMP(NOW(3)) * 1000) AS SIGNED)";
+
+/**
+ * What makes [`MYSQL_STORE_CLOCK`] unambiguous: the session's time zone, as an
+ * offset — which every server takes, where a named zone needs its time-zone
+ * tables loaded. No column here is a temporal type, so nothing else reads it.
+ */
+const MYSQL_STORE_TIME_ZONE = "SET SESSION time_zone = '+00:00'";
+
 /** MySQL takes `?` as written. */
 const MYSQL_STORE_DIALECT: StoreDialect = {
   bind: positionalBind,
   overwrite: duplicateKeyOverwrite,
   ignore: duplicateKeyNoop,
+  clock: MYSQL_STORE_CLOCK,
+  // One partition, by its hash — `store_entries_partition_expiry` (see
+  // [`MYSQL_STORE_SCHEMA`]) — and only ever under that partition's sequence
+  // lock, a write's or a store-wide sweep batch's (`StoreDialect`). MySQL takes
+  // no `SKIP LOCKED` on a `DELETE`, and needs none here: the `DELETE` holds
+  // each row's clustered record and then the entries its other indexes have
+  // for it, so two statements reaching one row through two indexes would each
+  // hold what the other waits for — which is why no `DELETE` of expired rows
+  // runs outside the lock that keeps a second one off the partition.
+  sweepPartition: (limit) =>
+    "DELETE FROM store_entries WHERE store = ? AND scope_hash = UNHEX(SHA2(?, 256)) " +
+    `AND expires_at <= ? ORDER BY expires_at LIMIT ${limit}`,
 };
 
 /**
@@ -562,6 +633,10 @@ async function openMysqlStore(
     uri: url,
     // This side's own probes, the other direction of the socket question.
     enableKeepAlive: true,
+    // The dial's deadline, spelled out although it is `mysql2`'s default: it is
+    // the bound every dial of a store has (`STORE_DIAL_MS`), not a default this
+    // arm happens to inherit.
+    connectTimeout: STORE_DIAL_MS,
     // See the note above: the ledger claim's arithmetic, not a preference. The
     // list form because that is what `mysql2` types the option as, and
     // `mergeFlags` takes an array as written.
@@ -592,6 +667,7 @@ async function openMysqlStore(
     await connection.query(MYSQL_STORE_AUTOCOMMIT);
     await connection.query(MYSQL_STORE_SORT_LENGTH);
     await connection.query(MYSQL_STORE_ISOLATION);
+    await connection.query(MYSQL_STORE_TIME_ZONE);
     // `CONCAT_WS` rather than `CONCAT`, because a server whose `sql_mode` is
     // empty would otherwise be handed a list with a leading comma — an empty
     // mode name, which MySQL refuses. `NULLIF` is what turns the empty string
@@ -639,12 +715,14 @@ async function openMysqlStore(
         if ((error as { errno?: unknown } | null)?.errno !== MYSQL_TABLE_EXISTS) throw error;
       }
     }
-    const [probed] = await connection.query<RowDataPacket[]>(MYSQL_STORE_VERSION_COLUMN.probe);
-    if (Number(probed[0]?.["held"]) === 0) {
+    for (const migration of MYSQL_STORE_MIGRATIONS) {
+      const [probed] = await connection.query<RowDataPacket[]>(migration.probe);
+      if (Number(probed[0]?.["held"]) !== 0) continue;
       try {
-        await connection.query(MYSQL_STORE_VERSION_COLUMN.add);
+        await connection.query(migration.add);
       } catch (error) {
-        if ((error as { errno?: unknown } | null)?.errno !== MYSQL_DUPLICATE_COLUMN) throw error;
+        const errno = (error as { errno?: unknown } | null)?.errno;
+        if (errno !== MYSQL_DUPLICATE_COLUMN && errno !== MYSQL_DUPLICATE_KEY) throw error;
       }
     }
   } catch (error) {

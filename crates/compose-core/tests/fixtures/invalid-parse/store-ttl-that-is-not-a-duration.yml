@@ -1,0 +1,18 @@
+# rule: a `kv` write's `ttl:` is grammar 4.4's duration or `never` (grammar 11.4, Decision D22, PRD resolved q69)
+# code: invalid-duration
+# message: `5 minutes` is not a valid duration for `ttl`
+# at: 15:12
+# help: durations are a positive integer followed by `ms`, `s`, `m`, or `h`, e.g. `30s`; compound forms like `1m30s` are not supported; `never` is the other spelling a `ttl:` takes — a key that does not expire, whatever the store's `default_ttl:` (grammar 11.4, PRD resolved q69)
+flow.demo:
+  outputs: {}
+  nodes:
+    claim:
+      store: store.leases
+      op: set
+      key: "'job-1'"
+      if: absent
+      value: { owner: "'me'" }
+      ttl: 5 minutes
+  edges:
+    - { from: start, to: claim }
+    - { from: claim, to: end }

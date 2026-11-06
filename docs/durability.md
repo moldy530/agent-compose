@@ -1406,7 +1406,14 @@ the executions in flight — a parent's or a child's, running or still queued fo
 permit — and that is the durability contract rather than a gap in it: each is an
 open row, so the next start recovers it, a child whose parent had already
 settled among them. What a stop costs is the one effect each was in the middle
-of, which is §2's window for any execution.
+of, which is §2's window for any execution. What it does wait for is the store
+work of the executions that have already **settled** — the deletion of their
+idempotency-ledger rows, started then for one still waiting on a detached
+delivery the exit cuts off, and the start's sweep of expired keys
+(`docs/topics/stores.md`, PRD resolved q69) — because a settled execution is
+the one the next start does not come back for, so rows a stop left behind would
+be rows no process ever removes. Each dial that wait makes is bounded at ten
+seconds, and nothing is closed under the executions still running beside it.
 
 ### 6.2 `run` journals; `resume` replays
 
@@ -1995,8 +2002,12 @@ Stated by resolved q28, and restated here so a reader is not left to infer it:
   machine recovers every execution the one that died left open (§10). The
   exclusion is about the backend rather than about the format.
 * **journal compaction** — nothing is pruned. The file grows with the effects a
-  project has ever issued, exactly as the stores' idempotency ledger does, and
-  retention is deleting it.
+  project has ever issued, and retention is deleting it. The stores'
+  idempotency ledger no longer grows the same way: a keyed write's ledger row is
+  deleted when the execution that wrote it settles, because a settled execution
+  never resumes (PRD resolved q65, q69; `docs/grammar.md` §11.4) — which is a
+  prune the journal's own record of that settlement licenses, not a compaction
+  of the journal.
 
 And one this document states rather than defers, because it is a property of the
 backend v1 binds rather than a feature left out:

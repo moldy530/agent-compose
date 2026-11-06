@@ -951,15 +951,18 @@ pub fn invoke_entrypoint(
     host: Option<&str>,
 ) -> Option<Invocation> {
     let (project, built) = build_entrypoint(entrypoint, "invoke")?;
-    if let Some(source) = host {
-        std::fs::write(project.join("host-functions.mjs"), source)
-            .expect("the project directory is writable");
-    }
+    // Before the host preamble is written into the project, so a build that
+    // failed is reported with what `build` said rather than as a project
+    // directory that is not there.
     assert!(
         built.status.success(),
         "the composition `{label}` did not build:\n{}",
         String::from_utf8_lossy(&built.stderr)
     );
+    if let Some(source) = host {
+        std::fs::write(project.join("host-functions.mjs"), source)
+            .expect("the project directory is writable");
+    }
 
     let inputs_path = project.join("invoke-inputs.json");
     std::fs::write(
@@ -2055,7 +2058,34 @@ pub fn journal_rows(project: &Path, query: &str) -> Value {
     })
 }
 
+/// Read rows out of one SQLite file a built project's runtime wrote — a store's
+/// own file under `.agent-compose/stores/`, which is where a claim about what a
+/// store **holds**, rather than what an op answered, can only be read.
+///
+/// The same driver as [`journal_rows`], for its reasons: the pinned SQLite, its
+/// locking, and its stale-lock rule. `project` is any built project, for the
+/// driver's `node_modules`; `file` is the database.
+pub fn sqlite_rows(project: &Path, file: &Path, query: &str) -> Value {
+    let output = sqlite_driver(project, file, query, true);
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "the query of {} answered no JSON ({error}): {}",
+            file.display(),
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
+}
+
 fn journal_driver(project: &Path, sql: &str, query: bool) -> Output {
+    sqlite_driver(
+        project,
+        &project.join(".agent-compose").join("journal.sqlite"),
+        sql,
+        query,
+    )
+}
+
+fn sqlite_driver(project: &Path, file: &Path, sql: &str, query: bool) -> Output {
     let driver = project.join("journal-sql.mjs");
     std::fs::copy(
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2081,10 +2111,7 @@ fn journal_driver(project: &Path, sql: &str, query: bool) -> Output {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let mut command = bun();
-        command
-            .arg(&driver)
-            .arg(project.join(".agent-compose").join("journal.sqlite"))
-            .arg(&script);
+        command.arg(&driver).arg(file).arg(&script);
         if query {
             command.arg("--query");
         }

@@ -434,6 +434,7 @@ const storeLedger: stores.StoreBinding = {
   description: "Who holds what, and how often it was touched.",
   metadata: false,
   value: storeLedgerValueSchema,
+  defaultTtl: 86400000,
   backend: {
     provider: "sqlite",
     from: "the `local` target substitutes local storage for every store unconditionally",
@@ -456,6 +457,11 @@ const storeNotes: stores.StoreBinding = {
     from: "the `local` target substitutes local storage for every store unconditionally",
   },
 };
+
+/**
+ * Every store this composition binds, so an execution's settlement prunes its ledger rows from each and a process start sweeps each of the keys that have expired (PRD resolved q69).
+ */
+stores.bindsStores([storeDocs, storeLedger, storeNotes]);
 
 /**
  * `tool.dispatch` — an HTTP request (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for. This is the parse a `function:` node's binding faces, and it is a `ResultMismatch` that fails the node: the arguments are the composition's, checked field-by-field at compile time, so a value constraint they miss at runtime is the graph's own failure and there is nobody to hand it to. A **model's** arguments are refused one level out, at the entry in the agent's `tools:`, where `runtime.parseToolArguments` raises the `ToolCallRefused` the loop hands back (Decision D119). The tool's **result** is parsed with `runtime.parseResult` on both surfaces: a tool answering off-contract is not a call anybody can rephrase.
@@ -1471,6 +1477,7 @@ const flowShapeNodeClaim: runtime.NodeDescriptor = {
       "hits": runtime.toJson(runtime.evaluate("0", roots)),
     },
     condition: "absent",
+    ttl: 90000,
   }),
   run: async (input, context, view) => ({
     output: await stores.runStoreOp(
@@ -1501,6 +1508,7 @@ const flowShapeNodeStamp: runtime.NodeDescriptor = {
     value: runtime.toJson(runtime.evaluate("state.latest", roots)),
     field: "marks",
     unique: true,
+    ttl: "never",
   }),
   run: async (input, context, view) => ({
     output: await stores.runStoreOp(
@@ -1530,6 +1538,7 @@ const flowShapeNodeTick: runtime.NodeDescriptor = {
     key: String(runtime.toJson(runtime.evaluate("input.goal", roots))),
     field: "hits",
     by: Number(runtime.toJson(runtime.evaluate("2", roots))),
+    ttl: 300000,
   }),
   run: async (input, context, view) => ({
     output: await stores.runStoreOp(

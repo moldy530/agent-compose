@@ -1,0 +1,11 @@
+# rule: a store's `default_ttl:` is grammar 4.4's duration; `never` is a write's override, and the default's absence already keeps keys (grammar 11.1, PRD resolved q69)
+# code: invalid-duration
+# message: `never` is not a valid duration for `default_ttl`
+# at: 9:16
+# help: durations are a positive integer followed by `ms`, `s`, `m`, or `h`, e.g. `30s`; compound forms like `1m30s` are not supported; `never` is a write's `ttl:`, which overrides a default — a store with no `default_ttl:` already keeps every key a write leaves without one, so omit the key instead (grammar 11.1, PRD resolved q69)
+store.sessions:
+  kind: kv
+  scope: global
+  default_ttl: never
+  value_schema:
+    user: { type: string }

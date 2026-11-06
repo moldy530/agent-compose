@@ -649,6 +649,128 @@ const TRUE_EVERYWHERE: &[&str] = &[
     // another write's read-modify-write waits for its commit and builds on it.
     "the_window_was_open_when_the_second_write_arrived",
     "a_write_inside_another_writes_window_waits_and_builds_on_it",
+    // PRD resolved q69 (a)–(b), expiry, with the store's clock moved by the
+    // module's own offset rather than slept through: a key with a `ttl` is
+    // read until its expiry and is absent from it on, to every read and every
+    // condition — so `if: absent` takes an expired key, which is a lease, and
+    // expiry consumes no version.
+    "a_key_with_a_ttl_is_readable_before_it_expires",
+    "an_expired_key_is_absent_to_get_and_list",
+    // …and to PRD resolved q70's reads alike, through the one liveness
+    // fragment every read of many keys applies: a `count` stops counting it, a
+    // `get_many` answers it `found: false`, and a page skips it — the page's
+    // `next` included, which a page reading the expired row as its "one more"
+    // would still answer. The row is still stored while they read past it, so
+    // it is each read's own filter that keeps it out, not a sweep.
+    "an_expired_key_is_uncounted_by_count",
+    "an_expired_key_is_not_found_by_get_many",
+    "an_expired_key_is_skipped_by_a_page_and_its_next",
+    "the_expired_key_was_still_stored_when_those_reads_skipped_it",
+    "if_absent_declines_a_key_that_has_not_expired",
+    "if_present_and_if_version_decline_an_expired_key_with_no_version",
+    "if_absent_applies_on_an_expired_key",
+    "a_key_set_again_after_expiring_takes_the_next_version",
+    // …and so they do while the expired key is still a row: behind a backlog
+    // of 400 expired fillers, each write's bounded sweep takes a hundred of
+    // them and leaves the key stored, so what each condition reads is an
+    // expired row rather than a missing one.
+    "if_present_and_if_version_decline_an_expired_key_a_sweep_has_not_reached",
+    "if_absent_takes_an_expired_key_a_sweep_has_not_reached",
+    // …a write refreshes the expiry to its own `ttl`, else the store's
+    // `default_ttl:`, else clears it; `ttl: never` beats a default; and a
+    // declined write changes nothing.
+    "a_write_refreshes_expiry_to_its_own_ttl",
+    "a_write_with_no_ttl_and_no_default_clears_expiry",
+    "a_declined_write_leaves_expiry_unchanged",
+    "a_write_with_no_ttl_takes_the_store_default",
+    "ttl_never_clears_a_store_default",
+    "a_writes_own_ttl_beats_the_store_default",
+    "a_unique_append_that_changes_nothing_still_refreshes_expiry",
+    "merge_append_and_incr_each_take_a_ttl",
+    // (c) the cleanup schedule: invisible at once, out of storage at the next
+    // write to the partition — at most 100 rows a write — or the next process
+    // start, whichever comes first: a process whose first op on the store is a
+    // read, and a process start that makes no op on the store at all.
+    "an_expired_key_stays_invisible_until_a_write_removes_it",
+    "the_write_sweep_removes_at_most_100_rows",
+    "an_expired_key_leaves_storage_at_the_next_writes_to_its_partition",
+    // …and that write's sweep is its own partition's alone: two partitions of
+    // 50 expired keys each, fewer than one write's hundred together, and a
+    // write to one leaves the other's every row — what keeps a write's
+    // `DELETE` off rows another partition's writer is about to reach for
+    // (Decision D153).
+    "a_writes_sweep_takes_no_other_partitions_rows",
+    "an_expired_key_leaves_storage_when_a_process_next_opens_the_store",
+    "an_expired_key_leaves_storage_when_a_process_starts_without_reaching_the_store",
+    // …where that open's sweep runs behind the process's first op rather than
+    // in front of it — the op answers with the backlog still stored — and has
+    // removed all of it by the time the process lets go of the store.
+    "a_first_op_answers_before_the_start_sweep_has_finished",
+    "the_start_sweep_has_removed_the_backlog_when_the_process_lets_go",
+    // …in batches of at most 1000 rows, counted by a second process **between**
+    // two batches (`store-sweep-batches.mjs`), so that a sweep of one unbounded
+    // `DELETE` — which the two cases above would both pass — is caught: no op
+    // waits for more than the one batch in progress however large the backlog.
+    "the_start_sweep_takes_at_most_1000_rows_a_batch",
+    "a_malformed_clock_offset_is_refused_by_name",
+    // (d) the ledger a settled execution leaves is pruned, through the
+    // runtime's own settle: N executions leave a bounded ledger and keep their
+    // data, an unsettled one keeps its rows and its resume still dedupes, and
+    // a child's rows go when the child settles.
+    "an_open_executions_writes_hold_their_ledger_rows",
+    "settled_executions_leave_no_ledger_rows",
+    "a_settled_executions_data_stays",
+    "an_unsettled_executions_ledger_rows_are_kept",
+    "a_resume_of_an_unsettled_execution_still_dedupes",
+    "a_prune_reaches_only_its_own_executions_prefix",
+    "a_childs_ledger_rows_go_when_the_child_settles",
+    "a_parents_ledger_rows_go_when_the_parent_settles",
+    // …the two outcomes `settleExecution` leaves open — a parked `human`
+    // pause and a replay divergence — keep every row through the settlement
+    // itself, and the resume of each is answered from them.
+    "a_parked_executions_settlement_keeps_its_ledger_rows",
+    "a_diverged_executions_settlement_keeps_its_ledger_rows",
+    // …what is pruned is every store the composition binds, so a keyed write a
+    // second process made (a placement's worker) goes when the process that
+    // settles prunes, though it never saw the write.
+    "a_keyed_write_another_process_made_is_pruned_at_settlement",
+    // …and a detached delivery still running at settlement writes under the
+    // execution's id: its rows stay until it has finished, so a retry inside
+    // it after the run settled is answered rather than applied twice.
+    "a_detached_delivery_running_at_settlement_keeps_its_ledger_rows",
+    "a_retry_inside_a_detached_delivery_after_settlement_still_dedupes",
+    "a_detached_deliverys_rows_go_once_it_has_finished",
+    // …unless the command lets go of its stores first, as `agent-compose run`
+    // does without waiting for its deliveries: the exit starts the prune the
+    // delivery was holding back, and the delivery — still running in the
+    // process until it ends — is refused a keyed write from then on rather
+    // than applying one its ledger can no longer answer.
+    "a_command_letting_go_prunes_what_a_running_delivery_held_back",
+    "a_delivery_cut_off_by_its_command_is_refused_a_keyed_write",
+    // …and so does a `serve` when it is stopped, the one exit it has: nothing
+    // comes back for a settled execution afterwards, so the stop starts the
+    // prune and refuses the delivery's keyed write the same way — while
+    // closing nothing under an execution still open, which writes on, is
+    // answered, and keeps its rows for the start that recovers it.
+    "a_stopped_serve_prunes_what_a_running_delivery_held_back",
+    "a_delivery_cut_off_by_a_stopped_serve_is_refused_a_keyed_write",
+    "an_open_execution_still_writes_while_a_serve_stops",
+    // …and nothing is pruned under a placed node a worker may still be
+    // running: a supersession ends the attempt and not the worker's runner,
+    // which writes under the same keys as the retry that replaced it, so an
+    // execution whose dispatch a worker was handed and no result ended keeps
+    // every row, and the runner's late write after settlement is answered from
+    // one. A dispatch a result settled, or one no worker took, holds nothing.
+    "a_superseded_placed_dispatch_keeps_its_executions_ledger_rows",
+    "a_superseded_runners_late_write_after_settlement_still_dedupes",
+    "a_placed_dispatch_still_held_at_settlement_keeps_its_executions_ledger_rows",
+    "a_placed_dispatch_a_result_settled_does_not_hold_the_prune",
+    "a_placed_dispatch_no_worker_took_does_not_hold_the_prune",
+    // …and in a process that hands placed nodes out, the prune a delivery held
+    // back asks again as it starts, so a node that delivery handed to a worker
+    // after the settlement holds it the same way.
+    "a_node_a_delivery_hands_out_after_settlement_holds_the_prune_when_superseded",
+    "a_node_a_delivery_hands_out_after_settlement_is_pruned_behind_its_result",
     // PRD resolved q70: a 100,000-key store walked page by page, bulk-seeded
     // beside the store rather than written through it. The pages laid end to
     // end are the sorted key set — gapless, duplicate-free and in byte order —
@@ -778,6 +900,48 @@ const TRUE_WHEN_DIALLED: &[&str] = &[
     // the lost one had already committed.
     "a_lost_connection_is_redialled",
     "a_redialled_store_still_holds_what_it_wrote",
+    // PRD resolved q69 (a): a dialled store's expiry is the **server's** clock
+    // plus the `ttl`, so writers whose own clocks disagree agree about which
+    // keys are alive — the row holds the server's instant with this process's
+    // clock ten days off.
+    "expiry_is_computed_by_the_servers_clock",
+    // …and every read judges that row by the same clock: with this process's
+    // clock ten days ahead or behind, a `get`, a `list`, a `count` and a
+    // `get_many` find the key while the server's clock holds it alive and miss
+    // it once that clock (moved by the store offset) is past its expiry.
+    "a_dialled_read_finds_a_key_the_servers_clock_holds_alive",
+    "a_dialled_read_misses_a_key_the_servers_clock_holds_expired",
+    // …and so does the store-wide sweep a connection's first op starts: a
+    // process whose clock runs ten days fast takes no key the server's clock
+    // holds alive, and one ten days slow still takes a key it holds expired.
+    "a_store_wide_sweep_keeps_a_key_the_servers_clock_holds_alive",
+    "a_store_wide_sweep_takes_a_key_the_servers_clock_holds_expired",
+    // PRD resolved q69 (c): the two halves of the cleanup schedule — a write's
+    // sweep of its partition and the store-wide sweep a connection's first op
+    // starts — run at once in two processes over one backlog without either
+    // failing as a deadlock, the sweep takes no key a write refreshed, and the
+    // backlog is gone once both processes have let go of the store. Each of the
+    // three also holds only where the store-wide sweep really ran during the
+    // writer's run: the backlog carries rows only that sweep can take.
+    "a_store_wide_sweep_and_a_write_never_deadlock",
+    "a_store_wide_sweep_takes_no_key_a_write_refreshed",
+    "a_store_wide_sweep_removes_the_whole_backlog",
+    // …and each batch of that sweep takes only the rows of the one partition
+    // whose sequence lock it holds — the store's oldest expired row's — and
+    // none of another's, counted between batches as above: a batch with no
+    // partition in its `DELETE` would hold rows a write to another partition
+    // reaches for under a lock that write does not take, which is the deadlock
+    // the lock exists to rule out (`StoreDialect.sweepPartition`, D153). The
+    // race above cannot tell the two apart: its backlog is one partition's.
+    "a_store_wide_sweep_batch_takes_only_its_own_partitions_rows",
+    // PRD resolved q69 (d): a settlement prunes every store the composition
+    // binds, so a bound store whose server accepts a connection and never
+    // answers is one every settlement meets — and it delays neither the
+    // settlement nor any other store's prune, and holds a command's exit for
+    // the dial deadline and no longer.
+    "a_store_that_never_answers_delays_no_settlement",
+    "a_store_that_never_answers_delays_no_other_stores_prune",
+    "a_store_that_never_answers_holds_a_command_for_its_dial_deadline_alone",
     // A server keeps what a run leaves on it, so the run takes every row of its
     // own run-unique stores back off it at the end (the large walk's hundred
     // thousand go first, in that case's own `finally`: `TRUE_EVERYWHERE`).

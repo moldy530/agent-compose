@@ -634,6 +634,9 @@ fn store_params(params: &StoreParams) -> Vec<BindingView> {
     if let Some(version) = &params.if_version {
         push("if_version", version.value.as_str().to_string());
     }
+    if let Some(ttl) = &params.ttl {
+        push("ttl", ttl.value.as_str().to_string());
+    }
     // A `kv` page's cursor and its values, and a `get_many`'s keys (PRD
     // resolved q70).
     if let Some(after) = &params.after {

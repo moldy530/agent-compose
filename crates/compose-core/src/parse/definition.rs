@@ -1,7 +1,7 @@
 //! The six definition namespaces (grammar 5, 6, 7, 11, 12).
 
 use crate::ast::binding::BuiltinBlock;
-use crate::ast::common::{Address, Namespace};
+use crate::ast::common::{Address, Duration, Namespace};
 use crate::ast::definition::{
     AgentAccess, Builtin, DefinitionBody, DirectModel, EmbedBlock, ModelDef, ProviderDef,
     ProviderKind, RouteCondition, RouteModel, Settings, StoreDef, StoreKind, StoreScope, ToolDef,
@@ -653,6 +653,32 @@ fn store(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> StoreDef {
         }
     }
 
+    // `default_ttl:` is a `kv` key: an expiry is what a `kv` key a write left
+    // holding a value has, and no `vector` or `blob` op takes a `ttl:` for a
+    // default to stand in for (grammar 11.1, PRD resolved q69). Refused by name
+    // on the other two kinds, like every other key a kind would ignore.
+    let default_ttl = match (kind.as_ref(), fields.take_entry("default_ttl")) {
+        (_, None) => None,
+        (Some(kind), Some(entry)) if kind.value != StoreKind::Kv => {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::ConflictingKeys,
+                    entry.key.span.clone(),
+                    format!(
+                        "`default_ttl` is not legal on a `{}` store",
+                        kind.value.as_str()
+                    ),
+                )
+                .with_label(kind.span.clone(), "the kind is declared here")
+                .with_help(
+                    "an expiry is a `kv` key's: `default_ttl:` is how long the key a `kv` write leaves lives when the write names no `ttl:`, and no `vector` or `blob` op leaves one (grammar 11.1, PRD resolved q69)",
+                ),
+            );
+            None
+        }
+        (_, Some(entry)) => default_ttl(&entry.value, cx),
+    };
+
     let backend = fields
         .string("backend", cx)
         .and_then(|text| lexical::identifier(&text, "backend alias", cx));
@@ -693,7 +719,27 @@ fn store(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> StoreDef {
         backend,
         description,
         agent_access,
+        default_ttl,
     }
+}
+
+/// A `kv` store's `default_ttl:` — grammar 4.4's duration, and nothing else.
+///
+/// `never` is a **write**'s spelling: it overrides a default, and a store that
+/// declares none already keeps the keys its writes leave, so as a default it
+/// would be a second way to write the omission. It is refused with the same
+/// `invalid-duration` every other malformed duration draws, saying which of the
+/// two the author meant.
+fn default_ttl(node: &Node, cx: &mut Cx) -> Option<Spanned<Duration>> {
+    let help = if matches!(&node.value, Yaml::String(text) if text == "never") {
+        format!(
+            "{}; `never` is a write's `ttl:`, which overrides a default — a store with no `default_ttl:` already keeps every key a write leaves without one, so omit the key instead (grammar 11.1, PRD resolved q69)",
+            lexical::DURATION_RULE
+        )
+    } else {
+        lexical::DURATION_RULE.to_string()
+    };
+    lexical::duration_with_help(node, "`default_ttl`", &help, cx)
 }
 
 fn schema_key(

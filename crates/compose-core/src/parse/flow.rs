@@ -6,7 +6,8 @@ use crate::ast::definition::Settings;
 use crate::ast::flow::{
     CoderBlock, CoderWorkspace, Edge, FlowContext, FlowDef, FlowNode, Harness, HumanBlock,
     ItemError, MapBlock, MapDispatch, MapRoute, NODE_KIND_KEYS, Node as FlowNodeAst, NodeKind,
-    PermissionMode, StoreCondition, StoreNode, StoreOp, StoreOpParams, StoreValue, WorkspaceAccess,
+    PermissionMode, StoreCondition, StoreNode, StoreOp, StoreOpParams, StoreTtl, StoreValue,
+    WorkspaceAccess,
 };
 use crate::ast::policy::PolicyBlock;
 use crate::ast::schema::Surface;
@@ -780,10 +781,60 @@ const STORE_PARAMS: &[&str] = &[
     "by",
     "if",
     "if_version",
+    "ttl",
     "after",
     "include_values",
     "keys",
 ];
+
+/// The `kv` writes that take a `ttl:` (grammar 11.4, PRD resolved q69), named
+/// in the help a `ttl:` anywhere else draws.
+const TTL_OPS: &[&str] = &["set", "merge", "append", "incr"];
+
+/// What a `ttl:` outside its row is told beside the row it is outside of.
+///
+/// The parameter is the one in the catalogue whose absence from a row is a fact
+/// about the **op** rather than about the store: an expiry is what a key holding
+/// a value has, so the ops that leave a key holding one take it and nothing
+/// else does — a read writes nothing, a `delete` leaves nothing, and a `vector`
+/// or `blob` op is not a `kv` key's at all.
+fn ttl_help(op: StoreOp) -> String {
+    let why = if op.writes() {
+        format!(
+            "a `{}` leaves no `kv` key holding a value to expire",
+            op.as_str()
+        )
+    } else {
+        format!("a `{}` reads, and writes nothing to expire", op.as_str())
+    };
+    format!(
+        "; `ttl:` is how long a `kv` write's key lives, and only {} take one — {why} (grammar 11.4, PRD resolved q69)",
+        list(TTL_OPS)
+    )
+}
+
+/// The literal a `ttl:` names: grammar 4.4's duration, or `never`.
+///
+/// A malformed one is §4.4's `invalid-duration`, the diagnostic every other
+/// duration position raises, with the one spelling only this position takes
+/// named beside the rule.
+fn store_ttl(node: &Node, cx: &mut Cx) -> Option<Spanned<StoreTtl>> {
+    if let Yaml::String(text) = &node.value
+        && text == "never"
+    {
+        return Some(Spanned::new(StoreTtl::Never, node.span.clone()));
+    }
+    lexical::duration_with_help(
+        node,
+        "`ttl`",
+        &format!(
+            "{}; `never` is the other spelling a `ttl:` takes — a key that does not expire, whatever the store's `default_ttl:` (grammar 11.4, PRD resolved q69)",
+            lexical::DURATION_RULE
+        ),
+        cx,
+    )
+    .map(|duration| Spanned::new(StoreTtl::After(duration.value), duration.span))
+}
 
 fn store_params(
     fields: &mut Fields<'_>,
@@ -828,7 +879,16 @@ fn store_params(
                 ),
             )
             .with_label(op.span.clone(), "the op is declared here")
-            .with_help(format!("`{}` takes {}", op.value.as_str(), list(&legal))),
+            .with_help(format!(
+                "`{}` takes {}{}",
+                op.value.as_str(),
+                list(&legal),
+                if *name == "ttl" {
+                    ttl_help(op.value)
+                } else {
+                    String::new()
+                }
+            )),
         );
     }
 
@@ -899,6 +959,9 @@ fn store_params(
         .and_then(|node| lexical::keyword(node, "`if`", STORE_CONDITIONS, cx));
     params.if_version = store_param(fields, &legal, "if_version")
         .and_then(|node| lexical::cel(node, "`if_version`", cx));
+    // A literal like `field:` and `if:`: how long a key lives is readable
+    // without running the graph (PRD resolved q69).
+    params.ttl = store_param(fields, &legal, "ttl").and_then(|node| store_ttl(node, cx));
 
     // The reads of PRD resolved q70: a `list`'s cursor and the `get_many`'s
     // keys are expressions, and whether a page carries its values is a literal

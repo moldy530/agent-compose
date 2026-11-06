@@ -633,6 +633,7 @@ const DEFAULT_ROUTE_ON: &[&str] = &["rate_limit", "overloaded", "timeout"];
 /// node reads.
 fn stores(ir: &Ir, names: &Names, imported: &mut Vec<String>) -> String {
     let mut text = String::new();
+    let mut bound: Vec<String> = Vec::new();
     for (address, definition) in &ir.definitions {
         let DefinitionBody::Store(store) = &definition.body else {
             continue;
@@ -641,6 +642,7 @@ fn stores(ir: &Ir, names: &Names, imported: &mut Vec<String>) -> String {
             .split_once('.')
             .map_or(address.as_str(), |(_, rest)| rest);
         let backend = crate::ir::deploy::backend_of(ir, store);
+        bound.push(names.value(address).to_string());
         text.push('\n');
         text.push_str(&names::doc(
             "",
@@ -691,6 +693,12 @@ fn stores(ir: &Ir, names: &Names, imported: &mut Vec<String>) -> String {
             text.push_str(&format!("  value: {schema},\n"));
             imported.push(schema);
         }
+        // `default_ttl:`, in milliseconds: the expiry a `kv` write that names no
+        // `ttl:` gives the key it leaves — a node's and a synthesized tool's
+        // alike, since a tool's arguments carry no `ttl` (PRD resolved q69).
+        if let Some(ttl) = &store.default_ttl {
+            text.push_str(&format!("  defaultTtl: {},\n", ttl_millis(&ttl.value)));
+        }
         if let Some(embed) = &store.embed {
             text.push_str("  embed: {\n");
             text.push_str(&format!("    store: {},\n", names::string(address)));
@@ -722,6 +730,26 @@ fn stores(ir: &Ir, names: &Names, imported: &mut Vec<String>) -> String {
         }
         text.push_str("  },\n");
         text.push_str("};\n");
+    }
+    // Every binding, registered with the module whose settlement prunes the
+    // idempotency ledger (PRD resolved q69): the process that settles an
+    // execution is not always the one that made its keyed writes — a placed
+    // node writes from its worker — so the prune visits every store the
+    // composition binds rather than the ones this process happened to reach.
+    // The same set is what a process start sweeps of expired keys, for the
+    // ruling's "or the next process start".
+    if !bound.is_empty() {
+        text.push('\n');
+        text.push_str(&names::doc(
+            "",
+            &[
+                "Every store this composition binds, so an execution's settlement prunes \
+               its ledger rows from each and a process start sweeps each of the keys \
+               that have expired (PRD resolved q69)."
+                    .to_string(),
+            ],
+        ));
+        text.push_str(&format!("stores.bindsStores([{}]);\n", bound.join(", ")));
     }
     text
 }
@@ -2101,8 +2129,34 @@ fn store_params(op: crate::ast::flow::StoreOp, params: &crate::ir::flow::StorePa
             names::string(version.value.as_str())
         ));
     }
+    // PRD resolved q69's `ttl:`, a literal like the rest of this block: the
+    // milliseconds a key the write leaves lives, or `"never"`, which clears an
+    // expiry the store's `default_ttl:` would otherwise set.
+    if let Some(ttl) = &params.ttl {
+        let ttl = match &ttl.value {
+            crate::ast::flow::StoreTtl::Never => names::string("never"),
+            crate::ast::flow::StoreTtl::After(duration) => ttl_millis(duration).to_string(),
+        };
+        text.push_str(&format!("    ttl: {ttl},\n"));
+    }
     text.push_str("  }),\n");
     text
+}
+
+/// A grammar 4.4 duration as the milliseconds a store's expiry adds to its
+/// clock, held to the largest integer a JavaScript number carries exactly.
+///
+/// Grammar 4.4 states no ceiling, and [`Duration::as_millis`] saturates at
+/// 64 bits; a `ttl:` past `Number.MAX_SAFE_INTEGER` milliseconds — about 285,000
+/// years — would be emitted as a literal the runtime cannot add to a clock
+/// without rounding, so it is held there instead, which is the same expiry for
+/// every purpose a store has (PRD resolved q69).
+///
+/// [`Duration::as_millis`]: crate::ast::common::Duration::as_millis
+fn ttl_millis(duration: &crate::ast::common::Duration) -> u64 {
+    /// `Number.MAX_SAFE_INTEGER`.
+    const SAFE: u64 = (1 << 53) - 1;
+    duration.as_millis().min(SAFE)
 }
 
 /// An object built field by field from a binding map, over a declared surface.

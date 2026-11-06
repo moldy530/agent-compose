@@ -858,8 +858,9 @@ duration = integer , ( "ms" | "s" | "m" | "h" ) ;    # e.g. 250ms, 30s, 5m, 24h
 ```
 
 Single-segment only: `1m30s` is a parse error, write `90s`. Values MUST be > 0.
-Used by `timeout:`, `retry.backoff`, `retry.max_backoff`, `human.timeout`, and
-trigger `timeout:`.
+Used by `timeout:`, `retry.backoff`, `retry.max_backoff`, `human.timeout`,
+trigger `timeout:`, a `kv` store's `default_ttl:` (§11.1) and a `kv` write's
+`ttl:` (§11.4) — the one position that also takes the literal `never`.
 
 ---
 
@@ -3015,29 +3016,30 @@ load_prefs:
 |---|---|---|---|
 | `store` | `store.*` ref | yes | |
 | `op` | enum | yes | legal set depends on the store's `kind` (§11.4) |
-| `key`, `value`, `query`, `prefix`, `top_k`, `limit`, `filter`, `metadata`, `content_type`, `fields`, `field`, `unique`, `by`, `if`, `if_version`, `after`, `include_values`, `keys` | per op | per op | §11.4 |
+| `key`, `value`, `query`, `prefix`, `top_k`, `limit`, `filter`, `metadata`, `content_type`, `fields`, `field`, `unique`, `by`, `if`, `if_version`, `ttl`, `after`, `include_values`, `keys` | per op | per op | §11.4 |
 
 A store-op node takes **no `input:` key**: its parameters are exactly the op's
 own row in §11.4, written out in the node, and none of them resolves by name
 from a channel or a flow input (§8.0). The op's output schema is derived from the
 store definition (§11.4) and is written by name like any other node output.
 
-**Which parameters are CEL.** Eleven of the eighteen are, and they are exactly
+**Which parameters are CEL.** Eleven of the nineteen are, and they are exactly
 the row §4.1 scopes to `input`, `state`, and `execution`: `key`, `query`,
 `prefix`, `after`, `by` and `if_version` are one expression each, and so is
 `keys`, whose result is a list of strings; `value` is one expression on a
 `vector upsert`, a `blob put` and a `kv append` and a field map of expressions on
 a `kv set`; `filter`, `metadata` and `fields` are maps of one expression per
-entry (§11.4). The other seven are **literals**, not expressions: `top_k` and
+entry (§11.4). The other eight are **literals**, not expressions: `top_k` and
 `limit` are integers in the ranges §11.4 fixes, `content_type` is a media type
 string, which §4.3 puts in class 3 so it carries no env refs either, `field` is
 the name of one field of the store's `value_schema`, `unique` and
-`include_values` are booleans and `if` is `absent` or `present`. A CEL string
-where §11.4 declares an integer is a type error, not a computed bound — a
-fan-out's cardinality is a schema bound (§3.5) and a store op's is a
-written-down one, and both are meant to be readable without running the graph,
-as are which field a partial update touches, what a write is conditioned on and
-whether a page carries its values. All seven are decidable in one file, so the
+`include_values` are booleans, `if` is `absent` or `present`, and `ttl` is a
+§4.4 duration or `never`. A CEL string where §11.4 declares an integer is a
+type error, not a computed bound — a fan-out's cardinality is a schema bound
+(§3.5) and a store op's is a written-down one, and both are meant to be
+readable without running the graph, as are which field a partial update
+touches, what a write is conditioned on, how long the key it leaves lives and
+whether a page carries its values. All eight are decidable in one file, so the
 published schema types them too (Appendix B). A `get_many`'s `keys` carries the
 one bound no type decides — at most 1000 keys, and a list's length is not known
 until it is evaluated — so that bound is the run's to hold (§11.4).
@@ -3922,7 +3924,11 @@ Two properties follow, and they are the whole point of fixing the form:
   instance (§8.5) all re-run the *same* attempt: the traversal ordinal counts
   executions of the node within its instance and a re-executed instance starts
   over, so every attempt derives one key. That is what makes delivery
-  at-least-once rather than a stream of distinct writes.
+  at-least-once rather than a stream of distinct writes. A store keeps the
+  ledger row that answers a repeated write for exactly as long as an attempt
+  can repeat — until the execution settles, when every row under its
+  `execution.id` prefix is deleted (§11.4, Decision
+  [D153](#d153-a-kv-key-may-expire-and-a-settled-executions-ledger-rows-are-deleted)).
 
 The key is derived, never authored: no spec construct sets or overrides it, so
 there is nothing here for `validate` to reject. The rules that *are* checked
@@ -4154,6 +4160,7 @@ store.docs:
 | `backend` | identifier (bare alias) | no | abstract slot; never provider config |
 | `description` | string | no | LLM-facing for agent-attached stores |
 | `agent_access` | `read` \| `read_write` \| `full` | no (default `read_write`); `full` is `kv` only | how much of the synthesized tool surface an attaching agent gets (§11.5) |
+| `default_ttl` | duration (§4.4) | no; `kv` only, `vector`/`blob` illegal | how long the key a write that names no `ttl:` leaves lives — a store-op node's and a synthesized tool's alike; absent means such a key never expires (§11.4, PRD resolved q69) |
 
 **`metadata_schema` is a `vector` key.** Nothing in this grammar reads a `blob`
 store's metadata: no `blob` op takes a `metadata` or a `filter` parameter — `put`
@@ -4171,6 +4178,19 @@ additive change if a real case appears — parameters on the `blob` rows of §11
 and a place in §11.5's synthesized surface — and its absence is what says that
 is not v0. Until then a blob's filterable attributes live in a `kv` store keyed
 by the same key.
+
+**`default_ttl` is a `kv` key too** (PRD resolved q69, Decision
+[D153](#d153-a-kv-key-may-expire-and-a-settled-executions-ledger-rows-are-deleted)).
+An expiry is what a `kv` key a write left holding a value has, and no `vector`
+or `blob` op leaves one, so on either kind the key is `conflicting-keys` naming
+the store's kind. It is a §4.4 duration and nothing else: `never` is a write's
+spelling, which overrides a default, and a store that declares no
+`default_ttl:` already keeps every key a write leaves without a `ttl:` — so as a
+default it would be a second way to write the omission, and it is
+`invalid-duration`. `scope:` is orthogonal to it (Decision
+[D35](#d35-scope-is-required-on-store-definitions)): a `scope: execution` store
+may declare one, and its keys die with the execution whether or not they
+expired first.
 
 ### 11.2 `embed` (vector only)
 
@@ -4247,17 +4267,19 @@ Legal ops per kind, with their parameters and derived output schema. `V` is the
 store's `value_schema` object, which a `kv` store always declares (§11.1); `M`
 is its `metadata_schema` object, which a `vector` store MAY leave undeclared —
 see the `M`-is-absent rule below. `C` is one optional **condition**, `if:` or
-`if_version:` and never both (the conditions rule below).
+`if_version:` and never both (the conditions rule below). `T` is an optional
+**`ttl`** — a literal §4.4 duration or `never` — on the four writes that leave a
+key holding a value (the expiry rule below).
 
 | kind | `op` | Parameters | Output |
 |---|---|---|---|
 | `kv` | `get` | `key` (CEL string) | `{ value: V (optional), found: boolean, version: integer (optional) }` |
-| `kv` | `set` | `key`, `value` (map field→CEL matching `V`), `C` | `{ key: string, applied: boolean, version: integer (optional), deduped: boolean }` |
+| `kv` | `set` | `key`, `value` (map field→CEL matching `V`), `C`, `T` | `{ key: string, applied: boolean, version: integer (optional), deduped: boolean }` |
 | `kv` | `delete` | `key`, `if_version` (CEL int, optional) | `{ deleted: boolean, applied: boolean, version: integer (optional), deduped: boolean }` |
 | `kv` | `list` | `prefix` (CEL string, optional), `limit` (integer 1..1000, required), `after` (CEL string, optional — the exclusive cursor), `include_values` (literal boolean, default `false`) | `{ keys: array<string>, next: string (optional), entries: array<{ key: string, value: V, version: integer }> }` — `entries` present exactly when `include_values: true` |
-| `kv` | `merge` | `key`, `fields` (map field→CEL, each a field of `V`), `C` | `{ key: string, applied: boolean, version: integer (optional), value: V (optional), deduped: boolean }` |
-| `kv` | `append` | `key`, `field` (an array field of `V`, literal), `value` (CEL, one item of it), `unique` (literal boolean, default `false`), `C` | as `merge` |
-| `kv` | `incr` | `key`, `field` (an `integer` or `number` field of `V`, literal), `by` (CEL number of the field's type, default `1`), `C` | as `merge` |
+| `kv` | `merge` | `key`, `fields` (map field→CEL, each a field of `V`), `C`, `T` | `{ key: string, applied: boolean, version: integer (optional), value: V (optional), deduped: boolean }` |
+| `kv` | `append` | `key`, `field` (an array field of `V`, literal), `value` (CEL, one item of it), `unique` (literal boolean, default `false`), `C`, `T` | as `merge` |
+| `kv` | `incr` | `key`, `field` (an `integer` or `number` field of `V`, literal), `by` (CEL number of the field's type, default `1`), `C`, `T` | as `merge` |
 | `kv` | `count` | `prefix` (CEL string, optional) | `{ count: integer }` |
 | `kv` | `get_many` | `keys` (CEL list of string, at most 1000) | `{ entries: array<{ key: string, value: V (optional), found: boolean, version: integer (optional) }> }` — one per key asked, in the order asked |
 | `vector` | `search` | `query` (CEL string), `top_k` (integer 1..100, required), `filter` (map metadata-field→CEL, optional) | `{ matches: array<{ id: string, score: number, text: string, metadata: M }> }` |
@@ -4321,6 +4343,45 @@ Rules (PRD 5.8):
   hold (compared as JSON); an item it holds changes nothing and is answered
   `applied: true` with the key's current `version` and `value`. A result `V`
   refuses **fails the node** — naming the field — and changes nothing.
+- **Expiry.** `set`, `merge`, `append` and `incr` take `ttl:`, a literal §4.4
+  duration or `never`; a `kv` store may declare `default_ttl:` (§11.1), which
+  stands in for a write that names none — a synthesized tool's write included,
+  whose arguments carry no `ttl` (§11.5). A key carries an absolute **expiry**:
+  the store's clock at the write plus the `ttl` — the **server's** clock on a
+  dialled backend (§11.3), so every writer of one store agrees about time, and
+  the process's on a local one. Every write that applies sets it again: to its
+  own `ttl`, else the store's `default_ttl:`, else to nothing — so a write
+  refreshes an expiry, `ttl: never` clears one a default would set, a write
+  naming no `ttl` on a store with no default clears it, and an `append` with
+  `unique: true` that changed nothing still refreshes it, because it applied. A
+  write that declined changes nothing, its key's expiry included (Decision
+  [D153](#d153-a-kv-key-may-expire-and-a-settled-executions-ledger-rows-are-deleted),
+  PRD resolved q69).
+
+  An expired key is **absent** — to `get`, `list`, `count` and `get_many`, and
+  to every condition: `if: absent` holds of it, `if: present` and
+  `if_version:` do not, and a write declining against it answers no `version`. So a `set` with `if: absent` on an
+  expired key applies and takes it, which with a version is a **lease**: claim
+  with `if: absent` and a `ttl`, keep with `if_version:` and a fresh `ttl`,
+  release with a `delete` carrying `if_version:`. Expiry consumes no version: a
+  key set again after expiring takes the partition's next one, past every
+  version it showed before.
+
+  Removal is lazy, on a stated schedule. An expired key is invisible the
+  instant it expires and leaves storage at whichever comes first: the next
+  write to its partition, which removes **at most 100** of that partition's
+  expired keys before it reads its own; or the next process start — every
+  `run`, `resume` and `serve`, on every `kv` store the composition binds whether
+  or not it reaches the store, and any other process at its first op on one —
+  which removes **every** key of the store that had expired by then, every
+  partition included. That removal runs behind the ops, a batch of at most 1000
+  between two of them, so no op waits for more than one batch; a command waits
+  for the rest before it exits; and on a dialled backend each batch takes its
+  partition's version lock as a write does, so it and a write wait for each
+  other rather than deadlocking. A `ttl`
+  adds no field to any output row (Decision
+  [D34](#d34-the-store-op-catalog-is-normative-including-derived-output-schemas)):
+  an expired key is answered exactly as a key never written is.
 - **What a write answers.** Every `kv` write answers `applied`, `version` and
   `deduped`, beside its own fields; a partial update answers the whole `value`
   it left, present exactly when it applied. `deduped` is grammar 9.4's ledger
@@ -4402,13 +4463,14 @@ Rules (PRD 5.8):
   `on_error:`.
 
   All three are **reads** (below): recorded with what they answered, answered
-  out of the record on a replay, carrying no idempotency key. Expiry (PRD
-  resolved q69) folds into them the way it folds into the conditions — an
-  expired key is skipped by a page, uncounted by a `count` and not found by a
-  `get_many` — and is not part of this entry. On a `blob` store `list` keeps its
-  one shape — `prefix:` and `limit:` and `{ keys }` — and `after:` or
-  `include_values:` there is a compile error naming the store: a cursor and the
-  values beside a page's keys are a `kv` page's.
+  out of the record on a replay, carrying no idempotency key. Expiry (the
+  expiry rule above, PRD resolved q69) holds of them as it holds of a `get`
+  and of the conditions, by the one inequality every read applies: an expired
+  key is skipped by a page, uncounted by a `count` and not found by a
+  `get_many`. On a `blob` store `list` keeps its one shape — `prefix:` and
+  `limit:` and `{ keys }` — and `after:` or `include_values:` there is a
+  compile error naming the store: a cursor and the values beside a page's keys
+  are a `kv` page's.
 - **A store with no `M`.** `metadata_schema:` is optional on a `vector` store
   (§11.1), and a store that declares none has no metadata at all rather than
   empty metadata (Decision
@@ -4466,6 +4528,25 @@ Rules (PRD 5.8):
   the execution id plus the store node's flattened instance path, which is what
   keeps two instantiations of one flow, and the repeating item indexes of nested
   maps, from deriving one key for two different writes.
+- **The ledger a settled execution leaves is deleted.** A keyed write's ledger
+  row is what answers a retry of its effect site, and an execution retries only
+  while its journal row is open; every §9.4 key begins `<execution.id>/`, and a
+  settled execution never resumes (PRD resolved q65). So when an execution's row
+  closes `completed` or `failed` and the detached `agent.*`/`tool.*` deliveries
+  it started have finished — they write, and retry, under its id (§8.6 rule 7) —
+  the runtime deletes the ledger rows under that prefix from every store the
+  composition binds, which reaches every partition the execution wrote from any
+  process, a placement's worker included (§14.1 rule 5); a child execution's
+  rows go under the child's own id, when the child settles. An execution the
+  journal still holds open keeps every row, so a resume still writes nothing
+  twice (PRD resolved q29, q69). A `scope: execution` store's partition, ledger
+  included, already dies with the run (§11.3). The prune runs behind the
+  outcome and nothing of the outcome waits for it — each store on its own, a
+  dial bounded at ten seconds — and a command waits for it on its way out (a
+  `run` or `resume` as it exits, a `serve` when it is stopped), starting then a
+  prune still waiting on deliveries the exit cuts off, whose keyed writes are
+  refused from then on. A prune that fails is said and changes no outcome: the
+  rows answer nothing again.
 - A store **write** performed inside a `map`-dispatched instance — `kv set`,
   `kv delete`, `kv merge`, `kv append`, `kv incr`, `vector upsert`,
   `vector delete`, `blob put`, `blob delete` — MUST be one of two forms (PRD 5.8,
@@ -4602,7 +4683,10 @@ The `kv` writes' conditions are arguments too — `<name>_set` stays at
 it — offered as `if` (a string: `absent`, `present`, or empty for none, the
 default) and `if_version` (an integer, `-1` for none, the default), since a
 tool's optional argument is spelled with a `default:` and neither has a value of
-its own type that means "none". One row is folded rather than copied, because
+its own type that means "none". A `ttl` is **not** an argument: how long a key
+lives is the composition's to say, so a synthesized write's key takes the
+store's `default_ttl:` (§11.1), or no expiry where it declares none (PRD
+resolved q69). One row is folded rather than copied, because
 its second half is typed by its first: an `append`'s `field` and `value` arrive
 as `item`, an object whose properties are `V`'s array fields each typed as its
 item, naming exactly one — `{"item": {"tags": "urgent"}}`. A call naming both
@@ -10986,11 +11070,173 @@ new op is a keyed `kv` write it already exempts, which the ops now make safe at 
 constant key. The op catalogue is per kind, and with three ops that only one
 kind takes, which kind takes an op is now checked against the store a node
 names rather than left to a comment. Expiry (PRD resolved q69) counts as absent
-and folds into the one predicate the conditions read; it is not part of this
-entry.
+and folds into the one predicate the conditions read; it is
+[D153](#d153-a-kv-key-may-expire-and-a-settled-executions-ledger-rows-are-deleted)'s,
+not this entry's.
 
 **Status**: shipped. *PRD 5.8, resolved q13, q29, q63, q68; §9.4, §11.3, §11.4,
 §11.5.*
+
+### D153. A `kv` key may expire, and a settled execution's ledger rows are deleted
+
+`set`, `merge`, `append` and `incr` take `ttl:` — a §4.4 duration or `never` —
+and a `kv` store takes `default_ttl:`, a duration, for every write that names
+none. A key carries an absolute expiry computed by the store's clock — the
+server's on a dialled backend, the process's locally — which every write that
+applies sets again to its own `ttl`, else the default, else to nothing; a write
+that declined changes nothing. An expired key is absent to every read and every
+condition, consumes no version, and leaves storage at the next write to its
+partition (at most 100 rows a write) or the next process start, whichever comes
+first — every `run`, `resume` and `serve` starting the sweep of every `kv` store
+the composition binds, any other process its first op on a store, and the
+sweep running behind that process's ops, a bounded batch at a time, never in
+front of them. When an execution's journal row closes `completed` or `failed`
+and its detached deliveries have finished, the ledger rows under its
+`<execution.id>/` prefix are deleted from every store the composition binds,
+which is every partition its keyed writes reached from any process — behind
+the outcome, which never waits for it, and before a command exits, a stopped
+`serve` included — unless a worker may still be running one of its placed
+nodes: an execution with a dispatch a worker was handed and no result ended
+keeps every row (§4.4, §8.8, §11.1, §11.4, §11.5, PRD resolved q69).
+
+**Rationale**: a store several runs share has two growth problems a `kv` store
+had no answer to. The composition's own keys — a claim, a cache entry, a
+session's scratch — outlive the reason they were written, so a crashed run's
+claim held its job for ever; and the idempotency ledger grew with every keyed
+write a store had ever taken, though a row only ever answers a retry of its own
+execution. Expiry is the first, and the second is retention keyed to the one
+fact that ends a row's use.
+
+**An absolute instant, from one clock.** A relative `ttl` stored as such would
+need every reader to know when it was written, and a reader's own clock to
+agree with the writer's. Storing `expires_at` — the clock at the write plus the
+`ttl` — makes "alive" one comparison every arm makes in a statement, and taking
+that clock from the **server** on a dialled backend makes it one clock for every
+writer: two processes whose clocks drift still agree which keys are alive, which
+is the property a dialled store exists for
+([D149](#d149-a-dialled-kv-store-is-multi-writer-and-per-key-last-write-wins)).
+A local store has one process and its clock.
+
+**Every write that applies sets it, and a declined one does not.** "A write
+refreshes expiry" is what makes a lease's keep a keep, and "a write with no
+`ttl` on a store with no default clears it" is the same rule read with nothing
+to set: the expiry is the write's, not a property the key carries forward. So
+`ttl: never` is an answer of its own rather than a missing value — it beats a
+default — and an `append` with `unique: true` that found its item already there
+refreshes the expiry while taking no version, because it applied. A declined
+write wrote nothing, so the expiry it would have set is not written either.
+
+**Absent, through the one predicate.** An expired key folds into the predicate
+[D152](#d152-a-kv-key-is-versioned-and-a-conditional-or-partial-write-is-serialized-against-every-write-to-its-key)
+left for "absent": the conditions, the declined answer's missing `version` and
+a partial update starting from nothing all read a key through it, and the reads
+filter on the same inequality. That is what makes `if: absent` a lease's claim
+with nothing added — the expired holder's key is absent, so the claim applies
+and takes it. Expiry takes no version because nothing wrote: the partition's
+sequence is untouched, and the next write takes its next value, which is past
+every version the key ever showed, so the ABA argument D152 makes still holds.
+
+**Lazy removal, on a schedule stated rather than promised.** Removing an
+expired key at the instant it expires needs a clock-driven process on every
+backend; making it invisible at that instant needs only the comparison. So
+visibility is exact and storage is lazy: each write sweeps its own partition —
+under the lock it already holds, through an index over the expiry, so it reads
+no live row — bounded at 100 rows so a backlog never stalls a write, and a
+process start removes every store's whole backlog, so a store nobody writes to
+again still sheds what expired the next time the deployment starts. "Process
+start" is read as the ruling writes it, not as "the next process to touch the
+store": every `run`, `resume` and `serve` starts the sweep on every `kv` store
+the composition binds, a store none of its executions will reach included,
+because a cache or a session's scratch that nothing reads past its expiry is
+exactly the store that would otherwise keep its expired keys for ever. Any
+other process — a placement's worker, a library caller — and a connection
+dialled again after a loss start the same sweep with their first op on a
+store. The sweep runs **behind** the process's ops and between them, one batch
+of at most 1000 rows at a time, so it never stalls an op either: an op waits
+for at most the batch in progress, and a command waits for the rest on its way
+out rather than in front of its first op; a dial it needs is made in the
+background and bounded, so a bound store whose server does not answer delays
+nothing the process does.
+On a dialled backend each batch is one partition's, under that partition's
+version-sequence lock taken first, as a write takes it — two `DELETE`s reaching
+one expired row through two indexes lock it in two orders, which a server
+breaks by failing one of them, and the sequence lock is what keeps a second
+one off the partition while either runs.
+
+**The ledger, pruned at settlement.** A ledger row exists to answer a retry of
+its effect site under the at-least-once of
+[D104](#d104-the-idempotency-key-is-the-flattened-instance-path), and an
+execution can retry only while its journal row is open: a settled execution
+never resumes (PRD resolved q65). Every derived key begins with the execution's
+id, so the rows a settled execution left are exactly one prefix of the ledger,
+and deleting them — after the row closes, never before — leaves the ledger
+proportional to the executions that are open rather than to history. "After"
+means after everything still writing under that id, too: a detached `agent.*`
+or `tool.*` delivery outlives the run that dispatched it (§8.6 rule 7) and
+retries under the run's id, so the prune waits for those deliveries to finish
+— chained behind them, so the outcome does not. A command does not wait for
+them — `agent-compose run` exits under a delivery still in flight, and so does
+a `serve` that is stopped — so it starts such a prune on its way out instead,
+which for a `serve` is its stop: the one exit it has, and the one point after
+which nothing would ever run the prune, since recovery takes open executions
+alone. No process retries a settled execution's delivery once this one is gone
+(PRD resolved q65), and the delivery still running here until the exit is
+refused any keyed write from then on, so it can never apply one a second time
+for want of the row. **Nor does the outcome wait for the prune itself.** It
+visits every store the composition binds, and one of those can be on a server
+that is slow or does not answer; an outcome that waited would hand every bound
+store's reachability to every run, a store the run never touched included. So
+the prune runs behind the outcome, each store on its own, with a dial bounded
+at ten seconds, and a command waits for it before it exits — a stopped `serve`
+without closing anything under the executions it leaves running for the next
+start to recover. And it is every store the composition binds that is pruned,
+not the ones the settling process wrote: a placed node writes a dialled store
+from its worker (§14.1 rule 5), and the hub that settles never sees that write.
+A `kv` or `vector` store's ledger is keyed by the idempotency key alone, so the
+prefix is one range on a primary key in each, and a store the execution never
+wrote costs a seek that finds nothing; a
+`blob` store's is a directory per partition, which no placement can reach
+([D131](#d131-a-process-local-store-is-refused-where-a-placement-can-open-it)),
+so the execution wrote it only in the partition its identity addresses, and it
+is pruned there. A resume of an unsettled execution finds every row it wrote,
+so it still writes nothing twice (PRD resolved q29). The ledger is still the
+server's on a dialled backend — D149's clause stands; this prunes it — and a
+child execution's rows are its own prefix, so they go when the child settles.
+
+**Not under a runner the hub let go of.** "Everything still writing under that
+id" has one member no process of the hub's can wait for: a placed node's
+runner whose dispatch the hub superseded (`docs/distributed.md` §3.4, §6.3).
+A supersession — the session gone quiet past the liveness window, the artifact
+replaced, the node's deadline spent, the issuing hub replaced — ends the
+attempt and not the runner: the worker does not stop a runner its session
+lost, and the runner writes a dialled store directly (§14.1 rule 5) under the
+§9.4 key the retry that replaced it wrote under too. PRD resolved q63's "applies
+once even when the two attempts are two processes" is that late write being
+answered from the retry's row, which a prune at settlement would take away —
+and the hub learns nothing when the runner stops, since a late result is
+refused (`409`) and a worker that never comes back sends none. So the
+premise "a settled execution never resumes, so its rows answer nothing" is
+read as narrowly as it is true: an execution with a dispatch a session was
+handed and no result settled is not pruned, which the journal's dispatch rows
+answer at settlement — the one place dispatch state is held
+(`docs/distributed.md` §8 rule 3). A dispatch no worker took had no runner, and one a result
+settled had one that has finished, the result being a runner's last line, so
+neither holds anything back. A detached delivery still in flight at settlement
+can reach a placed node afterwards, so a process that hands placed nodes out —
+a `serve` whose target places something — asks again as the prune it held
+back starts. What this costs is the rows of those executions, kept as every
+execution's were before this decision: proportional to the supersessions a
+deployment sees rather than to its history.
+
+**What it does not touch.** `scope:` is orthogonal
+([D35](#d35-scope-is-required-on-store-definitions)): an execution-scoped key may
+carry a `ttl`, and dies with the execution regardless. No output field moves
+([D34](#d34-the-store-op-catalog-is-normative-including-derived-output-schemas)),
+and no trace field: an expired key is answered as a key never written is. A
+synthesized tool takes no `ttl` argument and writes under the store's default.
+
+**Status**: shipped. *PRD 5.8, resolved q29, q63, q65, q68, q69; §4.4, §8.8,
+§9.4, §11.1, §11.3, §11.4, §11.5.*
 
 ### D154. A `kv` store is read at scale a page at a time, and a page's `entries` are there when its node asks
 
@@ -11064,7 +11310,9 @@ key given.
 **Reads, and only reads.** All three are recorded with their answer, replayed
 out of the record, and carry no idempotency key — exactly a `get` (PRD resolved
 q29). Expiry (PRD resolved q69) folds into them through the one liveness
-predicate every read applies, and is not part of this entry.
+predicate every read applies; it is
+[D153](#d153-a-kv-key-may-expire-and-a-settled-executions-ledger-rows-are-deleted)'s,
+not this entry's.
 
 **What this does not change.** The `blob` `list` keeps its one shape — `prefix:`
 and `limit:`, `{ keys }` — and `after:` or `include_values:` on it is a compile
@@ -11168,10 +11416,12 @@ a literal in the same object: store-op parameter sets per `op` (§11.4), a `kv`
 write's two conditions as one or the other and never both, and the parameters
 that are literals rather than CEL — `top_k` and `limit` typed as integers in
 their ranges, `content_type` as a string carrying no env ref, `field` as an
-identifier, `unique` and `include_values` as booleans and `if` as `absent` or
-`present` (§8.8, §11.4) — store definition key sets per `kind`, both the schema each kind
-requires and the ones it refuses, `metadata_schema` being `vector`'s alone
-(§11.1, D113) and the `provider:` a `vector` store's `embed:` block must name
+identifier, `unique` and `include_values` as booleans, `if` as `absent` or
+`present` and `ttl` as a duration or `never` (§8.8, §11.4) — store definition
+key sets per `kind`, both the schema each kind requires and the ones it refuses,
+`metadata_schema` being `vector`'s alone (§11.1, D113), `default_ttl` being
+`kv`'s alone and a duration (§11.1, D153), and the `provider:` a `vector`
+store's `embed:` block must name
 (§11.2, D116), provider key sets per `kind` — both halves, the required keys and
 the closed row the optional ones live in (§12.1, D106), including the one
 required key that is *conditional*, an `anthropic` or `openai` provider's

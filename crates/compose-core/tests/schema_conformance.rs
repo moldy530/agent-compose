@@ -1340,6 +1340,139 @@ fn the_published_schema_takes_every_journal_the_grammar_spells() {
     }
 }
 
+/// **The published schema takes a `kv` write's `ttl:` and a `kv` store's
+/// `default_ttl:` exactly where the parser does** (grammar 11.1, 11.4, PRD
+/// resolved q69).
+///
+/// Both halves, from both sides. The accepted shapes — a duration or `never` on
+/// each of the four writes that leave a key holding a value, a duration as a
+/// `kv` store's default — are what the example corpus does not carry yet, and
+/// the refused ones are the spellings an editor must squiggle because
+/// `validate` refuses them by name: a `ttl:` on a read, a `delete` or another
+/// kind's op, a malformed duration, a `default_ttl:` off a `kv` store or spelled
+/// `never`.
+#[test]
+fn the_published_schema_takes_a_ttl_exactly_where_the_parser_does() {
+    let validator = compile_schema();
+    let document = |store: Value, node: Value| {
+        json!({
+            "version": "0.1",
+            "store.jobs": store,
+            "flow.work": {
+                "outputs": {},
+                "nodes": { "write": node },
+                "edges": [{ "from": "start", "to": "write" }, { "from": "write", "to": "end" }],
+            },
+        })
+    };
+    let kv = json!({
+        "kind": "kv",
+        "scope": "global",
+        "value_schema": { "owner": { "type": "string" }, "tags": { "type": "array", "max_items": 10, "items": { "type": "string" } }, "count": { "type": "integer" } },
+    });
+    let kv_with_default = {
+        let mut store = kv.clone();
+        store["default_ttl"] = json!("24h");
+        store
+    };
+    let blob = json!({ "kind": "blob", "scope": "global" });
+    let write = |op: &str, ttl: Value| {
+        let mut node = match op {
+            "set" => {
+                json!({ "store": "store.jobs", "op": "set", "key": "'job'", "value": { "owner": "'me'" } })
+            }
+            "merge" => {
+                json!({ "store": "store.jobs", "op": "merge", "key": "'job'", "fields": { "owner": "'me'" } })
+            }
+            "append" => {
+                json!({ "store": "store.jobs", "op": "append", "key": "'job'", "field": "tags", "value": "'x'" })
+            }
+            "incr" => {
+                json!({ "store": "store.jobs", "op": "incr", "key": "'job'", "field": "count" })
+            }
+            "get" => json!({ "store": "store.jobs", "op": "get", "key": "'job'" }),
+            "delete" => json!({ "store": "store.jobs", "op": "delete", "key": "'job'" }),
+            "put" => json!({ "store": "store.jobs", "op": "put", "key": "'job'", "value": "'x'" }),
+            other => panic!("no row for `{other}`"),
+        };
+        node["ttl"] = ttl;
+        node
+    };
+    let agree = |instance: &Value, accepted: bool| {
+        let errors = validation_errors(&validator, instance);
+        let source = serde_yaml_ng::to_string(instance).expect("a printable document");
+        let parsed = compose_core::parse_str(&source, "main.yml");
+        let said = parsed
+            .diagnostics
+            .iter()
+            .map(|diagnostic| format!("  [{}] {}", diagnostic.code, diagnostic.message))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            errors.is_empty(),
+            accepted,
+            "the published schema must {} this:\n{source}\n{}",
+            if accepted { "accept" } else { "refuse" },
+            errors.join("\n")
+        );
+        assert_eq!(
+            parsed.diagnostics.is_empty(),
+            accepted,
+            "the parser must {} what the published schema {}:\n{source}\n{said}",
+            if accepted { "accept" } else { "refuse" },
+            if accepted { "accepts" } else { "refuses" },
+        );
+    };
+
+    for op in ["set", "merge", "append", "incr"] {
+        for ttl in [
+            json!("30s"),
+            json!("250ms"),
+            json!("5m"),
+            json!("24h"),
+            json!("never"),
+        ] {
+            agree(&document(kv.clone(), write(op, ttl.clone())), true);
+            agree(&document(kv_with_default.clone(), write(op, ttl)), true);
+        }
+        for ttl in [
+            json!("5 minutes"),
+            json!("1m30s"),
+            json!("0s"),
+            json!("forever"),
+            json!(30),
+        ] {
+            agree(&document(kv.clone(), write(op, ttl)), false);
+        }
+    }
+    for op in ["get", "delete"] {
+        agree(&document(kv.clone(), write(op, json!("30s"))), false);
+    }
+    agree(&document(blob.clone(), write("put", json!("30s"))), false);
+
+    let mut never_default = kv.clone();
+    never_default["default_ttl"] = json!("never");
+    agree(
+        &document(
+            never_default,
+            json!({ "store": "store.jobs", "op": "get", "key": "'job'" }),
+        ),
+        false,
+    );
+    for kind in [
+        json!({ "kind": "blob", "scope": "global", "default_ttl": "1h" }),
+        json!({
+            "kind": "vector",
+            "scope": "global",
+            "embed": { "model": "text-embedding-3-small", "provider": "provider.openai" },
+            "default_ttl": "1h",
+        }),
+    ] {
+        let instance = json!({ "version": "0.1", "store.jobs": kind });
+        agree(&instance, false);
+    }
+}
+
 /// **The published schema takes every storage provider the grammar spells**
 /// (grammar 14.3, PRD resolved q63).
 ///

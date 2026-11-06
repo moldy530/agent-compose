@@ -171,6 +171,7 @@ import {
 } from "./delivery.ts";
 import { type CompiledFlow, type FlowRun, flows, runChildFlow, runFlow } from "./graph.ts";
 import { mountWorkerRoutes, placementWaits, watchPlacementWaits } from "./mesh.ts";
+import { drainStores, sweepBoundStores } from "./stores.ts";
 import {
   deliverHumanAnswer,
   deliveriesOf,
@@ -2137,6 +2138,20 @@ function strings(held: unknown): Record<string, string> {
  * so the next start recovers each — a child whose parent had already settled
  * among them — and replays it to its frontier. What a stop costs is the one
  * effect each was in the middle of, which is §2's window for any execution.
+ *
+ * **What the executions that already settled left over the stores is finished
+ * first** (PRD resolved q69, `./stores.ts`'s `drainStores`): each one's ledger
+ * prune still in flight, each one still waiting on a detached delivery the
+ * exit is about to cut off, and the store-wide sweeps this start began. A
+ * settled execution is the one thing the next start does not come back for —
+ * recovery takes open rows (PRD resolved q65) — so a prune a stop cut off
+ * would be rows no process ever removes, and a `serve` stopped on every deploy
+ * would grow its ledger with history. Nothing is closed under the executions
+ * still running meanwhile, and a dial the wait needs is bounded, so a store
+ * whose server does not answer holds the stop for ten seconds and no longer.
+ * The stop happens once: a second signal while it is under way — the launcher
+ * forwarding one the terminal also delivered, or `builtin.bash`'s group sweep
+ * raising the signal again (`./runtime.ts`) — joins it.
  */
 export async function serve(options: ServeOptions = {}): Promise<FastifyInstance> {
   const app = createApp();
@@ -2147,10 +2162,22 @@ export async function serve(options: ServeOptions = {}): Promise<FastifyInstance
   const bound = typeof address === "object" && address !== null ? address.port : port;
   const shown = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
   process.stdout.write(`${JSON.stringify({ base_url: `http://${shown}:${bound}` })}\n`);
-  for (const signal of ["SIGINT", "SIGTERM"] as const) {
-    process.on(signal, () => {
-      void app.close().then(() => process.exit(0));
+  // A process start, which is half of PRD resolved q69's cleanup schedule: every
+  // `kv` store the composition binds starts shedding the keys that have expired
+  // in it, in the background and behind every request (`./stores.ts`).
+  sweepBoundStores();
+  let stopping = false;
+  const stop = (): void => {
+    if (stopping) return;
+    stopping = true;
+    // The app first, so no request starts an execution while the stores are
+    // drained; then the stores, with the executions still in flight running on
+    // beside the wait (see above).
+    void app.close().then(async () => {
+      await drainStores();
+      process.exit(0);
     });
-  }
+  };
+  for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, stop);
   return app;
 }

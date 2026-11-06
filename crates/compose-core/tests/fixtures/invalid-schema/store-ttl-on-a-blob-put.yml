@@ -1,0 +1,15 @@
+# rule: `ttl:` is a `kv` write's, and a `blob put` leaves no `kv` key to expire (grammar 11.4, PRD resolved q69)
+# at: /flow.demo/nodes/save/ttl
+# via: /$defs/storeNode/allOf/4/then/properties/ttl
+flow.demo:
+  outputs: {}
+  nodes:
+    save:
+      store: store.artifacts
+      op: put
+      key: "'report.txt'"
+      value: "'the report'"
+      ttl: 1h
+  edges:
+    - { from: start, to: save }
+    - { from: save, to: end }

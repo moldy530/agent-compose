@@ -1532,6 +1532,10 @@
         "by": { "description": "kv incr only: CEL number added to the field (default 1).", "$ref": "#/$defs/cel" },
         "if": { "description": "Apply a kv write only if the key holds no value (`absent`) or only if it holds one (`present`). A literal, not CEL. Mutually exclusive with `if_version:`; a condition that does not hold answers `applied: false` (PRD resolved q68).", "enum": ["absent", "present"] },
         "if_version": { "description": "CEL integer: apply a kv write only if the key's current version - as a `get` or an earlier write answered it - is this one. Mutually exclusive with `if:` (PRD resolved q68).", "$ref": "#/$defs/cel" },
+        "ttl": {
+          "description": "kv set/merge/append/incr only: how long the key the write leaves lives - a literal duration (e.g. 30s, 5m, 24h), or `never`, which clears an expiry the store's `default_ttl:` would set. Not CEL. Every write that lands refreshes the key's expiry to its own ttl, else the store's default, else none; an expired key is absent to every read and every condition, so `if: absent` on one applies (grammar 11.4, PRD resolved q69).",
+          "oneOf": [{ "$ref": "#/$defs/duration" }, { "const": "never" }]
+        },
         "after": { "description": "kv list only: CEL string, the exclusive cursor - the last key of the page before, as its `next` answered it. The page holds the keys after it in byte order, under the same `prefix` (PRD resolved q70).", "$ref": "#/$defs/cel" },
         "include_values": { "description": "kv list only: answer each key's value and version beside it, as `entries` (default false). A literal, not CEL: it decides whether the derived output has an `entries` field at all (PRD resolved q70).", "type": "boolean" },
         "keys": { "description": "kv get_many only: CEL list of strings, the keys to read - at most 1000, which the run enforces, since a list's length is not known before it runs. Answered one entry per key, in the order given (PRD resolved q70).", "$ref": "#/$defs/cel" },
@@ -1562,6 +1566,7 @@
               "unique": false,
               "by": false,
               "if": false,
+              "ttl": false,
               "after": false,
               "include_values": false,
               "keys": false
@@ -1611,6 +1616,7 @@
               "by": false,
               "if": false,
               "if_version": false,
+              "ttl": false,
               "after": false,
               "include_values": false,
               "keys": false
@@ -1634,6 +1640,7 @@
               "by": false,
               "if": false,
               "if_version": false,
+              "ttl": false,
               "after": false,
               "include_values": false,
               "keys": false
@@ -1659,6 +1666,7 @@
               "by": false,
               "if": false,
               "if_version": false,
+              "ttl": false,
               "keys": false
             }
           }
@@ -1681,6 +1689,7 @@
               "by": false,
               "if": false,
               "if_version": false,
+              "ttl": false,
               "after": false,
               "include_values": false,
               "keys": false
@@ -1793,6 +1802,7 @@
               "by": false,
               "if": false,
               "if_version": false,
+              "ttl": false,
               "after": false,
               "include_values": false,
               "keys": false
@@ -1820,6 +1830,7 @@
               "by": false,
               "if": false,
               "if_version": false,
+              "ttl": false,
               "after": false,
               "include_values": false
             }
@@ -1983,6 +1994,10 @@
         "agent_access": {
           "description": "How much of this store's synthesized tool surface an attaching agent gets (default read_write): `read` withholds the writes, `read_write` adds the whole-value write, and `full` adds a kv store's partial updates and delete - merge, append, incr, delete. `full` is a kv level and is refused on a vector or blob store (grammar 11.5, PRD resolved q68).",
           "enum": ["read", "read_write", "full"]
+        },
+        "default_ttl": {
+          "description": "kv only: how long the key a write that names no `ttl:` leaves lives - a literal duration (e.g. 30s, 5m, 24h). Absent means such a key never expires; a write's own `ttl:` (a duration, or `never`) overrides it. An expired key is invisible at once and removed from storage at the next write to its partition (at most 100 rows per write) or when a process next opens the store (grammar 11.1, PRD resolved q69).",
+          "$ref": "#/$defs/duration"
         }
       },
       "additionalProperties": false,
@@ -1998,10 +2013,11 @@
         {
           "if": { "properties": { "kind": { "const": "vector" } }, "required": ["kind"] },
           "then": {
-            "description": "A vector store declares `embed:` and MAY declare `metadata_schema:`; `value_schema` is kv's (grammar 11.1), and so is `agent_access: full`, whose extra tools are a kv store's writes (grammar 11.5, PRD resolved q68).",
+            "description": "A vector store declares `embed:` and MAY declare `metadata_schema:`; `value_schema` is kv's (grammar 11.1), and so is `agent_access: full`, whose extra tools are a kv store's writes (grammar 11.5, PRD resolved q68), and `default_ttl:`, since an expiry is a kv key's (grammar 11.1, PRD resolved q69).",
             "required": ["embed"],
             "properties": {
               "value_schema": false,
+              "default_ttl": false,
               "agent_access": { "enum": ["read", "read_write"] }
             }
           }
@@ -2009,11 +2025,12 @@
         {
           "if": { "properties": { "kind": { "const": "blob" } }, "required": ["kind"] },
           "then": {
-            "description": "A blob store declares neither schema: `value_schema` is kv's, and no blob op reads metadata, so `metadata_schema` would be inert (grammar 11.1, Decision D113). `agent_access: full` is kv's too, whose extra tools are a kv store's writes (grammar 11.5, PRD resolved q68).",
+            "description": "A blob store declares neither schema: `value_schema` is kv's, and no blob op reads metadata, so `metadata_schema` would be inert (grammar 11.1, Decision D113). `agent_access: full` is kv's too, whose extra tools are a kv store's writes (grammar 11.5, PRD resolved q68), and so is `default_ttl:`, since an expiry is a kv key's (grammar 11.1, PRD resolved q69).",
             "properties": {
               "value_schema": false,
               "metadata_schema": false,
               "embed": false,
+              "default_ttl": false,
               "agent_access": { "enum": ["read", "read_write"] }
             }
           }

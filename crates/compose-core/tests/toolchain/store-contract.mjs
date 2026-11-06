@@ -143,6 +143,29 @@ const get = (store, key, run) => stores.runStoreOp(store, "get", { key }, run, n
 const list = (store, run, prefix = undefined, limit = 50) =>
   stores.runStoreOp(store, "list", { limit, ...(prefix === undefined ? {} : { prefix }) }, run, node());
 
+/**
+ * Run one helper process of this directory's beside this one, and answer the
+ * JSON it printed with what it said on stderr.
+ */
+const helper = (script, args, env = process.env) =>
+  new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      [path.join(path.dirname(fileURLToPath(import.meta.url)), script), ...args],
+      { env, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (chunk) => (out += chunk));
+    child.stderr.on("data", (chunk) => (err += chunk));
+    child.on("error", reject);
+    child.on("close", (code) =>
+      code === 0
+        ? resolve({ answer: JSON.parse(out), stderr: err })
+        : reject(new Error(`\`${script}\` exited ${code}: ${err}`)),
+    );
+  });
+
 // --- The second connection, which is this file's and not a store's -----------
 //
 // The last case needs two things no `kv` op can do: hold a row lock on the key a
@@ -1689,6 +1712,1690 @@ const refusal = async (promise) => {
     answer.window = { early, late: late ?? null, held: held.value ?? null };
   } catch (error) {
     answer.window_error = String(error?.message ?? error);
+  }
+}
+
+// --- Expiry (PRD resolved q69) ------------------------------------------------
+//
+// Every case here moves time with the store module's own clock hook rather than
+// by sleeping: `AGENT_COMPOSE_STORE_CLOCK_OFFSET_MS` is read at every op and
+// shifts the clock the arm already reads — `Date.now()` on SQLite, the server's
+// clock inside the statement on a dialled one — so "an hour later" is one
+// environment variable away, on every arm, and the margins can be minutes
+// rather than the milliseconds a real wait would leave.
+
+/** The variable `src/stores.ts` reads its clock offset from. */
+const CLOCK = stores.STORE_CLOCK_OFFSET;
+
+/** An hour: the `ttl` most cases below write, in milliseconds. */
+const HOUR = 3_600_000;
+
+/** A minute, which is every margin either side of an expiry below. */
+const MINUTE = 60_000;
+
+/** Run `work` with the store clock `offset` milliseconds ahead, and put it back. */
+const later = async (offset, work) => {
+  const before = process.env[CLOCK];
+  process.env[CLOCK] = String(offset);
+  try {
+    return await work();
+  } finally {
+    if (before === undefined) delete process.env[CLOCK];
+    else process.env[CLOCK] = before;
+  }
+};
+
+/**
+ * Rows of a store's storage as they really are — expired ones included —
+ * answered by a connection this file opens itself, the way an operator would
+ * look: SQLite's file with the pinned driver, a server over its own socket.
+ * `sql` is written once with `?` placeholders over the dialled schema
+ * (`store_entries`, `store_applied`), and the SQLite form drops the `store`
+ * column, which a file per store does not have.
+ */
+async function storage(sql, parameters, sqliteSql = undefined, sqliteParameters = undefined) {
+  if (provider === "sqlite") {
+    const module = await import("node-sqlite3-wasm");
+    const { Database } = module.default ?? module;
+    const [file, statement, bound] = sqliteSql;
+    const database = new Database(path.join(data, "stores", `${stores.encodeKey(file)}.sqlite`));
+    try {
+      database.exec("PRAGMA busy_timeout = 5000;");
+      return database.all(statement, bound ?? sqliteParameters ?? []);
+    } finally {
+      database.close();
+    }
+  }
+  const server = await openServer(process.env[URL_ENV]);
+  try {
+    let next = 0;
+    const spelled = provider === "postgres" ? sql.replace(/\?/g, () => `$${++next}`) : sql;
+    return await rows(server, spelled, parameters);
+  } finally {
+    await server.end().catch(() => undefined);
+  }
+}
+
+/** How many rows one partition of a store holds in storage, expired ones included. */
+async function storedRows(store, scopeKey) {
+  const counted = await storage(
+    "SELECT COUNT(*) AS n FROM store_entries WHERE store = ? AND scope_key = ?",
+    [store.name, scopeKey],
+    [store.name, "SELECT COUNT(*) AS n FROM entries WHERE scope_key = ?", [scopeKey]],
+  );
+  return Number(counted[0]?.n);
+}
+
+/** How many ledger rows a store holds under one key prefix. */
+async function ledgerRows(store, prefix) {
+  const counted = await storage(
+    "SELECT COUNT(*) AS n FROM store_applied WHERE store = ? AND SUBSTR(idempotency_key, 1, ?) = ?",
+    [store.name, prefix.length, prefix],
+    [
+      store.name,
+      "SELECT COUNT(*) AS n FROM applied WHERE substr(idempotency_key, 1, ?) = ?",
+      [prefix.length, prefix],
+    ],
+  );
+  return Number(counted[0]?.n);
+}
+
+{
+  // A key with a `ttl` is there until its expiry and absent from it on, to
+  // `get` and to `list` alike — and absent the way a key never written is: no
+  // `value`, no `version`.
+  const store = kv("expiry", "global");
+  const run = ctx(execution("expiry"));
+  await later(0, () => write(store, "set", { key: "k", value: { n: 1 }, ttl: HOUR }, run, "e/1"));
+  await later(0, () => write(store, "set", { key: "kept", value: { n: 2 } }, run, "e/2"));
+  const before = await later(HOUR - MINUTE, () => get(store, "k", run));
+  const listedBefore = await later(HOUR - MINUTE, () => list(store, run));
+  const after = await later(HOUR + MINUTE, () => get(store, "k", run));
+  const listedAfter = await later(HOUR + MINUTE, () => list(store, run));
+  answer.a_key_with_a_ttl_is_readable_before_it_expires =
+    before.found === true && before.value?.n === 1 && same(listedBefore.keys, ["k", "kept"]);
+  answer.an_expired_key_is_absent_to_get_and_list =
+    same(after, { found: false }) && same(listedAfter.keys, ["kept"]);
+
+  // …and to PRD resolved q70's reads, which judge a key by the same
+  // inequality a `get` does (`liveRows`): a `count` stops counting it, a
+  // `get_many` answers it as a key never written, and a page skips it —
+  // which is also what decides the page's `next`. With `limit: 1` the page
+  // before the expiry is `k` with `kept` past it, so `next` is `k`; after it,
+  // the extra row the page reads to know whether more remain is the expired
+  // key itself, so a page that counted it would still answer a `next`. None
+  // of these reads writes, so no sweep has run: the expired row is still
+  // stored, and only the read's own filter keeps it out.
+  const count = () => stores.runStoreOp(store, "count", {}, run, node());
+  const many = () => stores.runStoreOp(store, "get_many", { keys: ["k", "kept"] }, run, node());
+  const page = () => stores.runStoreOp(store, "list", { limit: 1, includeValues: true }, run, node());
+  const countedBefore = await later(HOUR - MINUTE, count);
+  const manyBefore = await later(HOUR - MINUTE, many);
+  const pageBefore = await later(HOUR - MINUTE, page);
+  const countedAfter = await later(HOUR + MINUTE, count);
+  const manyAfter = await later(HOUR + MINUTE, many);
+  const pageAfter = await later(HOUR + MINUTE, page);
+  const storedAfter = await storedRows(store, "global");
+  answer.an_expired_key_is_uncounted_by_count = countedBefore.count === 2 && countedAfter.count === 1;
+  answer.an_expired_key_is_not_found_by_get_many =
+    manyBefore.entries?.[0]?.found === true &&
+    manyBefore.entries?.[0]?.value?.n === 1 &&
+    same(manyAfter.entries?.[0], { key: "k", found: false }) &&
+    manyAfter.entries?.[1]?.found === true &&
+    manyAfter.entries?.[1]?.value?.n === 2;
+  answer.an_expired_key_is_skipped_by_a_page_and_its_next =
+    same(pageBefore.keys, ["k"]) &&
+    pageBefore.next === "k" &&
+    same(
+      pageBefore.entries?.map((entry) => entry.key),
+      ["k"],
+    ) &&
+    same(pageAfter.keys, ["kept"]) &&
+    !("next" in pageAfter) &&
+    same(
+      pageAfter.entries?.map((entry) => [entry.key, entry.value?.n]),
+      [["kept", 2]],
+    );
+  // The premise of the three: the expired row was still in storage when they
+  // read past it.
+  answer.the_expired_key_was_still_stored_when_those_reads_skipped_it = storedAfter === 2;
+  answer.expiry_trace = {
+    before,
+    after,
+    listedBefore,
+    listedAfter,
+    countedBefore,
+    countedAfter,
+    manyBefore,
+    manyAfter,
+    pageBefore,
+    pageAfter,
+    storedAfter,
+  };
+}
+
+{
+  // Every condition treats an expired key as absent: `if: present` and
+  // `if_version:` decline it with no version to answer, and `if: absent`
+  // applies and takes it — which, with a version, is a lease. Expiry consumes
+  // no version: the key set again takes the partition's very next one.
+  const store = kv("lease", "global");
+  const run = ctx(execution("lease"));
+  const claim = await later(0, () =>
+    write(store, "set", { key: "job", value: { owner: "a" }, condition: "absent", ttl: HOUR }, run, "l/1"),
+  );
+  const held = await later(HOUR - MINUTE, () =>
+    write(store, "set", { key: "job", value: { owner: "b" }, condition: "absent", ttl: HOUR }, run, "l/2"),
+  );
+  const present = await later(HOUR + MINUTE, () =>
+    write(store, "set", { key: "job", value: { owner: "c" }, condition: "present" }, run, "l/3"),
+  );
+  const versioned = await later(HOUR + MINUTE, () =>
+    write(store, "set", { key: "job", value: { owner: "c" }, ifVersion: claim.version }, run, "l/4"),
+  );
+  const retaken = await later(HOUR + MINUTE, () =>
+    write(store, "set", { key: "job", value: { owner: "b" }, condition: "absent", ttl: HOUR }, run, "l/5"),
+  );
+  answer.if_absent_declines_a_key_that_has_not_expired =
+    claim.applied === true && held.applied === false && held.version === claim.version;
+  answer.if_present_and_if_version_decline_an_expired_key_with_no_version =
+    present.applied === false &&
+    !("version" in present) &&
+    versioned.applied === false &&
+    !("version" in versioned);
+  answer.if_absent_applies_on_an_expired_key = retaken.applied === true;
+  answer.a_key_set_again_after_expiring_takes_the_next_version =
+    retaken.version === claim.version + 1 &&
+    (await later(HOUR + MINUTE, () => get(store, "job", run))).value?.owner === "b";
+  answer.lease_trace = { claim, held, present, versioned, retaken };
+}
+
+{
+  // **…and so does every condition while the expired key is still stored.** A
+  // write's own sweep removes at most 100 of its partition's expired rows
+  // before it reads its key, so above, where the partition holds the one
+  // expired key, that sweep has deleted it before any condition looks — and
+  // the conditions would pass with no notion of expiry at all. Here 400
+  // fillers expire two minutes ahead of the key, so each write's sweep takes a
+  // hundred of them and leaves the key a row: what the condition reads is an
+  // expired row, and it has to read it as absent. Every count below says the
+  // key was still stored when the condition read it.
+  const store = kv("lease_backlog", "global");
+  const run = ctx(execution("lease_backlog"));
+  const FILLERS = 400;
+  await later(0, async () => {
+    for (let index = 0; index < FILLERS; index += 1) {
+      await write(
+        store,
+        "set",
+        { key: `f-${String(index).padStart(3, "0")}`, value: { n: index }, ttl: HOUR - 2 * MINUTE },
+        run,
+      );
+    }
+  });
+  const claim = await later(0, () =>
+    write(store, "set", { key: "job", value: { owner: "a" }, condition: "absent", ttl: HOUR }, run),
+  );
+  /** Whether `job` is still a row, expired or not, and how many rows the partition holds. */
+  const stored = async () => [
+    Number(
+      (
+        await storage(
+          `SELECT COUNT(*) AS n FROM store_entries WHERE store = ? AND scope_key = ? AND ${provider === "mysql" ? "`key`" : '"key"'} = ?`,
+          [store.name, "global", "job"],
+          [store.name, "SELECT COUNT(*) AS n FROM entries WHERE scope_key = ? AND key = ?", ["global", "job"]],
+        )
+      )[0]?.n,
+    ),
+    await storedRows(store, "global"),
+  ];
+  const present = await later(HOUR + MINUTE, () =>
+    write(store, "set", { key: "job", value: { owner: "c" }, condition: "present" }, run),
+  );
+  const afterPresent = await stored();
+  const read = await later(HOUR + MINUTE, () => get(store, "job", run));
+  const versioned = await later(HOUR + MINUTE, () =>
+    write(store, "set", { key: "job", value: { owner: "c" }, ifVersion: claim.version }, run),
+  );
+  const afterVersioned = await stored();
+  const retaken = await later(HOUR + MINUTE, () =>
+    write(store, "set", { key: "job", value: { owner: "b" }, condition: "absent", ttl: HOUR }, run),
+  );
+  const afterRetaken = await stored();
+  // 400 fillers and the key; each write's sweep takes a hundred fillers.
+  answer.if_present_and_if_version_decline_an_expired_key_a_sweep_has_not_reached =
+    claim.applied === true &&
+    claim.version === FILLERS + 1 &&
+    present.applied === false &&
+    !("version" in present) &&
+    same(afterPresent, [1, 301]) &&
+    read.found === false &&
+    versioned.applied === false &&
+    !("version" in versioned) &&
+    same(afterVersioned, [1, 201]);
+  answer.if_absent_takes_an_expired_key_a_sweep_has_not_reached =
+    retaken.applied === true && retaken.version === claim.version + 1 && same(afterRetaken, [1, 101]);
+  answer.lease_backlog_trace = { claim, present, afterPresent, read, versioned, afterVersioned, retaken, afterRetaken };
+}
+
+{
+  // A write refreshes its key's expiry to its own `ttl`; a write naming none on
+  // a store with no default clears it; and a write that declined changes
+  // nothing, the expiry included.
+  const store = kv("refresh", "global", URL_ENV, RECORD);
+  const run = ctx(execution("refresh"));
+  const value = { title: "t", tags: [], count: 0 };
+  await later(0, () => write(store, "set", { key: "r", value, ttl: HOUR }, run, "r/1"));
+  await later(HOUR / 2, () =>
+    write(store, "merge", { key: "r", fields: { note: "kept" }, ttl: HOUR }, run, "r/2"),
+  );
+  const refreshed = await later(HOUR + HOUR / 4, () => get(store, "r", run));
+  const lapsed = await later(HOUR + HOUR / 2 + MINUTE, () => get(store, "r", run));
+
+  await later(0, () => write(store, "set", { key: "c", value, ttl: HOUR }, run, "r/3"));
+  await later(HOUR / 2, () => write(store, "incr", { key: "c", field: "count" }, run, "r/4"));
+  const cleared = await later(10 * HOUR, () => get(store, "c", run));
+
+  await later(0, () => write(store, "set", { key: "d", value, ttl: HOUR }, run, "r/5"));
+  const declined = await later(HOUR / 2, () =>
+    write(store, "set", { key: "d", value, condition: "absent", ttl: "never" }, run, "r/6"),
+  );
+  const unchanged = await later(HOUR + MINUTE, () => get(store, "d", run));
+
+  answer.a_write_refreshes_expiry_to_its_own_ttl =
+    refreshed.found === true && refreshed.value?.note === "kept" && lapsed.found === false;
+  answer.a_write_with_no_ttl_and_no_default_clears_expiry =
+    cleared.found === true && cleared.value?.count === 1;
+  answer.a_declined_write_leaves_expiry_unchanged =
+    declined.applied === false && unchanged.found === false;
+  answer.refresh_trace = { refreshed, lapsed, cleared, declined, unchanged };
+}
+
+{
+  // `default_ttl:` stands in for a write that names no `ttl`, and `ttl: never`
+  // beats it — on a write that sets the key afresh and on one that clears an
+  // expiry the default gave it — as does a write's own duration.
+  const store = { ...kv("defaulted", "global"), defaultTtl: HOUR };
+  const run = ctx(execution("defaulted"));
+  await later(0, () => write(store, "set", { key: "plain", value: { n: 1 } }, run, "d/1"));
+  await later(0, () => write(store, "set", { key: "never", value: { n: 2 }, ttl: "never" }, run, "d/2"));
+  await later(0, () => write(store, "set", { key: "longer", value: { n: 3 }, ttl: 3 * HOUR }, run, "d/3"));
+  await later(0, () => write(store, "set", { key: "cleared", value: { n: 4 } }, run, "d/4"));
+  await later(HOUR / 2, () =>
+    write(store, "set", { key: "cleared", value: { n: 5 }, ttl: "never" }, run, "d/5"),
+  );
+  const at = (key) => later(2 * HOUR, () => get(store, key, run));
+  const [plain, never, longer, cleared] = [
+    await at("plain"),
+    await at("never"),
+    await at("longer"),
+    await at("cleared"),
+  ];
+  answer.a_write_with_no_ttl_takes_the_store_default = plain.found === false;
+  answer.ttl_never_clears_a_store_default = never.found === true && cleared.value?.n === 5;
+  answer.a_writes_own_ttl_beats_the_store_default = longer.found === true;
+  answer.default_trace = { plain, never, longer, cleared };
+}
+
+{
+  // The partial updates take a `ttl` like a `set`: an `append` and an `incr`
+  // that create their key date it, and an `append` with `unique: true` whose
+  // item is already there — which changes neither value nor version — still
+  // refreshes the expiry, because it applied.
+  const store = kv("partial_expiry", "global", URL_ENV, RECORD);
+  const run = ctx(execution("partial_expiry"));
+  await later(0, () =>
+    write(store, "set", { key: "u", value: { title: "u", tags: ["a"], count: 0 }, ttl: HOUR }, run, "p/2"),
+  );
+  const same_ = await later(HOUR / 2, () =>
+    write(store, "append", { key: "u", field: "tags", value: "a", unique: true, ttl: HOUR }, run, "p/3"),
+  );
+  const refreshed = await later(HOUR + HOUR / 4, () => get(store, "u", run));
+  await later(0, () =>
+    write(store, "set", { key: "a", value: { title: "a", tags: [], count: 0 } }, run, "p/4"),
+  );
+  await later(0, () => write(store, "append", { key: "a", field: "tags", value: "x", ttl: HOUR }, run, "p/5"));
+  await later(0, () => write(store, "incr", { key: "a", field: "count", ttl: 3 * HOUR }, run, "p/6"));
+  const appended = await later(2 * HOUR, () => get(store, "a", run));
+  await later(0, () =>
+    write(store, "merge", { key: "m", fields: { title: "m", tags: [], count: 1 }, ttl: HOUR }, run, "p/7"),
+  );
+  const merged = await later(HOUR + MINUTE, () => get(store, "m", run));
+  answer.a_unique_append_that_changes_nothing_still_refreshes_expiry =
+    same_.applied === true && refreshed.found === true && refreshed.version === same_.version;
+  answer.merge_append_and_incr_each_take_a_ttl =
+    appended.found === true && same(appended.value?.tags, ["x"]) && merged.found === false;
+  answer.partial_expiry_trace = { same: same_, refreshed, appended, merged };
+}
+
+{
+  // **An expired key is invisible at once and leaves storage lazily**: it is
+  // still a row until a write to its partition sweeps it — and that sweep is
+  // bounded, so a backlog of 150 loses 100 to one write and the rest to the
+  // next.
+  const store = kv("sweep", "global");
+  const run = ctx(execution("sweep"));
+  await later(0, async () => {
+    // One key that never expires, beside 150 that do, so every count below is
+    // the expired rows still stored plus the ones that are alive.
+    await write(store, "set", { key: "kept", value: { n: -1 } }, run);
+    for (let index = 0; index < 150; index += 1) {
+      await write(store, "set", { key: `old-${String(index).padStart(3, "0")}`, value: { n: index }, ttl: HOUR }, run);
+    }
+  });
+  const seeded = await storedRows(store, "global");
+  const listed = await later(HOUR + MINUTE, () => list(store, run, undefined, 1000));
+  const read = await later(HOUR + MINUTE, () => get(store, "old-007", run));
+  const beforeSweep = await storedRows(store, "global");
+  await later(HOUR + MINUTE, () => write(store, "set", { key: "new-1", value: { n: 0 } }, run));
+  const afterOne = await storedRows(store, "global");
+  await later(HOUR + MINUTE, () => write(store, "set", { key: "new-2", value: { n: 0 } }, run));
+  const afterTwo = await storedRows(store, "global");
+  answer.an_expired_key_stays_invisible_until_a_write_removes_it =
+    seeded === 151 && beforeSweep === 151 && same(listed.keys, ["kept"]) && read.found === false;
+  // 150 expired and one alive; one write removes 100 and adds itself.
+  answer.the_write_sweep_removes_at_most_100_rows = afterOne === 151 - 100 + 1;
+  // …and the next removes the other 50: `kept`, `new-1` and `new-2` are left.
+  answer.an_expired_key_leaves_storage_at_the_next_writes_to_its_partition = afterTwo === 3;
+  answer.sweep_trace = { seeded, beforeSweep, afterOne, afterTwo };
+}
+
+{
+  // **…and that sweep is its own partition's, and no other's** (PRD resolved
+  // q69 (c), Decision D153). A write sweeps under the sequence lock of the
+  // partition it writes, and on a server that lock is what keeps its `DELETE`
+  // and every other one off each other's rows: a sweep that reached into a
+  // second partition would hold rows a write to that partition is about to
+  // reach for, under a lock that write does not take — the deadlock the lock
+  // exists to rule out. So two partitions each hold 50 expired keys, fewer than
+  // one write's 100 together, and a write to the first must leave the second's
+  // every one: a sweep with no partition in its `DELETE` takes all 100.
+  const store = kv("sweep_partition", "session");
+  const runs = {
+    a: ctx(execution("sweep_partition_a"), "a"),
+    b: ctx(execution("sweep_partition_b"), "b"),
+  };
+  await later(0, async () => {
+    for (const session of ["a", "b"]) {
+      await write(store, "set", { key: "kept", value: { n: -1 } }, runs[session]);
+      for (let index = 0; index < 50; index += 1) {
+        await write(store, "set", { key: `old-${String(index).padStart(2, "0")}`, value: { n: index }, ttl: HOUR }, runs[session]);
+      }
+    }
+  });
+  const partitions = async () => [await storedRows(store, "session/a"), await storedRows(store, "session/b")];
+  const seeded = await partitions();
+  await later(HOUR + MINUTE, () => write(store, "set", { key: "new", value: { n: 0 } }, runs.a));
+  const afterFirst = await partitions();
+  await later(HOUR + MINUTE, () => write(store, "set", { key: "new", value: { n: 0 } }, runs.b));
+  const afterSecond = await partitions();
+  // 50 expired and `kept` in each; the write to `a` leaves `kept` and itself
+  // there and all 51 in `b`, and the write to `b` then does the same there.
+  answer.a_writes_sweep_takes_no_other_partitions_rows =
+    same(seeded, [51, 51]) && same(afterFirst, [2, 51]) && same(afterSecond, [2, 2]);
+  answer.sweep_partition_trace = { seeded, afterFirst, afterSecond };
+}
+
+{
+  // …or when a process next opens the store, whichever comes first: a process
+  // whose first op on the store is a **read** still removes every expired key
+  // of it, every partition included. The second process is real — the open is
+  // per process on SQLite, and per connection on a server — and it reads the
+  // clock the parent hands it.
+  const script = path.join(path.dirname(fileURLToPath(import.meta.url)), "store-expiry-open.mjs");
+  const store = kv("reopen_expiry", "session", THIRD_URL_ENV);
+  try {
+    for (const session of ["a", "b"]) {
+      const run = ctx(execution(`reopen_expiry_${session}`), session);
+      await later(0, async () => {
+        for (let index = 0; index < 3; index += 1) {
+          await write(store, "set", { key: `k${index}`, value: { n: index }, ttl: HOUR }, run);
+        }
+        await write(store, "set", { key: "kept", value: { n: 9 } }, run);
+      });
+    }
+    const before = [await storedRows(store, "session/a"), await storedRows(store, "session/b")];
+    const opened = await new Promise((resolve, reject) => {
+      const child = spawn(
+        process.execPath,
+        [script, project, provider, data, JSON.stringify(store), "a"],
+        {
+          env: { ...process.env, [CLOCK]: String(HOUR + MINUTE) },
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+      let out = "";
+      let err = "";
+      child.stdout.on("data", (chunk) => (out += chunk));
+      child.stderr.on("data", (chunk) => (err += chunk));
+      child.on("error", reject);
+      child.on("close", (code) =>
+        code === 0 ? resolve(JSON.parse(out)) : reject(new Error(`the opener exited ${code}: ${err}`)),
+      );
+    });
+    const after = [await storedRows(store, "session/a"), await storedRows(store, "session/b")];
+    answer.an_expired_key_leaves_storage_when_a_process_next_opens_the_store =
+      same(before, [4, 4]) && same(after, [1, 1]) && opened.found === false;
+    answer.reopen_trace = { before, after, opened };
+  } catch (error) {
+    answer.reopen_error = String(error?.message ?? error);
+  }
+}
+
+{
+  // …**and when the deployment next starts, whether or not anything it does
+  // reaches the store.** A process starting — a `run`, a `resume`, a `serve` —
+  // starts the store-wide sweep of every `kv` store the composition binds
+  // (`stores.sweepBoundStores`), so a store whose partitions nothing writes or
+  // reads again still sheds what expired in it. The second process here makes
+  // no op at all (`store-process-start.mjs`): what removes the backlog is its
+  // start, not a first op.
+  const store = kv("start_expiry", "session", FOURTH_URL_ENV);
+  try {
+    for (const session of ["a", "b"]) {
+      const run = ctx(execution(`start_expiry_${session}`), session);
+      await later(0, async () => {
+        for (let index = 0; index < 3; index += 1) {
+          await write(store, "set", { key: `k${index}`, value: { n: index }, ttl: HOUR }, run);
+        }
+        await write(store, "set", { key: "kept", value: { n: 9 } }, run);
+      });
+    }
+    const before = [await storedRows(store, "session/a"), await storedRows(store, "session/b")];
+    // A start whose clock has not reached the expiry removes nothing…
+    const early = await helper("store-process-start.mjs", [project, provider, data, JSON.stringify(store)], {
+      ...process.env,
+      [CLOCK]: String(HOUR - MINUTE),
+    });
+    const beforeExpiry = [await storedRows(store, "session/a"), await storedRows(store, "session/b")];
+    // …and one past it removes every expired key, both partitions included.
+    const started = await helper("store-process-start.mjs", [project, provider, data, JSON.stringify(store)], {
+      ...process.env,
+      [CLOCK]: String(HOUR + MINUTE),
+    });
+    const after = [await storedRows(store, "session/a"), await storedRows(store, "session/b")];
+    const kept = (await get(store, "kept", ctx(execution("start_expiry_read"), "a"))).value?.n;
+    answer.an_expired_key_leaves_storage_when_a_process_starts_without_reaching_the_store =
+      early.answer.started === true &&
+      started.answer.started === true &&
+      same(before, [4, 4]) &&
+      same(beforeExpiry, [4, 4]) &&
+      same(after, [1, 1]) &&
+      kept === 9;
+    answer.start_expiry_trace = { before, beforeExpiry, after, kept };
+  } catch (error) {
+    answer.start_expiry_error = String(error?.message ?? error);
+  }
+}
+
+if (provider !== "sqlite") {
+  // **A store-wide sweep and a write never deadlock**, and the sweep takes no
+  // key a write refreshed. Both halves of the cleanup schedule delete expired
+  // rows — a write its own partition's, a connection's first op the whole
+  // store's — and on a server two `DELETE`s reaching one row through two
+  // indexes lock it in two orders, a cycle the server breaks by failing one of
+  // them. So the two run at once, in two processes (`store-sweep-race.mjs`),
+  // over a partition holding a backlog of expired rows both reach for: every
+  // write has to land, and every sweep has to finish.
+  //
+  // The backlog is laid down in bulk over this file's own connection rather
+  // than written key by key, because what is under test is the sweeps that
+  // remove it; the one write before it gives the partition its sequence row,
+  // as the first write to any partition does.
+  const store = kv("sweep_race", "global");
+  //
+  // The backlog expires **during** the race, a slice at a time, so the writer's
+  // own sweep keeps finding fresh rows to take while the other process's
+  // store-wide sweep — whose clock has them all expired — is taking the same
+  // rows in bulk. That is the overlap a deadlock needs, and against a store
+  // that lets the two `DELETE`s meet it fails the writer as a deadlock victim
+  // on every run of this case measured; the sweeper starts a moment after the
+  // writer so the writer is mid-stream when it does.
+  const KEYS = 1_000;
+  const BACKLOG = 20_000;
+  /** How long after the race starts the backlog finishes expiring, to the writer. */
+  const SPREAD = 3_000;
+  /**
+   * Rows of the same partition that only the store-wide sweep can take: they
+   * expire half an hour from now, so they are never expired to the writer and
+   * long expired to the sweeper. Without them every row the race removes is one
+   * the writer's own bounded sweeps could have removed alone — a thousand
+   * writes at a hundred rows each is five times the backlog — so a store whose
+   * store-wide sweep never ran would pass all three cases below: nothing to
+   * deadlock with, nothing to take a refreshed key, and a backlog gone anyway.
+   */
+  const SWEPT_ONLY = 5_000;
+  try {
+    await later(0, () => set(store, "seed", { n: 0 }, ctx(execution("sweep_race_seed"))));
+    const serverNow = async () =>
+      Number(
+        (
+          await storage(
+            provider === "postgres"
+              ? "SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint AS now"
+              : "SELECT CAST(FLOOR(UNIX_TIMESTAMP(NOW(3)) * 1000) AS SIGNED) AS now",
+            [],
+          )
+        )[0]?.now,
+      );
+    const insert = async (entries) => {
+      for (let at = 0; at < entries.length; at += 2_000) {
+        const chunk = entries.slice(at, at + 2_000);
+        await storage(
+          `INSERT INTO store_entries (store, scope_key, ${provider === "postgres" ? '"key"' : "`key`"}, value, version, expires_at) VALUES ` +
+            chunk.map(() => "(?, ?, ?, ?, ?, ?)").join(", "),
+          chunk.flatMap(([key, expiresAt]) => [store.name, "global", key, '{"n":0}', 0, expiresAt]),
+        );
+      }
+    };
+    // The rows only the store-wide sweep can take — first, so laying them down
+    // spends none of the two seconds the race below is timed from.
+    const sweptOnlyExpiry = (await serverNow()) + HOUR / 2;
+    await insert(
+      Array.from({ length: SWEPT_ONLY }, (_, index) => [`y-${String(index).padStart(5, "0")}`, sweptOnlyExpiry]),
+    );
+    const now = await serverNow();
+    const startAt = Date.now() + 2_000;
+    // The backlog: expiring across the race's first three seconds, to the
+    // writer, and long expired to the sweeper. The keys: live for an hour to
+    // the writer, which refreshes each, and expired to the sweeper.
+    await insert(
+      Array.from({ length: BACKLOG }, (_, index) => [
+        `z-${String(index).padStart(5, "0")}`,
+        now + 2_000 + Math.floor((index * SPREAD) / BACKLOG),
+      ]),
+    );
+    await insert(Array.from({ length: KEYS }, (_, index) => [`k-${String(index).padStart(5, "0")}`, now + HOUR]));
+    const args = (role) => [
+      project,
+      provider,
+      data,
+      JSON.stringify(store),
+      role,
+      String(role === "sweep" ? startAt + 300 : startAt),
+      String(KEYS),
+    ];
+    const [writer, sweeper] = await Promise.all([
+      helper("store-sweep-race.mjs", args("write"), { ...process.env, [CLOCK]: "0" }),
+      helper("store-sweep-race.mjs", args("sweep"), { ...process.env, [CLOCK]: String(HOUR + MINUTE) }),
+    ]);
+    const refreshed = await later(HOUR + MINUTE, async () => {
+      let found = 0;
+      for (let index = 0; index < KEYS; index += 1) {
+        const held = await get(store, `k-${String(index).padStart(5, "0")}`, ctx(execution("sweep_race_read")));
+        if (held.found === true && held.value?.n === -index) found += 1;
+      }
+      return found;
+    });
+    // Every backlog row expires before any key does, so this counts the
+    // backlog still stored and nothing else.
+    const backlog = Number(
+      (
+        await storage("SELECT COUNT(*) AS n FROM store_entries WHERE store = ? AND expires_at < ?", [
+          store.name,
+          now + HOUR,
+        ])
+      )[0]?.n,
+    );
+    // …and the rows no write could have taken, which are gone only if the
+    // store-wide sweep ran — in the very partition the writer was writing.
+    const sweptOnly = Number(
+      (
+        await storage(
+          `SELECT COUNT(*) AS n FROM store_entries WHERE store = ? AND SUBSTR(${provider === "postgres" ? '"key"' : "`key`"}, 1, 2) = ?`,
+          [store.name, "y-"],
+        )
+      )[0]?.n,
+    );
+    // The two processes' windows overlap: the sweeper's first op — which starts
+    // its sweeps — came before the writer's last write, and its sweeps ended
+    // after the writer's first. Two processes that ran one after the other
+    // would be no race at all.
+    const raced =
+      sweeper.answer.from < writer.answer.to && sweeper.answer.to > writer.answer.from;
+    const swept = sweptOnly === 0 && raced;
+    const warned = (sweeper.stderr + writer.stderr).includes("could not finish removing");
+    answer.a_store_wide_sweep_and_a_write_never_deadlock =
+      swept &&
+      writer.answer.errors.length === 0 &&
+      sweeper.answer.errors.length === 0 &&
+      writer.answer.applied === KEYS &&
+      !warned;
+    answer.a_store_wide_sweep_takes_no_key_a_write_refreshed = swept && refreshed === KEYS;
+    answer.a_store_wide_sweep_removes_the_whole_backlog = swept && backlog === 0;
+    answer.sweep_race_trace = {
+      writer: {
+        applied: writer.answer.applied,
+        errors: writer.answer.errors.slice(0, 3),
+        from: writer.answer.from,
+        to: writer.answer.to,
+      },
+      sweeper: { errors: sweeper.answer.errors.slice(0, 3), from: sweeper.answer.from, to: sweeper.answer.to },
+      warned,
+      refreshed,
+      backlog,
+      sweptOnly,
+      raced,
+    };
+  } catch (error) {
+    answer.sweep_race_error = String(error?.message ?? error);
+  } finally {
+    // This run's rows, and only them: the server is shared.
+    for (const table of ["store_entries", "store_applied", "store_sequences"]) {
+      await storage(`DELETE FROM ${table} WHERE store = ?`, [store.name]).catch(() => undefined);
+    }
+  }
+}
+
+{
+  // **The start sweep runs behind a process's first op on a store, never in
+  // front of it, and has finished by the time the process lets go** (PRD
+  // resolved q69 (c)). A backlog of expired keys is laid down in bulk; a second
+  // process's first op on the store is a read, and the moment it answers that
+  // process counts how much of the backlog is still stored, then lets go of the
+  // store and counts again (`store-first-op.mjs`). A sweep in front of the op
+  // would have removed all of it before the read answered — every op of a
+  // process starting against a store with a large backlog waiting on it.
+  const store = kv("first_op", "global");
+  const BACKLOG = 20_000;
+  try {
+    await set(store, "kept", { n: 1 }, ctx(execution("first_op_seed")));
+    const clock =
+      provider === "sqlite"
+        ? Date.now()
+        : Number(
+            (
+              await storage(
+                provider === "postgres"
+                  ? "SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint AS now"
+                  : "SELECT CAST(FLOOR(UNIX_TIMESTAMP(NOW(3)) * 1000) AS SIGNED) AS now",
+                [],
+              )
+            )[0]?.now,
+          );
+    // Live to this process for an hour; expired to the second, whose clock is
+    // an hour and a minute ahead.
+    const expiresAt = clock + HOUR;
+    for (let at = 0; at < BACKLOG; at += 2_000) {
+      const keys = Array.from({ length: Math.min(2_000, BACKLOG - at) }, (_, index) => `z-${at + index}`);
+      if (provider === "sqlite") {
+        await storage(undefined, undefined, [
+          store.name,
+          "INSERT INTO entries (scope_key, key, value, version, expires_at) VALUES " +
+            keys.map(() => "(?, ?, ?, ?, ?)").join(", "),
+          keys.flatMap((key) => ["global", key, '{"n":0}', 0, expiresAt]),
+        ]);
+      } else {
+        await storage(
+          `INSERT INTO store_entries (store, scope_key, ${provider === "postgres" ? '"key"' : "`key`"}, value, version, expires_at) VALUES ` +
+            keys.map(() => "(?, ?, ?, ?, ?, ?)").join(", "),
+          keys.flatMap((key) => [store.name, "global", key, '{"n":0}', 0, expiresAt]),
+        );
+      }
+    }
+    const opened = await helper(
+      "store-first-op.mjs",
+      [project, provider, data, JSON.stringify(store), String(expiresAt + 1)],
+      { ...process.env, [CLOCK]: String(HOUR + MINUTE) },
+    );
+    const { atAnswer, afterRelease } = opened.answer;
+    answer.a_first_op_answers_before_the_start_sweep_has_finished =
+      opened.answer.answer?.found === true && atAnswer > 0;
+    answer.the_start_sweep_has_removed_the_backlog_when_the_process_lets_go = afterRelease === 0;
+    answer.first_op_trace = { atAnswer, afterRelease };
+  } catch (error) {
+    answer.first_op_error = String(error?.message ?? error);
+  } finally {
+    if (provider !== "sqlite") {
+      for (const table of ["store_entries", "store_applied", "store_sequences"]) {
+        await storage(`DELETE FROM ${table} WHERE store = ?`, [store.name]).catch(() => undefined);
+      }
+    }
+  }
+}
+
+{
+  // **The start sweep takes at most 1000 rows a batch, and on a server each
+  // batch takes only the rows of its own partition** (PRD resolved q69 (c),
+  // Decision D153). The bound is what keeps an op from waiting for more than
+  // the one batch in progress however large the backlog is — on SQLite a batch
+  // is a synchronous statement the event loop cannot interrupt, and on a server
+  // one holds a partition's sequence lock and this connection's queue — and the
+  // partition is what keeps a batch from deadlocking a write to another one. A
+  // case that counted the backlog *while* the sweep ran would pass one
+  // unbounded `DELETE`, so a second process counts it **between** the sweep's
+  // batches (`store-sweep-batches.mjs` says how, per arm), after each of
+  // several probes.
+  //
+  // Two partitions hold the backlog: `a` the ten oldest rows, `b` several
+  // batches' worth behind them. Every batch may take at most 1000 rows of the
+  // total; and on a server the first batch is `a`'s — the partition holding the
+  // store's oldest expired row — and must take all ten of it and nothing of
+  // `b`, where a batch with no partition in its `DELETE` takes 1000 rows of
+  // the store, at least 990 of them `b`'s. Every later batch changes one
+  // partition's count. The local sweep is the file's, so on SQLite only the
+  // bound is asked of it.
+  const store = kv("sweep_batches", "session");
+  const FIRST = 10;
+  const SECOND = 3_500;
+  /** One more than the batches the backlog takes, so the last count is past the sweep's end. */
+  const PROBES = 6;
+  const partitions = ["session/a", "session/b"];
+  /** A count, with a partition the backlog has left counted as zero rather than absent. */
+  const backlog = (counted) =>
+    Object.fromEntries(partitions.map((partition) => [partition, Number(counted?.[partition] ?? 0)]));
+  try {
+    // Each partition's sequence row — a store-wide batch takes its partition's
+    // lock first, so a partition without one is one it cannot sweep — and a
+    // key that never expires, beside the partition the probes write to.
+    for (const session of ["a", "b", "probe"]) {
+      await later(0, () => set(store, "kept", { n: 0 }, ctx(execution(`sweep_batches_${session}`), session)));
+    }
+    const clock =
+      provider === "sqlite"
+        ? Date.now()
+        : Number(
+            (
+              await storage(
+                provider === "postgres"
+                  ? "SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint AS now"
+                  : "SELECT CAST(FLOOR(UNIX_TIMESTAMP(NOW(3)) * 1000) AS SIGNED) AS now",
+                [],
+              )
+            )[0]?.now,
+          );
+    // Live to every probe for half an hour, and expired to the sweep, whose
+    // clock is an hour and a minute ahead: `a`'s rows first, then `b`'s, one
+    // millisecond apart.
+    const laid = [
+      ...Array.from({ length: FIRST }, (_, index) => ["session/a", `z-a-${index}`, clock + HOUR / 2]),
+      ...Array.from({ length: SECOND }, (_, index) => [
+        "session/b",
+        `z-b-${String(index).padStart(4, "0")}`,
+        clock + HOUR / 2 + MINUTE + index,
+      ]),
+    ];
+    for (let at = 0; at < laid.length; at += 2_000) {
+      const chunk = laid.slice(at, at + 2_000);
+      if (provider === "sqlite") {
+        await storage(undefined, undefined, [
+          store.name,
+          "INSERT INTO entries (scope_key, key, value, version, expires_at) VALUES " +
+            chunk.map(() => "(?, ?, ?, ?, ?)").join(", "),
+          chunk.flatMap(([partition, key, expiresAt]) => [partition, key, '{"n":0}', 0, expiresAt]),
+        ]);
+      } else {
+        await storage(
+          `INSERT INTO store_entries (store, scope_key, ${provider === "postgres" ? '"key"' : "`key`"}, value, version, expires_at) VALUES ` +
+            chunk.map(() => "(?, ?, ?, ?, ?, ?)").join(", "),
+          chunk.flatMap(([partition, key, expiresAt]) => [store.name, partition, key, '{"n":0}', 0, expiresAt]),
+        );
+      }
+    }
+    const before = backlog(
+      Object.fromEntries(
+        (
+          await storage(
+            "SELECT scope_key, COUNT(*) AS n FROM store_entries WHERE store = ? AND expires_at IS NOT NULL GROUP BY scope_key",
+            [store.name],
+            [store.name, "SELECT scope_key, COUNT(*) AS n FROM entries WHERE expires_at IS NOT NULL GROUP BY scope_key"],
+          )
+        ).map((row) => [String(row.scope_key), Number(row.n)]),
+      ),
+    );
+    const swept = await helper(
+      "store-sweep-batches.mjs",
+      [project, provider, data, JSON.stringify(store), String(PROBES)],
+      { ...process.env, [CLOCK]: String(HOUR + MINUTE) },
+    );
+    const failed = swept.answer.observed.find((counted) => counted?.error !== undefined);
+    const observed = swept.answer.observed.map(backlog);
+    const after = backlog(swept.answer.after);
+    const total = (counted) => partitions.reduce((sum, partition) => sum + counted[partition], 0);
+    const totals = [before, ...observed].map(total);
+    const taken = totals.slice(1).map((left, index) => totals[index] - left);
+    // Every probe found the sweep at most one batch further on, and at least one
+    // found it under way — neither untouched nor finished — so the counts are
+    // the sweep's own steps rather than its two ends.
+    answer.the_start_sweep_takes_at_most_1000_rows_a_batch =
+      failed === undefined &&
+      swept.answer.first?.found === true &&
+      same(before, { "session/a": FIRST, "session/b": SECOND }) &&
+      observed.length === PROBES &&
+      taken.every((n) => n >= 0 && n <= 1_000) &&
+      totals.some((n) => n > 0 && n < totals[0]) &&
+      total(after) === 0;
+    if (provider !== "sqlite") {
+      const steps = [before, ...observed];
+      answer.a_store_wide_sweep_batch_takes_only_its_own_partitions_rows =
+        failed === undefined &&
+        same(observed[0], { "session/a": 0, "session/b": SECOND }) &&
+        steps
+          .slice(1)
+          .every(
+            (counted, index) =>
+              partitions.filter((partition) => counted[partition] !== steps[index][partition]).length <= 1,
+          );
+    }
+    answer.sweep_batches_trace = { before, observed, after, failed, totals };
+  } catch (error) {
+    answer.sweep_batches_error = String(error?.message ?? error);
+  } finally {
+    if (provider !== "sqlite") {
+      for (const table of ["store_entries", "store_applied", "store_sequences"]) {
+        await storage(`DELETE FROM ${table} WHERE store = ?`, [store.name]).catch(() => undefined);
+      }
+    }
+  }
+}
+
+{
+  // A clock offset nobody can read fails the op by name rather than being
+  // read as no offset — a test that believed it moved the clock and did not
+  // would pass for the wrong reason.
+  const store = kv("bad_clock", "global");
+  const run = ctx(execution("bad_clock"));
+  const refused = await later("an hour", () => refusal(get(store, "k", run)));
+  answer.a_malformed_clock_offset_is_refused_by_name = (refused ?? "").includes(CLOCK);
+}
+
+/** Ten days: how far off this process's own clock is put by [`skewed`]. */
+const TEN_DAYS = 10 * 24 * HOUR;
+
+/**
+ * Run `work` with **this process's** clock — `Date.now` itself, not the store
+ * clock [`later`] moves — `shift` milliseconds off, and put it back once `work`
+ * has finished, every await inside it included.
+ */
+const skewed = async (shift, work) => {
+  const realNow = Date.now;
+  Date.now = () => realNow() + shift;
+  try {
+    return await work();
+  } finally {
+    Date.now = realNow;
+  }
+};
+
+/** The server's own clock in epoch milliseconds, spelled here rather than borrowed from the arm. */
+const SERVER_NOW =
+  provider === "postgres"
+    ? "SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint AS server_now"
+    : "SELECT CAST(FLOOR(UNIX_TIMESTAMP(NOW(3)) * 1000) AS SIGNED) AS server_now";
+
+if (provider !== "sqlite") {
+  // **A dialled store's expiry is the server's clock's**, so two writers whose
+  // own clocks disagree still agree about which keys are alive. This process's
+  // clock is moved ten days ahead for the write; what the row holds is the
+  // server's instant plus the `ttl`, and the key is alive to a reader on the
+  // server's clock.
+  const store = kv("server_clock", "global");
+  const run = ctx(execution("server_clock"));
+  const written = await skewed(TEN_DAYS, () =>
+    write(store, "set", { key: "k", value: { n: 1 }, ttl: HOUR }, run),
+  );
+  // The server's own clock, spelled here rather than borrowed from the arm, so
+  // the case does not take the arm's word for what that clock is. Epoch time
+  // is zone-free on Postgres; MySQL's `UNIX_TIMESTAMP()` with no argument is
+  // too, at a second's resolution — well inside the margin.
+  const [held] = await storage(
+    provider === "postgres"
+      ? 'SELECT expires_at, FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint AS server_now FROM store_entries WHERE store = ? AND "key" = ?'
+      : "SELECT expires_at, UNIX_TIMESTAMP() * 1000 AS server_now FROM store_entries WHERE store = ? AND `key` = ?",
+    [store.name, "k"],
+  );
+  const ahead = Number(held?.expires_at) - Number(held?.server_now);
+  answer.expiry_is_computed_by_the_servers_clock =
+    written?.applied === true && ahead > HOUR - MINUTE && ahead < HOUR + MINUTE;
+
+  // **…and so is every read's.** A `get`, a `list`, a `count` and a `get_many`
+  // judge that row by the server's clock too, with this process's ten days
+  // ahead and ten days behind:
+  // the key is found while the server's clock holds it alive, and is absent
+  // once the store clock is moved past its expiry. A read dated by this
+  // process instead would miss it while it is alive (ahead) and still find it
+  // once it has expired (behind) — and would disagree with the `if: absent` a
+  // writer on the same server is judged by.
+  const reads = {};
+  for (const [label, shift] of [
+    ["ahead", TEN_DAYS],
+    ["behind", -TEN_DAYS],
+  ]) {
+    for (const [moment, offset] of [
+      ["alive", 0],
+      ["expired", HOUR + MINUTE],
+    ]) {
+      reads[`${label}_${moment}`] = await skewed(shift, () =>
+        later(offset, async () => ({
+          got: await get(store, "k", run),
+          listed: (await list(store, run)).keys,
+          // PRD resolved q70's reads carry the same server clock inside their
+          // own statement (`liveRows`), so they agree with the `get` beside them.
+          counted: (await stores.runStoreOp(store, "count", {}, run, node())).count,
+          many: (await stores.runStoreOp(store, "get_many", { keys: ["k"] }, run, node())).entries,
+        })),
+      );
+    }
+  }
+  const found = (read) =>
+    read.got.found === true &&
+    read.got.value?.n === 1 &&
+    same(read.listed, ["k"]) &&
+    read.counted === 1 &&
+    read.many?.[0]?.found === true &&
+    read.many?.[0]?.value?.n === 1;
+  const missed = (read) =>
+    same(read.got, { found: false }) &&
+    same(read.listed, []) &&
+    read.counted === 0 &&
+    same(read.many, [{ key: "k", found: false }]);
+  answer.a_dialled_read_finds_a_key_the_servers_clock_holds_alive =
+    found(reads.ahead_alive) && found(reads.behind_alive);
+  answer.a_dialled_read_misses_a_key_the_servers_clock_holds_expired =
+    missed(reads.ahead_expired) && missed(reads.behind_expired);
+  answer.server_clock_trace = { ahead, reads };
+}
+
+if (provider !== "sqlite") {
+  // **…and so is a store-wide sweep's.** What the sweep a connection's first op
+  // on a store starts removes is what had expired by the server's clock at
+  // that op, whatever this process's clock says — so a writer's live key is
+  // never taken by a process whose clock runs fast, and an expired one is not
+  // left by a process whose clock runs slow. Two stores, each laid down
+  // straight into storage (its partition's sequence row with it, which a sweep
+  // batch locks), so this process's first op on each is a `get` that starts
+  // its sweep; each is then swept to the end with this process's clock ten
+  // days off. Ahead: a key alive on the server's clock stays, and one expired
+  // on both clocks goes, which is the proof that the sweep ran. Behind, with
+  // the store clock moved past a key's expiry: that key goes, and one alive on
+  // both clocks stays.
+  const fast = kv("server_clock_sweep_fast", "global");
+  const slow = kv("server_clock_sweep_slow", "global");
+  const key = provider === "postgres" ? '"key"' : "`key`";
+  try {
+    const serverNow = Number((await storage(SERVER_NOW, []))[0]?.server_now);
+    const lay = async (store, rows) => {
+      await storage("INSERT INTO store_sequences (store, scope_key, last) VALUES (?, ?, ?)", [
+        store.name,
+        "global",
+        rows.length,
+      ]);
+      await storage(
+        `INSERT INTO store_entries (store, scope_key, ${key}, value, version, expires_at) VALUES ` +
+          rows.map(() => "(?, ?, ?, ?, ?, ?)").join(", "),
+        rows.flatMap(([name, expiresAt], index) => [store.name, "global", name, '{"n":1}', index + 1, expiresAt]),
+      );
+    };
+    await lay(fast, [
+      ["alive", serverNow + HOUR],
+      ["expired", serverNow - HOUR],
+    ]);
+    await lay(slow, [
+      ["due", serverNow + HOUR],
+      ["far", serverNow + 2 * TEN_DAYS],
+    ]);
+    const run = ctx(execution("server_clock_sweep"));
+    // `drainStores` is the wait a command makes for its sweeps on its way out,
+    // made inside the skew so the instant the sweep reads is read under it.
+    await skewed(TEN_DAYS, async () => {
+      await get(fast, "probe", run);
+      await stores.drainStores();
+    });
+    await skewed(-TEN_DAYS, () =>
+      later(HOUR + MINUTE, async () => {
+        await get(slow, "probe", run);
+        await stores.drainStores();
+      }),
+    );
+    const kept = async (store) =>
+      (await storage(`SELECT ${key} AS k FROM store_entries WHERE store = ? ORDER BY ${key}`, [store.name])).map(
+        (row) => String(row.k),
+      );
+    const fastKept = await kept(fast);
+    const slowKept = await kept(slow);
+    answer.a_store_wide_sweep_keeps_a_key_the_servers_clock_holds_alive = same(fastKept, ["alive"]);
+    answer.a_store_wide_sweep_takes_a_key_the_servers_clock_holds_expired = same(slowKept, ["far"]);
+    answer.server_clock_sweep_trace = { fastKept, slowKept };
+  } catch (error) {
+    answer.server_clock_sweep_error = String(error?.message ?? error);
+  } finally {
+    // This run's rows, and only them: the server is shared.
+    for (const store of [fast, slow]) {
+      for (const table of ["store_entries", "store_applied", "store_sequences"]) {
+        await storage(`DELETE FROM ${table} WHERE store = ?`, [store.name]).catch(() => undefined);
+      }
+    }
+  }
+}
+
+// --- Ledger retention (PRD resolved q69) --------------------------------------
+//
+// Driven through the runtime's own lifecycle — `openExecution`, then
+// `settleExecution` and `closeExecution`, exactly as `runFlow` calls them — so
+// what prunes the ledger is the hook a settled execution really reaches, over
+// this arm's store. Each store is registered as `src/graph.ts` registers every
+// store a composition binds (`stores.bindsStores`), because that set — not the
+// writes this process happened to make — is what a settlement prunes.
+
+/** Begin one execution's journal row, as `runFlow` does before its graph. */
+const begin_ = (id, extra = {}) =>
+  runtime.openExecution({
+    execution: id,
+    flow: "flow.probe",
+    trigger: "manual",
+    inputs: {},
+    sessionKey: "",
+    ...extra,
+  });
+
+/**
+ * Settle and close one execution, as `runFlow` does on its way out — and then
+ * wait for the ledger prune the settlement started, which nothing in the
+ * settlement itself waits for (`stores.pruneLedger`): a case reading what the
+ * prune left reads it after the prune, as a command's `releaseStores` does.
+ */
+const settle = async (id, error = undefined) => {
+  try {
+    await runtime.settleExecution(id, error);
+  } finally {
+    runtime.closeExecution(id);
+  }
+  await stores.ledgerPrunesSettled();
+};
+
+{
+  // **A store taking writes across N executions holds a bounded ledger**: each
+  // keyed write leaves a row while its execution is open, and the row goes when
+  // the execution settles — completed or failed — while the data it wrote
+  // stays.
+  const store = kv("ledger", "global");
+  stores.bindsStores([store]);
+  const ids = Array.from({ length: 6 }, (_, index) => execution(`ledger_${index}`));
+  const held = [];
+  for (const [index, id] of ids.entries()) {
+    await begin_(id);
+    for (let write_ = 0; write_ < 3; write_ += 1) {
+      await set(store, `k-${index}-${write_}`, { n: write_ }, ctx(id), `${id}/save/${write_}`);
+    }
+    held.push(await ledgerRows(store, `${id}/`));
+    await settle(id, index % 2 === 0 ? undefined : new Error("this execution failed"));
+  }
+  const left = await ledgerRows(store, `exec_${RUN}_ledger_`);
+  const data = (await list(store, ctx(execution("ledger_read")), "k-", 1000)).keys.length;
+  answer.an_open_executions_writes_hold_their_ledger_rows = held.every((count) => count === 3);
+  answer.settled_executions_leave_no_ledger_rows = left === 0;
+  answer.a_settled_executions_data_stays = data === 18;
+  answer.ledger_trace = { held, left, data };
+}
+
+{
+  // **An execution the journal still holds open keeps every row**, so its
+  // resume still writes nothing twice; and a prune is the settled execution's
+  // own prefix, never another's whose id merely begins with it.
+  const store = kv("ledger_open", "global");
+  stores.bindsStores([store]);
+  const parked = execution("ledger_open_1");
+  const neighbour = execution("ledger_open_10");
+  await begin_(parked);
+  await set(store, "a", { n: 1 }, ctx(parked), `${parked}/save/0`);
+  // A generation that stops without settling — a crash, a parked pause.
+  runtime.closeExecution(parked);
+  await begin_(neighbour);
+  await set(store, "b", { n: 1 }, ctx(neighbour), `${neighbour}/save/0`);
+  const kept = await ledgerRows(store, `${parked}/`);
+  // The resume: the same write at the same site is answered from the ledger.
+  await begin_(parked, { resuming: true });
+  const resumed = await set(store, "a", { n: 2 }, ctx(parked), `${parked}/save/0`);
+  await settle(parked);
+  const pruned = await ledgerRows(store, `${parked}/`);
+  const neighbourKept = await ledgerRows(store, `${neighbour}/`);
+  await settle(neighbour);
+  answer.an_unsettled_executions_ledger_rows_are_kept = kept === 1;
+  answer.a_resume_of_an_unsettled_execution_still_dedupes =
+    resumed.deduped === true && resumed.applied === true &&
+    (await get(store, "a", ctx(execution("ledger_open_read")))).value?.n === 1;
+  answer.a_prune_reaches_only_its_own_executions_prefix = pruned === 0 && neighbourKept === 1;
+  answer.ledger_open_trace = { kept, resumed, pruned, neighbourKept };
+}
+
+{
+  // **A child execution's rows go when the child settles**, under the child's
+  // own id, while its parent — still open — keeps its own.
+  const store = kv("ledger_child", "global");
+  stores.bindsStores([store]);
+  const parent = execution("ledger_parent");
+  await begin_(parent);
+  await set(store, "p", { n: 1 }, ctx(parent), `${parent}/dispatch/0/0/save/0`);
+  const dispatch = `${parent}/dispatch/0/0`;
+  const child = runtime.childExecutionId(parent, dispatch);
+  await begin_(child, { lineage: { parent, idempotencyKey: dispatch } });
+  await set(store, "c", { n: 1 }, ctx(child), `${child}/save/0`);
+  const before = [await ledgerRows(store, `${parent}/`), await ledgerRows(store, `${child}/`)];
+  await settle(child);
+  const childSettled = [await ledgerRows(store, `${parent}/`), await ledgerRows(store, `${child}/`)];
+  await settle(parent);
+  const parentSettled = await ledgerRows(store, `${parent}/`);
+  answer.a_childs_ledger_rows_go_when_the_child_settles =
+    same(before, [1, 1]) && same(childSettled, [1, 0]);
+  answer.a_parents_ledger_rows_go_when_the_parent_settles = parentSettled === 0;
+  answer.ledger_child_trace = { before, childSettled, parentSettled };
+}
+
+{
+  // **The two outcomes a settlement leaves open keep every row through it**: a
+  // run that reached a `human` pause nobody could answer, and a resume whose
+  // record this build disagrees with (`runtime.settleExecution`, PRD resolved
+  // q28). Each is settled exactly as `runFlow` settles it — through
+  // `settleExecution`, with the error it really carries, wrapped the way a
+  // node failure wraps it — and both are what a later resume replays, so a
+  // prune of either would make that resume write a second time.
+  const store = kv("ledger_unsettled", "global", URL_ENV, z.object({ count: z.number().int() }).strict());
+  stores.bindsStores([store]);
+  const parked = execution("ledger_parked");
+  const diverged = execution("ledger_diverged");
+  const bump = (id) => write(store, "incr", { key: id, field: "count" }, ctx(id), `${id}/count/0`);
+  const outcomes = {
+    [parked]: new Error("flow.probe node `ask` failed", {
+      cause: new runtime.HumanInterrupt("flow.probe", "ask", `${parked}/ask`, { prompt: "?" }),
+    }),
+    [diverged]: new journal.ReplayDivergence(
+      { key: `${diverged}/count/0`, site: "flow.probe/count", kind: "store", ordinal: 0 },
+      "the record and this build's graph disagree",
+    ),
+  };
+  const kept = {};
+  const open = {};
+  const resumed = {};
+  for (const id of [parked, diverged]) {
+    await begin_(id);
+    await bump(id);
+    await settle(id, outcomes[id]);
+    kept[id] = await ledgerRows(store, `${id}/`);
+    open[id] = (await runtime.journaledExecution(id))?.status;
+    // The resume: the same write at the same site, answered from the row the
+    // settlement kept rather than applied a second time.
+    await begin_(id, { resuming: true });
+    resumed[id] = await bump(id);
+    await settle(id);
+  }
+  const counted = async (id) => (await get(store, id, ctx(execution("ledger_unsettled_read")))).value?.count;
+  const keeps = async (id) =>
+    kept[id] === 1 &&
+    open[id] === "open" &&
+    resumed[id].deduped === true &&
+    (await counted(id)) === 1 &&
+    (await ledgerRows(store, `${id}/`)) === 0;
+  answer.a_parked_executions_settlement_keeps_its_ledger_rows = await keeps(parked);
+  answer.a_diverged_executions_settlement_keeps_its_ledger_rows = await keeps(diverged);
+  answer.ledger_unsettled_trace = { kept, open, resumed };
+}
+
+{
+  // **A keyed write another process made is pruned by the process that
+  // settles**: the hub settles an execution whose placed node wrote from its
+  // worker, and never saw that write (PRD resolved q69 (d), "in every store
+  // partition the execution wrote"). Here the write is a second process's and
+  // this one has not written the store under that execution at all.
+  const store = kv("ledger_placed", "global");
+  stores.bindsStores([store]);
+  const id = execution("ledger_placed");
+  try {
+    await begin_(id);
+    const written = await helper("store-placed-write.mjs", [
+      project,
+      provider,
+      data,
+      JSON.stringify(store),
+      id,
+      `${id}/placed/0`,
+    ]);
+    const before = await ledgerRows(store, `${id}/`);
+    await settle(id);
+    const after = await ledgerRows(store, `${id}/`);
+    answer.a_keyed_write_another_process_made_is_pruned_at_settlement =
+      written.answer.applied === true && before === 1 && after === 0;
+    answer.ledger_placed_trace = { written: written.answer, before, after };
+  } catch (error) {
+    answer.ledger_placed_error = String(error?.message ?? error);
+  }
+}
+
+/**
+ * Dispatch one detached `agent.worker` delivery under execution `id` through
+ * the real `runtime.runMap` — a `map` of one item with a `detach: true` route —
+ * whose body is `deliver`. Answers once the `map` has returned, which a
+ * detached route does without waiting for its delivery (grammar 8.6 rule 7).
+ */
+const dispatchDetached = (id, deliver) => {
+  const map = {
+    node: "fan",
+    as: "item",
+    source: { path: "state.items", shape: "any" },
+    maxConcurrency: 1,
+    onItemError: "fail",
+    routes: [
+      {
+        target: "agent.worker",
+        maxConcurrency: 1,
+        detach: true,
+        itemShape: "any",
+        input: (roots) => runtime.toJson(runtime.evaluate("item", roots)),
+        writes: [],
+        run: deliver,
+      },
+    ],
+  };
+  const run = { ...runtime.emptyRun(), execution: { id, session_key: "" } };
+  const view = {
+    state: { items: [{ at: 0 }] },
+    run,
+    roots: {
+      input: runtime.bind({}, { properties: {} }),
+      state: runtime.bind({ items: [{ at: 0 }] }, { properties: { items: { items: "any" } } }),
+      execution: runtime.bind(run.execution, {
+        properties: { id: "string", session_key: "string", item_index: "int" },
+      }),
+    },
+  };
+  return runtime.runMap(map, runtime.mapPlan(map, view), {
+    execution: { id, session_key: "" },
+    signal: new AbortController().signal,
+    node: "fan",
+  });
+};
+
+/** A promise and the function that settles it. */
+const gate = () => {
+  let open = () => undefined;
+  const opened = new Promise((resolve) => {
+    open = resolve;
+  });
+  return { open, opened };
+};
+
+{
+  // **A detached delivery still running when its execution settles keeps the
+  // execution's ledger rows until it finishes.** A detached `map` delivery
+  // outlives the run that dispatched it (grammar 8.6 rule 7), and every effect
+  // it makes is that execution's, under its id — a flow an agent calls as a
+  // tool, `store:` nodes and all. Here it is the real `runtime.runMap` with a
+  // detached route whose instance makes a keyed `incr`, then fails after it as
+  // a model call that follows a tool call would, and is retried: the retry
+  // re-derives the same key and must be answered from the row the first
+  // attempt left, even though the run has settled in between.
+  const store = kv("ledger_detached", "global", URL_ENV, z.object({ count: z.number().int() }).strict());
+  stores.bindsStores([store]);
+  const id = execution("ledger_detached");
+  const { open: releaseRetry, opened: retry } = gate();
+  const { open: firstLanded, opened: landed } = gate();
+  const attempts = [];
+  const bump = () => write(store, "incr", { key: "delivered", field: "count" }, ctx(id), `${id}/fan/0#agent/0/count/0`);
+  try {
+    await begin_(id);
+    await dispatchDetached(id, async () => {
+      attempts.push(await bump());
+      firstLanded();
+      await retry;
+      attempts.push(await bump());
+      return { output: {} };
+    });
+    await landed;
+    // The run is over: its graph returned, and it settles with its delivery's
+    // first attempt applied and its retry still to come.
+    await settle(id);
+    const during = await ledgerRows(store, `${id}/`);
+    releaseRetry();
+    await runtime.settleDetached(id);
+    // The prune that waited for the delivery runs once it has finished, on its
+    // own and unawaited by anyone, so it is waited for here by its effect.
+    let after = await ledgerRows(store, `${id}/`);
+    for (let polls = 0; after !== 0 && polls < 50; polls += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      after = await ledgerRows(store, `${id}/`);
+    }
+    const held = await get(store, "delivered", ctx(execution("ledger_detached_read")));
+    answer.a_detached_delivery_running_at_settlement_keeps_its_ledger_rows = during === 1;
+    answer.a_retry_inside_a_detached_delivery_after_settlement_still_dedupes =
+      attempts.length === 2 &&
+      attempts[0].deduped === false &&
+      attempts[1].deduped === true &&
+      held.value?.count === 1;
+    answer.a_detached_deliverys_rows_go_once_it_has_finished = after === 0;
+    answer.ledger_detached_trace = { during, after, attempts, held };
+  } catch (error) {
+    answer.ledger_detached_error = String(error?.stack ?? error);
+  }
+}
+
+{
+  // **A command letting go of its stores prunes what a running delivery was
+  // holding back, and the delivery may not write without its ledger from
+  // then on.** `agent-compose run` exits without waiting for a detached
+  // `agent.*` or `tool.*` delivery, so a prune chained behind one would never
+  // run and every such run would leave its execution's rows for ever; the exit
+  // starts it instead (`stores.releaseStores`). The delivery is still running
+  // in this process until the exit, though, and a retry it makes after the
+  // prune would find no row to answer it — so its keyed write is refused
+  // rather than applied a second time.
+  const store = kv("ledger_cut_off", "global", URL_ENV, z.object({ count: z.number().int() }).strict());
+  stores.bindsStores([store]);
+  const id = execution("ledger_cut_off");
+  const { open: releaseRetry, opened: retry } = gate();
+  const { open: firstLanded, opened: landed } = gate();
+  const attempts = [];
+  let refused;
+  const bump = () => write(store, "incr", { key: "delivered", field: "count" }, ctx(id), `${id}/fan/0#agent/0/count/0`);
+  try {
+    await begin_(id);
+    await dispatchDetached(id, async () => {
+      attempts.push(await bump());
+      firstLanded();
+      await retry;
+      try {
+        attempts.push(await bump());
+      } catch (error) {
+        refused = String(error?.message ?? error);
+      }
+      return { output: {} };
+    });
+    await landed;
+    await settle(id);
+    const during = await ledgerRows(store, `${id}/`);
+    // The command's way out, with the delivery still holding its retry.
+    await stores.releaseStores();
+    const released = await ledgerRows(store, `${id}/`);
+    releaseRetry();
+    await runtime.settleDetached(id);
+    const held = await get(store, "delivered", ctx(execution("ledger_cut_off_read")));
+    answer.a_command_letting_go_prunes_what_a_running_delivery_held_back =
+      during === 1 && released === 0;
+    answer.a_delivery_cut_off_by_its_command_is_refused_a_keyed_write =
+      attempts.length === 1 &&
+      (refused ?? "").includes("has already deleted its idempotency ledger") &&
+      held.value?.count === 1;
+    answer.ledger_cut_off_trace = { during, released, attempts, refused, held };
+  } catch (error) {
+    answer.ledger_cut_off_error = String(error?.stack ?? error);
+  }
+}
+
+{
+  // **A stopped `serve` drains its stores the same way, and closes nothing
+  // under the executions it leaves running.** A `serve` stopped on a deploy
+  // exits with deliveries still in flight, and recovery never comes back for a
+  // settled execution, so its stop starts the prune a running delivery was
+  // holding back exactly as a command letting go does (`stores.drainStores`) —
+  // and refuses that delivery's keyed write from then on. What it does not do
+  // is close a connection: the executions still open keep running while it
+  // stops, and the next start recovers them, so one that writes meanwhile is
+  // answered and keeps the ledger rows its resume will need.
+  const store = kv("ledger_drained", "global", URL_ENV, z.object({ count: z.number().int() }).strict());
+  stores.bindsStores([store]);
+  const id = execution("ledger_drained");
+  const open = execution("ledger_drained_open");
+  const { open: releaseRetry, opened: retry } = gate();
+  const { open: firstLanded, opened: landed } = gate();
+  const attempts = [];
+  let refused;
+  const bump = () => write(store, "incr", { key: "delivered", field: "count" }, ctx(id), `${id}/fan/0#agent/0/count/0`);
+  const running = (n) =>
+    write(store, "incr", { key: "running", field: "count" }, ctx(open), `${open}/step/${n}`);
+  try {
+    await begin_(id);
+    await begin_(open);
+    await dispatchDetached(id, async () => {
+      attempts.push(await bump());
+      firstLanded();
+      await retry;
+      try {
+        attempts.push(await bump());
+      } catch (error) {
+        refused = String(error?.message ?? error);
+      }
+      return { output: {} };
+    });
+    await landed;
+    await settle(id);
+    const before = await running(0);
+    const during = await ledgerRows(store, `${id}/`);
+    // The stop, with the delivery still holding its retry and the other
+    // execution still open.
+    await stores.drainStores();
+    const drained = await ledgerRows(store, `${id}/`);
+    const after = await running(1);
+    const kept = await ledgerRows(store, `${open}/`);
+    releaseRetry();
+    await runtime.settleDetached(id);
+    const held = await get(store, "delivered", ctx(execution("ledger_drained_read")));
+    answer.a_stopped_serve_prunes_what_a_running_delivery_held_back =
+      during === 1 && drained === 0;
+    answer.a_delivery_cut_off_by_a_stopped_serve_is_refused_a_keyed_write =
+      attempts.length === 1 &&
+      (refused ?? "").includes("has already deleted its idempotency ledger") &&
+      held.value?.count === 1;
+    answer.an_open_execution_still_writes_while_a_serve_stops =
+      before.applied === true &&
+      after.applied === true &&
+      after.value?.count === 2 &&
+      kept === 2;
+    answer.ledger_drained_trace = { during, drained, before, after, kept, attempts, refused, held };
+  } catch (error) {
+    answer.ledger_drained_error = String(error?.stack ?? error);
+  } finally {
+    runtime.closeExecution(open);
+  }
+}
+
+if (provider !== "sqlite") {
+  // **A bound store whose server never answers delays no settlement and no
+  // other store's prune, and holds a command's exit for its dial deadline
+  // alone.** A settlement prunes every store the composition binds, the ones
+  // the execution never reached included — so a server that accepts a
+  // connection and then says nothing is one every settled execution meets.
+  // Here it is a socket this file listens on and never writes to, bound as a
+  // store of this arm's provider ahead of one the execution really wrote.
+  const net = await import("node:net");
+  const sockets = new Set();
+  const listener = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("error", () => undefined);
+  });
+  await new Promise((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  const SILENT_URL_ENV = "AGENT_COMPOSE_STORE_URL_SILENT";
+  process.env[SILENT_URL_ENV] = `${provider}://silent:silent@127.0.0.1:${listener.address().port}/silent`;
+  const silent = kv("ledger_silent", "global", SILENT_URL_ENV);
+  const answered = kv("ledger_answered", "global");
+  stores.bindsStores([silent, answered]);
+  const id = execution("ledger_silent");
+  try {
+    await begin_(id);
+    await set(answered, "k", { n: 1 }, ctx(id), `${id}/save/0`);
+    const settling = Date.now();
+    await runtime.settleExecution(id);
+    runtime.closeExecution(id);
+    const settledIn = Date.now() - settling;
+    const status = (await runtime.journaledExecution(id))?.status;
+    // The store that answers is pruned while the one that does not is still
+    // being dialled: each store is pruned on its own.
+    let pruned = await ledgerRows(answered, `${id}/`);
+    for (let polls = 0; pruned !== 0 && polls < 30; polls += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      pruned = await ledgerRows(answered, `${id}/`);
+    }
+    const prunedIn = Date.now() - settling;
+    const releasing = Date.now();
+    await stores.releaseStores();
+    const releasedIn = Date.now() - releasing;
+    answer.a_store_that_never_answers_delays_no_settlement =
+      settledIn < 2_000 && status === "completed";
+    answer.a_store_that_never_answers_delays_no_other_stores_prune =
+      pruned === 0 && prunedIn < 5_000;
+    answer.a_store_that_never_answers_holds_a_command_for_its_dial_deadline_alone =
+      sockets.size > 0 && releasedIn < 15_000;
+    answer.ledger_silent_trace = { settledIn, status, pruned, prunedIn, releasedIn, dials: sockets.size };
+  } catch (error) {
+    answer.ledger_silent_error = String(error?.stack ?? error);
+  } finally {
+    // Unset, so no later settlement in this file prunes it again.
+    delete process.env[SILENT_URL_ENV];
+    for (const socket of sockets) socket.destroy();
+    await new Promise((resolve) => listener.close(resolve));
+  }
+}
+
+// --- A placed node a worker may still be running (PRD resolved q69, q63) ------
+//
+// The hub superseding a placed node's dispatch — the session holding it gone
+// quiet past the liveness window, the artifact it was issued under replaced,
+// its node's deadline spent — ends the *attempt*, not the worker's node runner
+// (`docs/distributed.md` §6.3): the runner goes on, writing a dialled store
+// directly under the same grammar 9.4 keys as the retry that replaced it, and
+// its late write is answered from the retry's ledger row (PRD resolved q63) for
+// exactly as long as that row is there. So a settlement leaves every row of an
+// execution a worker was handed a node of that no result has ended. Driven
+// through the hub's own dispatch rows in the journal — parked, claimed by a
+// session, then superseded, still held, or settled by a result — and the
+// runtime's own settle.
+
+/**
+ * Lay down one placed dispatch of `id` at `wait` and take it as far as `end`:
+ * `parked` (no worker took it), `superseded` before any worker took it
+ * (`dropped`), or claimed by a session and then left `held`, `superseded` or
+ * `settled` by a result.
+ */
+const placedDispatch = async (handle, id, wait, end) => {
+  const row = await handle.park({
+    execution: id,
+    wait,
+    id: `dsp_${id}_${wait.replaceAll("/", "_")}`,
+    placement: "laptop",
+    node: "flow.probe.count",
+    site: "count",
+    inputs: {},
+    parkedAt: new Date().toISOString(),
+  });
+  if (end === "dropped") {
+    await handle.supersedeDispatch(row.id, "the hub stopped waiting for this dispatch: the node execution ended");
+    return;
+  }
+  if (end === "parked") return;
+  await handle.claimDispatch(row.id, `ses_${id}`);
+  if (end === "superseded") {
+    await handle.supersedeDispatch(row.id, "the session holding it stopped making requests");
+  } else if (end === "settled") {
+    await handle.settleDispatch(row.id, { kind: "value", value: {} });
+  }
+};
+
+{
+  const store = kv("ledger_placed_runner", "global", URL_ENV, z.object({ count: z.number().int() }).strict());
+  stores.bindsStores([store]);
+  const handle = await journal.openJournal();
+  const bump = (id) => write(store, "incr", { key: id, field: "count" }, ctx(id), `${id}/count/0`);
+  const counted = async (id) => (await get(store, id, ctx(execution("ledger_placed_runner_read")))).value?.count;
+  const left = {};
+  try {
+    // The finding's own sequence: the first worker's dispatch is superseded,
+    // the retry's — a second dispatch — lands the `incr` and is settled by its
+    // result, the execution settles, and then the first worker's runner, still
+    // going, issues the same `incr` under the same key.
+    const superseded = execution("ledger_runner_superseded");
+    await begin_(superseded);
+    await placedDispatch(handle, superseded, "count/0", "superseded");
+    await placedDispatch(handle, superseded, "count/1", "settled");
+    const retried = await bump(superseded);
+    await settle(superseded);
+    left.superseded = await ledgerRows(store, `${superseded}/`);
+    const late = await bump(superseded);
+    answer.a_superseded_placed_dispatch_keeps_its_executions_ledger_rows = left.superseded === 1;
+    answer.a_superseded_runners_late_write_after_settlement_still_dedupes =
+      retried.applied === true &&
+      retried.deduped === false &&
+      late.deduped === true &&
+      (await counted(superseded)) === 1;
+
+    // A dispatch a session still holds as its execution settles is a runner
+    // the hub has not ended at all — the execution failing around a placed
+    // node that is still running, its supersession not yet written.
+    const held = execution("ledger_runner_held");
+    await begin_(held);
+    await placedDispatch(handle, held, "count/0", "held");
+    await bump(held);
+    await settle(held, new Error("another branch failed"));
+    left.held = await ledgerRows(store, `${held}/`);
+    answer.a_placed_dispatch_still_held_at_settlement_keeps_its_executions_ledger_rows = left.held === 1;
+
+    // …while a dispatch a result settled had a runner that has finished, and
+    // one no worker took had none: neither holds anything back.
+    const settledByResult = execution("ledger_runner_settled");
+    await begin_(settledByResult);
+    await placedDispatch(handle, settledByResult, "count/0", "settled");
+    await bump(settledByResult);
+    await settle(settledByResult);
+    left.settled = await ledgerRows(store, `${settledByResult}/`);
+    const untaken = execution("ledger_runner_untaken");
+    await begin_(untaken);
+    await placedDispatch(handle, untaken, "count/0", "dropped");
+    await placedDispatch(handle, untaken, "count/1", "parked");
+    await bump(untaken);
+    await settle(untaken);
+    left.untaken = await ledgerRows(store, `${untaken}/`);
+    answer.a_placed_dispatch_a_result_settled_does_not_hold_the_prune = left.settled === 0;
+    answer.a_placed_dispatch_no_worker_took_does_not_hold_the_prune = left.untaken === 0;
+    answer.ledger_placed_runner_trace = { left, retried, late };
+  } catch (error) {
+    answer.ledger_placed_runner_error = String(error?.stack ?? error);
+  }
+}
+
+{
+  // **…and in a hub, a delivery still in flight at settlement can hand a node
+  // out afterwards**: a detached `map` delivery outlives its run (grammar 8.6
+  // rule 7) and may reach a placed component, so a process that hands placed
+  // nodes to workers asks the journal again as the prune it was holding back
+  // starts. Two executions, each settling under a delivery that then hands a
+  // node of it to a worker: one dispatch is superseded and its execution keeps
+  // its rows; the other is settled by its result and its rows go — which is
+  // also the proof that both deferred prunes ran.
+  const store = kv("ledger_handed_out", "global", URL_ENV, z.object({ count: z.number().int() }).strict());
+  stores.bindsStores([store]);
+  const handle = await journal.openJournal();
+  const bump = (id) => write(store, "incr", { key: id, field: "count" }, ctx(id), `${id}/fan/0#agent/0/count/0`);
+  // What `./mesh.ts` marks as it mounts the worker routes of a `serve`.
+  runtime.handsOutPlacedNodes();
+  const ends = {
+    [execution("ledger_handed_superseded")]: "superseded",
+    [execution("ledger_handed_settled")]: "settled",
+  };
+  const { open: handOut, opened: handing } = gate();
+  const handed = [];
+  try {
+    for (const [id, end] of Object.entries(ends)) {
+      await begin_(id);
+      await dispatchDetached(id, async () => {
+        await handing;
+        await placedDispatch(handle, id, "fan/0/count/0", end);
+        handed.push(await bump(id));
+        return { output: {} };
+      });
+      await settle(id);
+    }
+    handOut();
+    for (const id of Object.keys(ends)) await runtime.settleDetached(id);
+    const [superseded, settledByResult] = Object.keys(ends);
+    let gone = await ledgerRows(store, `${settledByResult}/`);
+    for (let polls = 0; gone !== 0 && polls < 50; polls += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      gone = await ledgerRows(store, `${settledByResult}/`);
+    }
+    await stores.ledgerPrunesSettled();
+    const kept = await ledgerRows(store, `${superseded}/`);
+    answer.a_node_a_delivery_hands_out_after_settlement_holds_the_prune_when_superseded =
+      handed.length === 2 && handed.every((written) => written.applied === true) && kept === 1;
+    answer.a_node_a_delivery_hands_out_after_settlement_is_pruned_behind_its_result = gone === 0;
+    answer.ledger_handed_out_trace = { kept, gone, handed };
+  } catch (error) {
+    answer.ledger_handed_out_error = String(error?.stack ?? error);
   }
 }
 

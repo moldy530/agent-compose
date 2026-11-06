@@ -52,7 +52,8 @@ pub use document::{
 };
 pub use flow::{
     Edge, FlowContext, FlowDef, FlowNode, HumanBlock, ItemError, MapBlock, MapDispatch, MapRoute,
-    NODE_KIND_KEYS, Node, NodeKind, StoreCondition, StoreNode, StoreOp, StoreOpParams, StoreValue,
+    NODE_KIND_KEYS, Node, NodeKind, StoreCondition, StoreNode, StoreOp, StoreOpParams, StoreTtl,
+    StoreValue,
 };
 pub use policy::{OnError, PolicyBlock, Retry};
 pub use schema::{

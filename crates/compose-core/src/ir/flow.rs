@@ -12,7 +12,8 @@ use crate::ast::common::{
     Address, Cel, ControlTarget, Duration, EdgeSource, EdgeTarget, Ident, Literal, PathExpr,
 };
 use crate::ast::flow::{
-    CoderWorkspace, FlowContext, Harness, PermissionMode, StoreCondition, StoreOp, WorkspaceAccess,
+    CoderWorkspace, FlowContext, Harness, PermissionMode, StoreCondition, StoreOp, StoreTtl,
+    WorkspaceAccess,
 };
 use crate::diag::{Span, Spanned};
 
@@ -223,11 +224,11 @@ pub struct Human {
 
 /// The parameters of a store op (grammar 11.4).
 ///
-/// Eleven of the eighteen are CEL; `top_k`, `limit`, `content_type`, `field`,
-/// `unique`, `if` and `include_values` are literals (grammar 8.8, 11.4), so a
-/// bound — and which field a partial update touches, what it is conditioned
-/// on, and whether a page carries its values — is readable without running the
-/// graph.
+/// Eleven of the nineteen are CEL; `top_k`, `limit`, `content_type`, `field`,
+/// `unique`, `include_values`, `if` and `ttl` are literals (grammar 8.8, 11.4),
+/// so a bound — and which field a partial update touches, what it is
+/// conditioned on, how long the key it leaves lives, and whether a page carries
+/// its values — is readable without running the graph.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct StoreParams {
     /// `key:`
@@ -276,6 +277,11 @@ pub struct StoreParams {
     /// `if_version:` — the version the key must hold for the write to apply.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub if_version: Option<Spanned<Cel>>,
+    /// `ttl:` — how long the key a `kv` write leaves lives: a duration, or
+    /// `never`; absent means the store's `default_ttl:`, if it declares one
+    /// (PRD resolved q69).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<Spanned<StoreTtl>>,
     /// `after:` — a `kv` `list`'s exclusive cursor (PRD resolved q70).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<Spanned<Cel>>,

@@ -1336,7 +1336,18 @@ op a composition written against this release performs, and every such record
 is a `"write"` with a `key`, which is what a reader that branches on `effect`
 already handles.
 
-**PRD resolved q70 is the same kind of release, and recorded for the same
+**PRD resolved q69 changes nothing here, and says so because it could have.** A
+`kv` key's expiry is the store's, not the record's: a `ttl:` adds no field to an
+op's output (grammar §11.4), so §6's records carry nothing new, and a read of a
+key that has expired answers — and is recorded — exactly as a read of a key
+never written: a `get`'s `answer` is `{ found: false }`, a `list`'s `keys` omit
+it, a `count` does not count it, and a `get_many` answers its entry
+`found: false`. Nor does the pruning of a settled execution's idempotency ledger
+touch a record: §6's `idempotencyKey` and `deduped` are what the write carried
+and found when it ran, and that run's trace is already written.
+`trace_version` stays `6`.
+
+**PRD resolved q70 is a release of q68's kind, and recorded for the same
 reason.** It added two ops to grammar §11.4's catalogue, `count` and
 `get_many`, which §6's `op` row now names, and grew a `kv` `list`'s answer with
 `next` and `entries`. Every record of the two new ops is a `"read"` with an

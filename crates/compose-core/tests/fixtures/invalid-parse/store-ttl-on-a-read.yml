@@ -1,0 +1,17 @@
+# rule: `ttl:` is a `kv` write's parameter, and a read writes nothing to expire (grammar 11.4, PRD resolved q69)
+# code: invalid-value
+# message: `ttl` is not a parameter of the `get` op
+# at: 14:7
+# help: `get` takes `key`; `ttl:` is how long a `kv` write's key lives, and only `set`, `merge`, `append`, `incr` take one — a `get` reads, and writes nothing to expire (grammar 11.4, PRD resolved q69)
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    load:
+      store: store.memory
+      op: get
+      key: "execution.session_key"
+      ttl: 30s
+  edges:
+    - { from: start, to: load }
+    - { from: load, to: end }

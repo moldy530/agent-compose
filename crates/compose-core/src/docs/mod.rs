@@ -73,6 +73,10 @@ pub const ENVIRONMENT: &[(&str, &str)] = &[
         "how long a worker session may go without a request before the hub gives up on it (`docs/distributed.md` §2)",
     ),
     (
+        "AGENT_COMPOSE_STORE_CLOCK_OFFSET_MS",
+        "milliseconds an emitted project adds to the clock a `kv` store reads expiry by, which is how a test moves past a `ttl:` (grammar 11.4)",
+    ),
+    (
         "NO_COLOR",
         "any non-empty value turns styling off on every report (no-color.org)",
     ),

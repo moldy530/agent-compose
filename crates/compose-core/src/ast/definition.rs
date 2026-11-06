@@ -5,7 +5,7 @@ use crate::diag::{Span, Spanned};
 use super::binding::{
     BuiltinBlock, ExecBlock, FunctionBinding, HttpBlock, InterpolatedEntry, ModuleBlock,
 };
-use super::common::{Address, Ident, Interpolated, LiteralEntry};
+use super::common::{Address, Duration, Ident, Interpolated, LiteralEntry};
 use super::flow::FlowDef;
 use super::schema::FieldMap;
 
@@ -339,6 +339,10 @@ pub struct StoreDef {
     pub description: Option<Spanned<String>>,
     /// `agent_access:` — defaults to `read_write`.
     pub agent_access: Option<Spanned<AgentAccess>>,
+    /// `default_ttl:` — a `kv` key alone: how long the key a write that names
+    /// no `ttl:` leaves lives (grammar 11.1, PRD resolved q69). Absent means a
+    /// key such a write leaves never expires.
+    pub default_ttl: Option<Spanned<Duration>>,
 }
 
 /// A vector store's `embed:` block (grammar 11.2, Decision D36).

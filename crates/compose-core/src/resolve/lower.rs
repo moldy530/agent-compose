@@ -233,6 +233,7 @@ fn store(source: &ast_def::StoreDef) -> Option<ir::definition::Store> {
         backend: source.backend.clone(),
         description: source.description.clone(),
         agent_access: source.agent_access.as_ref().map(|access| access.value),
+        default_ttl: source.default_ttl.clone(),
     })
 }
 
@@ -521,6 +522,7 @@ fn store_params(source: &ast_flow::StoreOpParams) -> Option<ir::flow::StoreParam
         by: source.by.clone(),
         condition: source.condition.clone(),
         if_version: source.if_version.clone(),
+        ttl: source.ttl.clone(),
         after: source.after.clone(),
         include_values: source.include_values.clone(),
         keys: source.keys.clone(),
