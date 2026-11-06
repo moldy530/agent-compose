@@ -36,6 +36,21 @@ second way to say any of those, and since those keys are refused rather than
 quietly removed, a setting that reaches this warning is one that really does
 travel to the SDK.
 
+**One open key has a reach worth knowing before you write it: `cc`'s
+`verbatimPrompts`.** Left off — the default, and where the adapter leaves it —
+the CLI reads a run's input as its own syntax before any model does: an `@path`
+mention pulls that file's contents into the first request, from outside
+`workspace:` and past `allow_tools:` and the permission mode, and an input
+opening with a slash command is dispatched, so `/model <id>` reaches around
+`model:`. That is a stated exemption from the node's containment rather than
+something the adapter closes, because turning the option on also drops the
+first turn's `CLAUDE.md`, skill and tool listings. A node whose `input:`
+carries text the composition did not write sets
+`settings: { verbatimPrompts: true }` and gives that context up; this warning
+then fires on the key, and is expected. The key is open rather than reserved
+because on it narrows — and an SDK release on which it stops doing so moves it
+to `reserved-harness-setting`.
+
 ## A spec that triggers it
 
 ```yaml triggers
@@ -131,5 +146,5 @@ flow.fix:
     - { from: implement, to: end }
 ```
 
-Grammar: `docs/grammar.md` §8.9, Decision D140. Topic:
+Grammar: `docs/grammar.md` §8.9, Decisions D140 and D164. Topic:
 `agent-compose docs agents`.

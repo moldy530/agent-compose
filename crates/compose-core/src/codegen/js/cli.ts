@@ -399,9 +399,9 @@ async function run(argv: readonly string[]): Promise<number> {
  * the execution holding the slot, and journals nothing. A command that could
  * not run at all, so exit `2`.
  *
- * **Which group a run is in** is the implementation's reading, flagged for the
- * owner in D163's Status: a run is in a trigger's group only where the
- * trigger declares no `concurrency.key` — the key-less group, one per trigger.
+ * **Which group a run is in** is the owner's ruling (PRD resolved q77 as
+ * amended 2026-11-06, D163's Status): a run is in a trigger's group only where
+ * the trigger declares no `concurrency.key` — the key-less group, one per trigger.
  * A keyed group's key is CEL over a payload a run does not have, so no keyed
  * group covers one. A run that starts holds no slot of its own: the lease is
  * the trigger's executions, and a run is not one of them.
