@@ -3565,6 +3565,22 @@ body with the node's `prompt:`, and a `read_only` run under this harness is
 asked for what the node asked for rather than for a plan to implement
 something.
 
+**On `cc`, the CLI reads the prompt before any of this binds — a stated
+exemption.** The input a `cc` run is handed reaches the CLI the Agent SDK
+drives before it reaches a model, and with the SDK's `verbatimPrompts` option
+off the CLI acts on two things in it: an `@path` mention is expanded into that
+file's contents on the run's first request — a file from outside `workspace:`,
+with no tool call, so `allow_tools:`, the permission callback and the mode never
+see it — and an input opening with a slash command is dispatched as one of the
+CLI's own commands, so `/model <id>` reaches around `model:`. The adapter
+leaves the option off, because on it also drops the first turn's `CLAUDE.md`,
+skill and tool listings — the harness context a coder node is adopted for — and
+the hole is an **exemption** from the containment this table states, stated as
+PRD resolved q57 ruling c states that q54's bounds do not apply inside a harness
+run. A node whose `input:` carries text the composition did not write closes it
+for itself with `settings: { verbatimPrompts: true }`, at the cost of that
+node's first-turn context ([D164](#d164-verbatimprompts-stays-off-on-cc-the-clis-prompt-pass-is-a-stated-exemption), PRD resolved q67).
+
 **`permission_mode:` is the second axis, and only one harness has one.**
 `access:` says how far a run may reach; a permission mode says, *inside* that
 reach, how a call is approved. The two are not the same question, and the
@@ -4940,7 +4956,8 @@ Rules (PRD 5.8):
     the one shape that types every writer in one derived field: `kind` is an
     enum, and `execution` and `path` are optional, under D110's posture. The
     tag changes the shape the ruling names (`{ execution, path }`, and the word
-    `cli`), so it is provisional until the owner rules on it (D158).
+    `cli`), and the owner ratified it as superseding that shape (D158, PRD
+    resolved q74 as amended 2026-11-06).
   - **`at`** is the write's own clock, in epoch milliseconds — the server's on
     a dialled backend, the process's on a local one.
 
@@ -7537,12 +7554,12 @@ or `end`, but never the flow's `finally:` node — `routed-finally` refuses it
 there — because a transfer into that node would run it a second time,
 mid-instance, with no outcome for it to read (§7.9). The ruling names "edges
 into or out of it"; refusing the two control-transfer positions as well is
-D159's reading of "excluded from routing", flagged there for the owner to
-confirm. The strategies are unchanged, and so is the target set of every flow
-with no `finally:` key; `human.on_timeout` (D52) is narrowed in the same words,
-so the two control-transfer positions stay identical. The amended text
-follows; the superseded phrase is quoted at the end so a reader of an older
-citation can see what moved.
+D159's reading of "excluded from routing", which the owner confirmed (PRD
+resolved q76 as amended 2026-11-06). The strategies are unchanged, and so is
+the target set of every flow with no `finally:` key; `human.on_timeout` (D52)
+is narrowed in the same words, so the two control-transfer positions stay
+identical. The amended text follows; the superseded phrase is quoted at the
+end so a reader of an older citation can see what moved.
 
 `fail` | `skip` | `{ fallback: <flow-local node id or end> }` — any node id of
 the flow but its `finally:` node — applied after
@@ -9280,7 +9297,8 @@ failure a `finally_error` "without changing the outcome" (§4.1, §7.9).
 `execution.error`, absent on an instance that did not fail, joins the absent
 values this entry lists. Reading the ruling's "an error it raises after
 retries" as covering the one failure a node has before its activity runs is
-D159's, flagged there for the owner to confirm. The write half is unchanged.
+D159's, which the owner confirmed (PRD resolved q76 as amended 2026-11-06).
+The write half is unchanged.
 The amended text follows; the superseded sentence is quoted at the end.
 
 Reading a value that is legally absent — a property listed in an object's
@@ -12877,7 +12895,8 @@ reads of the server's clock, and a `history` read and a write's sweep judge a
 row's retention by the server's clock alone. Values are stored as the JSON the
 entry holds, so a row is a copy of the value, not a reference to it.
 
-**The actor is tagged, and that amends the ruling's shape — provisionally.**
+**The actor is tagged, and that amends the ruling's shape — as the owner
+ratified.**
 The ruling names `{ execution, path }` for a node or tool write and `cli` for
 an operator's: two shapes, an object and a word. A derived output is one type
 (§8.8), and a field that is sometimes an object and sometimes a string is no
@@ -12890,17 +12909,14 @@ carried on every node, derived key or authored (D157), since an authored key
 names no instance but the write still has a writer. A tool's `path` is the
 frame a call a model made takes — the agent execution's instance path, then
 `<tool name>/<call ordinal>`, as a flow-as-tool dispatch's key does. **This is
-not a reading of the ruling but a change to the shape it names**, and it is
+not a reading of the ruling but a change to the shape it names**, and it was
 not this implementation's to make: an operator's row is the object
 `{ kind: "cli" }` where the ruling says the word `cli`, so a reader of the PRD
 who tests `actor === "cli"` finds no row, and a node's or tool's row carries a
-`kind` the ruling never names. Whether to supersede the ruling's shape is the
-owner's call, and it has not been made: the tag ships because the ruling's
-literal shape cannot be typed, and it stands only until the owner rules —
-ratifying the tag, or choosing another typed shape. A ruling for any other
-shape would change the derived row (`check::model`), the reading of the stored
-actor's three columns and the `store log` table, and no write, lock or sweep.
-Nothing in the PRD records that ruling yet.
+`kind` the ruling never names. The owner made it: PRD resolved q74, as amended
+2026-11-06, ratifies the tag as **superseding** the ruling's
+`{ execution, path }` and `cli`, for the reason the tag ships — the ruling's
+literal shape cannot be typed — so a reader tests `actor.kind`.
 
 **`seq` is an order, not a count.** It is an integer the table assigns as the
 row is inserted — SQLite's `AUTOINCREMENT`, a Postgres `BIGSERIAL`, a MySQL
@@ -12930,12 +12946,11 @@ and both applied: a `delete` of a key that held nothing (`deleted: false`), whos
 row has no value on either side and no version, and an `append` with
 `unique: true` whose item was already there, which keeps its version and
 refreshes its expiry, whose row holds the same value on both sides. **Those
-two are this implementation's reading, and await the owner's ruling as the
-actor's tag does**: the ruling does not say whether an applied write that
-changed no value is one it means, and recording it is the reading that loses
-nothing — an operator can skip a row, and cannot recover one that was never
-written. A ruling that such a write records nothing would drop the two rows
-and change nothing else; nothing in the PRD records one yet.
+two were this implementation's reading, and the owner ratified them with the
+actor's tag** (PRD resolved q74 as amended 2026-11-06): the ruling does not say
+whether an applied write that changed no value is one it means, and recording
+it is the reading that loses nothing — an operator can skip a row, and cannot
+recover one that was never written.
 
 **A batch is one row per entry.** A batch is one write of many keys (D156),
 and the history is per key, so it records one row per entry, each with the
@@ -13017,12 +13032,12 @@ first attempt's. No journal row, no trace field and no `trace_version` changes
 (`docs/trace.md` §10.2), `vector` and `blob` stores are untouched, and so is
 every store that does not declare `history: true`.
 
-**Status**: provisional — implemented as written here, and awaiting the
-owner's ruling on three points this decision marks as its own rather than the
-ruling's: the actor's tag, which changes the shape PRD resolved q74 names, and
-the rows a `delete` of a key holding nothing and an unchanged `unique: true`
-`append` record. Nothing in the PRD records that ruling yet. *PRD 5.8, resolved
-q29, q68, q69, q70, q71, q72, q73, q74; §8.8, §11.1, §11.4, §11.5.*
+**Status**: ratified — PRD resolved q74, as amended 2026-11-06. The three points
+this decision marked as its own rather than the ruling's — the actor's tag,
+which supersedes the shape the ruling names, and the rows a `delete` of a key
+holding nothing and an unchanged `unique: true` `append` record — are the
+owner's amendment. *PRD 5.8, resolved q29, q68, q69, q70, q71, q72, q73, q74;
+§8.8, §11.1, §11.4, §11.5.*
 
 ### D159. `finally:` names the node an instance runs once when it ends
 
@@ -13066,10 +13081,10 @@ refused one position at a time (`routed-finally`), and it is exempt from
 D71's "every node MUST have at least one outgoing edge" (§7.6.3 rule 1). The
 ruling names "edges into or out of it"; refusing it as an `on_error: { fallback:
 … }` and a `human.on_timeout:` target too is a reading of "excluded from
-routing" the owner may wish to confirm — §2.4 and D95 make those two positions
-transfers exactly as an edge is, and admitting them would run the node once on
-a branch and again at the end — and it narrows the target set D21 defines and
-D52 repeats, so both carry an amendment note. D95
+routing" the owner confirmed (PRD resolved q76 as amended 2026-11-06) — §2.4
+and D95 make those two positions transfers exactly as an edge is, and admitting
+them would run the node once on a branch and again at the end — and it narrows
+the target set D21 defines and D52 repeats, so both carry an amendment note. D95
 counts a node reachable when a transfer leads to it; the finally node is
 reachable because it is `finally:` — D21's reading of a fallback target, that a
 node addressed only by its position is live code, applied to the one position
@@ -13080,13 +13095,14 @@ detached dispatch's target answer for what their finally nodes reach too.
 
 **Its failure has one meaning.** An `on_error:` on the finally node is refused
 (`routed-finally`) rather than ignored, and this is a reading of the ruling the
-owner may wish to confirm: the ruling says "the §9.3 chain applies to it (its
-own `timeout:`, `retry:`)" and that an error after retries is `finally_error`
-with the outcome unchanged. `skip` and `fallback` would route out of a node that
-routes nowhere, and `fail` — "abort the execution" — would contradict the outcome
-being unchanged, so a strategy has nothing it could do. A strategy `defaults:` or
-an instantiating `policy:` delivers is not an error, because those levels are
-written for every node, and is not applied to it. `retry` and `timeout` resolve
+owner confirmed (PRD resolved q76 as amended 2026-11-06): the ruling says
+"the §9.3 chain applies to it (its own `timeout:`, `retry:`)" and that an error
+after retries is `finally_error` with the outcome unchanged. `skip` and
+`fallback` would route out of a node that routes nowhere, and `fail` — "abort
+the execution" — would contradict the outcome being unchanged, so a strategy
+has nothing it could do. A strategy `defaults:` or an instantiating `policy:`
+delivers is not an error, because those levels are written for every node, and
+is not applied to it. `retry` and `timeout` resolve
 through all four levels as on any node — unlike D102's `human` exemption, which
 withholds them, because a finally node is work the instance does and should be
 bounded like work.
@@ -13107,10 +13123,10 @@ evaluated is the node's own failure — `finally_error`, the outcome unchanged �
 which is the ruling's "whose own failure is recorded without changing the
 outcome" applied to the one failure a node has before its activity runs. The
 ruling's words are "an error it raises after retries", so reading them to
-cover an input that cannot be built is one the owner may wish to confirm; the
-alternative, failing the execution, is the one outcome the ruling says a
-finally node never has. That narrows D110, which carries the amendment note.
-Nothing dominates the finally node —
+cover an input that cannot be built is one the owner confirmed (PRD resolved
+q76 as amended 2026-11-06); the alternative, failing the execution, is the one
+outcome the ruling says a finally node never has. That narrows D110, which
+carries the amendment note. Nothing dominates the finally node —
 the instance may have ended before any node ran — so it reads no node output,
 and a finally `map`'s `over:` reading one is `non-dominating-source`.
 
@@ -13144,8 +13160,9 @@ describes: every resume reaches the same other end, so every resume diverges,
 and the finally node never finishes. That the instance also **settles** on the
 recorded end — a run whose replay completed closes `failed`, as the record
 says — rather than only running its finally node there is a reading of the
-ruling the owner may wish to confirm; the alternative would hand a caller an
-answer the finally node was told the instance never produced. The record cannot
+ruling the owner confirmed (PRD resolved q76 as amended 2026-11-06); the
+alternative would hand a caller an answer the finally node was told the
+instance never produced. The record cannot
 stand for one end only: a
 completion the replay did not reach, because a completed instance answers its
 body's outputs and no record holds them; that one is a divergence (q29), raised
@@ -13259,20 +13276,19 @@ q29's divergence are what the boundary record is read under. D153's lease
 example moves its release into a `finally:` node, guarded so that a run which
 never held the lease releases nothing (`docs/topics/stores.md`).
 
-**Status**: provisional on the end of an instance with work in flight, and
-shipped as written here. The ruling says only "innermost first when a cancel or
-failure ends several at once"; what the paragraphs above read into that is the
-implementation's, settled over seven review rounds, and awaits the owner's
-ruling: that a sibling's failure stops the other branches' instances and that an
-abandoned pause ends `failed`, both running their finally nodes; that an end
-under way inside the one ending is waited for; that nothing new begins inside an
-ended instance, an agent's further tool calls and model turns included; that a
-detached delivery is exempt; and that a finally failure past a closed record is
-said on stderr and held nowhere. Also the owner's, as marked above: the refusal
-of a fallback or `on_timeout:` target naming the node, `on_error:` refused
-rather than ignored, an input the node cannot build as `finally_error`, and the
-instance settling on the recorded end. Nothing in the PRD records those rulings
-yet. *PRD resolved q28, q29, q65, q69, q75, q76; §2.4, §4.1, §7, §7.6.3, §7.8,
+**Status**: ratified — PRD resolved q76, as amended 2026-11-06. The ruling says
+only "innermost first when a cancel or failure ends several at once"; what the
+paragraphs above read into that was the implementation's, settled over seven
+review rounds, and the owner ratified it: that a sibling's failure stops the
+other branches' instances and that an abandoned pause ends `failed`, both
+running their finally nodes; that an end under way inside the one ending is
+waited for; that nothing new begins inside an ended instance, an agent's further
+tool calls and model turns included; that a detached delivery is exempt; and
+that a finally failure past a closed record is said on stderr and held nowhere.
+Ratified with them, as marked above: the refusal of a fallback or `on_timeout:`
+target naming the node, `on_error:` refused rather than ignored, an input the
+node cannot build as `finally_error`, and the instance settling on the recorded
+end. *PRD resolved q28, q29, q65, q69, q75, q76; §2.4, §4.1, §7, §7.6.3, §7.8,
 §7.9, §8.7, §9.2, §9.3; amends D21, D52, D71, D95, D110; builds on D97, D103,
 D118, D150, D153.*
 
@@ -13449,8 +13465,10 @@ hub and not on that worker. The same holds where the hub dies between
 recording a cancel and writing the poll answer that names it. Closing it needs
 the restarted hub to tell the worker — on the first answer under its new
 session, every row it left `dispatched` for a cancel's frontier — and the
-worker to hold its orphan stops until that answer: a protocol choice, left to
-the owner (`docs/distributed.md` §5).
+worker to hold its orphan stops until that answer: a protocol choice protocol
+`3` does not make. The owner accepted the limitation as one protocol `3` does
+not close (PRD resolved q75 as amended 2026-11-06), and a later protocol may
+(`docs/distributed.md` §5).
 
 **A cancel before the row is begun.** `serve` answers a trigger's request while
 the execution's lifecycle row is still being begun — on a dialled journal, a
@@ -13500,23 +13518,24 @@ held in the journal's rows), q65 (lineage is the cascade) and q76 are read at
 their own words.
 
 **Status**: shipped as written here. The ruling fixes the mechanism, the status,
-the cascade, the surfaces and the restart; what the paragraphs above read into
-it is the implementation's, and awaits the owner's ruling where marked: that
-`execution.error` is absent on `cancelled`; that a cancel arriving after the
-root's body ended changes no outcome; that a detached `agent.*`/`tool.*`
-delivery is stopped as a running node; that a stopped effect is not recorded;
-that a recovered cancel completes at the replay's frontier; and that a worker
-holding a dispatch across a restart mid-cancel ends what it began there
-`failed`, not `cancelled` (above), which is a limitation the protocol does not
-close. **Provisional, as a whole, on what a worker does when the hub stops
-waiting for a dispatch it runs** — the `stop` list and its `SIGUSR2`, that a
-stop ends the instances it began `failed` and reaches every node in the runner,
-that an effect a stop cut off is kept out of the journal, and what a worker
-holding a dispatch learns across a hub restart: that seam is read from the
-ruling, not stated by it, and the campaign's seven review rounds each found a
-new defect in it. It stands as shipped and tested, and awaits the owner's
-ruling before protocol `3` is treated as frozen (D161, `docs/distributed.md`
-§3.2, §10.4). *PRD resolved
+the cascade, the surfaces and the restart. **What a worker does when the hub
+stops waiting for a dispatch it runs is ratified** (PRD resolved q75 and q79 as
+amended 2026-11-06): the `stop` list and its `SIGUSR2`, that a stop ends the
+instances it began `failed` and reaches every node in the runner, that an effect
+a stop cut off is kept out of the journal, and that both lists name a dispatch
+on every answer until its result arrives — a seam read from the ruling rather
+than stated by it, in which the campaign's seven review rounds each found a new
+defect, and which stands as shipped and tested. Protocol `3` is frozen with the
+`stop` field in it (D161, `docs/distributed.md` §3.2, §10.4). What a worker
+holding a dispatch learns across a hub restart is the limitation the owner
+accepted: it ends what it began there `failed`, not `cancelled` (above), and
+protocol `3` does not close that; a later protocol may. What the paragraphs
+above read into the ruling besides remains the implementation's, recorded for
+the owner: that `execution.error` is absent on `cancelled`; that a cancel
+arriving after the root's body ended changes no outcome; that a detached
+`agent.*`/`tool.*` delivery is stopped as a running node; that an effect the
+cancel stops in flight is not recorded; and that a recovered cancel completes at
+the replay's frontier. *PRD resolved
 q28, q29, q32, q34, q65, q75, q76; §7.6.3, §7.9, §8.6, §13.3; amends D70, D124,
 D159; builds on D94, D102, D150.*
 
@@ -13626,17 +13645,17 @@ words: the `cancel` list carries cancels and nothing else, and the `stop` list
 beside it carries what this decision's capacity rule needs the worker told.
 
 **Status**: shipped as written here. The ruling fixes the key, the cap and the
-least-loaded preference; the tie-break — the oldest poll — that a cancelled
-dispatch counts until its result arrives, that a dispatch the hub stopped
-waiting for is named on a `stop` list of its own and stopped without a cancel,
-that the stop reaches every node in the runner, and that both lists name a
-dispatch on every answer until its result arrives, are the implementation's,
-and await the owner's ruling. The **`stop` list in particular** is a wire field
-no ruling names — PRD resolved q75's ruling b gives the poll "a `cancel`
-list" — so protocol `3`'s `stop` field is provisional until the owner rules on
-it (`docs/distributed.md` §3.2, §10.4). With it, the whole of what a worker does
-when the hub stops waiting for a dispatch — named in D160's status — is
-provisional on the same ruling. *PRD resolved q38, q44, q75, q79; §14.1; builds on D128;
+least-loaded preference. That a dispatch the hub stopped waiting for is named on
+a `stop` list of its own and stopped without a cancel, that the stop reaches
+every node in the runner, and that both lists name a dispatch on every answer
+until its result arrives are **ratified**, with the whole of what a worker does
+when the hub stops waiting for a dispatch — named in D160's status (PRD resolved
+q75 and q79 as amended 2026-11-06). The **`stop` list in particular** was a wire
+field no ruling named — PRD resolved q75's ruling b gives the poll "a `cancel`
+list" — and the amendment names it: protocol `3` is frozen with its `stop`
+field (`docs/distributed.md` §3.2, §10.4). The tie-break — the oldest poll —
+and that a cancelled dispatch counts until its result arrives remain the
+implementation's, recorded for the owner. *PRD resolved q38, q44, q75, q79; §14.1; builds on D128;
 retires the mesh capacity decision of `docs/distributed.md` §13.*
 
 ### D162. `serve` fires schedules and runs a `kind: command` source, through one admission function
@@ -13769,16 +13788,17 @@ recorded in the Status below for the owner rather than resolved here.
 
 **Status**: shipped as written here. The ruling fixes the keys, the payloads,
 the fired-row identity, the skip, the checkpoint hand-back and the refusals.
-**Provisional, as a whole, on how a `kind: command` program's run ends and on
-what a stop or a restart reaps** — that a run ends at the program's exit and
-not when its pipes close, what is done about a helper left in the program's
-process group and about a descendant that left it, the stop's grace for the
-group, and what is read from the pipes after the group has gone: the ruling
-says only that an exit restarts the program with backoff, and the campaign's
-seven review rounds each found a new defect in that one seam (rounds five,
-six and seven in succession). It stands as shipped and tested below, and
-awaits the owner's ruling before it is treated as settled. The following are
-the implementation's own readings and await the owner's ruling:
+**How a `kind: command` program's run ends, and what a stop or a restart
+reaps, are ratified as a whole** (PRD resolved q78 as amended 2026-11-06) —
+that a run ends at the program's exit and not when its pipes close, what is
+done about a helper left in the program's process group and about a descendant
+that left it, the stop's grace for the group, and what is read from the pipes
+after the group has gone. The ruling says only that an exit restarts the
+program with backoff, and the campaign's seven review rounds each found a new
+defect in that one seam (rounds five, six and seven in succession); it stands
+as shipped and tested below.
+
+Ratified by the owner (2026-11-06, PRD resolved q78 as amended):
 
 - `payload.scheduled_at` is the tick's nominal instant in the trigger's zone
   with a numeric offset (`+00:00` for UTC, never `Z`); the fired row keys the
@@ -13799,6 +13819,32 @@ the implementation's own readings and await the owner's ruling:
   would become the newest and leave a claim nobody started below it, where no
   look reads it; and a look taken only as each tick falls due would reach a
   claim a standby inherits a schedule's period late.
+- A stop ends the program's stdin, then sends its group `SIGTERM` and, two
+  seconds after it, `SIGKILL` to whatever is still in the group — the program
+  exiting first cuts no other member's grace short; `serve` waits at most twice
+  the grace for the program's pipes to close, so a descendant that left the
+  group cannot hold `serve` open. A run that ends gets the same sequence for
+  what is left in its group, begun at the program's exit, before the restart
+  and without delaying it, and a stop waits for that too — so a program that
+  crashes after starting a helper leaves nothing per restart, and nothing
+  outlives a stop that finds the source backing off. A run ends at its
+  program's exit rather than when its pipes close: a helper in the group that
+  inherited stdout or stderr would otherwise hold the run open — never
+  journaled, never restarted, and reported `running` — so the exit's
+  `SIGTERM` and `SIGKILL` end it, what is left in the pipes is read and
+  admitted, and the `restarts` row records the exit's instant, from which the
+  backoff is counted. A descendant that left the group is not the program's,
+  and is not followed — nor does its hold on the pipes keep the run open:
+  once the group has gone, the pipes are read for two seconds more, counted
+  only while reading is not held for an admission, so a slow intake drops
+  nothing the program wrote; the line they were in the middle of is taken as
+  the last, they are let go, and the run ends with the exit's code or signal,
+  the serve log saying why. A program whose exit was seen is never signalled
+  again, by a stop or a restart: its pid — its group's id — may by then name
+  another process's group.
+
+The following remain the implementation's readings, recorded for the owner:
+
 - A tick or an event is admitted as **started** only once its execution's
   lifecycle row is journaled — the admission waits for that row — so a
   checkpoint never moves past, and a schedule is never armed past, an execution
@@ -13864,29 +13910,6 @@ the implementation's own readings and await the owner's ruling:
 - A source no `event` trigger binds is not started, and its status route reads
   `stopped`; an `event` trigger whose source `local` does not declare is logged
   at start.
-- A stop ends the program's stdin, then sends its group `SIGTERM` and, two
-  seconds after it, `SIGKILL` to whatever is still in the group — the program
-  exiting first cuts no other member's grace short; `serve` waits at most twice
-  the grace for the program's pipes to close, so a descendant that left the
-  group cannot hold `serve` open. A run that ends gets the same sequence for
-  what is left in its group, begun at the program's exit, before the restart
-  and without delaying it, and a stop waits for that too — so a program that
-  crashes after starting a helper leaves nothing per restart, and nothing
-  outlives a stop that finds the source backing off. A run ends at its
-  program's exit rather than when its pipes close: a helper in the group that
-  inherited stdout or stderr would otherwise hold the run open — never
-  journaled, never restarted, and reported `running` — so the exit's
-  `SIGTERM` and `SIGKILL` end it, what is left in the pipes is read and
-  admitted, and the `restarts` row records the exit's instant, from which the
-  backoff is counted. A descendant that left the group is not the program's,
-  and is not followed — nor does its hold on the pipes keep the run open:
-  once the group has gone, the pipes are read for two seconds more, counted
-  only while reading is not held for an admission, so a slow intake drops
-  nothing the program wrote; the line they were in the middle of is taken as
-  the last, they are let go, and the run ends with the exit's code or signal,
-  the serve log saying why. A program whose exit was seen is never signalled
-  again, by a stop or a restart: its pid — its group's id — may by then name
-  another process's group.
 - The refused-line and accepted-event counts are the running process's, not
   journaled.
 - `auth:` on an `event` trigger, a **grammar addition q78 does not make**.
@@ -14077,27 +14100,94 @@ amended, and the conflict below is recorded for the owner.
 
 **Status**: shipped as written here. The ruling fixes the keys, their defaults,
 the headers, the `intake_id` and its route, the refused `run` and the restart.
-**Provisional, as a whole, on what becomes of a start the journal refuses** —
-a queued row's, an owed one's, a debounce's close, a restart's repair, a gated
-`http` arrival's — what is undone and what is kept, whether its row goes back
-on the queue or stays `started`, when it is tried again, what its caller is
-told and what is pushed to its callback, and what is read into a journal that
-answered a failure after the row landed: the ruling says only that a restart
-starts what was queued and fires what was pending, and the campaign's seven
-review rounds returned to that one seam again and again (rounds one, three,
-six and seven, the sixth with the campaign's last must-fix). It stands as
-shipped and tested below, and awaits the owner's ruling before it is treated
-as settled. The following are the implementation's own readings and await the
-owner's ruling:
+**What becomes of a start the journal refuses is ratified as a whole** (PRD
+resolved q77 as amended 2026-11-06) — a queued row's, an owed one's, a
+debounce's close, a restart's repair, a gated `http` arrival's — what is undone
+and what is kept, whether its row goes back on the queue or stays `started`,
+when it is tried again, what its caller is told and what is pushed to its
+callback, and what is read into a journal that answered a failure after the row
+landed, exactly as the bullets below state it and `docs/durability.md` records
+it. The ruling says only that a restart starts what was queued and fires what
+was pending, and the campaign's seven review rounds returned to that one seam
+again and again (rounds one, three, six and seven, the sixth with the
+campaign's last must-fix); it stands as shipped and tested below.
+
+Ratified by the owner (2026-11-06, PRD resolved q77 as amended):
 
 - **Which groups cover a `run`.** A run is in a trigger's group only where the
   trigger declares no `concurrency.key`: the key is CEL over a payload a run
   does not have, so no keyed group covers one. A key-less group covers a run of
   its trigger's flow, counting the trigger's `max_running:`. A run that starts
   holds no slot — the lease is the trigger's executions, and a run is not one
-  of them — so arrivals are not held back by runs. This is the reading most
-  worth the owner's eye: ruling e says "a flow some trigger's group covers"
-  without saying which.
+  of them — so arrivals are not held back by runs. This was the reading most
+  worth the owner's eye — ruling e says "a flow some trigger's group covers"
+  without saying which — and the owner ratified it.
+- **What a crash between a row and its execution leaves.** A `started` row is
+  written before its execution is registered, as a tick's `fired` row is. At
+  the next start, a row that **waited** — its arrival was answered with its
+  intake id — and whose execution has no lifecycle row starts under the id it
+  recorded, once, **as the lease allows**: where its group has no free slot —
+  the execution the dead process was running is recovered and holds it — the
+  row goes back on the queue at the place it was admitted in, and starts when a
+  slot frees, never beside what holds it. A row that did not wait was answered
+  with nothing yet, so it is taken back and its arrival's source re-delivers
+  it. A start the journal
+  would not begin is undone the same two ways at once: a waited row goes back on
+  the queue, and an unwaited one is taken back and its arrival refused — a
+  `503` on `http` — as any admission the journal would not take is. **A
+  refused start of a waited row is not a settle**: the arrival is owed its
+  execution under the id it recorded, so no `settled` webhook is pushed for
+  it — pushed `failed`, it would be the only one the caller ever heard, since
+  the start that does run the execution finds that push journaled and
+  announces nothing — and the webhook goes where the start that reaches its
+  row closes it, as for any run (a debounce's close and a restart's repair
+  alike). An arrival that waited and is then dropped — superseded, or no
+  longer bound by the serving build — never began, and is pushed nothing;
+  its intake answers it. **Nor is a refused start of an unwaited row**, nor
+  of any arrival a gate keeps — a dedupe key's, a tick's: each is answered
+  only once its lifecycle row is down, so its caller is told nothing started
+  (on `http` the `503` that says the request may be sent again) and holds no
+  `202` naming the execution; a `failed` push for it would be a settle of an
+  execution nobody was told of, beside the one the resend starts. Only a start
+  no gate keeps — an `http` request with no `dedupe_key:` and no
+  `concurrency:`, answered `202` as it is set going — is pushed the failure of
+  a run that stopped before its row. **A start whose lifecycle row is down
+  although the journal answered a failure has begun**: a dialled journal can
+  commit an insert and lose the answer. Undone, its arrival would start twice
+  — a waited row begun again under its id beside the execution the next start
+  recovers, an unwaited one refused while that execution runs anyway — so its
+  row stays `started`, holding its slot as the open execution's, and the
+  execution runs at once in this process as a recovery would run it, from its
+  row: its generation recorded nothing, so the replay is its first run, and
+  the start is answered as the start it was. A start a gate keeps reads its
+  row the same way. **A waited row whose execution has begun already** —
+  this process runs it, after a recovery, or the journal holds its row, which
+  a start whose read of its own row missed the commit leaves — is moved to
+  `started` and never begun again: begun again it would be refused beside the
+  recovered generation, taking that one's place on the board as it went, and
+  run whole a second time once that one settled. A journal
+  that refuses the move back onto the queue too leaves the waited row
+  `started`, naming an execution that never began, which no drain of the queue
+  reads; the process keeps the start owed and tries the move again at every look
+  at the trigger's queue until it lands, and the next start finds the row either
+  way. **An owed start holds its group's slot** meanwhile: every look at the
+  queue reads it as a lease, so no later row of its group — nor one that would
+  take the trigger's last `max_running:` — starts into the slot its arrival was
+  answered for. And the unwaited row such a refusal leaves behind where it
+  cannot be taken back either is one more `started` row naming an execution its
+  source admits again under the same id: the lease is one slot per execution,
+  however many rows name it. A trigger counts as looked at after a start only
+  once the whole look is done — repairs, every pending row armed, the queue
+  drained — so a look the journal cut short is made again, whole, before the
+  trigger's next decision, and a pending row a dead process left is never left
+  unarmed.
+
+The following remain the implementation's readings, recorded for the owner —
+save where one states what becomes of a start the journal refused (when it
+is tried again, under "Queue order and progress"; a newcomer the journal
+refuses, under "`supersede` cancels every running execution of the group"),
+which is the seam ratified above:
+
 - **Which journal lets a `run` see the lease.** Ruling e's "it shares the
   journal, so it sees the lease" holds where a run can open the journal beside
   a `serve`, which is SQLite: its lock is taken per statement
@@ -14192,8 +14282,9 @@ owner's ruling:
   execution — it was replaced, not turned away — so its intake, and a repeat of
   its dedupe key, answer as an arrival that never began. A group under
   `supersede` therefore holds at most one queued arrival, its newest. A start
-  the process owes because the journal refused it (below) is not a queued row,
-  and is started as owed.
+  the process owes because the journal refused it (above, "What a crash
+  between a row and its execution leaves") is not a queued row, and is started
+  as owed.
 - **What `drop` answers.** `202`, the group's oldest running execution — or the
   trigger's, where it is `max_running:` that is full — its status URL, and the
   dropped row's `intake_id`; never a `409` or `429`, since the ruling answers a
@@ -14266,65 +14357,6 @@ owner's ruling:
   claim a crash left before the count, and is taken over — a dedupe key — or
   repaired — a tick — like any claim no admission began under, so the arrival
   is counted when it comes again rather than lost.
-- **What a crash between a row and its execution leaves.** A `started` row is
-  written before its execution is registered, as a tick's `fired` row is. At
-  the next start, a row that **waited** — its arrival was answered with its
-  intake id — and whose execution has no lifecycle row starts under the id it
-  recorded, once, **as the lease allows**: where its group has no free slot —
-  the execution the dead process was running is recovered and holds it — the
-  row goes back on the queue at the place it was admitted in, and starts when a
-  slot frees, never beside what holds it. A row that did not wait was answered
-  with nothing yet, so it is taken back and its arrival's source re-delivers
-  it. A start the journal
-  would not begin is undone the same two ways at once: a waited row goes back on
-  the queue, and an unwaited one is taken back and its arrival refused — a
-  `503` on `http` — as any admission the journal would not take is. **A
-  refused start of a waited row is not a settle**: the arrival is owed its
-  execution under the id it recorded, so no `settled` webhook is pushed for
-  it — pushed `failed`, it would be the only one the caller ever heard, since
-  the start that does run the execution finds that push journaled and
-  announces nothing — and the webhook goes where the start that reaches its
-  row closes it, as for any run (a debounce's close and a restart's repair
-  alike). An arrival that waited and is then dropped — superseded, or no
-  longer bound by the serving build — never began, and is pushed nothing;
-  its intake answers it. **Nor is a refused start of an unwaited row**, nor
-  of any arrival a gate keeps — a dedupe key's, a tick's: each is answered
-  only once its lifecycle row is down, so its caller is told nothing started
-  (on `http` the `503` that says the request may be sent again) and holds no
-  `202` naming the execution; a `failed` push for it would be a settle of an
-  execution nobody was told of, beside the one the resend starts. Only a start
-  no gate keeps — an `http` request with no `dedupe_key:` and no
-  `concurrency:`, answered `202` as it is set going — is pushed the failure of
-  a run that stopped before its row. **A start whose lifecycle row is down
-  although the journal answered a failure has begun**: a dialled journal can
-  commit an insert and lose the answer. Undone, its arrival would start twice
-  — a waited row begun again under its id beside the execution the next start
-  recovers, an unwaited one refused while that execution runs anyway — so its
-  row stays `started`, holding its slot as the open execution's, and the
-  execution runs at once in this process as a recovery would run it, from its
-  row: its generation recorded nothing, so the replay is its first run, and
-  the start is answered as the start it was. A start a gate keeps reads its
-  row the same way. **A waited row whose execution has begun already** —
-  this process runs it, after a recovery, or the journal holds its row, which
-  a start whose read of its own row missed the commit leaves — is moved to
-  `started` and never begun again: begun again it would be refused beside the
-  recovered generation, taking that one's place on the board as it went, and
-  run whole a second time once that one settled. A journal
-  that refuses the move back onto the queue too leaves the waited row
-  `started`, naming an execution that never began, which no drain of the queue
-  reads; the process keeps the start owed and tries the move again at every look
-  at the trigger's queue until it lands, and the next start finds the row either
-  way. **An owed start holds its group's slot** meanwhile: every look at the
-  queue reads it as a lease, so no later row of its group — nor one that would
-  take the trigger's last `max_running:` — starts into the slot its arrival was
-  answered for. And the unwaited row such a refusal leaves behind where it
-  cannot be taken back either is one more `started` row naming an execution its
-  source admits again under the same id: the lease is one slot per execution,
-  however many rows name it. A trigger counts as looked at after a start only
-  once the whole look is done — repairs, every pending row armed, the queue
-  drained — so a look the journal cut short is made again, whole, before the
-  trigger's next decision, and a pending row a dead process left is never left
-  unarmed.
 - **A deploy that removes a trigger's `concurrency:` block.** The rows an
   earlier build's intake accepted under it — queued and pending arrivals,
   answered `202` with an intake id — are owed a start all the same (ruling f),
@@ -14383,6 +14415,106 @@ owner's ruling:
 *PRD resolved q28, q32, q35, q36, q65, q75, q77, q78, q79; §4.1, §13.1–§13.5;
 `docs/durability.md` §3.12, §3.15, §6.3, §8, §11.2; `docs/distributed.md` §8;
 amends D162.*
+
+### D164. `verbatimPrompts` stays off on `cc`: the CLI's prompt pass is a stated exemption
+
+The `cc` adapter leaves the Agent SDK's `verbatimPrompts` option **off**, where
+the SDK defaults it, and the hole that leaves is a **stated exemption** from
+PRD resolved q57 ruling c's containment statement, stated as loudly as q54
+states its own. A node whose `input:` carries text the composition did not
+write closes the hole for itself with `settings: { verbatimPrompts: true }`,
+which [D140](#d140-harness-settings-is-a-second-open-object-checked-in-two-tiers)'s open tier admits and which stays off the reserved list ([D146](#d146-a-coder-nodes-permission-mode-is-a-key-bounded-by-access-and-a-reserved-setting-is-refused)).
+At every SDK pin bump the option's on setting is read against the pinned CLI
+again, and a CLI whose first `plan` request has lost the plan-mode reminder
+puts the key on that list (§8.9, PRD resolved q67).
+
+**The hole, in two halves.** The prompt a `cc` run is handed is its node's
+`input:`, which a node builds from state and a trigger's data, so text the
+composition did not write reaches the CLI as a prompt — and with the option off
+the CLI acts on two things in a prompt before any model reads it:
+
+* **An `@path` mention** is expanded into a synthetic `Read` result on the
+  run's first request: the file's contents, from anywhere the host can read,
+  with no tool call — so `allow_tools:`, the permission callback and the
+  permission mode never see it, and neither does `workspace:`. Observed against
+  the pinned CLI (2.1.284, SDK `0.3.284`) and against `0.3.272`'s (2.1.272)
+  alike, with a tool list of `Write` alone, a callback that denies every call
+  (and was never asked), a working directory of its own and a prompt naming a
+  file outside it: the first request carried the file, under `acceptEdits` and
+  `plan` both.
+* **A leading slash command** is dispatched as one of the CLI's own commands
+  rather than sent, and that reaches around `model:`: an input of `/model <id>`
+  switches the session's model, and the run's request goes out on `<id>` rather
+  than on the id the adapter mapped `model:` to — observed at both versions.
+  The same run's init message lists the commands the same text reaches
+  (`slash_commands`: `config`, `mcp`, `effort`, `fast` and `agents` among them).
+  Only `/model` has been driven; what the others reach is unaudited.
+
+Turned on — which `0.3.272` does not have — the option does neither: the file
+stays out of the first request, and a `/model …` prompt goes to the model as
+text, on the mapped id. The SDK also documents it as skipping, "on current
+CLIs", the CLI's whole turn-start attachment pass — the nested `CLAUDE.md` and
+rules files, the skill and tool listings, the other per-turn reminders — which
+then arrive only after the turn's first tool call. Under `read_only` that pass
+is where the plan-mode reminder §8.9's `cc` mapping rests on arrives, and the
+pinned CLI does not skip it: a `plan` run's first request with the option on
+still carries the reminder and the node's `planModeInstructions`, and of the
+context the run carried without the option the only piece missing was the
+token-budget reminder (observed against a local Messages endpoint, not only
+read). The emitted driver's audit note over `CC_RESERVED` records each of these
+observations.
+
+**Rationale**: the first turn's context — the project's `CLAUDE.md`, the skill
+and tool listings — is what PRD resolved q57 adopts a harness *for*: the
+vendor's loop with the vendor's context, co-trained with the model and not
+reassembled from `builtin.*` parts. Turning the option on for every run would
+buy containment of the prompt pass with exactly that, and re-supplying the
+context another way is not adopted. Containment at the harness's own primitive —
+`workspace:`, `access:` and the permission surface ([D138](#d138-a-coder-nodes-containment-is-a-workspace-an-access-preset-and-a-tool-list-one-harness-enforces), [D146](#d146-a-coder-nodes-permission-mode-is-a-key-bounded-by-access-and-a-reserved-setting-is-refused)) — covers
+what the harness *runs*, and it is unchanged: a tool call still goes through
+the tool list, the permission callback and the mode. The prompt pass is the
+vendor's CLI reading its own input, upstream of all of it, and what reaches that
+input is the composition's to decide. So the hole is stated rather than closed —
+as q54 states that a builtin tool hands the model the program, and q57(c) states
+that q54's bounds do not apply inside a harness run — and closing it for a node
+is left to the author, who knows what that node's `input:` carries.
+
+**The author's repair, per node.** `settings: { verbatimPrompts: true }`
+closes both halves for the node that sets it, at the cost of that node's
+first-turn context; a node whose `input:` the composition wrote whole has
+nothing to close. The key is in [D140](#d140-harness-settings-is-a-second-open-object-checked-in-two-tiers)'s open tier: the curated `cc` table does
+not know it, so `validate` warns that it travels unverified
+(`unknown-harness-setting`), and it travels. It is not on `CC_RESERVED` and is
+not refused, because on it **narrows**: it turns two CLI behaviours off and, at
+this pin, keeps the reminder `access: read_only` rests on.
+
+**The re-audit rule.** That last clause is an observation at one CLI, not a
+property of the option, and it is the first thing the next SDK pin bump
+re-verifies, before the pin moves: a CLI whose first request under `plan` has
+lost the plan-mode reminder makes the option a way around `read_only` — `plan`
+asks the permission callback, which answers `allow` inside the tool list, so a
+first turn without the reminder could run an in-list `Write` or `Bash` before
+the read-only preamble reached the model — and puts `verbatimPrompts` on
+`CC_RESERVED`, where `reserved-harness-setting` refuses it (PRD resolved q60
+ruling b).
+
+**Where it is stated.** Where an author meets the containment statement: §8.9,
+beside the `access:` table; the `agents` topic, beside its containment
+paragraph; the `unknown-harness-setting` explanation, which an author reads
+after writing the key; and the driver's audit note. `plan` output is unchanged.
+
+**Collision review.** [D138](#d138-a-coder-nodes-containment-is-a-workspace-an-access-preset-and-a-tool-list-one-harness-enforces)'s containment primitive is unchanged: the exemption
+sits upstream of it rather than weakening it. [D140](#d140-harness-settings-is-a-second-open-object-checked-in-two-tiers)'s open tier is read at its
+own words — the key travels, under a warning. [D146](#d146-a-coder-nodes-permission-mode-is-a-key-bounded-by-access-and-a-reserved-setting-is-refused)'s reserved list is
+unchanged, and the re-audit rule names the one observation that would add to it.
+PRD resolved q54 is the model the exemption follows; q57 ruling c is the
+statement it is an exemption from, and is otherwise unamended; q60's refusal is
+what the re-audit rule reaches for; and q66's audited range is unchanged — the
+observation is made at the range's floor, and a version inside the range is
+expected to keep it, unchecked, as every other driver contract is.
+
+**Status**: ratified — PRD resolved q67. *PRD resolved q54, q57, q60, q66, q67;
+§8.9; builds on D138, D140, D146.*
 
 ## Appendix B — Editor integration
 
