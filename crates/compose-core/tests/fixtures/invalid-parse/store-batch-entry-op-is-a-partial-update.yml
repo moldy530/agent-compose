@@ -1,0 +1,17 @@
+# rule: a `batch` entry is a `set` or a `delete`, and a partial update is a node of its own (grammar 11.4, PRD resolved q71)
+# code: unknown-variant
+# message: the `op` of `ops[0]` of node `move` is `merge`, and a batch entry is a `set` or a `delete`
+# at: 14:17
+# help: an entry's `op:` is the literal `set` or `delete`, never an expression — which write each entry is has to be readable without running the graph — and the partial updates are nodes of their own, since each reads the value it changes (grammar 11.4, PRD resolved q71)
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    move:
+      store: store.memory
+      op: batch
+      ops:
+        - { op: merge, key: "'new'", value: { body: "'x'" } }
+  edges:
+    - { from: start, to: move }
+    - { from: move, to: end }

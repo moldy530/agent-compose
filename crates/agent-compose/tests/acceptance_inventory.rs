@@ -918,6 +918,26 @@ const CODEGEN: &[Criterion] = &[
                 "a_flow_pages_through_a_kv_store_counts_it_and_reads_many_keys_at_once",
                 Status::Live,
             ),
+            // PRD resolved q71 on the node surface: a `batch` moves a record in
+            // one transaction and the flow routes on what it answered — a
+            // declined one applies none of its entries — and a `map` of batches
+            // at a key every instance shares lands every instance's entries
+            // (D67).
+            (
+                "a_flow_moves_a_record_with_a_batch_and_routes_on_what_it_answered",
+                Status::Live,
+            ),
+            (
+                "a_map_of_batches_lands_every_instances_entries",
+                Status::Live,
+            ),
+            // …and a batch's `set` entry is held to exactly what a single `set`
+            // is: q68's schema check, CEL typing at `validate` and no run-time
+            // Zod for a node, so one value lands by either.
+            (
+                "a_batch_set_entry_is_held_to_what_a_single_set_is",
+                Status::Live,
+            ),
         ],
     },
     Criterion {
@@ -1415,6 +1435,13 @@ const DURABILITY: &[Criterion] = &[
             // answer what the first generation read.
             (
                 "a_resumed_run_answers_a_count_and_a_get_many_out_of_the_record",
+                Status::Live,
+            ),
+            // …and PRD resolved q71's `batch`, across a store that moved back
+            // while the execution was down: a resumed batch answers what the
+            // first generation's did and applies none of it again.
+            (
+                "a_resumed_run_answers_a_batch_out_of_the_record_and_applies_none_of_it_again",
                 Status::Live,
             ),
         ],

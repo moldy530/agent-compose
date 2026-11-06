@@ -1,0 +1,17 @@
+# rule: a `delete` entry of a `batch` leaves no key to expire (grammar 11.4, PRD resolved q71, q69)
+# code: invalid-value
+# message: `ttl` is not a parameter of a `delete` entry: `ops[0]` of node `move` removes its key
+# at: 14:39
+# help: a `ttl:` is how long the key a write leaves lives, and a `delete` leaves none; give the `ttl:` to a `set` entry (grammar 11.4, PRD resolved q69)
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    move:
+      store: store.memory
+      op: batch
+      ops:
+        - { op: delete, key: "'old'", ttl: 1h }
+  edges:
+    - { from: start, to: move }
+    - { from: move, to: end }

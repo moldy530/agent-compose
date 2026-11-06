@@ -648,6 +648,35 @@ fn store_params(params: &StoreParams) -> Vec<BindingView> {
     if let Some(keys) = &params.keys {
         push("keys", keys.value.as_str().to_string());
     }
+    // A `batch`'s entries, each under its index — `ops[0].key`, `ops[1].if` —
+    // so the artifact shows every expression and literal one entry holds (PRD
+    // resolved q71).
+    if let Some(ops) = &params.ops {
+        for (index, entry) in ops.value.iter().enumerate() {
+            let at = |name: &str| format!("ops[{index}].{name}");
+            push(&at("op"), entry.op.value.as_str().to_string());
+            if let Some(key) = &entry.key {
+                push(&at("key"), key.value.as_str().to_string());
+            }
+            if let Some(value) = &entry.value {
+                for binding in &value.entries {
+                    push(
+                        &at(&format!("value.{}", binding.name.value)),
+                        binding.value.value.as_str().to_string(),
+                    );
+                }
+            }
+            if let Some(condition) = &entry.condition {
+                push(&at("if"), condition.value.as_str().to_string());
+            }
+            if let Some(version) = &entry.if_version {
+                push(&at("if_version"), version.value.as_str().to_string());
+            }
+            if let Some(ttl) = &entry.ttl {
+                push(&at("ttl"), ttl.value.as_str().to_string());
+            }
+        }
+    }
     held
 }
 
@@ -1202,7 +1231,7 @@ fn output_schema(ir: &Ir, node: &Node) -> Option<(SchemaSource, FieldMap)> {
             let declared = store_of(ir, &store.value.to_string())?;
             let bound = match declared.kind {
                 StoreKind::Vector => params.top_k,
-                _ => params.limit,
+                _ => params.bound(),
             };
             Some((
                 SchemaSource::KindDefault,

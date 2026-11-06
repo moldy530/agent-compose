@@ -60,11 +60,13 @@
 // so the arms differ in how they lock and store a row and in nothing a write
 // means.
 //
-// Every `kv` write answers `{ applied, version, deduped }` beside its own
-// fields, and the idempotency ledger below stores that **whole** answer: a
-// retried write is answered with its first attempt's `applied` and `version`
-// and `deduped: true`, so a retried successful claim never fails against its
-// own first write.
+// Every single-key `kv` write answers `{ applied, version, deduped }` beside
+// its own fields — a `batch`, which wrote many keys, answers `applied` and
+// `deduped` with each entry's version in its `results` instead — and the
+// idempotency ledger below stores that **whole** answer: a retried write is
+// answered with its first attempt's `applied` and `version` and
+// `deduped: true`, so a retried successful claim never fails against its own
+// first write.
 //
 // # Reading at scale (PRD resolved q70)
 //
@@ -438,9 +440,9 @@ export interface StoreBinding {
 
 /**
  * The ops of grammar 11.4's catalog — its seven, PRD resolved q68's three
- * partial updates, and q70's two reads.
+ * partial updates, q70's two reads, and q71's `batch`.
  */
-export type StoreOp = "get" | "set" | "delete" | "list" | "search" | "upsert" | "put" | "merge" | "append" | "incr" | "count" | "get_many";
+export type StoreOp = "get" | "set" | "delete" | "list" | "search" | "upsert" | "put" | "merge" | "append" | "incr" | "count" | "get_many" | "batch";
 
 /** The literal conditions a `kv` write's `if:` takes (grammar 11.4). */
 export type StoreCondition = "absent" | "present";
@@ -504,6 +506,32 @@ export interface StoreParams {
    * the type says it already is.
    */
   readonly keys?: unknown;
+  /**
+   * `ops:` — a `batch`'s entries, in the order they apply (PRD resolved q71).
+   * [`batchEntries`] holds them to the shape the compiler already decided, so
+   * a caller that skipped it is refused by name rather than half applied.
+   */
+  readonly ops?: readonly BatchEntryParams[];
+}
+
+/**
+ * One entry of a `batch`, already evaluated: a `set` or a `delete` of one key,
+ * with exactly the parameters the single op of its name takes (grammar 11.4,
+ * PRD resolved q71).
+ */
+export interface BatchEntryParams {
+  /** Which write the entry is. */
+  readonly op: "set" | "delete";
+  /** The key it addresses. */
+  readonly key: string;
+  /** A `set` entry's whole value. */
+  readonly value?: unknown;
+  /** `if:` — a `set` entry's literal condition. */
+  readonly condition?: StoreCondition;
+  /** `if_version:` — the version the key must hold. */
+  readonly ifVersion?: number;
+  /** `ttl:` — how long the key a `set` entry leaves lives, as a `set`'s is. */
+  readonly ttl?: number | "never";
 }
 
 /** Where an op was issued from, and what key it carries (grammar 9.4). */
@@ -537,7 +565,9 @@ type Issuer = StoreSite["via"] | "operator";
  *
  * Every other op is a **read**: recorded, answered out of the record on a
  * replay, and carrying no idempotency key — a `list` page and PRD resolved
- * q70's `count` and `get_many` exactly as a `get` (PRD resolved q29).
+ * q70's `count` and `get_many` exactly as a `get` (PRD resolved q29). A
+ * `batch` is a write, and **one**: its entries are one effect under the node's
+ * one key, answered by one ledger row (PRD resolved q71).
  */
 function writes(op: StoreOp): boolean {
   return (
@@ -547,7 +577,8 @@ function writes(op: StoreOp): boolean {
     op === "put" ||
     op === "merge" ||
     op === "append" ||
-    op === "incr"
+    op === "incr" ||
+    op === "batch"
   );
 }
 
@@ -1564,8 +1595,11 @@ export async function runStoreOp(
   // A `get_many`'s keys are a CEL list whose length nothing knew before the
   // node ran, so the most one reads is held here — before the journal, so a
   // refused read is a node failure rather than an effect anybody recorded, and
-  // a replay refuses it the same way (PRD resolved q70).
+  // a replay refuses it the same way (PRD resolved q70). A `batch`'s entries
+  // are held to their shape at the same point, for the same reason (PRD
+  // resolved q71).
   if (op === "get_many") getManyKeys(store, params);
+  if (op === "batch") batchEntries(store, params);
 
   // At-least-once, deduped on the key (grammar 9.4). Asked before the effect and
   // recorded with it in one transaction, so an attempt that failed half way
@@ -1607,7 +1641,10 @@ export async function runStoreOp(
   // A `kv` write's record carries what it decided — whether it landed, and
   // the version the key holds after it — read off its own answer, so the
   // record and the node's output cannot disagree (`docs/trace.md` §6, PRD
-  // resolved q68).
+  // resolved q68). A `batch` addresses many keys and leaves many versions, so
+  // its record carries neither a `key` nor a `version`: the keys it wrote and
+  // the version each took are its answer's `results`, which the record
+  // carries whole, as a read's does (PRD resolved q71).
   const version = answer.row["version"];
   record(context, {
     store: store.address,
@@ -1616,7 +1653,7 @@ export async function runStoreOp(
     via: site.via,
     scope: store.scope,
     ...(key === undefined ? {} : { key }),
-    ...(writes(op) ? {} : { answer: answer.row }),
+    ...(writes(op) && op !== "batch" ? {} : { answer: answer.row }),
     ...(kvWrite(store, op)
       ? {
           applied: answer.row["applied"] === true,
@@ -1934,6 +1971,121 @@ function refused(
   return via === "tool" ? new runtime.ToolCallRefused(message) : new Error(message);
 }
 
+// ---------------------------------------------------------------------------
+// What a `batch` decides (PRD resolved q71)
+// ---------------------------------------------------------------------------
+//
+// A batch is the shape of one `kv` write with N entries inside its one
+// transaction — not N writes. Each arm takes what a write takes **once**: the
+// partition's sequence lock (a dialled server's `FOR UPDATE`, SQLite's
+// `BEGIN IMMEDIATE`), the ledger check that answers a retry with the stored
+// row, the per-write sweep and the clock. Then it walks the entries in order,
+// each one exactly a single `set` or `delete`: it reads its key under the lock
+// a write of it would take ([`heldRow`]), and [`batchStep`] — which is
+// [`decideKvWrite`] — says what that entry does. An entry that lands lands at
+// once, inside the transaction, so a later entry naming the same key reads
+// what an earlier one left. A `set` entry takes the partition's next version,
+// in entry order, and its own expiry ([`expiryOf`] over the entry's `ttl`, else
+// the store's `default_ttl:`).
+//
+// **The first entry that cannot land decides the batch, and nothing lands.** A
+// condition that does not hold rolls every earlier entry back to the savepoint
+// taken before the first, and the batch answers `applied: false` naming that
+// entry's index as `failed` — an answer like a declined `set`'s, so it is the
+// ledger row too, and a retry answers it again. An entry's value is checked
+// against `value_schema` exactly as its single op's is — by CEL typing at
+// `validate`, the check PRD resolved q68 gives a store-op node — and written
+// as it evaluated, so no entry is refused here that its `set` would not be. A
+// statement that fails throws, and the transaction takes everything with it
+// but the error, with no version consumed. A crash anywhere between the first
+// entry and the `COMMIT` is a transaction that never committed, on every arm.
+
+/** The most entries one `batch` applies (grammar 11.4, PRD resolved q71). */
+const BATCH_MAX_ENTRIES = 100;
+
+/**
+ * A `batch`'s entries, held to the shape the compiler already decided: one to
+ * [`BATCH_MAX_ENTRIES`] of them, each a `set` with a key and a value or a
+ * `delete` with a key, and none carrying a parameter its op does not take.
+ *
+ * The compiler emits nothing else, so this refuses a caller that skipped it —
+ * by name, before the journal and before any store is reached — rather than
+ * letting a malformed entry be half of a transaction.
+ */
+function batchEntries(store: StoreBinding, params: StoreParams): readonly BatchEntryParams[] {
+  const entries = params.ops;
+  const refuse = (detail: string): Error =>
+    new Error(
+      `a \`batch\` on \`${store.address}\` was handed ${detail}: a batch applies 1 to ${BATCH_MAX_ENTRIES} entries, each a \`set\` of one key's whole value or a \`delete\` of one key (grammar 11.4, PRD resolved q71)`,
+    );
+  if (!Array.isArray(entries)) throw refuse("no list of entries");
+  if (entries.length === 0 || entries.length > BATCH_MAX_ENTRIES) {
+    throw refuse(`${entries.length} entries`);
+  }
+  entries.forEach((entry: BatchEntryParams, index: number) => {
+    if (entry === null || typeof entry !== "object") throw refuse(`an entry ${index} that is not an object`);
+    if (entry.op !== "set" && entry.op !== "delete") {
+      throw refuse(`an entry ${index} whose op is ${JSON.stringify(entry.op ?? null)}`);
+    }
+    if (typeof entry.key !== "string") throw refuse(`an entry ${index} with no key`);
+    if (entry.op === "set" && entry.value === undefined) throw refuse(`a \`set\` entry ${index} with no value`);
+    if (
+      entry.op === "delete" &&
+      (entry.value !== undefined || entry.condition !== undefined || entry.ttl !== undefined)
+    ) {
+      throw refuse(`a \`delete\` entry ${index} carrying a value, an \`if:\` or a \`ttl\``);
+    }
+    if (entry.condition !== undefined && entry.ifVersion !== undefined) {
+      throw refuse(`an entry ${index} with two conditions`);
+    }
+  });
+  return entries;
+}
+
+/** What one `batch` entry does, given what its key held. */
+type BatchStep =
+  | { readonly effect: "none" }
+  | { readonly effect: "remove" }
+  | { readonly effect: "write"; readonly value: unknown };
+
+/**
+ * One `batch` entry, decided: [`decideKvWrite`] over what its key held — the
+ * very decision a single `set` or `delete` makes, with the same conditions,
+ * so an entry cannot mean anything its single op would not.
+ *
+ * A `set` entry's value is not parsed against the store's `value_schema`
+ * here, because a single `set` node's is not: the schema check PRD resolved
+ * q71 gives every entry is q68's — CEL typing at `validate` for a store-op
+ * node, the emitted Zod at run time for a tool's arguments — and a batch is a
+ * node's alone. So an entry is written as its CEL evaluated, exactly as the
+ * `set` it spells would be, and a constraint CEL typing does not decide — a
+ * bound, a pattern — holds of an entry no more and no less than of that `set`
+ * (grammar 11.4's schema evolution).
+ */
+function batchStep(store: StoreBinding, entry: BatchEntryParams, held: Held | undefined): BatchStep {
+  const decision = decideKvWrite(store, entry.op, entry, held, "node");
+  switch (decision.effect) {
+    case "none":
+      return { effect: "none" };
+    case "remove":
+      return { effect: "remove" };
+    case "write":
+      return { effect: "write", value: decision.value };
+    case "touch":
+      // Only an `append` with `unique: true` touches, and no entry is one.
+      throw new Error(`a \`batch\` entry on \`${store.address}\` is a \`${entry.op}\`, which never only touches its key`);
+  }
+}
+
+/**
+ * What a batch whose entry `failed` declined answers: nothing applied, no
+ * results, and the entry whose condition did not hold — the row a retry is
+ * handed again (PRD resolved q71).
+ */
+function declinedBatch(failed: number): Record<string, unknown> {
+  return { applied: false, deduped: false, results: [], failed };
+}
+
 /** Two JSON values as one, whatever order an object's keys were written in. */
 function sameJson(left: unknown, right: unknown): boolean {
   return canonicalJson(left) === canonicalJson(right);
@@ -2138,10 +2290,60 @@ function localKv(
       }
       break;
     }
+    case "batch":
+      return localBatch(store, params, scopeKey, database, now);
     default:
       break;
   }
   throw new Error(`\`${store.address}\` is \`kind: kv\` and takes no \`${op}\``);
+}
+
+/**
+ * A `batch` on the local backend, inside the `BEGIN IMMEDIATE` transaction
+ * [`perform`] opened — whose ledger check has already answered a retry — and
+ * at the one instant `now` the op reads its clock (PRD resolved q71).
+ *
+ * The partition's expired rows are swept once, as one write sweeps them, and a
+ * savepoint is taken before the first entry, so an entry whose condition does
+ * not hold takes every earlier entry back with it while the ledger row the
+ * decline is answered by still commits. Each entry that lands is written at
+ * once — [`nextLocalVersion`] numbers them in entry order — so a later entry
+ * naming the same key reads what the earlier one left.
+ */
+function localBatch(
+  store: StoreBinding,
+  params: StoreParams,
+  scopeKey: string,
+  database: Database,
+  now: number,
+): Record<string, unknown> {
+  const entries = batchEntries(store, params);
+  sweepLocalPartition(database, scopeKey, now);
+  database.exec("SAVEPOINT batch_entries");
+  const results: Record<string, unknown>[] = [];
+  for (const [index, entry] of entries.entries()) {
+    const step = batchStep(store, entry, localHeld(database, scopeKey, entry.key, now));
+    if (step.effect === "none") {
+      database.exec("ROLLBACK TO SAVEPOINT batch_entries");
+      database.exec("RELEASE SAVEPOINT batch_entries");
+      return declinedBatch(index);
+    }
+    if (step.effect === "remove") {
+      database.run("DELETE FROM entries WHERE scope_key = ? AND key = ?", [scopeKey, entry.key]);
+      results.push({ key: entry.key });
+      continue;
+    }
+    const version = nextLocalVersion(database, scopeKey);
+    database.run(
+      "INSERT INTO entries (scope_key, key, value, version, expires_at) VALUES (?, ?, ?, ?, ?) " +
+        "ON CONFLICT (scope_key, key) DO UPDATE SET value = excluded.value, " +
+        "version = excluded.version, expires_at = excluded.expires_at",
+      [scopeKey, entry.key, JSON.stringify(step.value), version, expiryOf(store, entry, now)],
+    );
+    results.push({ key: entry.key, version });
+  }
+  database.exec("RELEASE SAVEPOINT batch_entries");
+  return { applied: true, deduped: false, results };
 }
 
 /**
@@ -3097,7 +3299,10 @@ class RemoteKv {
       return { row: await this.#read(store, op, params, scopeKey), deduped: false };
     }
     for (let attempt = 0; ; attempt += 1) {
-      const answered = await this.#write(store, op, params, scopeKey, idempotencyKey, via);
+      const answered =
+        op === "batch"
+          ? await this.#batch(store, params, scopeKey, idempotencyKey)
+          : await this.#write(store, op, params, scopeKey, idempotencyKey, via);
       if (answered !== undefined) return answered;
       // The partition's sequence row was not there to lock. It is created on
       // the partition's first write and deleted only when an execution-scoped
@@ -3268,6 +3473,143 @@ class RemoteKv {
         if (claimed === 0) {
           await this.#run("ROLLBACK", []);
           return await this.#claimedElsewhere(store, op, idempotencyKey);
+        }
+      }
+    } catch (error) {
+      await this.#run("ROLLBACK", []).catch(() => undefined);
+      throw error;
+    }
+    await this.#run("COMMIT", []);
+    return { row, deduped: false };
+  }
+
+  /**
+   * One `batch`, in one transaction: [`#write`]'s shape with its entries
+   * inside it — or `undefined` where the partition has no sequence row yet
+   * (PRD resolved q71).
+   *
+   * The partition's sequence row is locked first, the ledger asked once (a
+   * retry is answered with the stored row, whole), the clock read once and the
+   * partition swept once, all as one write does; then a savepoint, and each
+   * entry in order — its key's row locked `FOR UPDATE` and read, decided by
+   * [`batchStep`], and written at once, so a later entry naming the same key
+   * reads what an earlier one left. Sequence first and entries after, on every
+   * batch and every write, is the order that keeps two of them from waiting on
+   * each other in a circle, however their keys overlap. The versions the `set`
+   * entries take are the sequence's next ones in entry order, moved on in one
+   * statement once every entry has landed.
+   *
+   * An entry whose condition does not hold rolls the entries back to the
+   * savepoint and the batch answers its decline, which the ledger row then
+   * holds; a lost connection or a server that fails a statement throws, and
+   * the `ROLLBACK` takes every entry, the versions they would have taken and
+   * the sweep with it. A connection that dies between two entries — the
+   * process killed, the session ended by the server — is a transaction that
+   * never reached its `COMMIT`, which the server rolls back the same way.
+   */
+  async #batch(
+    store: StoreBinding,
+    params: StoreParams,
+    scopeKey: string,
+    idempotencyKey: string | undefined,
+  ): Promise<Applied | undefined> {
+    const entries = batchEntries(store, params);
+    await this.#run("BEGIN", []);
+    let row: Record<string, unknown>;
+    try {
+      const sequence = await this.#all(
+        "SELECT last FROM store_sequences WHERE store = ? AND scope_key = ? FOR UPDATE",
+        [store.name, scopeKey],
+      );
+      if (sequence.length === 0) {
+        await this.#run("ROLLBACK", []);
+        return undefined;
+      }
+      const first = Number(sequence[0]?.["last"]);
+      if (idempotencyKey !== undefined) {
+        const seen = await this.#all(
+          "SELECT result FROM store_applied WHERE store = ? AND idempotency_key = ?",
+          [store.name, idempotencyKey],
+        );
+        const result = seen[0]?.["result"];
+        if (result !== undefined && result !== null) {
+          await this.#run("ROLLBACK", []);
+          return { row: redelivered(store, "batch", String(result)), deduped: true };
+        }
+      }
+      const now = await this.#now();
+      await this.#run(this.#driver.dialect.sweepPartition(SWEEP_PER_WRITE), [
+        store.name,
+        scopeKey,
+        now,
+      ]);
+      await this.#run("SAVEPOINT batch_entries", []);
+      let last = first;
+      let failed: number | undefined;
+      const results: Record<string, unknown>[] = [];
+      for (const [index, entry] of entries.entries()) {
+        const found = await this.#all(
+          'SELECT value, version, expires_at FROM store_entries WHERE store = ? AND scope_key = ? AND "key" = ? FOR UPDATE',
+          [store.name, scopeKey, entry.key],
+        );
+        const step = batchStep(store, entry, heldRow(found[0], now));
+        if (step.effect === "none") {
+          failed = index;
+          break;
+        }
+        if (step.effect === "remove") {
+          await this.#run(
+            'DELETE FROM store_entries WHERE store = ? AND scope_key = ? AND "key" = ?',
+            [store.name, scopeKey, entry.key],
+          );
+          results.push({ key: entry.key });
+          continue;
+        }
+        last += 1;
+        await this.#run(
+          'INSERT INTO store_entries (store, scope_key, "key", value, version, expires_at) VALUES (?, ?, ?, ?, ?, ?) ' +
+            this.#driver.dialect.overwrite('(store, scope_key, "key")', [
+              "value",
+              "version",
+              "expires_at",
+            ]),
+          [
+            store.name,
+            scopeKey,
+            entry.key,
+            JSON.stringify(step.value),
+            last,
+            expiryOf(store, entry, now),
+          ],
+        );
+        results.push({ key: entry.key, version: last });
+      }
+      if (failed !== undefined) {
+        await this.#run("ROLLBACK TO SAVEPOINT batch_entries", []);
+        row = declinedBatch(failed);
+      } else {
+        if (last !== first) {
+          await this.#run("UPDATE store_sequences SET last = ? WHERE store = ? AND scope_key = ?", [
+            last,
+            store.name,
+            scopeKey,
+          ]);
+        }
+        row = { applied: true, deduped: false, results };
+      }
+      await this.#run("RELEASE SAVEPOINT batch_entries", []);
+      if (idempotencyKey !== undefined) {
+        const claimed = await this.#run(
+          "INSERT INTO store_applied (store, scope_key, idempotency_key, op, result) " +
+            `VALUES (?, ?, ?, ?, ?) ${this.#driver.dialect.ignore(
+              "(store, idempotency_key)",
+              "idempotency_key = idempotency_key",
+            )}`,
+          [store.name, scopeKey, idempotencyKey, "batch", JSON.stringify(row)],
+        );
+        if (claimed === 0) {
+          await this.#run("ROLLBACK", []);
+          return await this.#claimedElsewhere(store, "batch", idempotencyKey);
         }
       }
     } catch (error) {

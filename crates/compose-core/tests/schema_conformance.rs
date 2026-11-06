@@ -616,6 +616,72 @@ fn the_published_schema_accepts_a_page_a_count_and_a_get_many() {
     );
 }
 
+/// **The published schema takes a `batch` in every shape the grammar admits,
+/// and bounds its list** (grammar 11.4, PRD resolved q71).
+///
+/// The `invalid-schema/` corpus pins the refusals — an empty list, 101 entries,
+/// a `delete` entry with a `value`, a `set` entry without one, two conditions
+/// on one entry, a node-level `key:` beside `ops:` — and nothing in
+/// `examples/` reaches a batch, so the accepted half is pinned here: every
+/// entry key a `set` and a `delete` take, both conditions, a `ttl` of both
+/// spellings, and a list of exactly the most one batch holds.
+#[test]
+fn the_published_schema_accepts_a_batch_and_bounds_its_list() {
+    let validator = compile_schema();
+    let hundred: Vec<Value> = (0..compose_core::ast::flow::BATCH_MAX_ENTRIES)
+        .map(|index| json!({ "op": "delete", "key": format!("'k{index}'") }))
+        .collect();
+    let nodes = [
+        json!({
+            "store": "store.notes",
+            "op": "batch",
+            "ops": [
+                { "op": "set", "key": "'new'", "value": { "title": "input.title" }, "if": "absent", "ttl": "1h" },
+                { "op": "set", "key": "'other'", "value": { "title": "'x'" }, "if_version": "3", "ttl": "never" },
+                { "op": "delete", "key": "'old'", "if_version": "state.version" },
+                { "op": "delete", "key": "'gone'" },
+            ],
+            "writes": { "applied": "moved" },
+        }),
+        json!({ "store": "store.notes", "op": "batch", "ops": hundred }),
+    ];
+    for node in nodes {
+        let instance = json!({
+            "flow.work": {
+                "outputs": {},
+                "nodes": { "write": node },
+                "edges": [{ "from": "start", "to": "write" }, { "from": "write", "to": "end" }],
+            },
+        });
+        let errors = validation_errors(&validator, &instance);
+        assert!(
+            errors.is_empty(),
+            "the published schema must accept this legal batch:\n{}\n{}",
+            serde_json::to_string_pretty(&instance).expect("a printable instance"),
+            errors.join("\n")
+        );
+    }
+    let schema = read_schema();
+    let ops = &schema["$defs"]["storeNode"]["properties"]["ops"];
+    assert_eq!(ops["minItems"], json!(1), "{ops}");
+    assert_eq!(
+        ops["maxItems"],
+        json!(compose_core::ast::flow::BATCH_MAX_ENTRIES),
+        "the schema's bound is the compiler's: {ops}"
+    );
+    let entry_ops: Vec<&str> = schema["$defs"]["storeBatchEntry"]["properties"]["op"]["enum"]
+        .as_array()
+        .expect("an entry's op is an enum")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let catalogue: Vec<&str> = compose_core::ast::flow::BatchOp::ALL
+        .iter()
+        .map(|op| op.as_str())
+        .collect();
+    assert_eq!(entry_ops, catalogue, "an entry is a `set` or a `delete`");
+}
+
 /// **The published schema takes every `permission_mode:` the grammar spells,
 /// and no other** (grammar 8.9, Decision D146, PRD resolved q60 ruling a).
 ///

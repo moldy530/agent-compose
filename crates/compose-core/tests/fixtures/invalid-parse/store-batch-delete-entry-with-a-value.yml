@@ -1,0 +1,18 @@
+# rule: a `delete` entry of a `batch` takes no `value` (grammar 11.4, PRD resolved q71)
+# code: invalid-value
+# message: `value` is not a parameter of a `delete` entry: `ops[1]` of node `move` removes its key
+# at: 15:39
+# help: a `delete` entry takes `key` and `if_version`; to write a value at the key, make the entry `op: set` (grammar 11.4, PRD resolved q71)
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    move:
+      store: store.memory
+      op: batch
+      ops:
+        - { op: set, key: "'new'", value: { body: "'x'" } }
+        - { op: delete, key: "'old'", value: { body: "'x'" } }
+  edges:
+    - { from: start, to: move }
+    - { from: move, to: end }

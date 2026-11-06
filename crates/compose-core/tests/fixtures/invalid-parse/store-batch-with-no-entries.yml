@@ -1,0 +1,16 @@
+# rule: a `batch` applies 1 to 100 entries (grammar 11.4, PRD resolved q71)
+# code: value-out-of-range
+# message: `ops` of node `move` is empty, and a `batch` applies 1 to 100
+# at: 13:12
+# help: a batch applies its entries in one transaction under one ledger row, so one with none would be a write of nothing: write its entries, or drop the node (grammar 11.4, PRD resolved q71)
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    move:
+      store: store.memory
+      op: batch
+      ops: []
+  edges:
+    - { from: start, to: move }
+    - { from: move, to: end }

@@ -526,6 +526,29 @@ fn store_params(source: &ast_flow::StoreOpParams) -> Option<ir::flow::StoreParam
         after: source.after.clone(),
         include_values: source.include_values.clone(),
         keys: source.keys.clone(),
+        ops: match &source.ops {
+            None => None,
+            Some(ops) => Some(Spanned::new(
+                ops.value
+                    .iter()
+                    .map(batch_entry)
+                    .collect::<Option<Vec<_>>>()?,
+                ops.span.clone(),
+            )),
+        },
+    })
+}
+
+/// One `batch` entry. Its op is the one field a clean parse always has.
+fn batch_entry(source: &ast_flow::BatchEntry) -> Option<ir::flow::BatchEntry> {
+    Some(ir::flow::BatchEntry {
+        op: source.op.clone()?,
+        key: source.key.clone(),
+        value: source.value.as_ref().map(bindings),
+        condition: source.condition.clone(),
+        if_version: source.if_version.clone(),
+        ttl: source.ttl.clone(),
+        span: source.span.clone(),
     })
 }
 

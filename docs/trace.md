@@ -715,14 +715,14 @@ Writes are at-least-once with idempotency keys."
 | field | type | presence | meaning |
 |---|---|---|---|
 | `store` | string | always | The store's typed address (grammar §2.2). |
-| `op` | string | always | The op, spelled as grammar §11.4 spells it: `get`, `set`, `delete`, `list`, `search`, `upsert`, `put`, `merge`, `append`, `incr`, `count`, `get_many`. |
-| `effect` | `"read"` \| `"write"` | always | Which half of the replay discipline this record belongs to. `set`, `delete`, `upsert`, `put`, `merge`, `append` and `incr` are writes; the rest — `get`, `list`, `search`, `count` and `get_many` — are reads. |
+| `op` | string | always | The op, spelled as grammar §11.4 spells it: `get`, `set`, `delete`, `list`, `search`, `upsert`, `put`, `merge`, `append`, `incr`, `count`, `get_many`, `batch`. |
+| `effect` | `"read"` \| `"write"` | always | Which half of the replay discipline this record belongs to. `set`, `delete`, `upsert`, `put`, `merge`, `append`, `incr` and `batch` are writes — a `batch` **one** write, whatever its entries; the rest — `get`, `list`, `search`, `count` and `get_many` — are reads. |
 | `via` | `"node"` \| `"tool"` | always | Which of PRD 5.8's two consumption surfaces ran it: a store-op node, or a synthesized store tool an agent called inside its loop. |
 | `scope` | `"execution"` \| `"session"` \| `"global"` | always | The store's declared lifetime, and with it which partition was addressed (grammar §11.3). |
-| `key` | string | `get`, `set`, `delete`, `upsert`, `put`, `merge`, `append`, `incr` | The key the op addressed. Absent on the four ops of grammar §11.4's catalog that address no single key: `list`, which takes a `prefix` (and on a `kv` store an `after` cursor), `count`, which takes a `prefix`, `get_many`, which takes a list of `keys`, and `search`, which takes a `query`. Which keys a `list` or a `get_many` reached is in its `answer`. |
-| `answer` | any | `"read"` | What the read answered — the history a replay consumes. On **every** read record: a read that found nothing still answered, and grammar §11.4's own output row is what it answered with — a `get` that missed carries `{ found: false }` and no `value` (Decision D110), which is an answer and not an absence; a `kv` page carries its `keys`, its `next` where more remain and its `entries` where its node asked for them, a `count` its `count`, and a `get_many` one entry per key it was asked for. Its shape is the store's (grammar §11.4), not this format's. |
+| `key` | string | `get`, `set`, `delete`, `upsert`, `put`, `merge`, `append`, `incr` | The key the op addressed. Absent on the five ops of grammar §11.4's catalog that address no single key: `list`, which takes a `prefix` (and on a `kv` store an `after` cursor), `count`, which takes a `prefix`, `get_many`, which takes a list of `keys`, `search`, which takes a `query`, and `batch`, whose entries each name their own. Which keys a `list`, a `get_many` or a `batch` reached is in its `answer`. |
+| `answer` | any | `"read"`, and a `"write"` whose `op` is `batch` | What the read answered — the history a replay consumes. On **every** read record: a read that found nothing still answered, and grammar §11.4's own output row is what it answered with — a `get` that missed carries `{ found: false }` and no `value` (Decision D110), which is an answer and not an absence; a `kv` page carries its `keys`, its `next` where more remain and its `entries` where its node asked for them, a `count` its `count`, and a `get_many` one entry per key it was asked for. Its shape is the store's (grammar §11.4), not this format's. On a `batch` — the one write that carries it — it is what the batch answered, `{ applied, deduped, results, failed }`: `results` one `{ key, version }` per entry in the order they applied (no `version` on a `delete` entry's, and none at all where the batch declined, which names the entry in `failed`). A batch's keys and versions are there because it has no one `key` or `version` to put in those two fields (PRD resolved q71). |
 | `applied` | boolean | `"write"` on a `kv` store | Whether the write's condition held and it landed (grammar §11.4, PRD resolved q68). A write with no `if:`/`if_version:` is `true` whenever it ran; `false` is a condition that did not hold — an answer the node routed on, never a failure — and nothing was written. On **both** surfaces, because it is what the write decided rather than a property of how it was delivered. On a deduplicated record it is the first attempt's (`deduped` below). |
-| `version` | integer | `"write"` on a `kv` store whose answer carries one | The version the key holds after the write: the one it took from its partition's version sequence where it applied, the one it still holds where it declined (grammar §11.4). Absent on a `delete` that applied, which leaves the key holding nothing, and on a write that declined against a key holding nothing; a `delete` that declined carries the version the key still holds, like every other declined write. Like `applied`, on both surfaces. |
+| `version` | integer | `"write"` on a `kv` store whose answer carries one | The version the key holds after the write: the one it took from its partition's version sequence where it applied, the one it still holds where it declined (grammar §11.4). Absent on a `delete` that applied, which leaves the key holding nothing, and on a write that declined against a key holding nothing; a `delete` that declined carries the version the key still holds, like every other declined write. Absent on every `batch`, whose entries each took or left their own — they are in its `answer`. Like `applied`, on both surfaces. |
 | `idempotencyKey` | string | `"write"` **via `"node"`** | The key the write carried (grammar §9.4). See §8, and the paragraph below for the surface that carries none. |
 | `deduped` | boolean | `"write"` **via `"node"`** | Whether the backend had already applied that key — the difference between "this run wrote it" and "an earlier attempt of this same effect did". |
 
@@ -1279,8 +1279,8 @@ At a given `trace_version`, a reader MAY rely on:
   names as the one message-shaped field a reader may match on. `op` is the one
   whose type in `src/runtime.ts` is `string` rather than the union — the union is
   the emitted `src/stores.ts`'s `StoreOp`, and a record type declared under the
-  runtime cannot name it without inverting that dependency — so §6's ten are
-  its vocabulary, and the inventory checks them against `StoreOp` itself;
+  runtime cannot name it without inverting that dependency — so §6's thirteen
+  are its vocabulary, and the inventory checks them against `StoreOp` itself;
 * the orders §3.1, §4.1, §5 and §7.3 fix — entries by `(step, node)`, edge
   decisions in declaration order, a `map`'s dispatch records in source-item index
   order, a tool loop's in call order, and a model call's `toolCalls` in the
@@ -1356,6 +1356,24 @@ and an `answer`'s shape is the store's rather than this format's (§6), so a
 reader that branches on `effect` and ignores what it does not recognize
 (§10.1) reads them as before. The ruling states no trace change beyond the
 catalogue and makes no bump, so `trace_version` stays `6`.
+
+**PRD resolved q71 is a release of q68's kind too, and the one that moves a
+presence cell.** It added one op to grammar §11.4's catalogue, `batch`, which
+§6's `op` row now names. A batch record is a `"write"` that carries what every
+`kv` write's carries — `applied`, and on a node's `idempotencyKey` and
+`deduped` — and no `key` and no `version`, the shape a `list` record already
+has for "no single key". What it carries instead is an `answer`, which §6 had
+kept to reads: a batch writes up to a hundred keys at as many versions, and its
+answer's `results` is the one place those are written down. That widens
+`answer`'s presence cell, which §10.3 would make a bump if any record a reader
+of version `6` could have met changed — and none did: the cell gained the
+records of an op that did not exist, and every record of every other op is
+present and absent exactly where it was. A reader that branches on `effect` and
+ignores what it does not recognize (§10.1) reads a batch record as a write it
+cannot index by key, which is what it is. The ruling calls a batch one write
+and says nothing of the trace; its record's shape — a write with no key — is
+that statement read into §6, and §10.3's test finds nothing to bump, so
+`trace_version` stays `6`.
 
 ### 10.3 What requires a version bump
 

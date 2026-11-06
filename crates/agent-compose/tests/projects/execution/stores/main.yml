@@ -161,6 +161,49 @@ state:
     type: integer
     default: -1
 
+  # PRD resolved q71: what `flow.move`'s two batches answered, and what a
+  # page of the store held after them — each with a default no batch writes.
+  moved:
+    description: Whether the first move's batch answered `applied`.
+    type: boolean
+    default: false
+  refused_at:
+    description: The `failed` index the second, declined move answered.
+    type: integer
+    default: -1
+  move_keys:
+    description: The keys the moves left, in byte order.
+    type: array
+    max_items: 10
+    items: { type: string }
+    default: []
+  # …and what a fan-out of batches left: how many keys under `item/`, and the
+  # value at the one key every instance's batch shares.
+  batched:
+    description: How many `item/` keys the batches of `flow.batch_each` left.
+    type: integer
+    default: -1
+  batched_last:
+    description: The record at the key every batch of `flow.batch_each` writes.
+    type: object
+    properties:
+      name: { type: string }
+    default: { name: "nothing was batched" }
+  # …and what `flow.typed`'s `set` and one-entry `batch` left of one value
+  # its store's emitted Zod would refuse: the keys, and the batched record.
+  typed_keys:
+    description: The keys `flow.typed`'s `set` and `batch` left, in byte order.
+    type: array
+    max_items: 10
+    items: { type: string }
+    default: []
+  typed_batched:
+    description: The record `flow.typed`'s `batch` entry wrote.
+    type: object
+    properties:
+      name: { type: string }
+    default: { name: "nothing was batched" }
+
 provider.mock:
   kind: anthropic
   api_key: ${MOCK_API_KEY}
@@ -752,6 +795,196 @@ flow.tally:
     - { from: seed, to: each }
     - { from: each, to: read }
     - { from: read, to: end }
+
+# PRD resolved q71, end to end: a `batch` moves a record from one key to
+# another — set the new one if it is absent, delete the old — in one
+# transaction, and the flow routes on what it answered. The first move applies;
+# the second asks the same of a store where the new key is no longer absent, so
+# it declines at its first entry and applies nothing, its delete included, and
+# answers `failed: 0`. The page read last is the store as the moves left it.
+store.moves:
+  kind: kv
+  scope: execution
+  description: Records under `open/` and `closed/`.
+  value_schema:
+    name: { type: string }
+
+flow.move:
+  description: Seed two open records, move one to `closed/` twice, and read the keys back.
+  inputs:
+    name:
+      type: string
+      min_length: 1
+  outputs:
+    moved: { type: boolean }
+    refused_at: { type: integer }
+    move_keys:
+      type: array
+      max_items: 10
+      items: { type: string }
+  nodes:
+    seed:
+      store: store.moves
+      op: batch
+      ops:
+        - { op: set, key: "'open/' + input.name", value: { name: "input.name" } }
+        - { op: set, key: "'open/other'", value: { name: "'other'" } }
+    move:
+      store: store.moves
+      op: batch
+      ops:
+        - { op: set, key: "'closed/' + input.name", if: absent, value: { name: "input.name" } }
+        - { op: delete, key: "'open/' + input.name" }
+      writes:
+        applied: moved
+    again:
+      store: store.moves
+      op: batch
+      ops:
+        - { op: set, key: "'closed/' + input.name", if: absent, value: { name: "input.name" } }
+        - { op: delete, key: "'open/other'" }
+      writes:
+        failed: refused_at
+    look:
+      store: store.moves
+      op: list
+      limit: 10
+      writes:
+        keys: move_keys
+  edges:
+    - { from: start, to: seed }
+    - { from: seed, to: move }
+    - { from: move, to: again, when: "move.output.applied" }
+    - { from: move, to: end, else: true }
+    - { from: again, to: look, when: "!again.output.applied" }
+    - { from: again, to: end, else: true }
+    - { from: look, to: end }
+
+# D67, read for a `batch`: every instance of a `map` writes one batch of two
+# keys — its own under `item/`, and the one key every instance shares. Each
+# batch is a keyed `kv` write, so the constant key is admitted (form 2), and
+# each is one transaction serialized on the partition: every instance's two
+# keys land together, and the shared key holds one instance's record whole.
+store.batches:
+  kind: kv
+  scope: execution
+  description: One record per item, and the last one written.
+  value_schema:
+    name: { type: string }
+
+flow.batch_one:
+  description: Write one item's record and the shared last record, in one batch.
+  inputs:
+    item:
+      type: string
+  outputs: {}
+  nodes:
+    both:
+      store: store.batches
+      op: batch
+      ops:
+        - { op: set, key: "'item/' + input.item", value: { name: "input.item" } }
+        - { op: set, key: "'last'", value: { name: "input.item" } }
+  edges:
+    - { from: start, to: both }
+    - { from: both, to: end }
+
+flow.batch_each:
+  description: Fan out one batch per item, then count what landed and read the shared key.
+  inputs:
+    items:
+      type: array
+      max_items: 8
+      items: { type: string }
+  outputs:
+    batched: { type: integer }
+    batched_last:
+      type: object
+      properties:
+        name: { type: string }
+  nodes:
+    each:
+      map:
+        over: input.items
+        as: one
+        node: flow.batch_one
+        max_concurrency: 4
+        input:
+          item: "one"
+    counted:
+      store: store.batches
+      op: count
+      prefix: "'item/'"
+      writes:
+        count: batched
+    last:
+      store: store.batches
+      op: get
+      key: "'last'"
+      writes:
+        value: batched_last
+  edges:
+    - { from: start, to: each }
+    - { from: each, to: counted }
+    - { from: counted, to: last }
+    - { from: last, to: end }
+
+# PRD resolved q71's "every entry's schema check is q68's", end to end: a `set`
+# node and a `batch` whose one entry is that same `set` write one value — an
+# empty `name` under a `min_length: 1` that CEL typing does not decide — and
+# both land. A store-op node's value is typed against `value_schema` at
+# `validate` and not parsed against the emitted Zod at run time (q68's schema
+# evolution), and a `batch` entry is held to exactly what its single op is.
+store.typed:
+  kind: kv
+  scope: execution
+  description: One record a `set` wrote and one a `batch` entry wrote.
+  value_schema:
+    name: { type: string, min_length: 1 }
+
+flow.typed:
+  description: Write one value with a `set` and again with a `batch` entry, and read both back.
+  inputs:
+    name:
+      type: string
+  outputs:
+    typed_keys:
+      type: array
+      max_items: 10
+      items: { type: string }
+    typed_batched:
+      type: object
+      properties:
+        name: { type: string }
+  nodes:
+    one_set:
+      store: store.typed
+      op: set
+      key: "'single'"
+      value: { name: "input.name" }
+    one_batch:
+      store: store.typed
+      op: batch
+      ops:
+        - { op: set, key: "'batched'", value: { name: "input.name" } }
+    typed_page:
+      store: store.typed
+      op: list
+      limit: 10
+      writes:
+        keys: typed_keys
+    typed_read:
+      store: store.typed
+      op: get
+      key: "'batched'"
+      writes:
+        value: typed_batched
+  edges:
+    - { from: start, to: one_set }
+    - { from: one_set, to: one_batch }
+    - { from: one_batch, to: typed_page }
+    - { from: typed_page, to: typed_read }
+    - { from: typed_read, to: end }
 
 # PRD resolved q70, end to end: a `kv` store written by a fan-out and then read
 # back the way a flow reads one too large for one answer — a page at a time,

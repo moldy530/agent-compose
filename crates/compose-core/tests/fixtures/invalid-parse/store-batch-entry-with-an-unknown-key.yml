@@ -1,0 +1,16 @@
+# rule: a `batch` entry takes the keys of a `set` or a `delete` and no other (grammar 11.4, PRD resolved q71)
+# code: unknown-key
+# message: unknown key `fields` in `ops[0]` of node `move`
+# at: 13:39
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    move:
+      store: store.memory
+      op: batch
+      ops:
+        - { op: delete, key: "'old'", fields: { body: "'x'" } }
+  edges:
+    - { from: start, to: move }
+    - { from: move, to: end }

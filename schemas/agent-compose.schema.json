@@ -1488,8 +1488,8 @@
       "properties": {
         "store": { "description": "The store definition to operate on.", "$ref": "#/$defs/storeRef" },
         "op": {
-          "description": "The operation. Legal values depend on the store's kind: kv = get|set|delete|list|merge|append|incr|count|get_many, vector = search|upsert|delete, blob = get|put|delete|list. Each op's output schema is derived and fixed (grammar 11.4). A `get` that misses returns `found: false` and no `value` or `version`, so a `writes:` of `value` performs no write that pass and reading `<node>.output.value` fails the execution - route on `found` instead (Decision D110). A kv write answers `applied`: a write whose `if:`/`if_version:` condition did not hold changes nothing and answers `applied: false` - a result to route on, never a node error (PRD resolved q68). A kv `list` is one page: its `next` is the cursor of the page after it and is absent on the last page, and its `entries` are present only under `include_values: true`; `count` and `get_many` are reads (PRD resolved q70).",
-          "enum": ["get", "set", "delete", "list", "search", "upsert", "put", "merge", "append", "incr", "count", "get_many"]
+          "description": "The operation. Legal values depend on the store's kind: kv = get|set|delete|list|merge|append|incr|count|get_many|batch, vector = search|upsert|delete, blob = get|put|delete|list. Each op's output schema is derived and fixed (grammar 11.4). A `get` that misses returns `found: false` and no `value` or `version`, so a `writes:` of `value` performs no write that pass and reading `<node>.output.value` fails the execution - route on `found` instead (Decision D110). A kv write answers `applied`: a write whose `if:`/`if_version:` condition did not hold changes nothing and answers `applied: false` - a result to route on, never a node error (PRD resolved q68). A kv `list` is one page: its `next` is the cursor of the page after it and is absent on the last page, and its `entries` are present only under `include_values: true`; `count` and `get_many` are reads (PRD resolved q70). A kv `batch` applies its `ops:` list in one transaction - every entry or none - and answers once, with the index of the entry whose condition did not hold as `failed` (PRD resolved q71).",
+          "enum": ["get", "set", "delete", "list", "search", "upsert", "put", "merge", "append", "incr", "count", "get_many", "batch"]
         },
         "key": { "description": "CEL key expression. Inside a map-dispatched instance a write's key must derive from the item.", "$ref": "#/$defs/cel" },
         "value": {
@@ -1539,6 +1539,13 @@
         "after": { "description": "kv list only: CEL string, the exclusive cursor - the last key of the page before, as its `next` answered it. The page holds the keys after it in byte order, under the same `prefix` (PRD resolved q70).", "$ref": "#/$defs/cel" },
         "include_values": { "description": "kv list only: answer each key's value and version beside it, as `entries` (default false). A literal, not CEL: it decides whether the derived output has an `entries` field at all (PRD resolved q70).", "type": "boolean" },
         "keys": { "description": "kv get_many only: CEL list of strings, the keys to read - at most 1000, which the run enforces, since a list's length is not known before it runs. Answered one entry per key, in the order given (PRD resolved q70).", "$ref": "#/$defs/cel" },
+        "ops": {
+          "description": "kv batch only: the entries to apply, 1 to 100, in order - each a `set` or a `delete` of one key, with its own condition and ttl. The batch is one transaction on every backend: all of its entries land or none do, and one whose condition does not hold applies nothing (PRD resolved q71). A literal list, never CEL.",
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": { "$ref": "#/$defs/storeBatchEntry" }
+        },
         "writes": { "description": "Write remap over the op's derived output fields.", "$ref": "#/$defs/writes" },
         "retry": { "$ref": "#/$defs/retry" },
         "timeout": { "description": "Wall-clock bound on this node.", "$ref": "#/$defs/duration" },
@@ -1569,7 +1576,8 @@
               "ttl": false,
               "after": false,
               "include_values": false,
-              "keys": false
+              "keys": false,
+              "ops": false
             }
           }
         },
@@ -1595,7 +1603,8 @@
               "by": false,
               "after": false,
               "include_values": false,
-              "keys": false
+              "keys": false,
+              "ops": false
             }
           }
         },
@@ -1619,7 +1628,8 @@
               "ttl": false,
               "after": false,
               "include_values": false,
-              "keys": false
+              "keys": false,
+              "ops": false
             }
           }
         },
@@ -1643,7 +1653,8 @@
               "ttl": false,
               "after": false,
               "include_values": false,
-              "keys": false
+              "keys": false,
+              "ops": false
             }
           }
         },
@@ -1667,7 +1678,8 @@
               "if": false,
               "if_version": false,
               "ttl": false,
-              "keys": false
+              "keys": false,
+              "ops": false
             }
           }
         },
@@ -1692,7 +1704,8 @@
               "ttl": false,
               "after": false,
               "include_values": false,
-              "keys": false
+              "keys": false,
+              "ops": false
             }
           }
         },
@@ -1735,7 +1748,8 @@
               "by": false,
               "after": false,
               "include_values": false,
-              "keys": false
+              "keys": false,
+              "ops": false
             }
           }
         },
@@ -1757,7 +1771,8 @@
               "by": false,
               "after": false,
               "include_values": false,
-              "keys": false
+              "keys": false,
+              "ops": false
             }
           }
         },
@@ -1779,7 +1794,8 @@
               "unique": false,
               "after": false,
               "include_values": false,
-              "keys": false
+              "keys": false,
+              "ops": false
             }
           }
         },
@@ -1805,7 +1821,8 @@
               "ttl": false,
               "after": false,
               "include_values": false,
-              "keys": false
+              "keys": false,
+              "ops": false
             }
           }
         },
@@ -1832,7 +1849,8 @@
               "if_version": false,
               "ttl": false,
               "after": false,
-              "include_values": false
+              "include_values": false,
+              "ops": false
             }
           }
         },
@@ -1846,6 +1864,73 @@
             "description": "`get` reads and is conditioned on nothing.",
             "properties": { "if_version": false }
           }
+        },
+        {
+          "if": { "properties": { "op": { "const": "batch" } }, "required": ["op"] },
+          "then": {
+            "description": "`kv batch` takes `ops` alone: each entry carries its own key, value, condition and ttl. Grammar 11.4, PRD resolved q71.",
+            "required": ["ops"],
+            "properties": {
+              "key": false,
+              "value": false,
+              "query": false,
+              "top_k": false,
+              "prefix": false,
+              "limit": false,
+              "filter": false,
+              "metadata": false,
+              "content_type": false,
+              "fields": false,
+              "field": false,
+              "unique": false,
+              "by": false,
+              "if": false,
+              "if_version": false,
+              "ttl": false,
+              "after": false,
+              "include_values": false,
+              "keys": false
+            }
+          }
+        }
+      ]
+    },
+    "storeBatchEntry": {
+      "description": "One entry of a kv `batch`: a `set` (key and value, an optional condition and ttl) or a `delete` (key, an optional `if_version`), each exactly as the single op of its name takes them. Grammar 11.4, PRD resolved q71.",
+      "type": "object",
+      "required": ["op", "key"],
+      "properties": {
+        "op": { "description": "Which write this entry is - a literal, never CEL.", "enum": ["set", "delete"] },
+        "key": { "description": "CEL key expression.", "$ref": "#/$defs/cel" },
+        "value": {
+          "description": "A `set` entry's value: field -> CEL, matching the store's value_schema, exactly as a `kv set` takes one.",
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/identifier" },
+          "additionalProperties": { "$ref": "#/$defs/cel" }
+        },
+        "if": { "description": "`set` entries only: apply the batch only if the key holds no value (`absent`) or holds one (`present`). Mutually exclusive with `if_version:`.", "enum": ["absent", "present"] },
+        "if_version": { "description": "CEL integer: apply the batch only if the key's current version is this one. Mutually exclusive with `if:`.", "$ref": "#/$defs/cel" },
+        "ttl": {
+          "description": "`set` entries only: how long the key the entry leaves lives - a literal duration, or `never` (PRD resolved q69).",
+          "oneOf": [{ "$ref": "#/$defs/duration" }, { "const": "never" }]
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "op": { "const": "set" } }, "required": ["op"] },
+          "then": { "description": "A `set` entry writes the whole value at its key.", "required": ["value"] }
+        },
+        {
+          "if": { "properties": { "op": { "const": "delete" } }, "required": ["op"] },
+          "then": {
+            "description": "A `delete` entry takes `key` and an optional `if_version` - no value, no `if:`, no ttl.",
+            "properties": { "value": false, "if": false, "ttl": false }
+          }
+        },
+        {
+          "description": "An entry takes one condition, exactly as a single write does (PRD resolved q68).",
+          "not": { "required": ["if", "if_version"] }
         }
       ]
     },

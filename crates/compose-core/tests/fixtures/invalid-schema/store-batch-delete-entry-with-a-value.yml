@@ -1,0 +1,16 @@
+# rule: a `delete` entry of a `batch` takes no `value` (grammar 11.4, PRD resolved q71)
+# at: /flow.work/nodes/write/ops/1/value
+# via: /$defs/storeBatchEntry/allOf/1/then/properties/value
+flow.work:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    write:
+      store: store.notes
+      op: batch
+      ops:
+        - { op: set, key: "'new'", value: { title: "'x'" } }
+        - { op: delete, key: "'old'", value: { title: "'x'" } }
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: end }

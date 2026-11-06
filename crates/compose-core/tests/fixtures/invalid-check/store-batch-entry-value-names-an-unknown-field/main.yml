@@ -1,0 +1,25 @@
+# rule: a `batch` `set` entry's value is checked against `value_schema` exactly as a `set`'s is (grammar 11.4, PRD resolved q71)
+# code: unknown-field
+# message: `titel` is not a field `store.notes` declares
+# at: main.yml:22:61
+# label: main.yml:12:5 the store's schema is declared here
+# help: did you mean `title`?
+version: "0.1"
+store.notes:
+  kind: kv
+  scope: global
+  value_schema:
+    title: { type: string }
+    body: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    move:
+      store: store.notes
+      op: batch
+      ops:
+        - { op: set, key: "'new'", value: { title: "'x'", body: "''" } }
+        - { op: set, key: "'other'", value: { title: "'y'", titel: "'y'", body: "''" } }
+  edges:
+    - { from: start, to: move }
+    - { from: move, to: end }

@@ -1,0 +1,14 @@
+# rule: a `batch` applies 1 to 100 entries (grammar 11.4, PRD resolved q71)
+# at: /flow.work/nodes/write/ops
+# via: /$defs/storeNode/properties/ops/minItems
+flow.work:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    write:
+      store: store.notes
+      op: batch
+      ops: []
+  edges:
+    - { from: start, to: write }
+    - { from: write, to: end }

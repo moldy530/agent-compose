@@ -194,6 +194,7 @@ of any execution: nothing records it. `agent-compose docs cli` has the flags.
 | `kv` | `merge` | `key`, `fields` (field map of CEL, each a field of `V`), one optional condition, `ttl` (optional) | `{ key, applied, version (optional), value: V (optional), deduped }` |
 | `kv` | `append` | `key`, `field` (an array field of `V`), `value` (one item), `unique` (optional literal, default `false`), one optional condition, `ttl` (optional) | as `merge` |
 | `kv` | `incr` | `key`, `field` (an `integer`/`number` field of `V`), `by` (optional, default `1`), one optional condition, `ttl` (optional) | as `merge` |
+| `kv` | `batch` | `ops` (literal list of 1..100 `set` and `delete` entries, each with its own `key`, `value`, condition and `ttl`) | `{ applied: boolean, deduped: boolean, results: array<{ key, version (optional) }>, failed: integer (optional) }` |
 | `vector` | `search` | `query`, `top_k` (1..100, required), `filter` (optional) | `{ matches: array<{ id, score, text, metadata: M }> }` |
 | `vector` | `upsert` | `key`, `value` (the text), `metadata` (optional) | `{ id: string }` |
 | `vector` | `delete` | `key` | `{ deleted: boolean }` |
@@ -213,7 +214,10 @@ Eleven parameters are CEL over `input`/`state`/`execution` — `key`, `query`,
 `content_type` is a media type string, `field` is a field name, `unique` and
 `include_values` are booleans, `if` is `absent` or `present`, and `ttl` is a
 duration (`30s`, `5m`, `24h`) or `never`. A CEL string
-where an integer is declared is a type error, not a computed bound.
+where an integer is declared is a type error, not a computed bound. The one
+parameter left, a `batch`'s `ops`, is a literal **list** whose entries hold
+both kinds: each entry's `op`, `if` and `ttl` are literals, its `key`, `value`
+and `if_version` CEL.
 
 A `store:` node takes **no `input:` key**: its parameters are exactly the op's
 row, and none of them resolves by name from a channel.
@@ -437,11 +441,13 @@ nothing. `validate` refuses an `append` to a field that is not an array and an
 `incr` of one that is not an `integer` or `number` (`type-mismatch`), and a field
 the schema does not declare (`unknown-field`).
 
-**Every `kv` write answers `applied`, `version` and `deduped`**; a partial update
-also answers the whole `value` it left. A retried write — the same idempotency
-key, the same attempt — is answered with its first attempt's whole answer and
-`deduped: true`, so a retried claim that won answers `applied: true` again rather
-than losing to itself.
+**Every single-key `kv` write answers `applied`, `version` and `deduped`**; a
+partial update also answers the whole `value` it left. A `batch` (below) answers
+`applied` and `deduped` but no `version` of its own — it wrote many keys, so each
+entry's version is in its `results`, and a guard or a `writes:` on a batch reads
+those. A retried write — the same idempotency key, the same attempt — is
+answered with its first attempt's whole answer and `deduped: true`, so a retried
+claim that won answers `applied: true` again rather than losing to itself.
 
 **Schema evolution.** `value_schema` is checked on write: by CEL typing at
 `validate` for a node, by the emitted Zod at run time for a tool's arguments. A
@@ -450,6 +456,85 @@ is not refused there — it fails only when a CEL read reaches a field it lacks.
 `merge`, `append` or `incr` validates the value it is building on too, so under a
 changed schema it **fails naming the field** the stored value lacks; a `set` of
 the whole value is the repair.
+
+## Writing several keys at once: `batch`
+
+A `batch` writes several keys of one `kv` store **in one transaction**: every
+entry lands or none does, on every backend, so a crash partway through leaves
+all of it or nothing. Moving a record is the shape it is for — the new key set
+and the old one deleted together, so no run ever finds the record twice or not
+at all:
+
+```yaml spec
+version: "0.1"
+store.tickets:
+  kind: kv
+  scope: global
+  value_schema:
+    title:  { type: string }
+    status: { enum: [open, closed] }
+
+flow.close:
+  inputs:
+    id:    { type: string }
+    title: { type: string }
+  outputs: {}
+  nodes:
+    move:
+      store: store.tickets
+      op: batch
+      ops:
+        - op: set
+          key: "'closed/' + input.id"
+          if: absent
+          ttl: 720h
+          value:
+            title: "input.title"
+            status: "'closed'"
+        - { op: delete, key: "'open/' + input.id" }
+  edges:
+    - { from: start, to: move }
+    - { from: move, to: end, when: "move.output.applied" }
+    - { from: move, to: end, else: true }
+
+triggers:
+  cli: { type: manual, flow: flow.close }
+```
+
+**`ops:` is a literal list of 1 to 100 entries**, each one a single `set` or
+`delete` spelled exactly as that op is: a `set` entry takes `key` and `value`
+— a field map checked against `value_schema` and total — and may carry one of
+`if:`/`if_version:` and a `ttl:`; a `delete` entry takes `key` and may carry
+`if_version:` alone. An empty list, more than 100 entries, an entry that is
+some other op, a `delete` with a `value`, a `set` without one and an entry with
+two conditions are all refused by `validate` — and by the editor schema.
+
+**Entries apply in order**, each reading its key as the ones before it left it:
+a key two entries name is written by the first and then the second, and a
+condition on an entry is about the state the earlier entries made. Each `set`
+entry takes the partition's next version in that order, and its own expiry —
+its `ttl`, else the store's `default_ttl:` — exactly as one `set` would.
+
+**The first entry that cannot land decides the whole batch.** An entry whose
+condition does not hold applies **nothing** — the entries before it included —
+and the batch answers `applied: false`, `results: []` and `failed:` with that
+entry's index, counted from 0: a result to route on, as `move` above does.
+
+**An entry is typed as its single op is.** A `set` entry's value is checked
+against `value_schema` by CEL typing at `validate` — exactly the check a `set`
+node's value gets (schema evolution, above) — and written as it evaluated, so a
+value one `set` would write, its batch entry writes too. A batch that fails — a
+statement the store refuses, a lost connection — fails the node and writes
+nothing.
+
+**One effect, one answer.** A batch is one write carrying the node's one
+idempotency key, and its whole answer — a decline included — is what a retry
+is handed back, with `deduped: true`; nothing applies twice. `results` holds one
+`{ key, version }` per entry, in order — no `version` on a `delete`'s. The
+trace files one write record for the batch, with no single `key`: its keys and
+versions are in the record's `answer`.
+
+A batch is a store-op node's alone: no `agent_access:` level gives a model one.
 
 ## Expiry and leases
 
@@ -637,8 +722,8 @@ two forms:
    dispatch site* references the item binding or the index. Legal for every
    kind.
 2. a **keyed `kv` write** — any write on a `kv` store (`set`, `delete`,
-   `merge`, `append`, `incr`) with any legal key, including one constant across
-   instances.
+   `merge`, `append`, `incr`, `batch`) with any legal key, including one
+   constant across instances.
 
 Anything else — a `vector` or `blob` write whose key is not item-derived — is
 `unkeyed-map-write`. A field bound from `state.*`, from the enclosing flow's
@@ -656,8 +741,10 @@ named: a `set` replaces the whole value there, so concurrent instances setting
 one key are a declared overwrite — the store-side counterpart of
 `reduce: last_wins` — and a `merge`, `append` or `incr` is serialized against
 every other write to the key, so a `map` whose instances all append to one key
-keeps every instance's item. A `blob` or `vector` write has no such story: it is
-bulk content at a document id.
+keeps every instance's item. A `batch` from each instance is one transaction
+each, serialized on the partition: every instance's batch lands whole or not at
+all, whatever keys their entries share. A `blob` or `vector` write has no such
+story: it is bulk content at a document id.
 
 Store writes are at-least-once and carry an idempotency key derived from the
 execution id and the store node's flattened instance path.
@@ -685,7 +772,8 @@ array field: `{"item": {"tags": "x"}}`.
 
 `<name>` is the store's local name, so `store.user_prefs` gives `user_prefs_get`.
 A synthesized name colliding with an attached tool name is
-`tool-name-collision`.
+`tool-name-collision`. No level synthesizes a `batch`: which keys move together
+is the author's to write down, in a node.
 
 Each tool's arguments are its op row with the expressions replaced by what the
 model supplies, held to that schema **before the store sees them**. A call the

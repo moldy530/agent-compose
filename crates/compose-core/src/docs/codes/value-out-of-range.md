@@ -8,7 +8,9 @@ because something downstream depends on it being finite and sane:
 `retry.max` is 1..10 because retries consume a timeout budget,
 `max_iterations` is 1..1000 because it is a termination proof, `top_k` is
 1..100 and `limit` is 1..1000 because a store op's cardinality is meant to be
-readable without running the graph.
+readable without running the graph, and a `batch`'s `ops:` holds 1 to 100
+entries because it is one transaction and one ledger row — an empty one would
+write nothing, and a longer one splits into two batches.
 
 `min_length` and `max_items` and their neighbours are the schema-level version
 of the same idea.

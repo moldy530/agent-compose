@@ -12,8 +12,8 @@ use crate::ast::common::{
     Address, Cel, ControlTarget, Duration, EdgeSource, EdgeTarget, Ident, Literal, PathExpr,
 };
 use crate::ast::flow::{
-    CoderWorkspace, FlowContext, Harness, PermissionMode, StoreCondition, StoreOp, StoreTtl,
-    WorkspaceAccess,
+    BatchOp, CoderWorkspace, FlowContext, Harness, PermissionMode, StoreCondition, StoreOp,
+    StoreTtl, WorkspaceAccess,
 };
 use crate::diag::{Span, Spanned};
 
@@ -224,11 +224,14 @@ pub struct Human {
 
 /// The parameters of a store op (grammar 11.4).
 ///
-/// Eleven of the nineteen are CEL; `top_k`, `limit`, `content_type`, `field`,
+/// Eleven of the twenty are CEL; `top_k`, `limit`, `content_type`, `field`,
 /// `unique`, `include_values`, `if` and `ttl` are literals (grammar 8.8, 11.4),
 /// so a bound — and which field a partial update touches, what it is
 /// conditioned on, how long the key it leaves lives, and whether a page carries
-/// its values — is readable without running the graph.
+/// its values — is readable without running the graph. The twentieth, a
+/// `batch`'s `ops`, is a literal list whose entries hold both (PRD resolved
+/// q71): each one's op, condition and `ttl` literals, its key, value and
+/// version CEL, exactly as on the single ops.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct StoreParams {
     /// `key:`
@@ -292,6 +295,51 @@ pub struct StoreParams {
     /// `keys:` — the list of keys a `get_many` reads.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keys: Option<Spanned<Cel>>,
+    /// `ops:` — a `batch`'s entries, in the order they apply (PRD resolved
+    /// q71).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ops: Option<Spanned<Vec<BatchEntry>>>,
+}
+
+impl StoreParams {
+    /// The static bound of the one list a store op answers, where it has one:
+    /// a `search`'s `top_k`, a `list`'s `limit`, or a `batch`'s entry count —
+    /// one `results` entry per entry (grammar 3.5, 11.4).
+    #[must_use]
+    pub fn bound(&self) -> Option<i64> {
+        self.top_k.or(self.limit).or_else(|| {
+            self.ops
+                .as_ref()
+                .and_then(|ops| i64::try_from(ops.value.len()).ok())
+        })
+    }
+}
+
+/// One entry of a `kv` `batch` (grammar 11.4, PRD resolved q71).
+///
+/// Held as written: which of its fields an entry of its op may carry is the
+/// validator's to decide, against the single op of that name.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BatchEntry {
+    /// `op:` — `set` or `delete`.
+    pub op: Spanned<BatchOp>,
+    /// `key:`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<Spanned<Cel>>,
+    /// `value:` — a `set` entry's field map, matching `V`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<Bindings>,
+    /// `if:` — the literal condition the entry applies under.
+    #[serde(rename = "if", skip_serializing_if = "Option::is_none")]
+    pub condition: Option<Spanned<StoreCondition>>,
+    /// `if_version:` — the version the key must hold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub if_version: Option<Spanned<Cel>>,
+    /// `ttl:` — how long the key a `set` entry leaves lives.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<Spanned<StoreTtl>>,
+    /// The entry's own span.
+    pub span: Span,
 }
 
 /// A store op's `value:`: one expression on a `vector upsert` and a `blob put`,

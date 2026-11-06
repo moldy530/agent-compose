@@ -816,6 +816,70 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "a_replayed_count_answers_out_of_the_record",
     "a_replayed_get_many_answers_out_of_the_record",
     "a_replayed_page_answers_out_of_the_record",
+    // PRD resolved q71: a `batch` is one transaction on every arm — a set, a
+    // set and a delete land together at consecutive versions; a condition
+    // failing at index 2 takes indexes 0 and 1 back and answers `failed: 2`; a
+    // `set` entry's value is checked as a single `set`'s is (q68: CEL typing
+    // at `validate`, no run-time Zod for a node), so a value the emitted Zod
+    // would refuse is written by both alike; later entries read what earlier
+    // ones left; each entry's `ttl` and the store's default apply as on one
+    // write.
+    "a_batch_of_set_set_delete_lands_all_three_with_consecutive_versions",
+    "a_failed_condition_at_index_2_leaves_indexes_0_and_1_unapplied",
+    "a_batch_set_entry_writes_the_value_a_single_set_writes",
+    "a_duplicate_key_within_a_batch_applies_in_order",
+    "an_entry_condition_reads_what_the_entries_before_it_left",
+    "each_batch_entrys_ttl_and_the_store_default_apply",
+    "a_batch_of_101_entries_is_refused_by_name",
+    // PRD resolved q69 of a batch, which is one write: it sweeps its partition
+    // once — at most 100 expired rows, not none and not 100 per entry — and
+    // every entry's condition reads an expired key as absent behind a backlog
+    // that sweep has not reached, so `if: absent` takes it at the next version
+    // and `if: present` and `if_version:` decline it, consuming none.
+    "a_batch_sweeps_at_most_100_expired_rows_of_its_partition_once",
+    "an_expired_key_leaves_storage_at_the_next_batch_to_its_partition",
+    "a_batch_entrys_condition_declines_an_expired_key_a_sweep_has_not_reached",
+    "a_batch_entry_with_if_absent_takes_an_expired_key_a_sweep_has_not_reached",
+    // One idempotency key, one ledger row holding the whole answer: a retried
+    // batch dedupes whole, and so does a retried decline, which is an answer
+    // too — while the same entries under a fresh key apply.
+    "a_retried_batch_dedupes_whole",
+    "a_retried_declined_batch_answers_its_decline_deduped",
+    "the_same_entries_under_a_fresh_key_apply_once_the_condition_holds",
+    // The trace: a batch is one write addressing no single key, its keys and
+    // versions in the answer it carries.
+    "a_batch_record_is_one_write_with_no_key_and_its_answer",
+    // All or nothing under a real crash: the writing process killed with
+    // `SIGKILL` between two entry writes — its first entry provably written
+    // inside the open transaction — leaves the partition as it was, and the
+    // retry of that effect applies, once.
+    "the_batch_was_mid_transaction_when_it_was_killed",
+    "the_killed_batch_had_written_its_first_entry",
+    "a_batch_killed_mid_transaction_leaves_none_of_it",
+    "a_batch_retried_after_its_crash_applies_once",
+    // …and one that fails at its ledger row, the statement after its last
+    // entry, which no crash above reaches: the row commits in the batch's own
+    // transaction, so a batch that fails there — its session ended by the
+    // server while its insert waits on a ledger row held under its key, or
+    // the row refused by a trigger in the store's file — leaves none of its
+    // entries, no version and no ledger row, and its retry applies once and
+    // answers the retry after it. A ledger row written after the `COMMIT`
+    // fails the first: every entry would be there with nothing recording it.
+    "a_batch_that_fails_at_its_ledger_row_leaves_none_of_it",
+    "a_batch_that_failed_at_its_ledger_row_is_retried_once",
+    // Two processes racing batches over the same six keys in opposite orders
+    // (`store-batch-race.mjs`): the partition's sequence is locked before any
+    // key, so the two wait for each other rather than in a circle — every
+    // batch applies, no version is taken twice and each batch's are one
+    // consecutive run, a reader in a third process never finds two batches'
+    // values among the six, and the six end holding the last batch's. The
+    // same writers then race fresh keys into their own adjacent partitions.
+    "two_processes_racing_batches_really_overlapped",
+    "two_processes_racing_batches_over_shared_keys_in_opposite_orders_all_apply",
+    "two_processes_racing_batches_never_take_one_version",
+    "every_key_two_racing_batches_wrote_holds_the_last_batchs_value",
+    "a_reader_beside_two_racing_batches_never_finds_one_half_landed",
+    "two_processes_racing_batches_into_adjacent_partitions_all_apply",
 ];
 
 /// The order every arm pages a mixed set in: UTF-8 byte order, which Rust's
@@ -942,6 +1006,22 @@ const TRUE_WHEN_DIALLED: &[&str] = &[
     "a_store_that_never_answers_delays_no_settlement",
     "a_store_that_never_answers_delays_no_other_stores_prune",
     "a_store_that_never_answers_holds_a_command_for_its_dial_deadline_alone",
+    // PRD resolved q71 on the dialled arms' own failure: a batch whose session
+    // the server ends between two entry writes — caught waiting on a row lock
+    // after its first entry is written, which an uncommitted insert of that
+    // key proves — is refused by name, leaves none of its entries, no version
+    // and no ledger row, and its retry applies once.
+    "the_batch_was_caught_between_two_entries",
+    "the_ended_batch_had_written_its_first_entry",
+    "a_batch_whose_connection_the_server_ends_mid_transaction_leaves_none_of_it",
+    "a_batch_whose_connection_ended_is_retried_once",
+    // …and the premise of the ledger-row case above on a server: the batch
+    // was caught waiting on the ledger row this runner's connection holds
+    // under its key, with every one of its entries still uncommitted — an
+    // insert of each key waits on it — so the session the server ends is one
+    // whose entries and ledger row are one transaction.
+    "the_batch_was_caught_waiting_on_its_ledger_row",
+    "the_batch_caught_at_its_ledger_row_held_every_entry_uncommitted",
     // A server keeps what a run leaves on it, so the run takes every row of its
     // own run-unique stores back off it at the end (the large walk's hundred
     // thousand go first, in that case's own `finally`: `TRUE_EVERYWHERE`).

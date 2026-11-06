@@ -1,0 +1,117 @@
+# rule: a `batch` applies at most 100 entries (grammar 11.4, PRD resolved q71)
+# code: value-out-of-range
+# message: `ops` of node `move` holds 101 entries, and a `batch` applies 1 to 100
+# at: 14:9
+# help: one batch is at most 100 entries — one transaction and one ledger row; split the writes across two `batch` nodes, each of which lands all of its entries or none (grammar 11.4, PRD resolved q71)
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    move:
+      store: store.memory
+      op: batch
+      ops:
+        - { op: delete, key: "'k0'" }
+        - { op: delete, key: "'k1'" }
+        - { op: delete, key: "'k2'" }
+        - { op: delete, key: "'k3'" }
+        - { op: delete, key: "'k4'" }
+        - { op: delete, key: "'k5'" }
+        - { op: delete, key: "'k6'" }
+        - { op: delete, key: "'k7'" }
+        - { op: delete, key: "'k8'" }
+        - { op: delete, key: "'k9'" }
+        - { op: delete, key: "'k10'" }
+        - { op: delete, key: "'k11'" }
+        - { op: delete, key: "'k12'" }
+        - { op: delete, key: "'k13'" }
+        - { op: delete, key: "'k14'" }
+        - { op: delete, key: "'k15'" }
+        - { op: delete, key: "'k16'" }
+        - { op: delete, key: "'k17'" }
+        - { op: delete, key: "'k18'" }
+        - { op: delete, key: "'k19'" }
+        - { op: delete, key: "'k20'" }
+        - { op: delete, key: "'k21'" }
+        - { op: delete, key: "'k22'" }
+        - { op: delete, key: "'k23'" }
+        - { op: delete, key: "'k24'" }
+        - { op: delete, key: "'k25'" }
+        - { op: delete, key: "'k26'" }
+        - { op: delete, key: "'k27'" }
+        - { op: delete, key: "'k28'" }
+        - { op: delete, key: "'k29'" }
+        - { op: delete, key: "'k30'" }
+        - { op: delete, key: "'k31'" }
+        - { op: delete, key: "'k32'" }
+        - { op: delete, key: "'k33'" }
+        - { op: delete, key: "'k34'" }
+        - { op: delete, key: "'k35'" }
+        - { op: delete, key: "'k36'" }
+        - { op: delete, key: "'k37'" }
+        - { op: delete, key: "'k38'" }
+        - { op: delete, key: "'k39'" }
+        - { op: delete, key: "'k40'" }
+        - { op: delete, key: "'k41'" }
+        - { op: delete, key: "'k42'" }
+        - { op: delete, key: "'k43'" }
+        - { op: delete, key: "'k44'" }
+        - { op: delete, key: "'k45'" }
+        - { op: delete, key: "'k46'" }
+        - { op: delete, key: "'k47'" }
+        - { op: delete, key: "'k48'" }
+        - { op: delete, key: "'k49'" }
+        - { op: delete, key: "'k50'" }
+        - { op: delete, key: "'k51'" }
+        - { op: delete, key: "'k52'" }
+        - { op: delete, key: "'k53'" }
+        - { op: delete, key: "'k54'" }
+        - { op: delete, key: "'k55'" }
+        - { op: delete, key: "'k56'" }
+        - { op: delete, key: "'k57'" }
+        - { op: delete, key: "'k58'" }
+        - { op: delete, key: "'k59'" }
+        - { op: delete, key: "'k60'" }
+        - { op: delete, key: "'k61'" }
+        - { op: delete, key: "'k62'" }
+        - { op: delete, key: "'k63'" }
+        - { op: delete, key: "'k64'" }
+        - { op: delete, key: "'k65'" }
+        - { op: delete, key: "'k66'" }
+        - { op: delete, key: "'k67'" }
+        - { op: delete, key: "'k68'" }
+        - { op: delete, key: "'k69'" }
+        - { op: delete, key: "'k70'" }
+        - { op: delete, key: "'k71'" }
+        - { op: delete, key: "'k72'" }
+        - { op: delete, key: "'k73'" }
+        - { op: delete, key: "'k74'" }
+        - { op: delete, key: "'k75'" }
+        - { op: delete, key: "'k76'" }
+        - { op: delete, key: "'k77'" }
+        - { op: delete, key: "'k78'" }
+        - { op: delete, key: "'k79'" }
+        - { op: delete, key: "'k80'" }
+        - { op: delete, key: "'k81'" }
+        - { op: delete, key: "'k82'" }
+        - { op: delete, key: "'k83'" }
+        - { op: delete, key: "'k84'" }
+        - { op: delete, key: "'k85'" }
+        - { op: delete, key: "'k86'" }
+        - { op: delete, key: "'k87'" }
+        - { op: delete, key: "'k88'" }
+        - { op: delete, key: "'k89'" }
+        - { op: delete, key: "'k90'" }
+        - { op: delete, key: "'k91'" }
+        - { op: delete, key: "'k92'" }
+        - { op: delete, key: "'k93'" }
+        - { op: delete, key: "'k94'" }
+        - { op: delete, key: "'k95'" }
+        - { op: delete, key: "'k96'" }
+        - { op: delete, key: "'k97'" }
+        - { op: delete, key: "'k98'" }
+        - { op: delete, key: "'k99'" }
+        - { op: delete, key: "'k100'" }
+  edges:
+    - { from: start, to: move }
+    - { from: move, to: end }

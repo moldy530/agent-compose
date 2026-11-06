@@ -616,6 +616,7 @@ Spec(
                                             after: None,
                                             include_values: None,
                                             keys: None,
+                                            ops: None,
                                         },
                                     },
                                 ),

@@ -1,0 +1,23 @@
+# rule: a `batch` entry's `key` is one expression whose result is a string, as a single op's is (grammar 11.4, PRD resolved q71)
+# code: type-mismatch
+# message: `key` of `ops[1]` of node `move` must evaluate to a string, found an integer
+# at: main.yml:20:30
+version: "0.1"
+store.notes:
+  kind: kv
+  scope: global
+  value_schema:
+    title: { type: string }
+    body: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    move:
+      store: store.notes
+      op: batch
+      ops:
+        - { op: set, key: "'new'", value: { title: "'x'", body: "''" } }
+        - { op: delete, key: "7" }
+  edges:
+    - { from: start, to: move }
+    - { from: move, to: end }

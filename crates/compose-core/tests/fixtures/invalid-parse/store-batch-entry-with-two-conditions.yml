@@ -1,0 +1,17 @@
+# rule: a `batch` entry takes one condition, `if:` or `if_version:` (grammar 11.4, PRD resolved q71)
+# code: conflicting-keys
+# message: `ops[0]` of node `move` declares both `if:` and `if_version:`, and a write takes one condition
+# at: 14:84
+# help: `if:` asks whether the key holds a value and `if_version:` which version it holds, and only a key holding a value holds a version — so `if_version:` alone already asks `if: present` as well, and beside `if: absent` it could never apply: keep one (grammar 11.4)
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    move:
+      store: store.memory
+      op: batch
+      ops:
+        - { op: set, key: "'new'", value: { body: "'x'" }, if: absent, if_version: "3" }
+  edges:
+    - { from: start, to: move }
+    - { from: move, to: end }

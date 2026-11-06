@@ -9759,10 +9759,15 @@ export interface StoreRecord {
   readonly scope: "execution" | "session" | "global";
   /**
    * The key the op addressed, on the ops that address one — absent on a
-   * `list`, a `count`, a `get_many` and a `search`, which address none.
+   * `list`, a `count`, a `get_many` and a `search`, which address none, and on
+   * a `batch`, whose entries each address their own.
    */
   readonly key?: string;
-  /** What a read answered — the history a replay consumes. */
+  /**
+   * What a read answered — the history a replay consumes — and what a `batch`
+   * answered, whose `results` are the keys it wrote and the version each took
+   * (PRD resolved q71).
+   */
   readonly answer?: unknown;
   /**
    * Whether a `kv` write's condition held and it landed (PRD resolved q68) —
@@ -9772,7 +9777,7 @@ export interface StoreRecord {
   /**
    * The version the written key holds after the write — the one it took, or
    * the one it still holds where the write declined — on a `kv` write whose
-   * answer carries one.
+   * answer carries one. Never on a `batch`, whose versions are its answer's.
    */
   readonly version?: number;
   /** A store-op node write's idempotency key (grammar 9.4). */

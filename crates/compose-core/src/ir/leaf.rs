@@ -72,8 +72,8 @@ use crate::ast::definition::{
 use crate::ast::deploy::{BackendProvider, EventSourceKind, PluginValue, TraceSinkFormat};
 use crate::ast::document::Reduce;
 use crate::ast::flow::{
-    CoderWorkspace, FlowContext, Harness, PermissionMode, StoreCondition, StoreOp, StoreTtl,
-    WorkspaceAccess,
+    BatchOp, CoderWorkspace, FlowContext, Harness, PermissionMode, StoreCondition, StoreOp,
+    StoreTtl, WorkspaceAccess,
 };
 use crate::ast::schema::{Number, ScalarKind, StringFormat, Surface};
 use crate::ast::trigger::{HmacAlgorithm, Respond, SignatureEncoding, TriggerMethod};
@@ -147,6 +147,7 @@ macro_rules! serialize_as_keyword {
 serialize_as_keyword!(
     AgentAccess,
     BackendProvider,
+    BatchOp,
     EventSourceKind,
     FlowContext,
     Harness,

@@ -14,7 +14,8 @@ from a literal is **not** item-derived, however item-derived its name looks.
 
 `kv` writes are exempt: `set`/`delete` replace the whole value at a slot the
 author named, so concurrent instances writing one key are a declared overwrite —
-the store-side counterpart of `reduce: last_wins`.
+the store-side counterpart of `reduce: last_wins` — and a `merge`, `append`,
+`incr` or `batch` is serialized against every other write to its keys.
 
 ## A spec that triggers it
 
