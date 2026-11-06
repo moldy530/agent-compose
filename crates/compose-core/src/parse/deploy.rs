@@ -59,12 +59,22 @@ pub(crate) fn placements(node: &Node, cx: &mut Cx) -> Option<PlacementsSection> 
             .map(|node| members_of(node, &subject, cx))
             .unwrap_or_default();
         let description = description(&mut fields, cx);
+        // `max_running:` (grammar 14.1, Decision D161, PRD resolved q79): an
+        // integer of at least `1`, with no upper bound the grammar states. A
+        // string or a float is refused by type, and `0` or below by value —
+        // a placement no session may hold a dispatch of is one nothing runs.
+        let subject_key = format!("`max_running` of {subject}");
+        let max_running = fields.take("max_running").and_then(|node| {
+            super::reader::expect_integer(node, &subject_key, cx)
+                .filter(|value| super::reader::at_least(value, &subject_key, 1, cx))
+        });
         fields.finish(cx);
 
         placements.push(Placement {
             name,
             members,
             description,
+            max_running,
             span: entry.key.span.joined(&entry.value.span),
         });
     }

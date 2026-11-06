@@ -822,6 +822,39 @@ event_sources:
     assert_eq!(document.kind(), DocumentKind::Deploy);
 }
 
+/// A placement may say how many unsettled dispatches one worker session holds
+/// for it (grammar 14.1, Decision D161, PRD resolved q79): `max_running: 3` is
+/// read as written, and a placement that says nothing carries no value — the
+/// default of `1` is the IR's to answer, not the parser's to invent.
+#[test]
+fn a_placement_may_say_how_many_dispatches_one_session_holds() {
+    let document = accepts(
+        "deploy/mesh.yml",
+        r#"
+version: "0.1"
+
+hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
+placements:
+  gpu:
+    members: [agent.embedder]
+    max_running: 3
+  mac:
+    members: [agent.signer]
+"#,
+    );
+    let Document::Deploy(deploy) = &document else {
+        panic!("a deploy file parses as one: {document:?}");
+    };
+    let placements = &deploy.placements.as_ref().expect("the section").placements;
+    assert_eq!(
+        placements[0].max_running.as_ref().map(|held| held.value),
+        Some(3)
+    );
+    assert!(placements[1].max_running.is_none());
+}
+
 /// Grammar 4.3 puts non-secret `storage_backends`/`event_sources` config values
 /// in class 2, so an embedded `${NAME}` is the point of the surface rather than
 /// a mistake — and a plugin object is arbitrary YAML, so the reference can sit

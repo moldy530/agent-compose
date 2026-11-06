@@ -1,0 +1,13 @@
+# rule: a placement's `max_running:` is a whole number of dispatches (grammar 14.1, Decision D161)
+# code: wrong-type
+# message: expected an integer for `max_running` of placement `mac`, found a number
+# at: 13:18
+version: "0.1"
+
+hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
+placements:
+  mac:
+    members: [agent.signer]
+    max_running: 1.5

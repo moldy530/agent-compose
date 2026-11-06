@@ -9,6 +9,8 @@
 //! stdin   the dispatch, verbatim as `/workers/poll` answered it
 //! stdout  {"type":"effect", …}  → batched and POSTed to /workers/effects
 //!         {"type":"result",  …} → POSTed to /workers/result
+//!         {"type":"finally", "running": …} → read here, never sent: whether
+//!                                  a `finally:` node is running in the runner
 //! stderr  inherited by this process's own, so a node's diagnostics are the
 //!         worker's diagnostics
 //! ```
@@ -64,14 +66,289 @@
 //! the same way, so one oversized effect would be a mesh that never runs that
 //! node again.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
 use super::wire::{Answer, Hub};
 use super::{Sessions, Stop, note};
+
+/// How long a runner is given to stop on its own after a cancel's `SIGTERM`,
+/// or a stop's `SIGUSR2`, before its whole process group is killed (§3.2, PRD
+/// resolved q75).
+///
+/// The runner turns `SIGTERM` into its execution's cancel and `SIGUSR2` into a
+/// failure of the placed node ([`Halt`]), and either aborts every signal its
+/// activities read — a model call's `fetch`, a spawned command, a harness run
+/// — so an ordinary node stops in well under this. The kill is for one that
+/// does not: a host function that never reads its signal, or a child that
+/// ignores the signal. Inside the ten seconds PRD resolved q75 sets as the
+/// bar, with room for the poll that carried the cancel.
+///
+/// **Not while a `finally:` node is running in the runner**, which the runner
+/// reports on its stdout. A cancel ends the instances it reaches, and an
+/// instance that ends runs its finally node *whole* — "a cancel stops none of
+/// it, and nothing it begins" (grammar §7.9, Decision D160) — under that node's
+/// own `timeout:`. So the grace is held for as long as one runs, and runs again
+/// from the moment the last of them settles.
+pub(crate) const CANCEL_GRACE: Duration = Duration::from_secs(5);
+
+/// How often a held grace looks again at whether the runner's finally work has
+/// ended.
+const FINALLY_POLL: Duration = Duration::from_millis(50);
+
+/// How the hub ended a dispatch this worker holds (§3.2): the two lists a
+/// poll's `200` carries, and the two signals a runner reads them by.
+///
+/// **They are not one thing**, and the runner is the one that has to know
+/// which: a cancel is the execution's, and the instances the placed node began
+/// there — an attached `flow.*` — end `cancelled`, their finally nodes reading
+/// that outcome; a stop is the hub having stopped waiting — the node's
+/// `timeout:` ran out on the hub, its execution ended around it, or the session
+/// it was handed under ended ([`Running::orphan`]) — which is nobody's cancel,
+/// and those instances end `failed`, as they do on the hub when the node runs
+/// out of time there (grammar §7.9, PRD resolved q75, q76).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Halt {
+    /// The `cancel` list: the runner is sent `SIGTERM`, and the result is
+    /// `status: "cancelled"` (§3.4).
+    Cancel,
+    /// The `stop` list, or a session a `410` ended: the runner is sent
+    /// `SIGUSR2`, and the result is whatever the node ended on — which the hub
+    /// refuses `409` and only frees the slot by.
+    Stop,
+}
+
+impl Halt {
+    /// How this halt is recorded on a [`Handle`]: never `0`, which is none.
+    const fn mark(self) -> u8 {
+        match self {
+            Self::Cancel => 1,
+            Self::Stop => 2,
+        }
+    }
+
+    /// The halt a [`Handle`]'s mark records, if any.
+    const fn of(mark: u8) -> Option<Self> {
+        match mark {
+            1 => Some(Self::Cancel),
+            2 => Some(Self::Stop),
+            _ => None,
+        }
+    }
+}
+
+/// One dispatch this worker is running, as a cancel or a stop reaches it.
+#[derive(Default)]
+pub(crate) struct Handle {
+    /// Which of this worker's sessions it was handed under ([`super::Held`]'s
+    /// generation): once a newer one has been joined, the hub has ended the
+    /// session this dispatch belonged to, and with it the dispatch
+    /// ([`Running::orphan`]).
+    generation: u64,
+    /// The runner's pid, once it has one; `0` before it is spawned.
+    pid: AtomicU32,
+    /// How the hub ended this dispatch, if it has ([`Halt::mark`]): the first
+    /// word is the one it ends by.
+    halted: AtomicU8,
+    /// Whether the runner says a `finally:` node is running in it — the work a
+    /// cancel's grace does not cut off ([`CANCEL_GRACE`]).
+    finally: AtomicBool,
+}
+
+impl Handle {
+    /// How the hub ended this dispatch, if it has.
+    fn halted(&self) -> Option<Halt> {
+        Halt::of(self.halted.load(Ordering::SeqCst))
+    }
+}
+
+/// The dispatches this worker is running, by `dispatch_id` — shared between the
+/// poll thread, which reads the `cancel` and `stop` lists, and each dispatch's
+/// own thread.
+#[derive(Clone, Default)]
+pub(crate) struct Running(Arc<Mutex<HashMap<String, Arc<Handle>>>>);
+
+impl Running {
+    /// Put one dispatch on the books, answering its handle.
+    ///
+    /// Called by the **poll thread**, for the dispatch a poll answer hands over,
+    /// before that answer's `cancel` and `stop` lists are acted on (§3.2, PRD
+    /// resolved q75). A list may name that very dispatch — a cancel or a stop
+    /// that reached it while the hub was assembling the answer, and which the
+    /// hub names again on every answer until its result arrives — and a name
+    /// not yet on the books finds nothing to stop ([`Running::halt`]), so the
+    /// stop would wait a poll. So would the next poll's, if the hold waited for
+    /// the dispatch's own thread to be scheduled.
+    pub(crate) fn hold(&self, id: &str, generation: u64) -> Arc<Handle> {
+        let handle = Arc::new(Handle {
+            generation,
+            ..Handle::default()
+        });
+        self.0
+            .lock()
+            .expect("the running table is not poisoned")
+            .insert(id.to_string(), Arc::clone(&handle));
+        handle
+    }
+
+    /// Take one dispatch off the books.
+    fn release(&self, id: &str) {
+        self.0
+            .lock()
+            .expect("the running table is not poisoned")
+            .remove(id);
+    }
+
+    /// Whether `id` is still running here.
+    fn holds(&self, id: &str) -> bool {
+        self.0
+            .lock()
+            .expect("the running table is not poisoned")
+            .contains_key(id)
+    }
+
+    /// Stop every dispatch this worker took under a session **older** than
+    /// `generation` (§5, §6.3, PRD resolved q79).
+    ///
+    /// A `410` is the hub saying it no longer knows the session — it was
+    /// restarted, or its liveness sweep gave up on this worker — and either way
+    /// it has superseded what that session held: a result for one is refused
+    /// `409`. Left running, such a runner is work nothing will read, and —
+    /// since the new session holds nothing by the hub's count — a slot the hub
+    /// hands new work beside: a worker at `max_running: 1` would be running
+    /// two. So each is **stopped** ([`Halt::Stop`]) — never cancelled: nobody
+    /// cancelled its execution, and what it began here ends `failed` — by
+    /// `SIGUSR2`, the grace — held while a `finally:` node runs — and the group
+    /// killed after.
+    ///
+    /// **A stop even where the hub was cancelling it.** A `410` says the
+    /// session ended, not why, so a dispatch whose execution a restarted hub
+    /// is completing a cancel of is stopped here like any other — what it
+    /// began ends `failed`, not `cancelled` — which is the limitation grammar
+    /// D160 and `docs/distributed.md` §5 name, and a protocol choice left to
+    /// the owner.
+    pub(crate) fn orphan(&self, generation: u64) {
+        let older: Vec<String> = self
+            .0
+            .lock()
+            .expect("the running table is not poisoned")
+            .iter()
+            .filter(|(_, handle)| handle.generation < generation)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in older {
+            self.halt(&id, Halt::Stop);
+        }
+    }
+
+    /// Wait until nothing taken under a session older than `generation` is
+    /// still running here: the slot a dispatch handed to the new session takes
+    /// is one the hub counted free, and it is free once the old session's
+    /// runners have stopped ([`Running::orphan`]) — not before.
+    fn drained_before(&self, generation: u64) {
+        let older = || {
+            self.0
+                .lock()
+                .expect("the running table is not poisoned")
+                .values()
+                .any(|handle| handle.generation < generation)
+        };
+        while older() {
+            std::thread::sleep(FINALLY_POLL);
+        }
+    }
+
+    /// Act on the hub ending `id` (§3.2) — a name on a poll's `cancel` list
+    /// or its `stop` list, or a session a `410` ended ([`Running::orphan`]):
+    /// mark it, send its runner the signal [`Halt`] names, and kill its
+    /// process group if it is still running after [`CANCEL_GRACE`] — a grace
+    /// held while the runner reports a `finally:` node running, and given
+    /// again once it reports none. A dispatch this worker does not hold —
+    /// already settled, or never handed over — is nothing to stop, and one
+    /// already halted keeps the first word it was given.
+    pub(crate) fn halt(&self, id: &str, how: Halt) {
+        let Some(handle) = self
+            .0
+            .lock()
+            .expect("the running table is not poisoned")
+            .get(id)
+            .cloned()
+        else {
+            return;
+        };
+        if handle
+            .halted
+            .compare_exchange(0, how.mark(), Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let pid = handle.pid.load(Ordering::SeqCst);
+        if pid != 0 {
+            ask(pid, how);
+        }
+        let running = self.clone();
+        let id = id.to_string();
+        std::thread::spawn(move || {
+            std::thread::sleep(CANCEL_GRACE);
+            while running.holds(&id) {
+                if !handle.finally.load(Ordering::SeqCst) {
+                    kill_group(handle.pid.load(Ordering::SeqCst));
+                    return;
+                }
+                // A finally node is how the instance the cancel ended ends, and
+                // runs whole: the grace starts over once it has settled.
+                while running.holds(&id) && handle.finally.load(Ordering::SeqCst) {
+                    std::thread::sleep(FINALLY_POLL);
+                }
+                std::thread::sleep(CANCEL_GRACE);
+            }
+        });
+    }
+}
+
+/// Ask a runner to stop, the way [`Halt`] says: `SIGTERM`, which it turns into
+/// its execution's cancel, or `SIGUSR2`, which it turns into a failure of the
+/// placed node and cancels nothing.
+#[cfg(unix)]
+fn ask(pid: u32, how: Halt) {
+    let signal = match how {
+        Halt::Cancel => libc::SIGTERM,
+        Halt::Stop => libc::SIGUSR2,
+    };
+    if let Ok(pid) = libc::pid_t::try_from(pid) {
+        // SAFETY: a pid this worker spawned and has not reaped — the handle's
+        // pid is cleared the moment the runner is waited on.
+        unsafe { libc::kill(pid, signal) };
+    }
+}
+
+#[cfg(not(unix))]
+fn ask(_pid: u32, _how: Halt) {}
+
+/// Kill a runner and every process in its group: what a cancel does to a
+/// runner that did not stop within [`CANCEL_GRACE`].
+#[cfg(unix)]
+fn kill_group(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    if let Ok(pid) = libc::pid_t::try_from(pid) {
+        // SAFETY: the group this worker spawned the runner into, which is its
+        // own pid; `ESRCH` for a group already gone is ignored.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_group(_pid: u32) {}
 
 /// Why a `POST` this dispatch made did not go through.
 ///
@@ -99,6 +376,20 @@ impl From<Stop> for Unsent {
 /// and equally over (§3.4) — or left with the hub after a result it would not
 /// take ([`settle`]). `Err(Stop)` is the worker itself winding down, and nothing
 /// else.
+///
+/// `handle` is the dispatch on the books, put there by the poll thread before
+/// the answer that handed it over had its `cancel` and `stop` lists read
+/// ([`Running::hold`]): a cancel or a stop in that same answer has already
+/// marked it, and its runner is never started. Its generation is the session
+/// that poll was made under. A dispatch
+/// handed to a session this worker joined while runners of an older one are
+/// still stopping waits for them before its own runner starts
+/// ([`Running::drained_before`]) — a wait inside the node's `timeout:` chain,
+/// which runs from dispatch (§6.5).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one dispatch's whole context, passed through once"
+)]
 pub(crate) fn execute(
     hub: &Hub,
     sessions: &Sessions,
@@ -106,17 +397,81 @@ pub(crate) fn execute(
     bun: &Path,
     runner: &str,
     dispatch: &Value,
+    running: &Running,
+    handle: &Handle,
 ) -> Result<(), Stop> {
     let id = dispatch
         .get("dispatch_id")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    running.drained_before(handle.generation);
+    let ended = execute_held(hub, sessions, tree, bun, runner, dispatch, &id, handle);
+    running.release(&id);
+    ended
+}
+
+/// [`execute`], with the dispatch on the books a cancel reads.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one dispatch's whole context, passed through once"
+)]
+fn execute_held(
+    hub: &Hub,
+    sessions: &Sessions,
+    tree: &Path,
+    bun: &Path,
+    runner: &str,
+    dispatch: &Value,
+    id: &str,
+    handle: &Handle,
+) -> Result<(), Stop> {
+    let id = id.to_string();
     let mut sender = Sender {
         hub,
         sessions,
         dispatch: &id,
     };
+    // **A dispatch the hub cancelled is settled `cancelled`** (§3.4, PRD
+    // resolved q75), whatever its runner managed to say on its way out: the
+    // result is the worker's statement that it stopped the work. What a
+    // `finally:` node that ran in the runner raised travels beside it — a cancel
+    // is what starts most of them, and §3.4 carries `finally_error` on every
+    // ending.
+    let cancelled = |said: Option<&Value>| {
+        let mut body = json!({
+            "dispatch_id": id,
+            "status": "cancelled",
+        });
+        if let Some(finally_error) = said
+            .and_then(|said| said.get("finally_error"))
+            .filter(|held| held.is_string())
+        {
+            body["finally_error"] = finally_error.clone();
+        }
+        body
+    };
+    match handle.halted() {
+        Some(Halt::Cancel) => return settle(&mut sender, &cancelled(None)),
+        // Stopped before its runner started — named on the `stop` list of the
+        // answer that handed it over, or its session ended while it waited for
+        // an older one's runners ([`Running::drained_before`]). The hub has
+        // already superseded it, so this result is refused `409`; what it is
+        // for is the slot the hub keeps counted until a result arrives.
+        Some(Halt::Stop) => {
+            return settle(
+                &mut sender,
+                &json!({
+                    "dispatch_id": id,
+                    "error": {
+                        "name": "DispatchStopped",
+                        "message": "the hub stopped waiting for this dispatch before its runner started, so none was (docs/distributed.md §3.2)",
+                    },
+                }),
+            );
+        }
+        None => {}
+    }
 
     let child = spawn(bun, tree, runner, dispatch);
     let mut child = match child {
@@ -135,6 +490,12 @@ pub(crate) fn execute(
         }
     };
 
+    handle.pid.store(child.id(), Ordering::SeqCst);
+    // A cancel or a stop that arrived between the hold and the spawn found no
+    // pid to signal, so it is signalled here.
+    if let Some(how) = handle.halted() {
+        ask(child.id(), how);
+    }
     let stdout = child.stdout.take().expect("stdout is piped");
     let mut result: Option<Value> = None;
     let mut unreadable: Option<String> = None;
@@ -184,6 +545,12 @@ pub(crate) fn execute(
                 }
                 result = Some(body);
             }
+            // The runner's account of its finally work, for a cancel's grace
+            // ([`CANCEL_GRACE`]); the hub is never sent it.
+            Some("finally") => {
+                let running = said.get("running").and_then(Value::as_bool) == Some(true);
+                handle.finally.store(running, Ordering::SeqCst);
+            }
             _ => {
                 unreadable = Some(format!(
                     "the node runner wrote a line this worker does not understand: {line}"
@@ -199,12 +566,24 @@ pub(crate) fn execute(
         let _ = child.kill();
     }
     let status = child.wait();
+    // Reaped, so its pid is no longer this worker's to signal: off the handle
+    // a cancel reads — a dispatch stays on the books while its result is
+    // posted, and an orphaned session's stop ([`Running::orphan`]) can reach
+    // it then — and off the books a stop signal reads.
+    handle.pid.store(0, Ordering::SeqCst);
+    super::stop::ended(child.id());
     if let Some(stop) = abandoned {
         // The worker itself is winding down — a redeployment, a refusal — so the
         // dispatch is not settled here: the hub ended it, or is about to.
         return Err(stop);
     }
 
+    // A stopped dispatch is settled with whatever its runner ended on — the
+    // failure the stop raised in it, or a result it reached first — which the
+    // hub refuses `409` and frees the slot by (§3.4).
+    if handle.halted() == Some(Halt::Cancel) {
+        return settle(&mut sender, &cancelled(result.as_ref()));
+    }
     let settling = match (result, unreadable, rejected) {
         // The refusal first, and ahead of a result the runner may already have
         // written: a batch the journal never took is a frontier short of where
@@ -281,6 +660,19 @@ fn spawn(bun: &Path, tree: &Path, runner: &str, dispatch: &Value) -> Result<Chil
         // Inherited: a node's own diagnostics are this worker's, which is what
         // makes `agent-compose worker` a process an operator can read.
         .stderr(Stdio::inherit());
+    // A **process group of its own**, so a cancel the runner does not answer in
+    // time takes everything left in it with it (§3.2, PRD resolved q75). The
+    // commands an `exec:` node spawned are in groups of their own, which the
+    // runner stops itself as the cancel reaches them — `SIGTERM`, then `SIGKILL`
+    // two seconds later, well inside this worker's grace — and kills on its way
+    // out if it exits first (`src/runtime.ts`'s `stopExecGroup`). A group the
+    // terminal no longer reaches, so a stop signal to this worker is delivered
+    // to it by the worker ([`super::stop`]).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command.spawn().map_err(|error| {
         format!(
             "cannot start `{} {runner}` in `{}`: {error}",
@@ -288,6 +680,10 @@ fn spawn(bun: &Path, tree: &Path, runner: &str, dispatch: &Value) -> Result<Chil
             tree.display()
         )
     })?;
+    // On the books a stop signal to this worker reads: a group of its own is
+    // one the terminal's `Ctrl-C` no longer reaches, so the worker delivers it
+    // ([`super::stop`]).
+    super::stop::started(child.id());
     let mut stdin = child.stdin.take().expect("stdin is piped");
     let payload = serde_json::to_vec(dispatch).unwrap_or_else(|_| b"{}".to_vec());
     let written = stdin.write_all(&payload).and_then(|()| stdin.flush());
@@ -297,6 +693,7 @@ fn spawn(bun: &Path, tree: &Path, runner: &str, dispatch: &Value) -> Result<Chil
     if let Err(error) = written {
         let _ = child.kill();
         let _ = child.wait();
+        super::stop::ended(child.id());
         return Err(format!(
             "cannot hand the dispatch to the node runner: {error}"
         ));

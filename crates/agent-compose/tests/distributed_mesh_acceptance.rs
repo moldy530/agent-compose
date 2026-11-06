@@ -187,6 +187,70 @@ impl Mesh {
         .expect("the hub is served again");
     }
 
+    /// [`Mesh::restart`], with `between` run against the project while no
+    /// process is serving it — for a test that writes the journal a crash at
+    /// that moment would have left.
+    fn restart_after(&mut self, between: impl FnOnce(&Path)) {
+        let port = self
+            .base_url
+            .rsplit(':')
+            .next()
+            .and_then(|port| port.parse::<u16>().ok())
+            .expect("the hub's address names a port");
+        self.served.stop();
+        between(&self.project);
+        self.served = harness::serve_target_on(
+            &self.project,
+            &self.entrypoint,
+            TARGET,
+            port,
+            &self.environment,
+        )
+        .expect("the hub is served again");
+    }
+
+    /// This execution's dispatch rows, as the hub's journal holds them.
+    fn dispatch_rows(&self, execution: &str) -> Vec<Value> {
+        harness::journal_rows(
+            &self.project,
+            &format!(
+                "SELECT id, status, outcome, payload, detail FROM dispatches \
+                 WHERE execution = '{execution}' ORDER BY parked_at"
+            ),
+        )
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    }
+
+    /// Wait until every one of this execution's dispatch rows has been
+    /// **settled by its worker's cancelled result** (§3.4) — an `error`
+    /// outcome named `ExecutionCancelled`, which only that result writes: the
+    /// hub stopping waiting leaves a row a worker holds `dispatched` — and
+    /// answer the rows.
+    fn settled_cancelled(&self, execution: &str, count: usize, within: Duration) -> Vec<Value> {
+        let deadline = Instant::now() + within;
+        loop {
+            let rows = self.dispatch_rows(execution);
+            let settled = rows.iter().all(|row| {
+                row["status"] == "settled"
+                    && row["outcome"] == "error"
+                    && row["payload"]
+                        .as_str()
+                        .is_some_and(|payload| payload.contains("\"ExecutionCancelled\""))
+            });
+            if rows.len() == count && settled {
+                return rows;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the worker never settled this execution's dispatches with its cancelled \
+                 result: {rows:#?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Start one worker against this hub, claiming `PLACEMENT`.
     fn worker(&self, purpose: &str) -> Worker {
         Worker::start(&self.base_url, &self.environment, purpose, None)
@@ -395,6 +459,13 @@ impl Worker {
         }
     }
 
+    /// The node runners this worker has running right now — its child
+    /// processes running `worker-node` — read off `/proc`. `None` off Linux,
+    /// where there is no `/proc` to read them from.
+    fn runners(&self) -> Option<Vec<i32>> {
+        runners_of(self.child.id())
+    }
+
     /// Everything this worker has written, for a failure message.
     fn transcript(&self) -> String {
         self.said
@@ -404,9 +475,24 @@ impl Worker {
     }
 
     /// Kill this worker and everything it started — the disconnect of §7.3.
+    ///
+    /// A runner leads a process group of its own, which a kill aimed at the
+    /// worker's group does not reach, so each runner's group is killed too:
+    /// a machine that died takes its runners with it.
     fn kill(&mut self) {
+        self.kill_runners();
         end(&mut self.child);
         self.reaped = true;
+    }
+
+    /// `SIGKILL` to every runner's own group, read off `/proc`.
+    fn kill_runners(&self) {
+        #[cfg(unix)]
+        for pid in self.runners().unwrap_or_default() {
+            // SAFETY: the group of a runner this worker spawned; `ESRCH` for
+            // one already gone.
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
     }
 
     /// Whether this worker is still running.
@@ -446,9 +532,91 @@ enum Reader {
 impl Drop for Worker {
     fn drop(&mut self) {
         if !self.reaped {
+            // `SIGINT` first, which the worker hands to its runners' own
+            // groups — each sweeping the `exec:` groups it detached — before
+            // it ends; then the kill, for whatever is left.
+            #[cfg(unix)]
+            if let Ok(pid) = libc::pid_t::try_from(self.child.id()) {
+                // SAFETY: a child this process spawned into a group of its own
+                // and has not yet reaped.
+                unsafe { libc::kill(-pid, libc::SIGINT) };
+                let deadline = Instant::now() + Duration::from_secs(4);
+                while Instant::now() < deadline && matches!(self.child.try_wait(), Ok(None)) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+            self.kill_runners();
             end(&mut self.child);
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
+    }
+}
+
+/// The child processes of `parent` running `worker-node`, off `/proc`.
+#[cfg(target_os = "linux")]
+fn runners_of(parent: u32) -> Option<Vec<i32>> {
+    children_running(parent, "worker-node")
+}
+
+/// The child processes of `parent` whose command line holds `needle`, off
+/// `/proc`.
+#[cfg(target_os = "linux")]
+fn children_running(parent: u32, needle: &str) -> Option<Vec<i32>> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // `pid (comm) state ppid …`, where `comm` may hold spaces and parens.
+        let Some(after) = stat.rfind(')').map(|at| &stat[at + 1..]) else {
+            continue;
+        };
+        let ppid = after
+            .split_whitespace()
+            .nth(1)
+            .and_then(|field| field.parse::<u32>().ok());
+        if ppid != Some(parent) {
+            continue;
+        }
+        // A zombie's command line is empty, so a runner that has exited and
+        // not yet been reaped is not counted as running.
+        let command = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
+        if String::from_utf8_lossy(&command).contains(needle) {
+            found.push(pid);
+        }
+    }
+    Some(found)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn runners_of(_parent: u32) -> Option<Vec<i32>> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn children_running(_parent: u32, _needle: &str) -> Option<Vec<i32>> {
+    None
+}
+
+/// Whether a process is gone within `budget`.
+fn gone_within(pid: i32, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        // SAFETY: signal 0 delivers nothing; it asks whether `pid` exists.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return true;
+        }
+        if Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -1333,6 +1501,168 @@ fn a_hub_restarted_over_a_dispatch_a_worker_is_running_is_met_with_a_re_join() {
          met was read as a refusal (§3.1, §3.4); it said:\n{}",
         worker.transcript()
     );
+}
+
+/// The fixture with `flow.retried`'s `retry:` written as `retry`, served under
+/// its mesh target — for a case that needs the second attempt to wait a known
+/// time rather than the fixture's millisecond.
+fn retried_under(purpose: &str, retry: &str) -> Option<Mesh> {
+    let deploy = std::fs::read_to_string(
+        harness::fixture(FIXTURE)
+            .parent()
+            .expect("a fixture directory")
+            .join("deploy")
+            .join(format!("{TARGET}.yml")),
+    )
+    .expect("the fixture's mesh target is readable");
+    let (composition, entrypoint) = harness::staged_with_deploy(purpose, FIXTURE, TARGET, &deploy);
+    let main = std::fs::read_to_string(&entrypoint).expect("the staged composition is readable");
+    let at = main
+        .find("\nflow.retried:\n")
+        .expect("the fixture declares `flow.retried`");
+    let (head, tail) = main.split_at(at);
+    // The first `retry:` after the flow's own line is its `sign`'s: the flow
+    // declares one node.
+    const WRITTEN: &str = "retry: { max: 2, backoff: 1ms }";
+    assert!(
+        tail.contains(WRITTEN),
+        "`flow.retried` no longer says `{WRITTEN}`"
+    );
+    std::fs::write(
+        &entrypoint,
+        format!("{head}{}", tail.replacen(WRITTEN, retry, 1)),
+    )
+    .expect("the staged composition is writable");
+    Mesh::start_from(purpose, entrypoint, Some(composition))
+}
+
+/// **What a worker's stop cuts off is never journaled, and the retry makes it**
+/// (`docs/distributed.md` §3.2, §5, §7.3; `docs/durability.md` §6.1; PRD
+/// resolved q75, q79).
+///
+/// `flow.retried` once more, with its second attempt six seconds after the
+/// first and no jitter — so the order below is the same every run. The first
+/// attempt's loop call answers and is journaled; its pinned-output call is held
+/// for thirty seconds, and the process behind the hub is replaced while it is
+/// in flight. The worker meets `410`, joins again, and stops the runner it was
+/// running under the ended session (§5) by the stop the `stop` list uses —
+/// which aborts that call. The stop is the hub having stopped waiting, not the
+/// provider failing the call, so the runner records nothing for it; recorded,
+/// the failure would have been posted home under the new session (§3.3) and
+/// handed to the retry six seconds later as its history (§7.3), and **every**
+/// attempt would have replayed it — the execution failing on a
+/// `DispatchStopped` nobody asked for.
+///
+/// So the run completes with the third script's answer, which only a call the
+/// retry made live could have fetched; the provider was asked three times —
+/// the loop call once, never again, and the cut-off call twice; the journal's
+/// record at that call's key is the retry's answer; and no record anywhere in
+/// the execution carries the stop. The runner is gone long before its held call
+/// would have answered, which is what says the stop really met it in flight.
+#[test]
+fn a_model_call_a_workers_stop_cut_off_is_not_journaled_and_the_retry_makes_it() {
+    let Some(mut mesh) = retried_under(
+        "mesh-stop-unrecorded",
+        "retry: { max: 2, backoff: 6s, jitter: false }",
+    ) else {
+        return;
+    };
+    /// What the retry's live call answers, and nothing else does.
+    const SIGNED: &str = "signed-by-the-retry-the-stop-left-to-ask";
+    /// How long the first attempt's pinned-output call is held.
+    const HELD: Duration = Duration::from_secs(30);
+    mesh.provider.enqueue_all([
+        Script::new(SONNET, Outcome::text("thinking about it")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "signature": "answered after the stop" })).after(HELD),
+        ),
+        Script::new(SONNET, Outcome::structured(json!({ "signature": SIGNED }))),
+    ]);
+    let mut worker = mesh.worker("stop-unrecorded");
+    let execution = mesh.start_execution("/retried-releases", &json!({ "path": "release.dmg" }));
+
+    // The worker is **inside** the held call: the loop call is committed on
+    // the hub, the dispatch is held, and the provider has the second request.
+    until(
+        "the first attempt's loop call reached the hub's journal",
+        || worker.transcript(),
+        || harness::journal_holds(&mesh.project, &["sign/0#model/0"]),
+    );
+    mesh.until(&execution, "was taken by the worker", |report| {
+        report["placement_waits"][0]["status"] == "dispatched"
+    });
+    until(
+        "the first attempt's pinned-output call reached the provider",
+        || worker.transcript(),
+        || mesh.provider.requests().len() == 2,
+    );
+    let in_flight = Instant::now();
+    let runner = worker
+        .runners()
+        .and_then(|running| running.first().copied());
+
+    mesh.restart();
+
+    // The stop met the call in flight: the runner is gone well before the
+    // provider would have answered it.
+    if let Some(runner) = runner {
+        assert!(
+            gone_within(
+                runner,
+                (HELD - Duration::from_secs(5)).saturating_sub(in_flight.elapsed())
+            ),
+            "the runner the ended session left was not stopped in the middle of its call: {}",
+            worker.transcript()
+        );
+    }
+
+    let outputs = mesh.completed(&execution);
+    assert_eq!(
+        outputs["signature"],
+        SIGNED,
+        "the retry did not make the call the stop cut off; it said:\n{}",
+        worker.transcript()
+    );
+    let made = mesh.provider.requests();
+    assert_eq!(
+        made.len(),
+        3,
+        "the retry re-issued the recorded loop call, or never made the one the stop cut off: \
+         {made:#?}"
+    );
+
+    let rows = harness::journal_rows(
+        &mesh.project,
+        &format!(
+            "SELECT \"key\" AS k, outcome, payload FROM effects \
+             WHERE execution = '{execution}' ORDER BY \"key\""
+        ),
+    );
+    let rows = rows.as_array().expect("rows");
+    let stopped: Vec<&Value> = rows
+        .iter()
+        .filter(|row| {
+            row["payload"]
+                .as_str()
+                .is_some_and(|payload| payload.contains("DispatchStopped"))
+        })
+        .collect();
+    assert!(
+        stopped.is_empty(),
+        "an effect the worker's stop aborted was journaled as the world's answer: {stopped:#?}"
+    );
+    let cut_off = rows
+        .iter()
+        .find(|row| row["k"] == "sign/0#model/1")
+        .unwrap_or_else(|| panic!("the call the stop cut off has no record at all: {rows:#?}"));
+    assert!(
+        cut_off["payload"]
+            .as_str()
+            .is_some_and(|payload| payload.contains(SIGNED) && payload.contains("\"ok\":true")),
+        "the record at the cut-off call's key is not the retry's answer: {cut_off:#}"
+    );
+    assert!(worker.running(), "{}", worker.transcript());
 }
 
 // ---------------------------------------------------------------------------
@@ -2315,7 +2645,7 @@ fn a_mesh_execution_exports_its_whole_trace_from_the_hub() {
     let body = &exported[0].body;
     assert_eq!(body["execution_id"], execution, "{body:#}");
     assert_eq!(body["status"], "completed", "{body:#}");
-    assert_eq!(body["trace_version"], 6, "{body:#}");
+    assert_eq!(body["trace_version"], 7, "{body:#}");
 
     // The placed node's entry is in the hub's export, which is the whole of
     // "the hub owns the trace": `sign` ran in the worker's process, and its
@@ -2446,4 +2776,951 @@ fn a_mesh_execution_exports_its_whole_trace_from_the_hub() {
         "the hub's one export is still owed, so the collector's delivery came from somewhere \
          else: {rows:#}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 10. A session's capacity, and a cancel over the wire (PRD resolved q75, q79)
+// ---------------------------------------------------------------------------
+
+/// The fixture, staged with `max_running: <cap>` on its `mac` placement.
+fn capped(purpose: &str, cap: u32) -> Option<Mesh> {
+    let deploy = std::fs::read_to_string(
+        harness::fixture(FIXTURE)
+            .parent()
+            .expect("a fixture directory")
+            .join("deploy")
+            .join(format!("{TARGET}.yml")),
+    )
+    .expect("the fixture's mesh target is readable");
+    let deploy = deploy.replacen("  mac:\n", &format!("  mac:\n    max_running: {cap}\n"), 1);
+    assert!(
+        deploy.contains(&format!("max_running: {cap}")),
+        "the placement was not capped: {deploy}"
+    );
+    let (composition, entrypoint) = harness::staged_with_deploy(purpose, FIXTURE, TARGET, &deploy);
+    Mesh::start_from(purpose, entrypoint, Some(composition))
+}
+
+/// The two model calls one item of `flow.batch` makes — a turn of its loop,
+/// then the pinned structured answer, held for `held` so the item is in a
+/// worker's hands for that long.
+///
+/// Each is matched to **its** item's call rather than queued: items run at
+/// once here, and a queue would hand one item's answer to another's call. The
+/// loop's turn carries the item's path; the answer's request carries the turn
+/// it said, which no other item's request does.
+fn held_signature(path: &str, held: Duration) -> [Script; 2] {
+    let said = format!("thinking about {path}");
+    [
+        Script::new(SONNET, Outcome::text(said.clone())).matching(path),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "signature": format!("signed {path}") })).after(held),
+        )
+        .matching(said),
+    ]
+}
+
+/// Sample an execution's report while it runs, answering the most of its
+/// placement waits that were ever `dispatched` at once.
+fn most_dispatched_at_once(mesh: &Mesh, execution: &str, cap: usize) -> usize {
+    let watching = Instant::now() + Duration::from_secs(60);
+    let mut most = 0usize;
+    loop {
+        let report = mesh.report(execution);
+        if report["status"] != "running" || Instant::now() > watching {
+            return most;
+        }
+        let dispatched = report["placement_waits"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|wait| wait["status"] == "dispatched")
+            .count();
+        assert!(
+            dispatched <= cap,
+            "{dispatched} items were dispatched at once onto a pool whose caps sum to {cap} \
+             (docs/distributed.md §2, Decision D161): {report:#}"
+        );
+        most = most.max(dispatched);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// **Two workers at a cap of one run at most two items at once** (§2, PRD
+/// resolved q79, Decision D161).
+///
+/// A placement that declares no `max_running:` holds one dispatch per session,
+/// so a pool of two runs a five-item fan-out two at a time — never three, and,
+/// with each item held long enough to be seen, two at some point.
+#[test]
+fn two_workers_at_a_cap_of_one_run_at_most_two_items_at_once() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    for path in ["a.dmg", "b.dmg", "c.dmg", "d.dmg", "e.dmg"] {
+        mesh.provider
+            .enqueue_all(held_signature(path, Duration::from_millis(1500)));
+    }
+    let _first = mesh.worker("pool-of-two-a");
+    let _second = mesh.worker("pool-of-two-b");
+    let execution = mesh.start_execution(
+        "/batches",
+        &json!({ "paths": ["a.dmg", "b.dmg", "c.dmg", "d.dmg", "e.dmg"] }),
+    );
+    let most = most_dispatched_at_once(&mesh, &execution, 2);
+    assert_eq!(most, 2, "a pool of two never ran two items at once");
+    let outputs = mesh.completed(&execution);
+    assert_eq!(
+        outputs["signatures"].as_array().map(Vec::len),
+        Some(5),
+        "{outputs:#}"
+    );
+}
+
+/// **One worker whose placement says `max_running: 3` runs three at once**
+/// (§2, PRD resolved q79, Decision D161).
+///
+/// The same fan-out, three items, on a pool of one worker: the session holds
+/// all three, the worker runs them side by side — each item's call is held
+/// three seconds, so three dispatched at once is three running at once — and
+/// the fan-out completes.
+#[test]
+fn one_worker_whose_placement_says_max_running_three_runs_three_at_once() {
+    let Some(mesh) = capped("mesh-capacity-three", 3) else {
+        return;
+    };
+    for path in ["a.dmg", "b.dmg", "c.dmg"] {
+        mesh.provider
+            .enqueue_all(held_signature(path, Duration::from_secs(3)));
+    }
+    let _worker = mesh.worker("capacity-three");
+    let started = Instant::now();
+    let execution =
+        mesh.start_execution("/batches", &json!({ "paths": ["a.dmg", "b.dmg", "c.dmg"] }));
+    let most = most_dispatched_at_once(&mesh, &execution, 3);
+    assert_eq!(most, 3, "one session at a cap of three never held three");
+    let outputs = mesh.completed(&execution);
+    assert_eq!(
+        outputs["signatures"].as_array().map(Vec::len),
+        Some(3),
+        "{outputs:#}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "three items held three seconds each took {:?}: the worker ran them one after the \
+         other",
+        started.elapsed()
+    );
+}
+
+/// **A cancel stops a placed node on its worker** and settles the execution
+/// `cancelled` (PRD resolved q75 ruling b, `docs/distributed.md` §3.2, §3.4).
+///
+/// `flow.retried`'s `sign` is placed on `mac` and declares a `retry:`. Its first
+/// model call answers and is journaled; its second is held for ten minutes —
+/// the worker is in the middle of the node. The cancel reaches the worker on
+/// its next poll, the worker stops the runner and posts the cancelled ending,
+/// and the row settles `cancelled` within ten seconds, with the node's entry
+/// `cancelled` and no `error`. No retry ran — the provider was asked twice,
+/// never a third time — the held call the cancel aborted wrote no record
+/// (`docs/durability.md` §6.1), and the worker is still serving.
+///
+/// And the worker is what stopped it: the hub settles the node — and so the
+/// execution — only once the worker's `status: "cancelled"` result is home,
+/// because a cancelled node waits for what it began, and a placed node began
+/// it on the worker (Decision D160). So by the time the report says
+/// `cancelled` the journal's dispatch row is already settled with the
+/// `ExecutionCancelled` outcome that only that result writes (§3.4), and the
+/// runner process the worker started for the dispatch is gone — both inside
+/// the ten seconds.
+#[test]
+fn a_cancel_stops_a_placed_node_on_its_worker_and_settles_the_execution_cancelled() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider.enqueue_all([
+        Script::new(SONNET, Outcome::text("thinking about it")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "signature": "never delivered" }))
+                .after(Duration::from_secs(600)),
+        ),
+    ]);
+    let mut worker = mesh.worker("cancelled-mid-node");
+    let execution = mesh.start_execution("/retried-releases", &json!({ "path": "release.dmg" }));
+    until(
+        "the first model call reached the hub's journal",
+        || worker.transcript(),
+        || harness::journal_holds(&mesh.project, &["sign/0#model/0"]),
+    );
+    mesh.until(&execution, "was taken by the worker", |report| {
+        report["placement_waits"][0]["status"] == "dispatched"
+    });
+    let running = worker.runners();
+    if let Some(running) = &running {
+        assert_eq!(
+            running.len(),
+            1,
+            "one runner for the one dispatch: {running:?}"
+        );
+    }
+
+    let asked = Instant::now();
+    let cancelled = mesh.send(Request::post(format!("/executions/{execution}/cancel")));
+    assert_eq!(cancelled.status, 202, "{}", body_of(&cancelled));
+    let report = mesh.until(&execution, "was cancelled", |report| {
+        report["status"] == "cancelled"
+    });
+    // Already settled — the execution waited for it.
+    mesh.settled_cancelled(&execution, 1, Duration::ZERO);
+    for pid in running.into_iter().flatten() {
+        assert!(
+            gone_within(pid, Duration::from_secs(10).saturating_sub(asked.elapsed())),
+            "the runner {pid} the worker started for the cancelled dispatch is still alive: {}",
+            worker.transcript()
+        );
+    }
+    assert!(
+        asked.elapsed() < Duration::from_secs(10),
+        "the cancel took {:?} to settle a placed node",
+        asked.elapsed()
+    );
+    assert!(report.get("error").is_none(), "{report:#}");
+    let sign = report["trace"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["node"] == "sign")
+        .unwrap_or_else(|| panic!("the placed node has an entry: {report:#}"));
+    assert_eq!(sign["outcome"], "cancelled", "{sign:#}");
+    assert!(sign.get("error").is_none(), "{sign:#}");
+    assert_eq!(
+        mesh.provider.requests().len(),
+        2,
+        "a cancelled placed node was retried"
+    );
+    // The call the cancel aborted wrote no record (`docs/durability.md` §6.1):
+    // the runner's effects are posted ahead of its result, which settled the
+    // row above, so a record it had kept would be in the journal by now.
+    let aborted = harness::journal_rows(
+        &mesh.project,
+        &format!(
+            "SELECT \"key\" AS k, payload FROM effects \
+             WHERE execution = '{execution}' AND \"key\" = 'sign/0#model/1'"
+        ),
+    );
+    assert_eq!(
+        aborted,
+        json!([]),
+        "the model call the cancel aborted was journaled as an answer"
+    );
+    assert!(
+        worker.running(),
+        "the worker stopped with the node it was asked to cancel: {}",
+        worker.transcript()
+    );
+}
+
+/// **A cancel reaches a worker holding two of an execution's dispatches**
+/// (PRD resolved q75, q79; `docs/distributed.md` §3.2).
+///
+/// At `max_running: 2` one worker holds both items of a two-item fan-out, each
+/// in the middle of a ten-minute call. The cancel names both in the worker's
+/// next poll's `cancel` list, the worker stops both runners, and both cancelled
+/// results settle the row `cancelled` — read off the journal's dispatch rows,
+/// each settled with the outcome only the worker's result writes, and off the
+/// runner processes, both gone.
+#[test]
+fn a_cancel_reaches_a_worker_holding_two_of_its_dispatches() {
+    let Some(mesh) = capped("mesh-cancel-two", 2) else {
+        return;
+    };
+    for path in ["a.dmg", "b.dmg"] {
+        mesh.provider
+            .enqueue_all(held_signature(path, Duration::from_secs(600)));
+    }
+    let mut worker = mesh.worker("cancel-two");
+    let execution = mesh.start_execution("/batches", &json!({ "paths": ["a.dmg", "b.dmg"] }));
+    mesh.until(&execution, "had both items dispatched", |report| {
+        report["placement_waits"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|wait| wait["status"] == "dispatched")
+            .count()
+            == 2
+    });
+    // Both runners are up once both dispatches are in the worker's hands.
+    let running = worker.runners().map(|_| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let held = worker.runners().unwrap_or_default();
+            if held.len() == 2 || Instant::now() > deadline {
+                break held;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    if let Some(running) = &running {
+        assert_eq!(
+            running.len(),
+            2,
+            "two runners for two dispatches: {running:?}"
+        );
+    }
+    let asked = Instant::now();
+    let cancelled = mesh.send(Request::post(format!("/executions/{execution}/cancel")));
+    assert_eq!(cancelled.status, 202, "{}", body_of(&cancelled));
+    let report = mesh.until(&execution, "was cancelled", |report| {
+        report["status"] == "cancelled"
+    });
+    assert!(
+        asked.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        asked.elapsed()
+    );
+    assert!(report.get("error").is_none(), "{report:#}");
+    mesh.settled_cancelled(
+        &execution,
+        2,
+        Duration::from_secs(10).saturating_sub(asked.elapsed()),
+    );
+    for pid in running.into_iter().flatten() {
+        assert!(
+            gone_within(pid, Duration::from_secs(10).saturating_sub(asked.elapsed())),
+            "a runner the worker started for a cancelled dispatch is still alive: {}",
+            worker.transcript()
+        );
+    }
+    assert!(worker.running(), "{}", worker.transcript());
+}
+
+/// **A restart while a worker holds a cancelled execution's dispatch
+/// completes the cancel** (PRD resolved q75 ruling e, `docs/distributed.md`
+/// §5, `docs/durability.md` §6.1).
+///
+/// `flow.release`'s `sign` declares no `retry:` and its flow `on_error: fail`,
+/// so an attempt read as failed ends the execution `failed`. The worker is in
+/// the middle of the node; the hub is killed, and the journal is left as a
+/// crash right after the cancel route recorded its request would leave it —
+/// the request on the `cancellations` table, the dispatch still `dispatched`
+/// to a session the dead process issued. The hub that replaces it does not
+/// read that row as an orphan: the replay reaches it as the frontier of the
+/// cancel, so the node is cancelled, the execution settles `cancelled` with no
+/// `error`, and the row is withdrawn as the cancel's rather than superseded as
+/// a lost session's.
+#[test]
+fn a_restart_while_a_worker_holds_a_cancelled_dispatch_completes_the_cancel() {
+    let Some(mut mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider.enqueue_all([
+        Script::new(SONNET, Outcome::text("thinking about it")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "signature": "never delivered" }))
+                .after(Duration::from_secs(5)),
+        ),
+    ]);
+    let mut worker = mesh.worker("restart-mid-cancel");
+    let execution = mesh.start_execution("/releases", &json!({ "path": "release.dmg" }));
+    until(
+        "the first model call reached the hub's journal",
+        || worker.transcript(),
+        || harness::journal_holds(&mesh.project, &["sign/0#model/0"]),
+    );
+    mesh.until(&execution, "was taken by the worker", |report| {
+        report["placement_waits"][0]["status"] == "dispatched"
+    });
+
+    mesh.restart_after(|project| {
+        let wrote = harness::journal_sql(
+            project,
+            &format!(
+                "INSERT INTO cancellations (execution, requested_at) \
+                 VALUES ('{execution}', '2026-11-04T00:00:00.000Z');"
+            ),
+        );
+        assert!(
+            wrote.status.success(),
+            "{}",
+            String::from_utf8_lossy(&wrote.stderr)
+        );
+    });
+
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] == "cancelled" || report["status"] == "failed"
+    });
+    assert_eq!(
+        report["status"], "cancelled",
+        "a restart read the cancelled execution's held dispatch as an orphan: {report:#}"
+    );
+    assert!(report.get("error").is_none(), "{report:#}");
+    let sign = report["trace"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["node"] == "sign")
+        .unwrap_or_else(|| panic!("the placed node has an entry: {report:#}"));
+    assert_eq!(sign["outcome"], "cancelled", "{sign:#}");
+    let rows = mesh.dispatch_rows(&execution);
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(rows[0]["status"], "superseded", "{rows:#?}");
+    assert!(
+        rows[0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("was cancelled")),
+        "the held dispatch was ended as an orphan rather than as the cancel's: {rows:#?}"
+    );
+    assert!(worker.running(), "{}", worker.transcript());
+}
+
+/// What the resume route answers for an execution somebody cancelled
+/// (`src/serve.ts`'s `CANCELLED_RESUME`, PRD resolved q75 ruling e).
+const CANCELLED_RESUME: &str = "this execution was cancelled, so nothing is waiting for an \
+                                answer: a cancelled execution is ended for good and is never \
+                                resumed";
+
+/// Assert that a cancelled execution holds no wait any more, that its placed
+/// node's entry says `cancelled`, and that an answer to the wait it held is
+/// refused naming the status.
+fn assert_released_and_refused(mesh: &Mesh, execution: &str, wait: &str, report: &Value) {
+    assert!(report.get("error").is_none(), "{report:#}");
+    assert!(
+        report["interrupts"].as_array().is_none_or(Vec::is_empty),
+        "a cancelled execution still publishes the question it was waiting on: {report:#}"
+    );
+    assert!(
+        report["placement_waits"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "a cancelled execution still holds a placement wait: {report:#}"
+    );
+    let escalate = report["trace"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["node"] == "escalate")
+        .unwrap_or_else(|| panic!("the placed node has an entry: {report:#}"));
+    assert_eq!(escalate["outcome"], "cancelled", "{escalate:#}");
+    assert!(escalate.get("error").is_none(), "{escalate:#}");
+    let refused = mesh.resume(execution, wait, &json!({ "decision": "approve" }));
+    assert_eq!(refused.status, 409, "{}", body_of(&refused));
+    assert_eq!(
+        refused.json(),
+        json!({
+            "execution_id": execution,
+            "status": "cancelled",
+            "error": CANCELLED_RESUME,
+        }),
+        "the answer to a released wait was not refused naming the cancel"
+    );
+}
+
+/// **A cancel releases a pause a placed agent brought home** (PRD resolved q75
+/// ruling e: "human and placement waits are released"; Decision D160,
+/// `docs/distributed.md` §3.4).
+///
+/// `flow.escalated`'s placed agent reaches `flow.escalation`'s `ask` on the
+/// worker; the dispatch settles paused and the question is planted on the
+/// hub's board. A cancel while it waits answers `202`, abandons the wait — the
+/// report publishes no question, the placed node's entry is `cancelled` — and
+/// settles the row `cancelled` inside the field report's ten seconds, after
+/// which the answer the question was waiting for is refused naming the status.
+/// The node is not redispatched: one dispatch row, one model call.
+#[test]
+fn a_cancel_releases_a_pause_a_placed_agent_brought_home_and_settles_cancelled() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider.enqueue_all(escalating("never decided"));
+    let mut worker = mesh.worker("cancel-at-a-remote-pause");
+    let execution = mesh.start_execution("/escalations", &json!({ "path": "release.dmg" }));
+    let wait = mesh.paused(&execution);
+    let id = wait["wait_id"].as_str().expect("the wait names itself");
+
+    let asked = Instant::now();
+    let cancelled = mesh.send(Request::post(format!("/executions/{execution}/cancel")));
+    assert_eq!(cancelled.status, 202, "{}", body_of(&cancelled));
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] != "interrupted" && report["status"] != "running"
+    });
+    assert_eq!(
+        report["status"], "cancelled",
+        "a cancel of an execution parked at a worker's question did not end it cancelled: \
+         {report:#}"
+    );
+    assert!(
+        asked.elapsed() < Duration::from_secs(10),
+        "the cancel took {:?} to settle an execution parked at a pause",
+        asked.elapsed()
+    );
+    assert_released_and_refused(&mesh, &execution, id, &report);
+    let rows = mesh.dispatch_rows(&execution);
+    assert_eq!(
+        rows.len(),
+        1,
+        "the cancelled node was dispatched again: {rows:#?}"
+    );
+    assert_eq!(
+        mesh.provider.requests().len(),
+        1,
+        "a cancelled node made a model call past its pause"
+    );
+    assert!(worker.running(), "{}", worker.transcript());
+}
+
+/// **A hub restarted mid-cancel while a placed agent's pause waits completes
+/// the cancel** (PRD resolved q75 ruling e, `docs/durability.md` §6.1).
+///
+/// The journal is left as a `SIGKILL` right after the cancel route recorded its
+/// request would leave it: the request on the `cancellations` table, the
+/// dispatch settled paused with no answer recorded — an abandoned remote pause
+/// writes nothing. The recovered replay reaches the placed node and finds the
+/// unanswered pause, which is a frontier exactly as a local wait's claim is:
+/// the cancel fires there instead of the question going back on the board, so
+/// the row settles `cancelled` with no wait published and the answer is
+/// refused naming the status. Re-planted instead, the wait would refuse every
+/// answer as "being cancelled" while nothing ever ended it.
+#[test]
+fn a_hub_restarted_mid_cancel_at_a_placed_pause_completes_the_cancel() {
+    let Some(mut mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider.enqueue_all(escalating("never decided"));
+    let mut asked = mesh.worker("restart-mid-cancel-at-a-pause");
+    let execution = mesh.start_execution("/escalations", &json!({ "path": "release.dmg" }));
+    let wait = mesh.paused(&execution);
+    let id = wait["wait_id"]
+        .as_str()
+        .expect("the wait names itself")
+        .to_string();
+    asked.kill();
+
+    mesh.restart_after(|project| {
+        let wrote = harness::journal_sql(
+            project,
+            &format!(
+                "INSERT INTO cancellations (execution, requested_at) \
+                 VALUES ('{execution}', '2026-11-04T00:00:00.000Z');"
+            ),
+        );
+        assert!(
+            wrote.status.success(),
+            "{}",
+            String::from_utf8_lossy(&wrote.stderr)
+        );
+    });
+
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] == "cancelled" || report["status"] == "failed"
+    });
+    assert_eq!(
+        report["status"], "cancelled",
+        "the recovered execution did not complete its cancel: {report:#}"
+    );
+    assert_released_and_refused(&mesh, &execution, &id, &report);
+    let rows = mesh.dispatch_rows(&execution);
+    assert_eq!(
+        rows.len(),
+        1,
+        "the recovery dispatched the cancelled node again: {rows:#?}"
+    );
+    assert_eq!(rows[0]["status"], "settled", "{rows:#?}");
+    let human = harness::journal_rows(
+        &mesh.project,
+        "SELECT key FROM effects WHERE kind = 'human'",
+    );
+    assert_eq!(
+        human,
+        json!([]),
+        "the released pause was journaled as answered: {human:#}"
+    );
+    assert_eq!(
+        mesh.provider.requests().len(),
+        1,
+        "the recovery made a model call past the cancelled pause"
+    );
+}
+
+/// The one call `agent.closer` makes on the worker: the attached flow, whose
+/// body outlasts every test — so nothing past it is scripted.
+fn closing() -> Vec<Script> {
+    vec![Script::new(
+        SONNET,
+        Outcome::tool_calls(vec![ToolCall::new(
+            "closing",
+            json!({ "path": "release.dmg" }),
+        )]),
+    )]
+}
+
+/// **A cancel on a worker lets the finally node it started run whole** (grammar
+/// §7.9: "a cancel stops none of it, and nothing it begins"; PRD resolved q75,
+/// q76, Decision D160, `docs/distributed.md` §3.2, §3.4).
+///
+/// `flow.closed`'s placed agent attaches `flow.closing`, whose body is a
+/// ten-minute command and whose finally node takes eight seconds and then
+/// fails. The cancel lands while the body runs: the worker sends the runner
+/// `SIGTERM`, the runner cancels, the attached instance ends and starts its
+/// finally node — and the worker's five-second grace does **not** kill it,
+/// because the runner reports finally work under way. So past the grace the
+/// runner is still alive and the dispatch still held; and when the row settles,
+/// by the worker's cancelled result, that result carries the failure the
+/// finally node ended on after its eight seconds — work a kill at five would
+/// have cut off, leaving a result with no `finally_error` at all.
+///
+/// **And the execution waits for it.** A cancelled node settles only once every
+/// instance it began has ended, and a placed node began this one on the
+/// worker: so past the grace the execution is still not settled, and it
+/// settles only after the dispatch row has. The inner finally node's failure is
+/// then the **execution's** `finally_error` — on the status report and the
+/// journal's lifecycle row (PRD resolved q76) — and the root's own finally
+/// node, `noted`, which fails too, ran after it: the first failure stands, and
+/// the one that stands is the worker's, innermost first.
+#[test]
+fn a_cancel_on_a_worker_lets_the_finally_node_it_started_run_whole() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider.enqueue_all(closing());
+    let mut worker = mesh.worker("cancel-runs-finally-whole");
+    let execution = mesh.start_execution("/closings", &json!({ "path": "release.dmg" }));
+    until(
+        "the placed agent's model call reached the hub's journal",
+        || worker.transcript(),
+        || harness::journal_holds(&mesh.project, &["close/0#model/0"]),
+    );
+    // The attached flow's body is running once the runner has a `sleep` of its
+    // own; off Linux, where there is no `/proc` to ask, it is given a moment.
+    let runner = worker.runners().map(|_| {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let held = worker.runners().unwrap_or_default();
+            if let Some(runner) = held.first().copied() {
+                let body = u32::try_from(runner)
+                    .ok()
+                    .and_then(|runner| children_running(runner, "sleep"))
+                    .unwrap_or_default();
+                if !body.is_empty() {
+                    break runner;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the attached flow's body never started on the worker: {}",
+                worker.transcript()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    if runner.is_none() {
+        std::thread::sleep(Duration::from_secs(2));
+    }
+
+    let asked = Instant::now();
+    let cancelled = mesh.send(Request::post(format!("/executions/{execution}/cancel")));
+    assert_eq!(cancelled.status, 202, "{}", body_of(&cancelled));
+
+    // Past the worker's grace, and inside the finally node's eight seconds: the
+    // runner is alive, the dispatch held — and the execution not settled.
+    std::thread::sleep(Duration::from_millis(6_500).saturating_sub(asked.elapsed()));
+    let rows = mesh.dispatch_rows(&execution);
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["status"].clone())
+            .collect::<Vec<_>>(),
+        [json!("dispatched")],
+        "the dispatch settled inside the finally node's eight seconds, so the runner did not \
+         run it whole: {rows:#?}\n{}",
+        worker.transcript()
+    );
+    let early = mesh.report(&execution);
+    assert_eq!(
+        early["status"], "running",
+        "the execution settled while the instance its placed node began on the worker was still \
+         running its finally node: {early:#}"
+    );
+    if let Some(runner) = runner {
+        assert!(
+            !gone_within(runner, Duration::ZERO),
+            "the worker killed the runner at its grace while a finally node was running in it: \
+             {}",
+            worker.transcript()
+        );
+    }
+
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] != "running" && report["status"] != "interrupted"
+    });
+    assert_eq!(report["status"], "cancelled", "{report:#}");
+    assert!(
+        asked.elapsed() >= Duration::from_secs(8),
+        "the execution settled {:?} after the cancel, before the finally node's eight seconds",
+        asked.elapsed()
+    );
+    // Settled before the execution was, so read once the execution is.
+    let rows = mesh.dispatch_rows(&execution);
+    assert!(
+        rows.len() == 1
+            && rows[0]["status"] == "settled"
+            && rows[0]["payload"]
+                .as_str()
+                .is_some_and(|payload| payload.contains("\"ExecutionCancelled\"")),
+        "the execution settled before its worker's cancelled result did: {rows:#?}\n{}",
+        worker.transcript()
+    );
+    let payload = rows[0]["payload"].as_str().unwrap_or_default();
+    assert!(
+        payload.contains("flow.closing node `close_up` failed: ") && payload.contains("exited 3"),
+        "the cancelled result does not carry the failure the finally node ended on, so it did \
+         not run to its end: {rows:#?}\n{}",
+        worker.transcript()
+    );
+    // The worker's finally failure is the execution's, and it came first: the
+    // root's own `noted` failed after it, and the first failure stands.
+    let finally_error = report["finally_error"].as_str().unwrap_or_else(|| {
+        panic!(
+            "the cancelled execution carries no `finally_error`, though its worker's result did: \
+             {report:#}"
+        )
+    });
+    assert!(
+        finally_error.starts_with("flow.closing node `close_up` failed: ")
+            && finally_error.contains("exited 3"),
+        "the execution's `finally_error` is not the worker's, so the root's finally node ran \
+         before the instance inside it had ended: {finally_error}"
+    );
+    let noted = report["trace"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["node"] == "noted")
+        .unwrap_or_else(|| panic!("the root's finally node has an entry: {report:#}"));
+    assert_eq!(noted["outcome"], "failed", "{noted:#}");
+    let lifecycle = harness::journal_rows(
+        &mesh.project,
+        &format!("SELECT status, finally_error FROM executions WHERE id = '{execution}'"),
+    );
+    assert_eq!(
+        lifecycle,
+        json!([{ "status": "cancelled", "finally_error": finally_error }]),
+        "the journal's lifecycle row does not carry the worker's finally failure"
+    );
+    if let Some(runner) = runner {
+        assert!(
+            gone_within(runner, Duration::from_secs(10)),
+            "the runner outlived the result it posted: {}",
+            worker.transcript()
+        );
+    }
+    assert!(worker.running(), "{}", worker.transcript());
+}
+
+/// What the model asks for in `flow.lapsed`: the attached flow, whose body
+/// outlasts the placed node's four seconds — so nothing past it is scripted.
+fn lapsing() -> Vec<Script> {
+    vec![Script::new(
+        SONNET,
+        Outcome::tool_calls(vec![ToolCall::new(
+            "lapsing",
+            json!({ "path": "release.dmg" }),
+        )]),
+    )]
+}
+
+/// **A placed node's deadline ends what it began on the worker `failed`, never
+/// `cancelled` — and waits for it to end** (grammar §7.9, §9.2; PRD resolved
+/// q75, q76; Decision D159; `docs/distributed.md` §3.2, §3.3, §3.4).
+///
+/// `flow.lapsed`'s placed `lapse` has four seconds, and its model calls
+/// `flow.lapsing`, whose body runs for ten minutes on the worker and whose
+/// finally node fails at once. At four seconds the hub stops waiting: the node
+/// fails on its budget and the execution with it — `failed`, because nobody
+/// cancelled anything — and the worker is told to **stop** the dispatch, on the
+/// poll's `stop` list. The runner stops the placed node with a failure rather
+/// than firing its execution's cancel, so the attached instance ends `failed`
+/// and its finally node runs at that outcome; the boundary it crosses is
+/// journaled from the worker, and says `failed` — what the same instance
+/// records when an unplaced node runs out of time
+/// (`a_flow_node_whose_timeout_ran_out_waits_for_its_instances_finally_node`).
+/// Told to cancel instead, the runner would end it `cancelled` in an execution
+/// whose own outcome is `failed`, and a retry's redispatch would hand that
+/// record back to be replayed as the cancel nobody made.
+///
+/// **And the node waits for that end**, as a node whose deadline ran out waits
+/// for every instance it began: the hub holds `lapse` open at its site until
+/// the worker's result for the stopped dispatch comes home. So the boundary is
+/// in the journal by the time the execution settles, and the finally node's
+/// failure — carried on that result, which the hub refuses `409` — is the
+/// execution's `finally_error`, on the report and on the lifecycle row. A node
+/// that settled the moment its budget ran out would settle the execution
+/// before the instance on the worker had ended, and drop that failure with the
+/// refused result.
+#[test]
+fn a_deadline_on_a_worker_ends_the_instances_it_began_failed_not_cancelled() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider.enqueue_all(lapsing());
+    let mut worker = mesh.worker("deadline-ends-failed");
+    let execution = mesh.start_execution("/lapsings", &json!({ "path": "release.dmg" }));
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] != "running" && report["status"] != "interrupted"
+    });
+    assert_eq!(
+        report["status"],
+        "failed",
+        "a placed node that ran out of time fails its execution, and cancels nothing: \
+         {report:#}\n{}",
+        worker.transcript()
+    );
+    assert!(
+        report["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("timed out")),
+        "{report:#}"
+    );
+
+    // The instance on the worker ended once the runner had been told to stop,
+    // and the node waited for it: its boundary came home over
+    // `/workers/effects` **before** the execution settled on the hub.
+    const BOUNDARY: &str = "lapse/0/lapsing/0/lapse_up/0#finally/0";
+    assert!(
+        harness::journal_holds(&mesh.project, &[BOUNDARY]),
+        "the execution settled before the instance its placed node began on the worker had \
+         ended: {report:#}\n{}",
+        worker.transcript()
+    );
+    let finally_error = report["finally_error"].as_str().unwrap_or_else(|| {
+        panic!(
+            "the execution carries no `finally_error`, though the finally node the stop started \
+             on the worker failed and its result said so: {report:#}\n{}",
+            worker.transcript()
+        )
+    });
+    assert!(
+        finally_error.starts_with("flow.lapsing node `lapse_up` failed: ")
+            && finally_error.contains("exited 5"),
+        "the execution's `finally_error` is not the one the worker's result carried: \
+         {finally_error}"
+    );
+    let lifecycle = harness::journal_rows(
+        &mesh.project,
+        &format!("SELECT status, finally_error FROM executions WHERE id = '{execution}'"),
+    );
+    assert_eq!(
+        lifecycle,
+        json!([{ "status": "failed", "finally_error": finally_error }]),
+        "the journal's lifecycle row does not carry the worker's finally failure"
+    );
+    let rows = harness::journal_rows(
+        &mesh.project,
+        &format!(
+            "SELECT \"key\" AS k, payload FROM effects \
+             WHERE execution = '{execution}' AND kind = 'finally'"
+        ),
+    );
+    let rows = rows.as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "one instance ended, one boundary: {rows:?}");
+    assert_eq!(rows[0]["k"], BOUNDARY, "{rows:?}");
+    let recorded: Value = serde_json::from_str(rows[0]["payload"].as_str().expect("a payload"))
+        .expect("the payload is JSON");
+    assert_eq!(
+        recorded["outcome"],
+        "failed",
+        "the instance a placed node began on the worker ended as its node's deadline ends it, \
+         and not as a cancel nobody made: {recorded:#}\n{}",
+        worker.transcript()
+    );
+
+    // The dispatch was ended by the hub's deadline, never settled as a cancel.
+    let dispatches = mesh.dispatch_rows(&execution);
+    assert!(
+        dispatches.len() == 1
+            && dispatches[0]["status"] == "superseded"
+            && dispatches[0]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("stopped waiting")),
+        "{dispatches:#?}"
+    );
+    assert!(worker.running(), "{}", worker.transcript());
+}
+
+/// **A stop on a worker leaves none of the commands the placed node's attached
+/// flow was running** (Decision D160's "a stopped command is stopped whole";
+/// `docs/distributed.md` §3.2; PRD resolved q79).
+///
+/// `flow.lapsed` again: at four seconds the hub stops waiting for `lapse`,
+/// while the `sleep 600` of `flow.lapsing`'s body is running in a process
+/// group of its own under the runner. The stop is what ends that command too —
+/// every node the runner runs chains to it beside the execution's cancel —
+/// not only the placed node, whose attached instance ends on it and lets its
+/// running node go. Asserted **past the worker's grace**, which is when the
+/// command would otherwise show itself: the runner kept alive by it would be
+/// killed with its own group, and the command — a group of its own — would
+/// survive it, re-parented, still writing into the worker's workspace beside
+/// whatever the freed slot was handed next.
+#[test]
+fn a_stop_on_a_worker_leaves_none_of_the_commands_its_attached_flow_ran() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider.enqueue_all(lapsing());
+    let mut worker = mesh.worker("stop-takes-the-command");
+    let started = Instant::now();
+    let execution = mesh.start_execution("/lapsings", &json!({ "path": "release.dmg" }));
+    // The runner, and the attached flow's command under it, off `/proc`; off
+    // Linux there is no `/proc` to ask, and the case has nothing to read.
+    if worker.runners().is_none() {
+        return;
+    }
+    let (runner, command) = {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let held = worker.runners().unwrap_or_default();
+            if let Some(runner) = held.first().copied() {
+                let body = u32::try_from(runner)
+                    .ok()
+                    .and_then(|runner| children_running(runner, "sleep"))
+                    .unwrap_or_default();
+                if let Some(command) = body.first().copied() {
+                    break (runner, command);
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the attached flow's command never started on the worker: {}",
+                worker.transcript()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] != "running" && report["status"] != "interrupted"
+    });
+    assert_eq!(
+        report["status"],
+        "failed",
+        "{report:#}\n{}",
+        worker.transcript()
+    );
+
+    // Past the node's four seconds and the worker's five-second grace after
+    // them, with a second to spare.
+    std::thread::sleep(Duration::from_secs(10).saturating_sub(started.elapsed()));
+    assert!(
+        gone_within(command, Duration::ZERO),
+        "the attached flow's command outlived the stop that ended its instance, past the \
+         worker's grace: {}",
+        std::fs::read_to_string(format!("/proc/{command}/stat")).unwrap_or_default()
+    );
+    assert!(
+        gone_within(runner, Duration::ZERO),
+        "the runner outlived the grace: {}",
+        worker.transcript()
+    );
+    assert!(worker.running(), "{}", worker.transcript());
 }

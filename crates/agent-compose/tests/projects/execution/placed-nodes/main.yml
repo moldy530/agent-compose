@@ -17,6 +17,10 @@
 #     under a `retry:`, so a superseded attempt is followed by another that parks
 #     again and can be answered. Without a `retry:` the supersede would be the
 #     end of the run and there would be nothing to observe about the re-park.
+#   * `flow.overdue` is the same dispatch under a two-second `timeout:`: the hub
+#     gives up on an attempt a worker is still running, and the session holding
+#     it is told to stop it and is handed nothing else until its result says it
+#     has (§2, §3.2; PRD resolved q79).
 #   * `flow.batch` is §2's queueing clause: a `map` admitting twelve items onto a
 #     placement whose pool is whatever showed up. The map declares how many
 #     instances the *graph* may have in flight; how many are **running** is the
@@ -61,6 +65,26 @@
 #     journaled from there over `/workers/effects`, and what its finally node
 #     raised comes home on the dispatch's result as `finally_error`
 #     (`docs/distributed.md` §3.3, §3.4).
+#   * `flow.closed` is a cancel reaching that shape (PRD resolved q75, grammar
+#     §7.9, `docs/distributed.md` §3.2): a placed agent attaching a `flow.*`
+#     whose body runs for ten minutes and whose `finally:` node takes eight
+#     seconds and then fails. A cancel during the body ends the attached
+#     instance, which starts its finally node on the worker — and that node runs
+#     whole, past the worker's five-second grace, so the failure it ends on comes
+#     home on the cancelled result as the execution's `finally_error`. Its own
+#     root `finally:` node fails too, and runs only once the worker's result is
+#     home — innermost first — so the `finally_error` that stands, the first, is
+#     the worker's.
+#   * `flow.lapsed` is the same shape ended by the placed node's own deadline
+#     rather than by a cancel (grammar §7.9, §9.2, `docs/distributed.md` §3.2):
+#     the hub stops waiting at four seconds while the attached instance's body
+#     is still running on the worker, and tells the worker to **stop** it —
+#     never to cancel it, because nobody cancelled the execution. So that
+#     instance ends `failed`, as it does when an unplaced node runs out of time,
+#     and its finally boundary — journaled from the worker — says so. The stop
+#     takes the instance's running command with it, and the placed node waits
+#     for the worker's result, so the finally node's own failure is the
+#     execution's `finally_error`.
 #
 # `agent.signer` attaches `tool.sign` and both are members of `mac`, which is
 # grammar §14.1 rule 4's second row: the same answer written twice. `tool.sign`'s
@@ -129,6 +153,15 @@ triggers:
     type: http
     flow: flow.retried
     path: /retried-releases
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
+  on_overdue_release:
+    type: http
+    flow: flow.overdue
+    path: /overdue-releases
     method: POST
     input:
       path: "payload.body.path"
@@ -228,6 +261,26 @@ triggers:
     type: http
     flow: flow.tidied
     path: /tidyings
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
+  # A cancel reaching a finally node on a worker — see `flow.closed`.
+  on_closed:
+    type: http
+    flow: flow.closed
+    path: /closings
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
+  # A deadline reaching a finally node on a worker — see `flow.lapsed`.
+  on_lapsed:
+    type: http
+    flow: flow.lapsed
+    path: /lapsings
     method: POST
     input:
       path: "payload.body.path"
@@ -432,6 +485,86 @@ flow.tidying:
     - { from: look, to: end }
   finally: tidy_up
 
+# Placed, and what it attaches is a flow whose body a cancel stops and whose
+# finally node it cannot — see `flow.closed`.
+agent.closer:
+  description: Look a release over at length, and close up after it, on the machine that holds it.
+  model: model.smart
+  prompt: |
+    Look the path you are given over, and report what you found.
+  tools: [flow.closing]
+  input:
+    path:
+      type: string
+  output:
+    signature:
+      type: string
+      min_length: 1
+
+# Attached, never triggered: a body that outlasts any test, and a finally node
+# that outlasts the worker's cancel grace and then fails, so whether it ran to
+# its end is a `finally_error` the hub can read.
+flow.closing:
+  description: Look one release over at length, and close up after it slowly — which never works.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    look_long:
+      exec:
+        command: "${OPS_BIN}/sleep"
+        args: ["600"]
+    close_up:
+      exec:
+        command: "${OPS_BIN}/sh"
+        args: ["-c", "sleep 8; exit 3"]
+  edges:
+    - { from: start, to: look_long }
+    - { from: look_long, to: end }
+  finally: close_up
+
+# Placed, and what it attaches is a flow whose body outlasts the placed node's
+# own `timeout:` — see `flow.lapsed`.
+agent.lapser:
+  description: Look a release over at length, on the machine that holds it, inside a budget too short for it.
+  model: model.smart
+  prompt: |
+    Look the path you are given over, and report what you found.
+  tools: [flow.lapsing]
+  input:
+    path:
+      type: string
+  output:
+    signature:
+      type: string
+      min_length: 1
+
+# Attached, never triggered: a body that outlasts any test, and a finally node
+# that ends at once and fails, so the outcome its boundary records and the
+# `finally_error` it raises are the whole of what a test reads.
+flow.lapsing:
+  description: Look one release over at length, and tidy up after it — which never works.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    look_long:
+      exec:
+        command: "${OPS_BIN}/sleep"
+        args: ["600"]
+    lapse_up:
+      exec:
+        command: "${OPS_BIN}/sh"
+        args: ["-c", "exit 5"]
+  edges:
+    - { from: start, to: look_long }
+    - { from: look_long, to: end }
+  finally: lapse_up
+
 # Attached rather than triggered, and never reached any other way here: what it
 # is for is being **inside** a placed agent's tool loop.
 flow.escalation:
@@ -620,6 +753,66 @@ flow.tidied:
     - { from: start, to: tidy }
     - { from: tidy, to: end }
 
+# A cancel reaching an attached flow's finally node on a worker: `close` is
+# placed, its model calls `flow.closing`, and a cancel during that instance's
+# body starts its finally node there — which runs whole, past the worker's
+# grace, and fails (grammar §7.9, PRD resolved q75). `noted`, the root's own
+# finally node, runs on the hub and fails as well: it is the outer of the two
+# ends, so it runs after the worker's result is home, and its failure is the
+# second `finally_error` — which the first, the worker's, outranks.
+flow.closed:
+  description: A placed agent whose attached flow's slow finally node a cancel starts on the worker.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+  nodes:
+    close:
+      agent: agent.closer
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+    noted:
+      exec:
+        command: "${OPS_BIN}/sh"
+        args: ["-c", "exit 4"]
+  edges:
+    - { from: start, to: close }
+    - { from: close, to: end }
+  finally: noted
+
+# A placed node's deadline reaching an attached flow's finally node on a worker:
+# `lapse` is placed with four seconds, its model calls `flow.lapsing`, and the
+# hub stops waiting while that instance's body runs. The worker is told to stop
+# the dispatch — not to cancel it — so the instance ends `failed` there, its
+# command stopped with it, and its finally node runs at that outcome and fails;
+# and `lapse` waits for that, so the failure is the execution's (grammar §7.9,
+# `docs/distributed.md` §3.2).
+flow.lapsed:
+  description: A placed agent whose own deadline runs out while its attached flow runs on the worker.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+  nodes:
+    lapse:
+      agent: agent.lapser
+      timeout: 4s
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+  edges:
+    - { from: start, to: lapse }
+    - { from: lapse, to: end }
+
 flow.release:
   description: Sign a release on a worker, and notarize it on the hub.
   inputs:
@@ -749,6 +942,27 @@ flow.retried:
       # is that a superseded dispatch fails **an attempt** rather than the run
       # (§6.3), so the second attempt has to be reachable inside a test.
       retry: { max: 2, backoff: 1ms }
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+  edges:
+    - { from: start, to: sign }
+    - { from: sign, to: end }
+
+flow.overdue:
+  description: The same sign-off, under a deadline that outruns the worker.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+  nodes:
+    sign:
+      agent: agent.signer
+      timeout: 2s
       input:
         path: "input.path"
       writes:

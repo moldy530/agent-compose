@@ -116,6 +116,21 @@
 //! runs one — the composition simply arrives over the wire rather than off
 //! disk — and everything about the protocol lives in [`worker`].
 //!
+//! `cancel` stops an execution a `serve` is running (PRD resolved q75):
+//!
+//! ```text
+//! agent-compose cancel <path> <execution> [--url <base>] [--header 'Name: value']...
+//!                      [--target <name>] [--out <dir>] [--format human|json]
+//! ```
+//!
+//! It builds the project as `resume` does and launches the emitted command line's
+//! `cancel` verb, which posts `POST /executions/<id>/cancel` to the app at
+//! `--url`, or at the target's `hub.public_url`. The execution, every open child
+//! execution in its lineage, and every node running in them stop; a `run` is not
+//! cancelled this way — `Ctrl-C` leaves its row open for `resume` (PRD resolved
+//! q28). It exits `0` when the app accepted the cancel, `1` when it refused it,
+//! and `2` when there was no app to ask.
+//!
 //! `resume` is the durable half (PRD resolved q26–q29, `docs/durability.md`).
 //! Every invocation journals its effects as it makes them, and a `run` that
 //! crashed leaves an execution the journal holds open; `resume` re-runs that
@@ -394,6 +409,30 @@ enum Command {
         #[arg(long, value_name = "DIR")]
         out: Option<PathBuf>,
         /// How to report what was found
+        #[arg(long, value_enum, default_value_t = Format::Human)]
+        format: Format,
+    },
+    /// Cancel an execution a `serve` is running, and every open child execution it started
+    /// (validates, builds, then launches)
+    Cancel {
+        /// Path to the spec entrypoint (conventionally `main.yml`)
+        path: PathBuf,
+        /// The execution to cancel, as `serve` answered it (`execution_id`)
+        #[arg(value_name = "EXECUTION")]
+        execution: String,
+        /// The serving app's base URL [default: the target's `hub.public_url`]
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+        /// One request header, repeatable: the credential the starting trigger's `auth:` reads
+        #[arg(long = "header", value_name = "NAME: VALUE")]
+        headers: Vec<String>,
+        /// Deploy target to resolve and emit for
+        #[arg(long, value_name = "NAME", default_value = DEFAULT_TARGET)]
+        target: String,
+        /// Where to write the generated project [default: <project>/build/<target>]
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
+        /// How to report what was found, and what the app answered
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
     },
@@ -764,6 +803,39 @@ fn main() -> ExitCode {
                 port.to_string(),
             ];
             launch(&path, "serve", &target, &out, format.into(), &arguments)
+        }
+        Command::Cancel {
+            path,
+            execution,
+            url,
+            headers,
+            target,
+            out,
+            format,
+        } => {
+            let out = out.unwrap_or_else(|| build::default_out(&path, &target));
+            // The emitted command line's own `cancel` verb, which sends the
+            // route its request (PRD resolved q75): this binary carries the
+            // composition's `hub.public_url` no more than it carries a journal
+            // driver, and the build it launches does.
+            let mut arguments = vec!["cancel".to_string(), execution];
+            if let Some(url) = url {
+                arguments.push("--url".to_string());
+                arguments.push(url);
+            }
+            for header in headers {
+                arguments.push("--header".to_string());
+                arguments.push(header);
+            }
+            arguments.push("--format".to_string());
+            arguments.push(
+                match format {
+                    Format::Human => "human",
+                    Format::Json => "json",
+                }
+                .to_string(),
+            );
+            launch(&path, "cancel", &target, &out, format.into(), &arguments)
         }
         Command::Store { operation } => store(operation),
         Command::Docs { topic } => docs(topic.as_deref()),

@@ -690,6 +690,18 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "a_finally_error_round_trips_beside_its_outcome",
     "a_row_with_no_finally_error_reads_none",
     "a_journal_without_the_finally_error_column_gains_it_on_open",
+    // §3.5, §6.1 — a cancel's request (PRD resolved q75): absent on a row
+    // nobody cancelled, read back on the open row by both reads — the recovery
+    // scan's among them, which is how a restart completes the cancel — kept at
+    // its first instant by a second request, and beside a `cancelled` row that
+    // carries no `error` and has left the scan.
+    "an_execution_nobody_cancelled_carries_no_request",
+    "a_cancel_request_is_read_back_on_the_open_row",
+    "a_second_cancel_request_keeps_the_first",
+    "a_cancelled_row_settles_with_no_error",
+    // …and a journal a build before the cancel wrote, which has no such table,
+    // gains it on open and records a cancel of a row it holds open (§11.2).
+    "a_journal_without_the_cancellations_table_gains_it_on_open",
     // …and the dispatch board's half of the same field: a placed node's settled
     // failure keeps what a finally node raised on the worker beside it
     // (`docs/distributed.md` §3.4, §3.8).

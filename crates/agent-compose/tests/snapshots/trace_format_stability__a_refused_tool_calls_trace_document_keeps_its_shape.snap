@@ -158,5 +158,5 @@ expression: document(&run)
   "execution_id": "<execution-id>",
   "flow": "flow.ask",
   "status": "completed",
-  "trace_version": 6
+  "trace_version": 7
 }

@@ -2639,6 +2639,8 @@ async function quiesceFlow(
   // and its own finally node run (`runtime.endInstancesInside`).
   if (options.resume === true) await runtime.settleDetached(executionId);
   const ending = runtime.instanceEnding(executionId, ended);
+  // A run somebody cancelled says so (PRD resolved q75, Decision D160).
+  if (ending?.outcome === "cancelled") what = "was cancelled";
   let closing: runtime.FinallyRun | undefined;
   try {
     const inside = await runtime.endInstancesInside(

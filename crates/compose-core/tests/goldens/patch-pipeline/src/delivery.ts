@@ -109,7 +109,7 @@ export function blankSinkCredentials(): readonly string[] {
 export interface SettledTrace {
   readonly execution: string;
   readonly flow: string;
-  readonly status: "completed" | "failed" | "interrupted";
+  readonly status: "completed" | "failed" | "interrupted" | "cancelled";
   readonly error?: string;
   /** The envelope's `finally_error` (grammar 7.9, `docs/trace.md` §2). */
   readonly finallyError?: string;

@@ -884,6 +884,7 @@ fn deploy(source: &Composition) -> Option<ir::Deploy> {
                     name: placement.name.clone(),
                     members: placement.members.clone(),
                     description: placement.description.clone(),
+                    max_running: placement.max_running.clone(),
                     span: placement.span.clone(),
                 },
             );

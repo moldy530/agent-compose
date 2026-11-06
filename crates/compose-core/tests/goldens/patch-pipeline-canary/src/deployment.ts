@@ -58,6 +58,14 @@ export interface PlacementManifest {
    */
   readonly members: readonly string[];
   /**
+   * `max_running:` — how many unsettled dispatches of this placement one worker
+   * session may hold at once, with the default of `1` already applied (grammar
+   * §14.1, `docs/distributed.md` §2, Decision D161). The hub's poll handler
+   * offers a session work of this placement while the dispatches it holds for
+   * it number fewer than this.
+   */
+  readonly maxRunning: number;
+  /**
    * The variables of every component that can execute in this placement's
    * process, sorted by name — `docs/distributed.md` §9.1's partition.
    *

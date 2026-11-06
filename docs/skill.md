@@ -65,6 +65,7 @@ compiled project.
 | `run <path> <flow>` | build, then run one flow; `--input k=v`, `--session <key>` |
 | `resume <path> <execution>` | build, then carry on a journaled execution — replaying its recorded effects rather than re-issuing them |
 | `serve <path>` | build, then serve the project's `http` triggers |
+| `cancel <path> <execution>` | stop an execution a `serve` is running, and every open child execution it started; `--url <base>` (or the target's `hub.public_url`), `--header 'Name: value'` for the starting trigger's `auth:` |
 | `store <sub-verb> <path> <store>` | build, then read or write one `kv` store through the target's own backend with no flow: `get`, `set`, `delete`, `list`, `count`, `export`, `import`, `log`; `--session <key>` or `--execution <id>` names the partition |
 | `worker --hub <url> --claim <name> --token-env <VAR>` | join a hub and run the nodes placed on the names it claims; takes no spec |
 | `docs [<topic>]` | the topic index, or one topic |
@@ -74,7 +75,7 @@ compiled project.
 | `skill [--agent <name>] [--global]` | print this document, or install it; `--global` installs under `$HOME` |
 
 Add `--format json` to any verb that reports — `validate`, `plan`, `build`,
-`run`, `resume`, `serve`, `store` — when a script is reading the output. `visualize`'s
+`run`, `resume`, `serve`, `cancel`, `store` — when a script is reading the output. `visualize`'s
 `--format` is the odd one out: it names the **artifact** (`html` or `json`, the
 page or the document the page renders) rather than the shape of a report, and
 its diagnostics are `validate`'s either way. Add
@@ -88,9 +89,9 @@ answers what changed in the composition.
 
 | code | meaning |
 |---|---|
-| `0` | clean, or **warnings** only, or a plan was produced, or a document was printed |
-| `1` | the answer is no: **errors**, drift, a run with no answer, a resume that diverged from its journal, an occupied directory |
-| `2` | the command could not run at all: bad usage, unreadable entrypoint, missing dependency, an execution id the journal does not hold open |
+| `0` | clean, or **warnings** only, or a plan was produced, or a document was printed, or a cancel was accepted |
+| `1` | the answer is no: **errors**, drift, a run with no answer, a resume that diverged from its journal, an occupied directory, a cancel the app refused (`404`, `409` for an execution already ended, or the trigger's auth) |
+| `2` | the command could not run at all: bad usage, unreadable entrypoint, missing dependency, an execution id the journal does not hold open (a cancelled one among them), a cancel that reached no app |
 | `3` | a `run` or `resume` stopped at a `human` pause and had nobody to ask |
 
 Branch on these rather than on message text: codes and exit codes are stable,
@@ -121,6 +122,16 @@ work it had not yet done reaches the network. It takes no `--input` and no
 `--session`: the invocation it replays is the one the journal recorded. `serve`
 needs no such command; it recovers every open execution on start. See
 `agent-compose docs targets`.
+
+## Stopping a served execution
+
+`agent-compose cancel main.yml <execution-id> --url <app>` stops an execution a
+`serve` is running: every node it is running settles `cancelled` — a model
+call, a command, a harness run, a placed dispatch — each open instance ends
+`cancelled` and runs its `finally:` node, every open child execution it started
+is cancelled too, and the status route then reports `cancelled`. A cancelled
+execution is ended for good: `resume` refuses it. A `run` is stopped with
+`Ctrl-C` instead, which leaves it open for `resume`.
 
 ## Looking inside a store
 

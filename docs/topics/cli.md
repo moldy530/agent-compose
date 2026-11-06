@@ -1,6 +1,6 @@
 # cli
 
-One static binary. Nine verbs act on a composition; five teach you about
+One static binary. Ten verbs act on a composition; five teach you about
 compositions in general and take no spec at all.
 
 ```
@@ -14,6 +14,8 @@ agent-compose resume <path> <execution> [--target <name>] [--out <dir>]
                                         [--format human|json]
 agent-compose serve <path> [--host <host>] [--port <port>]
                            [--target <name>] [--out <dir>] [--format human|json]
+agent-compose cancel <path> <execution> [--url <base>] [--header 'Name: value']...
+                                        [--target <name>] [--out <dir>] [--format human|json]
 agent-compose store <sub-verb> <path> <store> [operands] [--session <key> | --execution <id>]
                     [--target <name>] [--out <dir>] [--format human|json]
 agent-compose worker --hub <url> --claim <name>... --token-env <VAR>
@@ -214,7 +216,9 @@ the first effect the journal does not hold — reaches the network, so a resume
 costs what is left of an execution rather than what it had already paid for.
 
 It takes no `--input` and no `--session`: the invocation it replays is the one
-the journal recorded. A resumed execution that reaches a wait nobody has
+the journal recorded. An execution somebody **cancelled** is never resumed: the
+command exits `2` saying it was cancelled and when, because a cancelled
+execution is ended for good and the journal keeps its record. A resumed execution that reaches a wait nobody has
 answered re-parks under its original wait id and prompts at the terminal exactly
 as an interactive `run` does, so its exit codes are `run`'s.
 
@@ -226,7 +230,7 @@ it. `agent-compose docs targets` has where the journal lives;
 ## `serve`
 
 Same build, then starts the generated app for the project's `http` triggers:
-start, resume, and status routes. `--port 0` takes one the operating system
+start, resume, cancel and status routes. `--port 0` takes one the operating system
 picks. Its stdout is the app's readiness line.
 
 On start it **recovers** every execution the journal holds open, before it
@@ -237,7 +241,48 @@ executions that exist.
 
 It does not wait for those replays, so an answer can arrive while one is still on
 its way back to its pause: that request is refused with `recovering: true` and
-told to send it again, rather than told there is nothing waiting for it.
+told to send it again, rather than told there is nothing waiting for it. An open
+execution whose cancel was accepted before the process died is recovered the
+same way, and **completes the cancel**: the replay re-enters every instance it
+had open, and where the next effect would have been issued, the cancel fires
+instead — each instance ends `cancelled` and runs its `finally:` node once.
+
+## `cancel`
+
+Stops an execution a `serve` is running, and every open child execution it
+started, recursively (PRD resolved q75). Same build as `run`, then the emitted
+project's own `cancel` verb sends `POST /executions/:id/cancel` to the app.
+
+```sh
+agent-compose cancel main.yml exec_9f1c8a3e-1b7d-4a20-9d61-1f0e8a2c4d55 \
+  --url http://127.0.0.1:8080 --header 'Authorization: Bearer …'
+```
+
+`--url` is the app's base URL; without it, the target's `hub.public_url` is
+used, and a target that declares none is a usage error. The route is under the
+auth of the trigger that started the execution, so `--header` (repeatable) is
+how the credential that trigger reads travels.
+
+What a cancel does: every node running in the execution settles `cancelled` —
+a model call's request, a spawned command, a harness run and a placed dispatch
+are stopped where they are — and nothing new begins. Every open instance ends
+at outcome `cancelled`, innermost first, each running its `finally:` node whole;
+every wait is released; and the row settles `cancelled`, which the settle
+webhook carries, the status route reports and `resume` refuses. A cancel that
+arrives after the body has already ended changes nothing: the execution ends
+the way its body did.
+
+The app answers `202` when the request is recorded — a second cancel of an
+execution already cancelling included — and the command prints where the status
+route is and exits `0`; the end is the status route's to report. A refusal —
+`404` for an id the app does not know, the trigger's own refusal for a
+credential it does not verify, `409` for an execution that has already ended —
+exits `1`. An app the command could not reach, or a status it does not give,
+exits `2`. Under `--format json` the app's answer is the one document on stdout,
+with `http_status` beside it.
+
+A `run` is not cancelled this way: `Ctrl-C` stops its process and leaves its row
+open for `resume` (PRD resolved q28). A cancel is `serve`'s.
 
 ## `store`
 
@@ -388,6 +433,33 @@ what the hub serves *after* the join. `--data-dir` is where materialised
 artifacts are kept, keyed by content hash, so a redeployment and a rollback are
 both a directory that is already there.
 
+It runs **every dispatch it holds at once**, and keeps polling while any is
+running, so a placement's `max_running:` (how many of its dispatches one worker
+may hold — `1` unless the deploy file says otherwise) is how many nodes this
+machine runs side by side. A dispatch the hub names in a poll's `cancel` list is
+stopped — its runner is sent `SIGTERM`, which it reads as its execution's
+cancel, and its whole process group `SIGKILL` five seconds later if it is still
+running, a grace held for as long as the runner reports a `finally:` node
+running, since that node runs whole — and reported `cancelled`. One the hub
+names in the poll's `stop` list — it stopped waiting, because the node's
+`timeout:` ran out or its execution ended — is stopped the same way but by
+`SIGUSR2`, which the runner reads as a failure of the node rather than a cancel,
+so what the node began there ends `failed` — and every node the runner is
+running stops with it, so a command an attached flow was in the middle of is
+stopped too rather than left behind; the result is whatever the node ended on.
+The hub names a dispatch on every answer it gives this worker until its result
+arrives, so a stop or a cancel whose first answer was lost on the way is heard
+on the next. A session the hub has forgotten (a `410`: the hub restarted, or
+gave up on this worker) takes its dispatches with it, so the runners still
+running under it are stopped as a `stop` list's are — never as a cancel, even
+where the hub was cancelling one when it restarted, since a `410` does not say
+— and work the new session is handed waits for them before it starts.
+
+Each runner is a process group of its own, so `Ctrl-C` — and `SIGTERM` or
+`SIGHUP` — reaches the worker and not the runners; the worker hands the stop on
+to every runner's group, kills what is left of each two seconds later, and then
+exits by the signal it was sent.
+
 It runs until it is stopped, or until a join is **refused** — a credential that
 does not verify, a release that does not match this hub's, a claim naming no
 placement, a manifest this machine does not satisfy — which exits `2` echoing
@@ -441,9 +513,9 @@ dropped would leave you believing something had been installed under `$HOME`.
 
 | code | meaning |
 |---|---|
-| `0` | clean: nothing was reported, or nothing but **warnings** was, or a `plan` was produced, or a document was printed, or a `store` op found or applied |
-| `1` | **errors** were reported, `build --check` found drift, a `run` produced no answer, a `resume` diverged from its journal, a `store` op found nothing, declined its condition or met a failing backend, a `store export` could not write its lines (a full disk, never a reader that left), a `plan`'s spec did not resolve, or a discovery verb found something already there and would not replace it |
-| `2` | the command could not run: bad usage, an unreadable entrypoint, an unwritable output directory, a missing or malformed environment variable, an uninstalled dependency set, no JavaScript runtime to launch, a `resume` naming an execution the journal does not hold open, a `store` address, sub-verb or partition flag the composition does not take, a `store log` of a store that keeps no history, or a `store` value its `value_schema` refuses |
+| `0` | clean: nothing was reported, or nothing but **warnings** was, or a `plan` was produced, or a document was printed, or a `store` op found or applied, or a `cancel` was accepted |
+| `1` | **errors** were reported, `build --check` found drift, a `run` produced no answer, a `resume` diverged from its journal, a `store` op found nothing, declined its condition or met a failing backend, a `store export` could not write its lines (a full disk, never a reader that left), a `plan`'s spec did not resolve, a `cancel` was refused (an execution that had already ended, an id the app does not know, a credential the trigger refused), or a discovery verb found something already there and would not replace it |
+| `2` | the command could not run: bad usage, an unreadable entrypoint, an unwritable output directory, a missing or malformed environment variable, an uninstalled dependency set, no JavaScript runtime to launch, a `resume` naming an execution the journal does not hold open (a cancelled one among them), a `cancel` that reached no app or had no URL to send to, a `store` address, sub-verb or partition flag the composition does not take, a `store log` of a store that keeps no history, or a `store` value its `value_schema` refuses |
 | `3` | a `run` or `resume` with nobody to ask stopped at a `human` pause |
 
 The split between `1` and `2` is *the answer is no* versus *the command could

@@ -36,7 +36,14 @@ const SOURCE: &str = include_str!("js/mesh.ts");
 /// which a peer of version `1` would read as a node that answered with no
 /// output. The handshake triple already refuses mixed releases, so the bump
 /// costs nothing in practice — §10 says so where it records it.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// `3` since PRD resolved q75 and q79, one bump for both: a poll answer carries
+/// a `cancel` list and a `stop` list and a result may say `status:
+/// "cancelled"` (§3.2, §3.4), and a session holding work may be handed more
+/// while it is below its placement's `max_running:` (§2). A peer of version `2`
+/// would run on a dispatch the hub cancelled or stopped waiting for, and queue
+/// work it is meant to run beside its first.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The routes the hub mounts on a target that declares `placements:` (§3).
 ///
@@ -259,41 +266,78 @@ mod tests {
         );
     }
 
-    /// §13's first row, held to its conservative default in the code.
+    /// A session's dispatch capacity is its placement's `max_running:` (grammar
+    /// §14.1, PRD resolved q79, Decision D161) — read out of the deploy layer's
+    /// manifest, the default of `1` applied there — and nothing else: no option,
+    /// no environment variable, no field a worker sends.
     ///
-    /// "Session dispatch capacity is exactly one" is a question the PRD owes an
-    /// answer to, and until it has one an implementation may not decide it — so
-    /// the wire's OPTIONAL capacity field is neither sent nor read, and no knob
-    /// for it exists. A grep is the honest test for an absence.
+    /// This replaces the test that pinned the retired "no capacity knob"
+    /// decision (`docs/distributed.md` §13), which grepped for the absence of a
+    /// capacity. What is pinned now is where the one capacity comes from, and
+    /// that the poll handler asks it per placement before it hands work over.
     #[test]
-    fn the_hub_declares_no_dispatch_capacity_of_any_kind() {
-        for spelled in ["capacity", "maxDispatches", "max_dispatches"] {
+    fn a_sessions_capacity_is_its_placements_max_running_and_nothing_else() {
+        let capacity = function_body("function capacityOf(");
+        assert!(
+            capacity.contains("placements.find((one) => one.name === placement)?.maxRunning ?? 1"),
+            "the hub's capacity is not the placement's `maxRunning`: {capacity}"
+        );
+        let taken = function_body("async function taken(");
+        assert!(
+            taken.contains("heldFor(session.id, row.placement) >= capacityOf(row.placement)"),
+            "the poll handler hands work over without asking the placement's cap: {taken}"
+        );
+        // No environment variable and no hub option either: the capacity is the
+        // deploy file's (Decision D161). Spelled by its suffix, so the sources'
+        // environment scan does not read this refusal as a variable they use.
+        for spelled in ["MESH_CAPACITY", "MAX_RUNNING", "maxDispatches"] {
             assert!(
                 !code().contains(spelled),
-                "`src/mesh.ts` has code mentioning `{spelled}`, and a session's dispatch capacity \
-                 is an open PRD question `docs/distributed.md` §13 forbids an implementation from \
-                 deciding"
+                "`src/mesh.ts` reads a capacity `{spelled}` from somewhere other than the \
+                 deploy layer's `max_running:` (Decision D161)"
             );
         }
     }
 
-    /// …and the positive half of the same row: a session carries exactly the
-    /// fields §5 gives it.
+    /// The least-loaded rule of §2 (PRD resolved q79, Decision D161): of the
+    /// sessions polling for a placement and below its cap, the one holding the
+    /// fewest of its unsettled dispatches — and between equals, the oldest poll.
+    #[test]
+    fn a_parked_dispatch_goes_to_the_least_loaded_session_polling_for_it() {
+        let chosen = function_body("function leastLoaded(");
+        assert!(
+            chosen.contains("load < chosen.load")
+                && chosen.contains("(load === chosen.load && since < chosen.since)")
+                && chosen.contains("if (load >= cap) continue;"),
+            "the hub does not choose the least-loaded session, oldest poll first between equals: \
+             {chosen}"
+        );
+        let taken = function_body("async function taken(");
+        assert!(
+            taken.contains("if (leastLoaded(row.placement) !== session.id) continue;"),
+            "a poll takes parked work without asking whether it is the least-loaded: {taken}"
+        );
+    }
+
+    /// …and the positive half: a session carries exactly the fields §5 gives
+    /// it, the cancels and stops it is owed an answer **at once** for among
+    /// them (§3.2, PRD resolved q75) — one map, and nothing about which list
+    /// names each: a poll names every dispatch the hub is still waiting on
+    /// that session's worker for, read off the hub's own books (`cancelling`,
+    /// `stopping`) until its result arrives, so a session that kept the lists
+    /// would be a second record of them.
     ///
-    /// A denylist holds the spellings a capacity has arrived under before; this
-    /// holds the one nobody has spelled yet. A `Session` that grew a `slots`, a
-    /// `budget`, an `inFlight` or a second `dispatchable` would be a dispatch
-    /// capacity whatever it was called, and §13's first row forbids this
-    /// implementation from deciding that number — so the shape of the record the
-    /// hub keeps per worker is pinned rather than scanned.
+    /// Its load is **not** a field: it is read off the dispatch rows each time
+    /// it is asked ([`heldFor`] in the emitted source), which is PRD resolved
+    /// q44's invariant that capacity is per session and held in the journal's
+    /// rows — a counter on the session would be a second record to drift.
     #[test]
     fn a_session_carries_exactly_the_fields_the_document_gives_it() {
         assert_eq!(
             fields_of("interface Session {"),
-            ["id", "claims", "dispatchable", "seen"],
+            ["id", "claims", "dispatchable", "seen", "unsaid"],
             "`src/mesh.ts`'s `Session` is not the record `docs/distributed.md` §5 describes: a \
-             field added to it is how a dispatch capacity would arrive without being called one, \
-             and §13's first row is the PRD question that forbids"
+             load or a slot count on it would be a second record of what the dispatch rows hold"
         );
     }
 

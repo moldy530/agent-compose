@@ -52,19 +52,20 @@ pub const RESOURCE_ATTRIBUTES: &[&str] = &[
 /// (`docs/trace.md` §12.4's first row).
 ///
 /// A compiler constant for [`RESOURCE_ATTRIBUTES`]'s reason, aimed at the
-/// silence a *ternary* leaves. The mapping's three arms — OK, ERROR, and the
-/// UNSET one a run holding a question gets — are reachable from the trace
-/// **format** rather than from today's callers: `shipTrace` settles executions,
-/// and `agent-compose run` parks one instead, writing a `status: "interrupted"`
+/// silence a *ternary* leaves. The mapping's arms — OK, ERROR, and the UNSET
+/// one a run holding a question gets and a cancelled run gets — are reachable
+/// from the trace **format** rather than only from today's callers: `shipTrace`
+/// settles executions (a cancelled one among them, PRD resolved q75), and
+/// `agent-compose run` parks one instead, writing a `status: "interrupted"`
 /// document that a reader may hand this exporter later. So the arms are named
 /// here, the corpus must reach every one of them
 /// (`tests/otlp_conformance.rs`'s `every_root_status_arm_has_a_fixture`), and
 /// [`the_root_status_arms_are_the_formats`] holds the list to the union
-/// `runtime.ts` publishes — a fourth status added to the format without a
+/// `runtime.ts` publishes — a fifth status added to the format without a
 /// mapping would otherwise fall silently into the `else`.
 ///
 /// [`the_root_status_arms_are_the_formats`]: tests::the_root_status_arms_are_the_formats
-pub const ENVELOPE_STATUSES: &[&str] = &["completed", "failed", "interrupted"];
+pub const ENVELOPE_STATUSES: &[&str] = &["completed", "failed", "interrupted", "cancelled"];
 
 /// Every reason `parseTraceparent` refuses an inbound header
 /// (`docs/trace.md` §12.3).
@@ -266,7 +267,7 @@ model.m:\n  provider: provider.p\n  id: some-model\n",
     /// reach, and this is what stops that list from being a list of its own: it
     /// is read back out of `src/runtime.ts`'s `TraceDocument.status`, which is
     /// the format `docs/trace.md` §2 publishes and the exporter's whole input. A
-    /// fourth status added there lands in the mapping's `else` — exported as
+    /// fifth status added there lands in the mapping's `else` — exported as
     /// UNSET with no arm of its own and no fixture — and the failure here is
     /// what sends its author to §12.4's table instead.
     #[test]

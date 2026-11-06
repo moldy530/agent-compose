@@ -225,8 +225,23 @@ pub struct Placement {
     /// `description:` — documentation only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<Spanned<String>>,
+    /// `max_running:` — the unsettled dispatches of this placement one worker
+    /// session may hold at once (grammar 14.1, Decision D161). Absent is `1`,
+    /// which [`Placement::capacity`] answers; kept as written so an IR reader
+    /// can tell a stated `1` from the default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_running: Option<Spanned<i64>>,
     /// The whole entry's span.
     pub span: Span,
+}
+
+impl Placement {
+    /// The capacity one session holds for this placement: `max_running:`, or
+    /// `1` where the deploy file says nothing (grammar 14.1, PRD resolved q79).
+    #[must_use]
+    pub fn capacity(&self) -> i64 {
+        self.max_running.as_ref().map_or(1, |held| held.value)
+    }
 }
 
 /// The `storage_backends:` section (grammar 14.3).

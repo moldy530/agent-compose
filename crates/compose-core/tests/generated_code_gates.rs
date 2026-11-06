@@ -2011,7 +2011,7 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
     assert_eq!(
         children["document"],
         serde_json::json!({
-            "trace_version": 6,
+            "trace_version": 7,
             "detached": true,
             "parent_execution": parent,
             "idempotency_key": key(1),
@@ -2034,7 +2034,7 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
     assert_eq!(
         children["plainDocument"],
         serde_json::json!({
-            "trace_version": 6,
+            "trace_version": 7,
             "flow": "flow.probe",
             "execution_id": parent,
             "status": "completed",
@@ -6430,6 +6430,99 @@ fn a_compiled_graphs_coder_nodes_record_route_and_write() {
         "the fallback routed to `end`, so what the implementing run wrote is \
          what the flow answers"
     );
+}
+
+/// **A cancel stops a `coder:` node mid-run** (grammar 8.9, PRD resolved q75,
+/// Decision D160).
+///
+/// `coder-cancel.mjs` runs the `patch-pipeline` golden's `flow.patch` with a
+/// harness driver that starts a ten-minute child process the way an SDK does
+/// and stops it when its run's signal fires — and cancels the execution from
+/// outside while that child runs, through `runtime.cancelExecution`, the call
+/// the cancel route makes. What the ruling owes, each asserted here:
+///
+/// * the run stops **promptly** — well inside the ten seconds the field report
+///   asks of it, against a child that would otherwise run for ten minutes —
+///   and the child the harness started is gone;
+/// * it ends with the outcome `cancelled`, not a failure: the run raised the
+///   cancellation, the node's entry is `cancelled` with no `error` and no
+///   `routing`, and nothing after it ran (the `codex` reviewer was never
+///   asked). It carries no harness record, because the one run it made was
+///   stopped in flight, and a run the cancel stopped records nothing
+///   (`docs/trace.md` §3.2, `docs/durability.md` §6.1);
+/// * the lifecycle row settled `cancelled`, with no `error`, beside the request
+///   the journal recorded before anything was stopped;
+/// * and a cancel that arrives **while the run's row is still being begun** —
+///   the window `serve` answers a trigger's request in, which a dialled
+///   journal holds open for a network round trip — is not lost: the run's
+///   controller exists from the tick the run starts, so the cancel fires it,
+///   the run ends `cancelled` with no harness run begun, and the row settles
+///   `cancelled` (Decision D160). The runner slows the journal's `begin` to
+///   make the window a fact.
+#[test]
+fn a_cancel_stops_a_coder_node_mid_run_and_settles_it_cancelled() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(goldens::golden("patch-pipeline"), root, "coder-cancel");
+    let scratch = root.join("projects").join("coder-cancel").join("scratch");
+    let _ = fs::remove_dir_all(&scratch);
+    fs::create_dir_all(&scratch).expect("the scratch area is writable");
+
+    let output = runner("coder-cancel.mjs")
+        .arg(&project)
+        .arg(&scratch)
+        .output()
+        .expect("bun runs");
+    assert!(
+        output.status.success(),
+        "the coder cancel runner failed:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let answer: Value =
+        serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
+
+    assert_eq!(answer["completed"], false, "{answer:#}");
+    assert_eq!(
+        answer["endedByCancel"], true,
+        "the run did not end cancelled: {answer:#}"
+    );
+    assert!(
+        answer["tookMs"].as_u64().is_some_and(|took| took < 10_000),
+        "the cancel took {} ms to stop a coder node: {answer:#}",
+        answer["tookMs"]
+    );
+    assert_eq!(
+        answer["childAlive"], false,
+        "the process the harness run started outlived the cancel: {answer:#}"
+    );
+    assert_eq!(
+        answer["entries"],
+        json!([{
+            "node": "implement",
+            "outcome": "cancelled",
+            "hasError": false,
+            "hasRouting": false,
+            "harness": [],
+        }]),
+        "a cancelled coder node's entry is `cancelled`, with no error or routing, and nothing \
+         ran after it: {answer:#}"
+    );
+    assert_eq!(answer["reviewRuns"], 0, "{answer:#}");
+    assert_eq!(answer["status"], "cancelled", "{answer:#}");
+    assert_eq!(answer["rowError"], Value::Null, "{answer:#}");
+    assert_eq!(answer["cancelRequested"], true, "{answer:#}");
+
+    assert_eq!(
+        answer["earlyEndedByCancel"], true,
+        "a cancel sent while the run's row was being begun was lost: {answer:#}"
+    );
+    assert_eq!(
+        answer["earlyHarnessRuns"], 0,
+        "the run a cancel had already reached began its coder node: {answer:#}"
+    );
+    assert_eq!(answer["earlyStatus"], "cancelled", "{answer:#}");
+    assert_eq!(answer["earlyRowError"], Value::Null, "{answer:#}");
 }
 
 /// Gate 26: the two shapes PRD resolved q61 added, through a compiled graph

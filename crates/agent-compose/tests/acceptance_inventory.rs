@@ -2154,6 +2154,13 @@ const EVENTS: &[Criterion] = &[
                 "a_signed_executions_status_and_resume_verify_over_each_requests_own_body",
                 Status::Live,
             ),
+            // …and the route PRD resolved q75 added under the same auth: a
+            // cancel is the one call on an execution that stops it, so a caller
+            // the trigger does not verify is refused before anything stops.
+            (
+                "an_executions_cancel_route_enforces_the_auth_of_the_trigger_that_started_it",
+                Status::Live,
+            ),
             // …and the half one process cannot decide: the trigger is on the
             // journal's lifecycle row, so a `serve` restarted while somebody was
             // thinking goes on refusing the same callers.

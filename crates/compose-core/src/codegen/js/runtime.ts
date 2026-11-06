@@ -75,6 +75,7 @@
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
+import { setMaxListeners } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -84,8 +85,12 @@ import { Command, GraphRecursionError, isInterrupted } from "@langchain/langgrap
 import { CelError, bind, evaluate, evaluateGuard, toJson } from "./cel.ts";
 import type { CelValue, Roots, Shape } from "./cel.ts";
 import {
+  ExecutionCancelled,
   JOURNAL_VERSION,
   ReplayDivergence,
+  asStopped,
+  cancelAtFrontier,
+  cancellationOf,
   closeSession,
   dataRoot,
   effectKey,
@@ -94,12 +99,14 @@ import {
   journaling,
   latchDivergence,
   latchedDivergence,
+  noteCancelled,
   openJournal,
   openSession,
   recordedAnswerOf,
   recorderFor,
   refuseRecorded,
   replayedFailure,
+  stoppedInFlight,
 } from "./journal.ts";
 import type {
   CallbackIntent,
@@ -116,8 +123,10 @@ import type {
 } from "./journal.ts";
 
 export {
+  ExecutionCancelled,
   JOURNAL_VERSION,
   ReplayDivergence,
+  cancellationOf,
   canonical,
   journalBinding,
   journalExists,
@@ -1146,6 +1155,394 @@ function untilAborted(signal: AbortSignal): Promise<never> {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Cancelling an execution (PRD resolved q75, grammar 7.9, Decision D160)
+// ---------------------------------------------------------------------------
+
+/**
+ * One abort controller per execution, the one a cancel pulls — and the one
+ * every node's own controller chains to ([`runActivity`]), so the signals that
+ * already reach a model call's `fetch`, a spawned command, a harness run and an
+ * instance's supersteps all fire together (PRD resolved q75 ruling b).
+ *
+ * Opened with the execution ([`openExecution`]) — and by a worker's node
+ * runner for the execution it runs a dispatch of (`./worker-node.ts`) — and
+ * dropped with it ([`closeExecution`]). A node that asks after that finds none
+ * and chains to nothing, which is a node of an execution nothing can cancel any
+ * more.
+ */
+const executionCancels = new Map<string, AbortController>();
+
+/**
+ * The signal `execution`'s cancel aborts, opening its controller where none is
+ * open yet — for a caller that is beginning work under the execution.
+ *
+ * Its listener ceiling is lifted: every node running under the execution chains
+ * to it at once — a `map` of fifty items is fifty — and the platform's
+ * "possible leak" warning at the eleventh would be a line on stderr for an
+ * ordinary fan-out.
+ */
+export function executionCancelSignal(execution: string): AbortSignal {
+  let held = executionCancels.get(execution);
+  if (held === undefined) {
+    held = new AbortController();
+    try {
+      setMaxListeners(0, held.signal);
+    } catch {
+      // A runtime without the call keeps its own default, which is a warning
+      // and never a failure.
+    }
+    executionCancels.set(execution, held);
+  }
+  return held.signal;
+}
+
+/** Whether `execution`'s cancel has fired in this process. */
+export function cancelFired(execution: string): boolean {
+  return executionCancels.get(execution)?.signal.aborted === true;
+}
+
+/**
+ * The `finally:` nodes running in each execution, by site — the work a cancel
+ * does **not** stop (grammar 7.9, Decision D160).
+ *
+ * A cancel ends every instance it reaches, and an instance that ends runs its
+ * finally node: that node, and everything it begins — the instances of a
+ * finally `flow:` node, a `map`, an agent's `flow.*` tools — is how the
+ * instance ends, not work inside one that has ended. So it runs whole, under
+ * its own §9.3 budget, whether the cancel came before it began (it runs at
+ * outcome `cancelled`) or while it was running (an end already under way, which
+ * D159 waits for and never stops). Held from the moment [`endInstance`] claims
+ * the boundary to the moment the node settles; a site at or under one is exempt
+ * ([`cancelSignalFor`], and the frontier of a recovered cancel).
+ */
+const finallySites = new Map<string, Map<string, number>>();
+
+/** How many finally sites are running in this process, every execution's together. */
+let finallyWorkHere = 0;
+
+/** Who is told when this process starts and stops running finally work ([`onFinallyWork`]). */
+let finallyWatcher: ((running: boolean) => void) | undefined;
+
+/**
+ * Be told whenever this process **starts** running finally work — the first
+ * finally site of any execution marked running ([`finallySites`]) — and
+ * whenever it **stops**, the last of them settled.
+ *
+ * What a process that is itself stopped by a cancel from outside needs: a
+ * worker's node runner (`./worker-node.ts`), whose worker kills it once a
+ * cancel's grace has passed (`docs/distributed.md` §3.2). A finally node runs
+ * whole whatever the cancel does (grammar 7.9, Decision D160), so the runner
+ * reports this to its worker and the worker's grace runs from the moment the
+ * work ends rather than cutting it off.
+ */
+export function onFinallyWork(watcher: (running: boolean) => void): void {
+  finallyWatcher = watcher;
+}
+
+/** Mark one finally node's site as running until the answer is called. */
+function finallyRunning(execution: string, site: string): () => void {
+  let held = finallySites.get(execution);
+  if (held === undefined) {
+    held = new Map();
+    finallySites.set(execution, held);
+  }
+  const sites = held;
+  sites.set(site, (sites.get(site) ?? 0) + 1);
+  finallyWorkHere += 1;
+  if (finallyWorkHere === 1) finallyWatcher?.(true);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const left = (sites.get(site) ?? 1) - 1;
+    if (left > 0) sites.set(site, left);
+    else sites.delete(site);
+    if (sites.size === 0 && finallySites.get(execution) === sites) finallySites.delete(execution);
+    finallyWorkHere -= 1;
+    if (finallyWorkHere === 0) finallyWatcher?.(false);
+  };
+}
+
+/** Whether `site` is at or under a finally node running in `execution`. */
+function underRunningFinally(execution: string, site: string): boolean {
+  const sites = finallySites.get(execution);
+  if (sites === undefined) return false;
+  for (const held of sites.keys()) {
+    if (site === held || site.startsWith(`${held}/`)) return true;
+  }
+  return false;
+}
+
+/**
+ * The signal a node execution at `site` chains to — its execution's cancel —
+ * or `undefined` where nothing can cancel it: no controller is open for the
+ * execution here, or the site is a finally node's or under one
+ * ([`finallySites`]).
+ */
+function cancelSignalFor(execution: string, site: string): AbortSignal | undefined {
+  const held = executionCancels.get(execution);
+  if (held === undefined) return undefined;
+  return underRunningFinally(execution, site) ? undefined : held.signal;
+}
+
+/**
+ * The stop every node this process runs chains to beside its execution's
+ * cancel ([`stopEveryNodeOn`]), or `undefined` where nothing installed one.
+ */
+let processStop: AbortSignal | undefined;
+
+/**
+ * Chain every node this process runs to `signal`, beside its execution's
+ * cancel — what a worker's node runner (`./worker-node.ts`) installs, and
+ * aborts when its worker stops the dispatch it runs: the hub stopped waiting
+ * for it (`docs/distributed.md` §3.2's `stop` list), or the session it was
+ * handed under ended.
+ *
+ * **A stop is not a cancel, and is not a deadline either.** The placed node
+ * fails on it, and the instances it began in the runner end `failed`, as they
+ * do on the hub when the same node runs out of time there (grammar 7.9). But
+ * on the hub a node an ended instance let go runs on to its own end — nothing
+ * reads it, and the process outlives it — while a stopped runner is one its
+ * worker kills a grace later. A let-go node there is a command, a harness run
+ * or a model call that the kill would cut off, and a command leads a process
+ * group of its own ([`forkExecCommand`]), which a kill aimed at the runner's
+ * group does not reach: it would run on, re-parented, writing into the
+ * worker's workspace with nothing supervising it — and beside the next
+ * dispatch the freed slot is handed. So in a runner every node's own
+ * controller follows this signal as it follows the cancel ([`runActivity`]):
+ * what each node is running stops by the path a deadline stops it by — an
+ * `exec:` command's group `SIGTERM`ed and then killed ([`stopExecGroup`]) —
+ * and the node leaves on an [`InstanceStopped`], which every ladder lets
+ * through, so no `retry:` and no `on_error:` acts on it and the instance it
+ * belongs to ends `failed`.
+ *
+ * **Save a finally node, and all it begins** ([`finallySites`]): the stop ends
+ * the instances it reaches, and each one's finally node is how it ends, so it
+ * runs whole whatever the stop does — exactly as it does under a cancel
+ * (grammar 7.9, Decision D160) — and the worker's grace waits for it (§3.2).
+ */
+export function stopEveryNodeOn(signal: AbortSignal): void {
+  processStop = signal;
+}
+
+/**
+ * The process-wide stop a node execution at `site` chains to
+ * ([`stopEveryNodeOn`]), or `undefined` where none is installed or the site is
+ * a finally node's or under one ([`finallySites`]).
+ */
+function stopSignalFor(execution: string, site: string): AbortSignal | undefined {
+  if (processStop === undefined) return undefined;
+  return underRunningFinally(execution, site) ? undefined : processStop;
+}
+
+/**
+ * A node the cancel stopped: it settles `cancelled`, not `failed`, and no
+ * `on_error:` decides anything about it (PRD resolved q75 ruling b, Decision
+ * D160).
+ *
+ * One per node execution, wrapping the execution's [`ExecutionCancelled`] as
+ * its `cause` — a fresh error rather than that shared reason, because the trace
+ * entry a node aborts with rides on the error it raises ([`carryEntry`]), and
+ * two nodes cancelled together would otherwise write their entries onto one
+ * object.
+ */
+export class NodeCancelled extends Error {
+  readonly flow: string;
+  readonly node: string;
+  /** How many attempts the node had made when the cancel reached it. */
+  readonly attempts: number;
+
+  constructor(flow: string, node: string, attempts: number, cause: unknown) {
+    super(`${flow} node \`${node}\` was cancelled`);
+    this.name = "NodeCancelled";
+    this.flow = flow;
+    this.node = node;
+    this.attempts = attempts;
+    this.cause = cause;
+  }
+}
+
+/**
+ * Fire `execution`'s cancel **in this process**: abort its controller, so
+ * every running node's signal fires and every node that would begin refuses,
+ * and let go of what it is waiting on — every pause on the board is abandoned,
+ * because the wait is over and nobody will answer it now. A placement wait is
+ * released by the same abort: the placed node's signal is what `./mesh.ts`'s
+ * board listens to, and it withdraws a parked dispatch and tells the worker
+ * holding a dispatched one (`docs/distributed.md` §3.2). Answers whether this
+ * call fired it.
+ *
+ * Nothing durable: [`cancelExecution`] records the request first, and this is
+ * what both it and a worker's node runner (on the hub's `cancel` list — never
+ * its `stop` list, which fails the placed node and cancels nothing) call.
+ */
+export function fireCancel(execution: string): boolean {
+  const controller = executionCancels.get(execution);
+  if (controller === undefined || controller.signal.aborted) return false;
+  noteCancelled(execution);
+  controller.abort(new ExecutionCancelled(execution));
+  abandonPausesUnder(execution, "");
+  return true;
+}
+
+/**
+ * Cancel one execution, and every open child execution in its lineage,
+ * recursively (PRD resolved q75 rulings c and e, Decision D160).
+ *
+ * **The request is recorded first**, on the journal's `cancellations` table, so
+ * a process that dies between accepting a cancel and settling the row leaves an
+ * open row carrying it — and the recovery that finds it completes the cancel
+ * ([`completeCancel`]). Then the cancel fires here, where the execution is
+ * running; and then each open descendant is cancelled the same way — a child,
+ * or one a settled child started ([`cascadeCancel`]) — which is the cascade the
+ * owner asked for ("if a parent establishes a child run then cancel should kill
+ * children"). A child cancelled alone leaves its parent running: the
+ * parent's detached dispatch resolved when it was issued (Decision D94), so the
+ * parent has nothing waiting on the child to stop.
+ */
+export async function cancelExecution(execution: string): Promise<void> {
+  const journal = await openJournal();
+  await journal.requestCancel(execution);
+  fireCancel(execution);
+  await cascadeCancel(journal, execution);
+}
+
+/**
+ * Cancel every open execution in `execution`'s lineage whose own cancel is not
+ * yet recorded, each recursively ([`cancelExecution`]) — the cascade of PRD
+ * resolved q75 ruling c: "every open child execution in its lineage,
+ * recursively".
+ *
+ * **Every open descendant, not only the open children.** A child that has
+ * already **settled** is not the end of the lineage: its own detached `flow.*`
+ * dispatch resolved when it was issued (Decision D94), so a child routinely
+ * completes while the grandchild it started is still running — and a walk that
+ * stopped at the settled child would leave that grandchild running under a
+ * cancelled root, with nothing in the cascade, now or on recovery, ever to stop
+ * it. So the walk is over the open rows, and an open row is this execution's to
+ * cancel when the **nearest open ancestor** its lineage reaches — through any
+ * number of settled ones — is this execution. One nearer that is open is that
+ * ancestor's own: its cancel, recursive in turn, reaches it, so each open
+ * descendant is cancelled once.
+ *
+ * Asked twice: by the cancel itself, and by a **recovered** execution whose
+ * cancel was requested ([`openExecution`]), because the first walk is not
+ * atomic with the request it follows. A process that died after recording the
+ * parent's request and before a child's left the child open with nothing
+ * asking it to stop, and the parent's replay re-issuing its dispatch would
+ * resume it as an ordinary child — ruling e's "restart mid-cancel completes the
+ * cancel" broken one generation down. A child already carrying a request is
+ * passed over: it completes its own cancel, cascade included, when it is
+ * recovered.
+ */
+async function cascadeCancel(journal: Journal, execution: string): Promise<void> {
+  const open = await journal.openExecutions();
+  const opened = new Set(open.map((row) => row.id));
+  // Each row's lineage, read once: the open rows' off the walk above, a settled
+  // ancestor's off its own row the first time a lineage reaches it.
+  const lineages = new Map<string, Lineage | undefined>(open.map((row) => [row.id, row.lineage]));
+  const lineageOf = async (id: string): Promise<Lineage | undefined> => {
+    if (lineages.has(id)) return lineages.get(id);
+    const lineage = (await journal.execution(id))?.lineage;
+    lineages.set(id, lineage);
+    return lineage;
+  };
+  for (const row of open) {
+    if (row.id === execution) continue;
+    // The links from this row up to the nearest open ancestor, each a
+    // dispatch that began the execution below it.
+    const links: Lineage[] = [];
+    let link = row.lineage;
+    // Bounded by the lineage's depth; the set is for a journal whose rows name
+    // each other in a cycle, which no runtime writes and a walk must still end.
+    const passed = new Set<string>();
+    while (link !== undefined) {
+      links.push(link);
+      const ancestor = link.parent;
+      if (ancestor === execution || opened.has(ancestor) || passed.has(ancestor)) break;
+      passed.add(ancestor);
+      link = await lineageOf(ancestor);
+    }
+    if (links[links.length - 1]?.parent !== execution) continue;
+    if (row.cancelRequestedAt !== undefined && cancelFired(row.id)) continue;
+    // **Work a finally node began is not the cancel's** (grammar 7.9, Decision
+    // D160): a row any of whose links is a dispatch a finally node issued —
+    // a cleanup run as a detached `flow.*` — runs whole, and so does what it
+    // goes on to begin.
+    let exempt = false;
+    for (const one of links) {
+      if (await begunByFinally(journal, one)) {
+        exempt = true;
+        break;
+      }
+    }
+    if (exempt) continue;
+    await cancelExecution(row.id);
+  }
+}
+
+/**
+ * Whether the dispatch one lineage link names was issued by a `finally:` node
+ * of the parent — at or under the site of one (grammar 7.9, Decision D160).
+ *
+ * Read off this process's marks while the node, or the delivery it issued,
+ * runs here ([`underRunningFinally`]), and otherwise off the parent's journal:
+ * the link's idempotency key is the dispatch's instance path under the
+ * parent's id (grammar 9.4), and a finally node's start is a `finally` record
+ * at its site (`docs/durability.md` §3.10) — so a prefix of the path holding
+ * one is a finally node the dispatch lies under, whichever generation issued
+ * it. That is what a recovered cancel's cascade reads: the marks of the
+ * process that began the child died with it.
+ */
+async function begunByFinally(journal: Journal, link: Lineage): Promise<boolean> {
+  const prefix = `${link.parent}/`;
+  if (!link.idempotencyKey.startsWith(prefix)) return false;
+  const path = link.idempotencyKey.slice(prefix.length);
+  if (underRunningFinally(link.parent, path)) return true;
+  const frames = path.split("/");
+  // A finally site is `<instance path>/<node id>/0`: two frames at least.
+  for (let length = 2; length <= frames.length; length += 1) {
+    const site = frames.slice(0, length).join("/");
+    if ((await journal.lookup(link.parent, effectKey(site, "finally", 0))) !== undefined) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Arrange for a **recovered** execution whose cancel was requested to complete
+ * it (PRD resolved q75, `docs/durability.md` §6.1): its controller is opened
+ * and its journal's frontier hook installed, so the replay consumes the
+ * recorded prefix — every instance the dying process had open is re-entered —
+ * and the first effect the record does not hold fires the cancel instead of
+ * being issued. A finally node's effects are exempt: they are how an instance
+ * ends ([`finallySites`]).
+ *
+ * Called by `src/serve.ts`'s recovery and `src/cli.ts`'s `resume` before the
+ * resumed `runFlow` opens the execution, for a row carrying
+ * `cancelRequestedAt`.
+ */
+export function completeCancel(execution: string): void {
+  executionCancelSignal(execution);
+  cancelAtFrontier(execution, (site) => {
+    if (underRunningFinally(execution, site)) return undefined;
+    fireCancel(execution);
+    return executionCancels.get(execution)?.signal.reason as Error | undefined;
+  });
+}
+
+/**
+ * Whether an error a run or an instance ended on is a **cancel** — the outcome
+ * `cancelled` — rather than a failure: a cancellation on its chain, or the end
+ * a resumed generation's boundary records as cancelled ([`RecordedEnding`]).
+ */
+export function endedByCancel(error: unknown): boolean {
+  if (error instanceof RecordedEnding) return error.ending.outcome === "cancelled";
+  return cancellationOf(error) !== undefined;
+}
+
 /** The delay before attempt `attempt` (1 = the first retry), per grammar 9.1. */
 export function backoffFor(policy: RetryPolicy, attempt: number): number {
   const raw = policy.backoffMs * policy.multiplier ** (attempt - 1);
@@ -1329,6 +1726,57 @@ export async function runActivity<T>(
   // to it on every attempt, so a rejection nobody is waiting on is still a
   // handled one.
   const expiry = budget === undefined ? undefined : untilAborted(controller.signal);
+  // **The execution's cancel**, which this node's own controller chains to (PRD
+  // resolved q75 ruling b, Decision D160): the signal every activity of this
+  // node already reads aborts with it, and the attempt is raced against it the
+  // way it is raced against the deadline above — so a host function that never
+  // looks at its signal still leaves the node on time. Absent on a finally
+  // node's site and under one, which a cancel never stops ([`finallySites`]).
+  const cancel = cancelSignalFor(execution.id, site);
+  let cancelled = false;
+  // Whether the process's stop reached the node first (below): the first of
+  // the two to fire is the one it ends on.
+  let halted = false;
+  const onCancel = (): void => {
+    if (halted) return;
+    cancelled = true;
+    controller.abort(cancel?.reason);
+  };
+  if (cancel !== undefined) {
+    if (cancel.aborted) onCancel();
+    else cancel.addEventListener("abort", onCancel, { once: true });
+  }
+  // **The process's stop**, where a worker's node runner installed one
+  // ([`stopEveryNodeOn`]): chained like the cancel, and like it absent on a
+  // finally node's site and under one — but what it leaves is a failure every
+  // ladder lets through, never a cancelled node.
+  const halt = stopSignalFor(execution.id, site);
+  const onHalt = (): void => {
+    if (cancelled) return;
+    halted = true;
+    controller.abort(halt?.reason);
+  };
+  if (halt !== undefined) {
+    if (halt.aborted) onHalt();
+    else halt.addEventListener("abort", onHalt, { once: true });
+  }
+  // Raced on the node's **own** signal, which the cancel aborts, rather than on
+  // the execution's: the one listener a node puts on the execution's signal is
+  // `onCancel` above, which it takes back as it settles. The process's stop is
+  // raced the same way.
+  const stopped =
+    cancel === undefined && halt === undefined
+      ? undefined
+      : (expiry ?? untilAborted(controller.signal));
+  stopped?.catch(() => undefined);
+  /** The cancelled node's own failure, with the attempts it had made. */
+  const cancellation = (): NodeCancelled => new NodeCancelled(flow, node, made, cancel?.reason);
+  /**
+   * The stopped node's own failure: the instance it runs in is ending on the
+   * process's stop, so what it raises is let through by every ladder
+   * ([`stoppedOf`]).
+   */
+  const halting = (): InstanceStopped => new InstanceStopped(flow, halt?.reason);
   // One recorder per node **execution**, not per attempt: the ordinals a key
   // carries count every effect this site ever issues in this execution, so a
   // second attempt's model call is a second record rather than a collision with
@@ -1342,6 +1790,10 @@ export async function runActivity<T>(
   try {
     let last: unknown;
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      // A cancelled node begins no attempt (Decision D160), and nor does a
+      // stopped one ([`stopEveryNodeOn`]).
+      if (cancelled) throw cancellation();
+      if (halted) throw halting();
       if (expired) break;
       // See *No attempt begins once the body has ended*.
       if (isAborted(bodyEnded)) throw abortReason(bodyEnded!);
@@ -1375,14 +1827,14 @@ export async function runActivity<T>(
         // the node — and in Node an unhandled rejection ends the process. This
         // is the handler that keeps an abandoned activity from taking the run
         // down with it.
-        if (expiry !== undefined) {
+        const racing = stopped ?? expiry;
+        if (racing !== undefined) {
           running.catch((error: unknown) => {
             late.settled = true;
             late.error = error;
           });
         }
-        const value =
-          expiry === undefined ? await running : await Promise.race([running, expiry]);
+        const value = racing === undefined ? await running : await Promise.race([running, racing]);
         return { value, attempts: attempt };
       } catch (error) {
         last = error;
@@ -1400,6 +1852,51 @@ export async function runActivity<T>(
         // ran inside the boundary.
         if (innerTraces !== undefined && error instanceof SubflowFailure) {
           innerTraces.push(...error.trace);
+        }
+        // **A cancel answered for the node** (PRD resolved q75, Decision D160):
+        // it settles `cancelled` — never `failed`, never through `retry:` or
+        // `on_error:` — once every instance it began has ended, each one's
+        // `finally:` node run at outcome `cancelled`, innermost first, as
+        // *An instance ends before its node does* has a deadline wait for them.
+        // A divergence is the one thing that still travels as itself: the
+        // record not describing this run is the record's, whatever stopped it.
+        if (cancelled && divergenceOf(error) === undefined) {
+          if (instancesOpenUnder(execution.id, site)) {
+            await instancesEnded(execution.id, site);
+            if (running !== undefined) {
+              await Promise.race([
+                running.then(
+                  () => undefined,
+                  () => undefined,
+                ),
+                new Promise<void>((resolve) => setTimeout(resolve, 0)),
+              ]);
+            }
+          }
+          // What the instance a `flow:` node's attempt ran did before the
+          // cancel ended it, where it ended after the cancel had answered: its
+          // trace is the only account of it, and its finally node's entry is in
+          // it (`docs/trace.md` §3.2).
+          if (
+            innerTraces !== undefined &&
+            late.settled &&
+            late.error !== error &&
+            late.error instanceof SubflowFailure
+          ) {
+            innerTraces.push(...late.error.trace);
+          }
+          throw cancellation();
+        }
+        // **The process's stop answered for the node** ([`stopEveryNodeOn`]):
+        // it leaves on the stop, through no `retry:` and no `on_error:` — once
+        // every instance it began has ended, each one's finally node run, as
+        // the cancel and the deadline wait for them.
+        if (halted && divergenceOf(error) === undefined) {
+          if (instancesOpenUnder(execution.id, site)) {
+            abandonPausesUnder(execution.id, site);
+            await instancesEnded(execution.id, site);
+          }
+          throw halting();
         }
         // A pause this run has no way to answer is not something the activity
         // did wrong, and it is emphatically not the retry ladder's to re-run:
@@ -1498,15 +1995,22 @@ export async function runActivity<T>(
         const delay = backoffFor(policy.retry!, attempt);
         try {
           await sleep(delay, controller.signal, bodyEnded);
-        } catch (stopped) {
+        } catch (asleep) {
+          // A cancel, which ends the backoff like the deadline and leaves the
+          // node `cancelled` (Decision D160) — or the process's stop, which
+          // leaves it stopped ([`stopEveryNodeOn`]).
+          if (cancelled) throw cancellation();
+          if (halted) throw halting();
           // The body's end, rather than the deadline: no attempt follows, and
           // the node leaves on the end itself (see *No attempt begins once the
           // body has ended*).
-          if (!expired && isAborted(bodyEnded)) throw stopped;
+          if (!expired && isAborted(bodyEnded)) throw asleep;
           break;
         }
       }
     }
+    if (cancelled) throw cancellation();
+    if (halted) throw halting();
     if (expired) {
       throw new NodeFailure(
         flow,
@@ -1519,6 +2023,8 @@ export async function runActivity<T>(
     throw new NodeFailure(flow, node, made, describe(last), last);
   } finally {
     if (timer !== undefined) clearTimeout(timer);
+    cancel?.removeEventListener("abort", onCancel);
+    halt?.removeEventListener("abort", onHalt);
     watching?.();
     // However this node execution ended, it has ended — so a pause still open
     // below it is one nothing will ever read the answer of, and leaving it on
@@ -2374,6 +2880,14 @@ export async function callModel(
     } satisfies JournaledCall)) as Extract<JournaledCall, { ok: true }>;
     return { answer: kept.answer, served: result.served };
   } catch (error) {
+    // A call **stopped** in flight is not one the world answered, and is not
+    // kept at all: a cancel's, which the generation that completes a cancel a
+    // restart interrupted would otherwise replay as a failure, and a worker's
+    // stop's, which the attempt after it would ([`stoppedUnder`]). Unrecorded,
+    // the call is the frontier, as [`journaled`] leaves every other effect such
+    // a stop reaches — so the value-keeping below, which bypasses that seam, has
+    // to ask the same question it asks.
+    if (stoppedUnder(recorder.execution, site.signal, error)) throw error;
     // Kept as a **value** rather than through the slot's error path, because a
     // spent ladder is more than its message: the records it filed are what a
     // reader of the failed node's entry reads, and they have to survive into
@@ -2411,6 +2925,24 @@ type JournaledCall =
       readonly error: { readonly name: string; readonly message: string };
       readonly calls: ModelCall[];
     };
+
+/**
+ * Whether an effect that failed while running under `signal` was **stopped**
+ * in flight rather than answered — by its execution's cancel or by a worker's
+ * stop — and so must not be recorded (`./journal.ts`'s [`stoppedInFlight`]).
+ *
+ * Asked by the two effect sites that keep a failure as a **value**, past the
+ * check [`journaled`] makes on its error path: a model call ([`callModel`])
+ * and a harness run ([`runCoder`]). What they threw is asked first; and the
+ * signal they ran under is asked too, because what a stop leaves behind is
+ * not always on the failure's chain — an SDK may report the abort as a
+ * failure of its own wording, with no `cause` — while the signal it aborted
+ * carries the stop's reason whatever the SDK made of it.
+ */
+function stoppedUnder(execution: string, signal: AbortSignal, error: unknown): boolean {
+  if (stoppedInFlight(execution, error)) return true;
+  return signal.aborted && stoppedInFlight(execution, signal.reason);
+}
 
 /** An error's class name, as `describe` reads it. */
 function nameOf(error: unknown): string {
@@ -6135,13 +6667,36 @@ async function runExecLive(
   // …) `` propagates as raised, and the catch keeps its one meaning: the
   // platform declined to start a command whose inputs all resolved.
   const cwd = binding.cwd === undefined ? undefined : interpolate(binding.cwd);
+  const signal = context.signal;
   const spawned = new Promise<{ code: number; stdout: string; stderr: string }>(
     (resolve, reject) => {
-      const child = spawn(command, args, {
-        cwd,
-        env: environment,
-        signal: context.signal,
-      });
+      // A signal that has already aborted forks nothing: the deadline or the
+      // cancel came first, and a command started now would be one to stop.
+      if (signal.aborted) {
+        reject(abortedBy(signal));
+        return;
+      }
+      const child = forkExecCommand(command, args, cwd, environment);
+      holdCommand(child);
+      // **The command's whole process group is what an abort stops** — the
+      // node's deadline or the execution's cancel (grammar 9.2, PRD resolved
+      // q75 ruling b): `SIGTERM` to the group at once, and `SIGKILL` to it once
+      // [`EXEC_STOP_GRACE_MS`] has passed ([`stopExecGroup`]). The group rather
+      // than the pid, because a command is very often a shell that forks — a
+      // `SIGTERM` aimed at it alone would end the shell and leave the `sleep`,
+      // the build or the server it started running, reparented, for as long as
+      // it likes. The promise rejects at once, as the platform's own `signal:`
+      // option would have: the node does not wait for a command it has told to
+      // stop.
+      const onAbort = (): void => {
+        stopExecGroup(child);
+        reject(abortedBy(signal));
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      const done = (): void => {
+        signal.removeEventListener("abort", onAbort);
+        releaseCommand(child);
+      };
       let stdout = "";
       let stderr = "";
       child.stdout.on("data", (chunk: Buffer) => {
@@ -6150,8 +6705,14 @@ async function runExecLive(
       child.stderr.on("data", (chunk: Buffer) => {
         stderr += chunk.toString();
       });
-      child.on("error", reject);
-      child.on("close", (code) => resolve({ code: code ?? -1, stdout, stderr }));
+      child.on("error", (error) => {
+        done();
+        reject(error);
+      });
+      child.on("close", (code) => {
+        done();
+        resolve({ code: code ?? -1, stdout, stderr });
+      });
       // A command that never reads its input closes the pipe while this write is
       // still in flight, and Node reports that as an `error` **event on the
       // stream** rather than as a rejected promise. Unhandled, an EventEmitter
@@ -6232,6 +6793,135 @@ async function runExecLive(
     },
     "trimmed",
   );
+}
+
+/**
+ * Fork one `exec:` command into a process group of its own, with the stop
+ * sweep armed **first** — [`forkBoundShell`]'s ordering, for the same reason
+ * (see [`armCommandSweep`]): `crates/compose-core/src/codegen/runtime.rs` holds
+ * the two lines in this order.
+ *
+ * `detached` is what puts the command in a group of its own, which is what an
+ * abort stops ([`stopExecGroup`]): a command that forks — a shell script, a
+ * build, a wrapper that starts a server — has its real work in its children,
+ * and a signal aimed at the command's pid alone would leave them running
+ * after the node that started them settled (PRD resolved q75 ruling b's "no
+ * child process alive"). A group of its own is also one the **terminal** no
+ * longer reaches, so the command joins the sweep that takes `builtin.bash`'s
+ * groups with a stop signal ([`holdCommand`]) — `Ctrl-C` at a `run` still
+ * stops what the run started.
+ *
+ * What still escapes is what left the group deliberately — a command that calls
+ * `setsid` or double-forks a daemon away — which [`killCommandGroup`] already
+ * says of a shell.
+ */
+function forkExecCommand(
+  command: string,
+  args: readonly string[],
+  cwd: string | undefined,
+  environment: NodeJS.ProcessEnv,
+) {
+  armCommandSweep();
+  try {
+    return spawn(command, args, { cwd, env: environment, detached: true });
+  } catch (error) {
+    if (runningCommands.size === 0) standDown();
+    throw error;
+  }
+}
+
+/**
+ * How long an aborted `exec:` command's process group has to end on `SIGTERM`
+ * before it is killed.
+ *
+ * Long enough for a command that cleans up on `SIGTERM` to do it; short enough
+ * that a command that ignores it is gone well inside the ten seconds PRD
+ * resolved q75 gives a cancel, and inside a worker's own five-second grace for
+ * the node runner it stops (`docs/distributed.md` §3.2) — so a runner that
+ * exits on time has killed its commands' groups first.
+ */
+const EXEC_STOP_GRACE_MS = 2_000;
+
+/**
+ * The `exec:` groups sent `SIGTERM` and not yet killed, each with the timer
+ * that will kill it.
+ *
+ * Held so that a process which **exits** inside a grace — a `run` whose
+ * cancelled node was its last, a node runner posting its cancelled result —
+ * kills them on its way out instead of leaving a command that ignored
+ * `SIGTERM` behind ([`killStoppingOnExit`]).
+ */
+const stoppingExecGroups = new Map<ChildProcess, ReturnType<typeof setTimeout>>();
+
+/** Whether the exit hook [`killStoppingOnExit`] has been installed. */
+let exitKillInstalled = false;
+
+/**
+ * Stop one aborted `exec:` command: `SIGTERM` to its whole process group now,
+ * and `SIGKILL` to it once [`EXEC_STOP_GRACE_MS`] has passed.
+ *
+ * The kill is aimed at the group whatever the command did with the `SIGTERM`:
+ * a shell that exits on it can leave a child behind that does not, and the
+ * group outlives its leader for as long as any member is alive. The timer does
+ * not hold this process open; a process that exits first kills the group on
+ * the way out instead.
+ */
+function stopExecGroup(child: ChildProcess): void {
+  signalGroup(child, "SIGTERM");
+  if (stoppingExecGroups.has(child)) return;
+  if (!exitKillInstalled) {
+    exitKillInstalled = true;
+    process.on("exit", killStoppingOnExit);
+  }
+  const timer = setTimeout(() => {
+    stoppingExecGroups.delete(child);
+    killCommandGroup(child);
+  }, EXEC_STOP_GRACE_MS);
+  timer.unref?.();
+  stoppingExecGroups.set(child, timer);
+}
+
+/** Kill every `exec:` group still inside its grace, as this process exits. */
+function killStoppingOnExit(): void {
+  for (const [child, timer] of stoppingExecGroups) {
+    clearTimeout(timer);
+    killCommandGroup(child);
+  }
+  stoppingExecGroups.clear();
+}
+
+/**
+ * Send `signal` to `child`'s process group, or to `child` alone on a host
+ * without groups ([`killCommandGroup`]'s fallback, at a signal of the
+ * caller's).
+ */
+function signalGroup(child: ChildProcess, signal: NodeJS.Signals): void {
+  const pid = child.pid;
+  if (pid !== undefined) {
+    try {
+      process.kill(-pid, signal);
+      return;
+    } catch {
+      // Already gone, or a host without process groups: fall through.
+    }
+  }
+  try {
+    child.kill(signal);
+  } catch {
+    // Already gone.
+  }
+}
+
+/**
+ * What an `exec:` command an abort stopped rejects with: the platform's own
+ * `AbortError` shape — what spawning with `signal:` raised — carrying the
+ * signal's reason as its `cause`, so a deadline or a cancel is read off it
+ * exactly as before ([`cancellationOf`]).
+ */
+function abortedBy(signal: AbortSignal): Error {
+  const error = new Error("The operation was aborted", { cause: signal.reason });
+  error.name = "AbortError";
+  return error;
 }
 
 // ---------------------------------------------------------------------------
@@ -7393,9 +8083,9 @@ function held(buffered: string): string {
  *
  * What still escapes is what **left the group deliberately**: a command that
  * calls `setsid`, one that turned job control on (`set -m`), a daemon that
- * double-forks away. Those are the same processes a hand-rolled `exec:` tool
- * would leave behind, and containing them is the distribution work's rather than
- * this bound's (grammar 5.5, Decision D124).
+ * double-forks away. Those escape an `exec:` command's group the same way
+ * ([`forkExecCommand`]), and containing them is the distribution work's rather
+ * than this bound's (grammar 5.5, Decisions D124, D160).
  *
  * The fallback is for the host where the group kill is not a thing —
  * `process.kill` with a negative pid is a POSIX call, and Windows is a posture
@@ -7421,7 +8111,7 @@ function killCommandGroup(child: ChildProcess): void {
   }
 }
 
-/** The `builtin.bash` shells this process has running right now. */
+/** The `builtin.bash` shells and `exec:` commands this process has running right now. */
 const runningCommands = new Set<ChildProcess>();
 
 /** The stop signals swept for, and the handlers installed for them. */
@@ -7436,9 +8126,9 @@ const commandSweeps: (() => void)[] = [];
  * the foreground one any more, so the `SIGINT` a person types reaches this
  * process and nothing below it. Left there, `Ctrl-C` on a `run` would end the
  * graph and leave the build it was in the middle of still writing into the
- * workspace — a regression against a hand-rolled `exec:` tool, whose child *is*
- * in that group and does die. So the group a session detached is swept here
- * instead, and what the terminal used to do the runtime now does.
+ * workspace. So the group a session detached is swept here instead, and what
+ * the terminal used to do the runtime now does — for an `exec:` command's group
+ * too, which is detached for the same reason a shell is ([`forkExecCommand`]).
  *
  * **Armed before the fork rather than after it**, which is an ordering and not a
  * detail. A stop signal has a *disposition* before it has a listener: until the
@@ -7465,6 +8155,10 @@ const commandSweeps: (() => void)[] = [];
 function armCommandSweep(): void {
   if (commandSweeps.length > 0) return;
   for (const signal of SWEPT_SIGNALS) {
+    // A process whose `SIGTERM` is an execution's cancel ([`cancelOnTerminate`])
+    // leaves that signal to the cancel: what it stops is what the cancel owes,
+    // and a finally node's command is not among it.
+    if (signal === "SIGTERM" && terminateCancels !== undefined) continue;
     const sweep = (): void => {
       for (const running of runningCommands) killCommandGroup(running);
       runningCommands.clear();
@@ -7476,13 +8170,42 @@ function armCommandSweep(): void {
   }
 }
 
-/** Register a running shell with the sweep [`armCommandSweep`] armed. */
+/** The execution a `SIGTERM` cancels in this process, where one does ([`cancelOnTerminate`]). */
+let terminateCancels: string | undefined;
+
+/**
+ * Make `SIGTERM` this process's **cancel** of `execution` rather than a stop
+ * (PRD resolved q75, Decision D160, `docs/distributed.md` §3.2) — what a
+ * worker's node runner (`./worker-node.ts`) is told by the signal its worker
+ * sends for a dispatch the hub cancelled.
+ *
+ * The signal fires the execution's controller ([`fireCancel`]), and the stop
+ * sweep ([`armCommandSweep`]) stands aside for it: swept, it would `SIGKILL`
+ * every command group running here the instant the signal landed — a finally
+ * node's among them, which runs whole whatever the cancel does (grammar 7.9) —
+ * where the cancel stops exactly the commands it owes, each by its own
+ * `SIGTERM`-then-`SIGKILL` ([`stopExecGroup`]). `SIGINT` is swept as before.
+ */
+export function cancelOnTerminate(execution: string): void {
+  terminateCancels = execution;
+  // A sweep armed before this call sweeps `SIGTERM` too, so it is re-armed
+  // without it.
+  if (commandSweeps.length > 0) {
+    standDown();
+    armCommandSweep();
+  }
+  process.on("SIGTERM", () => {
+    fireCancel(execution);
+  });
+}
+
+/** Register a running shell or command with the sweep [`armCommandSweep`] armed. */
 function holdCommand(child: ChildProcess): void {
   armCommandSweep();
   runningCommands.add(child);
 }
 
-/** Drop a shell that has ended, and the sweep with the last of them. */
+/** Drop a shell or command that has ended, and the sweep with the last of them. */
 function releaseCommand(child: ChildProcess): void {
   runningCommands.delete(child);
   if (runningCommands.size === 0) standDown();
@@ -9203,6 +9926,16 @@ export async function runCoder(
         // and `docs/trace.md` §7.6's "one record per attempt" would hold on the
         // generation that ran and not on the one that resumed.
         if (!(error instanceof HarnessRunFailed)) throw error;
+        // …save a run **stopped** in flight, by the execution's cancel or a
+        // worker's stop, which is not a failure the world answered and is kept
+        // off the record ([`stoppedUnder`]): thrown on through the seam marked
+        // as stopped, which it lets through unrecorded whatever the SDK put on
+        // the failure's chain. Its record is filed here, since the path below
+        // that files a failed run's is not reached.
+        if (stoppedUnder(view.run.execution.id, context.signal, error)) {
+          context.harnessRuns?.push(error.record);
+          throw asStopped(error);
+        }
         live = error;
         return { ok: false, detail: error.detail, record: error.record, stream };
       }
@@ -9697,7 +10430,7 @@ export function route(
  * value changed meaning, which `docs/trace.md` §10.3.5 records. (`5` was PRD
  * resolved q65's child execution, §10.3.4.)
  */
-export const TRACE_VERSION = 6;
+export const TRACE_VERSION = 7;
 
 /**
  * One run's whole trace, as a surface delivers it (`docs/trace.md`).
@@ -9766,9 +10499,11 @@ export interface TraceDocument {
    * (grammar 8.7, [`HumanInterrupt`]) — what `agent-compose run` does with every
    * pause, since resume is `serve`'s route. It is told apart from `"failed"`
    * because the two ask for different things from whoever is reading: one is a
-   * run to look into, the other is a question to answer.
+   * run to look into, the other is a question to answer. `"cancelled"` is a run
+   * somebody stopped (PRD resolved q75, Decision D160): no answer, and nothing
+   * to look into or to answer — so it carries no `error` either.
    */
-  readonly status: "completed" | "failed" | "interrupted";
+  readonly status: "completed" | "failed" | "interrupted" | "cancelled";
   /**
    * What stopped a run that produced no answer.
    *
@@ -9817,7 +10552,7 @@ export interface TraceEntry {
   readonly flow: string;
   readonly node: string;
   readonly traversal: number;
-  readonly outcome: "completed" | "skipped" | "failed";
+  readonly outcome: "completed" | "skipped" | "failed" | "cancelled";
   readonly attempts: number;
   readonly writes?: readonly string[];
   readonly routing?: RoutingDecision;
@@ -11097,6 +11832,28 @@ function instanceBegun(
 }
 
 /**
+ * Put a **placed node a cancel reached on its worker** on the books, until
+ * `ending` settles — the worker's cancelled result came home, or the hub lost
+ * the session holding it (`docs/distributed.md` §3.2, §3.4, §6.3; PRD resolved
+ * q75, Decision D160).
+ *
+ * What a placed node begins it begins on the worker — an attached `flow.*`
+ * instance and its `finally:` node run in the runner — so none of it is on
+ * this process's books, and without this entry a cancelled node would settle
+ * the moment it stopped waiting, while those instances were still ending: the
+ * instance around it would run its own finally node first, breaking
+ * innermost-first, and the execution would settle before the result carrying
+ * the inner finally node's `finally_error` arrived. Held at the node's own
+ * site, so the node's own cancel waits for it like any instance it began
+ * ([`runActivity`]), and so does every end around it ([`endInstancesInside`]).
+ * Its stop is pulled by nothing that matters: the worker has already been told
+ * to stop, and its grace is the bound (§3.2).
+ */
+export function holdRemoteEnd(execution: string, site: string, ending: Promise<unknown>): void {
+  instanceBegun(execution, site, ending, new AbortController(), deliveryAround(execution, site));
+}
+
+/**
  * Whether any instance at or under `site` is still running — the synchronous
  * half of [`instancesEnded`], so a node that began none settles on the turn it
  * always did.
@@ -11204,6 +11961,10 @@ function stoppedBy(signal: AbortSignal, error: unknown): unknown {
   if (error === undefined || !signal.aborted) return error;
   if (divergenceOf(error) !== undefined || interruptOf(error) !== undefined) return error;
   const reason: unknown = signal.reason;
+  // A cancel is how the instance ended, whatever its stream raised on the way
+  // out — an `Abort`, or the abandonment of a pause it was holding (Decision
+  // D160).
+  if (reason instanceof ExecutionCancelled) return reason;
   if (reason instanceof InstanceStopped || abandonedOf(error) !== undefined) return reason;
   return error;
 }
@@ -11460,10 +12221,10 @@ async function instancesEnded(execution: string, site: string): Promise<void> {
  * How one flow instance ended (grammar 7.9, PRD resolved q76): what a
  * `finally:` node reads as `execution.outcome`.
  *
- * `cancelled` is one of the three before anything produces it. PRD resolved
- * q75's cancel is what will, through [`endInstance`] like the other two, and
- * the value is here now so that a finally node written against it checks and
- * runs today rather than at the release that adds the route.
+ * `cancelled` is what a cancel ends an instance as (PRD resolved q75, Decision
+ * D160): [`cancelExecution`] fires the execution's controller, every instance it
+ * reaches ends at it ([`instanceEnding`]), and each runs its finally node here
+ * like the other two, innermost first.
  */
 export type InstanceOutcome = "completed" | "failed" | "cancelled";
 
@@ -11546,6 +12307,10 @@ export class RecordedEnding extends Error {
  * error is `failed`.
  */
 export function instanceEnding(execution: string, error: unknown): InstanceEnding | undefined {
+  // A cancel ends an instance `cancelled`, with no `execution.error`: nothing
+  // went wrong with the instance, somebody stopped it (PRD resolved q75,
+  // Decision D160). Asked after the divergence, which still keeps the row open.
+  if (divergenceOf(error) === undefined && endedByCancel(error)) return { outcome: "cancelled" };
   if (staysOpen(execution, error) || abandonedOf(error) !== undefined) return undefined;
   if (error === undefined) return { outcome: "completed" };
   return { outcome: "failed", error: describe(error) };
@@ -11693,11 +12458,12 @@ export function holdFinallyError(execution: string, error: string): void {
  * `finally:`, and an `ending` of `undefined` — a stop that is not an end
  * ([`instanceEnding`]).
  *
- * **The cancelled arm.** `ending.outcome` may be `"cancelled"`, and that is the
- * whole of what PRD resolved q75's cancel will need from this seam: it is
- * journaled, read and run exactly as the other two. Nothing in this release
- * produces it — there is no cancel route yet — so the one caller that passes it
- * is the test that drives this function directly.
+ * **The cancelled arm.** `ending.outcome` may be `"cancelled"` — what PRD
+ * resolved q75's cancel ends an instance as — and it is journaled, read and run
+ * exactly as the other two. The node runs whole whatever the cancel does: its
+ * site is marked as a running finally node for as long as it runs, so neither a
+ * cancel that ended the instance nor one arriving during its end stops it or
+ * anything it begins ([`finallySites`], Decision D160).
  */
 export async function endInstance(
   descriptor: NodeDescriptor | undefined,
@@ -11717,7 +12483,28 @@ export async function endInstance(
   const traversal = 0;
   const site = [...run.path, `${descriptor.node}/${traversal}`].join("/");
   const policy = effectivePolicy(descriptor.policy, false, run.policy);
+  // A finally node, and all it begins, is how its instance ends — so a cancel
+  // stops none of it, whether the cancel ended the instance or arrived while
+  // its end was under way ([`finallySites`], Decision D160).
+  const running = finallyRunning(run.execution.id, site);
+  try {
+    return await endInstanceAt(descriptor, state, ending, run, step, traversal, site, policy);
+  } finally {
+    running();
+  }
+}
 
+/** [`endInstance`]'s body, with the finally node's site marked as running. */
+async function endInstanceAt(
+  descriptor: NodeDescriptor,
+  state: GraphStateLike,
+  ending: InstanceEnding,
+  run: RunChannel,
+  step: number,
+  traversal: number,
+  site: string,
+  policy: NodePolicy,
+): Promise<FinallyRun> {
   // 1. The boundary, recorded before the node runs — and on a resumed
   // generation, read: the recorded end is the instance's, so the identity is the
   // node alone, and the outcome is what the record answers rather than what it
@@ -12547,6 +13334,11 @@ export async function runMap(
         idempotencyKey: site.idempotencyKey,
       });
       const gate = gateOf(route);
+      // The delivery's own site, which is what a cancel's exemption is read at:
+      // a delivery a **finally** node issued is part of how its instance ends,
+      // and a cancel stops none of it (Decision D160, [`finallySites`]).
+      const deliverySite = site.path.join("/");
+      const fromFinally = underRunningFinally(scoped.execution.id, deliverySite);
       // Its own signal, never the node's: see *A detached delivery is off the
       // node's clock* above. One per delivery rather than one per call, so a
       // fan-out of many sinks does not pile listeners onto a shared signal.
@@ -12572,7 +13364,14 @@ export async function runMap(
       // ([`dispatchChild`], PRD resolved q65).
       const delivery: RunContext = {
         ...scoped,
-        signal: new AbortController().signal,
+        // …save the execution's **cancel**, which stops a detached delivery like
+        // any running node (PRD resolved q75 ruling b, Decision D160): it is a
+        // dispatch of this execution, not an execution of its own — a detached
+        // `flow.*` is, and the cancel reaches it through the cascade instead.
+        // Read through [`cancelSignalFor`], so a delivery a finally node issued
+        // chains to nothing — on a cancelled execution that node runs *because*
+        // of the cancel, and the execution's signal has already fired.
+        signal: cancelSignalFor(scoped.execution.id, deliverySite) ?? new AbortController().signal,
         deadline: undefined,
         // …and off the instance's end, for the same reason: the delivery was
         // issued when its record was written, and the instance ending around
@@ -12596,7 +13395,15 @@ export async function runMap(
       // — including before `route.run` is reached. (A `flow.*` sink's nodes run
       // under the child execution's own id, which this execution's reading
       // never counted in the first place.)
-      const undetach = detaching(scoped.execution.id, site.path.join("/"));
+      const undetach = detaching(scoped.execution.id, deliverySite);
+      // And the exemption **lasts as long as the delivery does**, not only as
+      // long as the finally node that issued it: the node resolves a detached
+      // dispatch at once (D94) and settles, and what the delivery goes on to
+      // run — an agent's model turns, the instances its `flow.*` tools begin —
+      // reads its own cancel signal at its own site, after that node is gone.
+      // Marking the delivery's site as a finally node's keeps every one of
+      // those chained to nothing, which is "a finally node and all it begins".
+      const unmark = fromFinally ? finallyRunning(scoped.execution.id, deliverySite) : undefined;
       const delivering = (async () => {
         try {
           // **A child execution is issued now and admitted inside** (PRD
@@ -12648,6 +13455,7 @@ export async function runMap(
         } finally {
           retire(plan.admission, admission);
           undetach();
+          unmark?.();
         }
       })().catch((error: unknown) => {
         // Nothing it does can fail the enclosing flow instance, which is what an
@@ -13199,12 +14007,16 @@ function superviseChild(
       }
     } catch (error) {
       const known = child;
+      const named = `the child execution \`${id}\`${
+        known === undefined
+          ? ""
+          : ` (\`${known.flow}\`, started by the detached dispatch \`${known.lineage.idempotencyKey}\`)`
+      }`;
       process.stderr.write(
-        `the child execution \`${id}\`${
-          known === undefined
-            ? ""
-            : ` (\`${known.flow}\`, started by the detached dispatch \`${known.lineage.idempotencyKey}\`)`
-        } did not complete: ${describe(error)}\n`,
+        // A cancel is not something that went wrong with it (PRD resolved q75).
+        endedByCancel(error)
+          ? `${named} was cancelled\n`
+          : `${named} did not complete: ${describe(error)}\n`,
       );
     }
   })();
@@ -13278,13 +14090,31 @@ export async function dispatchChild(
     ...(admission === undefined ? {} : { admission: admission.bounds }),
   };
   const id = childExecutionId(lineage.parent, lineage.idempotencyKey);
+  // **A child a finally node begins is how its instance ends**, not work
+  // inside one that has: a cancel stops none of it and nothing it begins
+  // (grammar 7.9, Decision D160) — so on a cancelled parent, where that node
+  // runs *because* of the cancel, the child is begun uncancelled, and the
+  // cascade passes it over ([`begunByFinally`]). Read now, in the dispatch's
+  // own tick: the delivery's site is marked for as long as it runs
+  // ([`runMap`]), so the reading holds for the child's whole life.
+  const fromFinally = underRunningFinally(lineage.parent, site.path.join("/"));
   const supervised = superviseChild(
     id,
     async () => {
       if (!childrenBeginHere) throw new ChildOnAWorker(flow, lineage.idempotencyKey);
       const journal = await openJournal();
       const row = await journal.execution(id);
-      if (row !== undefined) return row.status === "open" ? childOf(row) : undefined;
+      if (row !== undefined) {
+        if (row.status !== "open") return undefined;
+        // An open child a cancelled parent reaches again — a recovered parent's
+        // re-issued dispatch — is cancelled as it resumes, exactly as one it
+        // begins below is: the cascade's walk may have missed it (PRD resolved
+        // q75 ruling c). Save a finally node's.
+        if (cancelFired(lineage.parent) && row.cancelRequestedAt === undefined && !fromFinally) {
+          await journal.requestCancel(id);
+        }
+        return childOf(row);
+      }
       const adopted = await adoptDelivery(journal, lineage, id, site.path.join("/"));
       const parent = await journal.execution(lineage.parent);
       const child: ChildExecution = {
@@ -13311,6 +14141,11 @@ export async function dispatchChild(
         journalVersion: JOURNAL_VERSION,
         startedAt: new Date().toISOString(),
       });
+      // A parent already cancelled cancels a child it was issuing as the cancel
+      // came — one the cascade's walk of the open rows could not have seen
+      // (PRD resolved q75 ruling c) — save one its finally node is issuing,
+      // which the cancel is the reason for.
+      if (cancelFired(lineage.parent) && !fromFinally) await journal.requestCancel(id);
       return child;
     },
     admission,
@@ -13498,7 +14333,7 @@ async function adoptDelivery(
 export function traceDocument(settled: {
   readonly execution: string;
   readonly flow: string;
-  readonly status: "completed" | "failed" | "interrupted";
+  readonly status: "completed" | "failed" | "interrupted" | "cancelled";
   readonly error?: string;
   readonly finallyError?: string;
   readonly entries: readonly TraceEntry[];
@@ -15718,10 +16553,26 @@ export async function openExecution(opening: ExecutionOpening): Promise<Lineage 
     );
   }
   openedExecutions.add(opening.execution);
+  // **The one controller a cancel of this execution pulls** (Decision D160),
+  // opened in this tick — before anything below is awaited — rather than once
+  // the row is begun. `src/serve.ts` answers a trigger's request while the
+  // `begin` below is still in flight, and on a dialled journal that is real
+  // network I/O: a cancel arriving inside it records its request and fires the
+  // controller it finds, so a controller opened only afterwards would be a
+  // fresh one nothing ever fires, and the run would go on to its end with its
+  // cancel recorded and its waits refusing every answer. Opened here, the
+  // cancel finds it and the first node begins already stopped.
+  const ownsController = !executionCancels.has(opening.execution);
+  executionCancelSignal(opening.execution);
   try {
     const journal = await openJournal();
     const resuming = opening.resuming === true;
     let lineage = opening.lineage;
+    // A cancel somebody requested before this generation began (PRD resolved
+    // q75, Decision D160): read off the row of a resumed execution, and of a
+    // child — whose row its dispatch began, and a cascade may have reached
+    // while it queued for a permit.
+    let cancelRequested: string | undefined;
     const begun = {
       id: opening.execution,
       flow: opening.flow,
@@ -15743,6 +16594,7 @@ export async function openExecution(opening: ExecutionOpening): Promise<Lineage 
         );
       }
       lineage = row?.lineage ?? lineage;
+      cancelRequested = row?.cancelRequestedAt;
       // The one resuming generation with no row to resume: a child whose records
       // an older build journaled under its parent, carried over before it began
       // (`docs/durability.md` §11.2). It consumes them like any resume and needs
@@ -15750,13 +16602,34 @@ export async function openExecution(opening: ExecutionOpening): Promise<Lineage 
       if (row === undefined && opening.lineage !== undefined) await journal.begin(begun);
     } else {
       await journal.begin(begun);
+      if (opening.lineage !== undefined) {
+        cancelRequested = (await journal.execution(opening.execution))?.cancelRequestedAt;
+      }
     }
     openSession(opening.execution, journal, resuming);
+    // A cancel already requested: a resumed generation completes it at its
+    // frontier, replaying what the record holds and issuing nothing past it
+    // ([`completeCancel`]), and a child that has not run yet is cancelled
+    // before its first node begins.
+    if (cancelRequested !== undefined) {
+      if (resuming) completeCancel(opening.execution);
+      else fireCancel(opening.execution);
+    }
+    // …and the **cascade** a resumed one owes: the process that accepted the
+    // cancel may have died between recording this execution's request and its
+    // children's, so the walk [`cancelExecution`] began is walked again here —
+    // before the replay re-issues any dispatch, so a child it reaches again
+    // resumes carrying its own request and completes its cancel at its own
+    // frontier (PRD resolved q75 rulings c and e).
+    if (cancelRequested !== undefined && resuming) {
+      await cascadeCancel(journal, opening.execution);
+    }
     settledJournals.set(opening.execution, journal);
     executionSessions.set(opening.execution, opening.sessionKey);
     return lineage;
   } catch (error) {
     openedExecutions.delete(opening.execution);
+    if (ownsController) executionCancels.delete(opening.execution);
     throw error;
   }
 }
@@ -15810,6 +16683,10 @@ export async function settleExecution(execution: string, error?: unknown): Promi
   const finallyError = finallyErrorOf(execution);
   if (error === undefined) {
     await journal.end(execution, "completed", undefined, finallyError);
+  } else if (endedByCancel(error)) {
+    // Cancelled, with no `error`: nothing went wrong with the run, somebody
+    // stopped it (PRD resolved q75, Decision D160).
+    await journal.end(execution, "cancelled", undefined, finallyError);
   } else {
     await journal.end(execution, "failed", describe(error), finallyError);
   }
@@ -16018,6 +16895,8 @@ export function closeExecution(execution: string): void {
   openedExecutions.delete(execution);
   executionSessions.delete(execution);
   finallyFailures.delete(execution);
+  executionCancels.delete(execution);
+  finallySites.delete(execution);
   closeSession(execution);
 }
 
@@ -16617,8 +17496,18 @@ export async function runNode(
   // (grammar 8.9, PRD resolved q57, and see [`RunContext.harnessRuns`]).
   const harnessRuns: HarnessRecord[] = [];
 
-  /** This node's entry, for a failure that leaves nothing else behind. */
-  const aborted = (error: unknown, made: number, routing?: RoutingDecision): TraceEntry => {
+  /**
+   * This node's entry, for a failure that leaves nothing else behind — or, with
+   * `outcome: "cancelled"`, for a node the execution's cancel stopped
+   * (`docs/trace.md` §3.2, Decision D160), which carries every record the node
+   * made and no `error`: a cancel is not something that went wrong with it.
+   */
+  const aborted = (
+    error: unknown,
+    made: number,
+    routing?: RoutingDecision,
+    outcome: "failed" | "cancelled" = "failed",
+  ): TraceEntry => {
     // A subflow that failed still made a trace, and it is the only account of
     // what happened inside the boundary (grammar 8.5, PRD 5.3). `inner` already
     // holds every instance *this node* ran — `runActivity` collects one per
@@ -16668,7 +17557,7 @@ export async function runNode(
       flow: descriptor.flow,
       node: descriptor.node,
       traversal,
-      outcome: "failed",
+      outcome,
       attempts: made,
       ...(routing === undefined ? {} : { routing }),
       ...(dispatched === undefined ? {} : { dispatches: dispatched }),
@@ -16682,7 +17571,7 @@ export async function runNode(
       ...(called === undefined ? {} : { models: called }),
       ...(ran.length === 0 ? {} : { harness: [...ran] }),
       ...(paused === undefined ? {} : { human: paused }),
-      error: describe(error),
+      ...(outcome === "cancelled" ? {} : { error: describe(error) }),
     };
   };
 
@@ -16758,6 +17647,14 @@ export async function runNode(
     // policies over what an activity did, and a wait that ran out its budget or
     // a run with no way to answer one are the composition's own control flow.
     failure = error instanceof NodeFailure ? error : undefined;
+    // **A cancelled node settles `cancelled`** (PRD resolved q75 ruling b,
+    // Decision D160): ahead of every policy, because a cancel is not an
+    // activity outcome — no `retry:` re-runs it, no `on_error:` routes on it,
+    // and the node's edges are never evaluated. It carries its entry like the
+    // node a run aborts at, so the trace says where the cancel found the run.
+    if (error instanceof NodeCancelled) {
+      throw carryEntry(error, aborted(error, error.attempts, undefined, "cancelled"));
+    }
     if (interruptOf(error) !== undefined) {
       // What the node *made*, which `runActivity` counted and wrapped this in:
       // an interrupt on the second attempt of a node whose first attempt failed

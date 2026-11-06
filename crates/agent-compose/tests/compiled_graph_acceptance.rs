@@ -16719,7 +16719,7 @@ fn a_terminal_asks_one_question_per_pause_and_a_refused_answer_asks_again() {
         "{record}"
     );
     assert_eq!(
-        record["trace_version"], 6,
+        record["trace_version"], 7,
         "the JSON document a run prints is unchanged in shape by having asked: {record}"
     );
     assert!(
@@ -23051,8 +23051,8 @@ fn nothing_settled(receiver: &harness::Receiver, budget: Duration) {
 /// either as final drops an answer nothing was wrong with, and the execution
 /// waits for ever.
 ///
-/// `flow.held` makes the window a fact rather than a race. Its subprocess is
-/// killed with the first generation, so no record of it lands and the generation
+/// `flow.held` makes the window a fact rather than a race. The first generation
+/// is killed inside its subprocess, so no record of it lands and the generation
 /// that recovers the execution has to run it **live** before it can re-park —
 /// and the shim runs until this test releases it. Nothing here is timed.
 #[test]
@@ -23099,8 +23099,11 @@ fn a_recovered_execution_still_catching_up_tells_a_resume_to_send_it_again() {
         // effect" a fact rather than a sleep: the line is written before it
         // starts waiting to be released.
         wait_for_lines(&log, 1);
-        // Dropping it signals the whole process group, so the blocked subprocess
-        // goes with the app that spawned it and its record never lands.
+        // Dropping it kills the app's process group, so the record of the
+        // blocked subprocess never lands. The subprocess itself is in a group of
+        // its own (an `exec:` command's, Decision D160) and outlives the app,
+        // waiting on the same release file as its successor — which is what
+        // lets it go once this test is done with both.
     }
 
     let Some(second) = harness::serve_into(&project, "durability", &environment) else {
@@ -24006,6 +24009,119 @@ fn an_executions_status_and_resume_enforce_the_auth_of_the_trigger_that_started_
         taken.status,
         202,
         "an execution a no-auth trigger began keeps open routes: {}",
+        taken.text()
+    );
+}
+
+/// An execution's `cancel` route enforces the auth of the trigger that
+/// **started** it, and an execution a no-auth trigger began keeps it open
+/// (PRD resolved q75 ruling d, q32; grammar 13.3; Decision D160).
+///
+/// The guarded execution parks at `flow.review`'s pause. A cancel with no
+/// credential, and one with a bearer token the trigger does not issue, are both
+/// refused `401` naming the trigger and saying nothing about the execution — and
+/// the refusal stopped nothing: the pause is still waiting afterwards. The
+/// trigger's own credential is then answered `202` and the row settles
+/// `cancelled`. The open execution's cancel takes no credential at all, which is
+/// the half that pins the guard to the execution's lifecycle row rather than to
+/// the route.
+#[test]
+fn an_executions_cancel_route_enforces_the_auth_of_the_trigger_that_started_it() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, environment) = events_environment(&provider, "events-cancel-auth");
+    let Some(project) = harness::scratch_project("events-cancel-auth") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, "http-events", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let started = app
+        .send(
+            Request::post("/watched")
+                .json(&json!({ "topic": "guarded cancel" }))
+                .header("authorization", events_bearer()),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{}", started.text());
+    let guarded = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+    let poll = format!("/executions/{guarded}");
+    let report = |credential: &str| {
+        let held = app
+            .send(Request::get(&poll).header("authorization", credential))
+            .expect("the status route answers");
+        assert_eq!(held.status, 200, "{}", held.text());
+        held.json()
+    };
+    harness::until(Duration::from_secs(30), || {
+        (report(&events_bearer())["status"] == "interrupted").then_some(())
+    });
+
+    let cancel = format!("/executions/{guarded}/cancel");
+    for (what, request) in [
+        ("no credential", Request::post(&cancel)),
+        (
+            "a token the trigger does not issue",
+            Request::post(&cancel).header("authorization", "Bearer not-the-trigger-token"),
+        ),
+    ] {
+        let refused = app.send(request).expect("the cancel route answers");
+        assert_eq!(refused.status, 401, "{what}: {}", refused.text());
+        assert_eq!(
+            refused.json()["trigger"],
+            "watched",
+            "{what}: {}",
+            refused.text()
+        );
+        assert!(
+            refused.json().get("status").is_none() && refused.json().get("cancelling").is_none(),
+            "{what}: a refused cancel answers nothing about the execution: {}",
+            refused.text()
+        );
+        let still = report(&events_bearer());
+        assert_eq!(
+            still["status"], "interrupted",
+            "{what}: a refused cancel stopped the execution: {still:#}"
+        );
+        assert!(
+            still["interrupts"]
+                .as_array()
+                .is_some_and(|open| !open.is_empty()),
+            "{what}: a refused cancel released the pause: {still:#}"
+        );
+    }
+
+    let accepted = app
+        .send(Request::post(&cancel).header("authorization", events_bearer()))
+        .expect("the cancel route answers");
+    assert_eq!(accepted.status, 202, "{}", accepted.text());
+    let cancelled = harness::until(Duration::from_secs(30), || {
+        let held = report(&events_bearer());
+        (held["status"] == "cancelled").then_some(held)
+    });
+    assert!(cancelled.get("error").is_none(), "{cancelled:#}");
+
+    let opened = app
+        .post_json("/open", &json!({ "topic": "open cancel" }))
+        .expect("the trigger's route answers");
+    assert_eq!(opened.status, 202, "{}", opened.text());
+    let open = opened.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+    let parked = harness::settled(&app, &open);
+    assert_eq!(parked["status"], "interrupted", "{parked}");
+    let taken = app
+        .send(Request::post(format!("/executions/{open}/cancel")))
+        .expect("the cancel route answers");
+    assert_eq!(
+        taken.status,
+        202,
+        "an execution a no-auth trigger began keeps an open cancel route: {}",
         taken.text()
     );
 }
