@@ -1929,17 +1929,61 @@ mod tests {
     }
 
     /// A `batch` is a `kv` op and a write — one effect carrying the node's
-    /// one idempotency key — whose row is `ops:` alone (PRD resolved q71).
+    /// one idempotency key — whose row is `ops:` and, beside it, the authored
+    /// key that replaces the derived one (PRD resolved q71, q73).
     #[test]
-    fn a_batch_is_a_kv_write_that_takes_ops_alone() {
+    fn a_batch_is_a_kv_write_that_takes_ops_and_an_authored_key() {
         assert!(kind_takes(StoreKind::Kv, StoreOp::Batch));
         assert!(!kind_takes(StoreKind::Vector, StoreOp::Batch));
         assert!(!kind_takes(StoreKind::Blob, StoreOp::Batch));
         assert!(StoreOp::Batch.writes());
         assert_eq!(StoreOp::Batch.required_parameters(), &["ops"]);
-        assert_eq!(StoreOp::Batch.optional_parameters(), &[] as &[&str]);
+        assert_eq!(StoreOp::Batch.optional_parameters(), &["idempotency_key"]);
         assert_eq!(StoreOp::Batch.as_str(), "batch");
         assert!(StoreOp::ALL.contains(&StoreOp::Batch));
+    }
+
+    /// `idempotency_key:` is in exactly the rows of the six `kv` writes — `set`,
+    /// `delete`, `merge`, `append`, `incr` and `batch` — and in no read's, nor
+    /// in a `vector` `upsert`'s or a `blob` `put`'s (PRD resolved q73). The
+    /// row is what the parser refuses a parameter outside of, so this is the
+    /// whole of the rule but the `delete` of another kind, which only the
+    /// store answers.
+    #[test]
+    fn an_authored_key_is_in_exactly_the_six_kv_write_rows() {
+        let carrying: Vec<StoreOp> = StoreOp::ALL
+            .iter()
+            .copied()
+            .filter(|op| op.optional_parameters().contains(&"idempotency_key"))
+            .collect();
+        assert_eq!(
+            carrying,
+            [
+                StoreOp::Set,
+                StoreOp::Delete,
+                StoreOp::Merge,
+                StoreOp::Append,
+                StoreOp::Incr,
+                StoreOp::Batch
+            ]
+        );
+        for op in carrying {
+            assert!(
+                op.writes(),
+                "`{}` carries a key and is a write",
+                op.as_str()
+            );
+            assert!(
+                kind_takes(StoreKind::Kv, op),
+                "`{}` is a `kv` op",
+                op.as_str()
+            );
+            assert!(
+                !op.required_parameters().contains(&"idempotency_key"),
+                "`{}` requires no authored key",
+                op.as_str()
+            );
+        }
     }
 
     /// A `batch`'s derived row: `applied`, `deduped`, one `{ key, version }`

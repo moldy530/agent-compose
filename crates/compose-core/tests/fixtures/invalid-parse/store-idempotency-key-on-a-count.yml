@@ -1,0 +1,16 @@
+# rule: `idempotency_key:` replaces a `kv` write's derived ledger key, and a `count` reads — it has no write for a key to dedupe (grammar 11.4, PRD resolved q73)
+# code: invalid-value
+# message: `idempotency_key` is not a parameter of the `count` op
+# at: 13:7
+# help: `count` takes `prefix`; `idempotency_key:` is the business key a `kv` write dedupes on in place of the derived one, and only `set`, `delete`, `merge`, `append`, `incr`, `batch` take one — a `count` reads, and has no write for a key to dedupe (grammar 11.4, PRD resolved q73)
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    step:
+      store: store.memory
+      op: count
+      idempotency_key: "execution.id"
+  edges:
+    - { from: start, to: step }
+    - { from: step, to: end }

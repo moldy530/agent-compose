@@ -1,0 +1,25 @@
+# rule: an authored key is a business key two executions share, and an execution-scoped store's partition is one execution's and dies with its run (grammar 11.3, 11.4, PRD resolved q73)
+# code: invalid-value
+# message: node `record` gives its write to `store.scratch` an `idempotency_key`, and `store.scratch` is `scope: execution`: its partition is one execution's and dies with the run, so no second execution ever writes under the key
+# at: main.yml:22:24
+# help: an authored key dedupes the executions that write one store under one business key, and the retries of this execution's own write are already deduped by the key grammar 9.4 derives: drop `idempotency_key:`, or declare the store `scope: session` or `scope: global` (grammar 11.3, 11.4, PRD resolved q73)
+version: "0.1"
+store.scratch:
+  kind: kv
+  scope: execution
+  value_schema:
+    seen: { type: integer }
+flow.f:
+  inputs:
+    event_id: { type: string }
+  outputs: {}
+  nodes:
+    record:
+      store: store.scratch
+      op: set
+      key: "'event'"
+      value: { seen: "1" }
+      idempotency_key: "input.event_id"
+  edges:
+    - { from: start, to: record }
+    - { from: record, to: end }

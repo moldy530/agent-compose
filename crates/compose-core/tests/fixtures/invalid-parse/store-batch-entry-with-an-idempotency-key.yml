@@ -1,0 +1,17 @@
+# rule: a `batch` is one write under one key, so its `idempotency_key:` is the node's and no entry's (grammar 11.4, PRD resolved q71, q73)
+# code: invalid-value
+# message: `idempotency_key` is not a key of a batch entry: `ops[0]` of node `step` is one entry of a write that dedupes as a whole
+# at: 14:39
+# help: a batch is one write, answered by one ledger row, so the key it dedupes on is the node's: write `idempotency_key:` beside `ops:` (grammar 11.4, PRD resolved q71, q73)
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    step:
+      store: store.memory
+      op: batch
+      ops:
+        - { op: delete, key: "'old'", idempotency_key: "'move'" }
+  edges:
+    - { from: start, to: step }
+    - { from: step, to: end }

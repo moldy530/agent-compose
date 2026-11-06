@@ -931,6 +931,13 @@ const CODEGEN: &[Criterion] = &[
                 "a_map_of_batches_lands_every_instances_entries",
                 Status::Live,
             ),
+            // PRD resolved q73: a write under an authored ledger key, run twice
+            // with one business event — two executions — lands once, and the
+            // second routes on `deduped` with the first's whole answer.
+            (
+                "a_webhook_run_twice_with_one_business_key_writes_once_and_routes_on_deduped",
+                Status::Live,
+            ),
             // …and a batch's `set` entry is held to exactly what a single `set`
             // is: q68's schema check, CEL typing at `validate` and no run-time
             // Zod for a node, so one value lands by either.
@@ -1442,6 +1449,13 @@ const DURABILITY: &[Criterion] = &[
             // first generation's did and applies none of it again.
             (
                 "a_resumed_run_answers_a_batch_out_of_the_record_and_applies_none_of_it_again",
+                Status::Live,
+            ),
+            // …and PRD resolved q73's authored key: a resumed write under one is
+            // answered out of the record, though a second execution has since
+            // been answered as its duplicate by the ledger.
+            (
+                "a_resumed_run_answers_a_write_under_an_authored_key_out_of_the_record",
                 Status::Live,
             ),
         ],

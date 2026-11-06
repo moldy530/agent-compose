@@ -840,7 +840,27 @@ function entryEvents(state: Emission, entry: TraceEntry): readonly OtlpEvent[] {
   return events;
 }
 
-/** One store op's attributes. The answer it read is **not** among them. */
+/**
+ * The first segment of an authored store ledger key, `author/<store>/<key>`
+ * (PRD resolved q73) — `runtime.AUTHORED_LEDGER_NAMESPACE` and a separator,
+ * spelled here because this module imports no value from any other.
+ *
+ * No execution id begins with it (`runtime.reservedExecutionId`), so it is how
+ * a store record's key is told from an instance path, which every other
+ * `idempotencyKey` is (`docs/trace.md` §8).
+ */
+const AUTHORED_KEY_PREFIX = "author/";
+
+/**
+ * One store op's attributes. The answer it read is **not** among them.
+ *
+ * A derived key is §8's instance path and is reported as one,
+ * `agentcompose.instance_path`. An authored key names no instance, so it is
+ * reported under an attribute of its own, `agentcompose.store.idempotency_key`,
+ * and the store event carries no instance path at all — a collector joining
+ * spans on `agentcompose.instance_path` meets only paths (PRD resolved q73,
+ * `docs/trace.md` §12.5).
+ */
 function storeAttributes(record: StoreRecord): readonly OtlpAttribute[] {
   return [
     text("agentcompose.store", record.store),
@@ -855,7 +875,9 @@ function storeAttributes(record: StoreRecord): readonly OtlpAttribute[] {
     ...(record.version === undefined ? [] : [integer("agentcompose.store.version", record.version)]),
     ...(record.idempotencyKey === undefined
       ? []
-      : [text("agentcompose.instance_path", record.idempotencyKey)]),
+      : record.idempotencyKey.startsWith(AUTHORED_KEY_PREFIX)
+        ? [text("agentcompose.store.idempotency_key", record.idempotencyKey)]
+        : [text("agentcompose.instance_path", record.idempotencyKey)]),
     ...(record.deduped === undefined
       ? []
       : [{ key: "agentcompose.store.deduped", value: { boolValue: record.deduped } }]),

@@ -1,0 +1,17 @@
+# rule: `idempotency_key:` replaces a `kv` write's derived ledger key, and a `get_many` reads — it has no write for a key to dedupe (grammar 11.4, PRD resolved q73)
+# code: invalid-value
+# message: `idempotency_key` is not a parameter of the `get_many` op
+# at: 14:7
+# help: `get_many` takes `keys`; `idempotency_key:` is the business key a `kv` write dedupes on in place of the derived one, and only `set`, `delete`, `merge`, `append`, `incr`, `batch` take one — a `get_many` reads, and has no write for a key to dedupe (grammar 11.4, PRD resolved q73)
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    step:
+      store: store.memory
+      op: get_many
+      keys: "['a', 'b']"
+      idempotency_key: "execution.id"
+  edges:
+    - { from: start, to: step }
+    - { from: step, to: end }

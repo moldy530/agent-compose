@@ -92,6 +92,11 @@
 #     generations: a resumed generation answers the batch out of the record and
 #     applies none of it again, so the entry stays where the world left it
 #     (PRD resolved q71, q29).
+#   * `flow.recorded` — a write under an **authored** idempotency key ahead of a
+#     model call, with a second execution of the same business event between
+#     the generations: the ledger answers that one as a duplicate, while the
+#     resumed generation answers its own write out of the record, `deduped:
+#     false` as its first generation was answered (PRD resolved q73, q29).
 #   * `flow.fanned` — a **detached** `map` whose sink calls a *model*, which
 #     `flow.parceled`'s subprocess sink cannot decide. A delivery runs with the
 #     node execution's collectors detached (Decision D94), so its record holds
@@ -156,6 +161,10 @@ state:
     description: Whether `flow.moved`'s batch answered `applied`.
     type: boolean
     default: false
+  recorded_duplicate:
+    description: Whether `flow.recorded`'s write under its business key was answered as one that had already landed.
+    type: boolean
+    default: true
   open_count:
     description: How many entries `flow.peeked` found under the topic's `open/` key.
     type: integer
@@ -1107,6 +1116,38 @@ flow.moved:
   edges:
     - { from: start, to: shift }
     - { from: shift, to: ask }
+    - { from: ask, to: end }
+
+flow.recorded:
+  description: Record one event under its business key, then call a model.
+  inputs:
+    event_id:
+      type: string
+      min_length: 1
+  outputs:
+    recorded_duplicate:
+      type: boolean
+    note:
+      type: string
+  nodes:
+    record:
+      store: store.ledger
+      op: set
+      key: "'event/' + input.event_id"
+      value:
+        entry: "input.event_id"
+      idempotency_key: "input.event_id"
+      writes:
+        deduped: recorded_duplicate
+    ask:
+      agent: agent.noter
+      input:
+        topic: "input.event_id"
+      writes:
+        note: note
+  edges:
+    - { from: start, to: record }
+    - { from: record, to: ask }
     - { from: ask, to: end }
 
 flow.peeked:

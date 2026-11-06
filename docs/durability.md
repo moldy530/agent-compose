@@ -680,7 +680,18 @@ the live store" — stops describing the trace and becomes the mechanism:
   filed.
 
 The request identity is the store's address, the op, the scope and the partition
-it addressed, which surface ran it, and the op's evaluated parameters.
+it addressed, which surface ran it, and the op's evaluated parameters — an
+authored `idempotency_key:`'s string among them, where the node writes one (PRD
+resolved q73).
+
+A write whose node authored its key is no exception to either bullet. Its
+ledger key is `author/<store>/<key>` rather than the execution id and the
+instance path (`docs/grammar.md` §9.4, §11.4), and a **second execution** writing
+the same business key is answered by the store's ledger with the first
+execution's row — but a **resumed** generation of either is answered by its own
+journal, as every replayed write is, and reaches no store: what it reports is
+what its first generation was answered, `deduped` included, whatever the ledger
+holds now.
 
 ### 3.4 A human wait
 

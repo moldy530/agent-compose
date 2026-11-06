@@ -787,6 +787,7 @@ const STORE_PARAMS: &[&str] = &[
     "include_values",
     "keys",
     "ops",
+    "idempotency_key",
 ];
 
 /// The `kv` writes that take a `ttl:` (grammar 11.4, PRD resolved q69), named
@@ -812,6 +813,36 @@ fn ttl_help(op: StoreOp) -> String {
     format!(
         "; `ttl:` is how long a `kv` write's key lives, and only {} take one — {why} (grammar 11.4, PRD resolved q69)",
         list(TTL_OPS)
+    )
+}
+
+/// The `kv` writes that take an `idempotency_key:` (grammar 11.4, PRD resolved
+/// q73), named in the help one anywhere else draws.
+const IDEMPOTENCY_KEY_OPS: &[&str] = &["set", "delete", "merge", "append", "incr", "batch"];
+
+/// What an `idempotency_key:` outside its row is told beside the row it is
+/// outside of.
+///
+/// `ttl:`'s shape, for the same kind of reason: the parameter replaces the key
+/// grammar 9.4 derives for a `kv` write, so its absence from a row is a fact
+/// about the op — a read carries no key to replace, and a `vector` `upsert` or a
+/// `blob` `put` keeps the derived one, which the ruling leaves as it is.
+fn idempotency_key_help(op: StoreOp) -> String {
+    let why = match op {
+        StoreOp::Upsert => {
+            "an `upsert` writes a `vector` store, whose writes dedupe on the key grammar 9.4 derives".to_string()
+        }
+        StoreOp::Put => {
+            "a `put` writes a `blob` store, whose writes dedupe on the key grammar 9.4 derives".to_string()
+        }
+        _ => format!(
+            "a `{}` reads, and has no write for a key to dedupe",
+            op.as_str()
+        ),
+    };
+    format!(
+        "; `idempotency_key:` is the business key a `kv` write dedupes on in place of the derived one, and only {} take one — {why} (grammar 11.4, PRD resolved q73)",
+        list(IDEMPOTENCY_KEY_OPS)
     )
 }
 
@@ -884,22 +915,24 @@ fn store_params(
             .with_help(if op.value == StoreOp::Batch {
                 // Every parameter a write takes is an entry's on a `batch`, so
                 // the one that was written at the node is named where it goes.
+                // The one that is the node's — the key the whole batch dedupes
+                // on — is named beside `ops` (PRD resolved q73).
                 if BATCH_ENTRY_KEYS.contains(name) {
                     format!(
-                        "`batch` takes `ops` alone: each entry carries its own `key`, `value`, `if`, `if_version` and `ttl`, so write `{name}:` inside the entries it belongs to (grammar 11.4, PRD resolved q71)"
+                        "`batch` takes `ops` and `idempotency_key`: each entry carries its own `key`, `value`, `if`, `if_version` and `ttl`, so write `{name}:` inside the entries it belongs to (grammar 11.4, PRD resolved q71)"
                     )
                 } else {
-                    "`batch` takes `ops` alone, a list of `set` and `delete` entries (grammar 11.4, PRD resolved q71)".to_string()
+                    "`batch` takes `ops`, a list of `set` and `delete` entries, and `idempotency_key` (grammar 11.4, PRD resolved q71, q73)".to_string()
                 }
             } else {
                 format!(
                     "`{}` takes {}{}",
                     op.value.as_str(),
                     list(&legal),
-                    if *name == "ttl" {
-                        ttl_help(op.value)
-                    } else {
-                        String::new()
+                    match *name {
+                        "ttl" => ttl_help(op.value),
+                        "idempotency_key" => idempotency_key_help(op.value),
+                        _ => String::new(),
                     }
                 )
             }),
@@ -999,6 +1032,13 @@ fn store_params(
     // entry of each op may carry, and what its expressions hold, is the
     // validator's — exactly where a single `set` or `delete` has it decided.
     params.ops = store_param(fields, &legal, "ops").and_then(|node| batch_ops(node, subject, cx));
+
+    // PRD resolved q73's business key: an expression like `key:`, over the
+    // same scope, so a retry re-derives the same string and a replay sees the
+    // same answer. What it must hold — a string — is the validator's, as every
+    // other expression's type is.
+    params.idempotency_key = store_param(fields, &legal, "idempotency_key")
+        .and_then(|node| lexical::cel(node, "`idempotency_key`", cx));
 
     // One condition per write. Both are legal in the row, so the row's own
     // check above admits them; together they would be two answers to one
@@ -1115,6 +1155,23 @@ fn batch_entry(mut fields: Fields<'_>, subject: &str, cx: &mut Cx) -> BatchEntry
             None
         }
     };
+
+    // A batch is **one** write under one key (PRD resolved q71), so the key it
+    // dedupes on is the node's and no entry's: one written inside an entry is
+    // named where it goes rather than left to the unknown-key report (PRD
+    // resolved q73).
+    if let Some(entry) = fields.take_entry("idempotency_key") {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidValue,
+                entry.key.span.clone(),
+                format!("`idempotency_key` is not a key of a batch entry: {subject} is one entry of a write that dedupes as a whole"),
+            )
+            .with_help(
+                "a batch is one write, answered by one ledger row, so the key it dedupes on is the node's: write `idempotency_key:` beside `ops:` (grammar 11.4, PRD resolved q71, q73)",
+            ),
+        );
+    }
 
     // The keys a `delete` entry does not take, each refused with the reason
     // the single `delete` row gives it.

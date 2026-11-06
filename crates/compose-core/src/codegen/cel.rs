@@ -398,6 +398,7 @@ fn node_kind<'ir>(kind: &'ir NodeKind, site: &str, found: &mut Vec<Expression<'i
                 (params.if_version.as_ref(), "if_version"),
                 (params.after.as_ref(), "after"),
                 (params.keys.as_ref(), "keys"),
+                (params.idempotency_key.as_ref(), "idempotency_key"),
             ] {
                 if let Some(source) = expression {
                     found.push(Expression {

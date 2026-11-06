@@ -3016,19 +3016,20 @@ load_prefs:
 |---|---|---|---|
 | `store` | `store.*` ref | yes | |
 | `op` | enum | yes | legal set depends on the store's `kind` (§11.4) |
-| `key`, `value`, `query`, `prefix`, `top_k`, `limit`, `filter`, `metadata`, `content_type`, `fields`, `field`, `unique`, `by`, `if`, `if_version`, `ttl`, `after`, `include_values`, `keys`, `ops` | per op | per op | §11.4 |
+| `key`, `value`, `query`, `prefix`, `top_k`, `limit`, `filter`, `metadata`, `content_type`, `fields`, `field`, `unique`, `by`, `if`, `if_version`, `ttl`, `after`, `include_values`, `keys`, `ops`, `idempotency_key` | per op | per op | §11.4 |
 
 A store-op node takes **no `input:` key**: its parameters are exactly the op's
 own row in §11.4, written out in the node, and none of them resolves by name
 from a channel or a flow input (§8.0). The op's output schema is derived from the
 store definition (§11.4) and is written by name like any other node output.
 
-**Which parameters are CEL.** Eleven of the twenty are, eight are literals, and
-the twentieth — a `batch`'s `ops` — is a literal **list** whose entries hold
-both. The eleven are exactly
+**Which parameters are CEL.** Twelve of the twenty-one are, eight are literals,
+and the twenty-first — a `batch`'s `ops` — is a literal **list** whose entries
+hold both. The twelve are exactly
 the row §4.1 scopes to `input`, `state`, and `execution`: `key`, `query`,
-`prefix`, `after`, `by` and `if_version` are one expression each, and so is
-`keys`, whose result is a list of strings; `value` is one expression on a
+`prefix`, `after`, `by`, `if_version` and `idempotency_key` are one expression
+each, and so is `keys`, whose result is a list of strings; `value` is one
+expression on a
 `vector upsert`, a `blob put` and a `kv append` and a field map of expressions on
 a `kv set`; `filter`, `metadata` and `fields` are maps of one expression per
 entry (§11.4). The other eight are **literals**, not expressions: `top_k` and
@@ -3053,9 +3054,18 @@ the list itself is a literal — written out in the node, one to 100 entries, so
 how many entries a batch holds and which op each is are readable without
 running the graph — and each entry is a single `set` or `delete` spelled as
 that op is, its `op`, `if` and `ttl` literals of the eight's kind and its
-`key`, `if_version` and `value` CEL of the eleven's. Its bounds are therefore
+`key`, `if_version` and `value` CEL of the twelve's. Its bounds are therefore
 decidable in one file, and refused at parse and by the published schema alike,
 where a `get_many`'s are the run's.
+
+`idempotency_key` is the one parameter that is about the **ledger** rather than
+the store's data (PRD resolved q73, Decision
+[D157](#d157-a-kv-write-may-name-its-own-ledger-key-and-two-executions-writing-under-it-apply-once)):
+a string expression naming the business key a `kv` write dedupes on in place of
+the key §9.4 derives, on the six `kv` writes and nothing else. It is CEL rather
+than a literal because a business key is the event's — an id a webhook carried,
+a record's own — and it is over the scope every other parameter reads, so a
+retry of the node re-derives the same string.
 
 A store op's result may omit a field. A `get` that misses returns
 `found: false` and **no `value`**, so the `writes: { value: prefs }` above
@@ -3917,8 +3927,11 @@ of the target's declared input schema.
 **Where a key is observable.** Both carriers record theirs in the run's trace —
 a dispatch record's `idempotencyKey` and a store record's — which is the one
 place the flattened instance path of a nested fan-out can be read back at all
-(§4.1's `execution.item_index` exposes only the innermost index). See
-[`docs/trace.md`](trace.md) §8.
+(§4.1's `execution.item_index` exposes only the innermost index). A store
+record whose node wrote `idempotency_key:` (below) carries the authored key
+`author/<store>/<key>` in that field instead, which is no instance path and
+names no instance: a key beginning `author/` is authored, and every other is
+the execution id and a path. See [`docs/trace.md`](trace.md) §8.
 
 ```
 exec_01/a/0/save/0          # store node `save`, in flow.ingest instantiated by node `a`
@@ -3940,17 +3953,41 @@ Two properties follow, and they are the whole point of fixing the form:
   executions of the node within its instance and a re-executed instance starts
   over, so every attempt derives one key. That is what makes delivery
   at-least-once rather than a stream of distinct writes. A store keeps the
-  ledger row that answers a repeated write for exactly as long as an attempt
-  can repeat — until the execution settles, when every row under its
-  `execution.id` prefix is deleted (§11.4, Decision
+  ledger row that answers a repeated write under a derived key for exactly as
+  long as an attempt can repeat — until the execution settles, when every row
+  under its `execution.id` prefix is deleted (§11.4, Decision
   [D153](#d153-a-kv-key-may-expire-and-a-settled-executions-ledger-rows-are-deleted)).
+  A row under an authored key (below) is under no execution's prefix and
+  outlives settlement: it expires with the store's `default_ttl:` when one is
+  declared and is otherwise kept (§11.4, Decision
+  [D157](#d157-a-kv-write-may-name-its-own-ledger-key-and-two-executions-writing-under-it-apply-once)).
 
-The key is derived, never authored: no spec construct sets or overrides it, so
-there is nothing here for `validate` to reject. The rules that *are* checked
-belong to the two carrying constructs — `detach: true` under a checkpointed
-target (§8.6 rule 7) and the map-write keying rule (§11.4). Nor is the key
-writable in CEL: `execution.item_index` exposes only the innermost enclosing
-map's index (§4.1), while a key needs every one of them.
+The key is derived, never authored — with **one exception, on one of the two
+carriers** (PRD resolved q73, Decision
+[D157](#d157-a-kv-write-may-name-its-own-ledger-key-and-two-executions-writing-under-it-apply-once)).
+A store-op node writing a `kv` `set`, `delete`, `merge`, `append`, `incr` or
+`batch` may write `idempotency_key:`, a CEL string over `input`, `state` and
+`execution`, and its write then carries the **authored** key
+`author/<store>/<key>` in place of the derived one — `<store>` the store's
+declared name, `<key>` the string. It is the business key the store's ledger
+dedupes on, so two executions writing one store under it apply once; and it is
+disjoint from every derived key, which begins with an execution id, and no
+execution id is `author` or begins `author/`. Of the two properties above it
+keeps the second — a retry evaluates the same CEL over the same `input`,
+`state` and `execution`, so it re-derives the same string — and gives up the
+first by design: two writes naming one business key are one effect to the
+ledger, which is what the author wrote. §11.4 states its rules — where it is
+legal, what a second write under it is answered, and how long its row lives.
+Every other key is derived, and nothing sets or overrides it: a detached
+dispatch takes no key of its own (PRD open question 80), a write without the
+parameter derives exactly the key above, and a synthesized tool's write carries
+no key at all (§11.5). The rules `validate` checks belong to the two carrying
+constructs — `detach: true` under a checkpointed target (§8.6 rule 7), the
+map-write keying rule and the authored key's placement (§11.4). Nor is a
+derived key writable in CEL: `execution.item_index` exposes only the innermost
+enclosing map's index (§4.1), while a derived key needs every one of them; an
+authored key is the business identity the author already holds, not an
+instance path spelled by hand.
 
 **The instance path has a third reader**, and it is not a key: a
 `workspace: fresh` coder node's directory is named by the frames above, under
@@ -4284,20 +4321,23 @@ is its `metadata_schema` object, which a `vector` store MAY leave undeclared —
 see the `M`-is-absent rule below. `C` is one optional **condition**, `if:` or
 `if_version:` and never both (the conditions rule below). `T` is an optional
 **`ttl`** — a literal §4.4 duration or `never` — on the four writes that leave a
-key holding a value (the expiry rule below).
+key holding a value (the expiry rule below). `K` is an optional
+**`idempotency_key`** — a CEL string, the business key the write dedupes on in
+place of §9.4's derived key — on the six `kv` writes (the authored-key rule
+below).
 
 | kind | `op` | Parameters | Output |
 |---|---|---|---|
 | `kv` | `get` | `key` (CEL string) | `{ value: V (optional), found: boolean, version: integer (optional) }` |
-| `kv` | `set` | `key`, `value` (map field→CEL matching `V`), `C`, `T` | `{ key: string, applied: boolean, version: integer (optional), deduped: boolean }` |
-| `kv` | `delete` | `key`, `if_version` (CEL int, optional) | `{ deleted: boolean, applied: boolean, version: integer (optional), deduped: boolean }` |
+| `kv` | `set` | `key`, `value` (map field→CEL matching `V`), `C`, `T`, `K` | `{ key: string, applied: boolean, version: integer (optional), deduped: boolean }` |
+| `kv` | `delete` | `key`, `if_version` (CEL int, optional), `K` | `{ deleted: boolean, applied: boolean, version: integer (optional), deduped: boolean }` |
 | `kv` | `list` | `prefix` (CEL string, optional), `limit` (integer 1..1000, required), `after` (CEL string, optional — the exclusive cursor), `include_values` (literal boolean, default `false`) | `{ keys: array<string>, next: string (optional), entries: array<{ key: string, value: V, version: integer }> }` — `entries` present exactly when `include_values: true` |
-| `kv` | `merge` | `key`, `fields` (map field→CEL, each a field of `V`), `C`, `T` | `{ key: string, applied: boolean, version: integer (optional), value: V (optional), deduped: boolean }` |
-| `kv` | `append` | `key`, `field` (an array field of `V`, literal), `value` (CEL, one item of it), `unique` (literal boolean, default `false`), `C`, `T` | as `merge` |
-| `kv` | `incr` | `key`, `field` (an `integer` or `number` field of `V`, literal), `by` (CEL number of the field's type, default `1`), `C`, `T` | as `merge` |
+| `kv` | `merge` | `key`, `fields` (map field→CEL, each a field of `V`), `C`, `T`, `K` | `{ key: string, applied: boolean, version: integer (optional), value: V (optional), deduped: boolean }` |
+| `kv` | `append` | `key`, `field` (an array field of `V`, literal), `value` (CEL, one item of it), `unique` (literal boolean, default `false`), `C`, `T`, `K` | as `merge` |
+| `kv` | `incr` | `key`, `field` (an `integer` or `number` field of `V`, literal), `by` (CEL number of the field's type, default `1`), `C`, `T`, `K` | as `merge` |
 | `kv` | `count` | `prefix` (CEL string, optional) | `{ count: integer }` |
 | `kv` | `get_many` | `keys` (CEL list of string, at most 1000) | `{ entries: array<{ key: string, value: V (optional), found: boolean, version: integer (optional) }> }` — one per key asked, in the order asked |
-| `kv` | `batch` | `ops` (literal list of 1..100 entries, required): each `{ op: set \| delete (literal), key (CEL string), value (map field→CEL matching `V`; `set` only, required there), C, T (`set` only) }` — a `delete` entry's `C` is `if_version` alone | `{ applied: boolean, deduped: boolean, results: array<{ key: string, version: integer (optional) }>, failed: integer (optional) }` — one result per entry, in entry order, `version` absent on a `delete` entry's; `failed` present exactly when `applied` is `false`, and `results` then empty |
+| `kv` | `batch` | `ops` (literal list of 1..100 entries, required): each `{ op: set \| delete (literal), key (CEL string), value (map field→CEL matching `V`; `set` only, required there), C, T (`set` only) }` — a `delete` entry's `C` is `if_version` alone; `K`, the node's and no entry's | `{ applied: boolean, deduped: boolean, results: array<{ key: string, version: integer (optional) }>, failed: integer (optional) }` — one result per entry, in entry order, `version` absent on a `delete` entry's; `failed` present exactly when `applied` is `false`, and `results` then empty |
 | `vector` | `search` | `query` (CEL string), `top_k` (integer 1..100, required), `filter` (map metadata-field→CEL, optional) | `{ matches: array<{ id: string, score: number, text: string, metadata: M }> }` |
 | `vector` | `upsert` | `key`, `value` (CEL string — the text), `metadata` (map field→CEL, optional) | `{ id: string }` |
 | `vector` | `delete` | `key` | `{ deleted: boolean }` |
@@ -4410,8 +4450,60 @@ Rules (PRD 5.8):
   the same key, the same attempt — is answered with its first attempt's
   `applied` and `version` (a batch's `results` and `failed`) and
   `deduped: true`, and a retried successful claim never fails against its own
-  first write. A synthesized tool's write carries no key (§9.4), so its
-  `deduped` is always `false`.
+  first write. Under an authored key (below) the write that first took the key
+  may be **another execution's**, and its answer is the one handed back the
+  same way — which is how a graph learns that a business event already landed.
+  A synthesized tool's write carries no key (§9.4), so its `deduped` is always
+  `false`.
+- **An authored ledger key** (PRD resolved q73, Decision
+  [D157](#d157-a-kv-write-may-name-its-own-ledger-key-and-two-executions-writing-under-it-apply-once)).
+  `idempotency_key:` on a `kv` `set`, `delete`, `merge`, `append`, `incr` or
+  `batch` is a CEL string over `input`, `state` and `execution` that
+  **replaces** the derived §9.4 key in the store's ledger, so a retry
+  re-derives the same string and a replay sees the same answer. It is the
+  **business** key a write dedupes on: two executions writing one store under
+  one key apply once, and the second writes nothing and is answered with the
+  first's whole answer — its `applied`, its `version`, a batch's `results` —
+  and `deduped: true`.
+
+  - **The namespace.** The ledger holds it as `author/<store>/<key>` —
+    `<store>` the store's declared name, `<key>` the string — disjoint from
+    every derived key, which begins with an execution id, and no execution id
+    is `author` or begins `author/`. A derived and an authored key never
+    collide, whatever the author's string holds.
+  - **Per store, not per partition.** The namespace names the store, so one
+    business key on two stores is two writes; and every partition of one store
+    shares it, so two sessions of a `scope: session` store writing one key are
+    one write — the second session is answered with the first's row and its
+    own partition is not written. A `scope: execution` store's partition is one
+    execution's and dies with the run, so no second execution can ever write
+    under the key: an authored key there is a compile error naming the store.
+  - **One key, one answer.** The answer a key is handed back is its first
+    write's, in that write's op's shape, and a second node naming the same key
+    is answered with it, `deduped: true`, wherever it holds every field the
+    second node's own output declares: the same op; any two of `merge`,
+    `append` and `incr`, whose rows are one shape; and a `set` after a partial
+    update, answered without the `value`. Any other pair — a partial update
+    after a `set`, whose row has no `value`, or a `delete` or a `batch` beside
+    another op — fails naming both rather than taking an answer its own output
+    does not describe.
+  - **Retention follows the store.** An authored row is under no execution's
+    prefix, so the settlement prune (below) never removes it. It **expires
+    with the store's `default_ttl:`** when the store declares one — the
+    store's, not the write's own `ttl:` — after which it answers nothing, and
+    the next write under the key applies as a first write does and takes its
+    place; it leaves storage inside the sweeps an expired key does (a write
+    under an authored key removes at most 100 of the store's expired ledger
+    rows, and the next process start the rest). On a store with no
+    `default_ttl:` it is **kept**, for good.
+  - **What it does not change.** A write without the parameter derives exactly
+    the key it did. The parameter is a node's: a synthesized tool's write
+    carries no key at all (§11.5), and the operator's command line none either.
+    It adds no field to any output row (Decision
+    [D34](#d34-the-store-op-catalog-is-normative-including-derived-output-schemas)).
+    A `vector` `upsert` or `delete` and a `blob` `put` or `delete` keep the
+    derived key: the parameter outside the six rows is refused, at parse for an
+    op whose row lacks it and against the store for a `delete` of another kind.
 - **A batch** (PRD resolved q71, Decision
   [D156](#d156-a-kv-batch-is-one-write-of-many-keys-and-its-list-is-a-literal)).
   A `batch` applies its `ops:` — a literal list of one to 100 `set` and
@@ -4591,7 +4683,10 @@ Rules (PRD 5.8):
   many entries it holds — are at-least-once carrying the idempotency key of §9.4 —
   the execution id plus the store node's flattened instance path, which is what
   keeps two instantiations of one flow, and the repeating item indexes of nested
-  maps, from deriving one key for two different writes.
+  maps, from deriving one key for two different writes — or, on a `kv` write
+  whose node writes `idempotency_key:`, the authored key `author/<store>/<key>`
+  in its place (the authored-key rule above, PRD resolved q73), which two
+  executions writing one business event share.
 - **The ledger a settled execution leaves is deleted.** A keyed write's ledger
   row is what answers a retry of its effect site, and an execution retries only
   while its journal row is open; every §9.4 key begins `<execution.id>/`, and a
@@ -4610,7 +4705,12 @@ Rules (PRD 5.8):
   `run` or `resume` as it exits, a `serve` when it is stopped), starting then a
   prune still waiting on deliveries the exit cuts off, whose keyed writes are
   refused from then on. A prune that fails is said and changes no outcome: the
-  rows answer nothing again.
+  rows answer nothing again. An **authored** key's row is the one ledger row
+  under no execution's prefix — its first segment is `author`, which no
+  execution id is — so no prune reaches it, and its retention is its store's
+  (the authored-key rule above): it expires with the store's `default_ttl:`
+  and is otherwise kept. A keyed write under one is not refused on a command's
+  way out either, since no prune has taken its row.
 - A store **write** performed inside a `map`-dispatched instance — `kv set`,
   `kv delete`, `kv merge`, `kv append`, `kv incr`, `kv batch`, `vector upsert`,
   `vector delete`, `blob put`, `blob delete` — MUST be one of two forms (PRD 5.8,
@@ -4624,7 +4724,12 @@ Rules (PRD 5.8):
      expression, including one constant across instances.
 
   Anything else — a `vector` or `blob` write whose key is not item-derived — is a
-  compile error naming the node and the store.
+  compile error naming the node and the store. The rule reads on `key:`, never
+  on `idempotency_key:`: an authored ledger key inside a `map` is form 2's like
+  any other `kv` write's, and one that is the **same** for every item dedupes
+  the items against each other — one lands and the rest are answered with its
+  row — which is what the author wrote (PRD resolved q73, Decision
+  [D157](#d157-a-kv-write-may-name-its-own-ledger-key-and-two-executions-writing-under-it-apply-once)).
 
   **Item-derivation.** A store node lives inside a `flow.*`, so it is inside a
   fan-out exactly when that flow is a `map` dispatch target, directly or through
@@ -4725,6 +4830,12 @@ calls — PRD 5.8):
 `<name>` is the store's local name (`store.user_prefs` → `user_prefs_get`). A
 synthesized tool name that collides with an attached `tool.*`/`flow.*` tool name
 is a compile error.
+
+No synthesized write carries an idempotency key — neither §9.4's derived one
+nor an authored one (§11.4, PRD resolved q73) — because a tool call's outcome
+goes straight back to the model that asked for it, which is what a key stands
+in for. `idempotency_key:` is a store-op node's alone, and no tool argument
+spells it.
 
 No row names a `batch`, and no level grants one (PRD resolved q71): a batch is
 a store-op node's alone. Its list is a literal the author writes down — which
@@ -8131,6 +8242,12 @@ on the string a sink sees, in the spirit of
 fixed output names. Every component is reproduced by a replay, because the
 schedule is a pure function of the graph and the recorded outputs (§7.6.4), so
 the key is stable across a resume. *PRD 5.6, 5.8, 5.12.*
+**Amended by** [D157](#d157-a-kv-write-may-name-its-own-ledger-key-and-two-executions-writing-under-it-apply-once) (PRD resolved q73): a store write's node may
+name its own ledger key, `idempotency_key:`, which replaces this derivation for
+that write alone, in a namespace — `author/<store>/<key>` — disjoint from every
+key derived here. The derivation, its rationale and the detached-dispatch
+carrier are unchanged; whether a dispatch may take a key of its own is PRD open
+question 80.
 
 ### D105. A `map` dispatch isolates conversation history per instance
 
@@ -11646,6 +11763,160 @@ unchanged; no other decision is amended.
 
 **Status**: shipped. *PRD 5.8, resolved q29, q63, q68, q69, q71; §8.8, §9.4,
 §11.4, §11.5; amends D152.*
+
+### D157. A `kv` write may name its own ledger key, and two executions writing under it apply once
+
+A store-op node writing a `kv` store — `set`, `delete`, `merge`, `append`,
+`incr` or `batch` — may write `idempotency_key:`, a CEL string over `input`,
+`state` and `execution`. When present it **replaces** the §9.4 derived key in
+the store's idempotency ledger: the ledger holds `author/<store>/<key>`, the
+first write under it applies and its **whole** answer is the row, and every
+later write under it — a retry of the same execution, or a second execution
+entirely — writes nothing and is answered with that row and `deduped: true`.
+It is refused everywhere else: on a read, a `vector` or `blob` write and a
+`scope: execution` store, and inside a `batch` entry, each by name. An
+authored row is never pruned at settlement; it expires with the store's
+`default_ttl:` when one is declared and is otherwise kept. A write without the
+parameter is unchanged (§8.8, §9.4, §11.4, §11.5, PRD resolved q73).
+
+**Rationale**: a derived key is one effect site of one execution, which is what
+at-least-once delivery inside a run needs and nothing more. The duplicate a
+deployment actually meets is a second **execution** — a webhook the sender
+delivered twice, a queue that redelivered — and two executions derive two keys
+for one business event, so both writes land. Two `get`-then-route-then-`set`
+nodes have the race in the middle q68 closed for claims, and q77's intake
+dedupe covers only the case where the duplicate is one trigger's. The ruling's
+answer is to let the author name the identity the derived key cannot see, and
+each clause below is what keeps that one key rather than a second ledger.
+
+**Replaces, not beside.** One write carries one key: the authored one is the
+site's ledger key in place of the derived one, read and claimed in the same
+transaction as the effect by the same code on every arm, so everything D152
+says of the ledger — the whole answer stored, `deduped` the ledger answering, a
+declined write's decline handed back — holds of it unchanged. A batch is one
+write (D156), so its authored key is the node's and no entry's, and an entry
+naming one is refused where the entry is parsed.
+
+**The namespace, and its proof.** `author/<store>/<key>` is disjoint from every
+derived key exactly when no execution id is `author` or begins `author/`, and
+three things rest on it: a derived key never collides with an authored one
+(an author's string may even *be* a derived key, and the two are still two
+rows), a settled execution's prune — the range under `<execution id>/` (D153) —
+never reaches an authored row, and a trace reader tells the two kinds apart by
+the first segment (`docs/trace.md` §8). It is shown rather than assumed, in
+both of the ways open to it. **Every id the runtime mints** is `exec_` and a
+UUID — `agent-compose run`'s, a `serve`'s, `runFlow`'s default — and a child
+execution's is `exec_` and a UUID laid out from a digest (D150), so none is
+`author` and none holds a `/`; a unit test reads every mint site off the
+emitted sources and fails on one it has not read. **The one boundary that
+takes a caller's id** — `runFlow`'s `executionId`, which every execution opens
+its journal row through — refuses one in the namespace by name, and so does
+every store op whatever called it, so a library caller cannot write a derived
+key the ledger would mistake for an authored one; the store contract drives
+both refusals on every arm.
+
+**What `<store>` is.** The store's declared name — its address without
+`store.`, the binding's `name`, which a dialled ledger's `store` column holds
+and a store file is named after — and one rule on every arm. Every ledger is
+already one store's, so the segment changes no row's identity; it is there
+because the namespace is the ruling's and because a trace record's key is read
+whole: two stores' authored keys are two strings wherever they appear.
+
+**Per store, not per partition.** The ledger has no partition in its key on any
+arm — a store file's `applied`, a dialled store's `(store, idempotency_key)` —
+and the namespace names the store and nothing narrower, so two sessions of one
+`scope: session` store writing one authored key are one write: the second is
+answered with the first's row and its own partition is not written. On a
+dialled store the two writers hold two partitions' sequence locks, so a write
+under an authored key takes one lock more — the store's **authored lock**, a
+`store_sequences` row named `author`, which no partition is — after its
+partition's and before it reads the ledger; the second writer waits there for
+the first's commit and then finds its row. Partition first and the authored
+lock second, on every write, is the order that keeps two writers from waiting
+on each other in a circle, and the ledger half of a store-wide sweep takes the
+authored lock alone. Per store is the ruling's own reading, not an inference
+from it: its namespace, `author/<store>/<key>`, names the store and no
+partition, and its headline is that two executions writing one store under one
+business key apply once — two sessions are two executions.
+
+**Not on an execution-scoped store.** A `scope: execution` partition is one
+execution's and dies with the run (§11.3), so no second execution can ever
+write under an authored key there — and the arms could not even agree what one
+would mean: the local arm's partition is an in-memory database per execution,
+whose ledger no other execution reaches, while a dialled store's ledger is the
+store's, so two overlapping executions would dedupe against each other there
+and not here. The retries of an execution's own write are deduped by the
+derived key already. So the pair is a compile error naming the store, and the
+runtime refuses it for a caller that is not the compiler. **That refusal is
+this implementation's, not the ruling's**: the ruling's list of legal ops names
+no scope, and execution scope is a case it does not address. The refusal is
+the narrower reading — a later ruling can lift it without breaking any
+composition that validates today, where shipping either meaning above would
+bind the owner to it — and it stands only until the owner rules on the case;
+nothing in the PRD records that ruling yet.
+
+**One key, one answer.** The row an authored key is answered with is its first
+write's answer, whose shape is that write's op's (D34): a `set`'s is `key`,
+`applied`, `version`; a partial update's adds `value`, and `merge`, `append`
+and `incr` share that one shape; a `delete`'s has `deleted` and no `key`; a
+batch's is `results`. Two nodes may name one key — that is the parameter's
+point — and the ruling's answer to the second is `deduped: true`, which this
+honours wherever the first's row can be the second's answer: the same op; any
+two of the partial updates, answered whole; and a `set` after a partial
+update, answered with the row less its `value`, a field the `set`'s output
+does not declare. Every other pair has no answer in the second write's shape —
+a partial update after a `set` would answer `applied: true` with no `value`,
+which its output promises exactly then, and a `delete` or a `batch` beside any
+other op lacks or adds whole fields — and handing one over would surface as an
+absent field somewhere downstream, so the second write fails instead, naming
+both ops. **That residue is also this implementation's, not the ruling's**: the
+ruling does not say what a second write of another shape is answered, D34
+leaves no answer to give it, and it stands until the owner rules on it. A
+derived key is one effect site, whose op never changes, and keeps its answer
+as it was.
+
+**Retention follows the store.** A derived row lives exactly as long as its
+execution can retry (D153). An authored row has no execution to wait for, so the
+ruling gives it the store's own notion of how long anything lives: it expires
+with `default_ttl:` — the store's, never the write's own `ttl:`, because the row
+is the business key's and not the value's — and on a store that declares none
+it is kept. That is the trade, stated in `docs/topics/stores.md`: a store with
+no default grows its ledger by one row per business key, for ever, and that is
+what makes an event land once however late its duplicate arrives. The ledger
+tables gain a nullable `expires_at`, `NULL` on every derived row and on every
+row an earlier release claimed, brought forward on open by the migration
+pattern q68's `version` column used — probed rather than attempted, so an open
+of an upgraded store takes no exclusive lock. An expired row answers nothing,
+by the one inequality every expiry is read through, so the next write under the
+key applies as a first write does and replaces it; expired rows leave storage
+inside the two sweeps an expired key does (D153) — a write under an authored
+key removes at most 100 of its store's, the next process start the rest.
+
+**`map`, replay and the trace.** D67's rule reads on `key:` and is unchanged: an
+authored key inside a `map` is form 2's, and one that is the same for every
+item dedupes the items against each other — one lands, the rest are answered
+with its row — which is what the author wrote. A resumed generation answers a
+recorded write out of the journal exactly as before, reaching no store. The
+trace record carries the key as the write carried it, `author/<store>/<key>`,
+in the field the derived key always filled; `trace_version` stays 6, because no
+record a version-6 reader has met changes — every write without the parameter
+derives what it did — and the new value appears only on nodes that could not
+exist before (`docs/trace.md` §10.2). The OTLP mapping reports it under
+`agentcompose.store.idempotency_key` rather than as an instance path, which it
+is not (§12.5).
+
+**What it amends, what it builds on, and what it does not touch.** It amends
+D104 and §9.4, whose "no spec construct sets or overrides" the key now has one
+exception, on one of the two carriers — D104 carries the note. It builds on
+D152's ledger (the whole answer, `deduped`), D153's prune prefix, `default_ttl:`
+and sweeps, and D156's one-write batch, each unchanged. The detached-dispatch
+carrier is untouched (PRD open question 80), and so are q19's positional reuse
+of flow-tool frames, the reads, `vector` and `blob` writes, the agent tool
+surface — a synthesized write carries no key of either kind (§11.5) — and the
+operator's command line (D155), whose writes carry none.
+
+**Status**: shipped. *PRD 5.8, resolved q29, q63, q68, q69, q71, q73; §8.8,
+§9.4, §11.4, §11.5; amends D104.*
 
 ## Appendix B — Editor integration
 

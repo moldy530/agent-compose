@@ -1,0 +1,26 @@
+# rule: `idempotency_key:` replaces a `kv` write's derived key, and the store decides the kind — a `delete` on a `vector` store dedupes on the key grammar 9.4 derives (grammar 11.4, PRD resolved q73)
+# code: invalid-value
+# message: `idempotency_key` is not a parameter of a `vector` `delete`: an authored key replaces the derived key of a `kv` write, and `store.docs` is `kind: vector`
+# at: main.yml:23:24
+# help: a `vector` or `blob` write dedupes on the key grammar 9.4 derives, and only a `kv` store's writes take one of their own: drop `idempotency_key:`, or keep the record in a `kv` store (grammar 11.4, PRD resolved q73)
+version: "0.1"
+provider.local:
+  kind: openai_compatible
+  base_url: ${U}
+store.docs:
+  kind: vector
+  scope: global
+  embed:
+    model: text-embedding-3-small
+    provider: provider.local
+flow.f:
+  outputs: {}
+  nodes:
+    forget:
+      store: store.docs
+      op: delete
+      key: "'doc-1'"
+      idempotency_key: "'forget/doc-1'"
+  edges:
+    - { from: start, to: forget }
+    - { from: forget, to: end }

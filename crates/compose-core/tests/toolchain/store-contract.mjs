@@ -4073,6 +4073,7 @@ const gate = () => {
   const { open: firstLanded, opened: landed } = gate();
   const attempts = [];
   let refused;
+  let authoredAfterCut;
   const bump = () => write(store, "incr", { key: "delivered", field: "count" }, ctx(id), `${id}/fan/0#agent/0/count/0`);
   try {
     await begin_(id);
@@ -4084,6 +4085,20 @@ const gate = () => {
         attempts.push(await bump());
       } catch (error) {
         refused = String(error?.message ?? error);
+      }
+      // …while a write under an **authored** key is made: its row is no
+      // execution's, so no prune removed it, and the ledger still answers it
+      // (PRD resolved q73).
+      try {
+        authoredAfterCut = await write(
+          store,
+          "incr",
+          { key: "authored", field: "count" },
+          ctx(id),
+          stores.authoredKey(store.name, "cut-off"),
+        );
+      } catch (error) {
+        authoredAfterCut = String(error?.message ?? error);
       }
       return { output: {} };
     });
@@ -4102,7 +4117,11 @@ const gate = () => {
       attempts.length === 1 &&
       (refused ?? "").includes("has already deleted its idempotency ledger") &&
       held.value?.count === 1;
-    answer.ledger_cut_off_trace = { during, released, attempts, refused, held };
+    answer.a_delivery_cut_off_by_its_command_still_makes_an_authored_write =
+      authoredAfterCut?.applied === true &&
+      authoredAfterCut?.deduped === false &&
+      (await get(store, "authored", ctx(execution("ledger_cut_off_read")))).value?.count === 1;
+    answer.ledger_cut_off_trace = { during, released, attempts, refused, held, authoredAfterCut };
   } catch (error) {
     answer.ledger_cut_off_error = String(error?.stack ?? error);
   }
@@ -4229,6 +4248,838 @@ if (provider !== "sqlite") {
     delete process.env[SILENT_URL_ENV];
     for (const socket of sockets) socket.destroy();
     await new Promise((resolve) => listener.close(resolve));
+  }
+}
+
+// --- Authored idempotency keys (PRD resolved q73) -----------------------------
+//
+// A `kv` write's node may name its own ledger key, `idempotency_key:`, and the
+// site then carries `author/<store>/<key>` in place of grammar 9.4's derived
+// one (`stores.authoredKey`, which is what `src/graph.ts` builds the site with).
+// What changes is who can repeat the write: a derived key is one effect site of
+// one execution, and an authored one is one business event of one store — so
+// every case below is about **two executions**, or about what outlives the
+// first of them.
+
+/** The site key a node that wrote `idempotency_key: <key>` carries. */
+const authored = (store, key) => stores.authoredKey(store.name, key);
+
+{
+  // **Two executions writing one store under one business key apply once**:
+  // the second writes nothing and is answered with the first's whole row —
+  // `applied` and `version` included — marked `deduped`, and the key holds the
+  // first's value at the first's version. A retry inside the first execution
+  // re-derives the same string and is answered the same way.
+  const store = kv("authored", "global");
+  const first = ctx(execution("authored_1"));
+  const second = ctx(execution("authored_2"));
+  try {
+    const applied = await write(
+      store,
+      "set",
+      { key: "event/1", value: { by: "first" }, idempotencyKey: "evt-1" },
+      first,
+      authored(store, "evt-1"),
+    );
+    const answered = await write(
+      store,
+      "set",
+      { key: "event/1", value: { by: "second" }, idempotencyKey: "evt-1" },
+      second,
+      authored(store, "evt-1"),
+    );
+    const held = await get(store, "event/1", ctx(execution("authored_read")));
+    answer.a_second_execution_under_an_authored_key_is_answered_with_the_firsts_row =
+      applied.applied === true &&
+      applied.deduped === false &&
+      typeof applied.version === "number" &&
+      answered.deduped === true &&
+      same({ ...applied, deduped: true }, answered);
+    answer.an_authored_key_holds_the_first_executions_value_and_version =
+      held.value?.by === "first" && held.version === applied.version;
+    const retried = await write(
+      store,
+      "set",
+      { key: "event/1", value: { by: "retry" }, idempotencyKey: "evt-1" },
+      first,
+      authored(store, "evt-1"),
+    );
+    answer.a_retry_under_an_authored_key_dedupes_the_same_way =
+      same({ ...applied, deduped: true }, retried) &&
+      (await get(store, "event/1", ctx(execution("authored_read")))).value?.by === "first";
+    // The record carries the key as the write carried it — the whole
+    // `author/<store>/<key>`, which names no instance — and `deduped` as ever.
+    const recorded = [...first.storeRecords, ...second.storeRecords].map((record) => [
+      record.idempotencyKey,
+      record.deduped,
+    ]);
+    answer.an_authored_write_record_carries_the_ledger_key_as_carried = same(recorded, [
+      [`author/${store.name}/evt-1`, false],
+      [`author/${store.name}/evt-1`, true],
+      [`author/${store.name}/evt-1`, true],
+    ]);
+    // Two different business keys are two writes, whichever executions make them.
+    const two = await write(store, "set", { key: "event/2", value: { by: "first" } }, first, authored(store, "evt-2"));
+    const three = await write(store, "set", { key: "event/3", value: { by: "second" } }, second, authored(store, "evt-3"));
+    answer.two_different_authored_keys_both_apply =
+      two.applied === true && two.deduped === false && three.applied === true && three.deduped === false;
+    // The namespace carries the store: one business key on two stores is two
+    // writes, one in each.
+    const other = kv("authored_other", "global");
+    const elsewhere = await write(
+      other,
+      "set",
+      { key: "event/1", value: { by: "other" } },
+      second,
+      authored(other, "evt-1"),
+    );
+    answer.the_same_authored_key_on_two_stores_applies_on_both =
+      elsewhere.applied === true &&
+      elsewhere.deduped === false &&
+      (await get(other, "event/1", ctx(execution("authored_read")))).value?.by === "other" &&
+      (await get(store, "event/1", ctx(execution("authored_read")))).value?.by === "first";
+    // A derived key and an authored one never collide — not even an authored
+    // key whose text **is** a derived key: the namespace is the first segment.
+    const derivedKey = `${execution("authored_1")}/record/0`;
+    const derived = await write(store, "set", { key: "event/4", value: { by: "derived" } }, first, derivedKey);
+    const shadow = await write(
+      store,
+      "set",
+      { key: "event/4", value: { by: "authored" } },
+      first,
+      authored(store, derivedKey),
+    );
+    answer.a_derived_and_an_authored_write_are_independent_ledger_rows =
+      derived.deduped === false &&
+      shadow.deduped === false &&
+      shadow.version > derived.version &&
+      (await ledgerRows(store, derivedKey)) === 1 &&
+      (await ledgerRows(store, authored(store, derivedKey))) === 1 &&
+      (await get(store, "event/4", ctx(execution("authored_read")))).value?.by === "authored";
+    // An authored key is answered by the row of the write that took it first,
+    // in that op's shape. A `delete` has no answer in a `set`'s row — its
+    // output declares `deleted`, which the row does not hold — so a second
+    // node naming the key with it fails naming both rather than taking an
+    // answer its own output does not describe.
+    const crossed = await refusal(
+      write(store, "delete", { key: "event/1" }, second, authored(store, "evt-1")),
+    );
+    answer.a_delete_under_an_authored_key_a_set_took_fails_naming_both =
+      (crossed ?? "").includes("for a `set`, and this write is a `delete`") &&
+      (await get(store, "event/1", ctx(execution("authored_read")))).value?.by === "first";
+    // A business key is the composition's string, whatever it holds — and a
+    // key past ASCII is a green write on every arm and dedupes on every arm,
+    // while one spelled the way a column might encode it is another key.
+    const unicode = "évènement/😀/42";
+    const looksEncoded = "%C3%A9v%C3%A8nement/%F0%9F%98%80/42";
+    const firstUnicode = await write(store, "set", { key: "event/u", value: { by: "first" } }, first, authored(store, unicode));
+    const againUnicode = await write(store, "set", { key: "event/u", value: { by: "second" } }, second, authored(store, unicode));
+    const encodedTwin = await write(store, "set", { key: "event/u", value: { by: "twin" } }, second, authored(store, looksEncoded));
+    answer.an_authored_key_past_ascii_applies_and_dedupes =
+      firstUnicode.deduped === false &&
+      same({ ...firstUnicode, deduped: true }, againUnicode) &&
+      encodedTwin.deduped === false &&
+      encodedTwin.version > firstUnicode.version &&
+      (await get(store, "event/u", ctx(execution("authored_read")))).value?.by === "twin";
+    answer.authored_trace = { applied, answered, retried, recorded, crossed, firstUnicode, againUnicode, encodedTwin };
+  } catch (error) {
+    answer.authored_error = String(error?.stack ?? error);
+  }
+}
+
+{
+  // **An authored key is a store's, not a partition's**: two session
+  // partitions of one store writing one business key are one write — the
+  // second session is answered with the first's row and its own partition is
+  // not written. Then the same, over two connections at once on a server — two
+  // partitions' sequence locks, which the store's authored lock is what
+  // serializes (`AUTHORED_LOCK`).
+  const store = kv("authored_sessions", "session");
+  try {
+    const inA = await write(
+      store,
+      "set",
+      { key: "event", value: { by: "a" } },
+      ctx(execution("authored_sessions_a"), "a"),
+      authored(store, "evt"),
+    );
+    const inB = await write(
+      store,
+      "set",
+      { key: "event", value: { by: "b" } },
+      ctx(execution("authored_sessions_b"), "b"),
+      authored(store, "evt"),
+    );
+    const readA = await get(store, "event", ctx(execution("authored_sessions_read"), "a"));
+    const readB = await get(store, "event", ctx(execution("authored_sessions_read"), "b"));
+    answer.two_session_partitions_sharing_an_authored_key_dedupe_against_each_other =
+      inA.applied === true &&
+      inA.deduped === false &&
+      inB.deduped === true &&
+      same({ ...inA, deduped: true }, inB) &&
+      readA.value?.by === "a" &&
+      readB.found === false;
+
+    const mine = kv("authored_sessions_race", "session", URL_ENV);
+    const theirs = kv("authored_sessions_race", "session", OTHER_URL_ENV);
+    const raced = await Promise.all([
+      write(mine, "set", { key: "event", value: { by: "a" } }, ctx(execution("authored_race_a"), "a"), authored(mine, "evt")),
+      write(theirs, "set", { key: "event", value: { by: "b" } }, ctx(execution("authored_race_b"), "b"), authored(theirs, "evt")),
+    ]);
+    const winner = raced.findIndex((row) => row.deduped === false);
+    const loser = raced[1 - winner];
+    answer.two_partitions_racing_one_authored_key_apply_it_once =
+      winner >= 0 &&
+      loser?.deduped === true &&
+      same({ ...raced[winner], deduped: true }, loser) &&
+      (await get(mine, "event", ctx(execution("authored_race_read"), winner === 0 ? "a" : "b"))).found === true &&
+      (await get(mine, "event", ctx(execution("authored_race_read"), winner === 0 ? "b" : "a"))).found === false;
+    answer.authored_sessions_trace = { inA, inB, raced };
+  } catch (error) {
+    answer.authored_sessions_error = String(error?.stack ?? error);
+  }
+}
+
+{
+  // **Two processes, two executions, one business key, at once** — the shape a
+  // webhook handler's duplicate delivery really arrives in. Every round both
+  // write the same authored key from an agreed instant, once into one global
+  // store and once from two session partitions of another: exactly one of each
+  // pair applies, the other is answered with its row, and the key holds the
+  // winner's value at the winner's version. See `store-authored-race.mjs`.
+  const race = path.join(path.dirname(fileURLToPath(import.meta.url)), "store-authored-race.mjs");
+  const startAt = Date.now() + 2_500;
+  try {
+    const [a, b] = await Promise.all(
+      ["a", "b"].map(
+        (role) =>
+          new Promise((resolve, reject) => {
+            const child = spawn(process.execPath, [race, project, provider, data, RUN, role, String(startAt)], {
+              env: process.env,
+              stdio: ["ignore", "pipe", "pipe"],
+            });
+            let out = "";
+            let err = "";
+            child.stdout.on("data", (chunk) => (out += chunk));
+            child.stderr.on("data", (chunk) => (err += chunk));
+            child.on("error", reject);
+            child.on("close", (code) =>
+              code === 0
+                ? resolve(JSON.parse(out))
+                : reject(new Error(`authored racer ${role} exited ${code}: ${err}`)),
+            );
+          }),
+      ),
+    );
+    const events = kv("authored_race", "global");
+    const sessions = kv("authored_race_sessions", "session");
+    let once = a.global.length === 20 && b.global.length === 20;
+    let sessionsOnce = a.sessions.length === 20 && b.sessions.length === 20;
+    for (let round = 0; round < 20; round += 1) {
+      const pair = [a.global[round], b.global[round]];
+      const winner = pair.findIndex((row) => row?.deduped === false);
+      const held = await get(events, `event/${round}`, ctx(execution("authored_race_read")));
+      if (
+        winner < 0 ||
+        pair[1 - winner]?.deduped !== true ||
+        !same({ ...pair[winner], deduped: true }, pair[1 - winner]) ||
+        held.value?.owner !== (winner === 0 ? "a" : "b") ||
+        held.version !== pair[winner].version
+      ) {
+        once = false;
+      }
+      const inSessions = [a.sessions[round], b.sessions[round]];
+      const sessionWinner = inSessions.findIndex((row) => row?.deduped === false);
+      const loserPartition = sessionWinner === 0 ? "session-b" : "session-a";
+      const unwritten = await get(sessions, `event/${round}`, ctx(execution("authored_race_read"), loserPartition));
+      if (
+        sessionWinner < 0 ||
+        inSessions[1 - sessionWinner]?.deduped !== true ||
+        !same({ ...inSessions[sessionWinner], deduped: true }, inSessions[1 - sessionWinner]) ||
+        unwritten.found !== false
+      ) {
+        sessionsOnce = false;
+      }
+    }
+    answer.two_processes_writing_one_authored_key_apply_it_once = once;
+    answer.two_processes_in_two_partitions_writing_one_authored_key_apply_it_once = sessionsOnce;
+    answer.authored_race_winners = a.global.map((row) => (row.deduped ? "b" : "a")).join("");
+  } catch (error) {
+    answer.authored_race_error = String(error?.stack ?? error);
+  }
+}
+
+{
+  // **A settled execution's prune takes its derived rows and never its
+  // authored one**: the prune is the range under `<execution id>/`, and an
+  // authored row is under `author/`, which no execution id is — so the business
+  // key still answers a later execution after the one that wrote it is gone.
+  const store = kv("authored_settle", "global");
+  stores.bindsStores([store]);
+  const id = execution("authored_settle");
+  try {
+    await begin_(id);
+    await set(store, "derived", { n: 1 }, ctx(id), `${id}/save/0`);
+    const took = await write(store, "set", { key: "event", value: { by: "settled" } }, ctx(id), authored(store, "evt"));
+    const before = [await ledgerRows(store, `${id}/`), await ledgerRows(store, authored(store, "evt"))];
+    await settle(id);
+    const after = [await ledgerRows(store, `${id}/`), await ledgerRows(store, authored(store, "evt"))];
+    const late = await write(
+      store,
+      "set",
+      { key: "event", value: { by: "late" } },
+      ctx(execution("authored_settle_late")),
+      authored(store, "evt"),
+    );
+    answer.a_settled_executions_prune_takes_its_derived_rows_and_leaves_its_authored_one =
+      same(before, [1, 1]) &&
+      same(after, [0, 1]) &&
+      same({ ...took, deduped: true }, late) &&
+      (await get(store, "event", ctx(execution("authored_settle_read")))).value?.by === "settled";
+    answer.authored_settle_trace = { before, after, took, late };
+  } catch (error) {
+    answer.authored_settle_error = String(error?.stack ?? error);
+  }
+}
+
+{
+  // **Retention follows the store**: on a store with `default_ttl:` an
+  // authored row answers until the default runs out, and a write after that
+  // applies as a first write does and takes the row's place. The expired rows
+  // leave storage inside the two sweeps an expired key does — the next write
+  // under an authored key, and the next process start.
+  const store = { ...kv("authored_ttl", "global"), defaultTtl: HOUR };
+  try {
+    const first = await later(0, () =>
+      write(store, "set", { key: "event", value: { by: "first" } }, ctx(execution("authored_ttl_1")), authored(store, "evt")),
+    );
+    await later(0, () =>
+      write(store, "set", { key: "swept", value: { by: "first" } }, ctx(execution("authored_ttl_1")), authored(store, "swept")),
+    );
+    await later(0, () =>
+      write(store, "set", { key: "started", value: { by: "first" } }, ctx(execution("authored_ttl_1")), authored(store, "started")),
+    );
+    const within = await later(HOUR - MINUTE, () =>
+      write(store, "set", { key: "event", value: { by: "second" } }, ctx(execution("authored_ttl_2")), authored(store, "evt")),
+    );
+    // Past the default: still stored, answering nothing.
+    const storedPast = [
+      await ledgerRows(store, authored(store, "swept")),
+      await ledgerRows(store, authored(store, "started")),
+    ];
+    const third = await later(HOUR + MINUTE, () =>
+      write(store, "set", { key: "event", value: { by: "third" } }, ctx(execution("authored_ttl_3")), authored(store, "evt")),
+    );
+    const held = await later(HOUR + MINUTE, () => get(store, "event", ctx(execution("authored_ttl_read"))));
+    const afterWrite = [
+      await ledgerRows(store, authored(store, "swept")),
+      await ledgerRows(store, authored(store, "evt")),
+    ];
+    answer.an_authored_key_answers_within_the_stores_default_ttl =
+      first.deduped === false && same({ ...first, deduped: true }, within);
+    answer.an_authored_key_past_the_stores_default_ttl_applies_again =
+      third.applied === true &&
+      third.deduped === false &&
+      third.version > first.version &&
+      held.value?.by === "third";
+    answer.an_expired_authored_row_leaves_storage_at_the_next_authored_write =
+      same(storedPast, [1, 1]) && same(afterWrite, [0, 1]);
+    // …and the next process start takes what no write reached. The write
+    // above swept the whole store's backlog, so one more row is made to
+    // expire for the start alone.
+    await later(HOUR + MINUTE, () =>
+      write(store, "set", { key: "restarted", value: { by: "first" } }, ctx(execution("authored_ttl_4")), authored(store, "restarted")),
+    );
+    const beforeStart = await ledgerRows(store, authored(store, "restarted"));
+    const started = await helper("store-process-start.mjs", [project, provider, data, JSON.stringify(store)], {
+      ...process.env,
+      [CLOCK]: String(3 * HOUR),
+    });
+    const afterStart = await ledgerRows(store, authored(store, "restarted"));
+    const replaced = await ledgerRows(store, authored(store, "evt"));
+    answer.an_expired_authored_row_leaves_storage_when_a_process_next_starts =
+      started.answer.started === true && beforeStart === 1 && afterStart === 0 && replaced === 0;
+    answer.authored_ttl_trace = { first, within, third, held, storedPast, afterWrite, beforeStart, afterStart, replaced };
+  } catch (error) {
+    answer.authored_ttl_error = String(error?.stack ?? error);
+  }
+}
+
+{
+  // …**and on a store without `default_ttl:` it is kept**: the row answers
+  // however long after its write the duplicate arrives, and no sweep takes it.
+  const store = kv("authored_kept", "global");
+  const DECADE = 10 * 365 * 24 * HOUR;
+  try {
+    const first = await write(store, "set", { key: "event", value: { by: "first" } }, ctx(execution("authored_kept_1")), authored(store, "evt"));
+    const started = await helper("store-process-start.mjs", [project, provider, data, JSON.stringify(store)], {
+      ...process.env,
+      [CLOCK]: String(DECADE),
+    });
+    const late = await later(DECADE, () =>
+      write(store, "set", { key: "event", value: { by: "late" } }, ctx(execution("authored_kept_2")), authored(store, "evt")),
+    );
+    answer.an_authored_row_on_a_store_without_default_ttl_answers_after_any_wait =
+      started.answer.started === true &&
+      same({ ...first, deduped: true }, late) &&
+      (await ledgerRows(store, authored(store, "evt"))) === 1 &&
+      (await get(store, "event", ctx(execution("authored_kept_read")))).value?.by === "first";
+  } catch (error) {
+    answer.authored_kept_error = String(error?.stack ?? error);
+  }
+}
+
+{
+  // **…and the default is the store's, never the write's** (PRD resolved q73,
+  // Decision D157): a write's own `ttl:` sets how long its key lives, not how
+  // long its business key is remembered — the row is the business key's, not
+  // the value's. On a store whose default is an hour, a write under an
+  // authored key with `ttl:` ten minutes leaves a key gone at eleven and a row
+  // that still answers there; one written `ttl: never` leaves a key kept for
+  // good and a row that stops answering with the store's hour, so the
+  // redelivery after it applies as a first write does.
+  const store = { ...kv("authored_write_ttl", "global"), defaultTtl: HOUR };
+  const read = ctx(execution("authored_write_ttl_read"));
+  const writeUnder = (name, by, ttl, label) =>
+    write(store, "set", { key: name, value: { by }, ttl }, ctx(execution(`authored_write_ttl_${label}`)), authored(store, name));
+  try {
+    const short = await later(0, () => writeUnder("short", "first", 10 * MINUTE, "1"));
+    const forever = await later(0, () => writeUnder("forever", "first", "never", "1"));
+    // Past the write's ten minutes and inside the store's hour: the key is
+    // gone, and its business key is still remembered.
+    const shortGone = await later(11 * MINUTE, () => get(store, "short", read));
+    const shortAgain = await later(11 * MINUTE, () => writeUnder("short", "second", 10 * MINUTE, "2"));
+    // Past the store's hour: a key written `ttl: never` is still there, and
+    // its business key is forgotten.
+    const foreverKept = await later(HOUR + MINUTE, () => get(store, "forever", read));
+    const foreverAgain = await later(HOUR + MINUTE, () => writeUnder("forever", "second", "never", "3"));
+    const foreverHeld = await later(HOUR + MINUTE, () => get(store, "forever", read));
+    answer.an_authored_row_outlives_a_shorter_ttl_its_write_gave_the_key =
+      short.applied === true &&
+      short.deduped === false &&
+      shortGone.found === false &&
+      same({ ...short, deduped: true }, shortAgain);
+    answer.an_authored_row_written_with_ttl_never_expires_with_the_stores_default =
+      forever.applied === true &&
+      forever.deduped === false &&
+      foreverKept.found === true &&
+      foreverKept.value?.by === "first" &&
+      foreverAgain.applied === true &&
+      foreverAgain.deduped === false &&
+      foreverAgain.version > forever.version &&
+      foreverHeld.value?.by === "second";
+    answer.authored_write_ttl_trace = { short, shortGone, shortAgain, forever, foreverKept, foreverAgain, foreverHeld };
+  } catch (error) {
+    answer.authored_write_ttl_error = String(error?.stack ?? error);
+  } finally {
+    if (provider !== "sqlite") await forget(store).catch(() => undefined);
+  }
+}
+
+{
+  // **…and a write's half of the ledger's cleanup is bounded, as a key's is**
+  // (PRD resolved q73, grammar §11.4): a write under an authored key removes
+  // at most 100 of the store's expired ledger rows, inside its own transaction
+  // — on a server, one that holds the store's authored lock, which every other
+  // authored writer of the store waits on, so an unbounded sweep there would
+  // stall them all behind one write. A backlog of 150 loses 100 to one write
+  // and the rest to the next.
+  const store = { ...kv("authored_sweep", "global"), defaultTtl: HOUR };
+  const run = ctx(execution("authored_sweep"));
+  const writeUnder = (name, index) =>
+    write(store, "set", { key: name, value: { n: index } }, run, authored(store, name));
+  /** The store's authored rows still stored, expired ones included. */
+  const stored = () => ledgerRows(store, authored(store, ""));
+  try {
+    await later(0, async () => {
+      for (let index = 0; index < 150; index += 1) {
+        await writeUnder(`old-${String(index).padStart(3, "0")}`, index);
+      }
+    });
+    const seeded = await stored();
+    await later(HOUR + MINUTE, () => writeUnder("new-1", 0));
+    const afterOne = await stored();
+    await later(HOUR + MINUTE, () => writeUnder("new-2", 0));
+    const afterTwo = await stored();
+    // 150 expired; one write removes 100 and claims its own row.
+    answer.an_authored_writes_ledger_sweep_removes_at_most_100_rows = seeded === 150 && afterOne === 150 - 100 + 1;
+    // …and the next removes the other 50: `new-1`'s row, alive, and its own
+    // are what is left.
+    answer.an_expired_ledger_backlog_leaves_storage_at_the_next_authored_writes =
+      afterTwo === 2 && (await ledgerRows(store, authored(store, "new-"))) === 2;
+    answer.authored_sweep_trace = { seeded, afterOne, afterTwo };
+  } catch (error) {
+    answer.authored_sweep_error = String(error?.stack ?? error);
+  } finally {
+    if (provider !== "sqlite") await forget(store).catch(() => undefined);
+  }
+}
+
+{
+  // **…and the start sweep takes the ledger's expired rows at most 1000 a
+  // batch, as it does a store's keys** (PRD resolved q73, q69 (c)): once the
+  // keys are swept, the store's expired ledger rows — authored ones, the only
+  // ledger rows with an expiry — leave behind the ops a batch at a time, each
+  // batch its own transaction (on a server one under the store's authored
+  // lock, which every authored writer of the store waits on). A second process
+  // counts the ledger's backlog **between** the batches (`store-sweep-batches.mjs`
+  // with `ledger`), where one unbounded `DELETE` would take it all at once.
+  //
+  // The backlog is laid down straight into storage, dated as a `default_ttl:`
+  // would date it: alive to every probe for half an hour, and expired to the
+  // sweep, whose clock is an hour and a minute ahead. The store's authored
+  // lock — a ledger batch takes it, so a store without one is one whose ledger
+  // no batch sweeps — is taken by one write under an authored key on a store
+  // with no default, so its own row never expires and is never counted.
+  const store = kv("ledger_batches", "global");
+  const BACKLOG = 3_500;
+  /** One more than the batches the backlog takes, so the last count is past the sweep's end. */
+  const PROBES = 6;
+  /** A count of the ledger's backlog, as the helper answers it or this file reads it. */
+  const ledger = (counted) => Number(counted?.ledger ?? NaN);
+  try {
+    await later(0, () =>
+      write(store, "set", { key: "kept", value: { n: 0 } }, ctx(execution("ledger_batches")), authored(store, "kept")),
+    );
+    const clock = provider === "sqlite" ? Date.now() : Number((await storage(SERVER_NOW, []))[0]?.server_now);
+    const laid = Array.from({ length: BACKLOG }, (_, index) => {
+      const name = `z-${String(index).padStart(4, "0")}`;
+      return [
+        authored(store, name),
+        JSON.stringify({ key: name, applied: true, version: index + 2, deduped: false }),
+        clock + HOUR / 2 + index,
+      ];
+    });
+    for (let at = 0; at < laid.length; at += 2_000) {
+      const chunk = laid.slice(at, at + 2_000);
+      if (provider === "sqlite") {
+        await storage(undefined, undefined, [
+          store.name,
+          "INSERT INTO applied (idempotency_key, op, result, expires_at) VALUES " +
+            chunk.map(() => "(?, ?, ?, ?)").join(", "),
+          chunk.flatMap(([key, result, expiresAt]) => [key, "set", result, expiresAt]),
+        ]);
+      } else {
+        await storage(
+          "INSERT INTO store_applied (store, scope_key, idempotency_key, op, result, expires_at) VALUES " +
+            chunk.map(() => "(?, ?, ?, ?, ?, ?)").join(", "),
+          chunk.flatMap(([key, result, expiresAt]) => [store.name, "global", key, "set", result, expiresAt]),
+        );
+      }
+    }
+    const before = Number(
+      (
+        await storage(
+          "SELECT COUNT(*) AS n FROM store_applied WHERE store = ? AND expires_at IS NOT NULL",
+          [store.name],
+          [store.name, "SELECT COUNT(*) AS n FROM applied WHERE expires_at IS NOT NULL"],
+        )
+      )[0]?.n,
+    );
+    const swept = await helper(
+      "store-sweep-batches.mjs",
+      [project, provider, data, JSON.stringify(store), String(PROBES), "ledger"],
+      { ...process.env, [CLOCK]: String(HOUR + MINUTE) },
+    );
+    const failed = swept.answer.observed.find((counted) => counted?.error !== undefined);
+    const observed = swept.answer.observed.map(ledger);
+    const totals = [before, ...observed];
+    const taken = totals.slice(1).map((left, index) => totals[index] - left);
+    // Every probe found the sweep at most one batch further on, and at least
+    // one found it under way — neither untouched nor finished — so the counts
+    // are the sweep's own steps rather than its two ends; and the row with no
+    // expiry is still there once the sweep is done.
+    answer.the_start_sweep_takes_at_most_1000_ledger_rows_a_batch =
+      failed === undefined &&
+      swept.answer.first?.found === true &&
+      before === BACKLOG &&
+      observed.length === PROBES &&
+      taken.every((n) => n >= 0 && n <= 1_000) &&
+      totals.some((n) => n > 0 && n < totals[0]) &&
+      ledger(swept.answer.after) === 0 &&
+      (await ledgerRows(store, authored(store, "kept"))) === 1;
+    answer.ledger_batches_trace = { before, observed, after: swept.answer.after, failed, totals };
+  } catch (error) {
+    answer.ledger_batches_error = String(error?.stack ?? error);
+  } finally {
+    if (provider !== "sqlite") await forget(store).catch(() => undefined);
+  }
+}
+
+if (provider !== "sqlite") {
+  // **An authored row's expiry is the server's clock's too** (PRD resolved
+  // q73, q69 (a)), as a key's is: two writers whose own clocks disagree must
+  // still agree about when a business key stops deduping, or a redelivery past
+  // `default_ttl:` is deduped by one and one inside it applies again by the
+  // other. This process's clock is moved ten days ahead for one write and ten
+  // days behind for another; each row holds the server's instant plus the
+  // store's default — the instant the key beside it holds — and a redelivery
+  // with the clock moved the other way is still answered by it, because the
+  // ledger is read by the server's clock as well.
+  const store = { ...kv("authored_server_clock", "global"), defaultTtl: HOUR };
+  const key = provider === "postgres" ? '"key"' : "`key`";
+  const writeUnder = (label, n, shift, again = "") =>
+    skewed(shift, () =>
+      write(
+        store,
+        "set",
+        { key: label, value: { n } },
+        ctx(execution(`authored_server_clock_${label}${again}`)),
+        authored(store, label),
+      ),
+    );
+  try {
+    const written = {
+      ahead: await writeUnder("ahead", 1, TEN_DAYS),
+      behind: await writeUnder("behind", 1, -TEN_DAYS),
+    };
+    const serverNow = Number((await storage(SERVER_NOW, []))[0]?.server_now);
+    const ledger = Object.fromEntries(
+      (await storage("SELECT idempotency_key, expires_at FROM store_applied WHERE store = ?", [store.name])).map(
+        (row) => [String(row.idempotency_key), Number(row.expires_at)],
+      ),
+    );
+    const entries = Object.fromEntries(
+      (await storage(`SELECT ${key} AS k, expires_at FROM store_entries WHERE store = ?`, [store.name])).map(
+        (row) => [String(row.k), Number(row.expires_at)],
+      ),
+    );
+    const redelivered = {
+      ahead: await writeUnder("ahead", 2, -TEN_DAYS, "_again"),
+      behind: await writeUnder("behind", 2, TEN_DAYS, "_again"),
+    };
+    const ahead = Object.fromEntries(
+      ["ahead", "behind"].map((label) => [label, ledger[authored(store, label)] - serverNow]),
+    );
+    answer.an_authored_rows_expiry_is_computed_by_the_servers_clock = ["ahead", "behind"].every(
+      (label) =>
+        written[label]?.applied === true &&
+        written[label]?.deduped === false &&
+        ahead[label] > HOUR - MINUTE &&
+        ahead[label] < HOUR + MINUTE &&
+        Math.abs(ledger[authored(store, label)] - entries[label]) < MINUTE,
+    );
+    answer.a_dialled_ledger_read_answers_an_authored_row_the_servers_clock_holds_alive = ["ahead", "behind"].every(
+      (label) => same({ ...written[label], deduped: true }, redelivered[label]),
+    );
+    answer.authored_server_clock_trace = { serverNow, ahead, ledger, entries, written, redelivered };
+  } catch (error) {
+    answer.authored_server_clock_error = String(error?.stack ?? error);
+  } finally {
+    await forget(store).catch(() => undefined);
+  }
+}
+
+{
+  // …**while a derived row never expires, whatever the store's default.** It
+  // is its execution's, kept for as long as an attempt can repeat and pruned
+  // when the execution settles (PRD resolved q69(d)) — so on a store with
+  // `default_ttl:`, a retry of a write an execution still open made, long
+  // past the default, is answered by its row rather than applied a second
+  // time, and the row carries no expiry at all. The key itself expires with
+  // the default as ever; what the default does not reach is the ledger's
+  // memory of the write.
+  const store = { ...kv("derived_defaulted", "global"), defaultTtl: HOUR };
+  const id = execution("derived_defaulted");
+  const site = `${id}/save/0`;
+  try {
+    const first = await later(0, () =>
+      write(store, "set", { key: "event", value: { by: "first" } }, ctx(id), site),
+    );
+    const retried = await later(10 * HOUR, () =>
+      write(store, "set", { key: "event", value: { by: "retried" } }, ctx(id), site),
+    );
+    const held = await later(10 * HOUR, () => get(store, "event", ctx(execution("derived_defaulted_read"))));
+    const expiry = await storage(
+      "SELECT expires_at FROM store_applied WHERE store = ? AND idempotency_key = ?",
+      [store.name, site],
+      [store.name, "SELECT expires_at FROM applied WHERE idempotency_key = ?", [site]],
+    );
+    answer.a_derived_row_on_a_store_with_default_ttl_never_expires =
+      first.applied === true &&
+      first.deduped === false &&
+      same({ ...first, deduped: true }, retried) &&
+      held.found === false &&
+      expiry.length === 1 &&
+      expiry[0].expires_at === null;
+    answer.derived_defaulted_trace = { first, retried, held, expiry };
+  } catch (error) {
+    answer.derived_defaulted_error = String(error?.stack ?? error);
+  }
+}
+
+{
+  // **One key, one answer, in the shape the later write declares.** Two nodes
+  // may name one authored key with different ops, and the later is answered
+  // with the first's row whenever that row holds every field its own output
+  // declares: `merge`, `append` and `incr` answer one shape, so each answers
+  // the others whole; a `set` is answered by a partial update's row without
+  // its `value`, which a `set`'s output does not declare. A partial update
+  // after a `set` has no `value` in the row to answer with, so it fails naming
+  // both, and writes nothing.
+  const store = kv("authored_ops", "global", URL_ENV, RECORD);
+  try {
+    const merged = await write(
+      store,
+      "merge",
+      { key: "record", fields: { title: "first", tags: [], count: 1 } },
+      ctx(execution("authored_ops_1")),
+      authored(store, "evt"),
+    );
+    const incremented = await write(
+      store,
+      "incr",
+      { key: "record", field: "count", by: 5 },
+      ctx(execution("authored_ops_2")),
+      authored(store, "evt"),
+    );
+    const appended = await write(
+      store,
+      "append",
+      { key: "record", field: "tags", value: "late" },
+      ctx(execution("authored_ops_3")),
+      authored(store, "evt"),
+    );
+    const replaced = await write(
+      store,
+      "set",
+      { key: "record", value: { title: "set", tags: [], count: 9 } },
+      ctx(execution("authored_ops_4")),
+      authored(store, "evt"),
+    );
+    const held = await get(store, "record", ctx(execution("authored_ops_read")));
+    const withoutValue = { ...merged, deduped: true };
+    delete withoutValue.value;
+    answer.partial_updates_under_one_authored_key_answer_one_another =
+      merged.applied === true &&
+      merged.deduped === false &&
+      merged.value?.count === 1 &&
+      same({ ...merged, deduped: true }, incremented) &&
+      same({ ...merged, deduped: true }, appended);
+    answer.a_set_after_a_partial_update_under_one_authored_key_is_answered_without_its_value =
+      same(withoutValue, replaced) &&
+      !("value" in replaced) &&
+      held.version === merged.version &&
+      held.value?.title === "first" &&
+      held.value?.count === 1 &&
+      same(held.value?.tags, []);
+    const seeded = await write(
+      store,
+      "set",
+      { key: "other", value: { title: "set", tags: [], count: 0 } },
+      ctx(execution("authored_ops_5")),
+      authored(store, "evt-set"),
+    );
+    const crossed = await refusal(
+      write(store, "incr", { key: "other", field: "count" }, ctx(execution("authored_ops_6")), authored(store, "evt-set")),
+    );
+    const other = await get(store, "other", ctx(execution("authored_ops_read")));
+    answer.a_partial_update_after_a_set_under_one_authored_key_fails_naming_both =
+      seeded.applied === true &&
+      (crossed ?? "").includes("for a `set`, and this write is a `incr`") &&
+      (crossed ?? "").includes("holds no answer in a `incr`'s shape") &&
+      other.version === seeded.version &&
+      other.value?.count === 0;
+    answer.authored_ops_trace = { merged, incremented, appended, replaced, held, seeded, crossed, other };
+  } catch (error) {
+    answer.authored_ops_error = String(error?.stack ?? error);
+  }
+}
+
+{
+  // **A batch under an authored key dedupes whole**: one write, one ledger row,
+  // so a second execution's batch under the key — whatever entries it holds —
+  // is answered with the first's `results` and applies none of its own.
+  const store = kv("authored_batch", "global");
+  try {
+    const first = await batch(
+      store,
+      [
+        { op: "set", key: "a", value: { n: 1 } },
+        { op: "set", key: "b", value: { n: 2 } },
+        { op: "delete", key: "c" },
+      ],
+      ctx(execution("authored_batch_1")),
+      authored(store, "evt"),
+    );
+    const second = await batch(
+      store,
+      [
+        { op: "set", key: "a", value: { n: 99 } },
+        { op: "delete", key: "b" },
+      ],
+      ctx(execution("authored_batch_2")),
+      authored(store, "evt"),
+    );
+    const heldA = await get(store, "a", ctx(execution("authored_batch_read")));
+    const heldB = await get(store, "b", ctx(execution("authored_batch_read")));
+    answer.a_batch_under_an_authored_key_dedupes_whole =
+      first.applied === true &&
+      first.deduped === false &&
+      second.deduped === true &&
+      same({ ...first, deduped: true }, second) &&
+      heldA.value?.n === 1 &&
+      heldA.version === first.results?.[0]?.version &&
+      heldB.value?.n === 2;
+    answer.authored_batch_trace = { first, second };
+  } catch (error) {
+    answer.authored_batch_error = String(error?.stack ?? error);
+  }
+}
+
+{
+  // **What the namespace refuses.** An execution-scoped store's partition is
+  // one run's, which no second execution reaches, so an authored key there is
+  // refused — by the compiler, and by the store for a caller that is not the
+  // compiler. And the disjointness the namespace rests on is held at the
+  // store's own boundary: an execution whose id is `author` or begins
+  // `author/` could write derived keys no ledger could tell from authored
+  // ones, so every op of one is refused, and so is the journal row it would
+  // open.
+  const scoped = kv("authored_scoped", "execution");
+  const global = kv("authored_reserved", "global");
+  try {
+    const onScoped = await refusal(
+      write(scoped, "set", { key: "event", value: { by: "x" } }, ctx(execution("authored_scoped")), authored(scoped, "evt")),
+    );
+    answer.an_authored_key_on_an_execution_scoped_store_is_refused = (onScoped ?? "").includes(
+      "is `scope: execution` and was handed the authored idempotency key",
+    );
+    // The store exists — one ordinary write made it — so what is counted below
+    // is rows a refused write did not leave, not a store nothing opened.
+    const id_ = execution("authored_reserved");
+    await write(global, "set", { key: "k", value: { n: 0 } }, ctx(id_), `${id_}/save/0`);
+    const reserved = await Promise.all(
+      ["author", "author/x"].map((id) => refusal(write(global, "set", { key: "k", value: { n: 1 } }, ctx(id), `${id}/save/0`))),
+    );
+    const opened = await refusal(begin_("author"));
+    answer.an_execution_id_in_the_authored_namespace_is_refused_by_the_store_and_the_journal =
+      reserved.every((refused) => (refused ?? "").includes("is not an execution id this runtime can run")) &&
+      (opened ?? "").includes("is not an execution id this runtime can run") &&
+      (await ledgerRows(global, "author")) === 0 &&
+      (await get(global, "k", ctx(id_))).value?.n === 0;
+    // …and the other half of the proof: an id this runtime derives — a
+    // child's, from any parent and any key, the authored namespace's own
+    // included — is `exec_` and a UUID, which the namespace never reserves.
+    const children = [
+      runtime.childExecutionId(execution("authored_parent"), `${execution("authored_parent")}/fan/0/0`),
+      runtime.childExecutionId(execution("authored_parent"), "author/notes/evt"),
+      runtime.childExecutionId("exec_parent", "author"),
+    ];
+    answer.every_derived_child_execution_id_is_outside_the_authored_namespace =
+      children.every((id) => /^exec_[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id)) &&
+      children.every((id) => !runtime.reservedExecutionId(id)) &&
+      runtime.reservedExecutionId("author") &&
+      runtime.reservedExecutionId("author/x") &&
+      !runtime.reservedExecutionId("authors") &&
+      !runtime.reservedExecutionId("exec_author") &&
+      runtime.AUTHORED_LEDGER_NAMESPACE === "author" &&
+      stores.authoredKey("notes", "a/b") === "author/notes/a/b" &&
+      stores.authored("author/notes/a/b") &&
+      !stores.authored(`${execution("authored_parent")}/save/0`);
+    answer.authored_refusals_trace = { onScoped, reserved, opened, children };
+  } catch (error) {
+    answer.authored_refusals_error = String(error?.stack ?? error);
   }
 }
 
@@ -4671,6 +5522,268 @@ const EARLIER_SCHEMA = {
     // which the case above already does mid-run, so the cases below redial —
     // and a dialled run's database is its own, so it is dropped rather than
     // left on a server a developer keeps.
+    await stores.releaseStores();
+    if (created) {
+      const admin = await openServer(process.env[URL_ENV]);
+      await rows(
+        admin,
+        provider === "postgres"
+          ? `DROP DATABASE IF EXISTS ${database} WITH (FORCE)`
+          : `DROP DATABASE IF EXISTS ${database}`,
+      ).catch(() => undefined);
+      await admin.end().catch(() => undefined);
+    }
+  }
+}
+
+// --- A store the release before authored keys created ----------------------
+
+/**
+ * The schema the release before PRD resolved q73 created, on each backend —
+ * this release's, but for a ledger with no `expires_at` and no index over one
+ * — copied from that release's `src/stores.ts`, `stores-postgres.ts` and
+ * `stores-mysql.ts`, because what is under test is that this release opens
+ * *that* one.
+ */
+const PRE_AUTHORED_SCHEMA = {
+  sqlite: [
+    `CREATE TABLE entries (
+  scope_key  TEXT NOT NULL,
+  key        TEXT NOT NULL,
+  value      TEXT NOT NULL,
+  metadata   TEXT,
+  embedding  TEXT,
+  version    INTEGER NOT NULL DEFAULT 0,
+  expires_at INTEGER,
+  PRIMARY KEY (scope_key, key)
+)`,
+    `CREATE TABLE applied (
+  idempotency_key TEXT PRIMARY KEY,
+  op              TEXT NOT NULL,
+  result          TEXT NOT NULL
+)`,
+    `CREATE TABLE sequences (
+  scope_key TEXT PRIMARY KEY,
+  last      INTEGER NOT NULL
+)`,
+    `CREATE INDEX entries_partition_expiry ON entries (scope_key, expires_at)
+  WHERE expires_at IS NOT NULL`,
+    "CREATE INDEX entries_expiry ON entries (expires_at) WHERE expires_at IS NOT NULL",
+  ],
+  postgres: [
+    `CREATE TABLE store_entries (
+  store      TEXT COLLATE "C" NOT NULL,
+  scope_key  TEXT COLLATE "C" NOT NULL,
+  "key"      TEXT COLLATE "C" NOT NULL,
+  value      TEXT NOT NULL,
+  version    BIGINT NOT NULL DEFAULT 0,
+  expires_at BIGINT,
+  PRIMARY KEY (store, scope_key, "key")
+)`,
+    `CREATE INDEX store_entries_partition_expiry
+  ON store_entries (store, scope_key, expires_at) WHERE expires_at IS NOT NULL`,
+    "CREATE INDEX store_entries_expiry ON store_entries (store, expires_at) WHERE expires_at IS NOT NULL",
+    `CREATE TABLE store_applied (
+  store           TEXT COLLATE "C" NOT NULL,
+  scope_key       TEXT COLLATE "C" NOT NULL,
+  idempotency_key TEXT COLLATE "C" NOT NULL,
+  op              TEXT NOT NULL,
+  result          TEXT NOT NULL,
+  PRIMARY KEY (store, idempotency_key)
+)`,
+    "CREATE INDEX store_applied_partition ON store_applied (store, scope_key)",
+    `CREATE TABLE store_sequences (
+  store     TEXT COLLATE "C" NOT NULL,
+  scope_key TEXT COLLATE "C" NOT NULL,
+  last      BIGINT NOT NULL,
+  PRIMARY KEY (store, scope_key)
+)`,
+  ],
+  mysql: [
+    `CREATE TABLE store_entries (
+  store      VARCHAR(128)  CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  scope_key  VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  \`key\`      VARCHAR(2048) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL,
+  value      LONGTEXT NOT NULL,
+  version    BIGINT NOT NULL DEFAULT 0,
+  expires_at BIGINT NULL,
+  scope_hash BINARY(32) AS (UNHEX(SHA2(scope_key, 256))) STORED NOT NULL,
+  key_hash   BINARY(32) AS (UNHEX(SHA2(\`key\`, 256))) STORED NOT NULL,
+  PRIMARY KEY (store, scope_hash, key_hash),
+  KEY store_entries_partition (store, scope_key(255), \`key\`(191)),
+  KEY store_entries_partition_expiry (store, scope_hash, expires_at),
+  KEY store_entries_expiry (store, expires_at)
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE store_applied (
+  store           VARCHAR(128)  CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  scope_key       VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  idempotency_key VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  op              VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  result          LONGTEXT NOT NULL,
+  PRIMARY KEY (store, idempotency_key),
+  KEY store_applied_partition (store, scope_key(255))
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
+    `CREATE TABLE store_sequences (
+  store      VARCHAR(128)  CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  scope_key  VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  last       BIGINT NOT NULL,
+  PRIMARY KEY (store, scope_key)
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC DEFAULT CHARSET=utf8mb4`,
+  ],
+};
+
+{
+  // **A deployment upgrading in place, again.** PRD resolved q73 gave the
+  // ledger an `expires_at` — an authored row's, under a store's
+  // `default_ttl:` — so a store the release before it created has a ledger
+  // without the column, and every keyed write of this release reads it. Each
+  // arm brings it forward at its open (SQLite's `migrateStoreFile`, the
+  // Postgres arm's probed `ALTER` in its own `DO` block, the MySQL arm's probed
+  // migration with its duplicate-column race), and every row it held — derived
+  // ones all — takes `NULL`, a row that never expires. Laid down by hand
+  // holding one key, its sequence and the ledger row its write left, then
+  // opened from four connections at once.
+  const PRE_URL_ENVS = [
+    "AGENT_COMPOSE_STORE_URL_PRE_AUTHORED",
+    "AGENT_COMPOSE_STORE_URL_PRE_AUTHORED_B",
+    "AGENT_COMPOSE_STORE_URL_PRE_AUTHORED_C",
+    "AGENT_COMPOSE_STORE_URL_PRE_AUTHORED_D",
+  ];
+  const openers = PRE_URL_ENVS.map((variable) => ({ ...kv("pre_authored", "global", variable), defaultTtl: HOUR }));
+  const name = openers[0].name;
+  const LEDGER_KEY = `${execution("pre_authored")}/write/0`;
+  const recorded = JSON.stringify({ applied: true, version: 1, deduped: false });
+  const database = `${RUN}_pre_authored`;
+  let created = false;
+  let address;
+  try {
+    if (provider === "sqlite") {
+      const module = await import("node-sqlite3-wasm");
+      const { Database } = module.default ?? module;
+      const directory = path.join(data, "stores");
+      fs.mkdirSync(directory, { recursive: true });
+      const file = new Database(path.join(directory, `${stores.encodeKey(name)}.sqlite`));
+      try {
+        for (const statement of PRE_AUTHORED_SCHEMA.sqlite) file.exec(statement);
+        file.run("INSERT INTO entries (scope_key, key, value, version) VALUES (?, ?, ?, ?)", [
+          "global",
+          "old",
+          JSON.stringify({ text: "old" }),
+          1,
+        ]);
+        file.run("INSERT INTO sequences (scope_key, last) VALUES (?, ?)", ["global", 1]);
+        file.run("INSERT INTO applied (idempotency_key, op, result) VALUES (?, ?, ?)", [
+          LEDGER_KEY,
+          "set",
+          recorded,
+        ]);
+      } finally {
+        file.close();
+      }
+    } else {
+      const admin = await openServer(process.env[URL_ENV]);
+      try {
+        await rows(admin, `CREATE DATABASE ${database}`);
+        created = true;
+      } finally {
+        await admin.end().catch(() => undefined);
+      }
+      address = new URL(process.env[URL_ENV]);
+      address.pathname = `/${database}`;
+      for (const variable of PRE_URL_ENVS) process.env[variable] = address.href;
+      const seeder = await openServer(address.href);
+      try {
+        for (const statement of PRE_AUTHORED_SCHEMA[provider]) await rows(seeder, statement);
+        const [entry, sequence, ledger] =
+          provider === "postgres"
+            ? [
+                'INSERT INTO store_entries (store, scope_key, "key", value, version) VALUES ($1, $2, $3, $4, $5)',
+                "INSERT INTO store_sequences (store, scope_key, last) VALUES ($1, $2, $3)",
+                "INSERT INTO store_applied (store, scope_key, idempotency_key, op, result) VALUES ($1, $2, $3, $4, $5)",
+              ]
+            : [
+                "INSERT INTO store_entries (store, scope_key, `key`, value, version) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO store_sequences (store, scope_key, last) VALUES (?, ?, ?)",
+                "INSERT INTO store_applied (store, scope_key, idempotency_key, op, result) VALUES (?, ?, ?, ?, ?)",
+              ];
+        await rows(seeder, entry, [name, "global", "old", JSON.stringify({ text: "old" }), 1]);
+        await rows(seeder, sequence, [name, "global", 1]);
+        await rows(seeder, ledger, [name, "global", LEDGER_KEY, "set", recorded]);
+      } finally {
+        await seeder.end().catch(() => undefined);
+      }
+    }
+
+    const run = ctx(execution("pre_authored"));
+    const opened = await Promise.allSettled(openers.map((store) => get(store, "old", run)));
+    answer.a_store_from_before_authored_keys_takes_every_opener_at_once = opened.every(
+      (outcome) => outcome.status === "fulfilled",
+    );
+    answer.pre_authored_opening_errors = opened
+      .filter((outcome) => outcome.status === "rejected")
+      .map((outcome) => String(outcome.reason?.message ?? outcome.reason));
+    const [store, other] = openers;
+    // What the earlier release's ledger held still answers its redelivery…
+    const redelivered = await set(store, "old", { text: "REWRITTEN" }, run, LEDGER_KEY);
+    // …and an authored write applies on the upgraded ledger, dated by the
+    // store's default, and answers a second execution.
+    const first = await write(
+      store,
+      "set",
+      { key: "event", value: { text: "first" } },
+      ctx(execution("pre_authored_1")),
+      authored(store, "evt"),
+    );
+    const second = await write(
+      other,
+      "set",
+      { key: "event", value: { text: "second" } },
+      ctx(execution("pre_authored_2")),
+      authored(other, "evt"),
+    );
+    const read = async (sql, parameters, sqliteSql) => {
+      if (provider === "sqlite") {
+        const module = await import("node-sqlite3-wasm");
+        const { Database } = module.default ?? module;
+        const file = new Database(path.join(data, "stores", `${stores.encodeKey(name)}.sqlite`));
+        try {
+          file.exec("PRAGMA busy_timeout = 5000;");
+          return file.all(sqliteSql, parameters.slice(1));
+        } finally {
+          file.close();
+        }
+      }
+      const server = await openServer(address.href);
+      try {
+        let next = 0;
+        return await rows(server, provider === "postgres" ? sql.replace(/\?/g, () => `$${++next}`) : sql, parameters);
+      } finally {
+        await server.end().catch(() => undefined);
+      }
+    };
+    const expiries = await read(
+      "SELECT idempotency_key, expires_at FROM store_applied WHERE store = ? ORDER BY idempotency_key",
+      [name],
+      "SELECT idempotency_key, expires_at FROM applied ORDER BY idempotency_key",
+    );
+    const expiryOf = (key) => {
+      const row = expiries.find((held) => held.idempotency_key === key);
+      return row === undefined ? undefined : row.expires_at === null ? null : Number(row.expires_at);
+    };
+    answer.a_ledger_from_before_authored_keys_is_migrated_on_open =
+      redelivered.deduped === true &&
+      redelivered.applied === true &&
+      (await get(other, "old", run)).value?.text === "old" &&
+      first.applied === true &&
+      first.deduped === false &&
+      first.version === 2 &&
+      same({ ...first, deduped: true }, second) &&
+      expiryOf(LEDGER_KEY) === null &&
+      typeof expiryOf(authored(store, "evt")) === "number";
+    answer.pre_authored_trace = { redelivered, first, second, expiries };
+  } catch (error) {
+    answer.pre_authored_error = String(error?.stack ?? error);
+  } finally {
     await stores.releaseStores();
     if (created) {
       const admin = await openServer(process.env[URL_ENV]);

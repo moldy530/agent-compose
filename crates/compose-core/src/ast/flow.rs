@@ -589,17 +589,28 @@ impl StoreOp {
     /// kinds, so a `blob` `list` naming either is refused against its store by
     /// the validator too.
     ///
-    /// A `batch` takes `ops:` and nothing else (PRD resolved q71): each entry
+    /// A `batch` takes `ops:` and, beside it, only the one parameter that is
+    /// the node's rather than an entry's (PRD resolved q71, q73): each entry
     /// carries its own key, value, condition and `ttl`, so a node-level one
     /// would be a second answer to a question every entry already answers.
+    ///
+    /// PRD resolved q73's `idempotency_key:` is on exactly the six `kv` writes
+    /// — `set`, `delete`, `merge`, `append`, `incr` and `batch` — because the
+    /// key it replaces is a write's and a `batch` is one write under one key.
+    /// A read carries no key to replace, and a `vector` `upsert` or a `blob`
+    /// `put` is a write whose ledger the ruling leaves as it is, so neither
+    /// row has it. `delete` is one op of three kinds, so a `vector`/`blob`
+    /// `delete` naming one is refused against its store by the validator, as
+    /// `if_version:` is.
     #[must_use]
     pub const fn optional_parameters(self) -> &'static [&'static str] {
         match self {
-            Self::Get | Self::Batch => &[],
-            Self::Delete => &["if_version"],
-            Self::Set | Self::Merge => &["if", "if_version", "ttl"],
-            Self::Append => &["unique", "if", "if_version", "ttl"],
-            Self::Incr => &["by", "if", "if_version", "ttl"],
+            Self::Get => &[],
+            Self::Batch => &["idempotency_key"],
+            Self::Delete => &["if_version", "idempotency_key"],
+            Self::Set | Self::Merge => &["if", "if_version", "ttl", "idempotency_key"],
+            Self::Append => &["unique", "if", "if_version", "ttl", "idempotency_key"],
+            Self::Incr => &["by", "if", "if_version", "ttl", "idempotency_key"],
             Self::List => &["prefix", "after", "include_values"],
             Self::Count => &["prefix"],
             Self::GetMany => &[],
@@ -789,6 +800,9 @@ pub struct StoreOpParams {
     /// `ops:` — a `batch`'s literal list of entries, in the order they apply
     /// (PRD resolved q71).
     pub ops: Option<Spanned<Vec<BatchEntry>>>,
+    /// `idempotency_key:` — the business key a `kv` write dedupes on in place
+    /// of grammar 9.4's derived one (PRD resolved q73).
+    pub idempotency_key: Option<Spanned<Cel>>,
 }
 
 /// Per-item error strategy on a `map` node (grammar 8.6 rule 10,

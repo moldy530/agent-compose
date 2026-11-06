@@ -177,6 +177,20 @@ state:
     max_items: 10
     items: { type: string }
     default: []
+  webhook_duplicate:
+    description: Whether `flow.webhook`'s write was answered as an event that had already landed.
+    type: boolean
+    default: false
+  webhook_version:
+    description: The version the event's key holds after `flow.webhook`'s write.
+    type: integer
+    default: -1
+  webhook_record:
+    description: What the event's key holds once `flow.webhook` has written it.
+    type: object
+    properties:
+      payload: { type: string }
+    default: { payload: nothing was read }
   # …and what a fan-out of batches left: how many keys under `item/`, and the
   # value at the one key every instance's batch shares.
   batched:
@@ -859,6 +873,65 @@ flow.move:
     - { from: again, to: look, when: "!again.output.applied" }
     - { from: again, to: end, else: true }
     - { from: look, to: end }
+
+# PRD resolved q73: a business key two executions share. `flow.webhook` is the
+# shape of a webhook handler a sender may deliver one event to twice: it writes
+# `event/<id>` under `idempotency_key: "input.event_id"` — so the ledger key is
+# `author/events/<id>` rather than the run's own instance path — and routes on
+# `deduped`, the one answer that says the event had already landed. A second
+# run with the same event id is a second **execution**, and is answered with the
+# first's whole row: its `version`, and the payload the first one wrote.
+store.events:
+  kind: kv
+  scope: global
+  description: One record per business event, written once however often the event arrives.
+  value_schema:
+    payload: { type: string }
+
+flow.webhook:
+  description: Record an event once, and route on whether it had already landed.
+  inputs:
+    event_id:
+      type: string
+      min_length: 1
+    payload:
+      type: string
+  outputs:
+    webhook_duplicate: { type: boolean }
+    webhook_version: { type: integer }
+    webhook_record:
+      type: object
+      properties:
+        payload: { type: string }
+  nodes:
+    record:
+      store: store.events
+      op: set
+      key: "'event/' + input.event_id"
+      value:
+        payload: "input.payload"
+      idempotency_key: "input.event_id"
+      writes:
+        deduped: webhook_duplicate
+        version: webhook_version
+    fresh:
+      store: store.events
+      op: get
+      key: "'event/' + input.event_id"
+      writes:
+        value: webhook_record
+    repeated:
+      store: store.events
+      op: get
+      key: "'event/' + input.event_id"
+      writes:
+        value: webhook_record
+  edges:
+    - { from: start, to: record }
+    - { from: record, to: fresh, when: "!record.output.deduped" }
+    - { from: record, to: repeated, else: true }
+    - { from: fresh, to: end }
+    - { from: repeated, to: end }
 
 # D67, read for a `batch`: every instance of a `map` writes one batch of two
 # keys — its own under `item/`, and the one key every instance shares. Each

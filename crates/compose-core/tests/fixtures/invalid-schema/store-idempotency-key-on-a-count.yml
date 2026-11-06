@@ -1,0 +1,14 @@
+# rule: `idempotency_key:` is a parameter of the six `kv` writes, and a `count` reads (grammar 11.4, PRD resolved q70, q73)
+# at: /flow.demo/nodes/tally/idempotency_key
+# via: /$defs/storeNode/allOf/12/then/properties/idempotency_key
+flow.demo:
+  outputs:
+    draft: { type: string }
+  nodes:
+    tally:
+      store: store.memory
+      op: count
+      idempotency_key: "execution.id"
+  edges:
+    - { from: start, to: tally }
+    - { from: tally, to: end }

@@ -590,4 +590,94 @@ mod tests {
             "the runtime differs between two compositions"
         );
     }
+
+    /// No execution id this runtime mints can name the authored ledger
+    /// namespace (PRD resolved q73).
+    ///
+    /// Every derived idempotency key begins `<execution id>/`, and an authored
+    /// one begins `author/`; the two are disjoint — so a derived key never
+    /// collides with an authored one and a settlement's prune never reaches an
+    /// authored row — exactly when no execution id is `author` or begins
+    /// `author/`. This is the half of that proof read off the source: every
+    /// place the emitted project mints a random id that is an **execution's**
+    /// spells it `exec_` and a UUID, and a child's id is `exec_` and a UUID
+    /// laid out from a digest ([`childExecutionId`]) — each begins `exec_` and
+    /// holds no `/`. The other half, a caller-chosen id refused at the one
+    /// boundary that takes one and at every store op, is the store contract's
+    /// `an_execution_id_in_the_authored_namespace_is_refused_by_the_store_and_the_journal`.
+    ///
+    /// A new mint site is this test failing until it is read: one spelled any
+    /// other way is a site whose id the namespace was never proven against.
+    #[test]
+    fn every_execution_id_this_runtime_mints_is_outside_the_authored_namespace() {
+        /// The one execution-id spelling, and the ids minted that are not an
+        /// execution's: a dispatch's, a worker's, and a command's output marker.
+        const EXECUTION: &str = "`exec_${globalThis.crypto.randomUUID()}`";
+        const NOT_AN_EXECUTION: &[&str] = &[
+            "`dsp_${globalThis.crypto.randomUUID()}`",
+            "`wrk_${globalThis.crypto.randomUUID()}`",
+            "`__agent_compose_${globalThis.crypto.randomUUID().replace(/-/g, \"\")}`",
+        ];
+        let sources = [
+            ("src/runtime.ts", SOURCE),
+            ("src/cli.ts", include_str!("js/cli.ts")),
+            ("src/serve.ts", include_str!("js/serve.ts")),
+            ("src/mesh.ts", include_str!("js/mesh.ts")),
+            ("src/stores.ts", include_str!("js/stores.ts")),
+            ("src/journal.ts", include_str!("js/journal.ts")),
+            ("src/delivery.ts", include_str!("js/delivery.ts")),
+            ("src/worker-node.ts", include_str!("js/worker-node.ts")),
+            ("src/graph.ts (`codegen::graph`)", include_str!("graph.rs")),
+        ];
+        let mut executions = 0;
+        for (name, source) in sources {
+            for line in source.lines().filter(|line| line.contains("randomUUID()")) {
+                if line.contains(EXECUTION) {
+                    executions += 1;
+                    continue;
+                }
+                assert!(
+                    NOT_AN_EXECUTION
+                        .iter()
+                        .any(|spelled| line.contains(spelled)),
+                    "`{name}` mints an id this test has not read: `{}` — if it is an execution's, \
+                     spell it {EXECUTION} so it cannot name the authored ledger namespace \
+                     `author/` (PRD resolved q73)",
+                    line.trim()
+                );
+            }
+        }
+        assert_eq!(
+            executions, 3,
+            "the execution-id mint sites are `agent-compose run`'s, a `serve`'s and `runFlow`'s \
+             default — one fewer or one more is a site this test has not read"
+        );
+
+        let child = function_body("export function childExecutionId(");
+        assert!(
+            child.contains("return `exec_${hex.slice(0, 8)}-"),
+            "a child execution's id no longer begins `exec_`, so nothing proves it is outside the \
+             authored namespace: {child}"
+        );
+        for guarded in [
+            "export async function openExecution(",
+            "export function refuseReservedExecutionId(",
+        ] {
+            assert!(
+                function_body(guarded).contains("reservedExecutionId(")
+                    || function_body(guarded).contains("refuseReservedExecutionId("),
+                "`{guarded}` no longer refuses an execution id in the authored namespace"
+            );
+        }
+        assert!(
+            function_body("export function reservedExecutionId(").contains(
+                "id === AUTHORED_LEDGER_NAMESPACE || id.startsWith(`${AUTHORED_LEDGER_NAMESPACE}/`)"
+            ),
+            "`reservedExecutionId` no longer reserves `author` and every id beginning `author/`"
+        );
+        assert!(
+            SOURCE.contains("export const AUTHORED_LEDGER_NAMESPACE = \"author\";"),
+            "the authored ledger namespace is no longer `author`, which is the ruling's spelling"
+        );
+    }
 }

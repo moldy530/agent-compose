@@ -648,6 +648,11 @@ fn store_params(params: &StoreParams) -> Vec<BindingView> {
     if let Some(keys) = &params.keys {
         push("keys", keys.value.as_str().to_string());
     }
+    // The business key a `kv` write dedupes on in place of the derived one
+    // (PRD resolved q73).
+    if let Some(key) = &params.idempotency_key {
+        push("idempotency_key", key.value.as_str().to_string());
+    }
     // A `batch`'s entries, each under its index — `ops[0].key`, `ops[1].if` —
     // so the artifact shows every expression and literal one entry holds (PRD
     // resolved q71).

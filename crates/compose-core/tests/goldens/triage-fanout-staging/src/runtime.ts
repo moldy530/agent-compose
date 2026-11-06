@@ -9780,9 +9780,20 @@ export interface StoreRecord {
    * answer carries one. Never on a `batch`, whose versions are its answer's.
    */
   readonly version?: number;
-  /** A store-op node write's idempotency key (grammar 9.4). */
+  /**
+   * A store-op node write's idempotency key, as the write carried it: grammar
+   * 9.4's derived key — the execution id and the node's flattened instance
+   * path — or, on a node that wrote `idempotency_key:`, the authored ledger key
+   * `author/<store>/<key>` (PRD resolved q73), which names no instance. A reader
+   * tells the two apart by the first segment, `author`, which no execution id
+   * is ([`refuseReservedExecutionId`]).
+   */
   readonly idempotencyKey?: string;
-  /** Whether the backend had already applied that key (at-least-once). */
+  /**
+   * Whether the backend had already applied that key (at-least-once) — under
+   * an authored key, possibly in another execution, whose answer this write
+   * was handed.
+   */
   readonly deduped?: boolean;
 }
 
@@ -11662,6 +11673,44 @@ function deliveriesInFlight(execution: string): boolean {
  */
 function startsChild(route: MapRoute): boolean {
   return route.detach && route.target.startsWith("flow.");
+}
+
+/**
+ * The namespace of an authored store ledger key — `author/<store>/<key>` (PRD
+ * resolved q73) — and so the one first segment no execution id may have.
+ *
+ * Every derived idempotency key begins `<execution id>/` (grammar 9.4), and an
+ * authored one begins `author/`. The two are disjoint exactly when no
+ * execution id is `author` or begins `author/`, and three things rest on it:
+ * a derived key can never collide with an authored one, a settled execution's
+ * ledger prune — the range under its `<execution id>/` — can never reach an
+ * authored row, and a trace reader tells the two kinds of key apart by their
+ * first segment (`docs/trace.md` §8).
+ */
+export const AUTHORED_LEDGER_NAMESPACE = "author";
+
+/**
+ * Whether an execution id is one the authored namespace reserves: `author`
+ * itself, or one whose first `/`-separated segment it is.
+ *
+ * No id this runtime mints is either. `agent-compose run`, a `serve` and a
+ * `runFlow` given no id each mint `exec_` and a random UUID, and a child
+ * execution's id is `exec_` and a UUID derived from its parent's
+ * ([`childExecutionId`]) — every one begins `exec_` and holds no `/`. The one
+ * boundary that takes an id a caller chose — `runFlow`'s `executionId`, which
+ * every execution passes through [`openExecution`] with — refuses this one,
+ * as does every store op ([`refuseReservedExecutionId`]).
+ */
+export function reservedExecutionId(id: string): boolean {
+  return id === AUTHORED_LEDGER_NAMESPACE || id.startsWith(`${AUTHORED_LEDGER_NAMESPACE}/`);
+}
+
+/** Refuse an execution id [`reservedExecutionId`] reserves, by name. */
+export function refuseReservedExecutionId(id: string): void {
+  if (!reservedExecutionId(id)) return;
+  throw new Error(
+    `${JSON.stringify(id)} is not an execution id this runtime can run: \`${AUTHORED_LEDGER_NAMESPACE}\` is the namespace of an authored store ledger key (\`${AUTHORED_LEDGER_NAMESPACE}/<store>/<key>\`, PRD resolved q73), and every derived key begins with its execution's id — so an execution named this way would write keys the ledger could not tell from authored ones, and its settlement would prune them. Let the runtime mint the id, or choose one whose first \`/\`-separated segment is not \`${AUTHORED_LEDGER_NAMESPACE}\``,
+  );
 }
 
 /**
@@ -14370,6 +14419,9 @@ export interface ExecutionOpening {
  * the guard beneath it.
  */
 export async function openExecution(opening: ExecutionOpening): Promise<Lineage | undefined> {
+  // Before anything is journaled: an execution this id would name is one no
+  // ledger could tell from the authored namespace (PRD resolved q73).
+  refuseReservedExecutionId(opening.execution);
   if (openedExecutions.has(opening.execution)) {
     throw new Error(
       `\`${opening.execution}\` is already running in this process, and one execution has one generation at a time: a second would write a second run's effects into its record (\`docs/durability.md\` §2.1)`,

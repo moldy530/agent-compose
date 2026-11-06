@@ -144,7 +144,10 @@
 // * **writes are at-least-once, keyed** — a store-op node's write carries the
 //   idempotency key of grammar 9.4, and this backend dedupes on it: a retry of
 //   the same effect site answers what the first attempt answered instead of
-//   writing twice.
+//   writing twice. A `kv` write whose node wrote `idempotency_key:` carries an
+//   **authored** key instead (PRD resolved q73) — `author/<store>/<key>`, see
+//   "Authored keys" below — and dedupes on it the same way, across every
+//   execution that writes the store under it.
 //
 //   The key is what a *receiver* dedupes on, and it stays load-bearing under
 //   durability for the one window a journal cannot close: an effect that
@@ -182,11 +185,66 @@
 // `docs/durability.md` §5 is normative for it.
 //
 // A store write an **agent** made through a synthesized tool (grammar 11.5)
-// carries no key and is not deduped. Grammar 9.4 names exactly two carriers — "a
+// carries no key — derived or authored — and is not deduped. Grammar 9.4 names exactly two carriers — "a
 // detached `map` dispatch (§8.6 rule 7) and a store write (§11.4)" — and §11.4 is
 // the store-op *node* catalog. The reading is also what the mechanism is for: a
 // key substitutes for an outcome nobody observed, and a tool call's outcome goes
 // straight back to the model that asked for it.
+//
+// # Authored keys (PRD resolved q73)
+//
+// A `kv` write's node may name its own ledger key, `idempotency_key:` — a CEL
+// string over the node's input phase, so a retry re-derives the same one — and
+// the site then carries `author/<store>/<key>` in place of grammar 9.4's
+// derived key ([`authoredKey`]). Nothing else about the write changes: the
+// ledger is asked before the effect and written with it, in one transaction,
+// and a write whose key the ledger holds is answered with the row it holds —
+// the first write's **whole** answer, its `version` included — and
+// `deduped: true`, writing nothing. What changes is who can repeat it: a
+// derived key is one effect site of one execution, while an authored key is
+// one business event of one store, so a second **execution** writing under it
+// is answered exactly as a retry of the first would be.
+//
+// **The namespace is the first segment.** Every derived key begins
+// `<execution id>/`, and no execution id is `author` or begins `author/`
+// ([`runtime.refuseReservedExecutionId`]: every id this runtime mints is
+// `exec_` and a UUID, and the one boundary that takes a caller's id refuses
+// that one), so the two kinds of key can never collide, a settled execution's
+// prune — a range under its `<execution id>/` — never reaches an authored row,
+// and a reader tells them apart by `author/` alone ([`authored`]).
+//
+// **Per store, not per partition.** Every ledger here is keyed by the
+// idempotency key with no partition in it — a store file's `applied` table, a
+// dialled store's `(store, idempotency_key)` — and an authored key's namespace
+// names the store, so two sessions of one `scope: session` store writing under
+// one authored key are one write: the second session is answered with the
+// first's row, and its own partition is not written. An execution-scoped
+// store's partition is one run's, which no second execution reaches, so the
+// compiler refuses an authored key there and [`runStoreOp`] refuses one a
+// caller hands it.
+//
+// **One key, one answer.** The row an authored key is answered with is the
+// answer of the write that first took the key, in its op's shape. A second
+// node naming the key is handed that row whenever it holds every field the
+// second node's own output declares — the same op, any two of the partial
+// updates, or a `set` after a partial update, without the `value` — and fails
+// naming both ops where it does not, rather than being handed an answer its
+// own output does not describe ([`answeredFrom`]).
+//
+// **Retention follows the store.** A derived row lives until its execution
+// settles (see "Retention"). An authored row has no execution to settle, so
+// it lives as long as the store's `default_ttl:` — its `expires_at` is the
+// store's clock at the write plus that default — and, on a store that declares
+// none, for good. An expired ledger row answers nothing, by the one inequality
+// every expiry is read through ([`live`]), so the next write under its key
+// applies as a first write does and takes the row's place; and it leaves
+// storage inside the two sweeps an expired key does: the write sweep — made by
+// a write carrying an authored key, at most [`SWEEP_PER_WRITE`] rows of its
+// store's ledger — and the process-start sweep, a batch of at most
+// [`SWEEP_PER_BATCH`] at a time behind the ops. That is the trade the stores
+// topic states: without a `default_ttl:` the ledger grows by one row per
+// business key, for ever, and that is what makes a business event land once
+// however late its duplicate arrives.
 //
 // # One process
 //
@@ -275,15 +333,17 @@
 // guarantee and is kept exactly as long as that guarantee has someone to serve:
 // a ledger row is what makes a retry of its effect site answer instead of
 // writing twice, and an execution can retry only while its journal row is open.
-// Every grammar 9.4 key begins `<execution id>/`, and PRD resolved q65 makes a
+// Every derived grammar 9.4 key begins `<execution id>/`, and PRD resolved q65 makes a
 // settled execution one that never resumes, so when an execution's row closes
 // `completed` or `failed` — and the detached deliveries it started, which
 // write under its id, have finished — [`pruneLedger`] deletes the rows under
 // that prefix in every store partition the execution could have written: a
 // child execution's under the child's own id, when the child settles. An execution
 // the journal still holds open keeps every row, so its resume writes nothing
-// twice (PRD resolved q29). The ledger therefore grows with the executions that
-// are open rather than with history. Which stores to prune is **not** a record
+// twice (PRD resolved q29). The ledger's derived rows therefore grow with the
+// executions that are open rather than with history; its authored rows are the
+// one exception, and their retention is their store's (see "Authored keys"
+// above): no prune reaches `author/`. Which stores to prune is **not** a record
 // this process keeps of the writes it made: a placed node's keyed write is
 // made in a worker, and a resumed generation's replay of a placed node runs
 // there too, so no one process sees every write an execution made. The prune
@@ -512,6 +572,14 @@ export interface StoreParams {
    * a caller that skipped it is refused by name rather than half applied.
    */
   readonly ops?: readonly BatchEntryParams[];
+  /**
+   * `idempotency_key:` — the business key a `kv` write's node authored, as its
+   * input phase evaluated it (PRD resolved q73). Read by nothing in this
+   * module's ops: the site's ledger key is built from it ([`authoredKey`]),
+   * and it travels here so the journal's request — what a resume compares —
+   * carries it, and the node's trace input shows it.
+   */
+  readonly idempotencyKey?: string;
 }
 
 /**
@@ -542,9 +610,110 @@ export interface StoreSite {
    * The idempotency key of grammar 9.4, on the surface that carries one.
    *
    * Present on a store-op **node**'s write and absent everywhere else — see the
-   * module header for why a tool-invoked write is not a carrier.
+   * module header for why a tool-invoked write is not a carrier. Derived — the
+   * execution id and the node's flattened instance path — or, on a node that
+   * wrote `idempotency_key:`, authored: `author/<store>/<key>` (PRD resolved
+   * q73, [`authoredKey`]).
    */
   readonly idempotencyKey?: string;
+}
+
+/**
+ * The first segment of every authored ledger key (PRD resolved q73) — which no
+ * execution id is, so no derived key begins with it
+ * ([`runtime.refuseReservedExecutionId`]).
+ */
+export const AUTHORED_NAMESPACE = runtime.AUTHORED_LEDGER_NAMESPACE;
+
+/**
+ * The ledger key a store-op node that wrote `idempotency_key:` carries:
+ * `author/<store>/<key>`, `<store>` the store's declared name — the binding's
+ * `name`, which a dialled ledger's `store` column holds too — and `<key>` the
+ * string its input phase evaluated (PRD resolved q73).
+ *
+ * The store is in it although every ledger is already one store's, because the
+ * namespace is the ruling's and a reader of a trace record — which names its
+ * store separately — reads the key whole: two stores' authored keys are two
+ * keys wherever they are read. The key is the remainder, so a `/` inside it is
+ * the author's and moves nothing.
+ */
+export function authoredKey(store: string, key: string | undefined): string {
+  if (typeof key !== "string") {
+    throw new Error(
+      `a store write to \`${store}\` was handed an \`idempotency_key\` of ${JSON.stringify(key ?? null)}: an authored ledger key is a string, which the compiler types its expression as (PRD resolved q73)`,
+    );
+  }
+  return `${AUTHORED_NAMESPACE}/${store}/${key}`;
+}
+
+/** Whether a ledger key is an authored one rather than grammar 9.4's derived one. */
+export function authored(idempotencyKey: string | undefined): boolean {
+  return idempotencyKey !== undefined && idempotencyKey.startsWith(`${AUTHORED_NAMESPACE}/`);
+}
+
+/**
+ * When the ledger row a keyed write leaves expires, given the write's clock —
+ * or `null`, for one that does not (PRD resolved q73).
+ *
+ * A derived row never expires: it is kept exactly as long as its execution can
+ * retry, and the settlement prune is what removes it ([`pruneLedger`]). An
+ * authored row has no execution to settle, so it lives as long as the store's
+ * `default_ttl:` says a key lives — the store's, never the write's own `ttl:`,
+ * because the row is the business key's and not the value's — and for good on
+ * a store that declares none.
+ */
+function ledgerExpiry(store: StoreBinding, idempotencyKey: string, now: number): number | null {
+  if (!authored(idempotencyKey) || store.defaultTtl === undefined) return null;
+  return Math.min(now + store.defaultTtl, Number.MAX_SAFE_INTEGER);
+}
+
+/**
+ * The ops whose answers are one shape: grammar 11.4's catalog gives `merge`,
+ * `append` and `incr` one output row (Decision D34), `{ key, applied,
+ * version, value, deduped }`.
+ */
+const PARTIAL_UPDATES: readonly StoreOp[] = ["merge", "append", "incr"];
+
+/**
+ * The answer a write whose key the ledger holds is owed: the row it holds,
+ * marked `deduped` ([`redelivered`]).
+ *
+ * An authored key may be named by more than one node, and the row it holds is
+ * the answer of the write that took it first — an answer in that write's op's
+ * shape. A later write under the key is answered with it, `deduped: true`,
+ * whenever the row holds every field the later write's own output declares
+ * (PRD resolved q73): the same op; any two of `merge`, `append` and `incr`,
+ * whose answers are one shape; and a `set` answered by a partial update's
+ * row, which holds every field a `set` answers — `key`, `applied`, `version`
+ * — and one more, the `value`, which a `set`'s output does not declare and so
+ * is not handed. Every other pair has no answer in the later write's shape: a
+ * partial update answered by a `set`'s row has no `value` to answer with, a
+ * `delete`'s answer has `deleted` and no `key` where every other single-key
+ * write's has the reverse, and a `batch`'s is `results` where a single-key
+ * write's is one key's. So that write fails naming both ops, rather than
+ * handing the node an answer its own output does not describe. A derived key
+ * is one effect site, whose op is the op that wrote its row, so it is answered
+ * as it always was.
+ */
+function answeredFrom(
+  store: StoreBinding,
+  op: StoreOp,
+  idempotencyKey: string,
+  held: Readonly<Record<string, unknown>>,
+): Applied {
+  const wrote = held["op"];
+  const row = redelivered(store, op, String(held["result"]));
+  if (!authored(idempotencyKey) || wrote === op) return { row, deduped: true };
+  const partial = (candidate: unknown): boolean => PARTIAL_UPDATES.some((one) => one === candidate);
+  if (partial(wrote) && partial(op)) return { row, deduped: true };
+  if (partial(wrote) && op === "set") {
+    const answer = { ...row };
+    delete answer["value"];
+    return { row: answer, deduped: true };
+  }
+  throw new Error(
+    `\`${store.address}\` holds the authored idempotency key ${JSON.stringify(idempotencyKey)} for a \`${String(wrote)}\`, and this write is a \`${op}\`: an authored key is answered by the row of the write that first took it, and a \`${String(wrote)}\`'s row holds no answer in a \`${op}\`'s shape — give the two nodes distinct keys, or make them ops one row answers alike: \`merge\`, \`append\` and \`incr\` answer one another, and a \`set\` takes a partial update's row without its \`value\` (PRD resolved q73)`,
+  );
 }
 
 /**
@@ -809,8 +978,13 @@ function handleKey(store: StoreBinding, execution: runtime.ExecutionIdentity): s
  * expires at, or `NULL` for a key that does not — an integer, so the expiry is
  * a comparison SQLite makes in a statement rather than a parse.
  *
+ * `applied` is the idempotency ledger, one row per keyed write, and its
+ * `expires_at` is an authored row's (PRD resolved q73): the epoch millisecond
+ * it stops answering, under a store's `default_ttl:`, and `NULL` on every
+ * other row — a derived one is pruned at its execution's settlement instead.
+ *
  * A file an earlier release created has `entries` without one column or both,
- * and [`migrateStoreFile`] adds them.
+ * or an `applied` without its `expires_at`, and [`migrateStoreFile`] adds them.
  */
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS entries (
@@ -826,7 +1000,8 @@ CREATE TABLE IF NOT EXISTS entries (
 CREATE TABLE IF NOT EXISTS applied (
   idempotency_key TEXT PRIMARY KEY,
   op              TEXT NOT NULL,
-  result          TEXT NOT NULL
+  result          TEXT NOT NULL,
+  expires_at      INTEGER
 );
 CREATE TABLE IF NOT EXISTS sequences (
   scope_key TEXT PRIMARY KEY,
@@ -835,20 +1010,23 @@ CREATE TABLE IF NOT EXISTS sequences (
 `;
 
 /**
- * The two indexes an expiry is found through (PRD resolved q69), partial so a
- * key that never expires costs neither of them anything.
+ * The indexes an expiry is found through (PRD resolved q69, q73), partial so a
+ * key — or a ledger row — that never expires costs none of them anything.
  *
  * `entries_partition_expiry` is what a write's bounded sweep of its own
  * partition reads, and `entries_expiry` what a store-wide one at open reads:
  * each finds the expired rows and only those, so neither sweep's cost depends
- * on how many live rows sit beside them. Created after [`migrateStoreFile`] has
- * the column there, because an index over a column a file from an earlier
+ * on how many live rows sit beside them. `applied_expiry` is the same for the
+ * ledger's authored rows, which both sweeps reach store-wide — an authored key
+ * is a store's, not a partition's. Created after [`migrateStoreFile`] has the
+ * columns there, because an index over a column a file from an earlier
  * release lacks is a statement that file refuses.
  */
 const EXPIRY_INDEXES = `
 CREATE INDEX IF NOT EXISTS entries_partition_expiry ON entries (scope_key, expires_at)
   WHERE expires_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS entries_expiry ON entries (expires_at) WHERE expires_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS applied_expiry ON applied (expires_at) WHERE expires_at IS NOT NULL;
 `;
 
 /**
@@ -863,19 +1041,22 @@ CREATE INDEX IF NOT EXISTS entries_expiry ON entries (expires_at) WHERE expires_
  * `version: 0` is one nothing has written since the upgrade, and an
  * `if_version: 0` names exactly it. An `expires_at` column added here gives its
  * rows `NULL`: a key written before expiry existed never expires until a write
- * gives it a `ttl`. Two processes opening one old file at once race to add a
- * column, and the loser's "duplicate column" is the column being there.
+ * gives it a `ttl`. A file from before PRD resolved q73 has an `applied` with no
+ * `expires_at`, and the column added here gives every row it holds `NULL` —
+ * each a derived row, which never expires. Two processes opening one old file
+ * at once race to add a column, and the loser's "duplicate column" is the
+ * column being there.
  */
 function migrateStoreFile(database: Database): void {
-  const columns = database.all("PRAGMA table_info(entries)") as Row[];
-  const held = (name: string): boolean => columns.some((column) => column["name"] === name);
-  for (const [name, definition] of [
-    ["version", "version INTEGER NOT NULL DEFAULT 0"],
-    ["expires_at", "expires_at INTEGER"],
+  for (const [table, name, definition] of [
+    ["entries", "version", "version INTEGER NOT NULL DEFAULT 0"],
+    ["entries", "expires_at", "expires_at INTEGER"],
+    ["applied", "expires_at", "expires_at INTEGER"],
   ] as const) {
-    if (held(name)) continue;
+    const columns = database.all(`PRAGMA table_info(${table})`) as Row[];
+    if (columns.some((column) => column["name"] === name)) continue;
     try {
-      database.exec(`ALTER TABLE entries ADD COLUMN ${definition}`);
+      database.exec(`ALTER TABLE ${table} ADD COLUMN ${definition}`);
     } catch (error) {
       if (!String((error as Error | undefined)?.message ?? error).includes("duplicate column")) {
         throw error;
@@ -899,6 +1080,25 @@ function sweepLocalPartition(database: Database, scopeKey: string, now: number):
     "DELETE FROM entries WHERE rowid IN (SELECT rowid FROM entries WHERE scope_key = ? " +
       `AND expires_at IS NOT NULL AND expires_at <= ? LIMIT ${SWEEP_PER_WRITE})`,
     [scopeKey, now],
+  );
+}
+
+/**
+ * Remove at most [`SWEEP_PER_WRITE`] expired ledger rows from a store file —
+ * the write half of the schedule, read on the ledger (PRD resolved q73): run
+ * by a write carrying an authored key, inside its transaction, before it
+ * claims its own row.
+ *
+ * Store-wide rather than one partition's, because an authored key is a
+ * store's: its row is no partition's to sweep. Through `applied_expiry`, so it
+ * reads the expired rows and nothing else — which are authored ones only,
+ * since a derived row never expires.
+ */
+function sweepLocalLedger(database: Database, now: number): void {
+  database.run(
+    "DELETE FROM applied WHERE rowid IN (SELECT rowid FROM applied WHERE " +
+      `expires_at IS NOT NULL AND expires_at <= ? LIMIT ${SWEEP_PER_WRITE})`,
+    [now],
   );
 }
 
@@ -930,6 +1130,10 @@ function holdSweep(sweeping: Promise<void>): void {
  * batches the same way. [`drainStores`] waits for the rest, so a command that
  * reached the store has removed its backlog by the time it exits.
  *
+ * **The ledger's expired rows go the same way** (PRD resolved q73): once the
+ * entries are swept, the authored ledger rows whose store's `default_ttl:` has
+ * run out by `now` leave in batches of the same size, through `applied_expiry`.
+ *
  * **Never an op's failure.** Every read and condition already treats an
  * expired row as absent, so a batch the file refused is said on stderr and the
  * sweep stops; the next write to each partition, and the next process, take
@@ -939,14 +1143,16 @@ function startLocalSweep(database: Database, store: StoreBinding, now: number): 
   holdSweep(
     (async () => {
       try {
-        for (;;) {
-          await new Promise((resolve) => setTimeout(resolve, 0));
-          const removed = database.run(
-            "DELETE FROM entries WHERE rowid IN (SELECT rowid FROM entries WHERE " +
-              `expires_at IS NOT NULL AND expires_at <= ? LIMIT ${SWEEP_PER_BATCH})`,
-            [now],
-          );
-          if (removed.changes < SWEEP_PER_BATCH) return;
+        for (const table of ["entries", "applied"]) {
+          for (;;) {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const removed = database.run(
+              `DELETE FROM ${table} WHERE rowid IN (SELECT rowid FROM ${table} WHERE ` +
+                `expires_at IS NOT NULL AND expires_at <= ? LIMIT ${SWEEP_PER_BATCH})`,
+              [now],
+            );
+            if (removed.changes < SWEEP_PER_BATCH) break;
+          }
         }
       } catch (error) {
         process.stderr.write(
@@ -1257,8 +1463,10 @@ const CUT_OFF = new Set<string>();
  * the composition binds (PRD resolved q69) — started now, or, where `after` is
  * given, once it settles.
  *
- * Every grammar 9.4 key begins `<execution id>/`, so the rows are exactly those
- * under that prefix: a ledger row is a retry's answer, a settled execution
+ * Every derived grammar 9.4 key begins `<execution id>/`, so the rows are
+ * exactly those under that prefix — an authored key's row is under `author/`,
+ * which no execution id is, and no prune reaches it (PRD resolved q73): a
+ * derived ledger row is a retry's answer, a settled execution
  * never resumes (PRD resolved q65), and nothing will ask for these again. A
  * child execution's rows are under the child's own id, and go when the child
  * settles. A row of an execution the journal still holds open is never
@@ -1334,6 +1542,11 @@ export function pruneLedger(
 
 /** Start one settled execution's prune, held in [`PRUNING`] until it ends. */
 function startPrune({ execution, held }: Deferred): void {
+  // Never the authored namespace's range (PRD resolved q73): an execution
+  // with that id is one nothing could have opened or written under
+  // ([`runtime.refuseReservedExecutionId`]), so it has no rows to prune — and
+  // its prefix would be every authored row's.
+  if (runtime.reservedExecutionId(execution.id)) return;
   const prefix = `${execution.id}/`;
   const pruning = (async () => {
     // A worker may still be running a placed node of it, writing under these
@@ -1409,9 +1622,15 @@ export async function ledgerPrunesSettled(): Promise<void> {
  * The ledger row a retry of the write would be answered from is gone, so made
  * here the write could apply a second time; refused, it is a delivery failing
  * on its way out of a process that is ending anyway.
+ *
+ * **Not an authored key** (PRD resolved q73). It names no execution — its
+ * first segment is `author`, which no execution id is — and no prune removes
+ * its row, so a write under one is answered by the ledger whatever has been
+ * pruned: made on the way out, it applies once like any other.
  */
 function refuseUnledgered(store: StoreBinding, idempotencyKey: string | undefined): void {
   if (idempotencyKey === undefined || CUT_OFF.size === 0) return;
+  if (authored(idempotencyKey)) return;
   const end = idempotencyKey.indexOf("/");
   const execution = end < 0 ? idempotencyKey : idempotencyKey.slice(0, end);
   if (!CUT_OFF.has(execution)) return;
@@ -1590,6 +1809,10 @@ export async function runStoreOp(
 ): Promise<Record<string, unknown>> {
   supported(store);
   const execution = context.execution;
+  // The disjointness the authored namespace rests on, at the store's own
+  // boundary — every op of an execution whose id it would not hold is refused
+  // here, whatever called it (PRD resolved q73).
+  runtime.refuseReservedExecutionId(execution.id);
   const scopeKey = partition(store, execution);
   const key = params.key;
   // A `get_many`'s keys are a CEL list whose length nothing knew before the
@@ -1605,6 +1828,15 @@ export async function runStoreOp(
   // recorded with it in one transaction, so an attempt that failed half way
   // leaves nothing for the next one to trip over.
   const idempotencyKey = writes(op) ? site.idempotencyKey : undefined;
+  // An authored key is a business key two executions share, and an
+  // execution-scoped store's partition is one execution's: the compiler
+  // refuses the pair, and so does this, for a caller that is not the compiler
+  // (PRD resolved q73).
+  if (authored(idempotencyKey) && store.scope === "execution") {
+    throw new Error(
+      `\`${store.address}\` is \`scope: execution\` and was handed the authored idempotency key ${JSON.stringify(idempotencyKey)}: an execution-scoped store's partition is one run's and dies with it, so no second execution ever writes under the key — declare the store \`scope: session\` or \`scope: global\`, or write under the derived key (PRD resolved q73)`,
+    );
+  }
 
   // What `scope: execution` makes this run the owner of, noted **outside** the
   // seam below because a replayed op never enters it (see [`remember`]).
@@ -2182,24 +2414,46 @@ async function perform(
   // other writer — another instance of a `map` in this process, or another
   // process on the same file — can land inside (PRD resolved q68).
   return transact(database, () => {
+    // The op's one clock, read once inside its transaction — a `kv` op's
+    // only, the one kind whose keys and authored ledger rows expire (PRD
+    // resolved q69, q73): what its ledger read judges a row by, what its
+    // sweeps remove and when what it leaves expires.
+    const now = store.kind === "kv" ? localNow() : undefined;
     if (idempotencyKey !== undefined) {
-      const seen = database.get("SELECT result FROM applied WHERE idempotency_key = ?", [
-        idempotencyKey,
-      ]) as Row | null;
-      if (seen !== null) {
-        return { row: redelivered(store, op, String(seen["result"])), deduped: true };
+      const seen = (
+        now === undefined
+          ? database.get("SELECT op, result FROM applied WHERE idempotency_key = ?", [
+              idempotencyKey,
+            ])
+          : database.get(
+              `SELECT op, result FROM applied WHERE idempotency_key = ? AND ${liveClause("?")}`,
+              [idempotencyKey, now],
+            )
+      ) as Row | null;
+      if (seen !== null) return answeredFrom(store, op, idempotencyKey, seen);
+      // An authored key's row may be there and expired, answering nothing: it
+      // goes, so this write's claim takes its place — and with it at most a
+      // hundred of the store's other expired ledger rows, the write half of the
+      // ledger's cleanup schedule (PRD resolved q73).
+      if (authored(idempotencyKey) && now !== undefined) {
+        sweepLocalLedger(database, now);
+        database.run("DELETE FROM applied WHERE idempotency_key = ?", [idempotencyKey]);
       }
     }
     const row =
       store.kind === "kv"
-        ? localKv(store, op, params, scopeKey, database, via)
+        ? localKv(store, op, params, scopeKey, database, via, now ?? localNow())
         : tabular(store, op, params, scopeKey, database, vector);
     if (idempotencyKey !== undefined) {
-      database.run("INSERT INTO applied (idempotency_key, op, result) VALUES (?, ?, ?)", [
-        idempotencyKey,
-        op,
-        JSON.stringify(row),
-      ]);
+      database.run(
+        "INSERT INTO applied (idempotency_key, op, result, expires_at) VALUES (?, ?, ?, ?)",
+        [
+          idempotencyKey,
+          op,
+          JSON.stringify(row),
+          now === undefined ? null : ledgerExpiry(store, idempotencyKey, now),
+        ],
+      );
     }
     return { row, deduped: false };
   });
@@ -2216,7 +2470,8 @@ async function perform(
  *
  * The clock is read once, inside the transaction, and is the op's whole notion
  * of now (PRD resolved q69): what is alive to its read, what its sweep removes,
- * and when the key it leaves expires.
+ * and when the key it leaves expires. [`perform`] reads it, so the ledger row
+ * an authored write leaves is dated by the same instant (PRD resolved q73).
  */
 function localKv(
   store: StoreBinding,
@@ -2225,8 +2480,8 @@ function localKv(
   scopeKey: string,
   database: Database,
   via: Issuer,
+  now: number,
 ): Record<string, unknown> {
-  const now = localNow();
   switch (op) {
     case "get": {
       const key = required(params.key, "key", store);
@@ -2813,14 +3068,16 @@ type Bound = string | number | null;
 /**
  * How one server spells the things the statements below differ in.
  *
- * Six, and each is a spelling rather than a meaning: the ops are **one**
+ * Seven, and each is a spelling rather than a meaning: the ops are **one**
  * implementation of grammar 11.4 rather than two that have to be kept in step,
  * which is the whole reason this interface is narrow. An entry that decided
  * something would be a place two backends could come to mean different things,
  * and the conformance suite would be proving it rather than the servers. The
- * first three are PRD resolved q63's; the other three are q69's, because an
+ * first three are PRD resolved q63's; the next three are q69's, because an
  * expiry needs the one thing a statement cannot carry portably — the server's
- * own clock — and a bounded `DELETE`, which the two servers spell differently.
+ * own clock — and a bounded `DELETE`, which the two servers spell differently;
+ * and the seventh is that bounded `DELETE` read on the ledger, whose authored
+ * rows expire too (PRD resolved q73).
  * The schema is not here for the same reason it is not a statement: a DDL is
  * how a backend spells the *shape* these statements need, which really is
  * per-backend, so each arm holds its own and runs it at open.
@@ -2869,7 +3126,54 @@ interface StoreDialect {
    * the other is waiting for.
    */
   readonly sweepPartition: (limit: number) => string;
+  /**
+   * A `DELETE` of at most `limit` expired rows of one store's idempotency
+   * ledger — authored rows, the only kind that expire (PRD resolved q73).
+   * Binds the store and `now`, in that order.
+   *
+   * Store-wide rather than one partition's, because an authored key is a
+   * store's; and run only under the store's **authored lock**
+   * ([`AUTHORED_LOCK`]), which every write carrying an authored key takes
+   * after its partition's sequence row and before it reads the ledger, and
+   * which each ledger batch of a store-wide sweep takes alone — so no other
+   * statement that touches an authored row is in flight beside it, and it
+   * cannot be half of a deadlock with one.
+   */
+  readonly sweepLedger: (limit: number) => string;
+  /**
+   * An idempotency key as this server's ledger column holds it — a spelling,
+   * not a different key (PRD resolved q73).
+   *
+   * Every derived key is ASCII — an execution id and a path of identifiers
+   * and decimals — but an **authored** one is a string the composition
+   * evaluated, and a column sized for the derived ones may hold only ASCII
+   * (MySQL's: `MYSQL_STORE_SCHEMA`). An arm whose column takes any string
+   * spells every key as it is; one whose column does not spells it reversibly
+   * and injectively into what the column holds, leaving every key that is
+   * already ASCII and holds no `%` byte for byte as it was — so a derived row
+   * an earlier release claimed is found by the same string, and a prefix of a
+   * key spells as a prefix of its spelling, which is what the settlement
+   * prune's range rests on ([`prefixEnd`]). Applied to every key a statement
+   * binds; the trace and the site carry the key as written.
+   */
+  readonly ledgerKey: (idempotencyKey: string) => string;
 }
+
+/**
+ * The partition name of a dialled store's **authored lock** — a row of
+ * `store_sequences` that is no partition's (PRD resolved q73).
+ *
+ * A real partition is `global`, `session/<encoded key>` or `execution/<id>`
+ * ([`partition`]), so `author` is never one. Its row holds no sequence anyone
+ * reads; it is what serializes every statement that touches a store's authored
+ * ledger rows, across connections and processes: a write under an authored key
+ * locks it after its own partition's sequence row — always in that order, so
+ * two writers never wait on each other in a circle — and the ledger half of a
+ * store-wide sweep locks it alone. Two partitions of one store writing one
+ * authored key therefore meet here rather than at the ledger's primary key,
+ * and the second finds the first's committed row and is answered with it.
+ */
+const AUTHORED_LOCK = "author";
 
 /** What one server's connection does, and the whole of it. */
 interface StoreDriver {
@@ -3207,10 +3511,13 @@ class RemoteKv {
    * them.
    */
   prune(store: string, prefix: string): Promise<unknown> {
+    // The prefix as the column spells it: a spelling keeps a prefix a prefix,
+    // and `/` spells as itself, so the range is the same range ([`ledgerKey`]).
+    const spelled = this.#driver.dialect.ledgerKey(prefix);
     return this.#serial(async () => {
       await this.#run(
         "DELETE FROM store_applied WHERE store = ? AND idempotency_key >= ? AND idempotency_key < ?",
-        [store, prefix, prefixEnd(prefix)],
+        [store, spelled, prefixEnd(spelled)],
       );
     });
   }
@@ -3298,23 +3605,92 @@ class RemoteKv {
     if (!writes(op)) {
       return { row: await this.#read(store, op, params, scopeKey), deduped: false };
     }
-    for (let attempt = 0; ; attempt += 1) {
+    const created = new Set<string>();
+    for (;;) {
       const answered =
         op === "batch"
           ? await this.#batch(store, params, scopeKey, idempotencyKey)
           : await this.#write(store, op, params, scopeKey, idempotencyKey, via);
-      if (answered !== undefined) return answered;
-      // The partition's sequence row was not there to lock. It is created on
-      // the partition's first write and deleted only when an execution-scoped
-      // partition's run ends, so a second miss in a row is a server that
-      // answers an insert it then does not show — not a race worth waiting on.
-      if (attempt > 0) {
+      if (!("missing" in answered)) return answered;
+      // A row the write locks was not there: the partition's sequence row, or
+      // the store's authored lock (PRD resolved q73). Each is created on the
+      // first write that needs it, and a partition's is deleted only when an
+      // execution-scoped partition's run ends, so a second miss of the same
+      // row is a server that answers an insert it then does not show — not a
+      // race worth waiting on.
+      if (created.has(answered.missing)) {
         throw new Error(
-          `\`${store.address}\` could not lock its version sequence for partition ${JSON.stringify(scopeKey)}: the row was created and then not found, so this server is not keeping what this store writes (PRD resolved q68)`,
+          `\`${store.address}\` could not lock its version sequence for partition ${JSON.stringify(answered.missing)}: the row was created and then not found, so this server is not keeping what this store writes (PRD resolved q68)`,
         );
       }
-      await this.#createSequence(store, scopeKey);
+      created.add(answered.missing);
+      await this.#createSequence(store, answered.missing);
     }
+  }
+
+  /**
+   * Take the locks a write holds before it reads anything — its partition's
+   * sequence row and, for a write under an authored key, the store's authored
+   * lock after it ([`AUTHORED_LOCK`]) — and answer the partition's last
+   * version, or which of the two rows is not there to lock, having rolled the
+   * transaction back.
+   */
+  async #lockWrite(
+    store: StoreBinding,
+    scopeKey: string,
+    idempotencyKey: string | undefined,
+  ): Promise<number | { readonly missing: string }> {
+    const sequence = await this.#all(
+      "SELECT last FROM store_sequences WHERE store = ? AND scope_key = ? FOR UPDATE",
+      [store.name, scopeKey],
+    );
+    if (sequence.length === 0) {
+      await this.#run("ROLLBACK", []);
+      return { missing: scopeKey };
+    }
+    if (authored(idempotencyKey)) {
+      const lock = await this.#all(
+        "SELECT last FROM store_sequences WHERE store = ? AND scope_key = ? FOR UPDATE",
+        [store.name, AUTHORED_LOCK],
+      );
+      if (lock.length === 0) {
+        await this.#run("ROLLBACK", []);
+        return { missing: AUTHORED_LOCK };
+      }
+    }
+    return Number(sequence[0]?.["last"]);
+  }
+
+  /**
+   * The ledger half of a keyed write, read under its locks: the answer a key
+   * the ledger holds alive is owed, or `undefined` where it holds none —
+   * having, for an authored key, removed the row that was there and expired,
+   * and at most a hundred of the store's other expired ledger rows with it
+   * (PRD resolved q73).
+   */
+  async #ledgerAnswer(
+    store: StoreBinding,
+    op: StoreOp,
+    idempotencyKey: string,
+    now: number,
+  ): Promise<Applied | undefined> {
+    const spelled = this.#driver.dialect.ledgerKey(idempotencyKey);
+    const seen = await this.#all(
+      `SELECT op, result FROM store_applied WHERE store = ? AND idempotency_key = ? AND ${liveClause("?")}`,
+      [store.name, spelled, now],
+    );
+    const held = seen[0];
+    if (held !== undefined && held["result"] !== undefined && held["result"] !== null) {
+      return answeredFrom(store, op, idempotencyKey, held);
+    }
+    if (authored(idempotencyKey)) {
+      await this.#run(this.#driver.dialect.sweepLedger(SWEEP_PER_WRITE), [store.name, now]);
+      await this.#run(
+        "DELETE FROM store_applied WHERE store = ? AND idempotency_key = ? AND expires_at <= ?",
+        [store.name, spelled, now],
+      );
+    }
+    return undefined;
   }
 
   /**
@@ -3365,6 +3741,14 @@ class RemoteKv {
    *
    * A partial update whose result the schema refuses throws out of
    * [`decideKvWrite`], and the `ROLLBACK` takes nothing with it but the locks.
+   *
+   * **A write under an authored key** (PRD resolved q73) takes one lock more,
+   * the store's authored lock, after the sequence row and before anything is
+   * read ([`#lockWrite`]): an authored key is a store's rather than a
+   * partition's, so two writers of it may hold two partitions' sequence rows,
+   * and this is where the second waits for the first's commit — and then finds
+   * its ledger row. The ledger is read by the store's clock, so an authored row
+   * whose `default_ttl:` has run out answers nothing ([`#ledgerAnswer`]).
    */
   async #write(
     store: StoreBinding,
@@ -3373,35 +3757,25 @@ class RemoteKv {
     scopeKey: string,
     idempotencyKey: string | undefined,
     via: Issuer,
-  ): Promise<Applied | undefined> {
+  ): Promise<Applied | { readonly missing: string }> {
     const key = required(params.key, "key", store);
     await this.#run("BEGIN", []);
     let row: Record<string, unknown>;
     try {
-      const sequence = await this.#all(
-        "SELECT last FROM store_sequences WHERE store = ? AND scope_key = ? FOR UPDATE",
-        [store.name, scopeKey],
-      );
-      if (sequence.length === 0) {
-        await this.#run("ROLLBACK", []);
-        return undefined;
-      }
-      const last = Number(sequence[0]?.["last"]);
+      const locked = await this.#lockWrite(store, scopeKey, idempotencyKey);
+      if (typeof locked !== "number") return locked;
+      const last = locked;
+      // The server's clock, read once and after the locks: the instant this
+      // write judges its key and its ledger row by, sweeps by and dates the
+      // key and the row it leaves from (PRD resolved q69, q73).
+      const now = await this.#now();
       if (idempotencyKey !== undefined) {
-        const seen = await this.#all(
-          "SELECT result FROM store_applied WHERE store = ? AND idempotency_key = ?",
-          [store.name, idempotencyKey],
-        );
-        const result = seen[0]?.["result"];
-        if (result !== undefined && result !== null) {
+        const answered = await this.#ledgerAnswer(store, op, idempotencyKey, now);
+        if (answered !== undefined) {
           await this.#run("ROLLBACK", []);
-          return { row: redelivered(store, op, String(result)), deduped: true };
+          return answered;
         }
       }
-      // The server's clock, read once and after the locks: the instant this
-      // write judges its key by, sweeps by and dates the key it leaves from
-      // (PRD resolved q69).
-      const now = await this.#now();
       // A write to a partition is the first half of the cleanup schedule: at
       // most a hundred of its expired rows leave storage — under the
       // partition's sequence lock, so no other write to it is in flight — before
@@ -3462,14 +3836,7 @@ class RemoteKv {
         }
       }
       if (idempotencyKey !== undefined) {
-        const claimed = await this.#run(
-          "INSERT INTO store_applied (store, scope_key, idempotency_key, op, result) " +
-            `VALUES (?, ?, ?, ?, ?) ${this.#driver.dialect.ignore(
-              "(store, idempotency_key)",
-              "idempotency_key = idempotency_key",
-            )}`,
-          [store.name, scopeKey, idempotencyKey, op, JSON.stringify(row)],
-        );
+        const claimed = await this.#claim(store, scopeKey, idempotencyKey, op, row, now);
         if (claimed === 0) {
           await this.#run("ROLLBACK", []);
           return await this.#claimedElsewhere(store, op, idempotencyKey);
@@ -3512,32 +3879,24 @@ class RemoteKv {
     params: StoreParams,
     scopeKey: string,
     idempotencyKey: string | undefined,
-  ): Promise<Applied | undefined> {
+  ): Promise<Applied | { readonly missing: string }> {
     const entries = batchEntries(store, params);
     await this.#run("BEGIN", []);
     let row: Record<string, unknown>;
     try {
-      const sequence = await this.#all(
-        "SELECT last FROM store_sequences WHERE store = ? AND scope_key = ? FOR UPDATE",
-        [store.name, scopeKey],
-      );
-      if (sequence.length === 0) {
-        await this.#run("ROLLBACK", []);
-        return undefined;
-      }
-      const first = Number(sequence[0]?.["last"]);
+      // The locks a single write takes, in its order — an authored key's
+      // included (PRD resolved q73) — and its ledger read by its clock.
+      const locked = await this.#lockWrite(store, scopeKey, idempotencyKey);
+      if (typeof locked !== "number") return locked;
+      const first = locked;
+      const now = await this.#now();
       if (idempotencyKey !== undefined) {
-        const seen = await this.#all(
-          "SELECT result FROM store_applied WHERE store = ? AND idempotency_key = ?",
-          [store.name, idempotencyKey],
-        );
-        const result = seen[0]?.["result"];
-        if (result !== undefined && result !== null) {
+        const answered = await this.#ledgerAnswer(store, "batch", idempotencyKey, now);
+        if (answered !== undefined) {
           await this.#run("ROLLBACK", []);
-          return { row: redelivered(store, "batch", String(result)), deduped: true };
+          return answered;
         }
       }
-      const now = await this.#now();
       await this.#run(this.#driver.dialect.sweepPartition(SWEEP_PER_WRITE), [
         store.name,
         scopeKey,
@@ -3599,14 +3958,7 @@ class RemoteKv {
       }
       await this.#run("RELEASE SAVEPOINT batch_entries", []);
       if (idempotencyKey !== undefined) {
-        const claimed = await this.#run(
-          "INSERT INTO store_applied (store, scope_key, idempotency_key, op, result) " +
-            `VALUES (?, ?, ?, ?, ?) ${this.#driver.dialect.ignore(
-              "(store, idempotency_key)",
-              "idempotency_key = idempotency_key",
-            )}`,
-          [store.name, scopeKey, idempotencyKey, "batch", JSON.stringify(row)],
-        );
+        const claimed = await this.#claim(store, scopeKey, idempotencyKey, "batch", row, now);
         if (claimed === 0) {
           await this.#run("ROLLBACK", []);
           return await this.#claimedElsewhere(store, "batch", idempotencyKey);
@@ -3621,6 +3973,36 @@ class RemoteKv {
   }
 
   /**
+   * Claim a keyed write's ledger row — the whole answer, and the instant an
+   * authored row stops answering (PRD resolved q73) — and answer how many rows
+   * the claim inserted: `0` where another attempt's row is already there.
+   */
+  async #claim(
+    store: StoreBinding,
+    scopeKey: string,
+    idempotencyKey: string,
+    op: StoreOp,
+    row: Record<string, unknown>,
+    now: number,
+  ): Promise<number> {
+    return await this.#run(
+      "INSERT INTO store_applied (store, scope_key, idempotency_key, op, result, expires_at) " +
+        `VALUES (?, ?, ?, ?, ?, ?) ${this.#driver.dialect.ignore(
+          "(store, idempotency_key)",
+          "idempotency_key = idempotency_key",
+        )}`,
+      [
+        store.name,
+        scopeKey,
+        this.#driver.dialect.ledgerKey(idempotencyKey),
+        op,
+        JSON.stringify(row),
+        ledgerExpiry(store, idempotencyKey, now),
+      ],
+    );
+  }
+
+  /**
    * The answer a claim that conflicted is owed: the row that won it.
    *
    * Read after the rollback rather than inside the transaction, because the row
@@ -3628,16 +4010,16 @@ class RemoteKv {
    */
   async #claimedElsewhere(store: StoreBinding, op: StoreOp, idempotencyKey: string): Promise<Applied> {
     const held = await this.#all(
-      "SELECT result FROM store_applied WHERE store = ? AND idempotency_key = ?",
-      [store.name, idempotencyKey],
+      "SELECT op, result FROM store_applied WHERE store = ? AND idempotency_key = ?",
+      [store.name, this.#driver.dialect.ledgerKey(idempotencyKey)],
     );
     const result = held[0]?.["result"];
-    if (result === undefined || result === null) {
+    if (held[0] === undefined || result === undefined || result === null) {
       throw new Error(
         `\`${store.address}\` refused a write under an idempotency key its ledger holds and then could not read what that key answered; the ledger row and the effect it dedupes are written in one transaction, so this server is not the one that took the write (grammar 9.4, PRD 5.8)`,
       );
     }
-    return { row: redelivered(store, op, String(result)), deduped: true };
+    return answeredFrom(store, op, idempotencyKey, held[0]);
   }
 
   /** The `kv` reads of grammar 11.4's catalogue, as this server answers them. */
@@ -3800,9 +4182,52 @@ class RemoteKv {
       [store.name, now],
     );
     const found = oldest[0]?.["scope_key"];
-    if (found === undefined || found === null) return undefined;
-    const scopeKey = String(found);
-    return { scopeKey, removed: await this.#sweepBatch(store, scopeKey, now) };
+    if (found !== undefined && found !== null) {
+      const scopeKey = String(found);
+      return { scopeKey, removed: await this.#sweepBatch(store, scopeKey, now) };
+    }
+    // The entries are done: then the ledger's expired rows, authored ones all
+    // (PRD resolved q73), found by a read that locks nothing and removed a
+    // batch at a time under the store's authored lock.
+    const ledger = await this.#all(
+      "SELECT idempotency_key FROM store_applied WHERE store = ? AND expires_at <= ? ORDER BY expires_at LIMIT 1",
+      [store.name, now],
+    );
+    if (ledger.length === 0) return undefined;
+    return { scopeKey: AUTHORED_LOCK, removed: await this.#sweepLedgerBatch(store, now) };
+  }
+
+  /**
+   * One batch of the ledger half of a store-wide sweep, in its own transaction
+   * under the store's authored lock, taken alone ([`AUTHORED_LOCK`]): at most
+   * [`SWEEP_PER_BATCH`] ledger rows expired by `now` (PRD resolved q73).
+   *
+   * An expired ledger row is an authored one, written by a write that held
+   * the lock, so the lock row is there; a batch that finds none removes
+   * nothing, and the step that asked ends the sweep the way a stalled
+   * partition does.
+   */
+  async #sweepLedgerBatch(store: StoreBinding, now: number): Promise<number> {
+    await this.#run("BEGIN", []);
+    try {
+      const lock = await this.#all(
+        "SELECT last FROM store_sequences WHERE store = ? AND scope_key = ? FOR UPDATE",
+        [store.name, AUTHORED_LOCK],
+      );
+      if (lock.length === 0) {
+        await this.#run("ROLLBACK", []);
+        return 0;
+      }
+      const removed = await this.#run(this.#driver.dialect.sweepLedger(SWEEP_PER_BATCH), [
+        store.name,
+        now,
+      ]);
+      await this.#run("COMMIT", []);
+      return removed;
+    } catch (error) {
+      await this.#run("ROLLBACK", []).catch(() => undefined);
+      throw error;
+    }
   }
 
   /**

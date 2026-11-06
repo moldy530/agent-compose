@@ -40,8 +40,18 @@
 // backlog is alive to the probe's own write, whose sweep of its partition
 // takes nothing, and the batches are the only thing removing rows.
 //
-// Usage: bun store-sweep-batches.mjs <project> <provider> <data directory> <binding json> <probes>
-//        bun store-sweep-batches.mjs --count <provider> <binding json>
+// **The ledger's half of the sweep** (PRD resolved q73) is counted the same
+// way, with `ledger` as the last argument: once a store's keys are swept, its
+// expired ledger rows — authored ones, the only ledger rows with an expiry —
+// leave a batch at a time behind the ops too (`#sweepLedgerBatch` on a server,
+// the second table of `startLocalSweep` on SQLite), at most the same 1000 a
+// batch. That count is the store's whole ledger backlog, as one number under
+// `ledger`: an authored row is a store's rather than a partition's. The
+// probes' own ledger rows are derived ones, which never expire, so they are
+// never part of it.
+//
+// Usage: bun store-sweep-batches.mjs <project> <provider> <data directory> <binding json> <probes> [entries|ledger]
+//        bun store-sweep-batches.mjs --count <provider> <binding json> [entries|ledger]
 // The first prints one JSON object: `observed`, the backlog by partition at each
 // probe, and `after`, the backlog once this process has let go of the store.
 // The second is the count a probe on a server spawns: the backlog by
@@ -58,11 +68,24 @@ import { z } from "zod";
 const CLOCK = "AGENT_COMPOSE_STORE_CLOCK_OFFSET_MS";
 
 /**
- * The rows still waiting to be swept, by partition: every row with an expiry,
- * since nothing but the backlog the parent laid down carries one — the keys
- * that give each partition its sequence row, and the probe's, never expire.
+ * The rows still waiting to be swept: every row with an expiry, since nothing
+ * but the backlog the parent laid down carries one — the keys that give each
+ * partition its sequence row, and the probe's, never expire, and neither does
+ * a derived ledger row. Of the keys, by partition (`entries`); of the ledger,
+ * as one count (`ledger`). `store` is the placeholder a server's statement
+ * binds the store's name to, and is absent on SQLite, whose file is the
+ * store's.
  */
-const BACKLOG = "expires_at IS NOT NULL GROUP BY scope_key";
+function backlog(table, store = undefined) {
+  const where = store === undefined ? "" : `store = ${store} AND `;
+  if (table === "ledger") {
+    const from = store === undefined ? "applied" : "store_applied";
+    return `SELECT 'ledger' AS scope_key, COUNT(*) AS n FROM ${from} WHERE ${where}expires_at IS NOT NULL`;
+  }
+  if (table !== "entries") throw new Error(`there is no \`${table}\` backlog to count: \`entries\` or \`ledger\``);
+  const from = store === undefined ? "entries" : "store_entries";
+  return `SELECT scope_key, COUNT(*) AS n FROM ${from} WHERE ${where}expires_at IS NOT NULL GROUP BY scope_key`;
+}
 
 /** A count's rows, as one object of partition → rows. */
 const byPartition = (rows) => Object.fromEntries(rows.map((row) => [String(row.scope_key), Number(row.n)]));
@@ -70,7 +93,7 @@ const byPartition = (rows) => Object.fromEntries(rows.map((row) => [String(row.s
 if (process.argv[2] === "--count") {
   // The child a probe on a server waits for: one connection of its own, the
   // way an operator would look, and the count it prints.
-  const [, , , provider, binding] = process.argv;
+  const [, , , provider, binding, table = "entries"] = process.argv;
   const store = JSON.parse(binding);
   const address = process.env[store.backend.urlEnv];
   if (provider === "postgres") {
@@ -80,10 +103,7 @@ if (process.argv[2] === "--count") {
     client.on("error", () => undefined);
     await client.connect();
     try {
-      const { rows } = await client.query(
-        `SELECT scope_key, COUNT(*) AS n FROM store_entries WHERE store = $1 AND ${BACKLOG}`,
-        [store.name],
-      );
+      const { rows } = await client.query(backlog(table, "$1"), [store.name]);
       process.stdout.write(JSON.stringify(byPartition(rows)));
     } finally {
       await client.end().catch(() => undefined);
@@ -94,10 +114,7 @@ if (process.argv[2] === "--count") {
     const connection = await createConnection({ uri: address });
     connection.on("error", () => undefined);
     try {
-      const [rows] = await connection.query(
-        `SELECT scope_key, COUNT(*) AS n FROM store_entries WHERE store = ? AND ${BACKLOG}`,
-        [store.name],
-      );
+      const [rows] = await connection.query(backlog(table, "?"), [store.name]);
       process.stdout.write(JSON.stringify(byPartition(rows)));
     } finally {
       await connection.end().catch(() => undefined);
@@ -106,12 +123,15 @@ if (process.argv[2] === "--count") {
   process.exit(0);
 }
 
-const [, , project, provider, data, binding, probes] = process.argv;
+const [, , project, provider, data, binding, probes, table = "entries"] = process.argv;
 if (probes === undefined) {
   throw new Error(
-    "usage: bun store-sweep-batches.mjs <project> <provider> <data directory> <binding json> <probes>",
+    "usage: bun store-sweep-batches.mjs <project> <provider> <data directory> <binding json> <probes> [entries|ledger]",
   );
 }
+// A table there is no backlog of is refused here, before any op, rather than
+// by the first count.
+backlog(table);
 process.env["AGENT_COMPOSE_DATA_DIR"] = data;
 
 const stores = await import(pathToFileURL(path.resolve(project, "src/stores.ts")).href);
@@ -119,19 +139,19 @@ const stores = await import(pathToFileURL(path.resolve(project, "src/stores.ts")
 /** The SQLite driver, loaded before any count so that a count is synchronous. */
 const sqlite = provider === "sqlite" ? await import("node-sqlite3-wasm") : undefined;
 
-/** The backlog by partition, from this process, synchronously. */
+/** The backlog by partition — or the ledger's, as one count — from this process, synchronously. */
 function counted() {
   if (sqlite !== undefined) {
     const { Database } = sqlite.default ?? sqlite;
     const database = new Database(path.join(data, "stores", `${stores.encodeKey(store.name)}.sqlite`));
     try {
       database.exec("PRAGMA busy_timeout = 5000;");
-      return byPartition(database.all(`SELECT scope_key, COUNT(*) AS n FROM entries WHERE ${BACKLOG}`));
+      return byPartition(database.all(backlog(table)));
     } finally {
       database.close();
     }
   }
-  const child = spawnSync(process.execPath, [fileURLToPath(import.meta.url), "--count", provider, binding], {
+  const child = spawnSync(process.execPath, [fileURLToPath(import.meta.url), "--count", provider, binding, table], {
     encoding: "utf8",
     timeout: 30_000,
   });

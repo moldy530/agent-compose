@@ -631,6 +631,11 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "a_write_an_earlier_release_recorded_still_dedupes",
     "if_version_zero_names_a_key_an_earlier_release_wrote",
     "an_upgraded_partitions_sequence_starts_past_what_it_holds",
+    // …and the ledger a release before PRD resolved q73 created, brought
+    // forward the same way: an `expires_at` on every arm, `NULL` on every row
+    // it held, and an authored write that dedupes over it.
+    "a_store_from_before_authored_keys_takes_every_opener_at_once",
+    "a_ledger_from_before_authored_keys_is_migrated_on_open",
     // The trace: a write record carries `applied` and `version`, and a tool's
     // carries neither an idempotency key nor `deduped`.
     "a_node_write_record_carries_applied_version_and_its_key",
@@ -747,6 +752,9 @@ const TRUE_EVERYWHERE: &[&str] = &[
     // than applying one its ledger can no longer answer.
     "a_command_letting_go_prunes_what_a_running_delivery_held_back",
     "a_delivery_cut_off_by_its_command_is_refused_a_keyed_write",
+    // …but not a write under an authored key, whose row no prune removes
+    // (PRD resolved q73).
+    "a_delivery_cut_off_by_its_command_still_makes_an_authored_write",
     // …and so does a `serve` when it is stopped, the one exit it has: nothing
     // comes back for a settled execution afterwards, so the stop starts the
     // prune and refuses the delivery's keyed write the same way — while
@@ -880,6 +888,60 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "every_key_two_racing_batches_wrote_holds_the_last_batchs_value",
     "a_reader_beside_two_racing_batches_never_finds_one_half_landed",
     "two_processes_racing_batches_into_adjacent_partitions_all_apply",
+    // PRD resolved q73: an authored idempotency key — `author/<store>/<key>`,
+    // a business key two executions share. The second execution's write is
+    // answered with the first's whole row and writes nothing; the namespace
+    // carries the store, and is disjoint from every derived key; it is a
+    // store's and not a partition's; two processes racing one key apply it
+    // once; the settlement prune never takes it; it lives as long as the
+    // store's `default_ttl:`, and for good without one; a batch dedupes whole;
+    // and what it refuses is refused by name.
+    "a_second_execution_under_an_authored_key_is_answered_with_the_firsts_row",
+    "an_authored_key_holds_the_first_executions_value_and_version",
+    "a_retry_under_an_authored_key_dedupes_the_same_way",
+    "an_authored_write_record_carries_the_ledger_key_as_carried",
+    "two_different_authored_keys_both_apply",
+    "the_same_authored_key_on_two_stores_applies_on_both",
+    "a_derived_and_an_authored_write_are_independent_ledger_rows",
+    "a_delete_under_an_authored_key_a_set_took_fails_naming_both",
+    "an_authored_key_past_ascii_applies_and_dedupes",
+    "two_session_partitions_sharing_an_authored_key_dedupe_against_each_other",
+    "two_partitions_racing_one_authored_key_apply_it_once",
+    "two_processes_writing_one_authored_key_apply_it_once",
+    "two_processes_in_two_partitions_writing_one_authored_key_apply_it_once",
+    "a_settled_executions_prune_takes_its_derived_rows_and_leaves_its_authored_one",
+    "an_authored_key_answers_within_the_stores_default_ttl",
+    "an_authored_key_past_the_stores_default_ttl_applies_again",
+    "an_expired_authored_row_leaves_storage_at_the_next_authored_write",
+    "an_expired_authored_row_leaves_storage_when_a_process_next_starts",
+    "an_authored_row_on_a_store_without_default_ttl_answers_after_any_wait",
+    // …and the default is the store's, never the write's (D157): a row written
+    // with a ten-minute `ttl:` still answers at eleven, and one written
+    // `ttl: never` stops answering with the store's hour.
+    "an_authored_row_outlives_a_shorter_ttl_its_write_gave_the_key",
+    "an_authored_row_written_with_ttl_never_expires_with_the_stores_default",
+    // …and the ledger's cleanup is bounded as a key's is: a write under an
+    // authored key removes at most 100 of the store's expired ledger rows —
+    // inside a transaction that, on a server, holds the store's authored lock
+    // — and the start sweep takes them at most 1000 a batch, counted between
+    // batches (`store-sweep-batches.mjs` with `ledger`).
+    "an_authored_writes_ledger_sweep_removes_at_most_100_rows",
+    "an_expired_ledger_backlog_leaves_storage_at_the_next_authored_writes",
+    "the_start_sweep_takes_at_most_1000_ledger_rows_a_batch",
+    // …while a derived row on a store with `default_ttl:` never expires: a
+    // retry of an open execution's write, long past the default, is still
+    // answered by its row, which carries no expiry (PRD resolved q69(d)).
+    "a_derived_row_on_a_store_with_default_ttl_never_expires",
+    // Two nodes naming one authored key with different ops: the later is
+    // answered with the first's row wherever that row holds every field its
+    // own output declares, and fails naming both where it does not.
+    "partial_updates_under_one_authored_key_answer_one_another",
+    "a_set_after_a_partial_update_under_one_authored_key_is_answered_without_its_value",
+    "a_partial_update_after_a_set_under_one_authored_key_fails_naming_both",
+    "a_batch_under_an_authored_key_dedupes_whole",
+    "an_authored_key_on_an_execution_scoped_store_is_refused",
+    "an_execution_id_in_the_authored_namespace_is_refused_by_the_store_and_the_journal",
+    "every_derived_child_execution_id_is_outside_the_authored_namespace",
 ];
 
 /// The order every arm pages a mixed set in: UTF-8 byte order, which Rust's
@@ -980,6 +1042,14 @@ const TRUE_WHEN_DIALLED: &[&str] = &[
     // holds alive, and one ten days slow still takes a key it holds expired.
     "a_store_wide_sweep_keeps_a_key_the_servers_clock_holds_alive",
     "a_store_wide_sweep_takes_a_key_the_servers_clock_holds_expired",
+    // PRD resolved q73: an authored ledger row's expiry is the server's clock
+    // plus the store's `default_ttl:` too — the instant the key beside it holds
+    // — so writers whose own clocks disagree agree about when a business key
+    // stops deduping; and a redelivery with this process's clock ten days the
+    // other way is still answered by the row, which the ledger read judges by
+    // the server's clock.
+    "an_authored_rows_expiry_is_computed_by_the_servers_clock",
+    "a_dialled_ledger_read_answers_an_authored_row_the_servers_clock_holds_alive",
     // PRD resolved q69 (c): the two halves of the cleanup schedule — a write's
     // sweep of its partition and the store-wide sweep a connection's first op
     // starts — run at once in two processes over one backlog without either
