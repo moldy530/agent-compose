@@ -615,15 +615,23 @@ fn execute_held(
         // a finally node the stop started raised travels beside it, as on every
         // ending (§3.4).
         (said, _, Some(detail)) => {
+            // What the stop came to: a runner that answered the signal ran its
+            // finally nodes and exited; one still running when the grace ran
+            // out had its group ended, and nothing says those nodes finished.
+            let ending = match &status {
+                Ok(status) if status.code().is_none() => {
+                    "its process group was ended when the stop's grace ran out"
+                }
+                _ => "the finally nodes it began ran on the worker",
+            };
             let mut body = json!({
                 "dispatch_id": id,
                 "error": {
                     "name": "WorkerEffectsRefused",
                     "message": format!(
-                        "{detail}. The node runner was stopped as a stop stops it, so the \
-                         finally nodes it began ran on the worker, and the {unsent} effect \
-                         record(s) it wrote after the refused batch were not sent \
-                         (docs/distributed.md §3.3)"
+                        "{detail}. The node runner was stopped as a stop stops it — {ending} — \
+                         and the {unsent} effect record(s) it wrote after the refused batch \
+                         were not sent (docs/distributed.md §3.3)"
                     ),
                 },
             });

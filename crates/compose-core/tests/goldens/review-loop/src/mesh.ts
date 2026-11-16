@@ -2265,7 +2265,7 @@ async function effects(request: FastifyRequest, reply: FastifyReply): Promise<un
       // journals, and the record's position is what finds it in a batch.
       return reply.code(400).send({
         dispatch_id: id,
-        error: `record ${index} of the batch: ${read.reason}. ${RECORD_RULE}`,
+        error: `record ${index} of the batch: ${read.reason}; ${RECORD_RULE}`,
       });
     }
     records.push(read.record);
