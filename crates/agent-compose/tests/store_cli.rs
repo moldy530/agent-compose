@@ -64,6 +64,12 @@
 //!    `--session`, and on a dialled arm the command, handed a parked run's
 //!    execution id, reads what that execution wrote — the very end of
 //!    [`drive`];
+//!  * **the command's environment is its store's backend references alone**
+//!    (PRD resolved q82, Decision D166): a `count` with a model provider's and
+//!    a trigger's variables unset succeeds, the backend's own variable unset is
+//!    refused exit `2` naming only it, `run` is still refused over the
+//!    provider's — and the emitted project run by hand skips its load-time
+//!    check for `store` alone — [`environment`], once per arm;
 //!  * a composition the compiler refuses, reported on stderr for an `export`
 //!    and never among its lines —
 //!    [`a_refused_composition_is_reported_beside_an_exports_summary_not_among_its_lines`];
@@ -2639,6 +2645,286 @@ fn a_store_a_target_binds_to_memory_is_refused_rather_than_read_from_an_empty_on
             arguments.join(" ")
         );
     }
+}
+
+/// The variable the environment composition's model provider is reached at.
+const PROVIDER_URL: &str = "AGENT_COMPOSE_CLI_PROVIDER_URL";
+
+/// …and the token its `http` trigger checks a caller's bearer against.
+const WEBHOOK_TOKEN: &str = "AGENT_COMPOSE_CLI_WEBHOOK_TOKEN";
+
+/// Where the dialled arm's backend entry is written, as a refusal names it.
+const STORE_SITE: &str = "deploy.storage_backends.aliases.cli_db.url";
+
+/// A composition whose hub needs three variables a `store` command spends at
+/// most one of: a model provider's `${PROVIDER_URL}`, an `http` trigger's
+/// `${WEBHOOK_TOKEN}`, and — on a dialled arm — the store's own backend's
+/// `${STORE_URL}` (PRD resolved q82).
+fn environment_composition(suffix: &str) -> String {
+    format!(
+        r#"version: "0.1"
+
+provider.vendor:
+  kind: openai_compatible
+  base_url: ${{{PROVIDER_URL}}}
+
+model.smart:
+  provider: provider.vendor
+  id: some-model
+
+agent.helper:
+  model: model.smart
+  prompt: Help.
+  input: {{ q: {{ type: string }} }}
+  output: {{ a: {{ type: string }} }}
+
+store.health_{suffix}:
+  kind: kv
+  scope: global
+  description: What a health check counts.
+  backend: cli_db
+  value_schema:
+    text: {{ type: string }}
+
+flow.ask:
+  inputs:
+    q: {{ type: string }}
+  outputs: {{}}
+  nodes:
+    ask:
+      agent: agent.helper
+      input:
+        q: "input.q"
+  edges:
+    - {{ from: start, to: ask }}
+    - {{ from: ask, to: end }}
+
+triggers:
+  hook:
+    type: http
+    flow: flow.ask
+    path: /ask
+    auth:
+      bearer:
+        token: ${{{WEBHOOK_TOKEN}}}
+"#
+    )
+}
+
+/// **A `store` command's environment is its store's backend references alone**
+/// (PRD resolved q82, Decision D166), on one arm.
+///
+/// The ruling's case: `store count` used as a health check refused over a
+/// model provider's URL and read as data loss. Asked of the whole chain and of
+/// each half of it:
+///
+///  * through `agent-compose store` — the launcher's manifest and the emitted
+///    project's both — a `count` with the provider's and the trigger's
+///    variables unset succeeds;
+///  * on a dialled arm, the same `count` with the backend's **own** variable
+///    unset is refused, exit `2`, naming only that variable and its site;
+///  * `agent-compose run` on the same composition is still refused naming the
+///    provider's variable — the hub's manifest is unchanged;
+///  * the emitted project driven by hand (`bun src/index.ts …`, which is what an
+///    ejected project's operator types): its load-time check does not fire for
+///    `store`, and does for `run` — and on a dialled arm its `store` verb
+///    refuses the backend's own variable itself, exit `2`, with
+///    `readEnvironment`'s message, before anything is opened.
+fn environment(arm: &Arm) {
+    let address = match arm.variable {
+        None => None,
+        Some(variable) => match std::env::var(variable) {
+            Ok(value) if !value.is_empty() => Some(value),
+            _ => {
+                assert!(
+                    !required(),
+                    "`{variable}` is required in CI: it names the `{}` server the store \
+                     command's environment is checked against (PRD resolved q82)",
+                    arm.provider
+                );
+                notice(&format!(
+                    "warning: skipping the store command's `{}` environment arm — `{variable}` \
+                     names no server. Point it at one to run it.",
+                    arm.provider
+                ));
+                return;
+            }
+        },
+    };
+    let Some(out) = scratch_project(&format!("store-cli-environment-{}", arm.provider)) else {
+        return;
+    };
+    let out = Scratch::at(out);
+    let suffix = run_unique();
+    let store = format!("store.health_{suffix}");
+    let source = Scratch::new(&format!("store-cli-environment-{}", arm.provider));
+    let entrypoint = source.path().join("main.yml");
+    std::fs::write(&entrypoint, environment_composition(&suffix))
+        .expect("the scratch area is writable");
+    let (target, backend): (&str, Vec<(String, String)>) = match &address {
+        None => ("local", Vec::new()),
+        Some(address) => {
+            std::fs::create_dir_all(source.path().join("deploy"))
+                .expect("the scratch area is writable");
+            std::fs::write(
+                source.path().join("deploy/remote.yml"),
+                format!(
+                    "version: \"0.1\"\nstorage_backends:\n  aliases:\n    cli_db: {{ provider: {}, url: \"${{{STORE_URL}}}\" }}\n",
+                    arm.provider
+                ),
+            )
+            .expect("the scratch area is writable");
+            ("remote", vec![(STORE_URL.to_string(), address.clone())])
+        }
+    };
+    // `agent-compose <verb…> --target … --out … main.yml <operands…>`, in
+    // exactly `environment` and nothing else.
+    let compose = |verb: &[&str], operands: &[&str], environment: &[(String, String)]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-compose"));
+        command
+            .args(verb)
+            .args(["--target", target])
+            .arg("--out")
+            .arg(out.path())
+            .arg(&entrypoint)
+            .args(operands);
+        seal(&mut command, environment);
+        Answer {
+            what: format!(
+                "{} {} (with {:?} set)",
+                verb.join(" "),
+                operands.join(" "),
+                environment
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>()
+            ),
+            output: command
+                .stdin(Stdio::null())
+                .output()
+                .expect("the command runs"),
+        }
+    };
+    let by_hand = |arguments: &[&str], environment: &[(String, String)]| {
+        let mut command = bun();
+        command
+            .arg(out.path().join("src/index.ts"))
+            .args(arguments)
+            .current_dir(out.path());
+        seal(&mut command, environment);
+        Answer {
+            what: format!("(by hand) bun src/index.ts {}", arguments.join(" ")),
+            output: command.stdin(Stdio::null()).output().expect("bun runs"),
+        }
+    };
+    let unrelated = |said: &str, what: &str| {
+        for variable in [PROVIDER_URL, WEBHOOK_TOKEN] {
+            assert!(
+                !said.contains(variable),
+                "{what} named `{variable}`, which the store command never spends:\n{said}"
+            );
+        }
+    };
+
+    // The health check, with the provider's and the trigger's variables unset
+    // and the backend's own set where it has one.
+    let counted = compose(&["store", "count"], &[&store, "--format", "json"], &backend);
+    counted.exits(0);
+    assert_eq!(
+        counted.json(),
+        json!({ "count": 0 }),
+        "the command reached the store and counted it"
+    );
+    unrelated(&counted.stderr(), "`store count`");
+
+    // `run` on the same composition is still the hub, and still refused over
+    // the provider's variable — before anything is spawned.
+    let refused_run = compose(&["run"], &["flow.ask", "--input", "q=hello"], &backend);
+    refused_run.exits(2);
+    for variable in [PROVIDER_URL, WEBHOOK_TOKEN] {
+        assert!(
+            refused_run.stderr().contains(&format!("`{variable}`"))
+                && refused_run.stderr().contains("not set"),
+            "`run` is the hub, whose manifest names `{variable}`:\n{}",
+            refused_run.stderr()
+        );
+    }
+
+    // The emitted project by hand, which the launcher no longer stands in front
+    // of: its load-time check stands aside for `store`…
+    let by_hand_count = by_hand(
+        &["store", "count", "--format", "json", "--", &store],
+        &backend,
+    );
+    by_hand_count.exits(0);
+    assert_eq!(by_hand_count.json(), json!({ "count": 0 }));
+    unrelated(&by_hand_count.stderr(), "the emitted `store count`");
+    // …and fires for `run`, naming the provider's variable at load.
+    let by_hand_run = by_hand(&["run", "flow.ask", "--input", "q=hello"], &backend);
+    assert!(
+        !by_hand_run.output.status.success(),
+        "`bun src/index.ts run` loaded with `{PROVIDER_URL}` unset: the load-time check did \
+         not run\nstdout: {}\nstderr: {}",
+        by_hand_run.stdout(),
+        by_hand_run.stderr()
+    );
+    assert!(
+        by_hand_run.stderr().contains("MissingEnvironmentError")
+            && by_hand_run.stderr().contains(PROVIDER_URL),
+        "the emitted project's load-time check names `{PROVIDER_URL}`:\n{}",
+        by_hand_run.stderr()
+    );
+
+    if address.is_none() {
+        return;
+    }
+
+    // The backend's own variable is the one the command needs: refused by the
+    // launcher, exit `2`, naming it and its site and nothing else…
+    let unset = compose(&["store", "count"], &[&store], &[]);
+    unset.exits(2);
+    assert!(
+        unset
+            .stderr()
+            .contains(&format!("`{STORE_URL}` (referenced by `{STORE_SITE}`)"))
+            && unset.stderr().contains("is not set"),
+        "the refusal names the backend's variable and where it is written:\n{}",
+        unset.stderr()
+    );
+    unrelated(&unset.stderr(), "the launcher's refusal");
+    assert_eq!(
+        unset.stdout(),
+        "",
+        "nothing was opened, so nothing is answered"
+    );
+
+    // …and by the emitted verb itself, run by hand: `readEnvironment`'s own
+    // message, as a usage error, before the backend is opened.
+    let unset_by_hand = by_hand(&["store", "count", "--", &store], &[]);
+    unset_by_hand.exits(2);
+    assert!(
+        unset_by_hand.stderr().contains(&format!(
+            "error: missing environment variable: {STORE_URL} (referenced by {STORE_SITE})"
+        )),
+        "the emitted verb refuses the backend's variable with `readEnvironment`'s message:\n{}",
+        unset_by_hand.stderr()
+    );
+    unrelated(&unset_by_hand.stderr(), "the emitted verb's refusal");
+}
+
+#[test]
+fn a_store_command_needs_only_its_backends_environment_on_sqlite() {
+    environment(&SQLITE);
+}
+
+#[test]
+fn a_store_command_needs_only_its_backends_environment_on_postgres() {
+    environment(&POSTGRES);
+}
+
+#[test]
+fn a_store_command_needs_only_its_backends_environment_on_mysql() {
+    environment(&MYSQL);
 }
 
 /// clap's own pages for the verb and each sub-verb, byte for byte.
