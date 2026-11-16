@@ -299,9 +299,10 @@ const CC_SETTINGS: readonly string[] = [
  *    available tool set and the per-call gate over it (`canUseTool`, or
  *    `allowedTools` under the one mode that never consults a callback),
  *    `timeout:` is the abort controller, and `model:` is the model and the one
- *    thinking budget Decision D141 maps into it (`thinking` is here for that
- *    last reason: the SDK documents it as taking precedence over the
- *    `maxThinkingTokens` D141 writes). `allowedTools` is the name of this kind
+ *    thinking setting Decisions D141 and D167 map into it — `maxThinkingTokens`
+ *    for the enabled form, `thinking` and `effort` for the adaptive one, all
+ *    three written by the driver from the `model.*` definition and none of them
+ *    a `settings:` key's to restate. `allowedTools` is the name of this kind
  *    the driver below writes under **one** mode only, and never beside
  *    `canUseTool`: a bare entry there approves a whole tool before the callback
  *    is consulted, which the pinned SDK flags as a shadowed callback (see
@@ -442,6 +443,7 @@ const CC_RESERVED: readonly string[] = [
   "appendSubagentSystemPrompt",
   "canUseTool",
   "cwd",
+  "effort",
   "env",
   "getHostAuthToken",
   "getOAuthToken",
@@ -915,6 +917,22 @@ function ccEnvironment(run: runtime.HarnessRun): Record<string, string> {
  * arrives as the result message's `structured_output`. The adapter parses it
  * against the **full** declared schema, which is where PRD resolved q55's
  * amendment to q16 lives.
+ *
+ * # How hard the model thinks
+ *
+ * The node's model states it, in `thinking:`'s two forms (Decisions D141,
+ * D167), and each lands on an option of the pinned SDK's own. The enabled
+ * form's budget is `maxThinkingTokens`, which the SDK now marks deprecated and
+ * still reads. The adaptive form is `thinking: { type: "adaptive" }`, the
+ * `ThinkingAdaptive` arm of the SDK's `ThinkingConfig`, which its `Options`
+ * documents as taking precedence over `maxThinkingTokens`; and that form's
+ * `effort` is `Options.effort`, typed `EffortLevel` and declared beside it at
+ * 0.3.284. PRD resolved q83 asks for one stderr line per run wherever the
+ * pinned SDK has no place for an effort; this one has a place for every effort
+ * the grammar admits, so the line is never written. A pin that drops the option
+ * is where it would be owed, and `effort` sits on [`CC_RESERVED`] for the
+ * reason `thinking` does: a `settings:` key spelling it would be a second
+ * spelling of what `model:` states.
  */
 const CC_DRIVER: runtime.HarnessDriver = {
   sdk: CC_SDK,
@@ -1062,15 +1080,29 @@ export function ccOptions(
   // default body is a code-implementation workflow, and a node under `plan`
   // is a run that reads and reports (see [`CC_PERMISSION`]).
   if (mode === "plan") options.planModeInstructions = run.instructions;
-  // The one `model.*` setting this harness has a place for: the `anthropic`
-  // plugin's `thinking: { budget_tokens: … }` is the SDK's
-  // `maxThinkingTokens` (Decision D141).
+  // The one `model.*` setting this harness has a place for, in either of its
+  // two forms (Decisions D141, D167). The enabled form's
+  // `thinking: { budget_tokens: … }` is the SDK's `maxThinkingTokens`, as it
+  // always was. The adaptive form is the SDK's own `ThinkingConfig` arm for
+  // it — `thinking: { type: "adaptive" }`, which the pinned `Options` documents
+  // as taking precedence over `maxThinkingTokens` — and its `effort` is
+  // `Options.effort`, which the pinned SDK declares beside it, so an effort
+  // always has a place here (see [`CC_DRIVER`]). The compiler refuses a budget
+  // beside the adaptive form and an effort beside the enabled one, so each
+  // branch reads only its own form's key.
   const thinking = run.modelSettings["thinking"];
-  const budgetTokens =
+  const form =
     typeof thinking === "object" && thinking !== null
-      ? settingNumber((thinking as Record<string, unknown>)["budget_tokens"])
+      ? (thinking as Record<string, unknown>)
       : undefined;
-  if (budgetTokens !== undefined) options.maxThinkingTokens = budgetTokens;
+  if (form?.["type"] === "adaptive") {
+    options.thinking = { type: "adaptive" };
+    const effort = form["effort"];
+    if (typeof effort === "string") options.effort = effort as Options["effort"];
+  } else {
+    const budgetTokens = form === undefined ? undefined : settingNumber(form["budget_tokens"]);
+    if (budgetTokens !== undefined) options.maxThinkingTokens = budgetTokens;
+  }
   const maxTurns = settingNumber(run.settings["max_turns"]);
   if (maxTurns !== undefined) options.maxTurns = maxTurns;
   const budget = settingNumber(run.settings["max_budget_usd"]);
