@@ -764,6 +764,27 @@ A worker SHOULD send a batch as soon as an effect completes rather than
 accumulating until the node ends, because an effect that never reached the hub is
 an effect the replay of §7 cannot skip.
 
+**A refused batch ends the attempt, and stops the runner as a stop does.** A
+batch answered `400` — or with any `4xx` this table does not give the route — is
+one no re-send improves: its records are not in the journal and nothing the
+worker does will put them there, so the dispatch is settled with a
+`WorkerEffectsRefused` failure (§3.4) and the node's own `retry:`/`on_error:`
+decide the run. What it costs is the attempt and nothing more: the worker does
+**not** kill the runner, which would run no `finally:` node and leave the
+instances the placed node began there — an attached `flow.*` whose finally node
+stops a server or puts a working tree back — ended nowhere. It stops the runner
+as a poll's `stop` list does (§3.2, grammar D160, D161): the runner is sent
+`SIGUSR2`, the placed node fails, every instance it began ends `failed` and runs
+its finally node **on the worker**, and the worker reads the runner on to its
+end — holding the grace while a finally node runs, and ending the group only
+once the grace runs out with the runner still running. Nothing the runner
+journals after the refused batch is sent, the finally boundaries those
+instances cross included: a record past a refused one would land beyond a hole
+in the frontier, and a stop's posture is already that what it cuts off is kept
+out of the journal (grammar D160). So the finally nodes run, and the hub's
+journal holds no record of them; the `finally_error` one raised travels on the
+result all the same (§3.4).
+
 ### 3.4 `POST /workers/result`
 
 Carries the session and the `dispatch_id`. The node's outcome: its output, its
@@ -1072,6 +1093,12 @@ the process that was told. A value that is not a string is not a failure to
 report, and is dropped rather than costing the node its attempt. A peer that
 does not send it is one whose finally nodes did not fail — an OPTIONAL field a
 peer of the previous version ignores, which §10.2 makes no bump.
+
+**A dispatch whose effects the hub refused** is one more ending that carries it.
+The worker settles such a dispatch with its `WorkerEffectsRefused` failure only
+once the runner it stopped has ended (§3.3), so the finally nodes the stop
+started have run on the worker by then, and the first failure among them is
+`finally_error` beside that failure — as it is beside a stopped dispatch's.
 
 **An end on the hub is not waited for across the wire.** The instances a placed
 node begins are the worker's: they end there, under the placed node's own clock.

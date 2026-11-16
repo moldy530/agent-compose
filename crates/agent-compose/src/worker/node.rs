@@ -65,6 +65,15 @@
 //! placement with none — and the replacement would reach the same record and die
 //! the same way, so one oversized effect would be a mesh that never runs that
 //! node again.
+//!
+//! # A refused batch stops the runner, as a stop does
+//!
+//! What a refused effect batch costs is the attempt — and only the attempt. The
+//! runner is not killed for it: a kill runs no `finally:` node, and the
+//! instances the placed node began here would be ended nowhere, the cleanup an
+//! attached flow declared never run. So the runner is sent a stop's `SIGUSR2`
+//! and read on to its end, under the grace a stop has (grammar D160, D161), and
+//! nothing it journals after the refused batch is sent ([`refused_batch`]).
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -121,7 +130,9 @@ pub(crate) enum Halt {
     Cancel,
     /// The `stop` list, or a session a `410` ended: the runner is sent
     /// `SIGUSR2`, and the result is whatever the node ended on — which the hub
-    /// refuses `409` and only frees the slot by.
+    /// refuses `409` and only frees the slot by. Also how a runner whose effect
+    /// batch the hub refused is stopped ([`refused_batch`]), whose dispatch
+    /// settles `WorkerEffectsRefused` instead.
     Stop,
 }
 
@@ -406,14 +417,18 @@ pub(crate) fn execute(
         .unwrap_or_default()
         .to_string();
     running.drained_before(handle.generation);
-    let ended = execute_held(hub, sessions, tree, bun, runner, dispatch, &id, handle);
+    let ended = execute_held(
+        hub, sessions, tree, bun, runner, dispatch, &id, running, handle,
+    );
     running.release(&id);
     ended
 }
 
-/// [`execute`], with the dispatch on the books a cancel reads.
+/// [`execute`], with the dispatch on the books a cancel reads — and a refused
+/// batch stops ([`refused_batch`]).
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "one dispatch's whole context, passed through once"
 )]
 fn execute_held(
@@ -424,6 +439,7 @@ fn execute_held(
     runner: &str,
     dispatch: &Value,
     id: &str,
+    running: &Running,
     handle: &Handle,
 ) -> Result<(), Stop> {
     let id = id.to_string();
@@ -502,8 +518,14 @@ fn execute_held(
     // Set where a batch met a status §3.3 does not give the route: the records
     // are not in the journal and nothing this worker does will put them there,
     // so the attempt fails rather than settling with an output whose effects the
-    // replay of §7.2 could not skip.
+    // replay of §7.2 could not skip. **And the runner is stopped, not killed**
+    // ([`refused_batch`]): it is read on to its end, so the finally nodes it
+    // began run here.
     let mut rejected: Option<String> = None;
+    // The effect lines the runner wrote after the refused batch, which are
+    // never sent: a record past a refused one would land beyond a hole in the
+    // frontier (§7.2). Counted, so the failure says what was not sent.
+    let mut unsent: usize = 0;
     // Set where this worker stops reading before the runner stops writing, which
     // is the one case the child has to be **killed** rather than waited on: a
     // process writing into a pipe nobody drains blocks for ever, and a `wait`
@@ -523,6 +545,7 @@ fn execute_held(
             break;
         };
         match said.get("type").and_then(Value::as_str) {
+            Some("effect") if rejected.is_some() => unsent += 1,
             Some("effect") => {
                 let record = said.get("effect").cloned().unwrap_or(Value::Null);
                 match sender.effects(&json!({ "dispatch_id": id, "effects": [record] })) {
@@ -532,8 +555,8 @@ fn execute_held(
                         break;
                     }
                     Err(Unsent::Rejected(detail)) => {
+                        refused_batch(&id, &detail, running);
                         rejected = Some(detail);
-                        break;
                     }
                 }
             }
@@ -588,11 +611,31 @@ fn execute_held(
         // The refusal first, and ahead of a result the runner may already have
         // written: a batch the journal never took is a frontier short of where
         // this attempt actually got to, so settling with the node's own output
-        // would hand the execution a value whose effects nothing recorded.
-        (_, _, Some(detail)) => json!({
-            "dispatch_id": id,
-            "error": { "name": "WorkerEffectsRefused", "message": detail },
-        }),
+        // would hand the execution a value whose effects nothing recorded. What
+        // a finally node the stop started raised travels beside it, as on every
+        // ending (§3.4).
+        (said, _, Some(detail)) => {
+            let mut body = json!({
+                "dispatch_id": id,
+                "error": {
+                    "name": "WorkerEffectsRefused",
+                    "message": format!(
+                        "{detail}. The node runner was stopped as a stop stops it, so the \
+                         finally nodes it began ran on the worker, and the {unsent} effect \
+                         record(s) it wrote after the refused batch were not sent \
+                         (docs/distributed.md §3.3)"
+                    ),
+                },
+            });
+            if let Some(finally_error) = said
+                .as_ref()
+                .and_then(|said| said.get("finally_error"))
+                .filter(|held| held.is_string())
+            {
+                body["finally_error"] = finally_error.clone();
+            }
+            body
+        }
         (Some(body), None, None) => body,
         // §3.4's other half: a dispatch that produced no result is an attempt
         // that failed, and the hub is told so rather than left holding an
@@ -619,6 +662,34 @@ fn execute_held(
         }
     };
     settle(&mut sender, &settling)
+}
+
+/// A batch the hub refused: **stop the runner as a stop stops it** (§3.3,
+/// grammar D160, D161).
+///
+/// The refusal ends the attempt — the records are not in the journal and no
+/// re-send puts them there. Ending the runner with it would run no `finally:`
+/// node, so the instances the placed node began here — an attached `flow.*`
+/// whose finally node stops a server or puts a working tree back — would be
+/// ended nowhere: the hub sees a failed dispatch, and the cleanup they declared
+/// never happens. So the runner is sent the stop's `SIGUSR2`, through
+/// [`Running::halt`]: the placed node fails, every instance it began ends
+/// `failed` and runs its finally node here, the grace is held while one runs,
+/// and the group is ended only once the grace runs out with the runner still
+/// running — exactly the stop a poll's `stop` list asks for. The caller reads
+/// the runner on to its end and sends nothing more: an effect after the refused
+/// one would land beyond a hole in the frontier, and the finally boundaries are
+/// among them.
+///
+/// A dispatch already halted keeps the first word it was given: a cancel that
+/// reached it first is still the cancel it settles as.
+fn refused_batch(id: &str, detail: &str, running: &Running) {
+    note(&format!(
+        "{detail}: the dispatch fails, and its node runner is stopped as a stop stops it — the \
+         finally nodes it began run here, and nothing it journals after this batch is sent \
+         (docs/distributed.md §3.3)"
+    ));
+    running.halt(id, Halt::Stop);
 }
 
 /// Post the result that ends this dispatch, and say what a hub that would not

@@ -304,23 +304,67 @@ if (process.env.FIXTURE_RUNNER_PID_FILE) {
 }
 const line = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
 if (process.env.FIXTURE_RUNNER_IGNORE_TERM === "1") process.on("SIGTERM", () => {});
+// Where a test about a stopped runner reads what it did: one `finally` line per
+// finally node it ran, and one `exited` line when it ends **on its own** — an
+// exit handler runs on `process.exit` and never on a `SIGKILL`, so a runner the
+// worker killed leaves no `exited` line behind.
+const mark = process.env.FIXTURE_RUNNER_FINALLY_MARK;
+const { appendFileSync } = await import("node:fs");
+if (mark) process.on("exit", () => appendFileSync(mark, "exited\n"));
+let dispatch;
 // A stop (§3.2's `stop` list) arrives as `SIGUSR2`, and a real runner answers it
 // by failing the node — so this one does, saying which signal it was, which is
 // how a test tells a stop the worker sent from a cancel. Ignored instead, for a
 // test that needs a runner still running after its stop.
+//
+// With a mark file, it first does what a real runner does for an attached
+// flow's instance the stop ends: runs that instance's finally node — reported
+// on the `finally` lines a worker's grace reads, lasting
+// `FIXTURE_RUNNER_FINALLY_MS`, leaving its mark, and journaling the boundary it
+// crossed as an effect line — and reports what the node raised as the result's
+// `finally_error` where `FIXTURE_RUNNER_FINALLY_ERROR` names it. With
+// `FIXTURE_RUNNER_HANG_AFTER_FINALLY`, it then writes nothing more and runs on,
+// for a test that needs the worker to end it.
 if (process.env.FIXTURE_RUNNER_IGNORE_STOP === "1") {
   process.on("SIGUSR2", () => {});
 } else {
-  process.on("SIGUSR2", () => {
+  process.on("SIGUSR2", async () => {
+    if (mark) {
+      line({ type: "finally", running: true });
+      const lasts = Number(process.env.FIXTURE_RUNNER_FINALLY_MS ?? "0");
+      if (lasts > 0) await new Promise((resolve) => setTimeout(resolve, lasts));
+      appendFileSync(mark, "finally\n");
+      const site = `${dispatch.instance_path}/tidying/0/tidy_up/0`;
+      line({
+        type: "effect",
+        effect: {
+          key: `${site}#finally/0`,
+          site,
+          kind: "finally",
+          ordinal: 0,
+          request: '{"node":"tidy_up"}',
+          outcome: { kind: "value", value: { outcome: "failed" } },
+          refused: false,
+          recorded_at: "2026-11-16T00:00:00.000Z",
+        },
+      });
+      line({ type: "finally", running: false });
+      if (process.env.FIXTURE_RUNNER_HANG_AFTER_FINALLY === "1") return;
+    }
+    const failed = process.env.FIXTURE_RUNNER_FINALLY_ERROR;
     process.stdout.write(
-      `${JSON.stringify({ type: "result", error: { name: "DispatchStopped", message: "the runner was sent SIGUSR2" } })}\n`,
+      `${JSON.stringify({
+        type: "result",
+        error: { name: "DispatchStopped", message: "the runner was sent SIGUSR2" },
+        ...(failed ? { finally_error: failed } : {}),
+      })}\n`,
       () => process.exit(0),
     );
   });
 }
 let held = "";
 for await (const chunk of process.stdin) held += chunk;
-const dispatch = JSON.parse(held);
+dispatch = JSON.parse(held);
 line({
   type: "effect",
   effect: {
@@ -1483,6 +1527,267 @@ fn an_effect_batch_refused_outside_its_table_fails_the_dispatch_and_keeps_the_wo
         "one refused effect batch ended the worker, so the placement has none: {}",
         worker.transcript()
     );
+}
+
+/// Where a fixture runner leaves the marks of a stop it was sent, fresh for one
+/// test.
+fn mark_file(purpose: &str) -> PathBuf {
+    let file = std::env::temp_dir().join(format!(
+        "agent-compose-worker-{purpose}-{}.marks",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&file);
+    file
+}
+
+/// The marks a fixture runner left, one per line.
+fn marks(file: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(file)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// A `400` on an effect batch: what a hub of this release answers a record it
+/// cannot take (§3.3's fourth row).
+fn refused_batch(id: &str) -> Reply {
+    Reply::json(
+        400,
+        &json!({
+            "dispatch_id": id,
+            "error": "record 0 of the batch: its `kind` is `subagent`, which is not one of the kinds this hub's journal writes",
+        }),
+    )
+}
+
+/// **A refused batch stops the runner as a stop does, so its finally nodes run
+/// on the worker** (§3.3, §3.4, grammar D160, D161).
+///
+/// The hub refuses the dispatch's first batch with a `400`. The attempt is over
+/// — those records are not in the journal and no re-send puts them there — but
+/// what the placed node began on the worker is not: an attached flow's instance
+/// whose finally node stops a server or puts a working tree back. A worker that
+/// stopped reading and killed the runner left that cleanup undone anywhere. So
+/// the runner is sent the stop's `SIGUSR2`, and what is asserted is everything
+/// that follows from it:
+///
+/// * the finally node ran, **exactly once** — its mark is in the file;
+/// * the runner **exited on its own** — its exit handler left the `exited`
+///   mark, which a `SIGKILL` never runs — and well inside the grace;
+/// * the dispatch settled `WorkerEffectsRefused`, naming the status the hub
+///   gave, with the `finally_error` the runner reported beside it (§3.4);
+/// * nothing after the refused batch reached the hub: the finally boundary the
+///   runner journaled was not sent, since a record past a refused one would
+///   land beyond a hole in the frontier;
+/// * and the worker goes on.
+#[test]
+fn a_refused_batch_stops_the_runner_so_its_finally_nodes_run_and_sends_nothing_after() {
+    let hub = FixtureHub::start();
+    let (hash, tarball) = artifact();
+    hub.always("/workers/join", accepted(&hash, "wrk_ready"));
+    hub.always("/workers/artifact", Reply::bytes(200, tarball));
+    hub.script("/workers/poll", dispatch("dsp_refused_batch"));
+    hub.always("/workers/poll", Reply::empty(204));
+    hub.script("/workers/effects", refused_batch("dsp_refused_batch"));
+    hub.always("/workers/effects", Reply::empty(204));
+    hub.always("/workers/result", Reply::empty(204));
+
+    let marked = mark_file("refused-batch");
+    let mut worker = Worker::with_environment(
+        &hub,
+        "refused-batch",
+        &[
+            // A node that would run for a minute: what ends it is the stop.
+            ("FIXTURE_RUNNER_LINGER_MS".to_string(), "60000".to_string()),
+            (
+                "FIXTURE_RUNNER_FINALLY_MARK".to_string(),
+                marked.display().to_string(),
+            ),
+            (
+                "FIXTURE_RUNNER_FINALLY_ERROR".to_string(),
+                "flow.tidying node `tidy_up` failed: the server would not stop".to_string(),
+            ),
+        ],
+    );
+    let asked = hub.until("settled the dispatch whose batch was refused", |asked| {
+        asked
+            .iter()
+            .any(|request| request.path == "/workers/result")
+    });
+    let refused_at = asked
+        .iter()
+        .find(|request| request.path == "/workers/effects")
+        .expect("the batch the hub refused")
+        .at;
+    let result = asked
+        .iter()
+        .find(|request| request.path == "/workers/result")
+        .expect("a result");
+
+    assert_eq!(
+        result.body["dispatch_id"], "dsp_refused_batch",
+        "{:#}",
+        result.body
+    );
+    assert_eq!(
+        result.body["error"]["name"],
+        "WorkerEffectsRefused",
+        "a refused batch fails its dispatch by name: {:#}\n{}",
+        result.body,
+        worker.transcript()
+    );
+    let message = result.body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("with 400") && message.contains("1 effect record(s)"),
+        "the failure names the status the hub gave and the record it did not send: {message}"
+    );
+    assert_eq!(
+        result.body["finally_error"],
+        "flow.tidying node `tidy_up` failed: the server would not stop",
+        "what the finally node the stop started raised travels beside the refusal (§3.4): {:#}",
+        result.body
+    );
+    assert!(
+        result.body.get("output").is_none() && result.body.get("status").is_none(),
+        "{:#}",
+        result.body
+    );
+
+    // The marks are written by the runner's exit, which is the moment before the
+    // result is posted; read once the result is home.
+    assert_eq!(
+        marks(&marked),
+        ["finally", "exited"],
+        "the finally node ran exactly once and the runner then exited on its own — a runner \
+         the worker killed runs no finally node and leaves no `exited` mark:\n{}",
+        worker.transcript()
+    );
+    let took = result.at.duration_since(refused_at);
+    assert!(
+        took < Duration::from_secs(4),
+        "the runner was settled {took:?} after the refusal: one that stops on its signal is not \
+         waited out to the grace"
+    );
+
+    let batches = hub.asked_at("/workers/effects");
+    assert_eq!(
+        batches.len(),
+        1,
+        "an effect after the refused batch reached the hub — the finally boundary among them — \
+         past a hole in the frontier: {batches:#?}"
+    );
+    assert!(
+        worker
+            .transcript()
+            .contains("is stopped as a stop stops it"),
+        "the worker says what it did with the runner: {}",
+        worker.transcript()
+    );
+    assert!(worker.running(), "{}", worker.transcript());
+    let _ = std::fs::remove_file(&marked);
+}
+
+/// **A finally node a refused batch started runs whole past the grace, and the
+/// runner is ended only after it** — as for a stop (§3.2, grammar D160).
+///
+/// The runner's finally node runs for seven seconds, past the worker's
+/// five-second grace, so a grace that was not held for it would end the runner
+/// before the node left its mark. After it, the runner writes nothing and runs
+/// on — so the grace starts over once the node has settled, and the group is
+/// ended when it runs out: no `exited` mark, no runner left, and the dispatch
+/// settled `WorkerEffectsRefused` with nothing the runner said after the
+/// refusal sent home.
+#[test]
+fn a_finally_node_a_refused_batch_started_outlives_the_grace_and_the_runner_is_ended_after_it() {
+    let hub = FixtureHub::start();
+    let (hash, tarball) = artifact();
+    hub.always("/workers/join", accepted(&hash, "wrk_ready"));
+    hub.always("/workers/artifact", Reply::bytes(200, tarball));
+    hub.script("/workers/poll", dispatch("dsp_refused_long"));
+    hub.always("/workers/poll", Reply::empty(204));
+    hub.script("/workers/effects", refused_batch("dsp_refused_long"));
+    hub.always("/workers/effects", Reply::empty(204));
+    hub.always("/workers/result", Reply::empty(204));
+
+    let marked = mark_file("refused-batch-long");
+    let pids_at = pid_file("refused-batch-long");
+    let worker = Worker::with_environment(
+        &hub,
+        "refused-batch-long",
+        &[
+            ("FIXTURE_RUNNER_LINGER_MS".to_string(), "60000".to_string()),
+            (
+                "FIXTURE_RUNNER_FINALLY_MARK".to_string(),
+                marked.display().to_string(),
+            ),
+            ("FIXTURE_RUNNER_FINALLY_MS".to_string(), "7000".to_string()),
+            (
+                "FIXTURE_RUNNER_HANG_AFTER_FINALLY".to_string(),
+                "1".to_string(),
+            ),
+            (
+                "FIXTURE_RUNNER_PID_FILE".to_string(),
+                pids_at.display().to_string(),
+            ),
+        ],
+    );
+    let pids = runner_pids(&pids_at, Duration::from_secs(30));
+    assert_eq!(
+        pids.len(),
+        1,
+        "the runner did not start: {}",
+        worker.transcript()
+    );
+    let asked = hub.until("settled the dispatch whose batch was refused", |asked| {
+        asked
+            .iter()
+            .any(|request| request.path == "/workers/result")
+    });
+    let refused_at = asked
+        .iter()
+        .find(|request| request.path == "/workers/effects")
+        .expect("the batch the hub refused")
+        .at;
+    let result = asked
+        .iter()
+        .find(|request| request.path == "/workers/result")
+        .expect("a result");
+    assert_eq!(
+        result.body["error"]["name"],
+        "WorkerEffectsRefused",
+        "{:#}\n{}",
+        result.body,
+        worker.transcript()
+    );
+    // Seven seconds of finally node, then the five-second grace from the
+    // moment it settled: a grace that ran from the signal would have ended the
+    // runner at five, before the node left its mark.
+    let took = result.at.duration_since(refused_at);
+    assert!(
+        took >= Duration::from_secs(11) && took < Duration::from_secs(25),
+        "the dispatch was settled {took:?} after the refusal: the finally node runs whole for \
+         seven seconds and the grace of five runs from its end"
+    );
+    assert_eq!(
+        marks(&marked),
+        ["finally"],
+        "the finally node ran whole and once, and the runner that then ran on was ended rather \
+         than exiting:\n{}",
+        worker.transcript()
+    );
+    assert!(
+        !alive(pids[0]),
+        "the runner {} outlived the grace after its finally node",
+        pids[0]
+    );
+    assert_eq!(
+        hub.asked_at("/workers/effects").len(),
+        1,
+        "nothing after the refused batch reached the hub"
+    );
+    let _ = std::fs::remove_file(&marked);
+    let _ = std::fs::remove_file(&pids_at);
 }
 
 /// A node runner that stops at a question, and goes on past one it has been
