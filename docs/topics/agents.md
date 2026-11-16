@@ -134,10 +134,11 @@ declared input object, or a field map on a string-in agent, is a compile error.
 `flow.*` in a tool list **must** declare `description:` — the model needs one —
 and its `inputs`/`outputs` become the tool's parameter and result schemas. See
 `agent-compose docs tools` and `agent-compose docs flows`. The result is the
-flow's outputs as its body ended: a `finally:` node the flow declares runs after
-the agent has been answered, so the model never sees what that node did —
-whatever it says about the cleanup, the node's own trace entry and journal
-record are where to look.
+flow's outputs as its body left them: a `finally:` node the flow declares has
+run, inside the call, before the result reaches the model, but the outputs were
+read before it ran, so the model never sees what that node did — whatever it
+says about the cleanup, the node's own trace entry and journal record are where
+to look.
 
 `stores:` attaches stores, and the compiler synthesizes LLM-facing tools from
 each store's kind and `agent_access:` (`agent-compose docs stores`). A
