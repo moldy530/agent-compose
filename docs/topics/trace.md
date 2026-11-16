@@ -89,7 +89,9 @@ nodes are `"cancelled"` entries, and every instance it ended ran its
 `finally:` node, whose entry is there too. `finally_error` is there when a
 flow's `finally:` node failed after its retries — beside a `status` it did not
 change, so a `"completed"` run carrying one is a run that answered and whose
-cleanup did not.
+cleanup did not — and on a `"cancelled"` run a cancel closed because the
+serving build could not take its recovery, where it says no finally node ran
+(PRD resolved q81).
 
 `trace_version` is `7`: the version that added `"cancelled"` to both the
 envelope's `status` and an entry's `outcome`. A consumer written against `6`

@@ -364,8 +364,32 @@ exits `1`. An app the command could not reach, or a status it does not give,
 exits `2`. Under `--format json` the app's answer is the one document on stdout,
 with `http_status` beside it.
 
+**An execution the serving build's recovery could not take** — a replay that
+diverged from its journal, recorded inputs the build's `inputs:` refuse, a flow
+the build no longer declares — is open with nothing to run it, and the serve
+log names this command for it once per start:
+
+```
+`exec_9f1c8a3e-…` (flow.gate) could not be recovered by this build: ReplayDivergence: this execution's journal does not describe this run at `ask/0` …; its row stays open until `agent-compose cancel exec_9f1c8a3e-…` closes it
+```
+
+The cancel **closes** it (PRD resolved q81): the request is recorded, its open
+children this process is not running are closed the same way, and the row is
+ended `cancelled` at once with **no finally node run** — no generation can run
+one against a record it does not describe — which its `finally_error` says.
+The settle webhook and the trace export go as for any settle, and no later
+start recovers it. The app answers `202` with `cancelling: false`, the cancel
+being complete, and the command prints the app's `detail` and exits `0`:
+
+```
+cancelled `exec_9f1c8a3e-…`: this build could not take up this execution's recovery (this build declares no flow `flow.gate`), so no generation of it can run here: its lifecycle row is closed `cancelled` and no finally node ran, which its `finally_error` says
+```
+
+Sent again, it is the `409` every ended execution gets.
+
 A `run` is not cancelled this way: `Ctrl-C` stops its process and leaves its row
-open for `resume` (PRD resolved q28). A cancel is `serve`'s.
+open for `resume` (PRD resolved q28). A cancel is `serve`'s, and an open row a
+`run` wrote beside a `serve` is still `404` there.
 
 ## `store`
 

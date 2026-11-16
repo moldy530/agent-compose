@@ -157,10 +157,13 @@ recorded, `409` naming the status for an execution that has already ended,
 `404` for an id the app does not know. The execution then settles `cancelled`,
 and a `callback:` subscriber is told so by the `settled` webhook, whose body's
 `status` is `cancelled` and carries no `error`. `agent-compose cancel <path> <execution>` sends it
-(`agent-compose docs cli`). An execution a trigger's `concurrency:` started
-that this build cannot run — its recovery diverged or no longer binds, or its
-flow was renamed away — stays open in the journal and so keeps its slot; its
-cancel is answered `202` too, and frees the slot.
+(`agent-compose docs cli`). An execution this build cannot run — its recovery
+diverged or no longer binds, or its flow was renamed away — stays open in the
+journal, keeping any slot of a `concurrency:` group it holds, until it is
+cancelled: its cancel closes it there and then, `202` with `status:
+"cancelled"` and `cancelling: false`, the row ended `cancelled` with no
+finally node run — its `finally_error` says why — the settle webhook sent and
+the slot freed (PRD resolved q81).
 
 ## Authenticating an `http` trigger
 

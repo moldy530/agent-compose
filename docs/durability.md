@@ -788,7 +788,7 @@ One row per execution, written before the graph is streamed:
 | `journalVersion` | the version at the head of this document |
 | `startedAt`, `endedAt`, `error` | when, and why it failed — `error` is absent on a `cancelled` row: nothing went wrong with an execution somebody stopped (Decision D160) |
 | `cancelRequestedAt` | when somebody asked for this execution to be **cancelled** (`POST /executions/:id/cancel`, `agent-compose cancel`; PRD resolved q75, Decision D160) — absent on every row nobody cancelled. The request is recorded **before** anything is stopped, so a process that dies between the `202` and the settled row leaves an `open` row carrying it, and the recovery that finds it completes the cancel (§6.1). Held in a table of its own, `cancellations` — `execution` the primary key, `requested_at` the instant — and joined onto the row by both reads that return one, so it is a whole table `CREATE TABLE IF NOT EXISTS` adds to a journal an older build wrote, with no column probe on any backend (§11.2). A second request of the same execution is a no-op that keeps the first one's instant |
-| `finallyError` | what a flow's `finally:` node raised after its own retries, where one did (`docs/grammar.md` §7.9, PRD resolved q76): the **first** such failure in the execution — a subflow instance's finally node and the root's can both fail — as `<flow> node \`<id>\` failed: <error>`. Beside a `status` it does not change: a `completed` row carrying one is a run that produced its answer and whose cleanup did not. Absent on every row whose finally nodes completed, on every row of an execution that had none, and for a failure raised after the row was written (§3.10). The column is `finally_error`, nullable, and added to a journal an older build created by a probe on every backend (§11.2) |
+| `finallyError` | what a flow's `finally:` node raised after its own retries, where one did (`docs/grammar.md` §7.9, PRD resolved q76): the **first** such failure in the execution — a subflow instance's finally node and the root's can both fail — as `<flow> node \`<id>\` failed: <error>`. Beside a `status` it does not change: a `completed` row carrying one is a run that produced its answer and whose cleanup did not. Absent on every row whose finally nodes completed, on every row of an execution that had none, and for a failure raised after the row was written (§3.10). **One more source**: a `cancelled` row a cancel closed because no generation could run its execution — a recovery this build could not take (§7) — carries `no finally node ran: this build could not take up the execution's recovery (<reason>)` here, since no finally node could run, and `error` stays absent (PRD resolved q81, Decision D165). The column is `finally_error`, nullable, and added to a journal an older build created by a probe on every backend (§11.2) |
 
 ### 3.6 What `status` means
 
@@ -805,7 +805,10 @@ be resumed:
   `cancelled` and ran its `finally:` node, and every open child execution in its
   lineage was cancelled too (PRD resolved q75, Decision D160). Ended for good:
   `resume` refuses it naming the status, the cancel route answers `409`, and
-  recovery leaves it alone. It carries no `error`.
+  recovery leaves it alone. It carries no `error`. One `cancelled` row ran no
+  finally node: an execution this build's recovery could not take, whose row
+  the cancel closed with no generation to run one — its `finallyError` says so
+  (§7, PRD resolved q81).
 * **`open`** — the run has not ended. Two ways to be open, and both are exactly
   what recovery is for: the process died, or the run reached a `human` pause
   with nobody to answer it (`docs/grammar.md` §8.7) and ended `3`. The second is
@@ -1797,7 +1800,8 @@ on:
   delay grammar §8.6 rule 7 says a detached dispatch never causes. A parent this
   start cannot replay — its flow no longer declared, or its record diverging
   before it reaches the dispatch (§7) — holds its open children with it, open,
-  for the build that can. Where the
+  for the build that can, or for the cancel that closes the parent and them
+  with it (§7, PRD resolved q81). Where the
   parent has **settled**, nothing will re-issue it, so the walk resumes it
   itself, admitted under the bound its lineage recorded (§3.5, Decision D28):
   the children of one node share that node's gates as they did when they ran, so
@@ -1843,7 +1847,12 @@ route, and recovery of one execution never stops the process from serving the
 others. A **divergence** (§7) is reported the same way and leaves the journal
 row **open**: what this process reports is what this build saw, while the row
 records the execution. An open execution of a flow the current build no longer
-declares is reported on stderr and left open for the same reason.
+declares is reported on stderr and left open for the same reason. Each stays
+open **until it is cancelled**: the start says so once per execution — ``
+`<id>` (<flow>) could not be recovered by this build: <reason>; its row stays
+open until `agent-compose cancel <id>` closes it`` — and the cancel closes the
+row `cancelled` with no finally node run, said in `finallyError` (§7, PRD
+resolved q81).
 
 Because recovery takes every open execution, an execution worth resuming by hand
 is one no `serve` is running — see §2 on what is outside the promise.
@@ -2152,6 +2161,24 @@ make it unresumable for ever — `resume` refuses a `failed` row by name — eve
 after the composition is put back, and since `serve` replays *every* open
 execution at start (§6.1), one deploy that moved a prompt would close every open
 execution of that project in a single restart.
+
+**It stays open until it is cancelled.** Open is the default, so a composition
+put back is still recovered; an operator who will not put it back says so with
+`POST /executions/:id/cancel` or `agent-compose cancel`, and the cancel **closes**
+it (PRD resolved q81, `docs/grammar.md` D165): the request is recorded as every
+cancel's is, its open children in the lineage that the process is not running
+are closed the same way, and the row is ended `cancelled` with **no finally
+node run** — no generation can run one against a record it does not describe —
+which `finallyError` says (`no finally node ran: this build could not take up
+the execution's recovery (<reason>)`, §3.5), while `error` stays absent as on
+every cancelled row. The settle webhook and the trace export go as for any
+settle, journaled before the row ends (§3.7), and no later start recovers it.
+The same holds of a recovery that failed **before** the execution opened —
+recorded inputs the build's `inputs:` refuse — and of a row of a flow the build
+no longer declares, which recovery leaves in the journal (§6.1). `serve` says
+which command closes each, once per start: `` `<id>` (<flow>) could not be
+recovered by this build: <reason>; its row stays open until `agent-compose
+cancel <id>` closes it``.
 
 The commonest cause is a composition that moved under a journal — a changed
 prompt, a renamed tool, a different `url:`. That is the diagnosis the message is
