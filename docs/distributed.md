@@ -722,22 +722,27 @@ key**: a record the journal already holds is accepted and dropped. A batch is
 therefore safe to re-send after a transport failure, and a worker SHOULD re-send
 rather than guess.
 
-A record's `kind` is one of five: `model`, `tool`, `store` and `human` — the
-calls a placed node makes — and `finally`, the **boundary** a flow instance
+A record's `kind` is any kind the journal writes — the six of
+`docs/durability.md` §4, read off the one list the runtime declares them in
+(`EFFECT_KINDS` in `src/journal.ts`): `model`, `tool`, `store` and `human` — the
+calls a placed node makes — `harness`, the one run of a `coder:` node
+(`docs/durability.md` §3.9), and `finally`, the **boundary** a flow instance
 crosses when it ends and its `finally:` node begins (grammar §7.9,
-`docs/durability.md` §3.10). The fifth reaches this route because an instance can
-end on a worker: everything a placed agent's attached `flow.*` reaches runs in
-the agent's placement (grammar §14.1 rule 4), so an instance of that flow ends
-there, and its boundary is journaled from there under the key the hub would have
-derived — `<finally node's site>#finally/<ordinal>` — exactly as the finally
-node's own effects are. A record of any other kind is the `400` row below.
+`docs/durability.md` §3.10). The last two reach this route because a flow
+instance can run, and end, on a worker: everything a placed agent's attached
+`flow.*` reaches runs in the agent's placement (grammar §14.1 rule 4), so a
+`coder:` node in that flow runs there and journals its run from there, and the
+instance ends there and its boundary is journaled from there — each under the
+key the hub would have derived, `<site>#harness/<ordinal>` and `<finally node's
+site>#finally/<ordinal>`, exactly as the flow's other effects are. A record of
+any other kind is the `400` row below.
 
 | condition | status | body |
 |---|---|---|
 | the batch is journaled | `204` | empty. Every record in it was inserted or was already held |
 | the token does not verify | `401` | no detail, as everywhere (§3.1) |
 | the session is unknown | `410` | names the rule of §3: join again, and send this batch again under the new session |
-| the body is not a batch — a missing `dispatch_id`, a missing `effects` array, or a record short of a field, of a `kind` outside the five above, naming a `site` outside the dispatch's, or carrying a `key` its own `site`, `kind` and `ordinal` do not derive | `400` | names what a batch and a record carry |
+| the body is not a batch — a missing `dispatch_id`, a missing `effects` array, or a record short of a field, of a `kind` outside the six above, naming a `site` outside the dispatch's, or carrying a `key` its own `site`, `kind` and `ordinal` do not derive | `400` | names what a batch and a record carry; a refused record is named first, by its position in the batch and the one field it failed on — the `kind` received and the kinds the journal writes, or the `site` and the dispatch's `instance_path` — ahead of the rule every record is held to |
 | the `dispatch_id` names no dispatch this hub holds | `409` | names the dispatch. The batch is discarded, as at §3.4 |
 
 The last two rows are not about the batch's *contents* the way the first three
