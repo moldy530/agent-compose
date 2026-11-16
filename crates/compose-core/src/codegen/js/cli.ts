@@ -1678,6 +1678,28 @@ const STORE_SUBVERBS: Readonly<Record<string, StoreSubverb>> = {
   log: { operands: ["key"], options: { limit: "single", after: "single" } },
 };
 
+/**
+ * The option an unknown `store` flag stands for, where it spells an op
+ * parameter the sub-verb takes under another name.
+ *
+ * The flags mirror grammar 11.4's op parameters ([`STORE_SUBVERBS`]) but are
+ * not spelled as them: `--if-version` is `if_version:`, and `--values` is a
+ * `list`'s `include_values:`. An operator who wrote the parameter —
+ * `--if_version`, `--include-values` — was told only that the flag is unknown.
+ * So a flag that is one of the sub-verb's own once `_` is read as `-` and an
+ * `include-` prefix is dropped is named in the refusal. Nothing more is
+ * accepted: D155 names the flags, and an alias would be a second spelling of
+ * each.
+ */
+function storeSpelling(
+  options: Readonly<Record<string, Arity>>,
+): (name: string) => string | undefined {
+  const plain = (flag: string): string =>
+    flag.toLowerCase().replaceAll("_", "-").replace(/^include-/, "");
+  return (name) =>
+    Object.keys(options).find((option) => option !== name && plain(option) === plain(name));
+}
+
 /** What every `store` sub-verb takes: the partition, and the format. */
 const STORE_PARTITION_OPTIONS: Readonly<Record<string, Arity>> = {
   session: "single",
@@ -1753,7 +1775,8 @@ async function storeVerb(argv: readonly string[]): Promise<number> {
     );
   }
   const verb = `store ${name}`;
-  const options = parse(verb, rest, { ...subverb.options, ...STORE_PARTITION_OPTIONS }, true);
+  const taken = { ...subverb.options, ...STORE_PARTITION_OPTIONS };
+  const options = parse(verb, rest, taken, true, storeSpelling(taken));
   const usage = `${verb} <store>${subverb.operands.map((operand) => ` <${operand}>`).join("")}`;
   const [address, ...operands] = options.operands;
   if (address === undefined) {
@@ -2757,12 +2780,17 @@ type Arity = "single" | "repeatable" | "flag";
  * and then a word that is not an option is one of them, wherever it stands,
  * and everything after a bare `--` is one: which is how a key that begins with
  * `--` is written, and how `agent-compose store` hands its operands on.
+ *
+ * `spelledAs` answers the option an unknown `--name` stands for, where the verb
+ * knows one ([`storeSpelling`]): the refusal then names it, and accepts nothing
+ * more than it did.
  */
 function parse(
   verb: string,
   argv: readonly string[],
   options: Readonly<Record<string, Arity>>,
   takesOperands = false,
+  spelledAs: (name: string) => string | undefined = () => undefined,
 ): {
   single: Record<string, string>;
   repeated: Record<string, string[]>;
@@ -2794,8 +2822,11 @@ function parse(
     const arity = Object.hasOwn(options, name) ? options[name] : undefined;
     if (arity === undefined) {
       const taken = Object.keys(options).map((option) => `\`--${option}\``);
+      const spelled = spelledAs(name);
       throw new UsageError(
-        `\`--${name}\` is not an option of \`${verb}\`: it takes ${taken.length === 0 ? "no options" : taken.join(", ")} (see README.md)`,
+        spelled === undefined
+          ? `\`--${name}\` is not an option of \`${verb}\`: it takes ${taken.length === 0 ? "no options" : taken.join(", ")} (see README.md)`
+          : `\`--${name}\` is written \`--${spelled}\`: \`${verb}\` takes ${taken.join(", ")} (see README.md)`,
       );
     }
     if (arity === "flag") {

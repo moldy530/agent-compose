@@ -5242,6 +5242,89 @@ fn the_generated_command_line_refuses_an_option_its_verb_does_not_take() {
     }
 }
 
+/// The project's own `store` command names the flag an op parameter is written
+/// as, where an unknown flag spells one (D155, PRD resolved q72).
+///
+/// The `store` sub-verbs' flags mirror grammar 11.4's op parameters without
+/// being spelled as them — `list`'s `--values` is `include_values:`,
+/// `--if-version` is `if_version:` — and an ejected project's operator meets
+/// this command line with nothing in front of it. Each spelling is refused exit
+/// `2` as any unknown flag is, before a store is looked up, and the refusal
+/// says which flag stands for it and still lists what the sub-verb takes. A
+/// flag that spells nothing it takes keeps the plain refusal.
+#[test]
+fn the_generated_store_command_names_the_flag_an_op_parameter_is_written_as() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let golden = golden("review-loop");
+    let project = staged(golden, root, "store-spelling");
+    let references = compose_core::codegen::env::References::of(&artifact(golden));
+
+    let launch = |arguments: &[&str]| {
+        let mut command = bun();
+        command.arg(project.join("src/index.ts"));
+        command.args(arguments);
+        for name in references.names() {
+            command.env(name, "supplied");
+        }
+        command.output().expect("bun runs")
+    };
+
+    for (arguments, says) in [
+        (
+            ["store", "list", "store.notes", "--include-values"].as_slice(),
+            "`--include-values` is written `--values`: `store list` takes",
+        ),
+        (
+            ["store", "list", "store.notes", "--include_values"].as_slice(),
+            "`--include_values` is written `--values`: `store list` takes",
+        ),
+        (
+            [
+                "store",
+                "set",
+                "store.notes",
+                "k",
+                "{}",
+                "--if_version",
+                "1",
+            ]
+            .as_slice(),
+            "`--if_version` is written `--if-version`: `store set` takes",
+        ),
+        (
+            ["store", "import", "store.notes", "--if_absent"].as_slice(),
+            "`--if_absent` is written `--if-absent`: `store import` takes",
+        ),
+        (
+            ["store", "list", "store.notes", "--include-keys"].as_slice(),
+            "`--include-keys` is not an option of `store list`: it takes",
+        ),
+    ] {
+        let output = launch(arguments);
+        let complaint = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "`{arguments:?}` is a command that could not run, which is exit 2:\n{complaint}",
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "…and nothing ran, so stdout carries no answer: {}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        assert!(
+            complaint.contains(says),
+            "the refusal of `{arguments:?}` says `{says}`:\n{complaint}"
+        );
+        assert!(
+            complaint.contains("`--session`") && complaint.contains("`--format`"),
+            "…and lists what the sub-verb takes:\n{complaint}"
+        );
+    }
+}
+
 /// Every declared divergence is exercised, and every cited one is declared.
 ///
 /// This runs without a toolchain on purpose: it is about the corpus and the
