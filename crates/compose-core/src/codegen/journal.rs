@@ -1584,7 +1584,14 @@ mod tests {
             "an attempt the journal refused is dropped anyway, so the row under-counts its \
              attempts and the next start POSTs past the bound §3.7 states"
         );
-        let closed = function_body(serve, "closed");
+        // `closed` records the run and hands its settle to `announceSettle`,
+        // which a cancel closing a row no run reached calls too (PRD resolved
+        // q81): the settle's writes are that function's.
+        assert!(
+            function_body(serve, "closed").contains("announceSettle(execution, outcome)"),
+            "`closed` announces the settle a run owes through the one function that journals it"
+        );
+        let closed = function_body(serve, "announceSettle");
         let insisted = closed
             .find("insisting(")
             .expect("the settle's intent is insisted on, not tried once");
