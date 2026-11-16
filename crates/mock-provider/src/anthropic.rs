@@ -262,7 +262,7 @@ fn check_settings(checker: &mut Checker, body: &Map<String, Value>) {
     checker.bounded_integer("", body, "top_k", 0..=i64::MAX);
     checker.optional("", body, "stream", Kind::Boolean);
     checker.optional("", body, "metadata", Kind::Object);
-    checker.optional("", body, "thinking", Kind::Object);
+    check_thinking(checker, body);
     checker.optional("", body, "service_tier", Kind::String);
     let Some(stops) = checker.optional("", body, "stop_sequences", Kind::Array) else {
         return;
@@ -271,6 +271,58 @@ fn check_settings(checker: &mut Checker, body: &Map<String, Value>) {
         checker.typed(&at("stop_sequences", index), stop, Kind::String);
     }
 }
+
+/// The forms `thinking` takes, told apart by its `type` (PRD resolved q83,
+/// `WIRE-NOTES` (29)).
+///
+/// The API discriminates on `type`, so a `thinking` without one is refused
+/// rather than read as any form — which is exactly the request a compiled graph
+/// sent before resolved q83, spreading an authored `{ budget_tokens }` into the
+/// body as written. Each form's keys are its own: `enabled` carries a
+/// `budget_tokens` and must, `adaptive` carries none (its effort lives in
+/// `output_config`, [`check_output_config`]), and `disabled` carries nothing
+/// but its `type`. `display` is the one key both thinking forms share, and no
+/// compiled graph sends it.
+fn check_thinking(checker: &mut Checker, body: &Map<String, Value>) {
+    let Some(thinking) = checker
+        .optional("", body, "thinking", Kind::Object)
+        .and_then(Value::as_object)
+    else {
+        return;
+    };
+    let Some(kind) = checker.required("thinking", thinking, "type") else {
+        return;
+    };
+    let Some(kind) = checker.one_of("thinking.type", kind, THINKING_TYPES) else {
+        return;
+    };
+    let allowed: &[&str] = match kind {
+        "enabled" => &["type", "budget_tokens", "display"],
+        "adaptive" => &["type", "display"],
+        _ => &["type"],
+    };
+    checker.closed("thinking", thinking, allowed);
+    if let Some(display) = checker.optional("thinking", thinking, "display", Kind::String) {
+        checker.one_of("thinking.display", display, &["summarized", "omitted"]);
+    }
+    if kind == "enabled"
+        && checker
+            .required("thinking", thinking, "budget_tokens")
+            .is_some()
+    {
+        checker.bounded_integer("thinking", thinking, "budget_tokens", 1024..=i64::MAX);
+    }
+}
+
+/// The values `thinking.type` takes.
+const THINKING_TYPES: &[&str] = &["enabled", "adaptive", "disabled"];
+
+/// The values `output_config.effort` takes: the pinned Agent SDK's
+/// `EffortLevel`, which is the vendor's own list of the parameter's values
+/// (`WIRE-NOTES` (29)). Wider than the four a composition can write — grammar
+/// 12.2 admits `low`, `medium`, `high` and `max` — because this server refuses
+/// what the API refuses and nothing it takes.
+const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 /// `system` is a string or a list of text blocks, and nothing else.
 ///
@@ -590,8 +642,15 @@ fn check_prefill(checker: &mut Checker, body: &Map<String, Value>) {
         .and_then(Value::as_str)
         == Some("tool");
     // Presence, not shape: a malformed `output_config` is still a request asking
-    // for structured output, and [`check_output_config`] answers its shape.
-    let native = body.contains_key("output_config");
+    // for structured output, and [`check_output_config`] answers its shape. One
+    // well-formed `output_config` is not asking for one, though: an adaptive
+    // model's `effort` rides it on every call that model makes, a tool-loop
+    // turn's included, and the ask is its `format` (`WIRE-NOTES` (29)).
+    let native = body.get("output_config").is_some_and(|config| {
+        config
+            .as_object()
+            .is_none_or(|config| config.contains_key("format"))
+    });
     let asked = if forced {
         "`tool_choice` forces a tool"
     } else if native {
@@ -645,6 +704,12 @@ fn check_prefill(checker: &mut Checker, body: &Map<String, Value>) {
 /// *keywords* the format compiles at all ([`check_schema_subset`], PRD §9
 /// resolved q55): that one the runtime does send, on every composition, because
 /// grammar D10 requires `max_items` on every result-schema array.
+///
+/// The object holds one thing beside the format: an adaptive model's `effort`
+/// (PRD resolved q83), which a compiled graph merges into the same object
+/// rather than sending a second, so a pinned call on such a model carries both
+/// and a tool-loop turn on it carries the effort alone. An `output_config` with
+/// no `format` asks for no structured output (`WIRE-NOTES` (29)).
 fn check_output_config(
     checker: &mut Checker,
     body: &Map<String, Value>,
@@ -652,7 +717,10 @@ fn check_output_config(
     let config = checker
         .optional("", body, "output_config", Kind::Object)?
         .as_object()?;
-    checker.closed("output_config", config, &["format"]);
+    checker.closed("output_config", config, &["format", "effort"]);
+    if let Some(effort) = checker.optional("output_config", config, "effort", Kind::String) {
+        checker.one_of("output_config.effort", effort, EFFORTS);
+    }
     let format = checker
         .optional("output_config", config, "format", Kind::Object)?
         .as_object()?;
@@ -2498,6 +2566,151 @@ mod tests {
                 "service_tier": "auto",
             })),
             []
+        );
+    }
+
+    /// `thinking` is read by its `type`, and each form holds its own keys (PRD
+    /// resolved q83, `WIRE-NOTES` (29)).
+    ///
+    /// The first refusal is the request a compiled graph sent before the ruling:
+    /// an authored `{ budget_tokens }` spread into the body as written, with no
+    /// `type` for the API to discriminate on. The rest are each form's foreign
+    /// key, and the budget a form that takes one must carry.
+    #[test]
+    fn thinking_is_read_by_its_type_and_each_form_holds_its_own_keys() {
+        let complaints = |thinking: Value| {
+            let request = messages(json!({
+                "messages": [{ "role": "user", "content": "hi" }],
+                "thinking": thinking,
+            }));
+            parse(&headers(), Some(&request))
+                .failures
+                .into_iter()
+                .map(|failure| (failure.pointer, failure.message))
+                .collect::<Vec<_>>()
+        };
+        let one = |pointer: &str, message: &str| vec![(pointer.to_string(), message.to_string())];
+
+        assert_eq!(
+            complaints(json!({ "budget_tokens": 4000 })),
+            one("thinking.type", "thinking.type: Field required")
+        );
+        assert_eq!(
+            complaints(json!({ "type": "adaptive", "budget_tokens": 4000 })),
+            one(
+                "thinking.budget_tokens",
+                "thinking.budget_tokens: Extra inputs are not permitted"
+            )
+        );
+        assert_eq!(
+            complaints(json!({ "type": "enabled", "budget_tokens": 4000, "effort": "high" })),
+            one(
+                "thinking.effort",
+                "thinking.effort: Extra inputs are not permitted"
+            )
+        );
+        assert_eq!(
+            complaints(json!({ "type": "enabled" })),
+            one(
+                "thinking.budget_tokens",
+                "thinking.budget_tokens: Field required"
+            )
+        );
+        assert_eq!(
+            complaints(json!({ "type": "enabled", "budget_tokens": 512 })),
+            one(
+                "thinking.budget_tokens",
+                "thinking.budget_tokens: Input should be greater than or equal to 1024"
+            )
+        );
+        assert_eq!(
+            complaints(json!({ "type": "considered" })),
+            one(
+                "thinking.type",
+                "thinking.type: Input should be one of 'enabled', 'adaptive', 'disabled'"
+            )
+        );
+
+        // …and every form a request may carry, `display` and all.
+        for legal in [
+            json!({ "type": "enabled", "budget_tokens": 4000 }),
+            json!({ "type": "enabled", "budget_tokens": 4000, "display": "omitted" }),
+            json!({ "type": "adaptive" }),
+            json!({ "type": "adaptive", "display": "summarized" }),
+            json!({ "type": "disabled" }),
+        ] {
+            assert_eq!(complaints(legal.clone()), [], "{legal}");
+        }
+    }
+
+    /// `output_config` carries an adaptive model's `effort` beside its `format`,
+    /// or alone — and alone it asks for no structured output (PRD resolved q83,
+    /// `WIRE-NOTES` (29)).
+    ///
+    /// Alone is the shape a tool-loop turn on such a model takes: no schema is
+    /// pinned on it, and the effort still rides. That turn may follow an
+    /// assistant turn of its own making only where nothing is asked of the next
+    /// one, so an effort alone is not a structured-output ask for the prefill
+    /// rule either.
+    #[test]
+    fn output_config_carries_an_effort_beside_its_format_or_alone() {
+        let schema = json!({ "type": "object", "properties": { "verdict": { "type": "string" } } });
+        let both = parse(
+            &headers(),
+            Some(&messages(json!({
+                "messages": [{ "role": "user", "content": "hi" }],
+                "thinking": { "type": "adaptive" },
+                "output_config": {
+                    "effort": "high",
+                    "format": { "type": "json_schema", "schema": schema },
+                },
+            }))),
+        );
+        assert_eq!(both.failures, [], "effort beside format is one object");
+        assert!(
+            matches!(
+                both.structured_output,
+                Some(StructuredOutput::OutputConfig { .. })
+            ),
+            "the format is still the ask: {:?}",
+            both.structured_output
+        );
+
+        let alone = parse(
+            &headers(),
+            Some(&messages(json!({
+                "messages": [
+                    { "role": "user", "content": "hi" },
+                    { "role": "assistant", "content": [{ "type": "text", "text": "thinking aloud" }] },
+                ],
+                "thinking": { "type": "adaptive" },
+                "output_config": { "effort": "low" },
+            }))),
+        );
+        assert_eq!(
+            alone.failures,
+            [],
+            "an effort alone is no structured-output ask, so no prefill rule reads it"
+        );
+        assert!(alone.structured_output.is_none());
+
+        let refused = parse(
+            &headers(),
+            Some(&messages(json!({
+                "messages": [{ "role": "user", "content": "hi" }],
+                "output_config": { "effort": "extreme", "reasoning": "deep" },
+            }))),
+        )
+        .failures
+        .into_iter()
+        .map(|failure| failure.message)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            refused,
+            [
+                "output_config.reasoning: Extra inputs are not permitted",
+                "output_config.effort: Input should be one of 'low', 'medium', 'high', 'xhigh', 'max'",
+            ]
         );
     }
 

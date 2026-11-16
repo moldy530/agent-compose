@@ -198,6 +198,28 @@ const CODEGEN: &[Criterion] = &[
                 "a_refused_answer_carries_the_reason_the_model_gave",
                 Status::Live,
             ),
+            // The one `settings:` key a Messages node fn translates rather than
+            // spreads (grammar 12.2, Decision D167, PRD resolved q83): the
+            // enabled form with the `type` the wire discriminates on, and the
+            // adaptive form's effort in the `output_config` the native rung
+            // also writes — beside its format on a pinned call, alone on a
+            // tool-loop turn, and still there on the forced-tool rung.
+            (
+                "an_enabled_model_sends_its_budget_as_the_enabled_thinking_form",
+                Status::Live,
+            ),
+            (
+                "an_adaptive_model_sends_its_effort_in_the_output_config_beside_the_format",
+                Status::Live,
+            ),
+            (
+                "an_adaptive_models_tool_loop_turn_carries_its_effort_alone",
+                Status::Live,
+            ),
+            (
+                "an_adaptive_model_keeps_its_effort_on_the_forced_tool_rung",
+                Status::Live,
+            ),
             (
                 "an_agent_node_bounds_its_tool_loop_at_max_tool_iterations",
                 Status::Live,
