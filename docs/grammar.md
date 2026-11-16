@@ -14646,7 +14646,7 @@ cancel closes it.
 4. the trigger's queue is looked at, where the execution held a slot.
 
 `<reason>` is what the recovery failed on, as the status route reported it,
-clipped to 400 characters; `this build declares no flow \`<flow>\``; or `this
+clipped to 400 characters; `` this build declares no flow `<flow>` ``; or `this
 process has not recovered it`. The answer is `202` with `execution_id`,
 `status: "cancelled"`, **`cancelling: false`** — the cancel is complete, there
 is nothing to watch — the `status_url`, and a `detail` saying why the row was
@@ -14655,7 +14655,7 @@ slot of the trigger's lease is free). The execution is on the status route
 from then on, `cancelled` with that `finally_error`, an execution on no board
 included; a second cancel is the `409` every ended execution gets, `resume`
 refuses it as cancelled (D160), and no start recovers it: its row is closed.
-`agent-compose cancel` prints `cancelled \`<id>\`: <detail>` and exits `0`.
+`agent-compose cancel` prints `` cancelled `<id>`: <detail> `` and exits `0`.
 
 **What the export carries.** What the record holds: the envelope a settle
 ships, `status: "cancelled"`, no `error`, `finally_error` saying no finally
