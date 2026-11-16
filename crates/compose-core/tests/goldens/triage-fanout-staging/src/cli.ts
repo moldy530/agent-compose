@@ -37,11 +37,6 @@
 // place, its history row, as actor `cli`; on any other, nowhere. See
 // [`storeVerb`].
 //
-// Its environment is its store's backend entry's and nothing else (PRD
-// resolved q82): `./index.ts` skips the load-time check for this verb, and the
-// verb checks that entry's variables once it has resolved the store — see
-// [`storeEnvironment`].
-//
 // # What `run` prints
 //
 // **stdout carries the answer, stderr carries the report.** A flow's `outputs:`
@@ -213,12 +208,6 @@ import {
 } from "./stores.ts";
 import type { HistoryEntry, OperatorTarget, StoreBinding, StoreParams } from "./stores.ts";
 import { publicUrl } from "./deployment.ts";
-import {
-  type EnvironmentReference,
-  MissingEnvironmentError,
-  environmentReferences,
-  readEnvironment,
-} from "./env.ts";
 import { eventTriggers, httpTriggers, manualTriggers, scheduleTriggers } from "./triggers.ts";
 
 /** What a `--format` selects. */
@@ -569,11 +558,13 @@ async function resumeVerb(argv: readonly string[]): Promise<number> {
  * credential is the operator's to supply, as `--header 'Authorization: Bearer
  * …'` or whatever header the trigger's `auth:` reads.
  *
- * Exit `0` on `202` — the cancel is recorded and under way; the status route
- * says how the execution ended — `1` on any refusal the app answered with (a
- * settled execution's `409`, an unknown one's `404`, a `401`), and `2` where the
- * command could not run: bad usage, no URL to send to, or an app that did not
- * answer.
+ * Exit `0` on `202` — the cancel is recorded and under way, and the status
+ * route says how the execution ended; or, for an execution the serving build's
+ * recovery could not take, already complete, its row closed `cancelled` with
+ * the `detail` printed (PRD resolved q81) — `1` on any refusal the app
+ * answered with (a settled execution's `409`, an unknown one's `404`, a
+ * `401`), and `2` where the command could not run: bad usage, no URL to send
+ * to, or an app that did not answer.
  */
 async function cancelVerb(argv: readonly string[]): Promise<number> {
   const [execution, ...rest] = argv;
@@ -616,6 +607,11 @@ async function cancelVerb(argv: readonly string[]): Promise<number> {
   const accepted = response.status === 202;
   if (format === "json") {
     process.stdout.write(`${JSON.stringify(document, null, 2)}\n`);
+  } else if (accepted && answer["cancelling"] === false) {
+    // The cancel is complete already: an execution the serving build's
+    // recovery could not take, whose row the app closed `cancelled` with no
+    // finally node run (PRD resolved q81) — and the `detail` says why.
+    process.stdout.write(`cancelled \`${execution}\`: ${String(answer["detail"] ?? "")}\n`);
   } else if (accepted) {
     process.stdout.write(
       `cancelling \`${execution}\`: the status route at ${String(answer["status_url"] ?? `/executions/${execution}`)} says how it ends\n`,
@@ -1760,10 +1756,8 @@ const LAST_INSTANT = 8.64e15;
  * The exit codes are the project's, read for a store: `0` found or applied;
  * `1` the answer is no — a `get` that found nothing, a condition that did not
  * hold, or a backend that failed; `2` the command could not run — a flag, a
- * store address, a sub-verb or a partition the command does not take, a
- * variable the store's backend references that is not set ([`storeEnvironment`],
- * PRD resolved q82), or a value the store's `value_schema` refuses (PRD
- * resolved q72). A refused value
+ * store address, a sub-verb or a partition the command does not take, or a
+ * value the store's `value_schema` refuses (PRD resolved q72). A refused value
  * is usage rather than an answer of no for the reason an `--input` that does
  * not fit its type is usage to `run` (grammar 13.2): nothing was read or
  * written, and what is to fix is what was typed — so a supervisor retrying on
@@ -1808,7 +1802,6 @@ async function storeVerb(argv: readonly string[]): Promise<number> {
   }
   const format = formatOf(options.single["format"]);
   const target = operatorTarget(address, options.single["session"], options.single["execution"]);
-  storeEnvironment(target.store);
   let code: number;
   try {
     code = await storeSubverb(name, target, operands, options, format);
@@ -1884,44 +1877,6 @@ async function storeSubverb(
       throw new UsageError(
         `\`store ${name}\` is not a sub-verb of \`store\`: it takes ${Object.keys(STORE_SUBVERBS).map((held) => `\`${held}\``).join(", ")}`,
       );
-  }
-}
-
-/**
- * Refuse a `store` command whose store's backend needs a variable that is not
- * set — and only such a command (PRD resolved q82, grammar Decision D166).
- *
- * An operator's `store` command is a process whose only component is the
- * backend it opens (`docs/distributed.md` §9.1), so its manifest is the
- * references `./env.ts` files under that backend's `storage_backends:` entry
- * and nothing else: `./index.ts` skips its load-time check for this verb, and
- * this is the check in its place. A model provider's key, a trigger's token or
- * the journal's address is a variable the command never spends, and a
- * `store count` used as a health check that refused over one would read as the
- * store being gone.
- *
- * The entry is the binding's own `site` — the one `operatorTarget` resolved
- * and the op then opens — and a variable is the backend's where a site it is
- * referenced at sits under that entry; each is named with those sites alone. A
- * binding with no `site` is a target's built-in, a file under the build
- * directory that needs no variable. A missing one is a usage error, exit `2`,
- * with `readEnvironment`'s own message and before the backend is opened:
- * nothing was read or written, and what is to fix is the environment the
- * command was started in.
- */
-function storeEnvironment(store: StoreBinding): void {
-  const entry = store.backend.site;
-  if (entry === undefined) return;
-  const needed: EnvironmentReference[] = [];
-  for (const reference of environmentReferences) {
-    const sites = reference.sites.filter((site) => site.startsWith(`${entry}.`));
-    if (sites.length > 0) needed.push({ name: reference.name, sites });
-  }
-  try {
-    readEnvironment(process.env, needed);
-  } catch (error) {
-    if (error instanceof MissingEnvironmentError) throw new UsageError(error.message);
-    throw error;
   }
 }
 
