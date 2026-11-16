@@ -10,6 +10,12 @@ Everything on this page is a tool **this runtime dispatches**. A tool the
 declared on the connection rather than on the agent: see `server_tools:` in
 `agent-compose docs models`.
 
+An agent's `tools:` may list a `flow.*` too (`agent-compose docs flows`, *As a
+tool*). Its result is the flow's outputs **as its body ended**: a `finally:`
+node the flow declares runs after the agent has been answered, so the agent
+never sees what that node did, and its entry in the trace and record in the
+journal are the account of it — not what the model says.
+
 ```yaml spec
 version: "0.1"
 

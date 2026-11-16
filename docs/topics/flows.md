@@ -284,6 +284,13 @@ and the trace envelope), and a `run` prints it on one stderr line. So is an
 that completed is the usual one — where the same read in any other node would
 fail the run.
 
+**A flow called as a tool answers before its finally node runs.** The agent is
+handed the flow's outputs when the body ends, and the finally node runs after
+that — so the agent never sees what it did, and nothing the model says about it
+is evidence either way (an agent reporting "cleanup did not run" is describing
+the moment it was answered). What the finally node did is its own entry in the
+trace and its own record in the journal.
+
 **A restart runs it once.** The end of the instance is journaled before the
 finally node starts, and its own effects are journaled like any node's: a
 process killed in the middle of it resumes, replays the body, and runs it again
