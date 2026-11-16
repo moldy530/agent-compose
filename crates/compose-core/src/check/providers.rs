@@ -953,8 +953,9 @@ fn setting(
     }
 }
 
-/// `thinking:`'s two forms, each refused the other's key (grammar 12.2,
-/// Decision D167, PRD resolved q83).
+/// `thinking:`'s two forms, each refused the other's key, and the enabled form
+/// spelled out refused without its budget (grammar 12.2, Decision D167, PRD
+/// resolved q83).
 ///
 /// [`THINKING`] types each key alone, and what a shape cannot say is that the
 /// keys belong to different forms: `budget_tokens` is the **enabled** form's
@@ -970,9 +971,15 @@ fn setting(
 /// outside the two has already been refused by [`literal`] and says nothing here
 /// about which form the other keys belong to.
 ///
-/// What is not refused is the enabled form without a `budget_tokens`:
-/// `thinking: {}` was accepted before the second form existed, and resolved q83
-/// rules on the two foreign keys alone, so it stays what it was.
+/// The third refusal is `type: enabled` with no `budget_tokens`
+/// (`missing-key`): the enabled form **is** a budget, and the wire refuses an
+/// enabled `thinking` without one, so a definition that names the form and
+/// leaves out the one thing it carries would validate clean and fail on its
+/// first call. Refusing it breaks nothing that compiled before: `type:` was an
+/// unknown key of `thinking` until the second form existed. The one shape
+/// without a budget that did compile, `thinking: {}`, stays accepted as it was,
+/// which is why the refusal reads a **declared** `type: enabled` and not the
+/// default one.
 fn thinking_forms(ctx: &mut Ctx, model: &str, value: &Spanned<Literal>) {
     let Literal::Mapping(entries) = &value.value else {
         return;
@@ -986,6 +993,28 @@ fn thinking_forms(ctx: &mut Ctx, model: &str, value: &Spanned<Literal>) {
         Some(_) => return,
     };
     let subject = format!("`thinking` of `{model}`");
+    if let (false, Some(declared), None) = (adaptive, declared, find("budget_tokens")) {
+        ctx.push(
+            Diagnostic::error(
+                DiagnosticCode::MissingKey,
+                value.span.clone(),
+                format!(
+                    "missing required key `budget_tokens` in {subject}: `type: enabled` is the \
+                     fixed-budget form"
+                ),
+            )
+            .with_label(
+                declared.value.span.clone(),
+                "`type: enabled` is declared here",
+            )
+            .with_help(
+                "the enabled form thinks within a fixed budget, and the wire refuses it without \
+                 one: write `budget_tokens:` (an integer of at least 1), or write `type: \
+                 adaptive` to have the model decide how much to think (grammar 12.2, Decision \
+                 D167)",
+            ),
+        );
+    }
     let (foreign, message, help) = if adaptive {
         (
             "budget_tokens",
