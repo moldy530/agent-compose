@@ -34,6 +34,12 @@ model.smart:
     max_tokens: 8000
     thinking: { budget_tokens: 4000 }
 
+model.deep:
+  provider: provider.anthropic
+  id: claude-sonnet-4-5
+  settings:
+    thinking: { type: adaptive, effort: high }
+
 model.fast:
   provider: provider.anthropic
   id: claude-haiku-4-5
@@ -395,6 +401,35 @@ typed for editors — `temperature`, `top_p`, `top_k`, `max_tokens`, `stop`,
 plugin-specific keys are accepted and checked against the provider plugin's
 schema. `thinking:` on an OpenAI provider is a compile error **at the model
 definition**, not at run time.
+
+### `thinking:` has two forms
+
+`thinking:` is the `anthropic` and `bedrock` plugins' key, and it takes one of
+two forms, told apart by `type:` — `model.smart` and `model.deep` above are one
+of each:
+
+| form | write | what the model does |
+|---|---|---|
+| enabled (the default) | `{ budget_tokens: 4000 }`, or the same with `type: enabled` | thinks within a fixed token budget |
+| adaptive | `{ type: adaptive }`, or with `effort: low`, `medium`, `high` or `max` | decides how much to think, at that effort — or at the provider's default |
+
+**Which form a model takes is the model's.** The newer models think adaptively
+and refuse a fixed budget, asking for `type: adaptive` and an `effort` instead;
+the older ones take only the budget. A model id that answers a fixed budget with
+a 400 is the sign to switch its `model.*` definition to the adaptive form — one
+edit in one file, like every other model change.
+
+Each form's key beside the other's `type:` is a compile error at the model
+definition (`conflicting-keys`): `budget_tokens` belongs to the enabled form,
+`effort` to the adaptive one, and an `effort` beside no `type:` at all is an
+effort on the enabled form, which is the default. On the wire, the enabled form
+goes out as `thinking: { type: "enabled", budget_tokens }` and the adaptive form
+as `thinking: { type: "adaptive" }` with the effort in `output_config.effort`,
+beside the format structured output asks through there. A `coder:` node running
+`harness: cc` gets the same two forms on its SDK's own options — the budget as
+`maxThinkingTokens`, the adaptive form as the SDK's adaptive thinking and its
+`effort` — and its own `settings:` cannot spell an `effort` of its own: that is
+the model's to say.
 
 Values inside `settings:` carry no env refs: every LLM configuration in a
 project stays greppable in one file, and a value that only exists at process
