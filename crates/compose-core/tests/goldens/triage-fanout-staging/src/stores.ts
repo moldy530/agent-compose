@@ -534,6 +534,18 @@ export interface BackendBinding {
    * target's built-in decided — which is every process-local one.
    */
   readonly urlEnv?: string;
+  /**
+   * The `storage_backends:` entry the binding was read from, as a spec
+   * address — `deploy.storage_backends.aliases.<alias>` or
+   * `deploy.storage_backends.defaults.<kind>` — and absent where a target's
+   * built-in decided it.
+   *
+   * The prefix of every site `./env.ts` files this entry's `${ENV}` references
+   * under, which is how an operator's `store` command finds the variables its
+   * one backend needs and checks those alone (PRD resolved q82): the command
+   * opens this entry and nothing else of the composition.
+   */
+  readonly site?: string;
 }
 
 /** A resolved `store.*` (grammar 11.1), as `./graph.ts` binds it. */
@@ -1249,13 +1261,12 @@ function migrateStoreFile(database: Database): void {
  *
  * Through `entries_partition_expiry`, so it reads the expired rows and nothing
  * else: a partition with a backlog of a million costs a write a hundred
- * deletes, and the next write a hundred more. Ordered by `expires_at`, so the
- * rows longest expired go first, as every dialect's sweep orders them.
+ * deletes, and the next write a hundred more.
  */
 function sweepLocalPartition(database: Database, scopeKey: string, now: number): void {
   database.run(
     "DELETE FROM entries WHERE rowid IN (SELECT rowid FROM entries WHERE scope_key = ? " +
-      `AND expires_at IS NOT NULL AND expires_at <= ? ORDER BY expires_at LIMIT ${SWEEP_PER_WRITE})`,
+      `AND expires_at IS NOT NULL AND expires_at <= ? LIMIT ${SWEEP_PER_WRITE})`,
     [scopeKey, now],
   );
 }
@@ -1274,7 +1285,7 @@ function sweepLocalPartition(database: Database, scopeKey: string, now: number):
 function sweepLocalLedger(database: Database, now: number): void {
   database.run(
     "DELETE FROM applied WHERE rowid IN (SELECT rowid FROM applied WHERE " +
-      `expires_at IS NOT NULL AND expires_at <= ? ORDER BY expires_at LIMIT ${SWEEP_PER_WRITE})`,
+      `expires_at IS NOT NULL AND expires_at <= ? LIMIT ${SWEEP_PER_WRITE})`,
     [now],
   );
 }
@@ -1305,7 +1316,7 @@ function sweepLocalHistory(database: Database, store: StoreBinding, scopeKey: st
   if (cutoff === undefined) return;
   database.run(
     "DELETE FROM history WHERE seq IN (SELECT seq FROM history WHERE scope_key = ? " +
-      `AND at <= ? ORDER BY at LIMIT ${SWEEP_PER_WRITE})`,
+      `AND at <= ? LIMIT ${SWEEP_PER_WRITE})`,
     [scopeKey, cutoff],
   );
 }
@@ -5846,18 +5857,11 @@ const POSTGRES_STORE_CLOCK = "FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000
  * address, so the outer delete removes exactly the rows the sub-select locked;
  * they cannot move while it holds them. It reads through the partial index over
  * `(store, scope_key, expires_at)`, so it reads no row that has not expired.
- *
- * **Ordered by `expires_at`**, so the rows longest expired go first and a
- * bounded sweep leaves the latest-expiring rows for the next one — the order
- * every dialect's sweep keeps, and the one the store contract reads (a key
- * behind a backlog of earlier-expiring rows stays a row until its turn).
- * Without it the sub-select's `LIMIT` takes whichever rows the plan reaches
- * first, which a seq scan and an index scan answer differently.
  */
 function postgresSweep(limit: number): string {
   return (
     "DELETE FROM store_entries WHERE ctid = ANY(ARRAY(SELECT ctid FROM store_entries " +
-    `WHERE store = ? AND scope_key = ? AND expires_at <= ? ORDER BY expires_at LIMIT ${limit} FOR UPDATE SKIP LOCKED))`
+    `WHERE store = ? AND scope_key = ? AND expires_at <= ? LIMIT ${limit} FOR UPDATE SKIP LOCKED))`
   );
 }
 
@@ -5873,7 +5877,7 @@ function postgresSweep(limit: number): string {
 function postgresLedgerSweep(limit: number): string {
   return (
     "DELETE FROM store_applied WHERE ctid = ANY(ARRAY(SELECT ctid FROM store_applied " +
-    `WHERE store = ? AND expires_at <= ? ORDER BY expires_at LIMIT ${limit} FOR UPDATE SKIP LOCKED))`
+    `WHERE store = ? AND expires_at <= ? LIMIT ${limit} FOR UPDATE SKIP LOCKED))`
   );
 }
 
@@ -5887,7 +5891,7 @@ function postgresLedgerSweep(limit: number): string {
 function postgresHistorySweep(limit: number): string {
   return (
     "DELETE FROM store_history WHERE ctid = ANY(ARRAY(SELECT ctid FROM store_history " +
-    `WHERE store = ? AND scope_key = ? AND at <= ? ORDER BY at LIMIT ${limit} FOR UPDATE SKIP LOCKED))`
+    `WHERE store = ? AND scope_key = ? AND at <= ? LIMIT ${limit} FOR UPDATE SKIP LOCKED))`
   );
 }
 
