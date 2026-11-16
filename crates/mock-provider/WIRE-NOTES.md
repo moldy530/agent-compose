@@ -1045,11 +1045,19 @@ its `type` alone — the sentences, which are this file's ordinary pydantic
 wording at the flat address (`thinking.budget_tokens`) rather than at a
 discriminated one; and the effort values, which are the pinned Agent SDK's
 `EffortLevel` (`low`, `medium`, `high`, `xhigh`, `max`), wider than the four a
-composition can write so that nothing the API takes is refused. Two things are
-**not** checked, both of which the API does refuse: a budget at or above
-`max_tokens`, and a form the requested model does not take (the enabled form on
-a model that only thinks adaptively). The first is a relation the compiler does
-not check either; the second is per model, and this server serves any model id.
+composition can write so that nothing the API takes is refused. Three things are
+**not** checked, each of which the API does refuse: a budget at or above
+`max_tokens`; a form the requested model does not take (the enabled form on a
+model that only thinks adaptively); and a forced `tool_choice` (`{ type: "tool" }`
+or `any`) beside thinking in either form, which the models that think only under
+`tool_choice: auto` or `none` refuse, as do the newest models, which refuse a
+forced choice whether or not they think. The first is a relation the compiler
+does not check either; the second and third are per model, and this server
+serves any model id. So this server answers the forced-tool rung on a thinking
+model with a 200 where such a model answers 400:
+`an_adaptive_model_keeps_its_effort_on_the_forced_tool_rung` pins what that
+rung's **request** carries — the effort beside the `tool_choice` — and is no
+evidence that the rung succeeds for a model that thinks (grammar D167).
 
 An `output_config` holding an effort and no `format` asks for **no** structured
 output: it is what a tool-loop turn on an adaptive model sends, and the prefill

@@ -5519,7 +5519,9 @@ Rules (PRD 5.9):
   `max` (absent, the provider's default). Each form's key beside the other's
   `type:` — `budget_tokens` beside `adaptive`, `effort` beside `enabled` or
   beside no `type:` — is a compile error at the model definition
-  (`conflicting-keys`). Which form a model takes is the model's: the newer
+  (`conflicting-keys`), and so is `type: enabled` declared without its
+  `budget_tokens` (`missing-key`); `thinking: {}`, which compiled before
+  `type:` existed, still does. Which form a model takes is the model's: the newer
   models think adaptively and refuse a fixed budget, the older ones take only
   the budget. On the Messages wire the enabled form is sent as
   `thinking: { type: "enabled", budget_tokens }` and the adaptive form as
@@ -14682,10 +14684,15 @@ definition** (`conflicting-keys`): `budget_tokens` beside `type: adaptive`
 ("`budget_tokens` is the enabled form's; adaptive thinking takes `effort`"), and
 `effort` beside `type: enabled` or beside no `type:` at all, which is the enabled
 form. A `type:` or an `effort` outside its closed set is `unknown-variant`, and
-`thinking:` on any other kind is the `unknown-key` it was. The enabled form with
-no `budget_tokens` — `thinking: {}` — is accepted as it was before this entry:
-q83 rules on the two foreign keys, and a `{}` the compiler has always taken stays
-taken, going out as `{ type: "enabled" }` for the provider to answer.
+`thinking:` on any other kind is the `unknown-key` it was. **`type: enabled`
+declared with no `budget_tokens` is `missing-key`**: the enabled form *is* a
+budget, and the wire refuses an enabled `thinking` without one, so that
+definition would validate clean and fail on its first call. Refusing it breaks
+nothing that compiled before, because `type:` was an unknown key of `thinking`
+until this entry. The one budgetless shape that did compile, `thinking: {}`, is
+the exception, and only it: it stays accepted as it was (a refusal of a
+composition the compiler has always taken is not this entry's to make), and it
+goes out as `{ type: "enabled" }` for the provider to answer.
 
 **On the Messages wire** the setting is the one key a request **translates**
 rather than spreads as written. The enabled form is sent as
@@ -14699,7 +14706,15 @@ on this wire at all: it is `output_config.effort`, **merged** into the one
 an adaptive model carries `output_config: { effort, format }`; a tool-loop turn,
 which pins nothing, carries `output_config: { effort }` alone; and the forced-tool
 rung, which sends no format, still carries the effort beside its `tool_choice`,
-because the effort is the model's setting and not the mechanism. A
+because the effort is the model's setting and not the mechanism. That is a
+statement about what the request carries, **not** a claim that the rung works for
+a thinking model: a forced `tool_choice` (`tool` or `any`) beside thinking, in
+either form, is a request many models refuse — the ones that think only under
+`tool_choice: auto` or `none`, and the newest, which refuse a forced choice
+whether or not they think — so on such a model the forced-tool rung is no
+fallback, and an endpoint that refuses the native rung leaves its structured
+output nowhere to go. Which models refuse it is per model; the mock serves any
+model id and does not check it (`WIRE-NOTES` (29)). A
 `output_config.effort` refusal is a path *inside* the parameter, which the
 mechanism ladder already reads as not a refusal of the parameter — so it fails
 the call with the provider's words rather than laddering. Nothing else of

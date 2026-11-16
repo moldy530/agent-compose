@@ -2223,6 +2223,11 @@ fn an_adaptive_models_tool_loop_turn_carries_its_effort_alone() {
 /// effort on this rung too, and the run then fails with that endpoint's own
 /// words. The mock's lagging-gateway personality refuses the *mechanism* and no
 /// more, which is what lets the second request be read at all.
+///
+/// Nor is the 200 this rung gets evidence that it works for a model that
+/// thinks: a forced `tool_choice` beside thinking, in either form, is a request
+/// many models refuse, and the mock — which serves any model id — does not check
+/// it (`WIRE-NOTES` (29), grammar D167).
 #[test]
 fn an_adaptive_model_keeps_its_effort_on_the_forced_tool_rung() {
     let provider = MockProvider::start().expect("a loopback port");

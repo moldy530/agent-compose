@@ -36,7 +36,7 @@ model.smart:
 
 model.deep:
   provider: provider.anthropic
-  id: claude-sonnet-4-5
+  id: claude-sonnet-4-6
   settings:
     thinking: { type: adaptive, effort: high }
 
@@ -422,7 +422,9 @@ edit in one file, like every other model change.
 Each form's key beside the other's `type:` is a compile error at the model
 definition (`conflicting-keys`): `budget_tokens` belongs to the enabled form,
 `effort` to the adaptive one, and an `effort` beside no `type:` at all is an
-effort on the enabled form, which is the default. On the wire, the enabled form
+effort on the enabled form, which is the default. `type: enabled` written out
+without a `budget_tokens` is refused too (`missing-key`): that form is the
+budget. On the wire, the enabled form
 goes out as `thinking: { type: "enabled", budget_tokens }` and the adaptive form
 as `thinking: { type: "adaptive" }` with the effort in `output_config.effort`,
 beside the format structured output asks through there. A `coder:` node running
