@@ -51,6 +51,17 @@
 //! * and `run`'s posture, which a cancel does not change: an interrupted run's
 //!   row stays open for `resume` (PRD resolved q28) —
 //!   [`an_interrupted_run_is_left_open_for_resume_rather_than_cancelled`].
+//!
+//! And what PRD resolved q81 adds: a cancel **closes** an execution the serving
+//! build's recovery could not take — its row ended `cancelled` with no finally
+//! node run, said in `finally_error` — together with the open children it left
+//! that this process is not running, while one it *is* running goes through
+//! the cascade; and `agent-compose cancel` prints why —
+//! [`a_cancel_closes_an_execution_this_build_cannot_run_and_the_open_child_it_left`],
+//! [`a_cancel_of_an_execution_whose_recovery_diverged_cancels_the_child_it_runs_through_the_cascade`]
+//! and [`agent_compose_cancel_prints_why_it_closed_an_execution_this_build_cannot_run`]
+//! (the divergence and the renamed flow under `pushed`'s settle webhook and a
+//! trace sink are in `compiled_graph_acceptance.rs`).
 
 #[path = "compiled_graph_acceptance/harness.rs"]
 mod harness;
@@ -1514,4 +1525,490 @@ fn an_interrupted_run_is_left_open_for_resume_rather_than_cancelled() {
         std::fs::read_to_string(&pid_file).is_ok_and(|held| held.lines().count() >= 2)
     });
     assert_eq!(killed.execution, execution, "{}", killed.stderr);
+}
+
+/// **A cancel closes an execution this build cannot run, and the open child it
+/// left** (PRD resolved q81, Decision D165).
+///
+/// `flow.parent` detaches a ten-minute `flow.long` child and runs a ten-minute
+/// command of its own when its `serve` is killed, so both rows are open. The
+/// next build renames `flow.parent`: recovery leaves the parent's row in the
+/// journal on no board, and the child — whose recovery waits for its open
+/// parent to re-issue it — is on no board either, since nothing will. Neither
+/// is answered by the status route.
+///
+/// The cancel of the parent closes both: `202` with the cancel complete, and
+/// two rows ended `cancelled` with their requests recorded and `finally_error`
+/// saying no finally node ran — the parent's naming the flow this build lacks,
+/// the child's that this process has not recovered it. No finally node ran
+/// anywhere. Both are on the status route now, and a cancel of the child is
+/// the `409` every ended execution gets.
+#[test]
+fn a_cancel_closes_an_execution_this_build_cannot_run_and_the_open_child_it_left() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("cancel-unrun-lineage");
+    let (environment, log) = environment(&provider, &scratch);
+    let pid_file = PathBuf::from(format!("{}.pids", log.display()));
+    let Some(project) = harness::scratch_project("cancel-unrun-lineage") else {
+        return;
+    };
+    let parent;
+    {
+        let Some(first) = harness::serve_into(&project, FIXTURE, &environment) else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        parent = started(
+            &app,
+            "/parent",
+            &json!({ "child_lingers": [600], "linger": 600 }),
+        );
+        pids(&log, 2);
+        // Dropped holding both: `SIGKILL` to the group, both rows left open.
+    }
+    let child = child_row_of(&project, &parent).expect("the parent's child has a row");
+
+    let entrypoint = scratch.path().join("renamed.yml");
+    std::fs::write(&entrypoint, renamed("flow.parent", "flow.parented"))
+        .expect("the scratch area is writable");
+    let Some(mut served) = harness::serve_entrypoint_into(&project, &entrypoint, &environment)
+    else {
+        kill_listed(&pid_file);
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    for id in [&parent, &child] {
+        let unknown = app
+            .get(&format!("/executions/{id}"))
+            .expect("the status route answers");
+        assert_eq!(
+            unknown.status,
+            404,
+            "{id} is on no board: {}",
+            unknown.text()
+        );
+    }
+
+    let (status, body) = cancel(&app, &parent);
+    assert_eq!(status, 202, "{body:#}");
+    assert_eq!(body["status"], "cancelled", "{body:#}");
+    assert_eq!(body["cancelling"], false, "{body:#}");
+    assert_eq!(
+        body["status_url"],
+        format!("/executions/{parent}"),
+        "{body:#}"
+    );
+
+    let mut expected = vec![
+        json!({
+            "id": &child,
+            "status": "cancelled",
+            "error": null,
+            "finally_error": closed_detail("this process has not recovered it"),
+            "requested": 1,
+        }),
+        json!({
+            "id": &parent,
+            "status": "cancelled",
+            "error": null,
+            "finally_error": closed_detail("this build declares no flow `flow.parent`"),
+            "requested": 1,
+        }),
+    ];
+    expected.sort_by(|one, other| one["id"].as_str().cmp(&other["id"].as_str()));
+    assert_eq!(
+        closed_rows(&project),
+        Value::Array(expected),
+        "both rows closed `cancelled`, their requests recorded, saying why"
+    );
+    assert!(
+        ended(&log).is_empty(),
+        "no finally node ran: {:?}",
+        ended(&log)
+    );
+    let child_report: Value = app
+        .get(&format!("/executions/{child}"))
+        .expect("the status route answers")
+        .json();
+    assert_eq!(child_report["status"], "cancelled", "{child_report:#}");
+    let (again, refused) = cancel(&app, &child);
+    assert_eq!(again, 409, "{refused:#}");
+
+    let said = served.stop_and_read_stderr();
+    kill_listed(&pid_file);
+    assert_eq!(
+        said.lines()
+            .filter(|line| line.starts_with(&format!(
+                "`{parent}` (flow.parent) could not be recovered by this build: "
+            )))
+            .count(),
+        1,
+        "{said}"
+    );
+}
+
+/// **`agent-compose cancel` prints why it closed an execution the serving
+/// build cannot run** (PRD resolved q81, Decision D165).
+///
+/// `flow.long` is running a ten-minute command when its `serve` is killed, and
+/// the next build renames the flow. `agent-compose cancel` against that build
+/// exits `0` and prints the route's `detail` — the row closed `cancelled`, no
+/// finally node run — and the execution is `cancelled` on the status route.
+/// Sent again, it is the app's `409`: exit `1`.
+#[test]
+fn agent_compose_cancel_prints_why_it_closed_an_execution_this_build_cannot_run() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("cancel-cli-unrun");
+    let (environment, log) = environment(&provider, &scratch);
+    let pid_file = PathBuf::from(format!("{}.pids", log.display()));
+    let Some(project) = harness::scratch_project("cancel-cli-unrun") else {
+        return;
+    };
+    let Some(cli_out) = harness::scratch_project("cancel-cli-unrun-build") else {
+        return;
+    };
+    let execution;
+    {
+        let Some(first) = harness::serve_into(&project, FIXTURE, &environment) else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        execution = started(&app, "/long", &json!({ "linger": 600 }));
+        pids(&log, 1);
+    }
+    let entrypoint = scratch.path().join("renamed.yml");
+    std::fs::write(&entrypoint, renamed("flow.long", "flow.lasting"))
+        .expect("the scratch area is writable");
+    let Some(served) = harness::serve_entrypoint_into(&project, &entrypoint, &environment) else {
+        kill_listed(&pid_file);
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let cancelling = |format: &str| {
+        compiler(&environment)
+            .arg("cancel")
+            .arg(&entrypoint)
+            .arg(&execution)
+            .args(["--url", &served.base_url, "--format", format])
+            .arg("--out")
+            .arg(&cli_out)
+            .output()
+            .expect("the compiler runs")
+    };
+
+    let closed = cancelling("human");
+    kill_listed(&pid_file);
+    assert_eq!(
+        closed.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&closed.stderr)
+    );
+    let printed = String::from_utf8_lossy(&closed.stdout);
+    assert_eq!(
+        printed.trim_end(),
+        format!(
+            "cancelled `{execution}`: this build could not take up this execution's recovery \
+             (this build declares no flow `flow.long`), so no generation of it can run here: \
+             its lifecycle row is closed `cancelled` and no finally node ran, which its \
+             `finally_error` says"
+        ),
+        "{printed}"
+    );
+    let report = reaches(&app, &execution, "cancelled", SETTLE);
+    assert_eq!(
+        report["finally_error"],
+        closed_detail("this build declares no flow `flow.long`"),
+        "{report:#}"
+    );
+
+    let refused = cancelling("json");
+    assert_eq!(
+        refused.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let document: Value =
+        serde_json::from_slice(&refused.stdout).expect("`--format json` prints one document");
+    assert_eq!(document["http_status"], 409, "{document:#}");
+    assert_eq!(document["status"], "cancelled", "{document:#}");
+}
+
+/// **A cancel of an execution whose recovery diverged cancels the child this
+/// process is running through the cascade, and closes the execution after
+/// it** (PRD resolved q81, q75 ruling c; Decision D165, D160).
+///
+/// [`PARENT_WITH_STEP`]'s parent detaches a ten-minute child, runs a quick
+/// step, and then a ten-minute command, when its `serve` is killed. The next
+/// build gives the step an argument it never had: the parent's replay re-issues
+/// its dispatch — so the child is resumed, and runs here again — and then meets
+/// the recorded step this build would not make, and diverges. The parent is
+/// `failed` on the status route with its row open; the child is `running`.
+///
+/// The cancel of the parent closes it and leaves the child to the cascade: the
+/// child's command stops, its finally node runs at `cancelled` and its row
+/// settles `cancelled` on its own — no `finally_error` — while the parent's
+/// row is closed `cancelled` with the divergence in its `finally_error`, after
+/// the child's cancel was recorded.
+#[test]
+fn a_cancel_of_an_execution_whose_recovery_diverged_cancels_the_child_it_runs_through_the_cascade()
+{
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("cancel-unrun-running-child");
+    let (environment, log) = environment(&provider, &scratch);
+    let pid_file = PathBuf::from(format!("{}.pids", log.display()));
+    let before = scratch.path().join("before.yml");
+    std::fs::write(&before, PARENT_WITH_STEP).expect("the scratch area is writable");
+    let after = scratch.path().join("after.yml");
+    let moved = PARENT_WITH_STEP.replace(
+        "        command: \"${TALLY_BIN}/ended\"\n      input:\n        outcome: \"'stepped'\"",
+        "        command: \"${TALLY_BIN}/ended\"\n        args: [\"--moved\"]\n      input:\n        outcome: \"'stepped'\"",
+    );
+    assert_ne!(
+        moved, PARENT_WITH_STEP,
+        "the step's binding is the one that moves"
+    );
+    std::fs::write(&after, moved).expect("the scratch area is writable");
+    let Some(project) = harness::scratch_project("cancel-unrun-running-child") else {
+        return;
+    };
+
+    let parent;
+    {
+        let Some(first) = harness::serve_entrypoint_into(&project, &before, &environment) else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        parent = started(
+            &app,
+            "/parent",
+            &json!({ "child_lingers": [600], "linger": 600 }),
+        );
+        pids(&log, 2);
+        assert_eq!(
+            ended(&log),
+            ["stepped|none"],
+            "the step ran and was recorded"
+        );
+    }
+    let child = child_row_of(&project, &parent).expect("the parent's child has a row");
+
+    let Some(mut served) = harness::serve_entrypoint_into(&project, &after, &environment) else {
+        kill_listed(&pid_file);
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let diverged = reaches(&app, &parent, "failed", Duration::from_secs(30));
+    let reason = diverged["error"].as_str().unwrap_or_default().to_string();
+    assert!(reason.contains("ReplayDivergence: "), "{diverged:#}");
+    // The child is running here again: its command was the one in flight.
+    let rerun = pids(&log, 3)[2];
+    reaches(&app, &child, "running", Duration::from_secs(30));
+
+    let (status, body) = cancel(&app, &parent);
+    assert_eq!(status, 202, "{body:#}");
+    assert_eq!(body["status"], "cancelled", "{body:#}");
+    assert_eq!(body["cancelling"], false, "{body:#}");
+
+    let child_report = reaches(&app, &child, "cancelled", SETTLE);
+    assert!(child_report.get("error").is_none(), "{child_report:#}");
+    assert!(
+        child_report.get("finally_error").is_none(),
+        "the child's own finally node ran, and ran clean: {child_report:#}"
+    );
+    assert!(!alive(rerun), "the child's command outlived the cascade");
+    let deadline = Instant::now() + SETTLE;
+    while ended(&log).len() < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        ended(&log),
+        ["stepped|none", "cancelled|none"],
+        "the child's finally node ran at `cancelled`, and the parent's ran nowhere"
+    );
+
+    let rows = harness::journal_rows(
+        &project,
+        &format!(
+            "SELECT executions.id AS id, executions.status AS status, \
+             executions.finally_error AS finally_error, executions.ended_at AS ended_at, \
+             cancellations.requested_at AS requested_at FROM executions \
+             LEFT JOIN cancellations ON cancellations.execution = executions.id \
+             WHERE executions.id IN ('{parent}', '{child}')"
+        ),
+    );
+    let row = |id: &str| -> Value {
+        rows.as_array()
+            .into_iter()
+            .flatten()
+            .find(|row| row["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("{id}'s row: {rows:#}"))
+    };
+    let (parent_row, child_row) = (row(&parent), row(&child));
+    assert_eq!(parent_row["status"], "cancelled", "{rows:#}");
+    let detail = parent_row["finally_error"].as_str().unwrap_or_default();
+    assert!(
+        detail.starts_with(
+            "no finally node ran: this build could not take up the execution's recovery ("
+        ) && detail.contains("ReplayDivergence: "),
+        "{rows:#}"
+    );
+    assert_eq!(child_row["status"], "cancelled", "{rows:#}");
+    let child_requested = child_row["requested_at"]
+        .as_str()
+        .expect("the child's request");
+    let parent_ended = parent_row["ended_at"].as_str().expect("the parent's end");
+    assert!(
+        child_requested <= parent_ended,
+        "the child's cancel ({child_requested}) was recorded before the parent's row closed \
+         ({parent_ended}): {rows:#}"
+    );
+
+    let said = served.stop_and_read_stderr();
+    kill_listed(&pid_file);
+    assert_eq!(
+        said.lines()
+            .filter(|line| line.starts_with(&format!(
+                "`{parent}` (flow.parent) could not be recovered by this build: "
+            )) && line.ends_with(&format!(
+                "; its row stays open until `agent-compose cancel {parent}` closes it"
+            )))
+            .count(),
+        1,
+        "{said}"
+    );
+}
+
+/// [`a_cancel_of_an_execution_whose_recovery_diverged_cancels_the_child_it_runs_through_the_cascade`]'s
+/// composition: `cancellation`'s `flow.long`, and a parent that detaches one,
+/// runs a quick step of its own — `${TALLY_BIN}/ended`, recording `stepped` —
+/// and then a command that lingers. The step is the effect a moved build
+/// diverges at, after the dispatch its replay re-issues.
+const PARENT_WITH_STEP: &str = r#"version: "0.1"
+
+defaults:
+  timeout: 300s
+
+triggers:
+  on_parent:
+    type: http
+    flow: flow.parent
+    path: /parent
+    method: POST
+    input:
+      child_lingers: "payload.body.child_lingers"
+      linger: "payload.body.linger"
+    respond: async
+
+flow.long:
+  description: A command that runs as long as it is told to, and a record of how the run ended.
+  inputs:
+    linger:
+      type: integer
+  outputs: {}
+  nodes:
+    work:
+      exec:
+        command: "${TALLY_BIN}/linger"
+      input:
+        linger: "input.linger"
+    record:
+      exec:
+        command: "${TALLY_BIN}/ended"
+      input:
+        outcome: "execution.outcome"
+        error: "has(execution.error) ? execution.error : 'none'"
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: record
+
+flow.parent:
+  description: A detached child that lingers, a quick step, then a command of the parent's own.
+  inputs:
+    child_lingers:
+      type: array
+      max_items: 1
+      items: { type: integer }
+    linger:
+      type: integer
+  outputs: {}
+  nodes:
+    spawn:
+      map:
+        over: input.child_lingers
+        as: seconds
+        node: flow.long
+        max_concurrency: 1
+        detach: true
+        input:
+          linger: "seconds"
+    step:
+      exec:
+        command: "${TALLY_BIN}/ended"
+      input:
+        outcome: "'stepped'"
+        error: "'none'"
+    hold:
+      exec:
+        command: "${TALLY_BIN}/linger"
+      input:
+        linger: "input.linger"
+    parent_end:
+      exec:
+        command: "${TALLY_BIN}/ended"
+      input:
+        outcome: "execution.outcome"
+        error: "has(execution.error) ? execution.error : 'none'"
+  edges:
+    - { from: start, to: spawn }
+    - { from: spawn, to: step }
+    - { from: step, to: hold }
+    - { from: hold, to: end }
+  finally: parent_end
+"#;
+
+/// The fixture with one flow renamed, everything naming it following: a build
+/// that no longer declares the flow an open execution ran.
+fn renamed(flow: &str, to: &str) -> String {
+    let source = std::fs::read_to_string(harness::fixture(FIXTURE)).expect("the fixture");
+    let edited = source
+        .replace(&format!("\n{flow}:\n"), &format!("\n{to}:\n"))
+        .replace(&format!(" {flow}\n"), &format!(" {to}\n"));
+    assert!(
+        !edited.contains(&format!("\n{flow}:\n")),
+        "`{flow}` is no longer declared"
+    );
+    edited
+}
+
+/// The child execution `parent`'s detached dispatch started, off its lineage
+/// row.
+fn child_row_of(project: &Path, parent: &str) -> Option<String> {
+    harness::journal_rows(
+        project,
+        &format!("SELECT execution FROM lineage WHERE parent = '{parent}'"),
+    )
+    .as_array()?
+    .first()?["execution"]
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Every lifecycle row, with what a close writes on it, by id.
+fn closed_rows(project: &Path) -> Value {
+    harness::journal_rows(
+        project,
+        "SELECT executions.id AS id, executions.status AS status, executions.error AS error, \
+         executions.finally_error AS finally_error, \
+         (SELECT COUNT(*) FROM cancellations WHERE cancellations.execution = executions.id) \
+         AS requested FROM executions ORDER BY executions.id",
+    )
+}
+
+/// What a closed execution's `finally_error` says (PRD resolved q81).
+fn closed_detail(reason: &str) -> String {
+    format!("no finally node ran: this build could not take up the execution's recovery ({reason})")
 }

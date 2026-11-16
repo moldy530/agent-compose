@@ -1843,6 +1843,19 @@ const DURABILITY: &[Criterion] = &[
                 "a_recovery_that_cannot_take_the_recorded_inputs_delivers_no_webhook",
                 Status::Live,
             ),
+            // …and what closes such a row when nobody puts the composition back:
+            // a cancel ends it `cancelled` with no finally node run, delivers
+            // the one settle and the export, and no later start recovers it
+            // (PRD resolved q81) — for a replay that diverged, and for a flow
+            // the build no longer declares.
+            (
+                "a_cancel_closes_an_execution_whose_recovery_diverged_and_no_later_start_recovers_it",
+                Status::Live,
+            ),
+            (
+                "a_cancel_closes_an_execution_whose_flow_the_build_no_longer_declares",
+                Status::Live,
+            ),
             // …and what a run that stops on its own must not leave behind: a
             // detached delivery made with no record is one the resume makes
             // again.
