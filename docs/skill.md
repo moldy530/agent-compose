@@ -162,7 +162,9 @@ covers is refused, exit `2`. `GET /sources/<name>` reports the program, under th
 read, through the same backend; `set`, `delete`, `list`, `count`, `export`,
 `import` and `log` are the rest of the surface, and a value is held to the
 store's `value_schema` before it is written. Use it to seed a store before a
-run, or to see what a run left, rather than writing a flow to do either. On a
+run, or to see what a run left, rather than writing a flow to do either. It
+needs only the environment variables the store's backend entry references, not
+the provider keys a `run` needs. On a
 store that declares `history: true`, `log <key>` reads who wrote the key, what
 and when, a page at a time. A write made this way is not an effect of any
 execution: it is recorded only in such a history, as actor `cli`, and

@@ -322,11 +322,20 @@ written. Same build as `run`, then the emitted project's own `store` verb opens
 the store exactly as a flow of that build would — the compiler carries no
 database driver, so it delegates — which is why `--target local` reads the
 SQLite files under the build directory and a named target reaches the `postgres`
-or `mysql` server its deploy file binds, with the target's environment variables,
-as `run` would. It checks `run`'s two preconditions first, and the first is the
-whole composition's: every `${ENV}` reference has a value — a provider's
-credential as much as the store's address — and the pinned dependency set is
-installed.
+or `mysql` server its deploy file binds, as `run` would. It checks `run`'s two
+preconditions first, and the first is narrower than `run`'s: **the environment
+a `store` command needs is its store's backend entry's and nothing else** (PRD
+resolved q82). The command opens that one backend and runs no flow, calls no
+model and serves no trigger, so a provider's credential, a trigger's token or
+the journal's address is never asked for — a `store count` used as a health
+check is not refused over a model provider's URL — while every `${ENV}` the
+store's `storage_backends:` entry references must be set, and one that is not
+is refused with exit `2`, naming it and the site it is written at, before
+anything is opened. A store `--target local` substitutes, or one the target
+binds to no entry, needs none. The emitted project checks the same list: run
+by hand, `bun src/index.ts store …` skips the load-time check every other verb
+makes and refuses a missing backend variable itself, with the same exit `2`.
+The second precondition is unchanged: the pinned dependency set is installed.
 
 ```sh
 agent-compose store set main.yml store.notes greeting '{"text":"hello"}'
@@ -546,7 +555,7 @@ dropped would leave you believing something had been installed under `$HOME`.
 |---|---|
 | `0` | clean: nothing was reported, or nothing but **warnings** was, or a `plan` was produced, or a document was printed, or a `store` op found or applied, or a `cancel` was accepted |
 | `1` | **errors** were reported, `build --check` found drift, a `run` produced no answer, a `resume` diverged from its journal, a `store` op found nothing, declined its condition or met a failing backend, a `store export` could not write its lines (a full disk, never a reader that left), a `plan`'s spec did not resolve, a `cancel` was refused (an execution that had already ended, an id the app does not know, a credential the trigger refused), or a discovery verb found something already there and would not replace it |
-| `2` | the command could not run: bad usage, an unreadable entrypoint, an unwritable output directory, a missing or malformed environment variable, an uninstalled dependency set, no JavaScript runtime to launch, a `resume` naming an execution the journal does not hold open (a cancelled one among them), a `cancel` that reached no app or had no URL to send to, a `store` address, sub-verb or partition flag the composition does not take, a `store log` of a store that keeps no history, or a `store` value its `value_schema` refuses |
+| `2` | the command could not run: bad usage, an unreadable entrypoint, an unwritable output directory, a missing or malformed environment variable (for `store`, one its store's backend entry references — no other is asked for), an uninstalled dependency set, no JavaScript runtime to launch, a `resume` naming an execution the journal does not hold open (a cancelled one among them), a `cancel` that reached no app or had no URL to send to, a `store` address, sub-verb or partition flag the composition does not take, a `store log` of a store that keeps no history, or a `store` value its `value_schema` refuses |
 | `3` | a `run` or `resume` with nobody to ask stopped at a `human` pause |
 
 The split between `1` and `2` is *the answer is no* versus *the command could
