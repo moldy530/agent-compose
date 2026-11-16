@@ -10,6 +10,14 @@
 //! start". This module emits the check; the barrel calls it; nothing here reads
 //! `process.env` at compile time.
 //!
+//! **One verb stands aside: `store`.** An operator's `store` command is a
+//! process whose only component is the backend it opens, so its manifest is
+//! that backend entry's references alone ([`References::for_store`], PRD
+//! resolved q82). The barrel skips its load-time check when it is launched with
+//! that verb, and the emitted verb checks the subset of `environmentReferences`
+//! filed under its store's entry once it has resolved the store — before the
+//! backend is opened, with the same `MissingEnvironmentError`, exit `2`.
+//!
 //! **`agent-compose build` does not.** Env refs survive *unresolved* into the IR
 //! and into generated code, which is what keeps the artifact committable and
 //! keeps a key out of every file this compiler writes. PRD 5.9 says so outright
@@ -108,6 +116,23 @@ const DEPLOY_OWNER: &str = "deploy:";
 /// so the two cannot name different entries.
 fn backend_owner(site: &str) -> String {
     format!("{DEPLOY_OWNER}{site}")
+}
+
+/// The [`backend_owner`] of the `storage_backends:` entry the store at `store`
+/// binds on this artifact's target — `None` where a target built-in decided it,
+/// or `store` names no store.
+///
+/// The one resolution [`Partition::of`] and [`References::for_store`] both read,
+/// and it is [`crate::ir::deploy::backend_of`]'s, which is also what the
+/// emitted binding is written from: three readers of one function rather than
+/// three derivations of which entry a store opens.
+fn store_backend_owner(ir: &Ir, store: &str) -> Option<String> {
+    let DefinitionBody::Store(definition) = &ir.definitions.get(store)?.body else {
+        return None;
+    };
+    crate::ir::deploy::backend_of(ir, definition)
+        .site
+        .map(|site| backend_owner(&site))
 }
 
 /// The owner key the `package_registry:` credentials are filed under
@@ -448,18 +473,14 @@ impl Partition {
         // worker that joins clean (§9.2 cannot refuse over a variable the
         // manifest does not name) and fails at its first store op — precisely
         // the failure §9.1 exists to prevent.
-        for (address, definition) in &ir.definitions {
-            let DefinitionBody::Store(store) = &definition.body else {
-                continue;
-            };
-            let Some(site) = crate::ir::deploy::backend_of(ir, store).site else {
+        for address in ir.definitions.keys() {
+            let Some(owner) = store_backend_owner(ir, address) else {
                 continue;
             };
             let held: Vec<Process> = runs
                 .get(address)
                 .map(|held| held.keys().cloned().collect())
                 .unwrap_or_default();
-            let owner = backend_owner(&site);
             for process in held {
                 arrive(
                     &mut runs,
@@ -667,6 +688,38 @@ impl References {
     #[must_use]
     pub fn for_process(ir: &Ir, partition: &Partition, process: &Process) -> Self {
         Self::collect(ir, &mut |owner| partition.holds(owner, process))
+    }
+
+    /// The references **an operator's `store` command** needs: those of the
+    /// `storage_backends:` entry the store at `store` binds on the target this
+    /// artifact was resolved for, and nothing else of the composition (PRD
+    /// resolved q82, grammar Decision D166).
+    ///
+    /// The command is a process like any other, and §9.1's rule is that a
+    /// process's manifest is the variables of every component that can execute
+    /// in it (`docs/distributed.md` §9.1). An operator's `store` command
+    /// executes exactly one: the backend it opens. It calls no model, serves no
+    /// trigger, opens no journal and joins no mesh, so a credential any of
+    /// those spend is one it must not demand — a `store count` used as a health
+    /// check that refused over a model provider's URL would read as the store
+    /// being gone.
+    ///
+    /// The same walk as [`Self::of`], filtered to the one owner
+    /// [`Partition::of`] files that entry's references under, and the entry is
+    /// the one [`crate::ir::deploy::backend_of`] resolves — the function the
+    /// emitted binding and the partition read — so this cannot name a
+    /// different entry than the command then opens. A store a target built-in
+    /// decides (every store under `--target local`, and any whose kind the
+    /// target neither aliases nor defaults) is opened from a file under the
+    /// build directory with no variable at all, and an address that names no
+    /// store is the emitted command's usage error to report: both answer an
+    /// empty manifest.
+    #[must_use]
+    pub fn for_store(ir: &Ir, store: &str) -> Self {
+        let Some(owner) = store_backend_owner(ir, store) else {
+            return Self::default();
+        };
+        Self::collect(ir, &mut |held| held == owner)
     }
 
     /// The walk both of the above are, with `wanted` deciding which owners
@@ -1115,7 +1168,9 @@ const MODULE_DOC: &str = "\
 //
 // Every `${ENV}` reference the composition makes, and `readEnvironment()`, the
 // presence check over them (PRD 5.9, grammar 4.3). `./index.ts` is what calls
-// it, at module scope, so loading this project is what checks its environment.
+// it, at module scope, so loading this project is what checks its environment —
+// for every verb but `store`, which checks its one backend's references once it
+// knows the store (`./cli.ts`, PRD resolved q82).
 // No value is baked in here: the spec never contains a credential, and neither
 // does this file — `agent-compose build` resolved nothing.
 ";
@@ -1159,13 +1214,19 @@ export class MissingEnvironmentError extends Error {
  * Presence is `!== undefined`: a variable set to the empty string is set. All
  * missing variables are reported at once, because a deployment that is short
  * three keys should learn that in one run rather than in three.
+ *
+ * `references` is the manifest checked, and every process that loads this
+ * project checks the whole list — but one: an operator's `store` command opens
+ * one backend and executes nothing else, so it hands in that backend entry's
+ * references alone, once it knows which store it was named (PRD resolved q82).
  */
 export function readEnvironment(
   source: Record<string, string | undefined> = process.env,
+  references: readonly EnvironmentReference[] = environmentReferences,
 ): ReadonlyMap<string, string> {
   const resolved = new Map<string, string>();
   const missing: EnvironmentReference[] = [];
-  for (const reference of environmentReferences) {
+  for (const reference of references) {
     const value = source[reference.name];
     if (value === undefined) {
       missing.push(reference);
@@ -1539,6 +1600,64 @@ storage_backends:\n  defaults:\n    kv:\n      provider: redis\n      url: ${RED
         assert!(
             !vault.contains(&"REDIS_URL".to_string()),
             "no store binds that default, so no placement opens it: {vault:?}"
+        );
+    }
+
+    /// **An operator's `store` command needs its store's backend and nothing
+    /// else** (PRD resolved q82, Decision D166).
+    ///
+    /// The composition is the one the ruling was raised over: a model provider,
+    /// an authenticated `http` trigger and a Postgres store, each with a
+    /// variable of its own, and beside them a store the target binds to no
+    /// entry. A `store count` used as a health check that refused over
+    /// `PROVIDER_URL` read as the store being gone; the command opens one
+    /// backend, so its manifest is that backend's references alone — and a
+    /// store nothing on the target binds opens a file under the build
+    /// directory, with no variable at all.
+    ///
+    /// The third assertion is the other half of the ruling: the **hub's**
+    /// manifest is untouched, so `run` and `serve` still refuse over each of the
+    /// three.
+    #[test]
+    fn a_store_commands_manifest_is_its_stores_backend_entry_alone() {
+        let ir = ir_of_mesh(
+            "version: \"0.1\"\n\
+provider.vendor:\n  kind: openai_compatible\n  base_url: ${PROVIDER_URL}\n\
+model.smart:\n  provider: provider.vendor\n  id: some-model\n\
+agent.helper:\n  model: model.smart\n  prompt: Help.\n  input: { q: { type: string } }\n  output: { a: { type: string } }\n\
+store.ledger:\n  kind: kv\n  scope: global\n  backend: pg_db\n  value_schema:\n    text: { type: string }\n\
+store.cache:\n  kind: kv\n  scope: global\n  value_schema:\n    text: { type: string }\n\
+flow.ask:\n  inputs:\n    q: { type: string }\n  outputs: {}\n  nodes:\n    ask:\n      agent: agent.helper\n      input:\n        q: \"input.q\"\n  edges:\n    - { from: start, to: ask }\n    - { from: ask, to: end }\n\
+triggers:\n  hook:\n    type: http\n    flow: flow.ask\n    path: /ask\n    auth:\n      bearer:\n        token: ${WEBHOOK_TOKEN}\n",
+            "version: \"0.1\"\n\
+storage_backends:\n  aliases:\n    pg_db:\n      provider: postgres\n      url: ${STORE_URL}\n",
+        );
+
+        let ledger = References::for_store(&ir, "store.ledger");
+        assert_eq!(
+            ledger.names().collect::<Vec<_>>(),
+            ["STORE_URL"],
+            "the command opens `store.ledger`'s backend and nothing else"
+        );
+        assert_eq!(
+            ledger.sites("STORE_URL"),
+            ["deploy.storage_backends.aliases.pg_db.url"],
+            "the refusal names the entry the store binds"
+        );
+        assert!(
+            References::for_store(&ir, "store.cache").is_empty(),
+            "a store the target binds to no entry opens a file under the build directory, which \
+             needs no variable"
+        );
+        assert!(
+            References::for_store(&ir, "store.missing").is_empty(),
+            "an address naming no store is the emitted command's usage error, not an environment \
+             refusal"
+        );
+        assert_eq!(
+            manifest(&ir, &Partition::of(&ir), &Process::Hub),
+            ["PROVIDER_URL", "STORE_URL", "WEBHOOK_TOKEN"],
+            "the hub's manifest is unchanged: `run` and `serve` still need all three"
         );
     }
 
