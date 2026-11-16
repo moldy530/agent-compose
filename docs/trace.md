@@ -157,7 +157,9 @@ records, harness runs and the child's own joined dispatches on them.
 * **A child that failed ships too**, `status: "failed"` and `error` on its
   envelope and the aborting entry last (§9) — the debugging story is strongest
   exactly there. One that met a replay **divergence** stays open and ships
-  nothing, as every execution does (`docs/durability.md` §7).
+  nothing, as every execution does (`docs/durability.md` §7) — until a cancel
+  closes it, its own or its parent's, and it ships `"cancelled"` with a
+  `finally_error` saying no finally node ran (PRD resolved q81).
 * **Nothing about it can delay or fail its parent** (grammar §8.6 rule 7). The
   parent never waits for its child: a parent may settle, and export, before its
   child has run a node, and a child that fails fails on its own.
