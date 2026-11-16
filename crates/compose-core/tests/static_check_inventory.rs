@@ -135,6 +135,9 @@ const M0: &[Check] = &[
             "unknown-variant",
             "value-out-of-range",
             "type-mismatch",
+            // `thinking:`'s two forms, each refused the other's key (grammar
+            // 12.2, D167): a pair a shape that types each key alone cannot see.
+            "conflicting-keys",
             "missing-capability",
         ],
         evidence: Evidence::Fixture,

@@ -1,0 +1,22 @@
+# rule: `effort` is the adaptive form's, refused beside `type: enabled` (grammar 12.2, D167)
+# code: conflicting-keys
+# message: `thinking` of `model.m` declares `effort` beside `type: enabled`
+# at: main.yml:22:7
+# label: main.yml:20:13 `type: enabled` is declared here
+# help: `effort` is the adaptive form's; the enabled form takes `budget_tokens`: write `type: adaptive` to have the model decide how much to think at that effort, or drop `effort` and keep the fixed budget (grammar 12.2, Decision D167)
+#
+# On a `bedrock` provider, which publishes `thinking:` beside `anthropic`
+# because it serves Anthropic's models (PRD resolved q83 names both): the rule
+# is the setting's shape, and the shape is the plugin's.
+version: "0.1"
+provider.p:
+  kind: bedrock
+  region: us-east-1
+model.m:
+  provider: provider.p
+  id: some-model
+  settings:
+    thinking:
+      type: enabled
+      budget_tokens: 4000
+      effort: high

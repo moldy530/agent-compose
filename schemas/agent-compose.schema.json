@@ -2966,7 +2966,15 @@
         "max_tokens": { "description": "Maximum output tokens.", "type": "integer", "minimum": 1 },
         "stop": { "description": "Stop sequences.", "type": "array", "items": { "type": "string" } },
         "seed": { "description": "Sampling seed, where the provider supports it.", "type": "integer" },
-        "thinking": { "description": "Extended-thinking configuration, where the provider supports it.", "type": "object" },
+        "thinking": {
+          "description": "Extended-thinking configuration, published by the anthropic and bedrock plugins and refused on every other kind. Two forms, told apart by type: — { type: enabled, budget_tokens } (enabled is the default when type: is absent) is a fixed thinking budget; { type: adaptive, effort? } lets the model decide how much to think, at the effort given. budget_tokens beside adaptive, and effort beside enabled, are compile errors. Grammar 12.2 / Decision D167.",
+          "type": "object",
+          "properties": {
+            "type": { "description": "Which form: enabled (a fixed budget; the default) or adaptive (the model decides how much to think).", "enum": ["enabled", "adaptive"] },
+            "budget_tokens": { "description": "The enabled form's thinking budget, in tokens.", "type": "integer", "minimum": 1 },
+            "effort": { "description": "The adaptive form's effort: how hard the model thinks.", "enum": ["low", "medium", "high", "max"] }
+          }
+        },
         "reasoning_effort": { "description": "Reasoning effort, where the provider supports it.", "type": "string" },
         "parallel_tool_calls": { "description": "Whether parallel tool calls are permitted.", "type": "boolean" }
       },

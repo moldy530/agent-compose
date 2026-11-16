@@ -114,9 +114,21 @@ const COMMON: &[(&str, Shape)] = &[
 ];
 
 const TOP_K: (&str, Shape) = ("top_k", Shape::Integer(1, i64::MAX));
+
+/// `thinking:`, in the two forms the Messages wire has (grammar 12.2, Decision
+/// D167, PRD resolved q83): `{ type: enabled, budget_tokens }` — the fixed
+/// budget, and the form a `thinking:` with no `type:` is, so every
+/// `{ budget_tokens }` written before the second form existed keeps its meaning
+/// — and `{ type: adaptive, effort? }`, where the model decides how much to
+/// think and `effort` says how hard. The shape types each key alone; a form's
+/// own key beside the other form's `type:` is [`thinking_forms`]' refusal.
 const THINKING: (&str, Shape) = (
     "thinking",
-    Shape::Object(&[("budget_tokens", Shape::Integer(1, i64::MAX))]),
+    Shape::Object(&[
+        ("type", Shape::Choice(&["enabled", "adaptive"])),
+        ("budget_tokens", Shape::Integer(1, i64::MAX)),
+        ("effort", Shape::Choice(&["low", "medium", "high", "max"])),
+    ]),
 );
 const REASONING_EFFORT: (&str, Shape) = (
     "reasoning_effort",
@@ -936,6 +948,83 @@ fn setting(
         return;
     };
     literal(ctx, &format!("`{key}` of `{model}`"), value, *shape);
+    if key == THINKING.0 {
+        thinking_forms(ctx, model, value);
+    }
+}
+
+/// `thinking:`'s two forms, each refused the other's key (grammar 12.2,
+/// Decision D167, PRD resolved q83).
+///
+/// [`THINKING`] types each key alone, and what a shape cannot say is that the
+/// keys belong to different forms: `budget_tokens` is the **enabled** form's
+/// fixed budget, and `effort` is how hard the **adaptive** form thinks. A
+/// `thinking:` carrying one form's key beside the other's `type:` describes no
+/// request the wire has — the enabled form is sent as a budget and nothing that
+/// says how hard, the adaptive form as an effort and no budget — so it is
+/// refused at the model definition rather than reaching the provider as a 400
+/// on the first call, or as a key one form would silently drop (PRD G3).
+///
+/// `type:` absent **is** the enabled form, so an `effort` beside no `type:` at
+/// all is the second refusal, worded for the default it fell into. A `type:`
+/// outside the two has already been refused by [`literal`] and says nothing here
+/// about which form the other keys belong to.
+///
+/// What is not refused is the enabled form without a `budget_tokens`:
+/// `thinking: {}` was accepted before the second form existed, and resolved q83
+/// rules on the two foreign keys alone, so it stays what it was.
+fn thinking_forms(ctx: &mut Ctx, model: &str, value: &Spanned<Literal>) {
+    let Literal::Mapping(entries) = &value.value else {
+        return;
+    };
+    let find = |name: &str| entries.iter().find(|entry| entry.key.value == name);
+    let declared = find("type");
+    let adaptive = match declared.map(|entry| &entry.value.value) {
+        None => false,
+        Some(Literal::String(form)) if form == "enabled" => false,
+        Some(Literal::String(form)) if form == "adaptive" => true,
+        Some(_) => return,
+    };
+    let subject = format!("`thinking` of `{model}`");
+    let (foreign, message, help) = if adaptive {
+        (
+            "budget_tokens",
+            format!("{subject} declares `budget_tokens` beside `type: adaptive`"),
+            "`budget_tokens` is the enabled form's; adaptive thinking takes `effort`: drop \
+             `budget_tokens` and say how hard the model thinks with `effort:` (`low`, `medium`, \
+             `high` or `max`), or write `type: enabled` to keep the fixed budget (grammar 12.2, \
+             Decision D167)",
+        )
+    } else {
+        (
+            "effort",
+            if declared.is_some() {
+                format!("{subject} declares `effort` beside `type: enabled`")
+            } else {
+                format!("{subject} declares `effort` and no `type:`, which is the enabled form")
+            },
+            "`effort` is the adaptive form's; the enabled form takes `budget_tokens`: write \
+             `type: adaptive` to have the model decide how much to think at that effort, or drop \
+             `effort` and keep the fixed budget (grammar 12.2, Decision D167)",
+        )
+    };
+    let Some(entry) = find(foreign) else {
+        return;
+    };
+    let mut diagnostic = Diagnostic::error(
+        DiagnosticCode::ConflictingKeys,
+        entry.key.span.clone(),
+        message,
+    )
+    .with_help(help);
+    if let Some(declared) = declared {
+        let form = if adaptive { "adaptive" } else { "enabled" };
+        diagnostic = diagnostic.with_label(
+            declared.value.span.clone(),
+            format!("`type: {form}` is declared here"),
+        );
+    }
+    ctx.push(diagnostic);
 }
 
 fn literal(ctx: &mut Ctx, subject: &str, value: &Spanned<Literal>, shape: Shape) {

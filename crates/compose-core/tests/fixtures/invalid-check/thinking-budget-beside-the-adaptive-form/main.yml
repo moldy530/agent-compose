@@ -1,0 +1,23 @@
+# rule: `budget_tokens` is the enabled form's, refused beside `type: adaptive` (grammar 12.2, D167)
+# code: conflicting-keys
+# message: `thinking` of `model.m` declares `budget_tokens` beside `type: adaptive`
+# at: main.yml:23:7
+# label: main.yml:22:13 `type: adaptive` is declared here
+# help: `budget_tokens` is the enabled form's; adaptive thinking takes `effort`: drop `budget_tokens` and say how hard the model thinks with `effort:` (`low`, `medium`, `high` or `max`), or write `type: enabled` to keep the fixed budget (grammar 12.2, Decision D167)
+#
+# The two forms of `thinking:` are told apart by `type:` (PRD resolved q83), and
+# each has a key the other does not: the enabled form's fixed budget, the
+# adaptive form's effort. A budget beside `type: adaptive` is a request the wire
+# has no spelling for — the adaptive form is sent as `{ type: "adaptive" }` and
+# carries no budget — so it is refused here rather than dropped on the way out.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+  settings:
+    thinking:
+      type: adaptive
+      budget_tokens: 4000

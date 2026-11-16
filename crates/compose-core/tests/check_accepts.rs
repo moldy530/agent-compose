@@ -3348,3 +3348,98 @@ event_sources:
         ),
     );
 }
+
+/// `thinking:` in both of its forms, on both plugins that publish it (grammar
+/// 12.2, Decision D167, PRD resolved q83).
+///
+/// The accepting half of `thinking_forms`' two refusals, and of the shape that
+/// gained a `type:` and an `effort`: the enabled form written the way every
+/// composition before the second form wrote it — no `type:` at all — and with
+/// `type: enabled` spelled out; the adaptive form with and without an `effort`,
+/// at every effort the setting takes; the same on `bedrock`, which serves
+/// Anthropic's models and publishes their key; and `thinking: {}`, which was
+/// legal before `type:` existed and which the ruling does not touch. An agent
+/// runs on two of them, so the capability checks read the models too.
+#[test]
+fn thinking_in_both_forms_on_both_plugins_that_publish_it() {
+    accepts(
+        "thinking-in-both-forms",
+        r#"
+provider.aws:
+  kind: bedrock
+  region: us-east-1
+model.budgeted:
+  provider: provider.p
+  id: some-model
+  settings:
+    max_tokens: 16000
+    thinking: { budget_tokens: 4000 }
+model.enabled:
+  provider: provider.p
+  id: some-model
+  settings:
+    thinking: { type: enabled, budget_tokens: 4000 }
+model.adaptive:
+  provider: provider.p
+  id: some-model
+  settings:
+    thinking: { type: adaptive }
+model.adaptive_low:
+  provider: provider.p
+  id: some-model
+  settings:
+    thinking: { type: adaptive, effort: low }
+model.adaptive_medium:
+  provider: provider.p
+  id: some-model
+  settings:
+    thinking: { type: adaptive, effort: medium }
+model.adaptive_high:
+  provider: provider.p
+  id: some-model
+  settings:
+    thinking: { type: adaptive, effort: high }
+model.adaptive_max:
+  provider: provider.p
+  id: some-model
+  settings:
+    thinking:
+      type: adaptive
+      effort: max
+model.unconfigured:
+  provider: provider.p
+  id: some-model
+  settings:
+    thinking: {}
+model.on_bedrock:
+  provider: provider.aws
+  id: some-model
+  settings:
+    thinking: { type: adaptive, effort: high }
+model.on_bedrock_budgeted:
+  provider: provider.aws
+  id: some-model
+  settings:
+    thinking: { budget_tokens: 2048 }
+agent.thinker:
+  model: model.adaptive_high
+  prompt: Think it through.
+  output:
+    answer: { type: string }
+agent.counter:
+  model: model.budgeted
+  prompt: Count carefully.
+  output:
+    answer: { type: string }
+flow.think:
+  outputs: {}
+  nodes:
+    think: { agent: agent.thinker, input: "'a question'" }
+    count: { agent: agent.counter, input: "'a sum'" }
+  edges:
+    - { from: start, to: think }
+    - { from: think, to: count }
+    - { from: count, to: end }
+"#,
+    );
+}

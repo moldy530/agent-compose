@@ -24,7 +24,12 @@ Two keys that may not appear together both appear. The pairs are not arbitrary
   `body:` on a body-bearing method, `query:` on `GET`/`HEAD`;
 - `if:` and `if_version:` on one `kv` write — a single write, or one entry of a
   `batch` — which are two answers to one condition;
-- two implementation bindings on one `tool.*`.
+- two implementation bindings on one `tool.*`;
+- one form of a model's `thinking:` setting beside the other's `type:` —
+  `budget_tokens` beside `type: adaptive`, and `effort` beside `type: enabled`
+  or beside no `type:` at all, which is the enabled form. The enabled form is a
+  fixed budget and the adaptive form an effort, and the wire has no request
+  carrying both.
 
 ## A spec that triggers it
 
@@ -43,6 +48,10 @@ Drop one. The message names both keys and which construct they are on, and in
 most of these one of the two is the one you meant — the other arrived by
 copy-paste from a construct that does take it.
 
-Grammar: `docs/grammar.md` §6, §7.2, §8.3, §8.6, §11.1, §13.3, Decisions D113,
-D153, D158.
-Topics: `agent-compose docs stores`, `agent-compose docs maps`.
+For `thinking:`, the help says which way each repair goes: drop the foreign key,
+or change `type:` to the form it belongs to.
+
+Grammar: `docs/grammar.md` §6, §7.2, §8.3, §8.6, §11.1, §12.2, §13.3,
+Decisions D113, D153, D158, D167.
+Topics: `agent-compose docs stores`, `agent-compose docs maps`,
+`agent-compose docs models`.
