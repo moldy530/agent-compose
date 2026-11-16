@@ -1171,6 +1171,15 @@ const CC_RESERVED: &[ReservedOption] = &[
         answered: Answered::Already("workspace"),
     },
     ReservedOption {
+        // The adaptive thinking form's effort, which the driver writes from
+        // the `model.*` definition's `thinking: { type: adaptive, effort }`
+        // (Decision D167) beside the `thinking` option below — so a key here
+        // would be a second spelling of what `model:` states, and the one that
+        // silently lost to it.
+        option: "effort",
+        answered: Answered::Through("model", THINKING),
+    },
+    ReservedOption {
         option: "env",
         answered: Answered::By("env"),
     },
@@ -1460,13 +1469,15 @@ const SPAWN: &str = "which program a run is — the binary, the runtime that spa
 /// [`Answered::Through`] rows (Decision D141).
 ///
 /// Two strings rather than one because the `model.*` key is the harness's own:
-/// `thinking:` carries `cc`'s budget and `reasoning_effort:` carries `codex`'s
-/// effort, and a refusal that named the other harness's key would be the
-/// sends-you-to-a-second-diagnostic failure this whole answer exists to avoid.
+/// `thinking:` carries `cc`'s budget or effort, in its two forms (Decision
+/// D167), and `reasoning_effort:` carries `codex`'s effort, and a refusal that
+/// named the other harness's key would be the sends-you-to-a-second-diagnostic
+/// failure this whole answer exists to avoid.
 const THINKING: &str = "`model:` is a registry address, so the one model setting this harness \
                         takes is written in the `model.*` definition it names — `thinking:` in \
-                        that definition's own `settings:`, where the provider plugin's schema \
-                        checks it (grammar 12.2, Decision D141)";
+                        that definition's own `settings:`, a `budget_tokens` in its enabled form \
+                        or an `effort` in its adaptive one, where the provider plugin's schema \
+                        checks it (grammar 12.2, Decisions D141, D167)";
 
 /// …and `codex`'s half of it.
 const REASONING: &str = "`model:` is a registry address, so the one model setting this harness \
@@ -2798,12 +2809,14 @@ flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n 
             );
         }
         // …and the one that answers *through* a key rather than to one: the
-        // thinking budget is written in the `model.*` definition `model:` names
+        // thinking budget — or, in the adaptive form, the effort (Decision
+        // D167) — is written in the `model.*` definition `model:` names
         // (Decision D141), and `model:` is required, so "write `model:` instead"
         // would name a line already on the node.
         for (harness, option) in [
             (Harness::Cc, "thinking"),
             (Harness::Cc, "maxThinkingTokens"),
+            (Harness::Cc, "effort"),
             (Harness::Codex, "modelReasoningEffort"),
         ] {
             assert!(

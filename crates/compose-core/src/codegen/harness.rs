@@ -1138,6 +1138,7 @@ mod tests {
                     "canUseTool",
                     "continue",
                     "cwd",
+                    "effort",
                     "env",
                     "executable",
                     "executableArgs",

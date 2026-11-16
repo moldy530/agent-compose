@@ -1561,4 +1561,47 @@ const results = {};
   };
 }
 
+// --- 17. Each thinking form reaches the SDK's own option for it -------------
+//
+// Decision D167, PRD resolved q83: a model's `thinking:` setting takes two
+// forms, and `cc` maps each onto the pinned Agent SDK's own option rather than
+// onto one shape for both. The enabled form's budget is `maxThinkingTokens`, as
+// it always was. The adaptive form is the SDK's `ThinkingConfig` arm for it,
+// `thinking: { type: "adaptive" }`, and that form's `effort` is the SDK's
+// `effort` option — which the pinned `Options` declares, so no stderr line is
+// owed. Invisible from the seam for section 11's reason: a scripted driver is
+// handed `run.modelSettings` whole, and it is the real driver's option builder
+// that decides what `query` is called with. Four runs:
+//
+//   * the enabled form, written the way every composition wrote it before the
+//     second form existed (no `type:`): a budget, no `thinking`, no `effort`;
+//   * the adaptive form with an effort: `thinking` and `effort`, no budget —
+//     a `maxThinkingTokens` beside them is the deprecated option the SDK says
+//     `thinking` takes precedence over, and is not written;
+//   * the adaptive form with none: `thinking` alone;
+//   * the adaptive form with no effort, and an `effort` key in the **node's**
+//     `settings:` — refused at `validate` (`reserved-harness-setting`), and
+//     subtracted here as defence in depth for an artifact an older release
+//     built: the run carries no effort the model did not state.
+{
+  const optionsFor = async (modelSettings, settings = { max_turns: 40 }) => {
+    const stub = harness.scriptedDriver("cc", script({ summary: "x", touched: [] }));
+    await runCoder(binding({ modelSettings, settings }), { goal: "fix it" }, context(), {
+      cc: stub.driver,
+    });
+    const options = harness.ccOptions(stub.runs[0], [], new Set());
+    return {
+      maxThinkingTokens: options.maxThinkingTokens ?? null,
+      thinking: options.thinking ?? null,
+      effort: options.effort ?? null,
+    };
+  };
+  results["thinkingForms"] = {
+    enabled: await optionsFor({ thinking: { budget_tokens: 8000 } }),
+    adaptive: await optionsFor({ thinking: { type: "adaptive", effort: "high" } }),
+    adaptiveUnspecified: await optionsFor({ thinking: { type: "adaptive" } }),
+    nodeEffort: await optionsFor({ thinking: { type: "adaptive" } }, { max_turns: 40, effort: "low" }),
+  };
+}
+
 process.stdout.write(`${JSON.stringify(results, null, 2)}\n`);
