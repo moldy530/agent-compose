@@ -1514,6 +1514,64 @@ async function begunByFinally(journal: Journal, link: Lineage): Promise<boolean>
 }
 
 /**
+ * Every open execution in `execution`'s lineage — its open children, and
+ * theirs, reached through any number of settled ones — **deepest first**, so
+ * a caller closing them one by one closes each before the execution above it
+ * (PRD resolved q81, Decision D165).
+ *
+ * [`cascadeCancel`]'s walk, answered rather than acted on: `src/serve.ts`'s
+ * cancel of an execution this build's recovery could not take closes the
+ * descendants this process runs no generation of, and the cascade has already
+ * cancelled the ones it does. Depth is counted in lineage links, settled ones
+ * included, so an open row is always deeper than every open row above it.
+ */
+export async function openDescendants(execution: string): Promise<readonly ExecutionRow[]> {
+  const journal = await openJournal();
+  const open = await journal.openExecutions();
+  const lineages = new Map<string, Lineage | undefined>(open.map((row) => [row.id, row.lineage]));
+  const lineageOf = async (id: string): Promise<Lineage | undefined> => {
+    if (lineages.has(id)) return lineages.get(id);
+    const lineage = (await journal.execution(id))?.lineage;
+    lineages.set(id, lineage);
+    return lineage;
+  };
+  const found: { readonly row: ExecutionRow; readonly depth: number }[] = [];
+  for (const row of open) {
+    if (row.id === execution) continue;
+    let link = row.lineage;
+    let depth = 0;
+    // Bounded by the lineage's depth; the set is [`cascadeCancel`]'s, for a
+    // journal whose rows name each other in a cycle.
+    const passed = new Set<string>();
+    while (link !== undefined) {
+      depth += 1;
+      if (link.parent === execution) {
+        found.push({ row, depth });
+        break;
+      }
+      if (passed.has(link.parent)) break;
+      passed.add(link.parent);
+      link = await lineageOf(link.parent);
+    }
+  }
+  return found.sort((one, other) => other.depth - one.depth).map((held) => held.row);
+}
+
+/**
+ * Whether this process is running a generation of `execution`: one it has
+ * opened and not yet closed ([`openExecution`]), or a child execution on its
+ * books — a dispatch still waiting for its permit included
+ * ([`runningChildren`]).
+ *
+ * What `src/serve.ts`'s cancel route asks before it closes a lifecycle row
+ * itself (PRD resolved q81, Decision D165): a row a generation here is running
+ * is that generation's to close, and its cancel goes through the cascade.
+ */
+export function runsHere(execution: string): boolean {
+  return openedExecutions.has(execution) || runningChildren.has(execution);
+}
+
+/**
  * Arrange for a **recovered** execution whose cancel was requested to complete
  * it (PRD resolved q75, `docs/durability.md` §6.1): its controller is opened
  * and its journal's frontier hook installed, so the replay consumes the
