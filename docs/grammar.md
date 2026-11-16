@@ -14617,7 +14617,7 @@ them (`runtime.runsHere`):
   the hook that closes rows;
 * **on no board** — a row of a flow the build does not declare, which recovery
   leaves in the journal, or one of a flow it declares that this process has
-  not recovered: a child whose recovery waits on a parent that will not
+  not recovered: a child whose recovery waits on its parent's replay to
   re-issue it, a row a recovery this start could not finish has yet to reach.
   A row a `run` wrote beside the `serve` — its trigger is `manual` — is not
   one: that execution is the `run`'s (below).

@@ -4855,8 +4855,9 @@ interface Unrecoverable {
  *  * **on no board** — a row of a flow this build does not declare, which
  *    recovery leaves in the journal and puts on no board at all; or one of a
  *    flow it does declare that this process has not recovered: a child whose
- *    recovery waits on a parent that will not re-issue it, a row a recovery
- *    this start could not finish has yet to reach. Save a row a **`run`**
+ *    recovery waits on its parent's replay to re-issue it — which finds the
+ *    row closed and delivers the dispatch, as for any settled child — a row a
+ *    recovery this start could not finish has yet to reach. Save a row a **`run`**
  *    wrote — its trigger is `manual` — beside this `serve`: that execution is
  *    the `run`'s, its interrupt leaves the row for `resume`, and its cancel is
  *    not `serve`'s (PRD resolved q75 ruling d, Decision D163's Status), so it
