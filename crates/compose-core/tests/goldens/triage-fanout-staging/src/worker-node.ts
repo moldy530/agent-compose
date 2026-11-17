@@ -913,8 +913,10 @@ async function main(): Promise<void> {
   // would issue it fails with a sentence that says what to change
   // (`runtime.ChildOnAWorker`) — the node's own failure, which grammar 8.6 rule
   // 7 leaves to its `on_error:` and which travels home with this dispatch like
-  // any other. It is the one construct a flow attached to a placed agent can
-  // reach that only the hub may begin.
+  // any other. It is the one construct that only the hub may begin and that a
+  // worker can still reach — inside a flow a placed agent attaches (grammar
+  // §14.1 rule 4), or anywhere in a placed flow's instance, which runs here
+  // whole (grammar §14.1 rule 2, Decision D171).
   refuseChildExecutions();
   executeLocally(runPlaced);
   // …and a pause reached under any of it settles this dispatch rather than
