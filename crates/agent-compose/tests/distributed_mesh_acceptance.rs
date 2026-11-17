@@ -4810,122 +4810,218 @@ fn a_deadline_over_a_placed_flow_stops_its_instance_on_the_worker_and_waits_for_
     assert!(worker.running(), "{}", worker.transcript());
 }
 
-/// What `agent-compose run` says when it reaches a placed flow's instance: the
-/// refusal a placed agent's node meets in a process with no mesh, naming the
-/// flow and its placement.
-fn unreachable(flow: &str) -> String {
-    format!(
-        "PlacementUnreachable: `{flow}` is placed on `{PLACEMENT}`, and this invocation has no \
-         mesh for a worker to join: a placed node — and every instance of a placed flow — \
-         executes on whichever worker claims its placement, so it needs a served hub with a \
-         worker beside it rather than a single process (docs/distributed.md §1, §3; grammar \
-         §14.1)"
-    )
+/// The address a `run` says it serves its mesh at, once it has said so.
+///
+/// The run writes one `mesh: <url> — …` line on stderr when the first dispatch
+/// it makes to a placement starts its listener (Decision D171); everything
+/// after the url on that line is the `agent-compose worker` command a reader
+/// starts next. Waits for the line rather than for the process, which is still
+/// running — it is waiting for the worker this answer is used to start.
+fn mesh_of(running: &harness::Running) -> String {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let said = running.said();
+        if let Some(url) = said.lines().find_map(|line| {
+            line.strip_prefix("mesh: ")
+                .and_then(|rest| rest.split_whitespace().next())
+                .map(str::to_string)
+        }) {
+            return url;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the run never said where a worker joins it\nstderr: {said}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
-/// **`agent-compose run` of a placed flow is refused at the dispatch, and runs
-/// nothing of the instance in its own process** (grammar §14.1 rule 2;
-/// Decision D171, which amends D64; `docs/distributed.md` §2).
+/// One `run`'s dispatch rows, with the columns [`dispatches_of`] reads.
+fn run_dispatches(project: &Path, flow: &str) -> Vec<Value> {
+    harness::journal_rows(
+        project,
+        &format!(
+            "SELECT d.placement, d.node, d.site, d.wait, d.status, d.session, d.outcome \
+             FROM dispatches d JOIN executions e ON e.id = d.execution \
+             WHERE e.flow = '{flow}' ORDER BY d.parked_at, d.wait"
+        ),
+    )
+    .as_array()
+    .cloned()
+    .unwrap_or_default()
+}
+
+/// **`agent-compose run` of a placed flow serves the mesh itself, and a worker
+/// that joins it runs the instance** (PRD resolved q84 — "a root execution a
+/// trigger or `run` starts … runs on a worker claiming the placement"; grammar
+/// §14.1 rule 2; Decision D171; `docs/distributed.md` §2).
 ///
-/// Every instance of a placed flow is a dispatch the **hub** makes — onto a
-/// board, through routes a worker joins — and a `run` is one process with
-/// neither. So a `run` that reaches a placed flow's instance does what a `run`
-/// that reaches a placed agent's node has always done: the dispatch throws
-/// `PlacementUnreachable`, naming the flow and `mac`, before anything is
-/// journaled, and what reached it fails on it. Both ways a `run` can reach one
-/// are pinned:
+/// A `run` is one process, and the placed instance it starts is still a
+/// dispatch a hub makes: onto a board, through the routes a worker joins. So the
+/// run is that hub for as long as it lasts. Its first dispatch to `mac` starts a
+/// listener for the worker routes and says where on stderr, the instance
+/// **parks** there — at the empty instance path, keyed by the execution and the
+/// flow's address, held by no session — and the run waits. A worker started
+/// against the address it named joins, is handed the dispatch, runs the
+/// instance's `agent:` node and its `finally:` node, streams their effects home
+/// to the run's journal and posts the instance's outputs, which are the run's
+/// answer on stdout. The CLI's own process called no provider: the one model
+/// call the provider answered was the worker's.
 ///
-///  * a `run` of `flow.placed_build` itself: the execution opens its row and
-///    fails at the root dispatch, said as a dispatch that never happened rather
-///    than one that "did not complete" somewhere;
-///  * a `run` of `flow.placed_retried`, which the run does execute, whose
-///    `build` node instantiates the placed flow: the node fails on the
-///    refusal — under its `retry:`, which meets the same refusal every attempt —
-///    and the execution with it.
+/// Both ways a `run` reaches a placed flow are driven, each with a worker of its
+/// own:
 ///
-/// **Nothing ran the instance in the CLI's process instead.** The provider is
-/// scripted to answer the instance's `agent:` node, so an instance that fell
-/// back to running locally would *complete* — the run would succeed — and it
-/// is asked nothing; the journal holds no effect of either execution and no
-/// dispatch row. A fallback like that would be the one start of a placed flow
-/// the placement did not decide.
+///  * a `run` of `flow.placed_build` itself — the root dispatch;
+///  * a `run` of `flow.placed_retried`, which the run executes, whose `build`
+///    node instantiates the placed flow — at that node's instance path — with
+///    `--host` and `--port` given, which the mesh line names back.
 #[test]
-fn a_run_of_a_placed_flow_is_refused_at_its_dispatch_and_runs_nothing_of_the_instance() {
+fn a_run_of_a_placed_flow_serves_the_mesh_and_the_worker_that_joins_it_runs_the_instance() {
     let Some(project) = harness::scratch_project("placed-flow-run") else {
         return;
     };
     let _scratch = harness::Scratch::at(project.clone());
     let provider = MockProvider::start().expect("a loopback port");
     provider.enqueue_all([
-        inspecting("release.dmg", "inspected-in-the-cli"),
-        inspecting("release.dmg", "inspected-in-the-cli"),
+        inspecting("release.dmg", "inspected-on-the-runs-worker"),
+        inspecting("hotfix.dmg", "inspected-from-the-runs-node"),
     ]);
     let entrypoint = harness::fixture(FIXTURE);
     let environment = environment(&provider);
 
     // The placed flow as the run's own root.
-    let root = harness::run_target(
+    let running = harness::run_target_spawned_with(
         &project,
         &entrypoint,
         TARGET,
         "flow.placed_build",
         &[("path", "release.dmg")],
+        &[],
         &environment,
     );
-    let said = root.failed();
+    let hub = mesh_of(&running);
     assert!(
-        said.contains(&format!(
-            "`flow.placed_build` was not dispatched to placement `{PLACEMENT}`: {}",
-            unreachable("flow.placed_build")
+        running.said().contains(&format!(
+            "agent-compose worker --hub {hub} --claim {PLACEMENT} --token-env {TOKEN_VARIABLE}"
         )),
-        "a `run` of a placed flow is refused at its root dispatch, by name: {said}"
+        "the run names the command a worker joins it with: {}",
+        running.said()
     );
+    // Parked on the run's board while nothing claims `mac` (§6.4), and nothing
+    // of the instance has run anywhere.
+    until(
+        "the run parked the instance on its own board",
+        || running.said(),
+        || {
+            run_dispatches(&project, "flow.placed_build")
+                .first()
+                .is_some_and(|row| row["status"] == "parked")
+        },
+    );
+    assert!(
+        provider.requests().is_empty(),
+        "the run's own process ran the placed instance's `agent:` node: {:#?}",
+        provider.snapshot()
+    );
+    let worker = Worker::start(&hub, &environment, "placed-flow-run-root", None);
+    let run = running.finish();
+    run.succeeded();
+    assert_eq!(
+        run.outputs()["signature"],
+        "inspected-on-the-runs-worker",
+        "the instance's outputs are the run's answer: {}\n{}",
+        run.stderr(),
+        worker.transcript()
+    );
+    assert_eq!(
+        run.trace()
+            .iter()
+            .filter_map(|entry| entry["node"].as_str().map(str::to_string))
+            .collect::<Vec<_>>(),
+        ["inspect", "settle"],
+        "the run's trace is the instance's own, its finally node's entry last"
+    );
+    let rows = run_dispatches(&project, "flow.placed_build");
+    assert_eq!(rows.len(), 1, "one instance, one dispatch: {rows:#?}");
+    assert_eq!(rows[0]["placement"], PLACEMENT, "{rows:#?}");
+    assert_eq!(rows[0]["node"], "flow.placed_build", "{rows:#?}");
+    assert_eq!(
+        rows[0]["site"], "",
+        "a root instance sits at the empty path: {rows:#?}"
+    );
+    assert_eq!(rows[0]["wait"], "flow.placed_build/0", "{rows:#?}");
+    assert_eq!(
+        (rows[0]["status"].as_str(), rows[0]["outcome"].as_str()),
+        (Some("settled"), Some("value")),
+        "{rows:#?}"
+    );
+    assert!(
+        rows[0]["session"]
+            .as_str()
+            .is_some_and(|session| session.starts_with("wrk_")),
+        "a worker session held the dispatch: {rows:#?}"
+    );
+    assert!(
+        harness::journal_holds(&project, &["inspect/0#model/0", "settle/0#finally/0"]),
+        "the instance's effects were streamed home to the run's journal: {}",
+        harness::journal_rows(&project, "SELECT \"key\" AS k FROM effects")
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "the instance's one model call was made once, by the worker"
+    );
+    drop(worker);
 
-    // A `flow:` node over it, in a flow the run executes itself.
-    let node = harness::run_target(
+    // A `flow:` node over it, in a flow the run executes itself, at the
+    // address the command names.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("a loopback port")
+        .port();
+    let running = harness::run_target_spawned_with(
         &project,
         &entrypoint,
         TARGET,
         "flow.placed_retried",
-        &[("path", "release.dmg")],
+        &[("path", "hotfix.dmg")],
+        &["--host", "127.0.0.1", "--port", &port.to_string()],
         &environment,
     );
-    let said = node.failed();
-    assert!(
-        said.contains(&unreachable("flow.placed_build")),
-        "a `run` reaching a placed flow through a `flow:` node is refused at that node's \
-         dispatch, by name: {said}"
+    let hub = mesh_of(&running);
+    assert_eq!(
+        hub,
+        format!("http://127.0.0.1:{port}"),
+        "the run serves its mesh where `--host` and `--port` say: {}",
+        running.said()
     );
-
-    // Nothing of either instance ran here.
-    assert!(
-        provider.requests().is_empty(),
-        "the CLI's process ran the placed instance's `agent:` node itself: {:#?}",
-        provider.snapshot()
+    let worker = Worker::start(&hub, &environment, "placed-flow-run-node", None);
+    let run = running.finish();
+    run.succeeded();
+    assert_eq!(
+        run.outputs()["signature"],
+        "inspected-from-the-runs-node",
+        "the `flow:` node's instance ran on the worker and its outputs reached the run: {}\n{}",
+        run.stderr(),
+        worker.transcript()
     );
-    let lifecycle = harness::journal_rows(
-        &project,
-        "SELECT flow, status FROM executions ORDER BY started_at",
+    let rows = run_dispatches(&project, "flow.placed_retried");
+    assert_eq!(rows.len(), 1, "one instance, one dispatch: {rows:#?}");
+    assert_eq!(rows[0]["placement"], PLACEMENT, "{rows:#?}");
+    assert_eq!(rows[0]["node"], "flow.placed_build", "{rows:#?}");
+    assert_eq!(
+        rows[0]["site"], "build/0",
+        "a `flow:` node's instance is dispatched at the node's own instance path: {rows:#?}"
     );
     assert_eq!(
-        lifecycle,
-        json!([
-            { "flow": "flow.placed_build", "status": "failed" },
-            { "flow": "flow.placed_retried", "status": "failed" },
-        ]),
-        "each `run` opened its execution and failed it"
+        (rows[0]["status"].as_str(), rows[0]["outcome"].as_str()),
+        (Some("settled"), Some("value")),
+        "{rows:#?}"
     );
-    let effects = harness::journal_rows(&project, "SELECT \"key\" AS k FROM effects");
     assert_eq!(
-        effects,
-        json!([]),
-        "an effect of the placed instance was journaled by the CLI's process"
-    );
-    let dispatches = harness::journal_rows(&project, "SELECT id FROM dispatches");
-    assert_eq!(
-        dispatches,
-        json!([]),
-        "a `run` parked a dispatch on a board no worker can reach"
+        provider.requests().len(),
+        2,
+        "each instance's one model call was made once, by a worker"
     );
 }
 

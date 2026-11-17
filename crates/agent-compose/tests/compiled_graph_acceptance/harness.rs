@@ -538,12 +538,28 @@ pub fn run_target_spawned(
     inputs: &[(&str, &str)],
     environment: &[(String, String)],
 ) -> Running {
+    run_target_spawned_with(out, entrypoint, target, flow, inputs, &[], environment)
+}
+
+/// [`run_target_spawned`], with `extra` arguments after the target's — the
+/// `--host`/`--port` a run serves its mesh at, for one (grammar §14.1,
+/// Decision D171).
+pub fn run_target_spawned_with(
+    out: &Path,
+    entrypoint: &Path,
+    target: &str,
+    flow: &str,
+    inputs: &[(&str, &str)],
+    extra: &[&str],
+    environment: &[(String, String)],
+) -> Running {
     let mut command = agent_compose();
     command.arg("run").arg(entrypoint).arg(flow);
     for (field, value) in inputs {
         command.arg("--input").arg(format!("{field}={value}"));
     }
     command.args(["--target", target]).arg("--out").arg(out);
+    command.args(extra);
     seal(&mut command, environment);
     command
         .stdin(Stdio::null())
