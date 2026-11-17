@@ -1,20 +1,27 @@
-# Acceptance fixture: a `coder:` node run on a worker, both ways a build step
+# Acceptance fixture: a `coder:` node run on a worker, each way a build step
 # reaches one.
 #
 # The first is the one a release without placed flows had to write: a **placed
-# agent whose only tool is a `flow.*` holding the coder node**. The attached
-# flow runs in the agent's placement (grammar §14.1 rule 4), so everything it
-# holds runs on the worker that took the agent's dispatch — at the cost of a
-# model call per run and a model restating the flow's outputs.
+# agent whose only tool is an unplaced `flow.*` holding the coder node** —
+# `agent.builder` and `flow.building`. The attached flow runs in the agent's
+# placement (grammar §14.1 rule 4), so everything it holds runs on the worker
+# that took the agent's dispatch — at the cost of a model call per run and a
+# model restating the flow's outputs.
 #
 # The second is the build step as a flow of its own (PRD resolved q84,
-# Decision D171): `flow.building` is itself a member of `mac`, so the trigger
-# `on_build_step` starts it as a root execution that the hub dispatches whole —
-# coder node, finally node and all — to a worker claiming `mac`, with no agent
-# in the way. The agent's attachment stays legal beside it: a placed flow
-# attached by an agent of the same placement is the same answer written twice.
+# Decision D171): `flow.placed_building` is itself a member of `mac`, so the
+# trigger `on_build_step` starts it as a root execution that the hub dispatches
+# whole — coder node, finally node and all — to a worker claiming `mac`, with
+# no agent in the way.
 #
-# Either way, the worker runs:
+# The third is that same placed flow attached as a tool by `agent.placed_builder`,
+# an agent of the **same** placement — the same answer written twice. Its
+# instance is a placed flow's, so it is dispatched rather than run in the loop;
+# but the dispatch is issued on the worker already running the agent, which is
+# the one process it can be handed to, so the worker answers it by running the
+# instance in its own process.
+#
+# Every way, the worker runs:
 #
 #   * `build`, the coder node, whose one harness run is journaled as a
 #     `harness` record (`docs/durability.md` §3.9) and streamed home over
@@ -59,8 +66,18 @@ triggers:
   # The build step started directly, as a root execution of the placed flow.
   on_build_step:
     type: http
-    flow: flow.building
+    flow: flow.placed_building
     path: /build-steps
+    method: POST
+    input:
+      goal: "payload.body.goal"
+    respond: async
+
+  # The placed flow called from the loop of an agent of its own placement.
+  on_placed_build:
+    type: http
+    flow: flow.placed_built
+    path: /placed-builds
     method: POST
     input:
       goal: "payload.body.goal"
@@ -77,8 +94,8 @@ model.smart:
   settings:
     max_tokens: 4096
 
-# Placed, and what it attaches is the flow holding the coder node — the shape a
-# build step on a worker has to take while a coder node cannot be placed itself.
+# Placed, and what it attaches is the unplaced flow holding the coder node — the
+# shape a build step on a worker took before a flow could be placed itself.
 agent.builder:
   description: Run one build step on the machine that holds the checkout, and report it.
   model: model.smart
@@ -93,11 +110,8 @@ agent.builder:
       type: string
       min_length: 1
 
-# Placed on `mac` itself (Decision D171), and attached by `agent.builder` of the
-# same placement: started by `on_build_step`, its instance is dispatched to a
-# worker claiming `mac`; called from `agent.builder`'s loop, it runs in that loop
-# on the worker that already holds it. Coder node and finally node run there
-# either way.
+# Attached, never triggered: its instance runs inside `agent.builder`'s loop on
+# the worker, coder node and finally node both.
 flow.building:
   description: Run one build step with a coding agent, and tidy up after it.
   inputs:
@@ -147,6 +161,84 @@ flow.built:
   nodes:
     build:
       agent: agent.builder
+      input:
+        goal: "input.goal"
+      writes:
+        summary: summary
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }
+
+# The same build step, placed on `mac` itself (Decision D171): started by
+# `on_build_step`, its instance is dispatched to a worker claiming `mac`; called
+# from `agent.placed_builder`'s loop, it is dispatched on the worker already
+# running that agent, which runs it there. Coder node and finally node run on
+# the worker either way.
+flow.placed_building:
+  description: Run one build step with a coding agent on the build machine, and tidy up after it.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+  outputs:
+    summary:
+      type: string
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: fresh
+        access: full_access
+        prompt: |
+          Run the build step the goal describes in the directory you have been
+          given, and report what it did.
+        input:
+          goal: { type: string }
+        output:
+          summary: { type: string }
+        allow_tools: [Bash, Read]
+      input:
+        goal: "input.goal"
+      writes: { summary: summary }
+      timeout: 5m
+    tidy_up:
+      exec:
+        command: "${OPS_BIN}/true"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }
+  finally: tidy_up
+
+# Placed on `mac`, and what it attaches is a flow placed on `mac` too.
+agent.placed_builder:
+  description: Run one build step through the placed flow that holds it, and report it.
+  model: model.smart
+  prompt: |
+    Run the build step for the goal you are given, and report what it did.
+  tools: [flow.placed_building]
+  input:
+    goal:
+      type: string
+  output:
+    summary:
+      type: string
+      min_length: 1
+
+# The hub's flow for the third way: one placed node, whose agent calls the
+# placed flow from its loop.
+flow.placed_built:
+  description: Run a build step on a worker, through a placed agent that attaches the placed flow.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+  outputs:
+    summary:
+      type: string
+  nodes:
+    build:
+      agent: agent.placed_builder
       input:
         goal: "input.goal"
       writes:

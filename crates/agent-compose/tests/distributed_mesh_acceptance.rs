@@ -3930,8 +3930,10 @@ fn a_stop_on_a_worker_leaves_none_of_the_commands_its_attached_flow_ran() {
 // A `coder:` node on a worker
 // ---------------------------------------------------------------------------
 
-/// The `placed-coder` fixture: a placed agent whose only tool is a flow holding
-/// a `coder:` node and a `finally:` node.
+/// The `placed-coder` fixture: a placed agent whose only tool is an unplaced
+/// flow holding a `coder:` node and a `finally:` node; the same build step as a
+/// placed flow of its own (Decision D171); and a placed agent attaching that
+/// placed flow on its own placement.
 const CODER_FIXTURE: &str = "placed-coder";
 
 /// The code the pinned Agent SDK reports a shadowed permission callback under.
@@ -4001,11 +4003,17 @@ fn stand_in_the_agent_sdk(data_dir: &Path) {
 /// The three calls `agent.builder` makes on the worker: the attached flow, a
 /// turn after it, and the structured answer.
 fn building(summary: &str) -> Vec<Script> {
+    building_through("building", summary)
+}
+
+/// The three calls an agent attaching a build-step flow as the tool `tool`
+/// makes on the worker: the call, a turn after it, and the structured answer.
+fn building_through(tool: &str, summary: &str) -> Vec<Script> {
     vec![
         Script::new(
             SONNET,
             Outcome::tool_calls(vec![ToolCall::new(
-                "building",
+                tool,
                 json!({ "goal": "make the release build" }),
             )]),
         ),
@@ -4018,12 +4026,13 @@ fn building(summary: &str) -> Vec<Script> {
 /// §14.1 rule 4, `docs/distributed.md` §3.3, §3.4, `docs/durability.md` §3.9,
 /// §3.10).
 ///
-/// The whole of the shape a build step on a build machine takes in this
-/// release: `agent.builder` is placed on `mac`, and its only tool is
-/// `flow.building`, whose `build` node is a `full_access` coder node and whose
-/// `finally:` node tidies up. The attached flow runs in the agent's placement,
-/// so all of it runs **on the worker** — and every half of it has to reach the
-/// hub:
+/// The shape a build step on a build machine took before a flow could be
+/// placed itself, and which stays legal beside it: `agent.builder` is placed on
+/// `mac`, and its only tool is `flow.building` — **unplaced** — whose `build`
+/// node is a `full_access` coder node and whose `finally:` node tidies up. The
+/// attached flow runs in the agent's placement (grammar §14.1 rule 4) and in
+/// its loop, never dispatched, so all of it runs **on the worker** — and every
+/// half of it has to reach the hub:
 ///
 /// * the coder's run, journaled as a `harness` record and streamed home over
 ///   `/workers/effects`. A hub that took only the four calls and the `finally`
@@ -4728,6 +4737,114 @@ fn a_hub_restarted_over_a_placed_flows_dispatch_recovers_it_through_the_retry() 
     );
 }
 
+/// **A hub restarted over a placed flow's root dispatch fails the execution
+/// once, and nothing runs the instance again** (§2, §5, §6.3, Decision D171).
+///
+/// `flow.placed_build` started as a root execution: the hub opens the lifecycle
+/// row and dispatches the instance at the empty path, keyed by the execution and
+/// the flow's address. The worker is inside it — its model call held three
+/// seconds — when the process behind the hub's name is replaced. The replacing
+/// process supersedes the dispatch the dead one issued, and recovery replays the
+/// execution to that dispatch and finds it superseded. A root instance has no
+/// instantiating node and so no `retry:` ladder: the execution fails on the
+/// lost session, its lifecycle row closes `failed`, and **no second dispatch is
+/// issued** — the long step is not run twice. The worker that survived the
+/// restart is still running, and whatever its old runner was doing is never
+/// asked of the provider again.
+#[test]
+fn a_hub_restarted_over_a_placed_flows_root_dispatch_fails_the_execution_without_a_second_run() {
+    let Some(mut mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider.enqueue(
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "signature": "inspected-before-the-restart" }))
+                .after(Duration::from_secs(3)),
+        )
+        .matching("release.dmg"),
+    );
+    let mut worker = mesh.worker("placed-flow-root-restart");
+
+    let execution = mesh.start_execution("/placed-builds", &json!({ "path": "release.dmg" }));
+    let holding = mesh.until(&execution, "was taken by the worker", |report| {
+        report["placement_waits"][0]["status"] == "dispatched"
+    });
+    assert_eq!(
+        holding["placement_waits"][0]["wait_id"], "flow.placed_build/0",
+        "the root instance's wait is keyed by the flow's address: {holding:#}"
+    );
+    let superseded = holding["placement_waits"][0]["dispatch_id"]
+        .as_str()
+        .expect("a dispatched wait names the dispatch holding it")
+        .to_string();
+    until(
+        "the instance's model call reached the provider",
+        || worker.transcript(),
+        || !mesh.provider.requests().is_empty(),
+    );
+
+    mesh.restart();
+
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] == "completed" || report["status"] == "failed"
+    });
+    assert_eq!(
+        report["status"],
+        "failed",
+        "a root instance whose session was lost has no retry to recover through, so its \
+         execution fails (§2): {report:#}\n{}",
+        worker.transcript()
+    );
+    let error = report["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("DispatchSuperseded") && error.contains("was replaced"),
+        "the execution's failure is not the superseded dispatch's: {report:#}"
+    );
+    let lifecycle = harness::journal_rows(
+        &mesh.project,
+        &format!("SELECT status FROM executions WHERE id = '{execution}'"),
+    );
+    assert_eq!(
+        lifecycle,
+        json!([{ "status": "failed" }]),
+        "the lifecycle row the hub opened for the root did not close failed"
+    );
+
+    // The worker's old runner ends — stopped on its re-join, or answering a
+    // session that is over — and nothing it did after the restart is anyone's.
+    until(
+        "the runner the restart orphaned is gone",
+        || worker.transcript(),
+        || worker.runners().is_none_or(|running| running.is_empty()),
+    );
+    let rows = mesh.dispatch_rows(&execution);
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row["id"].as_str(), row["status"].as_str()))
+            .collect::<Vec<_>>(),
+        [(Some(superseded.as_str()), Some("superseded"))],
+        "the one root dispatch is the one superseded, and none was issued after it: {rows:#?}\n{}",
+        worker.transcript()
+    );
+    assert_eq!(
+        mesh.report(&execution)["status"],
+        "failed",
+        "the worker's late answer reopened an execution that had failed"
+    );
+    let requests = mesh.provider.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the instance's model call was made again after the restart: {requests:#?}"
+    );
+    assert!(
+        worker.running(),
+        "the worker stopped somewhere across the restart: {}",
+        worker.transcript()
+    );
+}
+
 /// **A placed flow's dispatches count against its placement's `max_running:`**
 /// (`docs/distributed.md` §2, Decision D161, D171).
 ///
@@ -4784,13 +4901,13 @@ fn a_placed_flows_dispatches_count_against_its_placements_max_running() {
 /// **A `coder:` node in a placed flow runs on the worker, with no agent in the
 /// way** (PRD resolved q84, Decision D171).
 ///
-/// The report's use case. `flow.building` is a member of `mac` itself, so the
-/// trigger that starts it starts a root execution the hub dispatches whole: the
-/// coder node's run happens on the worker and its `harness` record comes home,
-/// the finally node runs there and its boundary comes home, and the summary the
-/// coder produced is the execution's output. No model is called for it at all —
-/// the placed agent the coder node used to need, and its extra model call, are
-/// gone.
+/// The report's use case. `flow.placed_building` is a member of `mac` itself,
+/// so the trigger that starts it starts a root execution the hub dispatches
+/// whole: the coder node's run happens on the worker and its `harness` record
+/// comes home, the finally node runs there and its boundary comes home, and the
+/// summary the coder produced is the execution's output. No model is called for
+/// it at all — the placed agent the coder node used to need, and its extra
+/// model call, are gone.
 #[test]
 fn a_coder_node_in_a_placed_flow_runs_on_the_worker_with_no_agent_in_the_way() {
     let Some(mesh) = Mesh::start_from("mesh-coder-flow", harness::fixture(CODER_FIXTURE), None)
@@ -4836,12 +4953,116 @@ fn a_coder_node_in_a_placed_flow_runs_on_the_worker_with_no_agent_in_the_way() {
 
     let rows = dispatches_of(&mesh, &execution);
     assert_eq!(rows.len(), 1, "{rows:#?}");
-    assert_eq!(rows[0]["node"], "flow.building", "{rows:#?}");
+    assert_eq!(rows[0]["node"], "flow.placed_building", "{rows:#?}");
     assert_eq!(rows[0]["placement"], PLACEMENT, "{rows:#?}");
     assert!(
         mesh.provider.requests().is_empty(),
         "a placed build step called a model: {:#?}",
         mesh.provider.requests()
+    );
+}
+
+/// **A placed flow attached by an agent of its own placement runs on the worker
+/// already running the agent** (grammar §14.1 rule 4, Decision D171).
+///
+/// `agent.placed_builder` is a member of `mac`, and its one tool is
+/// `flow.placed_building`, a member of `mac` too — the same answer written
+/// twice. The call's instance is a placed flow's, so the runtime dispatches it
+/// rather than running it in the loop; but the dispatch is issued on the worker
+/// that took the agent's node, the one process a worker can hand it to, so that
+/// worker runs the instance itself. Nothing about it reaches the hub's board:
+/// one dispatch — the agent node's — settles with the node's value, while the
+/// coder node's `harness` record and the instance's `finally` boundary come
+/// home keyed under the call inside that node, exactly as an unplaced attached
+/// flow's do. The model is handed the coder's summary as the tool's result.
+#[test]
+fn a_placed_flow_attached_by_an_agent_of_its_own_placement_runs_on_the_agents_worker() {
+    let Some(mesh) = Mesh::start_from(
+        "mesh-coder-same-placement",
+        harness::fixture(CODER_FIXTURE),
+        None,
+    ) else {
+        return;
+    };
+    mesh.provider.enqueue_all(building_through(
+        "placed_building",
+        "the placed build ran in the agent's loop",
+    ));
+    let data_dir = scratch_data_dir("placed-coder-same-placement");
+    stand_in_the_agent_sdk(&data_dir);
+    let worker = mesh.worker_into("placed-coder-same-placement", &data_dir);
+
+    let execution = mesh.start_execution(
+        "/placed-builds",
+        &json!({ "goal": "make the release build" }),
+    );
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] == "completed" || report["status"] == "failed"
+    });
+    assert_eq!(
+        report["status"],
+        "completed",
+        "{report:#}\n{}",
+        worker.transcript()
+    );
+    assert_eq!(
+        report["outputs"]["summary"], "the placed build ran in the agent's loop",
+        "{report:#}"
+    );
+    assert!(
+        report.get("finally_error").is_none_or(Value::is_null),
+        "the finally node ran clean on the worker: {report:#}"
+    );
+
+    // The coder's run and the instance's end, journaled from the worker under
+    // the call inside the placed agent node.
+    let records = harness::journal_rows(
+        &mesh.project,
+        &format!(
+            "SELECT \"key\" AS k, kind FROM effects \
+             WHERE execution = '{execution}' AND kind IN ('harness', 'finally') ORDER BY \"key\""
+        ),
+    );
+    assert_eq!(
+        records,
+        json!([
+            { "k": "build/0/placed_building/0/build/0#harness/0", "kind": "harness" },
+            { "k": "build/0/placed_building/0/tidy_up/0#finally/0", "kind": "finally" },
+        ]),
+        "the run and the instance's end came home under the call: {}",
+        worker.transcript()
+    );
+
+    // One dispatch, the agent node's: the instance its loop started was run by
+    // the worker holding it, not handed back to the hub's board.
+    let rows = dispatches_of(&mesh, &execution);
+    assert_eq!(
+        rows.iter()
+            .map(|row| (
+                row["placement"].as_str(),
+                row["node"].as_str(),
+                row["status"].as_str(),
+                row["outcome"].as_str()
+            ))
+            .collect::<Vec<_>>(),
+        [(
+            Some(PLACEMENT),
+            Some("flow.placed_built.build"),
+            Some("settled"),
+            Some("value")
+        )],
+        "the placed agent node is the one dispatch, settled with its value: {rows:#?}\n{}",
+        worker.transcript()
+    );
+
+    // The model was handed what the instance answered, and asked three times.
+    let requests = mesh.provider.requests();
+    assert_eq!(requests.len(), 3, "{requests:#?}");
+    assert!(
+        requests.iter().any(|request| request
+            .body_text
+            .contains("built on the worker for make the release build")),
+        "the tool result the model saw was not the instance's outputs: {requests:#?}"
     );
 }
 
