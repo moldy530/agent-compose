@@ -530,7 +530,11 @@ its numbering, and then §14.2's about the token:
   of it — its `finally:` node too — runs there, and its effects are journaled on
   the hub as any dispatch's are. That is how one build step runs on one build
   machine with no agent in the way: put the step in a flow — a `coder:` node, an
-  `exec:` node — and name the flow.
+  `exec:` node — and name the flow. One construct does not move with it: a
+  `detach: true` `flow.*` dispatch starts a child execution only the hub can
+  begin, so anywhere in a placed flow's instance it fails its `map` node on
+  every run (`ChildOnAWorker`, under the node's `on_error:`) — leave detached
+  dispatches to a flow the hub runs.
 - **rule 3** — placements are **disjoint**. One component in two of them is two
   answers to which worker runs it — and so is a component placed elsewhere that
   a placed flow's instance reaches, since a worker runs every node of the

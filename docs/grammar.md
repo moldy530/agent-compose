@@ -6615,7 +6615,13 @@ documents cite them by number** (Decisions
    among them — execute on that worker, and their effects are journaled on the
    hub as any dispatch's are. The flow's `inputs:`, `outputs:` and nodes mean
    what they meant unplaced; only *where* changes (PRD resolved q84,
-   [D171](#d171-a-placed-flow-runs-each-of-its-instances-whole-on-a-worker-claiming-its-placement)). Nothing else is a member: a `store.*`, `model.*` or `provider.*`
+   [D171](#d171-a-placed-flow-runs-each-of-its-instances-whole-on-a-worker-claiming-its-placement)) —
+   with one construct that does not survive the move: a `detach: true`
+   `flow.*` dispatch anywhere in the instance starts a child execution, which
+   only the hub begins (PRD resolved q65), so on the worker it cannot be issued
+   and its `map` node fails by name under its own `on_error:` (§8.6 rule 7,
+   [`docs/distributed.md`](distributed.md) §3.3) — on every run, since every
+   instance runs there. Nothing else is a member: a `store.*`, `model.*` or `provider.*`
    goes where what reaches it goes (rule 5, [`docs/distributed.md`](distributed.md)
    §9.1), and a `coder:` node is placed by placing the flow that holds it —
    a node naming a placement of its own is not added by q84.
@@ -15585,7 +15591,19 @@ runs dispatches it, so that is fine; an agent placed elsewhere cannot, directly
 or through an unplaced flow it attaches. And rule 4 reads an *unplaced* agent's
 answer off where it executes: one only placed flows run is on their placement,
 not on the hub, so a tool on that same placement is accepted. A flow named by
-two placements is rule 1's repeated-claim error, as any member is.
+two placements is rule 3's disjointness error, as any member is.
+
+**What does not move with it.** A detached `flow.*` dispatch (§8.6 rule 7)
+starts a child execution, which the hub alone begins, journals and recovers
+(PRD resolved q65, q42), and a worker cannot issue one — the limit a flow a
+placed agent attaches has always had. Inside a placed flow's instance, which a
+worker runs whole, such a dispatch therefore fails its `map` node on every run,
+by name (`ChildOnAWorker`, whose repair names both cases) and under that node's
+own `on_error:` (`docs/distributed.md` §3.3). The compiler does not refuse it:
+the rule is the one the attached-flow path already had, kept as one runtime
+refusal rather than split into a compile error for a placed flow and a run-time
+one for an attached flow, and a placed flow that needs a child leaves the
+detached dispatch to a flow the hub runs.
 
 **Rationale.** PRD resolved q84 states the problem: running one build step on
 a build machine took a placed agent whose only tool was a flow holding the

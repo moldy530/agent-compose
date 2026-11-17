@@ -733,11 +733,14 @@ can open, and that journal refuses by name every operation that is the hub's: a
 lifecycle row, a delivery, the dispatch board. The one construct a placed node
 can reach that would need one is a detached `flow.*` dispatch, which starts a
 **child execution** (PRD resolved q65, `docs/durability.md` §3.2) — begun,
-journaled and recovered by the single writer. A worker reaches one only inside a
-flow a placed agent attaches as a tool (grammar §14.1 rule 4), and there the
-dispatch **cannot be issued**, rather than being begun on a journal the hub never
-reads. That is the one detached-dispatch failure grammar §8.6 rule 7 leaves to
-the `map` node itself — its `on_error:` "still covers the node's own failures,
+journaled and recovered by the single writer. A worker reaches one two ways —
+inside a flow a placed agent attaches as a tool (grammar §14.1 rule 4), and
+anywhere in a **placed flow's** instance, every node of which (and of the
+unplaced flows it instantiates) runs on the worker that took its dispatch
+(grammar §14.1 rule 2, Decision D171) — and either way the dispatch **cannot be
+issued**, rather than being begun on a journal the hub never reads. That is the
+one detached-dispatch failure grammar §8.6 rule 7 leaves to the `map` node
+itself — its `on_error:` "still covers the node's own failures,
 including a dispatch that could not be issued at all" — so the map node fails
 before it dispatches anything, with no stub `"detached"` record claiming a
 dispatch was made, and the error names the flow, the dispatch's key and what to
@@ -745,7 +748,9 @@ change. The failure is the node's like any other: on its trace entry, under its
 `retry:` and `on_error:`, and home with the placed node's settled dispatch —
 never only on the worker's stderr. A composition that needs the child dispatches
 it from a flow the hub runs, or drops `detach:` so the dispatch is joined inside
-the placed node.
+the placed node. The compiler accepts the construct in both places and leaves it
+to this failure — and inside a placed flow, every instance of which runs on a
+worker, that means every run: a placed flow is no place for a detached dispatch.
 
 Each record carries its **effect key**, derived by the execution-derived rule
 grammar §9.4 fixes — `<site>#<kind>/<ordinal>`, which the hub re-derives from the

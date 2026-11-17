@@ -177,7 +177,12 @@ What changes is the environment: what only the flow reaches — its `coder:`
 node's `env:`, an agent only it names — is that machine's to hold, and not the
 hub's. And what it reaches cannot be placed **elsewhere**: the worker running
 the instance runs all of it, so a component another placement claims is a
-compile error naming both.
+compile error naming both. One construct does not come along: a `detach: true`
+`flow.*` dispatch starts a child execution only the hub can begin, so anywhere
+in a placed flow's instance its `map` node fails on every run
+(`ChildOnAWorker`, under that node's `on_error:`). The compiler accepts it, as
+it does inside a flow a placed agent attaches; dispatch detached work from a
+flow the hub runs instead.
 
 ## Reachability, and no recursion
 
