@@ -1486,12 +1486,15 @@ decisions about one row agree on one.
   source under the same execution id and a second row. **An open row the
   serving build cannot run holds its slot as any open row does** — a recovery
   whose replay diverged or whose recorded inputs the build refuses, open on
-  purpose (§7), or a row of a flow the build no longer declares, which
-  recovery leaves where it is — and nothing that build runs will close it, so
-  `serve`'s cancel route records a cancel for such an execution too, where an
-  intake started it: the `cancellations` row frees the slot, and the row stays
-  open for the start that next recovers it under a build that can run it,
-  which completes the cancel (§6.1; `docs/grammar.md` D163's Status).
+  purpose until it is cancelled (§7), or a row of a flow the build no longer
+  declares, which recovery leaves where it is — and nothing that build runs
+  will close it, so it holds the slot until `serve`'s cancel route closes it,
+  as that route closes every such execution, lease or no lease (§7; PRD
+  resolved q81, `docs/grammar.md` D165, amending D163's Status): the
+  `cancellations` row the cancel records first frees the slot, the row is then
+  ended `cancelled` with no finally node run, said in `finallyError` (§3.5),
+  and the trigger's queue is looked at once it has. No later start recovers
+  it.
 * **A started row is written before its execution is registered**, as a tick's
   `fired` row is (§3.11), and the start waits for the lifecycle row before the
   next decision reads the lease. A crash between the two leaves a `started` row
@@ -2167,8 +2170,10 @@ put back is still recovered; an operator who will not put it back says so with
 `POST /executions/:id/cancel` or `agent-compose cancel`, and the cancel **closes**
 it (PRD resolved q81, `docs/grammar.md` D165): the request is recorded as every
 cancel's is, its open children in the lineage that the process is not running
-are closed the same way, and the row is ended `cancelled` with **no finally
-node run** — no generation can run one against a record it does not describe —
+are closed the same way — those it is running are cancelled through the
+cascade, and waited for until they have settled — and the row is ended
+`cancelled` with **no finally node run** — no generation can run one against a
+record it does not describe —
 which `finallyError` says (`no finally node ran: this build could not take up
 the execution's recovery (<reason>)`, §3.5), while `error` stays absent as on
 every cancelled row. The settle webhook and the trace export go as for any

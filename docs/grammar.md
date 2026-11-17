@@ -5850,8 +5850,9 @@ a flow input field can accept it.
   diverged or recorded inputs the build refuses, reported `failed` while its
   row stays open, or a flow the build no longer declares, on no board — is
   open, and its cancel **closes** it: its open children in the lineage this
-  process is not running the same way, and then its row is ended `cancelled`
-  with no finally node run, which its `finally_error` says (`no finally node
+  process is not running the same way, those it is running through the
+  cascade and waited for until they settle, and then its row is ended
+  `cancelled` with no finally node run, which its `finally_error` says (`no finally node
   ran: this build could not take up the execution's recovery (<reason>)`); the
   settle webhook and the export go as for any settle, a slot it held of a
   trigger's lease is freed, and the answer is `202` with `status: "cancelled"`,
@@ -14635,8 +14636,11 @@ cancel closes it.
    its own, finally node and all;
 2. every **open descendant this process runs no generation of** — reached by
    the cascade, through any number of settled ones (D160's walk) — is closed
-   the same way, deepest first; a dispatch a finally node issued is not the
-   cancel's (D160) and is left for the start that finds its parent settled;
+   the same way, deepest first, and every one it **does** run is waited for,
+   in the same order, until the cascade has settled it, so no row closes
+   before a descendant below it is down; a dispatch a finally node issued is
+   not the cancel's (D160) and is left for the start that finds its parent
+   settled;
 3. the execution's own row closes: the settle is journaled **while the row is
    still open**, as every settle is (q35, `serve`'s `closed` hook) — the
    `settled` webhook once, guarded by the journal's own record of it, and the
@@ -14692,9 +14696,11 @@ build declares and this process has not recovered is closed, with a reason that
 says so, rather than left for a recovery that may yet reach it — the ruling's
 "lease or no lease" read at its widest, short of a `run`'s row; that the cancel
 closes the descendants it reached and not one a finally node's dispatch began;
-that the descendant this process runs is left to its own controller and the
-execution's row closes once the cascade has fired it, without waiting for the
-descendant to settle; that the settle and the export are journaled before the
+that the descendant this process runs is left to its own controller — its row
+is its generation's to close — and the rows above it close only once it has
+settled, which holds the answer until its finally node has run, so that
+`cancelling: false` is true of the whole lineage rather than of the one row;
+that the settle and the export are journaled before the
 row ends, as every settle's are, so a process killed between them leaves the
 row open and a cancel sent again finds the settle down and closes the row; that
 an execution on no board is put on the board once its row ends; and the

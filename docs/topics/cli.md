@@ -374,9 +374,11 @@ log names this command for it once per start:
 ```
 
 The cancel **closes** it (PRD resolved q81): the request is recorded, its open
-children this process is not running are closed the same way, and the row is
-ended `cancelled` at once with **no finally node run** — no generation can run
-one against a record it does not describe — which its `finally_error` says.
+children this process is not running are closed the same way — one it is
+running is cancelled through the cascade and waited for until it has settled —
+and the row is ended `cancelled` with **no finally node run** — no generation
+can run one against a record it does not describe — which its `finally_error`
+says.
 The settle webhook and the trace export go as for any settle, and no later
 start recovers it. The app answers `202` with `cancelling: false`, the cancel
 being complete, and the command prints the app's `detail` and exits `0`:
