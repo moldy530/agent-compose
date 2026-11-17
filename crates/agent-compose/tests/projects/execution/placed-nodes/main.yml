@@ -302,7 +302,8 @@ triggers:
   # The placed flows (grammar §14.1, PRD resolved q84, Decision D171) — every
   # way an instance of one starts, each dispatched to `mac` whole: a root
   # execution, a `flow:` node and a `map` item, a flow-as-tool call, and the
-  # three a dispatch is held to — its finally node, a cancel, a hub restart.
+  # four a dispatch is held to — its finally node, a cancel, a deadline, a hub
+  # restart.
   on_placed_build:
     type: http
     flow: flow.placed_build
@@ -352,6 +353,17 @@ triggers:
     type: http
     flow: flow.placed_retried
     path: /placed-retried-builds
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
+  # A placed flow's instance under its instantiating node's deadline — see
+  # `flow.placed_lapsed`.
+  on_placed_lapsed:
+    type: http
+    flow: flow.placed_lapsed
+    path: /placed-lapsings
     method: POST
     input:
       path: "payload.body.path"
@@ -1276,7 +1288,9 @@ flow.placed_tidying:
 
 # A placed flow whose body outlasts any test and whose finally node fails, so a
 # cancel of the execution it roots is the worker's to stop and the finally
-# node's failure comes home on the worker's cancelled result.
+# node's failure comes home on the worker's cancelled result — and a deadline
+# on a `flow:` node that starts it (`flow.placed_lapsed`) is the worker's to
+# stop as well, and that failure comes home on the result the hub refuses.
 flow.placed_closing:
   description: Look a release over at length on the machine that holds it, and close up after it — which never works.
   inputs:
@@ -1381,6 +1395,30 @@ flow.placed_retried:
   edges:
     - { from: start, to: build }
     - { from: build, to: end }
+
+# The placed look-over from a `flow:` node under a four-second `timeout:` — the
+# deadline half of what a placed flow's dispatch is held to (`docs/distributed.md`
+# §2, §6.5; grammar §7.9; Decision D171). The instance's body sleeps for ten
+# minutes on the worker, so the hub stops waiting for the dispatch at four
+# seconds and names it on the worker's `stop` list; the instance ends `failed`
+# there, its finally node fails, and the node — which waits for the instance it
+# began — fails on its deadline once that result is home.
+flow.placed_lapsed:
+  description: A placed look-over from a flow node whose deadline runs out while its instance runs on the worker.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    bounded:
+      flow: flow.placed_closing
+      timeout: 4s
+      input:
+        path: "input.path"
+  edges:
+    - { from: start, to: bounded }
+    - { from: bounded, to: end }
 
 # A **placed** flow whose own `human:` node asks the question, started as a
 # root execution (Decision D171). The whole instance runs on a worker claiming

@@ -4634,6 +4634,301 @@ fn a_cancel_ends_a_placed_flows_execution_cancelled_with_its_workers_result() {
     );
 }
 
+/// **A deadline on a `flow:` node over a placed flow stops the instance on its
+/// worker, ends it `failed`, and waits for its finally node there** (grammar
+/// §7.9, §9.2; PRD resolved q76, q79, q84; Decisions D159, D171;
+/// `docs/distributed.md` §2, §3.2, §6.5).
+///
+/// `flow.placed_lapsed`'s `bounded` node instantiates `flow.placed_closing`
+/// under four seconds, and the instance is a dispatch to `mac`: its body's
+/// ten-minute command runs on the worker, and its finally node fails there at
+/// once. At four seconds the node's deadline is the instance's stop — the
+/// clock `runtime.runSubflow` hands the instance follows the instantiating
+/// node's — so the hub stops waiting for the dispatch, supersedes it, and names
+/// it on the worker's next `stop` list. The runner is sent `SIGUSR2`, and what a
+/// placed flow's instance runs under is that stop (`PlacedSite.stop`): every
+/// node of it ends, its command with it, and the instance ends **`failed`** —
+/// the outcome nobody's cancel would give it — and runs its finally node on the
+/// worker at that outcome.
+///
+/// **And the node waits for that end**, as a node whose deadline ran out waits
+/// for every instance it began (q76's "a timed-out instantiating node waits for
+/// its instance's finally"): the hub holds `bounded` open until the worker's
+/// result for the stopped dispatch is home. That result is refused `409` — the
+/// dispatch is no longer the one the hub awaits — but the finally node's failure
+/// it carries is the execution's `finally_error`, on the report and on the
+/// lifecycle row, and the boundary is in the journal before the execution
+/// settles. A hub that settled the node the moment its budget ran out would
+/// close the execution with neither; a runner whose stop reached neither the
+/// instance nor the nodes it runs (`runtime.stopEveryNodeOn`) would leave the
+/// command running past the deadline, and the instance would end only when the
+/// worker's grace killed the runner — with no finally node and no result.
+#[test]
+fn a_deadline_over_a_placed_flow_stops_its_instance_on_the_worker_and_waits_for_its_finally() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    let mut worker = mesh.worker("placed-flow-deadline");
+    let started = Instant::now();
+    let execution = mesh.start_execution("/placed-lapsings", &json!({ "path": "release.dmg" }));
+
+    // The instance's body, running on the worker under the runner the dispatch
+    // spawned — off `/proc`, where there is one to ask.
+    let body = worker.runners().map(|_| {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let held = worker.runners().unwrap_or_default();
+            let running = held.iter().find_map(|runner| {
+                u32::try_from(*runner)
+                    .ok()
+                    .and_then(|runner| children_running(runner, "sleep"))
+                    .and_then(|commands| commands.first().copied())
+                    .map(|command| (*runner, command))
+            });
+            if let Some(running) = running {
+                break running;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the placed instance's body never started on the worker: {}",
+                worker.transcript()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] != "running" && report["status"] != "interrupted"
+    });
+    let settled_after = started.elapsed();
+    assert_eq!(
+        report["status"],
+        "failed",
+        "a `flow:` node that ran out of time over a placed flow fails its execution, and \
+         cancels nothing: {report:#}\n{}",
+        worker.transcript()
+    );
+    assert!(
+        report["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("timed out")),
+        "{report:#}"
+    );
+    // Settled by the stop's own path, not by the worker's grace running out on
+    // a runner that ignored it: four seconds of budget, then the runner's
+    // finally node, well inside the five-second grace that would follow.
+    assert!(
+        settled_after < Duration::from_secs(4 + 5),
+        "the execution took {settled_after:?} to settle — as long as the worker's grace, so the \
+         instance did not stop on the stop: {}",
+        worker.transcript()
+    );
+
+    // The instance ended on the worker, and the node waited for it: its
+    // boundary came home over `/workers/effects` **before** the execution
+    // settled, at the key the `flow:` node's instance takes.
+    const BOUNDARY: &str = "bounded/0/close_up/0#finally/0";
+    assert!(
+        harness::journal_holds(&mesh.project, &[BOUNDARY]),
+        "the execution settled before the placed instance its `flow:` node began on the worker \
+         had ended: {report:#}\n{}",
+        worker.transcript()
+    );
+    let finally_error = report["finally_error"].as_str().unwrap_or_else(|| {
+        panic!(
+            "the execution carries no `finally_error`, though the finally node the stop started \
+             on the worker failed and its result said so: {report:#}\n{}",
+            worker.transcript()
+        )
+    });
+    assert!(
+        finally_error.starts_with("flow.placed_closing node `close_up` failed: ")
+            && finally_error.contains("exited 3"),
+        "the execution's `finally_error` is not the one the worker's result carried: \
+         {finally_error}"
+    );
+    let lifecycle = harness::journal_rows(
+        &mesh.project,
+        &format!("SELECT status, finally_error FROM executions WHERE id = '{execution}'"),
+    );
+    assert_eq!(
+        lifecycle,
+        json!([{ "status": "failed", "finally_error": finally_error }]),
+        "the journal's lifecycle row does not carry the worker's finally failure"
+    );
+    let rows = harness::journal_rows(
+        &mesh.project,
+        &format!(
+            "SELECT \"key\" AS k, payload FROM effects \
+             WHERE execution = '{execution}' AND kind = 'finally'"
+        ),
+    );
+    let rows = rows.as_array().cloned().unwrap_or_default();
+    assert_eq!(rows.len(), 1, "one instance ended, one boundary: {rows:?}");
+    assert_eq!(rows[0]["k"], BOUNDARY, "{rows:?}");
+    let recorded: Value = serde_json::from_str(rows[0]["payload"].as_str().unwrap_or_default())
+        .expect("the payload is JSON");
+    assert_eq!(
+        recorded["outcome"],
+        "failed",
+        "the placed instance ended as its instantiating node's deadline ends it, and not as a \
+         cancel nobody made: {recorded:#}\n{}",
+        worker.transcript()
+    );
+
+    // One dispatch — the instance, to `mac`, at the `flow:` node's own instance
+    // path — ended by the hub's deadline, never settled as a cancel.
+    let placed = dispatches_of(&mesh, &execution);
+    assert_eq!(placed.len(), 1, "one instance, one dispatch: {placed:#?}");
+    assert_eq!(placed[0]["placement"], PLACEMENT, "{placed:#?}");
+    assert_eq!(placed[0]["node"], "flow.placed_closing", "{placed:#?}");
+    assert_eq!(placed[0]["site"], "bounded/0", "{placed:#?}");
+    let dispatches = mesh.dispatch_rows(&execution);
+    assert!(
+        dispatches.len() == 1
+            && dispatches[0]["status"] == "superseded"
+            && dispatches[0]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("stopped waiting")),
+        "{dispatches:#?}"
+    );
+
+    // The stop reached the instance's command, and the runner went with the
+    // result it posted rather than with the worker's grace.
+    if let Some((runner, command)) = body {
+        assert!(
+            gone_within(command, Duration::from_secs(2)),
+            "the placed instance's command outlived the stop that ended its instance: {}",
+            std::fs::read_to_string(format!("/proc/{command}/stat")).unwrap_or_default()
+        );
+        assert!(
+            gone_within(runner, Duration::from_secs(10)),
+            "the runner outlived the result it posted: {}",
+            worker.transcript()
+        );
+    }
+    assert!(worker.running(), "{}", worker.transcript());
+}
+
+/// What `agent-compose run` says when it reaches a placed flow's instance: the
+/// refusal a placed agent's node meets in a process with no mesh, naming the
+/// flow and its placement.
+fn unreachable(flow: &str) -> String {
+    format!(
+        "PlacementUnreachable: `{flow}` is placed on `{PLACEMENT}`, and this invocation has no \
+         mesh for a worker to join: a placed node — and every instance of a placed flow — \
+         executes on whichever worker claims its placement, so it needs a served hub with a \
+         worker beside it rather than a single process (docs/distributed.md §1, §3; grammar \
+         §14.1)"
+    )
+}
+
+/// **`agent-compose run` of a placed flow is refused at the dispatch, and runs
+/// nothing of the instance in its own process** (grammar §14.1 rule 2;
+/// Decision D171, which amends D64; `docs/distributed.md` §2).
+///
+/// Every instance of a placed flow is a dispatch the **hub** makes — onto a
+/// board, through routes a worker joins — and a `run` is one process with
+/// neither. So a `run` that reaches a placed flow's instance does what a `run`
+/// that reaches a placed agent's node has always done: the dispatch throws
+/// `PlacementUnreachable`, naming the flow and `mac`, before anything is
+/// journaled, and what reached it fails on it. Both ways a `run` can reach one
+/// are pinned:
+///
+///  * a `run` of `flow.placed_build` itself: the execution opens its row and
+///    fails at the root dispatch, said as a dispatch that never happened rather
+///    than one that "did not complete" somewhere;
+///  * a `run` of `flow.placed_retried`, which the run does execute, whose
+///    `build` node instantiates the placed flow: the node fails on the
+///    refusal — under its `retry:`, which meets the same refusal every attempt —
+///    and the execution with it.
+///
+/// **Nothing ran the instance in the CLI's process instead.** The provider is
+/// scripted to answer the instance's `agent:` node, so an instance that fell
+/// back to running locally would *complete* — the run would succeed — and it
+/// is asked nothing; the journal holds no effect of either execution and no
+/// dispatch row. A fallback like that would be the one start of a placed flow
+/// the placement did not decide.
+#[test]
+fn a_run_of_a_placed_flow_is_refused_at_its_dispatch_and_runs_nothing_of_the_instance() {
+    let Some(project) = harness::scratch_project("placed-flow-run") else {
+        return;
+    };
+    let _scratch = harness::Scratch::at(project.clone());
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        inspecting("release.dmg", "inspected-in-the-cli"),
+        inspecting("release.dmg", "inspected-in-the-cli"),
+    ]);
+    let entrypoint = harness::fixture(FIXTURE);
+    let environment = environment(&provider);
+
+    // The placed flow as the run's own root.
+    let root = harness::run_target(
+        &project,
+        &entrypoint,
+        TARGET,
+        "flow.placed_build",
+        &[("path", "release.dmg")],
+        &environment,
+    );
+    let said = root.failed();
+    assert!(
+        said.contains(&format!(
+            "`flow.placed_build` was not dispatched to placement `{PLACEMENT}`: {}",
+            unreachable("flow.placed_build")
+        )),
+        "a `run` of a placed flow is refused at its root dispatch, by name: {said}"
+    );
+
+    // A `flow:` node over it, in a flow the run executes itself.
+    let node = harness::run_target(
+        &project,
+        &entrypoint,
+        TARGET,
+        "flow.placed_retried",
+        &[("path", "release.dmg")],
+        &environment,
+    );
+    let said = node.failed();
+    assert!(
+        said.contains(&unreachable("flow.placed_build")),
+        "a `run` reaching a placed flow through a `flow:` node is refused at that node's \
+         dispatch, by name: {said}"
+    );
+
+    // Nothing of either instance ran here.
+    assert!(
+        provider.requests().is_empty(),
+        "the CLI's process ran the placed instance's `agent:` node itself: {:#?}",
+        provider.snapshot()
+    );
+    let lifecycle = harness::journal_rows(
+        &project,
+        "SELECT flow, status FROM executions ORDER BY started_at",
+    );
+    assert_eq!(
+        lifecycle,
+        json!([
+            { "flow": "flow.placed_build", "status": "failed" },
+            { "flow": "flow.placed_retried", "status": "failed" },
+        ]),
+        "each `run` opened its execution and failed it"
+    );
+    let effects = harness::journal_rows(&project, "SELECT \"key\" AS k FROM effects");
+    assert_eq!(
+        effects,
+        json!([]),
+        "an effect of the placed instance was journaled by the CLI's process"
+    );
+    let dispatches = harness::journal_rows(&project, "SELECT id FROM dispatches");
+    assert_eq!(
+        dispatches,
+        json!([]),
+        "a `run` parked a dispatch on a board no worker can reach"
+    );
+}
+
 /// **A placed flow's dispatch parks while nothing claims its placement, and a
 /// worker's join wakes it** (`docs/distributed.md` §6, Decision D171).
 ///
