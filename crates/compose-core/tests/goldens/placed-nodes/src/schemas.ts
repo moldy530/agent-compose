@@ -595,6 +595,20 @@ export const flowPlacedHoldingNodeSettleUpOutput = z.object({
 }).strict();
 export type FlowPlacedHoldingNodeSettleUpOutput = z.infer<typeof flowPlacedHoldingNodeSettleUpOutput>;
 
+/** `flow.placed_inspected_twice` — the module's parameters (grammar 7.5). */
+export const flowPlacedInspectedTwiceInputs = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type FlowPlacedInspectedTwiceInputs = z.infer<typeof flowPlacedInspectedTwiceInputs>;
+
+/**
+ * `flow.placed_inspected_twice` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowPlacedInspectedTwiceOutputs = z.object({
+  signature: z.string(),
+}).strict();
+export type FlowPlacedInspectedTwiceOutputs = z.infer<typeof flowPlacedInspectedTwiceOutputs>;
+
 /** `flow.placed_lapsed` — the module's parameters (grammar 7.5). */
 export const flowPlacedLapsedInputs = z.object({
   path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
@@ -606,6 +620,20 @@ export type FlowPlacedLapsedInputs = z.infer<typeof flowPlacedLapsedInputs>;
  */
 export const flowPlacedLapsedOutputs = z.object({}).strict();
 export type FlowPlacedLapsedOutputs = z.infer<typeof flowPlacedLapsedOutputs>;
+
+/** `flow.placed_reattempted` — the module's parameters (grammar 7.5). */
+export const flowPlacedReattemptedInputs = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type FlowPlacedReattemptedInputs = z.infer<typeof flowPlacedReattemptedInputs>;
+
+/**
+ * `flow.placed_reattempted` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowPlacedReattemptedOutputs = z.object({
+  signature: z.string(),
+}).strict();
+export type FlowPlacedReattemptedOutputs = z.infer<typeof flowPlacedReattemptedOutputs>;
 
 /** `flow.placed_retried` — the module's parameters (grammar 7.5). */
 export const flowPlacedRetriedInputs = z.object({

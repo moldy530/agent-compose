@@ -164,6 +164,7 @@ export const placements: readonly PlacementManifest[] = [
       "flow.placed_closing",
       "flow.placed_asking",
       "flow.placed_holding",
+      "flow.placed_inspected_twice",
     ],
     maxRunning: 1,
     environment: [

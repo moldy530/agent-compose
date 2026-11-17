@@ -73,7 +73,10 @@ import {
   flowPlacedHoldingInputs,
   flowPlacedHoldingNodeHoldOutput,
   flowPlacedHoldingNodeSettleUpOutput,
+  flowPlacedInspectedTwiceInputs,
+  flowPlacedInspectedTwiceOutputs,
   flowPlacedLapsedInputs,
+  flowPlacedReattemptedInputs,
   flowPlacedRetriedInputs,
   flowPlacedThenSignedInputs,
   flowPlacedTidyingInputs,
@@ -547,6 +550,31 @@ const flowPlacedHoldingNodeSettleUpShape: runtime.Shape = {
   }
 };
 
+/** `flow.placed_inspected_twice` — the `input` root inside it (grammar 7.5). */
+const flowPlacedInspectedTwiceShape: runtime.Shape = {
+  "properties": {
+    "path": "string"
+  }
+};
+
+/**
+ * `flow.placed_inspected_twice` node `inspect` — the `inspect.output` root its guards read.
+ */
+const flowPlacedInspectedTwiceNodeInspectShape: runtime.Shape = {
+  "properties": {
+    "signature": "string"
+  }
+};
+
+/**
+ * `flow.placed_inspected_twice` node `reinspect` — the `reinspect.output` root its guards read.
+ */
+const flowPlacedInspectedTwiceNodeReinspectShape: runtime.Shape = {
+  "properties": {
+    "signature": "string"
+  }
+};
+
 /** `flow.placed_lapsed` — the `input` root inside it (grammar 7.5). */
 const flowPlacedLapsedShape: runtime.Shape = {
   "properties": {
@@ -559,6 +587,22 @@ const flowPlacedLapsedShape: runtime.Shape = {
  */
 const flowPlacedLapsedNodeBoundedShape: runtime.Shape = {
   "properties": {}
+};
+
+/** `flow.placed_reattempted` — the `input` root inside it (grammar 7.5). */
+const flowPlacedReattemptedShape: runtime.Shape = {
+  "properties": {
+    "path": "string"
+  }
+};
+
+/**
+ * `flow.placed_reattempted` node `build` — the `build.output` root its guards read.
+ */
+const flowPlacedReattemptedNodeBuildShape: runtime.Shape = {
+  "properties": {
+    "signature": "string"
+  }
 };
 
 /** `flow.placed_retried` — the `input` root inside it (grammar 7.5). */
@@ -3336,6 +3380,120 @@ const flowPlacedHoldingBinding: runtime.SubflowBinding = {
     }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
 };
 
+// --- flow.placed_inspected_twice ---
+
+/**
+ * `flow.placed_inspected_twice` node `inspect` — `agent.inspector` (grammar 8.1).
+ */
+const flowPlacedInspectedTwiceNodeInspect: runtime.NodeDescriptor = {
+  flow: "flow.placed_inspected_twice",
+  node: "inspect",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from `defaults:`, `on_error` from `defaults:`.
+  policy: {
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowPlacedInspectedTwiceShape, state: stateShape, output: flowPlacedInspectedTwiceNodeInspectShape },
+  input: (roots, view) => ({
+    "path": runtime.toJson(runtime.evaluate("input.path", roots)),
+  }),
+  run: async (input, context, view) => {
+    const answer = await runtime.callAgent(
+      agentInspector,
+      input,
+      runtime.historyTurns(view.state["messages"] as unknown[]),
+      context,
+      { path: runtime.instancePath(view, "inspect"), policy: view.run.policy },
+    );
+    return {
+      output: runtime.parseResult(agentInspectorOutput, answer.output, "the answer of `agent.inspector`"),
+      history: answer.history,
+      models: answer.models,
+      toolDispatches: answer.toolDispatches,
+    };
+  },
+  writes: [
+    { field: "signature", channel: "signature", reduce: "set" },
+  ],
+  edges: [
+    { to: "reinspect" },
+  ],
+};
+
+/**
+ * `flow.placed_inspected_twice` node `reinspect` — `agent.inspector` (grammar 8.1).
+ */
+const flowPlacedInspectedTwiceNodeReinspect: runtime.NodeDescriptor = {
+  flow: "flow.placed_inspected_twice",
+  node: "reinspect",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from `defaults:`, `on_error` from `defaults:`.
+  policy: {
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowPlacedInspectedTwiceShape, state: stateShape, output: flowPlacedInspectedTwiceNodeReinspectShape },
+  input: (roots, view) => ({
+    "path": runtime.toJson(runtime.evaluate("input.path", roots)),
+  }),
+  run: async (input, context, view) => {
+    const answer = await runtime.callAgent(
+      agentInspector,
+      input,
+      runtime.historyTurns(view.state["messages"] as unknown[]),
+      context,
+      { path: runtime.instancePath(view, "reinspect"), policy: view.run.policy },
+    );
+    return {
+      output: runtime.parseResult(agentInspectorOutput, answer.output, "the answer of `agent.inspector`"),
+      history: answer.history,
+      models: answer.models,
+      toolDispatches: answer.toolDispatches,
+    };
+  },
+  writes: [
+    { field: "signature", channel: "signature", reduce: "set" },
+  ],
+  edges: [
+    { to: END },
+  ],
+};
+
+/**
+ * `flow.placed_inspected_twice` — its nodes, its `start` edges, and the compiled graph.
+ */
+function flowPlacedInspectedTwice() {
+  return new StateGraph(State)
+    .addNode("inspect", (state: GraphState) => runtime.runNode(flowPlacedInspectedTwiceNodeInspect, state), {
+      ends: ["reinspect"],
+    })
+    .addNode("reinspect", (state: GraphState) => runtime.runNode(flowPlacedInspectedTwiceNodeReinspect, state), {
+      ends: [END],
+    })
+    .addEdge(START, "inspect")
+    .compile();
+}
+
+/**
+ * `flow.placed_inspected_twice`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowPlacedInspectedTwiceGraph = flowPlacedInspectedTwice();
+
+/**
+ * `flow.placed_inspected_twice` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowPlacedInspectedTwiceBinding: runtime.SubflowBinding = {
+  address: "flow.placed_inspected_twice",
+  outputs: ["signature"],
+  recursionLimit: 27,
+  placement: "mac",
+  stream: (initial, options) =>
+    flowPlacedInspectedTwiceGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowPlacedInspectedTwiceGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
+
 // --- flow.placed_lapsed ---
 
 /** `flow.placed_lapsed` node `bounded` — `flow.placed_closing` (grammar 8.5). */
@@ -3395,6 +3553,78 @@ const flowPlacedLapsedBinding: runtime.SubflowBinding = {
       ...options,
       streamMode: "values",
       outputKeys: flowPlacedLapsedGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
+
+// --- flow.placed_reattempted ---
+
+/**
+ * `flow.placed_reattempted` node `build` — `flow.placed_inspected_twice` (grammar 8.5).
+ */
+const flowPlacedReattemptedNodeBuild: runtime.NodeDescriptor = {
+  flow: "flow.placed_reattempted",
+  node: "build",
+  // Grammar 9.3, resolved: `retry` from the node, `timeout` from the node, `on_error` from `defaults:`.
+  policy: {
+    retry: {
+      max: 2,
+      backoffMs: 1,
+      multiplier: 2,
+      jitter: true,
+    },
+    timeoutMs: 20000,
+    onError: "fail",
+  },
+  shapes: { input: flowPlacedReattemptedShape, state: stateShape, output: flowPlacedReattemptedNodeBuildShape },
+  input: (roots) => ({
+    "path": runtime.toJson(runtime.evaluate("input.path", roots)),
+  }),
+  run: async (input, context, view) =>
+    runtime.runSubflow(flowPlacedInspectedTwiceBinding, {
+      inputs: input as Record<string, unknown>,
+      execution: view.run.execution,
+      path: runtime.instancePath(view, "build"),
+      signal: context.signal,
+      bodyEnded: context.bodyEnded,
+      policy: runtime.instancePolicy(view.run.policy, undefined),
+    }),
+  writes: [
+    { field: "signature", channel: "signature", reduce: "set" },
+  ],
+  edges: [
+    { to: END },
+  ],
+};
+
+/**
+ * `flow.placed_reattempted` — its nodes, its `start` edges, and the compiled graph.
+ */
+function flowPlacedReattempted() {
+  return new StateGraph(State)
+    .addNode("build", (state: GraphState) => runtime.runNode(flowPlacedReattemptedNodeBuild, state), {
+      ends: [END],
+    })
+    .addEdge(START, "build")
+    .compile();
+}
+
+/**
+ * `flow.placed_reattempted`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowPlacedReattemptedGraph = flowPlacedReattempted();
+
+/**
+ * `flow.placed_reattempted` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowPlacedReattemptedBinding: runtime.SubflowBinding = {
+  address: "flow.placed_reattempted",
+  outputs: ["signature"],
+  recursionLimit: 26,
+  stream: (initial, options) =>
+    flowPlacedReattemptedGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowPlacedReattemptedGraph.outputChannels,
     }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
 };
 
@@ -4730,6 +4960,23 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
         outputKeys: flowPlacedHoldingGraph.outputChannels,
       }) as unknown as Promise<AsyncIterable<GraphState>>,
   },
+  "flow.placed_inspected_twice": {
+    address: "flow.placed_inspected_twice",
+    inputs: ["path"],
+    inputKinds: { "path": "string", },
+    outputs: ["signature"],
+    sessionStores: [],
+    recursionLimit: 27,
+    placement: "mac",
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowPlacedInspectedTwiceInputs, inputs, "the `inputs:` of `flow.placed_inspected_twice`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowPlacedInspectedTwiceGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowPlacedInspectedTwiceGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
   "flow.placed_lapsed": {
     address: "flow.placed_lapsed",
     inputs: ["path"],
@@ -4744,6 +4991,22 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
         ...options,
         streamMode: "values",
         outputKeys: flowPlacedLapsedGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
+  "flow.placed_reattempted": {
+    address: "flow.placed_reattempted",
+    inputs: ["path"],
+    inputKinds: { "path": "string", },
+    outputs: ["signature"],
+    sessionStores: [],
+    recursionLimit: 26,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowPlacedReattemptedInputs, inputs, "the `inputs:` of `flow.placed_reattempted`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowPlacedReattemptedGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowPlacedReattemptedGraph.outputChannels,
       }) as unknown as Promise<AsyncIterable<GraphState>>,
   },
   "flow.placed_retried": {
@@ -5780,6 +6043,22 @@ export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {
   "flow.placed_holding":
     async (input, context, site) => {
       const answer = await runtime.runSubflowHere(flowPlacedHoldingBinding, {
+        inputs: (input ?? {}) as Record<string, unknown>,
+        execution: site.execution,
+        path: site.path,
+        signal: site.stop ?? context.signal,
+        ...(site.policy === undefined ? {} : { policy: site.policy }),
+        ...(site.history === undefined ? {} : { history: site.history }),
+      });
+      return {
+        output: answer.output,
+        ...(answer.history === undefined ? {} : { history: answer.history }),
+        ...(answer.inner === undefined ? {} : { inner: answer.inner }),
+      };
+    },
+  "flow.placed_inspected_twice":
+    async (input, context, site) => {
+      const answer = await runtime.runSubflowHere(flowPlacedInspectedTwiceBinding, {
         inputs: (input ?? {}) as Record<string, unknown>,
         execution: site.execution,
         path: site.path,

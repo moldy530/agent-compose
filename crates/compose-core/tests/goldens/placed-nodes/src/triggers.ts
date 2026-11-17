@@ -637,6 +637,20 @@ export const httpTriggers: readonly HttpTrigger[] = [
     },
   },
   {
+    name: "on_placed_reattempted",
+    flow: "flow.placed_reattempted",
+    path: "/placed-reattempts",
+    method: "POST",
+    respond: "async",
+    readsBody: true,
+    input: (payload) => {
+      const bound = roots(payload);
+      return {
+        "path": runtime.toJson(runtime.evaluate("payload.body.path", bound)),
+      };
+    },
+  },
+  {
     name: "on_placed_retried",
     flow: "flow.placed_retried",
     path: "/placed-retried-builds",

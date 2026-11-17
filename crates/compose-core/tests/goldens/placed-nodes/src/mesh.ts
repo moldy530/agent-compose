@@ -917,6 +917,23 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
   // cancel or the stop withdraws it, and it settles as that with no finally
   // node run.
   //
+  // **Begun is read off this call's own rows, and never off the journal's
+  // effects at the instance path.** One call of this function is one instance:
+  // a `flow:` node's `retry:` attempt, a `map` item's attempt, a flow-as-tool
+  // call, a root execution. Every attempt of the same node is a *fresh*
+  // instance at the *same* path (grammar §8.5) — `build/0/0`, then `build/0/1`
+  // — so what an earlier attempt streamed home under that path says nothing
+  // about whether this one began: an attempt lost with its worker, followed by
+  // one parked with nobody claiming the placement, would read as begun, and a
+  // cancel or a deadline would park an end for an instance nothing ever ran —
+  // which no worker may ever take, and which, taken, would replay the earlier
+  // attempt's history and run a finally node that attempt's own worker runs
+  // too. Every place this asks is a row of this instance **no worker holds** —
+  // still parked, withdrawn before it was taken, or known never to have
+  // reached its worker — so the instance began exactly when an earlier row of
+  // it reached a worker and came back: a pause that came home ([`paused`]),
+  // live or read off a row a replaced process left settled.
+  //
   // **And never where a worker may still be running it.** A row a replaced
   // process left `dispatched` names a session that ended with that process, and
   // the worker that took it is still running the instance — or will be told,
@@ -935,11 +952,9 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
   let ending: EndKind | undefined;
   let stopped: unknown;
   // Whether an end that has just stopped this instance owes it an end on a
-  // worker: a placed flow's, that has begun — a pause of it came home, or the
-  // journal holds an effect it made.
-  const owesEnd = async (): Promise<boolean> =>
-    options.instance === true &&
-    (paused || (await journal.effectsUnder(options.execution, site)).length > 0);
+  // worker: a placed flow's, that has begun — a pause of this instance came
+  // home (above: never the effects an earlier attempt at the same path made).
+  const owesEnd = (): boolean => options.instance === true && paused;
   // How the node leaves once the end it is owed has run — or once a worker
   // still holding it is left to run it: as the cancel, or as the stop.
   const ended = (end: EndKind): never => {
@@ -1023,7 +1038,7 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
       if ((await journal.lookup(options.execution, settledAs.pause.effect.key)) === undefined) {
         const refusal = frontierRefusal(options.execution, site);
         if (refusal !== undefined) {
-          if (!(await owesEnd())) throw refusal;
+          if (!owesEnd()) throw refusal;
           ending = "cancel";
           continue;
         }
@@ -1057,7 +1072,7 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
       // worker held is that worker's to end.
       if (row.detail === CANCELLED_DETAIL || row.detail === CANCELLED_HELD_DETAIL) {
         fireCancel(options.execution);
-        if (row.detail === CANCELLED_DETAIL && (await owesEnd())) {
+        if (row.detail === CANCELLED_DETAIL && owesEnd()) {
           ending = "cancel";
           continue;
         }
@@ -1071,7 +1086,7 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
       // A begun instance's redispatch the hub **stopped** waiting for before any
       // worker took it — an end around it, or its node's deadline: the end it
       // is owed is the next row, as it was for the generation that stopped it.
-      if (row.detail?.startsWith(STOPPED_UNTAKEN) === true && (await owesEnd())) {
+      if (row.detail?.startsWith(STOPPED_UNTAKEN) === true && owesEnd()) {
         ending = "stop";
         stopped = superseded;
         continue;
@@ -1102,7 +1117,7 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
       }
       // Still parked: nobody has it, and a begun instance's end is the next row.
       await journal.supersedeDispatch(row.id, CANCELLED_DETAIL);
-      if (!(await owesEnd())) throw refusal;
+      if (!owesEnd()) throw refusal;
       ending = "cancel";
       continue;
     }
@@ -1134,7 +1149,7 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
       // The cancel, or a stop, ended this row while no worker had it — so none
       // ran the instance's end — and the instance had begun: its end is the
       // next row.
-      if (withdrawn !== undefined && ending === undefined && (await owesEnd())) {
+      if (withdrawn !== undefined && ending === undefined && owesEnd()) {
         ending = withdrawn;
         stopped = error;
         continue;
@@ -1311,20 +1326,32 @@ function awaited(
         // inner finally node runs before an outer one, and the `finally_error`
         // the result carries is the execution's before it settles
         // ([`finallyOf`]). The worker's grace bounds it (§3.2).
+        //
+        // Whether any worker took this row, read before the board is touched,
+        // as the stop below reads it.
+        const untaken = (rows.get(row.id) ?? row).status === "parked";
         if (stopOnHolder(row.id, row, "cancel")) {
           cancelledOnWorker = true;
           holdRemoteEnd(options.execution, site, ended);
           stirPolls();
           return;
         }
-        how.withdrawn("cancel");
+        // Withdrawn: a row no worker took, which is what owes a begun placed
+        // instance its end ([`dispatchPlaced`]). A row a worker took, whose
+        // session the liveness sweep has given up on but whose row it has not
+        // yet superseded (§6.3), is not that: the worker may still be running
+        // the instance, and the `410` its next request meets stops it there,
+        // finally node and all (§5). So it is ended as the cancel's, held by a
+        // worker ([`CANCELLED_HELD_DETAIL`]), and owes nothing more here.
+        if (untaken) how.withdrawn("cancel");
         held.settle({
           kind: "error",
           name: CANCELLED,
           message: new ExecutionCancelled(options.execution).message,
         });
         rows.delete(row.id);
-        void journal.supersedeDispatch(row.id, CANCELLED_DETAIL).catch((error: unknown) => {
+        const detail = untaken ? CANCELLED_DETAIL : CANCELLED_HELD_DETAIL;
+        void journal.supersedeDispatch(row.id, detail).catch((error: unknown) => {
           process.stderr.write(
             `could not withdraw \`${row.id}\`: ${error instanceof Error ? error.message : String(error)}\n`,
           );
