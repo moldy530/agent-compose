@@ -7,7 +7,9 @@
 //
 // Every `${ENV}` reference the composition makes, and `readEnvironment()`, the
 // presence check over them (PRD 5.9, grammar 4.3). `./index.ts` is what calls
-// it, at module scope, so loading this project is what checks its environment.
+// it, at module scope, so loading this project is what checks its environment —
+// for every verb but `store`, which checks its one backend's references once it
+// knows the store (`./cli.ts`, PRD resolved q82).
 // No value is baked in here: the spec never contains a credential, and neither
 // does this file — `agent-compose build` resolved nothing.
 
@@ -84,13 +86,19 @@ export class MissingEnvironmentError extends Error {
  * Presence is `!== undefined`: a variable set to the empty string is set. All
  * missing variables are reported at once, because a deployment that is short
  * three keys should learn that in one run rather than in three.
+ *
+ * `references` is the manifest checked, and every process that loads this
+ * project checks the whole list — but one: an operator's `store` command opens
+ * one backend and executes nothing else, so it hands in that backend entry's
+ * references alone, once it knows which store it was named (PRD resolved q82).
  */
 export function readEnvironment(
   source: Record<string, string | undefined> = process.env,
+  references: readonly EnvironmentReference[] = environmentReferences,
 ): ReadonlyMap<string, string> {
   const resolved = new Map<string, string>();
   const missing: EnvironmentReference[] = [];
-  for (const reference of environmentReferences) {
+  for (const reference of references) {
     const value = source[reference.name];
     if (value === undefined) {
       missing.push(reference);

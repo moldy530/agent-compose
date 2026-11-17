@@ -1520,6 +1520,79 @@ async function begunByFinally(journal: Journal, link: Lineage): Promise<boolean>
 }
 
 /**
+ * Every open execution in `execution`'s lineage — its open children, and
+ * theirs, reached through any number of settled ones — **deepest first**, so
+ * a caller closing them one by one closes each before the execution above it
+ * (PRD resolved q81, Decision D165).
+ *
+ * [`cascadeCancel`]'s walk, answered rather than acted on: `src/serve.ts`'s
+ * cancel of an execution this build's recovery could not take closes the
+ * descendants this process runs no generation of, and the cascade has already
+ * cancelled the ones it does. Depth is counted in lineage links, settled ones
+ * included, so an open row is always deeper than every open row above it.
+ */
+export async function openDescendants(execution: string): Promise<readonly ExecutionRow[]> {
+  const journal = await openJournal();
+  const open = await journal.openExecutions();
+  const lineages = new Map<string, Lineage | undefined>(open.map((row) => [row.id, row.lineage]));
+  const lineageOf = async (id: string): Promise<Lineage | undefined> => {
+    if (lineages.has(id)) return lineages.get(id);
+    const lineage = (await journal.execution(id))?.lineage;
+    lineages.set(id, lineage);
+    return lineage;
+  };
+  const found: { readonly row: ExecutionRow; readonly depth: number }[] = [];
+  for (const row of open) {
+    if (row.id === execution) continue;
+    let link = row.lineage;
+    let depth = 0;
+    // Bounded by the lineage's depth; the set is [`cascadeCancel`]'s, for a
+    // journal whose rows name each other in a cycle.
+    const passed = new Set<string>();
+    while (link !== undefined) {
+      depth += 1;
+      if (link.parent === execution) {
+        found.push({ row, depth });
+        break;
+      }
+      if (passed.has(link.parent)) break;
+      passed.add(link.parent);
+      link = await lineageOf(link.parent);
+    }
+  }
+  return found.sort((one, other) => other.depth - one.depth).map((held) => held.row);
+}
+
+/**
+ * Whether this process is running a generation of `execution`: one it has
+ * opened and not yet closed ([`openExecution`]), or a child execution on its
+ * books — a dispatch still waiting for its permit included
+ * ([`runningChildren`]).
+ *
+ * What `src/serve.ts`'s cancel route asks before it closes a lifecycle row
+ * itself (PRD resolved q81, Decision D165): a row a generation here is running
+ * is that generation's to close, and its cancel goes through the cascade.
+ */
+export function runsHere(execution: string): boolean {
+  return openedExecutions.has(execution) || runningChildren.has(execution);
+}
+
+/**
+ * Settles once the generation of `execution` this process runs as a child
+ * execution — issued, waiting for its permit, or running
+ * ([`runningChildren`]) — has stopped, and at once where it runs none. Never
+ * rejects ([`superviseChild`]).
+ *
+ * What `src/serve.ts`'s cancel of an execution this build's recovery could not
+ * take waits on for each open descendant the cascade cancelled here, before it
+ * closes a row above that descendant (PRD resolved q81, Decision D165): the
+ * answer says the cancel is complete, which is a claim about the lineage.
+ */
+export function childSettled(execution: string): Promise<void> {
+  return runningChildren.get(execution)?.settled ?? Promise.resolve();
+}
+
+/**
  * Arrange for a **recovered** execution whose cancel was requested to complete
  * it (PRD resolved q75, `docs/durability.md` §6.1): its controller is opened
  * and its journal's frontier hook installed, so the replay consumes the
@@ -4862,6 +4935,46 @@ function alsoAParameterOfThisWire(wire: Wire, keyword: string): string {
   return `. One caveat, on this wire only: \`${shared}\` — a parameter this wire asks for structured output with — is spelled with \`${keyword}\` too, so a service refusing *that* under its short name words its 400 the same way: read the quoted body before editing a row`;
 }
 
+/**
+ * A model's `thinking:` setting, as the Messages wire spells it (grammar 12.2,
+ * Decision D167, PRD resolved q83).
+ *
+ * The composition writes two forms under one key, told apart by `type:`, and
+ * neither is the wire's spelling as written:
+ *
+ *  * the **enabled** form — `{ budget_tokens }`, or the same with
+ *    `type: enabled` — goes out as `thinking: { type: "enabled", budget_tokens }`.
+ *    The API requires the `type`, and a `thinking:` written before the
+ *    adaptive form existed carries none, which is why this one setting is
+ *    translated where every other travels as written;
+ *  * the **adaptive** form — `{ type: adaptive, effort? }` — goes out as
+ *    `thinking: { type: "adaptive" }`, and its `effort` is not a field of
+ *    `thinking` on this wire at all: it is `output_config.effort`, which
+ *    [`callMessages`] merges into the one `output_config` the native
+ *    structured-output rung writes its `format` into, rather than either
+ *    replacing the other.
+ *
+ * Only the shapes the compiler admits arrive here: `validate` refuses a `type:`
+ * outside the two and each form's key beside the other's `type:`
+ * (`conflicting-keys`), so an `effort` never rides the enabled form and a
+ * budget never rides the adaptive one. No setting, no `thinking` — and no
+ * effort. The `bedrock` plugin publishes the same key, and would take the same
+ * translation; this runtime reaches no `bedrock` provider ([`callDirect`]).
+ */
+function messagesThinking(setting: unknown): {
+  readonly thinking?: Record<string, unknown>;
+  readonly effort?: unknown;
+} {
+  if (typeof setting !== "object" || setting === null) return {};
+  const { type, budget_tokens: budget, effort } = setting as Record<string, unknown>;
+  if (type === "adaptive") {
+    return { thinking: { type: "adaptive" }, ...(effort === undefined ? {} : { effort }) };
+  }
+  return {
+    thinking: { type: "enabled", ...(budget === undefined ? {} : { budget_tokens: budget }) },
+  };
+}
+
 async function callMessages(
   model: ModelBinding,
   request: ModelRequest,
@@ -4884,6 +4997,11 @@ async function callMessages(
   const settings = { ...model.settings };
   const maxTokens = settings["max_tokens"] ?? ANTHROPIC_MAX_TOKENS;
   delete settings["max_tokens"];
+  // `thinking:` in the wire's own spelling (Decision D167): the one setting
+  // whose composition shape is not the request's, and the only one that also
+  // writes into `output_config` — see [`messagesThinking`].
+  const thinking = messagesThinking(settings["thinking"]);
+  if (thinking.thinking !== undefined) settings["thinking"] = thinking.thinking;
 
   const messages: Record<string, unknown>[] = [];
   // Whether the turn this loop just **dropped** is the one the next message
@@ -5075,6 +5193,15 @@ async function callMessages(
       ...server,
     ];
   }
+  // `output_config` holds two things that are not one decision, and is
+  // assembled from both rather than written by either (Decision D167): an
+  // adaptive model's `effort`, which is a **setting** and rides every call that
+  // model makes — a tool-loop turn, a pinned call on either rung — and the
+  // native rung's `format` below. A pinned call on an adaptive model sends one
+  // object carrying both; a loop turn sends the effort alone; a model with no
+  // effort sends no `output_config` at all unless the rung is the native one.
+  const outputConfig: Record<string, unknown> = {};
+  if (thinking.effort !== undefined) outputConfig["effort"] = thinking.effort;
   if (pinned !== undefined) {
     if (native) {
       // The Messages API's own structured output: `output_config`'s `format`,
@@ -5084,13 +5211,12 @@ async function callMessages(
       // format object takes its `type` and its `schema` and nothing else: the
       // pinned tool's *name* is this compiler's, not the wire's, and there is
       // no call for it to name.
-      body["output_config"] = {
-        format: { type: "json_schema", schema: pinned.schema },
-      };
+      outputConfig["format"] = { type: "json_schema", schema: pinned.schema };
     } else {
       body["tool_choice"] = { type: "tool", name: pinned.name };
     }
   }
+  if (Object.keys(outputConfig).length > 0) body["output_config"] = outputConfig;
 
   const answer = await send(
     model,
@@ -9594,8 +9720,10 @@ function connectionAsWritten(binding: HarnessConnectionBinding): Record<string, 
  * side of this boundary for most of them to be applied to.
  *
  * The two rows therefore differ, and the difference is the vendors': `cc` takes
- * `thinking:`, whose `budget_tokens` is the Agent SDK's `maxThinkingTokens`, and
- * `codex` takes `reasoning_effort:`, which is its `modelReasoningEffort`.
+ * `thinking:` in either of its forms — the enabled form's `budget_tokens` is the
+ * Agent SDK's `maxThinkingTokens`, the adaptive form is its own `thinking`
+ * option and that form's `effort` its `effort` (Decision D167) — and `codex`
+ * takes `reasoning_effort:`, which is its `modelReasoningEffort`.
  *
  * Read by the **compiler** too, which computes [`HarnessBinding.modelSettings`]
  * from the same list, so a settings key that stops crossing is one edit in one
@@ -16862,11 +16990,55 @@ export async function settleExecution(execution: string, error?: unknown): Promi
   // **After** the row has closed, never before: a crash between the two leaves
   // ledger rows nothing will ask for again, and the other order could leave an
   // execution the journal still holds open without the rows its resume needs.
-  const identity: ExecutionIdentity = {
+  await pruneSettled(journal, {
     id: execution,
     session_key: executionSessions.get(execution) ?? "",
-  };
-  // …and after the detached `agent.*` and `tool.*` deliveries this execution
+  });
+}
+
+/**
+ * Prune the idempotency ledger of an execution whose row a cancel has just
+ * closed **with no generation of it running here** — one this build's
+ * recovery could not take (PRD resolved q81, Decision D165): what
+ * [`settleExecution`] does once a row it closed has closed, for the one row
+ * that closes without it.
+ *
+ * Such a row closes `cancelled` from `serve`'s cancel route, never through a
+ * run's settlement — the generation that recovered it, where one did, stopped
+ * short of closing it ([`staysOpen`]) and so pruned nothing — and a settled
+ * execution never resumes (PRD resolved q65), so the rows its keyed writes left
+ * under `<execution.id>/` answer nothing again: they go as every settled
+ * execution's do (PRD resolved q69 ruling d, Decision D153), behind the same
+ * two holds — a worker that may still be running one of its placed nodes
+ * ([`placedRunnerMayOutlive`]) keeps them for good, and a detached delivery
+ * its generation here left in flight is waited for first. `sessionKey` is the
+ * lifecycle row's, which is the partition a `blob` store's ledger is in.
+ *
+ * Called **after** the row has ended, for [`settleExecution`]'s reason, and
+ * never the close's failure: the cancel is complete whatever becomes of the
+ * prune, and a journal that cannot be read here keeps every row, said on
+ * stderr.
+ */
+export async function pruneClosedExecution(execution: string, sessionKey: string): Promise<void> {
+  let journal: Journal;
+  try {
+    journal = await openJournal();
+  } catch (failure) {
+    process.stderr.write(
+      `warning: the ledger rows execution \`${execution}\`'s keyed store writes left are kept: the journal could not be read to ask whether a worker may still be running one of its placed nodes (${describe(failure)}) (PRD resolved q69)\n`,
+    );
+    return;
+  }
+  await pruneSettled(journal, { id: execution, session_key: sessionKey });
+}
+
+/**
+ * Hand a settled execution's ledger to [`ledgerPrune`] — the tail of
+ * [`settleExecution`] and of [`pruneClosedExecution`], once the row has closed.
+ */
+async function pruneSettled(journal: Journal, identity: ExecutionIdentity): Promise<void> {
+  const execution = identity.id;
+  // After the detached `agent.*` and `tool.*` deliveries this execution
   // started have finished too. They outlive the run by design (grammar 8.6 rule
   // 7) and every effect they make is this execution's, under its id — a flow an
   // agent calls as a tool included — so a delivery still retrying a keyed write
@@ -16986,8 +17158,9 @@ const executionSessions = new Map<string, string>();
  * A registration rather than an import because the emitted import graph has
  * one direction: `src/stores.ts` imports this module, and this module imports
  * nothing that imports it. Called once an execution's row has closed
- * `completed` or `failed`, with the end of its detached deliveries where any
- * are still in flight — every grammar 9.4 key begins with the execution's id,
+ * `completed`, `failed` or `cancelled` — a cancel's close of a row no
+ * generation here could run included ([`pruneClosedExecution`]) — with the end
+ * of its detached deliveries where any are still in flight — every grammar 9.4 key begins with the execution's id,
  * and a settled execution never resumes (PRD resolved q65), so its rows answer
  * nothing again (PRD resolved q69). An execution that does not settle is never
  * handed to it, and nor is one a worker may still be running a placed node of

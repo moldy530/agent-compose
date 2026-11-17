@@ -266,6 +266,7 @@ const storeDocs: stores.StoreBinding = {
     provider: "chroma",
     from: "the alias `docs_db`, defined by the `staging` target",
     urlEnv: "CHROMA_URL",
+    site: "deploy.storage_backends.aliases.docs_db",
   },
 };
 
@@ -284,6 +285,7 @@ const storeTriageMemory: stores.StoreBinding = {
     provider: "postgres",
     from: "the `kv` default of the `staging` target",
     urlEnv: "TRIAGE_MEMORY_URL",
+    site: "deploy.storage_backends.defaults.kv",
   },
 };
 
