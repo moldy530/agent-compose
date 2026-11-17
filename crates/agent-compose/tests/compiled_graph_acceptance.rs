@@ -32824,7 +32824,7 @@ fn two_serves_on_one_postgres_journal_fire_each_tick_once() {
         return;
     };
     let query = |sql: &str| -> Vec<Value> {
-        postgres_rows(&one, &url, sql)
+        harness::postgres_rows(&one, &url, sql)
             .as_array()
             .expect("rows")
             .clone()
@@ -32885,30 +32885,6 @@ fn two_serves_on_one_postgres_journal_fire_each_tick_once() {
         "every tick the journal held was fired by one hub or the other: {one_said}\n{two_said}"
     );
     drop(scratch);
-}
-
-/// Rows of a dialled Postgres journal, read through the `pg` driver the built
-/// project pins — the same one its journal arm opens it with.
-fn postgres_rows(project: &Path, url: &str, sql: &str) -> Value {
-    let script = project.join("postgres-rows.mjs");
-    std::fs::write(
-        &script,
-        "import pg from \"pg\";\nconst client = new pg.Client({ connectionString: process.env.ROWS_URL });\nawait client.connect();\ntry {\n  const answer = await client.query(process.env.ROWS_SQL);\n  process.stdout.write(JSON.stringify(answer.rows));\n} finally {\n  await client.end();\n}\n",
-    )
-    .expect("the project is writable");
-    let mut command = harness::bun_command().expect("bun, since a project was built");
-    command
-        .arg(&script)
-        .env("ROWS_URL", url)
-        .env("ROWS_SQL", sql)
-        .current_dir(project);
-    let output = command.output().expect("bun runs");
-    assert!(
-        output.status.success(),
-        "the Postgres query failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).expect("JSON rows")
 }
 
 /// A standby takes a dialled journal over **with** what the hub it replaces
@@ -32978,7 +32954,7 @@ fn a_standby_serve_recovers_what_the_serve_it_takes_over_from_left_open_before_i
         return;
     };
     let open = |sql_trigger: &str| -> BTreeSet<String> {
-        postgres_rows(
+        harness::postgres_rows(
             &one,
             &url,
             &format!(
@@ -33017,7 +32993,7 @@ fn a_standby_serve_recovers_what_the_serve_it_takes_over_from_left_open_before_i
         Duration::from_secs(90),
         "every execution the first serve left running to complete under the standby",
         || {
-            let rows = postgres_rows(
+            let rows = harness::postgres_rows(
                 &one,
                 &url,
                 &format!("SELECT id, status FROM executions WHERE trigger_kind = '{trigger}'"),

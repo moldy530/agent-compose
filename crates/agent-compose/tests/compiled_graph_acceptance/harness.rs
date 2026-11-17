@@ -2159,6 +2159,31 @@ pub fn journal_sql(project: &Path, sql: &str) -> Output {
     journal_driver(project, sql, false)
 }
 
+/// Rows of a dialled Postgres journal, read through the `pg` driver the built
+/// project pins — the same one its journal arm opens it with. Shared by every
+/// suite with a dialled-journal case, so each reads the rows the same way.
+pub fn postgres_rows(project: &Path, url: &str, sql: &str) -> Value {
+    let script = project.join("postgres-rows.mjs");
+    std::fs::write(
+        &script,
+        "import pg from \"pg\";\nconst client = new pg.Client({ connectionString: process.env.ROWS_URL });\nawait client.connect();\ntry {\n  const answer = await client.query(process.env.ROWS_SQL);\n  process.stdout.write(JSON.stringify(answer.rows));\n} finally {\n  await client.end();\n}\n",
+    )
+    .expect("the project is writable");
+    let mut command = bun_command().expect("bun, since a project was built");
+    command
+        .arg(&script)
+        .env("ROWS_URL", url)
+        .env("ROWS_SQL", sql)
+        .current_dir(project);
+    let output = command.output().expect("bun runs");
+    assert!(
+        output.status.success(),
+        "the Postgres query failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("JSON rows")
+}
+
 /// Read rows out of a built project's journal, as JSON.
 ///
 /// The companion of [`journal_sql`], for the claims whose only surface is the

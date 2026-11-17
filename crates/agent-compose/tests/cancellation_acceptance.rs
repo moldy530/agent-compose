@@ -64,6 +64,13 @@
 //! trace sink are in `compiled_graph_acceptance.rs`) — while an open row a
 //! `run` beside the `serve` is running is still not `serve`'s to cancel —
 //! [`serves_cancel_of_an_execution_a_run_beside_it_is_running_is_404_and_leaves_its_row_open`].
+//! An execution this build *can* run is never closed so: one a recovery the
+//! process owes has not reached yet has its cancel recorded, and that recovery
+//! completes it, finally node and all —
+//! [`a_cancel_of_an_execution_the_owed_recovery_has_not_reached_is_completed_by_that_recovery`]
+//! — and a standby's cancel takes the recovery it owes first, so it cancels a
+//! running execution —
+//! [`a_standby_recovers_an_execution_before_cancelling_it_and_its_finally_node_runs`].
 
 #[path = "compiled_graph_acceptance/harness.rs"]
 mod harness;
@@ -1542,7 +1549,9 @@ fn an_interrupted_run_is_left_open_for_resume_rather_than_cancelled() {
 /// The cancel of the parent closes both: `202` with the cancel complete, and
 /// two rows ended `cancelled` with their requests recorded and `finally_error`
 /// saying no finally node ran — the parent's naming the flow this build lacks,
-/// the child's that this process has not recovered it. No finally node ran
+/// the child's that its open parent is one this build's recovery could not
+/// take, so nothing here re-issues it: the child's flow is declared, but no
+/// recovery of this build will ever run it. No finally node ran
 /// anywhere. Both are on the status route now, and a cancel of the child is
 /// the `409` every ended execution gets.
 #[test]
@@ -1606,7 +1615,10 @@ fn a_cancel_closes_an_execution_this_build_cannot_run_and_the_open_child_it_left
             "id": &child,
             "status": "cancelled",
             "error": null,
-            "finally_error": closed_detail("this process has not recovered it"),
+            "finally_error": closed_detail(&format!(
+                "its open parent `{parent}` is one this build's recovery could not take, so \
+                 nothing here re-issues it"
+            )),
             "requested": 1,
         }),
         json!({
@@ -1906,8 +1918,9 @@ fn a_cancel_of_an_execution_whose_recovery_diverged_cancels_the_child_it_runs_th
 /// project's own `run` of `flow.long` is running its ten-minute command while
 /// the project is served: its row is open, its flow is declared, it is on no
 /// board of the `serve`'s and the `serve` runs no generation of it — every
-/// mark of an execution that process has not recovered, which its cancel would
-/// close, save one: its trigger is `manual`. So the cancel is the `404` of an
+/// mark of an execution that process has not recovered, whose cancel it would
+/// record for the recovery that takes it, save one: its trigger is `manual`.
+/// So the cancel is the `404` of an
 /// id the app does not know; the row stays open, with no cancel request
 /// recorded and no `finally_error`; the status route does not know it; no
 /// finally node ran; and the `run` is still running its command.
@@ -2014,6 +2027,407 @@ impl Drop for Beside {
         let _ = self.run.wait();
         kill_listed(&self.pids);
     }
+}
+
+/// A host for a `serve` whose recovery walk cannot read the open executions
+/// until the file `$RECOVERY_GATE` appears: the walk's own read of them is
+/// refused while the file is missing — every other read of the journal goes
+/// through, a cancel's cascade among them — so the start owes the walk, as a
+/// standby's does on a journal another `serve` holds, and pays it on a retry
+/// once the file is there.
+const RECOVERY_HELD: &str = r#"import process from "node:process";
+import { existsSync } from "node:fs";
+import { openJournal } from "./src/journal.ts";
+
+await import("./src/index.ts");
+const journal = await openJournal();
+const openExecutions = journal.openExecutions.bind(journal);
+const gate = process.env.RECOVERY_GATE;
+journal.openExecutions = async () => {
+  // The walk's read and no other: the stack names who is asking.
+  if (!existsSync(gate) && (new Error().stack ?? "").includes("recoverExecutions")) {
+    throw new Error("the test holds the recovery walk until its gate opens");
+  }
+  return openExecutions();
+};
+const { runMain } = await import("./src/cli.ts");
+await runMain(process.argv.slice(2));
+"#;
+
+/// **A cancel of an execution the recovery this process owes has not reached
+/// is recorded, and that recovery completes it, finally node and all** (PRD
+/// resolved q81, q75 rulings d and e; Decision D165).
+///
+/// `flow.long` is running a ten-minute command when its `serve` is killed. The
+/// next `serve` of the same build starts with its recovery walk refused — its
+/// read of the open executions fails until a gate file appears, the position a
+/// standby is in while another `serve` holds its journal — so the execution is
+/// open, its flow declared, and on no board: one this build *can* run, whose
+/// recovery is still owed. A cancel of it is not a close. `agent-compose
+/// cancel` exits `0` and prints the route's `detail` — the cancel recorded, the
+/// row left for the recovery that takes it — and the route, asked again,
+/// answers `202` with the journal's `open`, `cancelling: true` and no status
+/// URL; the row is open with its request recorded and no `finally_error`, and
+/// no finally node has run. Once the gate opens the walk recovers it, finds the
+/// request and completes the cancel: the row settles `cancelled` with no
+/// `error` and no `finally_error`, its finally node having run once at
+/// `cancelled`, and a cancel after that is the `409` every ended execution
+/// gets. The serve log says it was recovered, and never that it could not be.
+#[test]
+fn a_cancel_of_an_execution_the_owed_recovery_has_not_reached_is_completed_by_that_recovery() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("cancel-owed-recovery");
+    let (mut environment, log) = environment(&provider, &scratch);
+    let gate = scratch.path().join("recovery-gate");
+    environment.push(("RECOVERY_GATE".to_string(), gate.display().to_string()));
+    let pid_file = PathBuf::from(format!("{}.pids", log.display()));
+    let Some(project) = harness::scratch_project("cancel-owed-recovery") else {
+        return;
+    };
+    let Some(cli_out) = harness::scratch_project("cancel-owed-recovery-build") else {
+        return;
+    };
+    let execution;
+    {
+        let Some(first) = harness::serve_into(&project, FIXTURE, &environment) else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        execution = started(&app, "/long", &json!({ "linger": 600 }));
+        pids(&log, 1);
+        // Dropped holding it: `SIGKILL` to the group, the row left open.
+    }
+    let Some(mut served) = harness::serve_built_hosted(&project, RECOVERY_HELD, &environment)
+    else {
+        kill_listed(&pid_file);
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let unknown = app
+        .get(&format!("/executions/{execution}"))
+        .expect("the status route answers");
+    assert_eq!(
+        unknown.status,
+        404,
+        "the walk that would put it on the board is owed: {}",
+        unknown.text()
+    );
+
+    let detail = "this process runs no generation of this execution yet, and a recovery of this \
+                  build takes it up — the recovery this process owes, which has not read the \
+                  journal yet — so the cancel is recorded and its lifecycle row stays open: that \
+                  recovery completes the cancel, its finally node included";
+    let printed = compiler(&environment)
+        .arg("cancel")
+        .arg(harness::fixture(FIXTURE))
+        .arg(&execution)
+        .args(["--url", &served.base_url])
+        .arg("--out")
+        .arg(&cli_out)
+        .output()
+        .expect("the compiler runs");
+    assert_eq!(
+        printed.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&printed.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&printed.stdout).trim_end(),
+        format!("cancelling `{execution}`: {detail}"),
+    );
+    let (status, body) = cancel(&app, &execution);
+    assert_eq!(status, 202, "the same request again: {body:#}");
+    assert_eq!(body["status"], "open", "{body:#}");
+    assert_eq!(body["cancelling"], true, "{body:#}");
+    assert!(
+        body.get("status_url").is_none(),
+        "no route of this process reports it yet: {body:#}"
+    );
+    assert_eq!(body["detail"], detail, "{body:#}");
+    assert_eq!(
+        closed_rows(&project),
+        json!([{
+            "id": &execution,
+            "status": "open",
+            "error": null,
+            "finally_error": null,
+            "requested": 1,
+        }]),
+        "the cancel is recorded, and nothing closed the row"
+    );
+    assert!(
+        ended(&log).is_empty(),
+        "no finally node ran: {:?}",
+        ended(&log)
+    );
+
+    std::fs::write(&gate, "").expect("the scratch area is writable");
+    let report = reaches(&app, &execution, "cancelled", Duration::from_secs(60));
+    assert!(report.get("error").is_none(), "{report:#}");
+    assert!(
+        report.get("finally_error").is_none(),
+        "its finally node ran, and ran clean: {report:#}"
+    );
+    assert_eq!(
+        ended(&log),
+        ["cancelled|none"],
+        "the recovery completed the cancel, running the finally node once at `cancelled`"
+    );
+    let rows = eventually_rows(&project, &execution, "cancelled");
+    assert_eq!(
+        rows,
+        json!([{
+            "id": &execution,
+            "status": "cancelled",
+            "error": null,
+            "finally_error": null,
+            "requested": 1,
+        }]),
+    );
+    let (again, refused) = cancel(&app, &execution);
+    assert_eq!(again, 409, "{refused:#}");
+    assert_eq!(refused["status"], "cancelled", "{refused:#}");
+
+    let said = served.stop_and_read_stderr();
+    kill_listed(&pid_file);
+    assert_eq!(
+        said.lines()
+            .filter(|line| *line == format!("recovered {execution} (flow.long)"))
+            .count(),
+        1,
+        "{said}"
+    );
+    assert!(
+        !said.contains(&format!("`{execution}` (flow.long) could not be recovered")),
+        "{said}"
+    );
+}
+
+/// The lifecycle rows once `execution`'s reads `status`, within ten seconds:
+/// a settle the status route already reports ends its row a moment after.
+fn eventually_rows(project: &Path, execution: &str, status: &str) -> Value {
+    let deadline = Instant::now() + SETTLE;
+    loop {
+        let rows = closed_rows(project);
+        let row = rows
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|row| row["id"] == execution);
+        if row.is_some_and(|row| row["status"] == status) {
+            return rows;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "`{execution}`'s row did not reach `{status}`: {rows:#}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// [`a_standby_recovers_an_execution_before_cancelling_it_and_its_finally_node_runs`]'s
+/// composition: `cancellation`'s `flow.long` alone, under a name each run
+/// replaces `flow.standby` with — the fixture's detached dispatches are
+/// refused under a durably checkpointed target such as a dialled journal's
+/// (grammar 8.6 rule 7).
+const STANDBY_COMPOSITION: &str = r#"version: "0.1"
+
+defaults:
+  timeout: 300s
+
+triggers:
+  on_long:
+    type: http
+    flow: flow.standby
+    path: /long
+    method: POST
+    input:
+      linger: "payload.body.linger"
+    respond: async
+
+flow.standby:
+  description: A command that runs as long as it is told to, and a record of how the run ended.
+  inputs:
+    linger:
+      type: integer
+  outputs: {}
+  nodes:
+    work:
+      exec:
+        command: "${TALLY_BIN}/linger"
+      input:
+        linger: "input.linger"
+    record:
+      exec:
+        command: "${TALLY_BIN}/ended"
+      input:
+        outcome: "execution.outcome"
+        error: "has(execution.error) ? execution.error : 'none'"
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+  finally: record
+"#;
+
+/// **A standby's cancel of an execution the `serve` it takes over from left
+/// running recovers it first, and cancels it as a running one** (PRD resolved
+/// q81, q75 rulings a and b; Decision D165; `docs/durability.md` §6.1).
+///
+/// The probe that found the case, as a test: a `serve` on a Postgres journal
+/// runs [`STANDBY_COMPOSITION`]'s ten-minute command, and a second `serve` over the same
+/// journal is its standby — its start cannot read the journal the first
+/// holds, so it owes the recovery, retrying with backoff. The first is
+/// `SIGKILL`ed a few seconds on, between two of those retries, and the cancel
+/// is sent to the standby the moment it can read the journal: well before its
+/// next retry. That cancel takes the recovery it owes first, so the execution
+/// is on its board and running when the cancel is decided — `202` with
+/// `cancelling: true`, not a close — and it settles `cancelled` with its
+/// finally node run once at `cancelled` and no `finally_error`, on the status
+/// route and on its row. A close would have ended the row with no finally node
+/// run, an execution this build can run among the ones it could not take.
+/// The flow is renamed per run, so no open row an earlier run left on the
+/// shared database is one this build declares. Skipped, with a notice, where
+/// `AGENT_COMPOSE_TEST_POSTGRES_URL` is unset.
+#[test]
+fn a_standby_recovers_an_execution_before_cancelling_it_and_its_finally_node_runs() {
+    let Ok(url) = std::env::var("AGENT_COMPOSE_TEST_POSTGRES_URL") else {
+        eprintln!(
+            "notice: skipping the standby cancel case: AGENT_COMPOSE_TEST_POSTGRES_URL is unset"
+        );
+        return;
+    };
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("cancel-standby");
+    let (mut environment, log) = environment(&provider, &scratch);
+    environment.push(("AGENT_COMPOSE_JOURNAL_URL".to_string(), url.clone()));
+    let pid_file = PathBuf::from(format!("{}.pids", log.display()));
+    let flow = format!(
+        "flow.long_standby_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_millis()
+    );
+    let composition = scratch.path().join("composition");
+    std::fs::create_dir_all(composition.join("deploy")).expect("the scratch area is writable");
+    let entrypoint = composition.join("main.yml");
+    std::fs::write(
+        &entrypoint,
+        STANDBY_COMPOSITION.replace("flow.standby", &flow),
+    )
+    .expect("the scratch area is writable");
+    std::fs::write(
+        composition.join("deploy/pg.yml"),
+        "version: \"0.1\"\njournal:\n  provider: postgres\n  url: ${AGENT_COMPOSE_JOURNAL_URL}\n",
+    )
+    .expect("the scratch area is writable");
+    let (Some(one), Some(two)) = (
+        harness::scratch_project("cancel-standby-one"),
+        harness::scratch_project("cancel-standby-two"),
+    ) else {
+        return;
+    };
+    let Some(mut first) = harness::serve_target_into(&one, &entrypoint, "pg", &environment) else {
+        return;
+    };
+    let execution = started(
+        &Client::new(&first.base_url).expect("a client for the generated app"),
+        "/long",
+        &json!({ "linger": 600 }),
+    );
+    pids(&log, 1);
+    let Some(mut second) = harness::serve_target_into(&two, &entrypoint, "pg", &environment) else {
+        first.stop();
+        kill_listed(&pid_file);
+        return;
+    };
+    let app = Client::new(&second.base_url).expect("a client for the generated app");
+    // The standby's retries come one, three and seven seconds after its start,
+    // and the next at fifteen: the first goes at eight, and the cancel lands
+    // in the window before that next retry.
+    std::thread::sleep(Duration::from_secs(8));
+    first.stop();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let body = loop {
+        let (status, body) = cancel(&app, &execution);
+        if status != 404 {
+            assert_eq!(status, 202, "{body:#}");
+            break body;
+        }
+        // Not the standby's to read until the server has let the first's
+        // session go.
+        assert!(
+            Instant::now() < deadline,
+            "the standby never read the journal the first left: {body:#}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(
+        body["cancelling"], true,
+        "a running execution's cancel, not a close: {body:#}"
+    );
+    assert_eq!(
+        body["status_url"],
+        format!("/executions/{execution}"),
+        "{body:#}"
+    );
+
+    let report = reaches(&app, &execution, "cancelled", Duration::from_secs(30));
+    assert!(report.get("error").is_none(), "{report:#}");
+    assert!(
+        report.get("finally_error").is_none(),
+        "its finally node ran, and ran clean: {report:#}"
+    );
+    assert_eq!(
+        ended(&log),
+        ["cancelled|none"],
+        "the finally node ran once, at `cancelled`"
+    );
+    let deadline = Instant::now() + SETTLE;
+    let row = loop {
+        let rows = harness::postgres_rows(
+            &two,
+            &url,
+            &format!(
+                "SELECT executions.status AS status, executions.error AS error, \
+                 executions.finally_error AS finally_error, \
+                 (SELECT COUNT(*) FROM cancellations WHERE cancellations.execution = executions.id) \
+                 AS requested FROM executions WHERE executions.id = '{execution}'"
+            ),
+        );
+        let row = rows[0].clone();
+        if row["status"] == "cancelled" || Instant::now() > deadline {
+            break row;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(row["status"], "cancelled", "{row:#}");
+    assert!(row["error"].is_null(), "{row:#}");
+    assert!(
+        row["finally_error"].is_null(),
+        "no close wrote one: {row:#}"
+    );
+    // Postgres answers a `COUNT(*)` as a `bigint`, which the driver hands over
+    // as a string.
+    assert_eq!(
+        row["requested"].to_string().trim_matches('"'),
+        "1",
+        "the request is recorded once: {row:#}"
+    );
+
+    let said = second.stop_and_read_stderr();
+    kill_listed(&pid_file);
+    assert!(
+        said.lines()
+            .any(|line| line == format!("recovered {execution} ({flow})")),
+        "the standby recovered it before the cancel was decided: {said}"
+    );
+    assert!(
+        !said.contains(&format!("`{execution}` ({flow}) could not be recovered")),
+        "{said}"
+    );
 }
 
 /// [`a_cancel_of_an_execution_whose_recovery_diverged_cancels_the_child_it_runs_through_the_cascade`]'s
