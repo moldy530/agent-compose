@@ -1856,6 +1856,20 @@ const DURABILITY: &[Criterion] = &[
                 "a_cancel_closes_an_execution_whose_flow_the_build_no_longer_declares",
                 Status::Live,
             ),
+            // …under the guard of the trigger that started it (PRD resolved
+            // q32): one whose trigger the build no longer declares is refused
+            // until a build declares it again, and the serve log says so…
+            (
+                "a_cancel_of_an_execution_whose_trigger_the_build_no_longer_declares_is_refused_until_it_is_declared_again",
+                Status::Live,
+            ),
+            // …and once closed, it lets go of what a settled execution does:
+            // its ledger rows and its `scope: execution` partition (PRD
+            // resolved q69 ruling d).
+            (
+                "a_cancel_that_closes_an_execution_prunes_its_ledger_rows_and_removes_its_execution_scoped_partition",
+                Status::Live,
+            ),
             // …and what a run that stops on its own must not leave behind: a
             // detached delivery made with no record is one the resume makes
             // again.
