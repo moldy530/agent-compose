@@ -15614,7 +15614,14 @@ withdraws the parked row and nothing runs. That is what the alternatives cost:
 running the finally node on the hub would run a placed node off its placement,
 with an environment the hub does not hold (*The environment*, below, and
 `docs/distributed.md` §9.1); and ending the instance with its finally node
-skipped is the outcome q75 ruling e rules out.
+skipped is the outcome q75 ruling e rules out. Begun is the instance's own,
+read off its own dispatches and never off what the journal holds at its
+instance path: a `retry:` attempt of a `flow:` node, or another attempt of a
+`map` item, is a fresh instance at the same path (§8.5, §8.6 rule 10), so what
+an earlier attempt made there — one lost with its worker, say — is that
+attempt's, and the next attempt, parked with nothing claiming the placement,
+has still not begun: a cancel or a deadline that ends it runs nothing and
+dispatches no end.
 
 **The end a stop owes.** The cancel is not the only way the hub ends an
 instance it is not running. An end around a placed instance — a sibling branch

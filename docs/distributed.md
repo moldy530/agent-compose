@@ -285,7 +285,13 @@ its replay stops the instance at a frontier no worker holds — an unanswered
 question, a parked redispatch (`docs/durability.md` §6.1). An instance whose
 dispatch no worker ever took has **not** begun, and has no end to run anything
 at (grammar §7.9): the cancel withdraws its parked row as it withdraws any, and
-it settles as the cancel with no finally node run.
+it settles as the cancel with no finally node run. Whether an instance began is
+read off its own rows — a pause of it that came home — and never off the
+effects journaled under its instance path: every `retry:` attempt of one
+`flow:` node is a fresh instance at that same path (`build/0/0`, then
+`build/0/1`), so an attempt whose worker was lost (§6.3) followed by one parked
+with nothing claiming the placement is an instance that never began, and a
+cancel or a deadline that finds it parked withdraws it and dispatches no end.
 
 **A hub stop owes one the same end.** The hub *stops* waiting for an instance
 — not a cancel, which is the execution's — when an end around it abandons its
