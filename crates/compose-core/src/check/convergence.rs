@@ -1265,7 +1265,7 @@ mod tests {
     }
 
     /// The source test behind the doubled-negation case: a `!` applied to a `!`,
-    /// whitespace aside, and nothing that only looks like one.
+    /// whitespace and comments aside, and nothing that only looks like one.
     #[test]
     fn a_repeated_negation_is_told_apart_from_its_lookalikes() {
         for repeated in ["!!x", "! !x", "a && !!b", "!!!x", "!\n!x"] {
@@ -1281,6 +1281,43 @@ mod tests {
             "x == r'!!'",
         ] {
             assert!(!crate::cel::repeats_a_negation(single), "{single}");
+        }
+    }
+
+    /// A `//` comment is hidden from the parser as whitespace is, so a run of
+    /// `!` split by one is still one run to the pinned parser — `!` ending a
+    /// commented line and `!input.x` on the next arrive as `!input.x` — and
+    /// rule 3 has to see through it the same way, a quote inside the comment
+    /// included. Each of these is `input.x` (or `input.x` conjoined), so reading
+    /// any of them as `!input.x` would prove it exclusive with itself.
+    #[test]
+    fn a_repeated_negation_split_by_a_comment_proves_nothing() {
+        for repeated in [
+            "!// c\n!input.x",
+            "a.output.ok && ! // not the slow path\n!input.x",
+            "! // one\n// two\n! input.x",
+            "! // \"\"\"\n!input.x && \"\"\"a\"\"\" == 'a'",
+            "! // '\n!input.x",
+        ] {
+            assert!(crate::cel::repeats_a_negation(repeated), "{repeated:?}");
+            assert!(
+                !exclusive_by_rule_3(repeated, "a.output.ok && input.x"),
+                "{repeated:?} against `a.output.ok && input.x`"
+            );
+        }
+        // A comment that only follows a negation, or holds what looks like
+        // one, splits no run — and the conjuncts around it are still read.
+        for single in [
+            "!input.x // !!",
+            "!input.x // a note\n&& !input.y",
+            "input.y == ('//' == '//') && !input.x",
+            "'// !' == '// !' && !input.x",
+        ] {
+            assert!(!crate::cel::repeats_a_negation(single), "{single:?}");
+            assert!(
+                exclusive_by_rule_3(single, "input.x"),
+                "{single:?} against `input.x`"
+            );
         }
     }
 }

@@ -15272,10 +15272,12 @@ names, so whitespace and grouping — which the parse has already discarded —
 change nothing, and an index is not a selection: `input['x']` is not the
 `input.x` another guard negates. One parse is not read as written: the pinned
 `cel` crate collapses a run of unary `!` into one application, so `!!q` arrives
-as `!q`. A guard whose source applies a `!` directly to a `!` — `!!q`, `! !q` —
-therefore holds no literal for this rule at all, because its AST carries a
-negation its source does not, and `!!q` against `q` would otherwise read as
-exclusive where the two guards are the same guard. `!(!q)` parses as written and
+as `!q`. A guard whose source applies a `!` directly to a `!` — `!!q`, `! !q`,
+or a `!` and a `!` with only a `//` comment and a line break between them, since
+a comment is hidden from the parser as whitespace is — therefore holds no
+literal for this rule at all, because its AST carries a negation its source
+does not, and `!!q` against `q` would otherwise read as exclusive where the two
+guards are the same guard. `!(!q)` parses as written and
 is simply not a literal.
 
 **Where it is asked.** Beside rule 2, in the per-edge reading `convergence.rs`

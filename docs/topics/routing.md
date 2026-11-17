@@ -141,7 +141,8 @@ never taken together, by one of three rules:
    `a.output.ok && !input.x`, whatever else either conjoins. `q` is a boolean
    field, channel or input read by path, or a `has(…)` test; it is compared as
    written, so spacing and parentheses do not matter. Nothing wider counts:
-   `q == true` against `q == false`, a `!q` under an `||`, `!!q`, and the same
+   `q == true` against `q == false`, a `!q` under an `||`, `!!q` (a `//`
+   comment between the two `!` included), and the same
    field read two ways (`input['x']` against `!input.x`) are not proved
    exclusive.
 

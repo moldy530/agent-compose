@@ -583,7 +583,8 @@ fn shape(source: &str) -> Shape {
 }
 
 /// Whether the source applies a unary `!` to a unary `!` directly — `!!x`,
-/// `! !x` — which the pinned parser does not read as written.
+/// `! !x`, a `!` ending a line whose comment the next `!x` follows — which the
+/// pinned parser does not read as written.
 ///
 /// `cel` 0.14.3's parser collapses a run of unary operators into **one**
 /// application whatever its length: `!!x` arrives as `!x`, `!!!x` as `!x` too
@@ -592,15 +593,23 @@ fn shape(source: &str) -> Shape {
 /// because the run is broken by the group. So a reading of a guard's AST that
 /// gives a negation meaning has to know the parse lied about it, and this is
 /// how: a lexical test over the source, skipping string literals the way
-/// [`shape`] does, for a `!` that is not `!=` followed — whitespace aside — by
-/// another. Grammar 7.6.1's third exclusivity rule reads nothing from such a
-/// guard (Decision D169).
+/// [`shape`] does, for a `!` that is not `!=` followed by another with nothing
+/// between the two but what the lexer hides from the parser. That is CEL's
+/// whitespace **and its `//` line comments** (the grammar's `WHITESPACE` and
+/// `COMMENT`, both on the hidden channel), so a comment is passed over here as
+/// whitespace is — and before a string literal is looked for, so a quote inside
+/// a comment opens nothing. Grammar 7.6.1's third exclusivity rule reads
+/// nothing from such a guard (Decision D169).
 #[must_use]
 pub fn repeats_a_negation(source: &str) -> bool {
     let characters: Vec<char> = source.chars().collect();
     let mut after_negation = false;
     let mut index = 0usize;
     while index < characters.len() {
+        if let Some(after) = line_comment(&characters, index) {
+            index = after;
+            continue;
+        }
         if let Some(after) = string_literal(&characters, index) {
             index = after;
             after_negation = false;
@@ -621,6 +630,23 @@ pub fn repeats_a_negation(source: &str) -> bool {
         }
     }
     false
+}
+
+/// Where the `//` line comment starting at `index` ends, if one starts there:
+/// at its line break, as the lexer's `COMMENT : '//' (~'\n')*` ends it, or at
+/// the end of the source. Only code is asked — a string literal is skipped
+/// whole before its contents could be — and in code a `//` is always a
+/// comment: no CEL operator starts with it.
+fn line_comment(characters: &[char], index: usize) -> Option<usize> {
+    if characters.get(index) != Some(&'/') || characters.get(index + 1) != Some(&'/') {
+        return None;
+    }
+    Some(
+        characters[index..]
+            .iter()
+            .position(|character| *character == '\n')
+            .map_or(characters.len(), |offset| index + offset),
+    )
 }
 
 /// Where the string literal starting at `index` ends, if one starts there.
