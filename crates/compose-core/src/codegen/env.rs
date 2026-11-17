@@ -1696,9 +1696,9 @@ storage_backends:\n  aliases:\n    docs_db:\n      provider: chroma\n      url: 
     /// hub's** (grammar §14.1, PRD resolved q84, Decision D171).
     ///
     /// `flow.build` is a member of `mac`, so every instance of it — the root
-    /// execution a trigger or `run` starts, the `flow:` node and the `map` item
-    /// of `flow.release`, a flow-as-tool call — is dispatched to a worker
-    /// claiming `mac` and runs whole there. Everything only it reaches executes
+    /// execution a trigger starts, the `flow:` node and the `map` item of
+    /// `flow.release`, a flow-as-tool call — is dispatched to a worker claiming
+    /// `mac` and runs whole there. Everything only it reaches executes
     /// on that worker: the unplaced `agent.inspector` and its provider, the
     /// `tool.package` that agent attaches, the `coder:` node's workspace, `env:`
     /// and provider, and the store its agent opens.

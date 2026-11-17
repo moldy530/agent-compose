@@ -525,16 +525,19 @@ its numbering, and then §14.2's about the token:
   once.
 - **rule 2** — members are `agent.*`, `tool.*` and `flow.*`. A **`flow.*`**
   member places **every instance** of the flow — the root execution a trigger
-  or `run` starts, a `flow:` node's, a `map` item's, a flow-as-tool call's: the
-  hub dispatches each one whole to a worker claiming the placement, every node
-  of it — its `finally:` node too — runs there, and its effects are journaled on
+  starts, a `flow:` node's, a `map` item's, a flow-as-tool call's: the hub
+  dispatches each one whole to a worker claiming the placement, every node of
+  it — its `finally:` node too — runs there, and its effects are journaled on
   the hub as any dispatch's are. That is how one build step runs on one build
   machine with no agent in the way: put the step in a flow — a `coder:` node, an
   `exec:` node — and name the flow. One construct does not move with it: a
   `detach: true` `flow.*` dispatch starts a child execution only the hub can
   begin, so anywhere in a placed flow's instance it fails its `map` node on
   every run (`ChildOnAWorker`, under the node's `on_error:`) — leave detached
-  dispatches to a flow the hub runs.
+  dispatches to a flow the hub runs. And a `run` has no mesh to dispatch into,
+  so one that reaches a placed flow fails at that dispatch with
+  `PlacementUnreachable`, as one that reaches a placed agent's node does, and
+  never runs the instance in its own process.
 - **rule 3** — placements are **disjoint**. One component in two of them is two
   answers to which worker runs it — and so is a component placed elsewhere that
   a placed flow's instance reaches, since a worker runs every node of the
