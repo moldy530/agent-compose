@@ -163,7 +163,10 @@ journal, keeping any slot of a `concurrency:` group it holds, until it is
 cancelled: its cancel closes it there and then, `202` with `status:
 "cancelled"` and `cancelling: false`, the row ended `cancelled` with no
 finally node run — its `finally_error` says why — the settle webhook sent and
-the slot freed (PRD resolved q81).
+the slot freed (PRD resolved q81). The cancel is under the `auth:` of the
+trigger that started the execution, as every per-execution route is, so one
+whose trigger was renamed or removed along with its flow is refused `401`
+until a build declares that trigger again; the serve log says so for it.
 
 ## Authenticating an `http` trigger
 

@@ -1687,7 +1687,9 @@ reason read one step further out: a `kv` store bound to `postgres` or `mysql`
 `scope: execution` fixes when they are deleted rather than where they live. The
 generation that **ends** the execution deletes that partition, a generation that
 only parked deletes nothing, and a resumed run reads exactly the world its
-recorded prefix left behind.
+recorded prefix left behind. An execution no generation can end — one this
+build's recovery could not take — keeps its partitions, `blob` or dialled, until
+a cancel closes its row (§7), and the close removes them.
 
 A generation that only **parked** removes nothing. `agent-compose run` reaching
 a `human` pause with nobody to answer it is not a crash — it exits `3` and
@@ -1855,7 +1857,9 @@ open **until it is cancelled**: the start says so once per execution — ``
 `<id>` (<flow>) could not be recovered by this build: <reason>; its row stays
 open until `agent-compose cancel <id>` closes it`` — and the cancel closes the
 row `cancelled` with no finally node run, said in `finallyError` (§7, PRD
-resolved q81).
+resolved q81). Where the trigger that started it is one this build does not
+declare, the line says the cancel route refuses that cancel until the trigger
+is declared again (§7).
 
 Because recovery takes every open execution, an execution worth resuming by hand
 is one no `serve` is running — see §2 on what is outside the promise.
@@ -2186,12 +2190,31 @@ which `finallyError` says (`no finally node ran: this build could not take up
 the execution's recovery (<reason>)`, §3.5), while `error` stays absent as on
 every cancelled row. The settle webhook and the trace export go as for any
 settle, journaled before the row ends (§3.7), and no later start recovers it.
+Once the row has ended, what a settled execution lets go of goes too: the
+idempotency ledger rows its keyed writes left are pruned as a settled
+execution's are (PRD resolved q69, `docs/grammar.md` D153) — kept, as there,
+while a worker may still be running one of its placed nodes — and the
+partitions of its `scope: execution` stores, which the generation that ends an
+execution removes (§5) and which no generation ends here, are removed by the
+close.
 The same holds of a recovery that failed **before** the execution opened —
 recorded inputs the build's `inputs:` refuse — and of a row of a flow the build
 no longer declares, which recovery leaves in the journal (§6.1). `serve` says
 which command closes each, once per start: `` `<id>` (<flow>) could not be
 recovered by this build: <reason>; its row stays open until `agent-compose
 cancel <id>` closes it``.
+
+**The cancel is under the trigger's `auth:`.** A close is a cancel, and the
+cancel route is under the `auth:` of the trigger that started the execution
+(PRD resolved q32, q75): an execution whose trigger the build no longer
+declares — renamed or removed, as removing a flow removes its triggers — is
+refused `401` whatever the request carries, since the authentication that
+trigger required cannot be read, and its row stays open with nothing recorded.
+The serve line says so for such an execution — `` …closes it, which the cancel
+route refuses until this build declares the trigger `<trigger>` that started it
+again: a cancel is authenticated by that trigger's `auth:` (PRD resolved q32)``
+— and a build that declares the trigger again closes it, its flow declared or
+not.
 
 **Only an execution nothing in the process will ever take is closed so.** An
 open row of a flow the build declares that the process has not recovered

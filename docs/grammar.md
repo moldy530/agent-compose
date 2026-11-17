@@ -5050,7 +5050,10 @@ Rules (PRD 5.8):
   row is what answers a retry of its effect site, and an execution retries only
   while its journal row is open; every §9.4 key begins `<execution.id>/`, and a
   settled execution never resumes (PRD resolved q65). So when an execution's row
-  closes `completed` or `failed` and the detached `agent.*`/`tool.*` deliveries
+  closes `completed`, `failed` or `cancelled` — a cancel's close of an execution
+  this build's recovery could not take included (Decision
+  [D165](#d165-a-cancel-closes-an-execution-this-builds-recovery-could-not-take))
+  — and the detached `agent.*`/`tool.*` deliveries
   it started have finished — they write, and retry, under its id (§8.6 rule 7) —
   the runtime deletes the ledger rows under that prefix from every store the
   composition binds, which reaches every partition the execution wrote from any
@@ -5058,7 +5061,8 @@ Rules (PRD 5.8):
   rows go under the child's own id, when the child settles. An execution the
   journal still holds open keeps every row, so a resume still writes nothing
   twice (PRD resolved q29, q69). A `scope: execution` store's partition, ledger
-  included, already dies with the run (§11.3). The prune runs behind the
+  included, already dies with the run (§11.3) — and, for an execution that
+  close ends with no generation of it running, with the close. The prune runs behind the
   outcome and nothing of the outcome waits for it — each store on its own, a
   dial bounded at ten seconds — and a command waits for it on its way out (a
   `run` or `resume` as it exits, a `serve` when it is stopped), starting then a
@@ -12431,7 +12435,13 @@ and no trace field: an expired key is answered as a key never written is. A
 synthesized tool takes no `ttl` argument and writes under the store's default.
 
 **Status**: shipped. *PRD 5.8, resolved q29, q63, q65, q68, q69; §4.4, §8.8,
-§9.4, §11.1, §11.3, §11.4, §11.5.*
+§9.4, §11.1, §11.3, §11.4, §11.5.* ***Amended by
+[D165](#d165-a-cancel-closes-an-execution-this-builds-recovery-could-not-take)
+(PRD resolved q81):*** *a row also closes `cancelled` with no generation of it
+running — a cancel's close of an execution this build's recovery could not
+take — and is pruned the same way once it has closed, under the same two
+holds; that close also removes the execution's `scope: execution` partitions,
+which no generation's end removes for it.*
 
 ### D154. A `kv` store is read at scale a page at a time, and a page's `entries` are there when its node asks
 
@@ -14699,6 +14709,13 @@ lease, never whether the cancel closes it.
    export the target's `trace_sink:` is owed — and then the row is ended
    `cancelled`, `error` null, `finally_error` reading
    `no finally node ran: this build could not take up the execution's recovery (<reason>)`;
+   and once it has, what a settled execution lets go of goes — the ledger rows
+   its keyed writes left under `<id>/`, pruned from every bound store as
+   [D153](#d153-a-kv-key-may-expire-and-a-settled-executions-ledger-rows-are-deleted)
+   prunes a settled execution's (kept, as there, while a worker may still be
+   running one of its placed nodes), and the partitions of its
+   `scope: execution` stores (§11.3), which no generation's end removes for
+   it — behind the answer, which waits for neither;
 4. the trigger's queue is looked at, where the execution held a slot.
 
 `<reason>` is what the recovery failed on, as the status route reported it,
@@ -14729,7 +14746,22 @@ per start per execution, naming the command that closes it:
 `` `<id>` (<flow>) could not be recovered by this build: <reason, 200 characters>; its row stays open until `agent-compose cancel <id>` closes it`` —
 for a replay that stopped short of closing its row, where the status route
 reports it, and for a flow the build does not declare, after the line that
-already said so. Every line the log wrote before is kept.
+already said so. Where the trigger that started the execution is one this
+build does not declare, the cancel that line names would be refused (below),
+so the line goes on to say so:
+`` …closes it, which the cancel route refuses until this build declares the trigger `<trigger>` that started it again: a cancel is authenticated by that trigger's `auth:` (PRD resolved q32)``.
+Every line the log wrote before is kept.
+
+**Under the guard of the trigger that started it.** The route is under the
+`auth:` of the trigger that started the execution (q32, q75 ruling d), and a
+close is a cancel: the request has to pass that trigger's `auth:`, and an
+execution whose trigger this build does not declare at all — the composition
+renamed or removed it, as removing a flow removes its triggers — is refused
+`401` whatever the request carries, because the authentication that trigger
+required cannot be read — as its status and resume routes refuse it. Its row
+stays open, nothing recorded, until a build declares that trigger again; that
+build's cancel closes it, the flow still undeclared or not. A `manual` row has
+no trigger to enforce and is never refused this way.
 
 **Rationale**: a divergence is absorbed by no policy (PRD resolved q29),
 because nothing in the composition decides it, and an operator's cancel is the
@@ -14767,8 +14799,17 @@ settled, which holds the answer until its finally node has run, so that
 that the settle and the export are journaled before the
 row ends, as every settle's are, so a process killed between them leaves the
 row open and a cancel sent again finds the settle down and closes the row; that
-an execution on no board is put on the board once its row ends; and the
-clipping of the reason.
+an execution on no board is put on the board once its row ends; that its ledger
+rows and its `scope: execution` partitions go once its row has ended, as a
+settled execution's do; and the clipping of the reason. And that "lease or no
+lease" does **not** reach past q32's guard: the ruling supersedes nothing, and
+q75 ruling d keeps the route under the auth of the trigger that started the
+execution, so one whose trigger the build no longer declares is refused until
+the trigger is declared again, and the serve log says so rather than naming a
+cancel that would be refused. Whether a close should reach past that guard —
+for an execution whose trigger is gone along with its flow, which an operator
+can otherwise close only by putting the trigger back — is the owner's call,
+not made here.
 
 **A `run`'s row is still `404`.** A `run` beside a `serve` — on SQLite, where a
 run can open the journal beside a serving process — writes an open row this
@@ -14780,7 +14821,18 @@ A `manual` row this process recovered at its start is on its board, and closed
 like any other.
 
 **Collision review.** PRD resolved q29: a divergence is still absorbed by no
-policy and still keeps the row open — until a cancel says otherwise. q34 and
+policy and still keeps the row open — until a cancel says otherwise. q32: read,
+not amended — a close is under the auth of the trigger that started the
+execution, as every per-execution route is, so an execution whose trigger this
+build does not declare is refused `401` and its row stays open until a build
+declares that trigger again; the serve log says so for such an execution
+rather than naming a cancel the route refuses (the gap is recorded above for
+the owner). q69 ruling d and
+[D153](#d153-a-kv-key-may-expire-and-a-settled-executions-ledger-rows-are-deleted):
+a row this closes is a settled row, so its ledger rows are pruned once it has
+closed, behind the same holds, and D153's Status carries the amendment note;
+§11.3's "dies with that execution" is kept for the `scope: execution`
+partitions no generation's end removes here. q34 and
 q35: the settle webhook fires once, journaled before the row closes, guarded by
 the journal's record of it across generations, with `cancelled` among its
 statuses as q75 put it there. q75: ruling b's "a cancelled node settles as
@@ -14803,8 +14855,9 @@ carries the amendment note; its lease frees at the recorded request, as it did.
 
 **Status**: ratified — PRD resolved q81 (owner, 2026-11-16: "go with your
 recommendations it's fine"). The readings above are the implementation's,
-recorded for the owner. *PRD resolved q28, q29, q34, q35, q75, q76, q77, q81;
-§7.9, §13.3; amends D163's Status; builds on D159, D160.*
+recorded for the owner. *PRD resolved q28, q29, q32, q34, q35, q69, q75, q76,
+q77, q81; §7.9, §11.3, §13.3; amends D153's and D163's Status; builds on D153,
+D159, D160.*
 
 ### D166. A `store` command's environment is its store's backend references alone
 

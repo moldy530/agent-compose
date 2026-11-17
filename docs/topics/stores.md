@@ -707,8 +707,9 @@ so its lease expires on its own; the run's resume runs `release` when it ends.
 
 **The idempotency ledger is pruned when an execution settles.** Each keyed
 write leaves a ledger row so a retry of it answers rather than writing twice.
-When the execution that wrote it settles — `completed` or `failed` — its rows go
-from every store the composition binds, so a write a placed node made from its
+When the execution that wrote it settles — `completed`, `failed` or
+`cancelled`, a cancel that closes an execution the serving build's recovery
+could not take included — its rows go from every store the composition binds, so a write a placed node made from its
 worker goes too; a child execution's go when the child settles. The prune runs
 *behind* the outcome: a run's answer never waits for it, so a bound store the
 run never reached, on a server that is slow or not answering, delays nothing
