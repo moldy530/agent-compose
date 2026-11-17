@@ -16774,11 +16774,55 @@ export async function settleExecution(execution: string, error?: unknown): Promi
   // **After** the row has closed, never before: a crash between the two leaves
   // ledger rows nothing will ask for again, and the other order could leave an
   // execution the journal still holds open without the rows its resume needs.
-  const identity: ExecutionIdentity = {
+  await pruneSettled(journal, {
     id: execution,
     session_key: executionSessions.get(execution) ?? "",
-  };
-  // …and after the detached `agent.*` and `tool.*` deliveries this execution
+  });
+}
+
+/**
+ * Prune the idempotency ledger of an execution whose row a cancel has just
+ * closed **with no generation of it running here** — one this build's
+ * recovery could not take (PRD resolved q81, Decision D165): what
+ * [`settleExecution`] does once a row it closed has closed, for the one row
+ * that closes without it.
+ *
+ * Such a row closes `cancelled` from `serve`'s cancel route, never through a
+ * run's settlement — the generation that recovered it, where one did, stopped
+ * short of closing it ([`staysOpen`]) and so pruned nothing — and a settled
+ * execution never resumes (PRD resolved q65), so the rows its keyed writes left
+ * under `<execution.id>/` answer nothing again: they go as every settled
+ * execution's do (PRD resolved q69 ruling d, Decision D153), behind the same
+ * two holds — a worker that may still be running one of its placed nodes
+ * ([`placedRunnerMayOutlive`]) keeps them for good, and a detached delivery
+ * its generation here left in flight is waited for first. `sessionKey` is the
+ * lifecycle row's, which is the partition a `blob` store's ledger is in.
+ *
+ * Called **after** the row has ended, for [`settleExecution`]'s reason, and
+ * never the close's failure: the cancel is complete whatever becomes of the
+ * prune, and a journal that cannot be read here keeps every row, said on
+ * stderr.
+ */
+export async function pruneClosedExecution(execution: string, sessionKey: string): Promise<void> {
+  let journal: Journal;
+  try {
+    journal = await openJournal();
+  } catch (failure) {
+    process.stderr.write(
+      `warning: the ledger rows execution \`${execution}\`'s keyed store writes left are kept: the journal could not be read to ask whether a worker may still be running one of its placed nodes (${describe(failure)}) (PRD resolved q69)\n`,
+    );
+    return;
+  }
+  await pruneSettled(journal, { id: execution, session_key: sessionKey });
+}
+
+/**
+ * Hand a settled execution's ledger to [`ledgerPrune`] — the tail of
+ * [`settleExecution`] and of [`pruneClosedExecution`], once the row has closed.
+ */
+async function pruneSettled(journal: Journal, identity: ExecutionIdentity): Promise<void> {
+  const execution = identity.id;
+  // After the detached `agent.*` and `tool.*` deliveries this execution
   // started have finished too. They outlive the run by design (grammar 8.6 rule
   // 7) and every effect they make is this execution's, under its id — a flow an
   // agent calls as a tool included — so a delivery still retrying a keyed write
@@ -16895,8 +16939,9 @@ const executionSessions = new Map<string, string>();
  * A registration rather than an import because the emitted import graph has
  * one direction: `src/stores.ts` imports this module, and this module imports
  * nothing that imports it. Called once an execution's row has closed
- * `completed` or `failed`, with the end of its detached deliveries where any
- * are still in flight — every grammar 9.4 key begins with the execution's id,
+ * `completed`, `failed` or `cancelled` — a cancel's close of a row no
+ * generation here could run included ([`pruneClosedExecution`]) — with the end
+ * of its detached deliveries where any are still in flight — every grammar 9.4 key begins with the execution's id,
  * and a settled execution never resumes (PRD resolved q65), so its rows answer
  * nothing again (PRD resolved q69). An execution that does not settle is never
  * handed to it, and nor is one a worker may still be running a placed node of
