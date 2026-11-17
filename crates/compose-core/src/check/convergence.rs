@@ -5,18 +5,24 @@
 //!
 //! Two outgoing edges of one vertex are **exclusive** when the validator can
 //! prove they are never taken together — one carries `else: true` and the other
-//! `when:` (grammar 7.3 rule 4 makes those mutually exclusive by construction),
+//! `when:` (grammar 7.3 rule 4 makes those mutually exclusive by construction);
 //! or both carry `when:` guards whose `possible` sets are disjoint for some
 //! enum-typed field of the source node's output ([`guards`](super::guards), read
-//! for disjointness instead of coverage). Every other pair is **co-takeable**,
-//! and an edge is never co-takeable on its own: it is one or the other *with
-//! respect to a named sibling* (Decision D99).
+//! for disjointness instead of coverage); or both carry `when:` guards, one of
+//! which holds a `bool`-typed read `q` as a top-level conjunct and the other
+//! `!q` — `a.output.ok && input.x` and `a.output.ok && !input.x` — read off the
+//! same parse ([`guards::literals`](super::guards::literals), Decision D169).
+//! Every other pair is **co-takeable**, and an edge is never co-takeable on its
+//! own: it is one or the other *with respect to a named sibling* (Decision
+//! D99).
 //!
 //! A vertex with a co-takeable pair is a **fork**. `start` is one too — grammar
 //! 7.6's step 0 runs the nodes its taken edges target, and grammar 7.3 rule 7
-//! says outright that routing applies to `start` as well — but only rule 1 can
-//! prove its edges exclusive, because `start` has no output for rule 2 to read
-//! (grammar 2.4).
+//! says outright that routing applies to `start` as well — but rule 2 never
+//! proves its edges exclusive, because `start` has no output for it to read
+//! (grammar 2.4). Rules 1 and 3 read `start`'s edges as they read any other's:
+//! a guard leaving `start` reads `input` and `state`, and `input.x` and
+//! `!input.x` are exclusive wherever they are written.
 //!
 //! # Balanced convergence
 //!
@@ -164,12 +170,15 @@
 //!    scan, and every pair it turns up is one being decided for the first and
 //!    last time. The work is then bounded by the answer — pairs of writers — and
 //!    not by how many forks separate them.
-//! 4. *One guard read per edge* ([`possible`]). Grammar 7.6.1's rule 2 asks what
+//! 4. *One guard read per edge* ([`readings`]). Grammar 7.6.1's rule 2 asks what
 //!    each guard leaves possible for each enum-typed field of the fork's output,
-//!    and that is a property of the guard rather than of the pair: read per pair
-//!    instead, every guard's AST is walked and its variant sets rebuilt *w*
-//!    times over. It is read once per edge, and a pair costs the disjointness
-//!    test alone, over sets bounded by the field's declared variants.
+//!    and rule 3 which `bool`-typed reads its conjuncts hold or negate; both are
+//!    properties of the guard rather than of the pair: read per pair instead,
+//!    every guard's AST is walked and its sets rebuilt *w* times over. It is
+//!    parsed once per edge for both rules, and a pair costs the disjointness
+//!    test over sets bounded by the field's declared variants, plus one lookup
+//!    per literal. Rule 3 needs a `!` on one side, so a fork whose guards write
+//!    none — and whose output has no enum for rule 2 — parses nothing at all.
 //!
 //! A wide fan-out is a shape the grammar admits — nothing bounds a node's
 //! out-degree, and `start` forks like any other vertex — while `validate` is a
@@ -210,7 +219,7 @@ pub(crate) struct Pair {
 /// The pairs are returned rather than dropped because the shared-workspace
 /// warning asks a second question of the **same** enumeration
 /// ([`concurrent_among`], PRD resolved q61 ruling b), and enumerating them again
-/// would re-read every guard of every fork with it: [`possible`] is hoisted out
+/// would re-read every guard of every fork with it: [`readings`] is hoisted out
 /// of the pair loop precisely because a 240-branch guarded fork costs 10.2 s the
 /// naive way, and a second pass pays that cost over again for a rule that adds
 /// no pair of its own. One enumeration per flow, two rules stated over it
@@ -297,10 +306,10 @@ fn pairs<'a>(ctx: &Ctx<'a>, graph: &Graph<'a>) -> Vec<Pair> {
         if outgoing.len() < 2 {
             continue;
         }
-        let possible = possible(ctx, graph, source, outgoing);
+        let readings = readings(ctx, graph, source, outgoing);
         for left in 0..outgoing.len() {
             for right in (left + 1)..outgoing.len() {
-                if exclusive(graph, outgoing, &possible, left, right) {
+                if exclusive(graph, outgoing, &readings, left, right) {
                     continue;
                 }
                 pairs.push(Pair {
@@ -313,59 +322,128 @@ fn pairs<'a>(ctx: &Ctx<'a>, graph: &Graph<'a>) -> Vec<Pair> {
     pairs
 }
 
-/// What each out-edge of one vertex leaves **possible** for each enum-typed
-/// field of that vertex's output (grammar 7.6.1 rule 2, 7.3.1), in one order —
-/// `None` for an edge rule 2 cannot read at all, whose exclusivity is rule 1's
+/// What one out-edge's guard says about exclusivity, read once (grammar 7.6.1).
+#[derive(Clone, Default)]
+struct Reading {
+    /// What the guard leaves **possible** for each enum-typed field of the
+    /// fork's output, in one order (rule 2, 7.3.1) — `None` where rule 2 cannot
+    /// read the edge at all.
+    possible: Option<Vec<BTreeSet<String>>>,
+    /// The guard's conjuncts that are a `bool`-typed read or its negation
+    /// (rule 3, Decision D169) — empty where rule 3 cannot read the edge.
+    literals: BTreeSet<guards::Literal>,
+}
+
+/// What each out-edge of one vertex says for rules 2 and 3, in one order: what
+/// its guard leaves possible for each enum-typed field of the vertex's output
+/// (grammar 7.6.1 rule 2, 7.3.1), and the `bool`-typed reads its conjuncts hold
+/// or negate (rule 3, Decision D169). An edge with no guard, or one the CEL
+/// front-end rejected, reads as nothing, and its exclusivity is rule 1's
 /// question alone.
 ///
 /// Read once per **edge**, not once per pair. What a guard admits is a property
-/// of that guard, while the rule that consumes it is stated over pairs and a
+/// of that guard, while the rules that consume it are stated over pairs and a
 /// fork of `w` out-edges has w(w-1)/2 of them — so a guard read per pair is a
 /// guard walked `w` times over, for every enum field, and the variant sets it
 /// builds are rebuilt with it. A 240-branch guarded fork over an output of five
 /// enum fields cost 10.2 s of `check` that way against 1.06 s this way, on a
 /// composition with nothing wrong with it and against a command whose budget is
 /// milliseconds (PRD 5.12). What a pair costs is then the disjointness test
-/// alone, over sets bounded by the field's declared variants
-/// (`tests/check_scale.rs`).
-fn possible<'a>(
+/// alone, over sets bounded by the field's declared variants, and a lookup of
+/// each of one side's literals in the other's (`tests/check_scale.rs`). Each
+/// guard is parsed once for both rules.
+fn readings<'a>(
     ctx: &Ctx<'a>,
     graph: &Graph<'a>,
     source: Vertex,
     outgoing: &[usize],
-) -> Vec<Option<Vec<BTreeSet<String>>>> {
-    let enums = source_enums(ctx, graph, source);
+) -> Vec<Reading> {
     // `start` has no output for rule 2 to read (grammar 2.4), and neither has a
     // node whose output declares no enum-typed field: nothing to be disjoint
-    // over, so no guard is worth parsing.
-    let Vertex::Node(at) = source else {
-        return vec![None; outgoing.len()];
+    // over for that rule.
+    let enums = source_enums(ctx, graph, source);
+    let id = match source {
+        Vertex::Node(at) if !enums.is_empty() => Some(graph.id(at)),
+        _ => None,
     };
-    if enums.is_empty() {
-        return vec![None; outgoing.len()];
+    // Rule 3 needs a negation on one side of the pair, so a fork none of whose
+    // guards writes a `!` has no pair it can prove — and then, with no enum for
+    // rule 2 either, no guard of it is worth parsing.
+    let negates = outgoing.iter().any(|edge| {
+        graph
+            .edge(*edge)
+            .when
+            .as_ref()
+            .is_some_and(|guard| guard.value.as_str().contains('!'))
+    });
+    if id.is_none() && !negates {
+        return vec![Reading::default(); outgoing.len()];
     }
-    let id = graph.id(at);
     outgoing
         .iter()
         .map(|edge| {
-            let guard = graph.edge(*edge).when.as_ref()?;
+            let Some(guard) = graph.edge(*edge).when.as_ref() else {
+                return Reading::default();
+            };
             // A guard the CEL front-end rejected proves nothing about which
-            // variants it admits, and reading it would turn one mistake into a
-            // second, unrelated diagnostic downstream.
-            let program = ctx
+            // variants it admits or which reads it holds, and reading it would
+            // turn one mistake into a second, unrelated diagnostic downstream.
+            let Some(program) = ctx
                 .guard_type_checked(&guard.span)
                 .then(|| guards::parse(guard.value.as_str()))
-                .flatten()?;
-            Some(
+                .flatten()
+            else {
+                return Reading::default();
+            };
+            let possible = id.map(|id| {
                 enums
                     .iter()
                     .map(|(field, variants)| {
                         guards::coverage(program.expression(), id, field, variants).possible
                     })
-                    .collect(),
-            )
+                    .collect()
+            });
+            let literals = if negates {
+                literals_of(
+                    guard.value.as_str(),
+                    program.expression(),
+                    ctx.guard_booleans(&guard.span),
+                )
+            } else {
+                BTreeSet::new()
+            };
+            Reading { possible, literals }
         })
         .collect()
+}
+
+/// Rule 3's reading of one guard: its conjuncts that are a `bool`-typed read or
+/// the negation of one ([`guards::literals`], Decision D169), with "`bool`-typed"
+/// answered by the reads the CEL front-end's walk of this guard typed `bool`.
+///
+/// The pinned parser reads `!!q` as `!q` ([`crate::cel::repeats_a_negation`]),
+/// so a guard that writes one carries a negation in its AST that is not the one
+/// in its source — and `!!q` against `q` would read as exclusive where the two
+/// are the same guard. Such a guard proves nothing under rule 3.
+fn literals_of(
+    source: &str,
+    expression: &::cel::common::ast::IdedExpr,
+    booleans: &[crate::cel::Read],
+) -> BTreeSet<guards::Literal> {
+    if crate::cel::repeats_a_negation(source) {
+        return BTreeSet::new();
+    }
+    guards::literals(expression, &|root, path| {
+        booleans
+            .iter()
+            .any(|read| !read.indexed && read.root == root && read.path == path)
+    })
+}
+
+/// Rule 3 over two guards' literals: one holds a read the other negates.
+fn negate_each_other(one: &BTreeSet<guards::Literal>, other: &BTreeSet<guards::Literal>) -> bool {
+    one.iter()
+        .any(|literal| other.contains(&literal.negation()))
 }
 
 /// The enum-typed fields of a fork's output, with their variant sets. `start`
@@ -400,11 +478,17 @@ fn source_enums<'a>(
         .collect()
 }
 
-/// Grammar 7.6.1's two exclusivity rules.
+/// Grammar 7.6.1's three exclusivity rules.
+///
+/// This is the one place a pair of sibling edges is decided exclusive, and
+/// everything that asks whether two branches can both run asks it through here:
+/// [`pairs`] keeps only the pairs this answers `false` for, and balanced
+/// convergence, the concurrent-writer rule and [`concurrent_among`]'s
+/// shared-workspace question all read those pairs and nothing else.
 fn exclusive(
     graph: &Graph<'_>,
     outgoing: &[usize],
-    possible: &[Option<Vec<BTreeSet<String>>>],
+    readings: &[Reading],
     left: usize,
     right: usize,
 ) -> bool {
@@ -416,15 +500,22 @@ fn exclusive(
     {
         return true;
     }
+    let (one, other) = (&readings[left], &readings[right]);
     // Rule 2: two guards no enum value satisfies at once. Both lists carry one
     // entry per enum-typed field of the source's output, in one order
-    // ([`possible`]), so the fields are compared by walking them together.
-    let (Some(one), Some(other)) = (&possible[left], &possible[right]) else {
-        return false;
-    };
-    one.iter()
-        .zip(other)
-        .any(|(one, other)| one.is_disjoint(other))
+    // ([`readings`]), so the fields are compared by walking them together.
+    if let (Some(one), Some(other)) = (&one.possible, &other.possible)
+        && one
+            .iter()
+            .zip(other)
+            .any(|(one, other)| one.is_disjoint(other))
+    {
+        return true;
+    }
+    // Rule 3: one guard holds a `bool`-typed read as a conjunct and the other
+    // holds its negation, so the two cannot both be true whatever else either
+    // conjoins (Decision D169).
+    negate_each_other(&one.literals, &other.literals)
 }
 
 /// The two nodes a co-takeable pair starts a branch at, or `None` where it
@@ -984,5 +1075,212 @@ mod tests {
         assert_eq!(nearest(&[at(1, 1, 1)], &[at(2, 9, 9)]), None);
         assert_eq!(nearest(&[at(1, 1, 3)], &[]), None);
         assert_eq!(nearest(&[], &[]), None);
+    }
+
+    /// An edge guard's scope for rule 3's tests: a node `a` whose output holds a
+    /// boolean, an integer and an optional string, and a flow input of two
+    /// booleans and an integer.
+    fn guard_scope() -> crate::cel::Scope {
+        use crate::cel::{Origin, Property, Type};
+        let property = |name: &str, ty: Type, optional: bool| Property {
+            name: name.to_string(),
+            ty,
+            optional,
+            defaulted: false,
+        };
+        let output = Type::object(
+            Origin::Declared("`a`'s output".to_string()),
+            vec![
+                property("ok", Type::Bool, false),
+                property("count", Type::Int, false),
+                property("note", Type::String, true),
+            ],
+        );
+        crate::cel::Scope::new(
+            "an edge guard",
+            vec![
+                (
+                    "a".to_string(),
+                    Type::object(
+                        Origin::Node {
+                            id: "a".to_string(),
+                            has_output: true,
+                        },
+                        vec![property("output", output, false)],
+                    ),
+                ),
+                (
+                    "input".to_string(),
+                    Type::object(
+                        Origin::Declared("`flow.f`'s inputs".to_string()),
+                        vec![
+                            property("x", Type::Bool, false),
+                            property("y", Type::Bool, false),
+                            property("n", Type::Int, false),
+                        ],
+                    ),
+                ),
+            ],
+        )
+    }
+
+    /// Rule 3's reading of one guard, as [`readings`] takes it: the guard
+    /// type-checks, and its literals are read with the `bool`-typed reads the
+    /// front-end's walk found.
+    #[track_caller]
+    fn literals(guard: &str) -> BTreeSet<guards::Literal> {
+        let analysis = crate::cel::analyze(guard, &guard_scope());
+        assert!(
+            analysis.problems.is_empty(),
+            "`{guard}` should type-check: {:?}",
+            analysis.problems
+        );
+        let program = guards::parse(guard).expect("the guard parses");
+        literals_of(guard, program.expression(), &analysis.booleans)
+    }
+
+    #[track_caller]
+    fn exclusive_by_rule_3(one: &str, other: &str) -> bool {
+        let (one, other) = (literals(one), literals(other));
+        let forward = negate_each_other(&one, &other);
+        assert_eq!(
+            forward,
+            negate_each_other(&other, &one),
+            "exclusivity is symmetric"
+        );
+        forward
+    }
+
+    /// The case PRD resolved q86 was raised for, and the rule's own shape: one
+    /// guard holds a `bool`-typed read, the other its negation, whatever else
+    /// either conjoins (grammar 7.6.1 rule 3, Decision D169).
+    #[test]
+    fn a_read_and_its_negation_make_two_guards_exclusive() {
+        assert!(exclusive_by_rule_3(
+            "a.output.ok && input.x",
+            "a.output.ok && !input.x"
+        ));
+        // Either side may carry the negation, and the shared read may be the
+        // only conjunct of either guard.
+        assert!(exclusive_by_rule_3("!a.output.ok", "a.output.ok"));
+        assert!(exclusive_by_rule_3(
+            "input.x && a.output.count > 2",
+            "!input.x && input.n == 0"
+        ));
+        // Two different reads are not the same read.
+        assert!(!exclusive_by_rule_3("input.x", "!input.y"));
+        assert!(!exclusive_by_rule_3(
+            "input.x && input.y",
+            "input.x && input.y"
+        ));
+    }
+
+    /// The read is compared as the parse spells it, so whitespace and grouping —
+    /// which the parse discards — change nothing, and neither does where in the
+    /// conjunction the read sits.
+    #[test]
+    fn whitespace_and_parentheses_do_not_change_the_read() {
+        for (one, other) in [
+            ("a.output.ok && input.x", "a . output . ok&&!input.x"),
+            ("a.output.ok && input.x", "!(input.x) && a.output.ok"),
+            ("(a.output.ok && (input.y && input.x))", "( !input.x )"),
+            (
+                "input.x && (a.output.ok && input.y)",
+                "input.y && !(input.x)",
+            ),
+            ("a.output.ok\n  && input.x", "! input.x"),
+        ] {
+            assert!(exclusive_by_rule_3(one, other), "`{one}` against `{other}`");
+        }
+    }
+
+    /// `has()` is a `bool`-typed read in its own right — it answers whether the
+    /// member is there — and is a different read from the member itself.
+    #[test]
+    fn a_presence_test_is_a_read_of_its_own() {
+        assert!(exclusive_by_rule_3(
+            "has(a.output.note) && a.output.ok",
+            "!has(a.output.note)"
+        ));
+        assert!(exclusive_by_rule_3(
+            "!has(a.output.note) && input.x",
+            "a.output.ok && (has(a.output.note))"
+        ));
+        // The presence of a member and the member's value are two reads.
+        assert!(!exclusive_by_rule_3("has(input.x)", "!input.x"));
+        assert!(!exclusive_by_rule_3(
+            "has(a.output.note)",
+            "!has(a.output.ok)"
+        ));
+    }
+
+    /// What the rule does not read, each of which the PRD's "a conjunct `q` and
+    /// `!q`" leaves out: a comparison against a literal, a read under an `||`,
+    /// an index rather than a selection, and a doubled negation — which the
+    /// pinned parser collapses to a single one, so `!!input.x` would otherwise
+    /// read as the negation of `input.x` it is the opposite of.
+    #[test]
+    fn the_rule_reads_a_conjunct_and_its_negation_and_nothing_wider() {
+        for (one, other) in [
+            ("input.x == true", "input.x == false"),
+            ("input.x == true", "!input.x"),
+            ("!input.x || a.output.ok", "input.x"),
+            ("(!input.x || a.output.ok) && input.y", "input.x"),
+            ("input['x']", "!input.x"),
+            ("!!input.x", "!input.x"),
+            ("!!input.x", "input.x"),
+            ("! !input.x", "input.x"),
+            ("!(!input.x)", "!input.x"),
+            ("input.n > 0", "!(input.n > 0)"),
+        ] {
+            assert!(
+                !exclusive_by_rule_3(one, other),
+                "`{one}` against `{other}`"
+            );
+        }
+        // A disjunction is one conjunct the rule does not read, and the rest of
+        // the conjunction is still read: these two share `input.y`.
+        assert!(exclusive_by_rule_3(
+            "(!input.x || a.output.ok) && input.y",
+            "input.x && !input.y"
+        ));
+    }
+
+    /// Only a read whose checked type is `bool` counts. A guard that negates an
+    /// integer does not type-check, so the case is a read the walk typed as
+    /// something else — here, every read a scope does not type `bool`.
+    #[test]
+    fn a_read_that_is_not_bool_typed_is_not_a_literal() {
+        let program = guards::parse("a.output.ok && input.x").expect("the guard parses");
+        assert!(
+            literals_of("a.output.ok && input.x", program.expression(), &[]).is_empty(),
+            "with no read typed `bool`, nothing is a literal"
+        );
+        assert_eq!(literals("a.output.ok && input.x").len(), 2);
+        assert_eq!(
+            literals("has(a.output.note)").len(),
+            1,
+            "a presence test needs no type: it is `bool` by construction"
+        );
+    }
+
+    /// The source test behind the doubled-negation case: a `!` applied to a `!`,
+    /// whitespace aside, and nothing that only looks like one.
+    #[test]
+    fn a_repeated_negation_is_told_apart_from_its_lookalikes() {
+        for repeated in ["!!x", "! !x", "a && !!b", "!!!x", "!\n!x"] {
+            assert!(crate::cel::repeats_a_negation(repeated), "{repeated}");
+        }
+        for single in [
+            "!x",
+            "!(!x)",
+            "a != !b",
+            "a != b",
+            "!a && !b",
+            "x == '!!'",
+            "x == r'!!'",
+        ] {
+            assert!(!crate::cel::repeats_a_negation(single), "{single}");
+        }
     }
 }

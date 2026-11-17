@@ -670,7 +670,7 @@ fn a_guarded_fork_reads_each_guard_once_rather_than_once_per_pair() {
 /// so the rule crosses the whole fan: 240 guarded edges are 28,680 co-takeable
 /// pairs, every arm's coder run is compared against every other's, and the
 /// per-edge guard reading the fork analysis is built around
-/// (`convergence::possible`) is entered at full width.
+/// (`convergence::readings`) is entered at full width.
 ///
 /// The budget is the file's usual one and guards what a budget can guard:
 /// anything this rule *walks* or *reads off a guard* per pair, which is the

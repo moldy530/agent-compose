@@ -9,8 +9,9 @@ model call.
 
 The check is per fork and per **co-takeable pair** of its outgoing edges,
 because only two edges that can both be taken can deliver twice. Two edges the
-validator can prove exclusive — one `else:` against one `when:`, or guards whose
-possible variant sets are disjoint — are not compared at all.
+validator can prove exclusive — one `else:` against one `when:`, guards whose
+possible variant sets are disjoint, or guards one of which holds a boolean read
+`q` as a conjunct while the other holds `!q` — are not compared at all.
 
 `end` is exempt: branches legitimately retire at different depths.
 
@@ -51,9 +52,13 @@ is missing, so both edges of the pair reach the convergence the same distance
 from the fork — or **make the pair exclusive**. Two edges that cannot both fire
 cannot both deliver, so an exclusive pair leaves the check entirely.
 
-Exclusive means one of two things, and both cost a guard. Either the two edges
-carry guards the exclusivity table can prove disjoint, or one carries `when:`
-and the other `else: true` — the `else:` spelling is the one to read twice,
+Exclusive means one of three things, and all three cost a guard. The two edges
+carry guards the exclusivity table can prove disjoint; or guards that disagree on
+one boolean read — `a.output.ok && input.fast` against
+`a.output.ok && !input.fast`, where the read is a field or a `has(…)` written the
+same way on both sides, and `!q` is a conjunct of its guard rather than under an
+`||`; or one carries `when:` and the other `else: true` — the `else:` spelling
+is the one to read twice,
 because an `else:` edge is itself required to have a `when:`-guarded sibling
 (`invalid-value`, D107). Putting `else: true` on one edge of an *unguarded* pair
 does not make it exclusive; it trades this diagnostic for that one.
@@ -102,4 +107,4 @@ flow.f:
 ```
 
 Grammar: `docs/grammar.md` §7.3, §7.6, §7.6.1, §7.6.2, Decisions D69, D99, D107,
-D112. Topic: `agent-compose docs routing`.
+D112, D169. Topic: `agent-compose docs routing`.

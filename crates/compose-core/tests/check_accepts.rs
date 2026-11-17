@@ -3444,6 +3444,101 @@ flow.think:
     );
 }
 
+/// The fork PRD resolved q86 was raised for: two guards that share a conjunct
+/// and disagree on a boolean read, `a.output.ok && input.x` and
+/// `a.output.ok && !input.x`, are exclusive (grammar 7.6.1 rule 3, Decision
+/// D169). So the convergence they reach at two depths runs once, and the two
+/// branches that both write the unreduced `summary` channel cannot race — with
+/// no `else:` and no `reduce:`. Before the rule, the pair was co-takeable and
+/// this composition drew `unbalanced-convergence` and `unreduced-write` both.
+#[test]
+fn guards_disagreeing_on_a_shared_boolean_read_are_exclusive() {
+    accepts(
+        "guards-disagreeing-on-a-boolean-read",
+        r#"
+agent.checker:
+  model: model.m
+  prompt: Check.
+  output:
+    ok: { type: boolean }
+agent.writer:
+  model: model.m
+  prompt: Write.
+  output:
+    summary: { type: string }
+state:
+  summary:
+    type: string
+flow.f:
+  inputs:
+    x: { type: boolean }
+  outputs: {}
+  nodes:
+    a: { agent: agent.checker, input: "'a'" }
+    quick: { agent: agent.writer, input: "'q'" }
+    draft: { agent: agent.writer, input: "'d'" }
+    polish: { agent: agent.writer, input: "'p'" }
+    merge: { agent: agent.writer, input: "'m'" }
+  edges:
+    - { from: start, to: a }
+    - { from: a, to: quick, when: "a.output.ok && input.x" }
+    - { from: a, to: draft, when: "a.output.ok && !input.x" }
+    - { from: quick, to: merge }
+    - { from: draft, to: polish }
+    - { from: polish, to: merge }
+    - { from: merge, to: end }
+"#,
+    );
+}
+
+/// The same rule at `start`, which has no output for rule 2 to read but whose
+/// guards read `input` like any other's (grammar 7.6.1 rule 3, Decision D169),
+/// and with the read a presence test: `has()` is `bool` by construction, and a
+/// `has()` and its negation are as exclusive as a field and its negation.
+/// `start` keeps the `else: true` edge grammar 7.3 requires of it, which rule 1
+/// makes exclusive with both guarded edges — so the pair rule 3 decides is the
+/// one fork pair `start` has.
+#[test]
+fn a_start_fork_on_a_read_and_its_negation_is_exclusive() {
+    accepts(
+        "start-fork-on-a-boolean-read",
+        r#"
+agent.writer:
+  model: model.m
+  prompt: Write.
+  output:
+    summary: { type: string }
+state:
+  summary:
+    type: string
+  hint:
+    type: string
+flow.f:
+  inputs:
+    fast: { type: boolean }
+  outputs: {}
+  nodes:
+    quick: { agent: agent.writer, input: "'q'" }
+    draft: { agent: agent.writer, input: "'d'" }
+    hinted: { agent: agent.writer, input: "'h'" }
+    plain: { agent: agent.writer, input: "'p'" }
+    merge: { agent: agent.writer, input: "'m'" }
+    idle: { agent: agent.writer, input: "'i'" }
+  edges:
+    - { from: start, to: quick, when: "input.fast" }
+    - { from: start, to: draft, when: "!input.fast" }
+    - { from: start, to: idle, else: true }
+    - { from: idle, to: end }
+    - { from: quick, to: merge }
+    - { from: draft, to: hinted, when: "has(state.hint) && size(state.hint) > 0" }
+    - { from: draft, to: plain, when: "!has(state.hint)" }
+    - { from: hinted, to: merge }
+    - { from: plain, to: merge }
+    - { from: merge, to: end }
+"#,
+    );
+}
+
 /// CEL's four conversions and the strings extension's `join` are on the
 /// authored surface wherever an expression is (PRD resolved q85, Decision
 /// D168): every argument type the specification gives a conversion an overload

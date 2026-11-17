@@ -26,6 +26,16 @@
 //! reading D82 replaced — would let that guard route every variant and leave
 //! the composition dead-ending on grammar 7.3 rule 7 at run time.
 //!
+//! **A second reading for disjointness** sits beside the table: a guard read as
+//! the conjunction of its top-level `&&` operands, where each conjunct that is a
+//! `bool`-typed read `q` — a selection path, or a presence test `has(…)` — or the
+//! negation `!q` of one is kept as a [`Literal`] ([`literals`]). Grammar
+//! 7.6.1's third exclusivity rule is stated over those: one guard holding `q`
+//! and the other `!q` cannot both be true, whatever else either conjoins
+//! (Decision D169). It is closed and syntactic for the table's reason, and
+//! narrower than a satisfiability check on purpose: `!!q`, `q == true`, a
+//! comparison, and anything under an `||` contribute nothing.
+//!
 //! **This module never reports.** Every expression it reads has already been
 //! parsed and type-checked by [`cel`](crate::cel) at the edge-guard surface, so
 //! a literal compared against `f` is already known to be one of `f`'s variants
@@ -161,6 +171,122 @@ pub(crate) fn coverage(
             folded.unwrap_or_else(unknown)
         }
         _ => unknown(),
+    }
+}
+
+/// One conjunct grammar 7.6.1's third exclusivity rule reads: a `bool`-typed
+/// read, or the negation of one (Decision D169).
+///
+/// The read is carried as the path it spells — its root and the member names
+/// after it — rather than as source text, so `a.output.ok`, `a .output. ok` and
+/// `(a.output.ok)` are one read: whitespace and grouping are gone from the
+/// parse, and the comparison is over what is left. `has(a.output.ok)` is a
+/// different read from `a.output.ok` — it asks whether the member is there, not
+/// what it holds — and is kept apart by [`presence`](Self::presence).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Literal {
+    /// Whether the read is a presence test, `has(<path>)`.
+    pub(crate) presence: bool,
+    /// The root identifier the path starts at.
+    pub(crate) root: String,
+    /// The member names selected after it, outermost first.
+    pub(crate) path: Vec<String>,
+    /// Whether the conjunct is `!<read>` rather than `<read>`.
+    pub(crate) negated: bool,
+}
+
+impl Literal {
+    /// The same read, the other way round: what a sibling guard has to hold for
+    /// the two to be exclusive.
+    pub(crate) fn negation(&self) -> Self {
+        Self {
+            negated: !self.negated,
+            ..self.clone()
+        }
+    }
+}
+
+/// The literals of one guard: every top-level conjunct that is a `bool`-typed
+/// read or its negation (grammar 7.6.1 rule 3, Decision D169).
+///
+/// The guard is read as a conjunction of its top-level `&&` operands, a
+/// parenthesised `&&` group flattening into the conjunction around it. A guard
+/// whose top is anything else — an `||` included — is one conjunct, so
+/// `!x || y` holds no literal at all. Within a conjunct, exactly two shapes are
+/// read: a read `q`, and a unary `!` whose operand is one. `!!q` is neither, and
+/// neither is `q == true`: the rule is the PRD's "a conjunct `q` and `!q`", and
+/// no wider.
+///
+/// A read is a selection path with no index in it — `a.output.ok`, `input.x` —
+/// whose checked type is `bool`, which `boolean` answers from the CEL
+/// front-end's own walk of the guard ([`Analysis::booleans`]); or a presence
+/// test `has(<path>)`, which is `bool` by construction and so needs no answer.
+///
+/// [`Analysis::booleans`]: crate::cel::Analysis::booleans
+pub(crate) fn literals(
+    expr: &IdedExpr,
+    boolean: &dyn Fn(&str, &[String]) -> bool,
+) -> BTreeSet<Literal> {
+    let mut found = BTreeSet::new();
+    let mut conjuncts = vec![expr];
+    while let Some(conjunct) = conjuncts.pop() {
+        if let Expr::Call(call) = &conjunct.expr
+            && call.func_name == LOGICAL_AND
+            && call.target.is_none()
+        {
+            conjuncts.extend(call.args.iter());
+            continue;
+        }
+        let (operand, negated) = match &conjunct.expr {
+            Expr::Call(call)
+                if call.func_name == LOGICAL_NOT
+                    && call.target.is_none()
+                    && call.args.len() == 1 =>
+            {
+                (&call.args[0], true)
+            }
+            _ => (conjunct, false),
+        };
+        if let Some((presence, root, path)) = read(operand)
+            && (presence || boolean(&root, &path))
+        {
+            found.insert(Literal {
+                presence,
+                root,
+                path,
+                negated,
+            });
+        }
+    }
+    found
+}
+
+/// The read one conjunct operand is, as `(presence, root, path)`: a selection
+/// path, or a presence test over one. Anything else — a call, an index, a
+/// literal, an operator — is no read.
+fn read(expr: &IdedExpr) -> Option<(bool, String, Vec<String>)> {
+    if let Expr::Select(select) = &expr.expr
+        && select.test
+    {
+        let (root, mut path) = selection(&select.operand)?;
+        path.push(select.field.clone());
+        return Some((true, root, path));
+    }
+    let (root, path) = selection(expr)?;
+    Some((false, root, path))
+}
+
+/// A selection path with no index and no presence test in it: a root
+/// identifier and the members selected after it.
+fn selection(expr: &IdedExpr) -> Option<(String, Vec<String>)> {
+    match &expr.expr {
+        Expr::Ident(name) => Some((name.clone(), Vec::new())),
+        Expr::Select(select) if !select.test => {
+            let (root, mut path) = selection(&select.operand)?;
+            path.push(select.field.clone());
+            Some((root, path))
+        }
+        _ => None,
     }
 }
 

@@ -253,6 +253,11 @@ pub struct Analysis {
     pub ty: Type,
     /// Every root-anchored path the expression reads.
     pub reads: Vec<Read>,
+    /// The reads among those whose checked type is `bool` — what grammar
+    /// 7.6.1's third exclusivity rule asks of a guard's conjuncts, which is a
+    /// question about a path's *type* that only this walk can answer (Decision
+    /// D169).
+    pub booleans: Vec<Read>,
     /// Everything wrong with it.
     pub problems: Vec<Problem>,
 }
@@ -336,6 +341,7 @@ pub fn analyze(source: &str, scope: &Scope) -> Analysis {
     let refused = |problem: Problem| Analysis {
         ty: Type::Dyn,
         reads: Vec::new(),
+        booleans: Vec::new(),
         problems: vec![problem],
     };
     let shape = shape(source);
@@ -398,14 +404,17 @@ pub fn analyze(source: &str, scope: &Scope) -> Analysis {
     let mut walk = Walk {
         scope,
         reads: Vec::new(),
+        booleans: Vec::new(),
         problems: Vec::new(),
         bindings: Vec::new(),
     };
     let (ty, path) = walk.expr(program.expression());
+    walk.typed(&ty, path.as_ref());
     walk.record(path.as_ref());
     Analysis {
         ty,
         reads: walk.reads,
+        booleans: walk.booleans,
         problems: walk.problems,
     }
 }
@@ -573,6 +582,47 @@ fn shape(source: &str) -> Shape {
     shape
 }
 
+/// Whether the source applies a unary `!` to a unary `!` directly — `!!x`,
+/// `! !x` — which the pinned parser does not read as written.
+///
+/// `cel` 0.14.3's parser collapses a run of unary operators into **one**
+/// application whatever its length: `!!x` arrives as `!x`, `!!!x` as `!x` too
+/// (and `--1` as `-1`), where the specification and the emitted evaluator apply
+/// each one. A parenthesised operand is read correctly — `!(!x)` is two calls —
+/// because the run is broken by the group. So a reading of a guard's AST that
+/// gives a negation meaning has to know the parse lied about it, and this is
+/// how: a lexical test over the source, skipping string literals the way
+/// [`shape`] does, for a `!` that is not `!=` followed — whitespace aside — by
+/// another. Grammar 7.6.1's third exclusivity rule reads nothing from such a
+/// guard (Decision D169).
+#[must_use]
+pub fn repeats_a_negation(source: &str) -> bool {
+    let characters: Vec<char> = source.chars().collect();
+    let mut after_negation = false;
+    let mut index = 0usize;
+    while index < characters.len() {
+        if let Some(after) = string_literal(&characters, index) {
+            index = after;
+            after_negation = false;
+            continue;
+        }
+        let character = characters[index];
+        index += 1;
+        if character.is_whitespace() {
+            continue;
+        }
+        if character == '!' && characters.get(index) != Some(&'=') {
+            if after_negation {
+                return true;
+            }
+            after_negation = true;
+        } else {
+            after_negation = false;
+        }
+    }
+    false
+}
+
 /// Where the string literal starting at `index` ends, if one starts there.
 ///
 /// Grammar 4.1's expressions are CEL's, so the literals are CEL's eight: single
@@ -713,6 +763,8 @@ impl Path {
 struct Walk<'a> {
     scope: &'a Scope,
     reads: Vec<Read>,
+    /// The finished paths whose type is `bool` ([`Analysis::booleans`]).
+    booleans: Vec<Read>,
     problems: Vec<Problem>,
     /// Comprehension bindings, innermost last.
     bindings: Vec<(String, Type)>,
@@ -735,9 +787,20 @@ impl Walk<'_> {
         }
     }
 
+    /// Record a finished path as a boolean read, if its checked type is `bool`.
+    fn typed(&mut self, ty: &Type, path: Option<&Path>) {
+        if let (Type::Bool, Some(path)) = (ty, path) {
+            let read = path.read();
+            if !self.booleans.contains(&read) {
+                self.booleans.push(read);
+            }
+        }
+    }
+
     /// The type of a sub-expression whose path, if any, ends here.
     fn value(&mut self, expr: &IdedExpr) -> Type {
         let (ty, path) = self.expr(expr);
+        self.typed(&ty, path.as_ref());
         self.record(path.as_ref());
         ty
     }

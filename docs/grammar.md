@@ -2046,7 +2046,24 @@ prove they are never taken together:
    `verdict == 'approve' && size(state.xs) > 0` and `verdict == 'revise'`,
    because an unrecognized conjunct widens nothing (`{approve} ∩ V`).
    `verdict == 'approve'` and `size(state.xs) > 0` are **not**: the second guard
-   is possible for every variant, which is the conservative answer.
+   is possible for every variant, which is the conservative answer; or
+3. both carry `when:` guards, and — each read as the conjunction of its
+   top-level `&&` operands, a parenthesised `&&` group flattening into the
+   conjunction around it — one holds a conjunct `q` and the other a conjunct
+   `!q`, for the same **boolean-typed read** `q`: a selection path with no index
+   in it whose checked type is `bool` (`a.output.ok`, `input.x`, `state.done`),
+   or a presence test `has(p)`. The read is compared as the parse spells it, so
+   whitespace and grouping change nothing, and the other conjuncts of either
+   guard are irrelevant: `a.output.ok && input.x` and `a.output.ok && !input.x`
+   are exclusive, and so are `has(state.hint) && size(state.hint) > 0` and
+   `!has(state.hint)`. Nothing wider is read (Decision
+   [D169](#d169-two-guards-are-exclusive-when-one-holds-a-boolean-read-and-the-other-its-negation)):
+   a guard whose top is `||` is a single conjunct, so `!x || y` holds no `!x`;
+   `x == true` and `x == false` are comparisons, not the read; `!!x` is not `x`
+   for this rule, and a guard that writes a negation of a negation holds no
+   literal at all; and `input['x']` is not the `input.x` another guard negates.
+   Rule 3 reads `start`'s edges as it reads any other vertex's — a guard leaving
+   `start` reads `input` and `state` — where rule 2 has no output to read.
 
 Any other pair is **co-takeable**. Co-takeability is a relation on a **pair** of
 sibling out-edges and is never a property of one edge on its own: an edge is not
@@ -2174,9 +2191,11 @@ Adding `- { from: plan, to: merge, when: "plan.output.trivial" }` makes
 `{2}`: `merge` would run in step 1 and again in step 2. That is the
 unbalanced-convergence compile error; the fixes are to route the short branch
 through the same depth, or to make the pair exclusive
-(`else: true` on the short edge, or guards §7.6.1 rule 2 can prove disjoint),
-which removes it from the check because two edges that cannot both fire cannot
-both deliver.
+(`else: true` on the short edge, or guards §7.6.1 rule 2 or rule 3 can prove
+disjoint — `plan.output.trivial` on the short edge and
+`!plan.output.trivial && …` on each long one is rule 3's spelling), which
+removes it from the check because two edges that cannot both fire cannot both
+deliver.
 
 Both guards false is a *different* error — §7.3 rule 7's "no viable route" at
 `plan` — which is what §7.4's escape rule and an `else:` edge exist to prevent.
@@ -15215,6 +15234,81 @@ every new function is a corpus file and not only a typing rule.
 
 **Status**: ratified — PRD resolved q85. *PRD 5.5; PRD resolved q29, q85; §4.1,
 §4.2; builds on D13, D110; leaves D42, D43, D57, D82, D98 unchanged.*
+
+### D169. Two guards are exclusive when one holds a boolean read and the other its negation
+
+§7.6.1 gains a third exclusivity rule: two `when:` guards are exclusive when,
+each read as the conjunction of its top-level `&&` operands, one holds a
+conjunct `q` and the other a conjunct `!q` for the same **boolean-typed read**
+`q` — a selection path with no index in it whose checked type is `bool`, or a
+presence test `has(p)` — compared as the parse spells it, whatever the other
+conjuncts are. That rule and no wider one: a guard whose top is `||` is one
+conjunct; `q == true` against `q == false` is two comparisons, not the read and
+its negation; `!!q` is not `q`; arithmetic, comparisons and every other shape
+contribute nothing; and nothing is decided by satisfiability.
+
+**Rationale**: D99's relation proved two guards exclusive only through an
+enum-typed field's `possible` sets (rule 2), so `a.output.ok && input.x` and
+`a.output.ok && !input.x` read as co-takeable and the convergence they share was
+`unbalanced-convergence`, which an author could only answer with a routing node
+carrying `else:` (PRD resolved q86). A boolean read and its negation cannot both
+hold, which is as provable as two disjoint variant sets; a read that fails —
+an absent value — fails the execution (D110), so neither guard is taken and the
+pair is still never taken together. A wider rule would be a satisfiability check,
+and `validate`'s millisecond budget forbids one (PRD 5.12).
+
+**What "boolean-typed" is decided by.** The type is the CEL front-end's: the walk
+that already type-checks every guard records which of its finished paths it typed
+`bool` (`Analysis::booleans`), and the rule reads that record rather than typing
+anything a second time. A path the walk could not type — a value of unknown type
+under a decoded payload — is not `bool`-typed and proves nothing, which is the
+conservative answer. A presence test needs no record: it is `bool` by
+construction, and `has(p)` is a different read from `p` — one asks whether the
+member is there, the other what it holds. A guard the front-end refused is read
+by neither rule 2 nor rule 3, as before.
+
+**Compared as the parse spells it.** The read is carried as its root and member
+names, so whitespace and grouping — which the parse has already discarded —
+change nothing, and an index is not a selection: `input['x']` is not the
+`input.x` another guard negates. One parse is not read as written: the pinned
+`cel` crate collapses a run of unary `!` into one application, so `!!q` arrives
+as `!q`. A guard whose source applies a `!` directly to a `!` — `!!q`, `! !q` —
+therefore holds no literal for this rule at all, because its AST carries a
+negation its source does not, and `!!q` against `q` would otherwise read as
+exclusive where the two guards are the same guard. `!(!q)` parses as written and
+is simply not a literal.
+
+**Where it is asked.** Beside rule 2, in the per-edge reading `convergence.rs`
+already hoists out of the pair loop: each guard is parsed once for both rules,
+and a pair costs the disjointness test plus one lookup per literal. Rule 3 needs
+a `!` on one side, so a fork none of whose guards writes one — and whose source
+has no enum-typed output field for rule 2 — parses nothing, as before. The rule
+changes only which pairs are exclusive: balanced convergence (§7.6.2), the
+concurrent-writer half of the reduced-channel rule (§10.2) and the shared-
+workspace refusal (D147) all read the co-takeable pairs one function decides, so
+all three follow it, and none of their diagnostics' text changes for a pair that
+stays co-takeable. `plan` and `visualize` print no fork pairs, so neither output
+moves. `start` is read by rule 3 like any other vertex — its guards read `input`
+and `state` — where rule 2 has no output to read there.
+
+**Collision review.** D99 is **amended by one clause**: its exclusivity relation
+gains rule 3; co-takeability stays a relation on a pair, named per sibling, and
+the pairwise reading of `dist` is unchanged. D112 is unchanged — balanced
+convergence still compares one distance from each edge of a co-takeable pair,
+and fewer pairs reach it. D82's closed table is unchanged: rule 3 is a second
+reading of a guard beside the table rather than a new row of it, it says nothing
+about coverage, and exhaustiveness (§7.3.1) still reads the table alone. D69's
+stepwise execution and D32's reduce policies are unchanged; a channel two
+exclusive branches write needs no policy, which is D32's own reading of a pair
+that cannot race. D107 is unchanged — an `else:` still requires a guarded
+sibling, and rule 1 still reads it. D147's shared-workspace rule reads the same
+pairs and follows the rule without a change of its own. §7.6.1 and §10.2 are the
+sections amended and read; §7.6.2's worked example names rule 3 beside rule 2
+as a way to make a pair exclusive.
+
+**Status**: ratified — PRD resolved q86. *PRD 5.12; PRD resolved q86; §7.6.1,
+§7.6.2, §10.2; amends D99; builds on D82, D110; leaves D32, D69, D107, D112,
+D147 unchanged.*
 
 ### D170. `--no-build` launches a built tree as it stands, and `build --restamp` re-hashes one
 
