@@ -892,20 +892,20 @@ fn no_document_files_placements_as_reserved_grammar() {
 ///
 /// §2.3 is the single place a reader — or an agent, which the `targets` topic
 /// points at the grammar as its normative source — looks up what a position
-/// accepts, and §14.1 rule 2 is what refuses a member. They are two statements of
+/// accepts, and §14.1 rule 2 is what decides a member. They are two statements of
 /// one fact and drifted apart once already: the re-cut left §2.3 carrying a row
 /// for the retired address-keyed shape, which named `placements` *keys* as a
-/// reference position and offered `flow.*` among the namespaces it took. Both
-/// halves of that row are now compile errors — `invalid-identifier` on the key
-/// and `unsupported-placement` on the member — so a reader following it writes a
-/// deploy file the compiler refuses twice over.
+/// reference position, so a reader following it wrote a deploy file the compiler
+/// refused.
 ///
-/// The rule is not "no document mentions `flow.*` near a placement": §14.1, D129
-/// and the topic all say a `flow.*` member is refused, and saying so is the
-/// point — the row this test guards says it too, in its notes. What is checked is
-/// narrower and is the shape a reader scans rather than reads: no table row that
-/// names a `placements` position may **offer** `flow.*` in the cell that lists
-/// what the position accepts.
+/// The member rule has since moved: PRD resolved q84 (Decision D171) admits a
+/// `flow.*` member beside `agent.*` and `tool.*`, where the release before it
+/// refused one as a deferral. That is the drift this test now guards in the
+/// other direction — a row still offering two namespaces would send an author
+/// building a step on a build machine back to the placed-agent workaround q84
+/// was raised to retire. What is checked is the shape a reader scans rather
+/// than reads: a table row naming a `placements` position that lists what the
+/// position accepts lists all three namespaces.
 #[test]
 fn the_reference_position_index_agrees_with_the_member_rule() {
     let grammar =
@@ -913,10 +913,10 @@ fn the_reference_position_index_agrees_with_the_member_rule() {
     let targets = compose_core::docs::topic("targets").expect("the `targets` topic ships");
 
     assert!(
-        grammar.contains("| `placements.<name>.members[]` | `agent.*`, `tool.*` |"),
-        "§2.3's reference-position table no longer names `placements.<name>.members[]` and what \
-         it accepts, so the grammar's normative index of reference positions has stopped covering \
-         the one position the deploy layer has"
+        grammar.contains("| `placements.<name>.members[]` | `agent.*`, `tool.*`, `flow.*` |"),
+        "§2.3's reference-position table no longer names `placements.<name>.members[]` and the \
+         three namespaces it accepts, so the grammar's normative index of reference positions has \
+         stopped covering the one position the deploy layer has"
     );
 
     for (name, document) in [
@@ -928,14 +928,16 @@ fn the_reference_position_index_agrees_with_the_member_rule() {
             let (Some(position), Some(accepts)) = (cells.next(), cells.next()) else {
                 continue;
             };
-            if !position.contains("placements") {
+            if !position.contains("placements") || !accepts.contains("`agent.*`") {
                 continue;
             }
-            assert!(
-                !accepts.contains("`flow.*`"),
-                "{name} has a table row offering `flow.*` where a placement member goes, and \
-                 §14.1 rule 2 refuses one: {row}"
-            );
+            for namespace in ["`tool.*`", "`flow.*`"] {
+                assert!(
+                    accepts.contains(namespace),
+                    "{name} has a table row listing what a placement member may name without \
+                     {namespace}, and §14.1 rule 2 admits one: {row}"
+                );
+            }
         }
     }
 }

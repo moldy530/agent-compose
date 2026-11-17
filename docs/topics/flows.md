@@ -164,6 +164,21 @@ call starts an instance exactly as a `flow:` node does, and:
   output — **fails the agent node**. It is never answered with a plausible
   result and never quietly dropped.
 
+## On a placed machine
+
+A deploy file may name a flow in a placement's `members:` (`agent-compose docs
+targets`), and then **every instance of it runs on a worker claiming that
+placement** — the root execution a trigger or `run` starts, a `flow:` node's, a
+`map` item's, a flow-as-tool call's. The hub dispatches the whole instance and
+the worker runs every node of it, its `finally:` node too; nothing above
+changes meaning. Its inputs are bound, its outputs written, its `policy:`
+crosses in, and its trace is recorded exactly as an unplaced instance's are.
+What changes is the environment: what only the flow reaches — its `coder:`
+node's `env:`, an agent only it names — is that machine's to hold, and not the
+hub's. And what it reaches cannot be placed **elsewhere**: the worker running
+the instance runs all of it, so a component another placement claims is a
+compile error naming both.
+
 ## Reachability, and no recursion
 
 A flow **reaches** its own nodes' components, its maps' dispatch targets, the
@@ -305,4 +320,4 @@ outcome that was recorded.
 an edge guard, another node's `input:`, a store key — are a compile error
 (`outcome-outside-finally`).
 
-Normative source: `docs/grammar.md` §7, §7.1, §7.5, §7.7, §7.9, §8.5, Decision D159
+Normative source: `docs/grammar.md` §7, §7.1, §7.5, §7.7, §7.9, §8.5, §14.1, Decisions D159, D171
