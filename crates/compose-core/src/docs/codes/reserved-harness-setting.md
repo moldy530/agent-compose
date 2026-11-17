@@ -137,10 +137,12 @@ the key for the optional ones (`permission_mode:`, `access:`, `allow_tools:`,
 time.
 
 One answer is a key that **addresses** the value rather than holding it. The one
-model setting a harness takes — `thinking` and `maxThinkingTokens` under `cc`,
-`modelReasoningEffort` under `codex` — is written in the `model.*` definition
-`model:` names, in that definition's own `settings:`, where the provider plugin's
-schema checks it (`docs/grammar.md` §12.2, Decision D141). The credential is the
+model setting a harness takes — `thinking`, `maxThinkingTokens` and `effort`
+under `cc`, `modelReasoningEffort` under `codex` — is written in the `model.*`
+definition `model:` names, in that definition's own `settings:`, where the
+provider plugin's schema checks it: under `cc`, a `thinking:` whose enabled form
+carries the budget and whose adaptive form carries the effort (`docs/grammar.md`
+§12.2, Decisions D141, D167). The credential is the
 same shape one step further along: `cc`'s token callbacks, `getOAuthToken` and
 `getHostAuthToken`, answer to the `api_key:` of the `provider.*` the `model.*`
 definition names, which is the one way a credential crosses into a harness run

@@ -1,0 +1,23 @@
+# rule: a `thinking:` that declares `type: enabled` declares the budget that form is (grammar 12.2, D167)
+# code: missing-key
+# message: missing required key `budget_tokens` in `thinking` of `model.m`: `type: enabled` is the fixed-budget form
+# at: main.yml:23:5
+# label: main.yml:23:23 `type: enabled` is declared here
+# help: the enabled form thinks within a fixed budget, and the wire refuses it without one: write `budget_tokens:` (an integer of at least 1), or write `type: adaptive` to have the model decide how much to think (grammar 12.2, Decision D167)
+#
+# The enabled form is a fixed thinking budget, sent as `thinking: { type:
+# "enabled", budget_tokens }`, and the provider refuses an enabled `thinking`
+# with no budget — so a definition that names the form and leaves out the one
+# thing it carries would validate clean and fail on its first call (PRD G3).
+# Nothing that compiled before is refused by this: `type:` was an unknown key of
+# `thinking` until the adaptive form existed. The one budgetless shape that did
+# compile, `thinking: {}`, is still accepted, and `check_accepts` holds it.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+  settings:
+    thinking: { type: enabled }

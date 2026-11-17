@@ -560,6 +560,68 @@ fn the_published_schema_accepts_a_keyless_provider_that_names_its_endpoint() {
     }
 }
 
+/// **The published schema types `thinking:`'s three keys, and takes both of its
+/// forms** (grammar 12.2, Decision D167, PRD resolved q83).
+///
+/// The example corpus writes the enabled form alone and only without a `type:`,
+/// so neither half of this is covered by it: an editor that underlined the
+/// adaptive form would be a red squiggle on the form the ruling exists to admit,
+/// and one that took any string for `type:` or `effort` would be the typing the
+/// schema promises ("known keys are typed for editors") not happening.
+///
+/// The cross-key rule — each form's key beside the other's `type:` — is the
+/// validator's (`conflicting-keys`), and Appendix B files provider settings
+/// checks under what the schema does not check, so it is not asserted here
+/// either way. Nor do the refused values get a fixture in `invalid-schema/`:
+/// the parser leaves settings to the checker, so the corpus that replays that
+/// directory against the parser could not hold them.
+#[test]
+fn the_published_schema_types_both_thinking_forms() {
+    let validator = compile_schema();
+    let model = |thinking: Value| {
+        json!({
+            "version": "0.1",
+            "model.m": { "provider": "provider.p", "id": "some-model", "settings": { "thinking": thinking } },
+        })
+    };
+    for legal in [
+        json!({ "budget_tokens": 4000 }),
+        json!({ "type": "enabled", "budget_tokens": 4000 }),
+        json!({ "type": "adaptive" }),
+        json!({ "type": "adaptive", "effort": "low" }),
+        json!({ "type": "adaptive", "effort": "medium" }),
+        json!({ "type": "adaptive", "effort": "high" }),
+        json!({ "type": "adaptive", "effort": "max" }),
+    ] {
+        let instance = model(legal.clone());
+        let errors = validation_errors(&validator, &instance);
+        assert!(
+            errors.is_empty(),
+            "the published schema must accept `thinking: {legal}`:\n{}",
+            errors.join("\n")
+        );
+    }
+    for (refused, keyword) in [
+        (json!({ "type": "disabled" }), "enum"),
+        (json!({ "type": "adaptive", "effort": "extreme" }), "enum"),
+        (json!({ "budget_tokens": 0 }), "minimum"),
+        (json!({ "budget_tokens": "lots" }), "type"),
+    ] {
+        let instance = model(refused.clone());
+        let errors: Vec<String> = validator
+            .iter_errors(&instance)
+            .map(|error| error.schema_path().to_string())
+            .collect();
+        assert!(
+            errors.iter().any(|path| path
+                .contains("/modelSettings/properties/thinking/properties/")
+                && path.ends_with(&format!("/{keyword}"))),
+            "the published schema must refuse `thinking: {refused}` by its `{keyword}`, and \
+             refused it by {errors:?}"
+        );
+    }
+}
+
 /// **The published schema takes the reads of PRD resolved q70 in every shape
 /// the grammar admits** (grammar 11.4).
 ///

@@ -1,0 +1,184 @@
+# Acceptance fixture: the two forms of a model's `thinking:` setting on the
+# Messages wire (grammar 12.2, Decision D167, PRD resolved q83).
+#
+# Three models, one per thing the wire has to be told:
+#
+#   * `model.budgeted` writes the **enabled** form the way every composition
+#     written before the second form did — `{ budget_tokens }` and no `type:` —
+#     which the wire takes as `thinking: { type: "enabled", budget_tokens }`.
+#     The `type` is the translation: the API discriminates on it, and a body
+#     carrying the authored object as written is one it refuses;
+#   * `model.adaptive` writes the **adaptive** form with an `effort`, which the
+#     wire takes as `thinking: { type: "adaptive" }` and `output_config.effort` —
+#     the same `output_config` the native structured-output rung writes its
+#     `format` into, so a pinned call carries one object holding both;
+#   * `model.adaptive_unspecified` writes the adaptive form alone, which sends no
+#     effort at all: the provider's default is the model's, not this compiler's.
+#
+# Each agent node carries no tools except the researcher's, so each flow's
+# transcript is one pinned call — or, for `flow.research`, a tool-loop turn
+# (nothing pinned, and the effort alone in `output_config`) followed by the
+# pinned one. The model ids name nothing a vendor serves: the mock answers any
+# id it is scripted for, and what is asserted is the request.
+version: "0.1"
+
+state:
+  answer:
+    description: What the agent answered, written by name from its output.
+    type: string
+    default: ""
+
+provider.mock:
+  kind: anthropic
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+
+model.budgeted:
+  provider: provider.mock
+  id: budgeted-thinker
+  settings:
+    max_tokens: 8000
+    thinking: { budget_tokens: 2048 }
+
+model.adaptive:
+  provider: provider.mock
+  id: adaptive-thinker
+  settings:
+    thinking:
+      type: adaptive
+      effort: high
+
+model.adaptive_unspecified:
+  provider: provider.mock
+  id: adaptive-default-thinker
+  settings:
+    thinking: { type: adaptive }
+
+tool.lookup:
+  description: Look up one fact the answer depends on.
+  input:
+    query:
+      description: What to look up.
+      type: string
+      min_length: 1
+  output:
+    snippet:
+      description: The one fact found, as text.
+      type: string
+  exec:
+    command: printf
+    args: ["a looked-up snippet"]
+
+agent.counter:
+  description: Answers on the enabled form's fixed budget.
+  model: model.budgeted
+  prompt: Count carefully.
+  input:
+    question:
+      description: What to answer.
+      type: string
+  output:
+    answer:
+      description: The answer.
+      type: string
+
+agent.thinker:
+  description: Answers on the adaptive form, at the effort its model states.
+  model: model.adaptive
+  prompt: Think it through.
+  input:
+    question:
+      description: What to answer.
+      type: string
+  output:
+    answer:
+      description: The answer.
+      type: string
+
+agent.plain_thinker:
+  description: Answers on the adaptive form, at the provider's default effort.
+  model: model.adaptive_unspecified
+  prompt: Think it through.
+  input:
+    question:
+      description: What to answer.
+      type: string
+  output:
+    answer:
+      description: The answer.
+      type: string
+
+agent.researcher:
+  description: Looks a fact up first, which is what opens the tool loop.
+  model: model.adaptive
+  prompt: Look up whatever the question depends on, then answer.
+  tools: [tool.lookup]
+  max_tool_iterations: 2
+  input:
+    question:
+      description: What to answer.
+      type: string
+  output:
+    answer:
+      description: The answer.
+      type: string
+
+flow.budgeted:
+  description: One answer on the enabled form.
+  inputs:
+    question: { type: string, min_length: 1 }
+  outputs:
+    answer: { type: string }
+  nodes:
+    count:
+      agent: agent.counter
+      input:
+        question: "input.question"
+  edges:
+    - { from: start, to: count }
+    - { from: count, to: end }
+
+flow.adaptive:
+  description: One answer on the adaptive form with an effort.
+  inputs:
+    question: { type: string, min_length: 1 }
+  outputs:
+    answer: { type: string }
+  nodes:
+    think:
+      agent: agent.thinker
+      input:
+        question: "input.question"
+  edges:
+    - { from: start, to: think }
+    - { from: think, to: end }
+
+flow.adaptive_unspecified:
+  description: One answer on the adaptive form with no effort.
+  inputs:
+    question: { type: string, min_length: 1 }
+  outputs:
+    answer: { type: string }
+  nodes:
+    think:
+      agent: agent.plain_thinker
+      input:
+        question: "input.question"
+  edges:
+    - { from: start, to: think }
+    - { from: think, to: end }
+
+flow.research:
+  description: A tool loop on the adaptive form, then the pinned answer.
+  inputs:
+    question: { type: string, min_length: 1 }
+  outputs:
+    answer: { type: string }
+  nodes:
+    research:
+      agent: agent.researcher
+      input:
+        question: "input.question"
+  edges:
+    - { from: start, to: research }
+    - { from: research, to: end }

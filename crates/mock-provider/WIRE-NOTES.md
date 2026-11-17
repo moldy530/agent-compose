@@ -1022,6 +1022,54 @@ answers that 400 the way ruling d says it must, failing the call loudly with the
 provider's body quoted rather than laddering to the other mechanism, because
 after lowering a schema-keyword refusal can only mean the table is wrong.
 
+### 29. `thinking`'s forms, and an `effort` beside the format in `output_config`
+
+PRD resolved q83 gives a model's `thinking:` setting two forms, and the wire has
+a spelling for each that is not the composition's: the enabled form goes out as
+`thinking: { type: "enabled", budget_tokens }`, the adaptive form as `thinking:
+{ type: "adaptive" }` with its effort at `output_config.effort` — in the **same**
+`output_config` the native structured-output rung writes its `format` into. This
+server holds both (`check_thinking`, `check_output_config`).
+
+*What is certain*: that the API discriminates `thinking` on `type` and refuses
+one without it — which is what a compiled graph sent before the ruling, an
+authored `{ budget_tokens }` spread as written; that the newest models refuse the
+enabled form and ask for `type: "adaptive"` and `output_config.effort` instead
+(the field report q83 was raised from); that `effort` is a field of
+`output_config` and not of `thinking`; and that the enabled form's budget has a
+floor of 1024.
+
+*What is assumed*: each form's closed key set — `enabled` takes `type`,
+`budget_tokens` and `display`, `adaptive` takes `type` and `display`, `disabled`
+its `type` alone — the sentences, which are this file's ordinary pydantic
+wording at the flat address (`thinking.budget_tokens`) rather than at a
+discriminated one; and the effort values, which are the pinned Agent SDK's
+`EffortLevel` (`low`, `medium`, `high`, `xhigh`, `max`), wider than the four a
+composition can write so that nothing the API takes is refused. Three things are
+**not** checked, each of which the API does refuse: a budget at or above
+`max_tokens`; a form the requested model does not take (the enabled form on a
+model that only thinks adaptively); and a forced `tool_choice` (`{ type: "tool" }`
+or `any`) beside thinking in either form, which the models that think only under
+`tool_choice: auto` or `none` refuse, as do the newest models, which refuse a
+forced choice whether or not they think. The first is a relation the compiler
+does not check either; the second and third are per model, and this server
+serves any model id. So this server answers the forced-tool rung on a thinking
+model with a 200 where such a model answers 400:
+`an_adaptive_model_keeps_its_effort_on_the_forced_tool_rung` pins what that
+rung's **request** carries — the effort beside the `tool_choice` — and is no
+evidence that the rung succeeds for a model that thinks (grammar D167).
+
+An `output_config` holding an effort and no `format` asks for **no** structured
+output: it is what a tool-loop turn on an adaptive model sends, and the prefill
+rule (24) reads the `format`, not the parameter's presence.
+
+*If wrong*: a closed key set too narrow refuses a request that is correct, and
+`src/anthropic.rs`'s `thinking_is_read_by_its_type_and_each_form_holds_its_own_keys`
+and `output_config_carries_an_effort_beside_its_format_or_alone` are where the
+lists are pinned; the acceptance suite's
+`an_adaptive_model_sends_its_effort_in_the_output_config_beside_the_format` is
+the runtime's half of the same claim.
+
 ---
 
 ## Accepted-key lists are curated, not exhaustive

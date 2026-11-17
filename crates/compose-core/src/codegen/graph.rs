@@ -3027,9 +3027,11 @@ fn direct_model<'ir>(
 ///
 /// So the two rows differ, and the difference is the vendors':
 ///
-///  * `cc` takes `thinking:`, whose `budget_tokens` is the Agent SDK's
-///    `maxThinkingTokens`. It is the `anthropic` plugin's key, which is the
-///    plugin a `cc` node's model resolves through.
+///  * `cc` takes `thinking:`, in either of its forms: the enabled form's
+///    `budget_tokens` is the Agent SDK's `maxThinkingTokens`, and the adaptive
+///    form is the SDK's own `thinking: { type: "adaptive" }` with its `effort`
+///    on the SDK's `effort` (Decision D167). It is the `anthropic` plugin's
+///    key, which is the plugin a `cc` node's model resolves through.
 ///  * `codex` takes `reasoning_effort:`, which is the Codex SDK's
 ///    `modelReasoningEffort` and the `openai` plugin's key.
 ///

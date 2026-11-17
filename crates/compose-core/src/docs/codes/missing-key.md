@@ -6,7 +6,8 @@ A required key is absent. Which keys are required is usually decided by a
 sibling: a `kv` store must declare `value_schema:`, a `vector` store must
 declare `embed:`, a `kv` store with a `history_retention:` must declare
 `history: true`, a `human:` block with a `timeout:` must declare `on_timeout:`,
-a route form must declare `route:`.
+a route form must declare `route:`, a model's `thinking:` that declares
+`type: enabled` must declare the `budget_tokens:` that form is.
 
 Sometimes what is required is a **choice**: a `tool.*` declares exactly one of
 `exec:`/`http:`/`function:`, an `http` trigger's inbound `auth:` exactly one of
@@ -41,6 +42,6 @@ store.memory:
     last: { type: string }
 ```
 
-Grammar: `docs/grammar.md` §6, §8.7, §11.1, §12.2, §13.3. Topics:
-`agent-compose docs stores`, `agent-compose docs human`,
-`agent-compose docs triggers`.
+Grammar: `docs/grammar.md` §6, §8.7, §11.1, §12.2, §13.3, Decision D167.
+Topics: `agent-compose docs stores`, `agent-compose docs human`,
+`agent-compose docs triggers`, `agent-compose docs models`.

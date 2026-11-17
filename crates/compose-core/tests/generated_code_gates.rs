@@ -7626,6 +7626,42 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
          `\"failed\"` (`docs/trace.md` 7.6.3)"
     );
 
+    // --- Each thinking form reaches its own SDK option (Decision D167) -----
+    //
+    // Read off the options the real `ccOptions` built for the run the adapter
+    // made, because a scripted driver is handed `run.modelSettings` whole. The
+    // enabled form is the budget it always was; the adaptive form is the SDK's
+    // own `thinking: { type: "adaptive" }` with its effort on `effort`, and no
+    // budget beside it; and an `effort` a node's `settings:` spells is
+    // subtracted rather than passed, so the run carries no effort its model
+    // did not state.
+    assert_eq!(
+        answer["thinkingForms"],
+        json!({
+            "enabled": { "maxThinkingTokens": 8000, "thinking": null, "effort": null },
+            "adaptive": {
+                "maxThinkingTokens": null,
+                "thinking": { "type": "adaptive" },
+                "effort": "high"
+            },
+            "adaptiveUnspecified": {
+                "maxThinkingTokens": null,
+                "thinking": { "type": "adaptive" },
+                "effort": null
+            },
+            "nodeEffort": {
+                "maxThinkingTokens": null,
+                "thinking": { "type": "adaptive" },
+                "effort": null
+            }
+        }),
+        "a `cc` run's thinking options are not its model's two forms (Decisions D141, D167, PRD \
+         resolved q83): the enabled form's budget is `maxThinkingTokens`; the adaptive form is \
+         the SDK's `thinking: {{ type: \"adaptive\" }}` with its effort on the SDK's `effort` \
+         option and no budget beside it; and a node's own `settings: {{ effort: … }}` is \
+         reserved, not passed"
+    );
+
     let codex = &answer["codexBound"];
     assert_eq!(
         codex["workingDirectory"],

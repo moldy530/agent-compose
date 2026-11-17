@@ -1,0 +1,16 @@
+# rule: `thinking.effort` is one of four (grammar 12.2, D167)
+# code: unknown-variant
+# message: `effort` of `thinking` of `model.m` is `extreme`, which the provider plugin does not accept
+# at: main.yml:16:15
+# help: the accepted values are `low`, `medium`, `high`, `max`
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+  settings:
+    thinking:
+      type: adaptive
+      effort: extreme

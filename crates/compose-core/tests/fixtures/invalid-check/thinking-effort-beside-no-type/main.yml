@@ -1,0 +1,20 @@
+# rule: a `thinking:` with no `type:` is the enabled form, so `effort` is refused there too (grammar 12.2, D167)
+# code: conflicting-keys
+# message: `thinking` of `model.m` declares `effort` and no `type:`, which is the enabled form
+# at: main.yml:20:38
+# help: `effort` is the adaptive form's; the enabled form takes `budget_tokens`: write `type: adaptive` to have the model decide how much to think at that effort, or drop `effort` and keep the fixed budget (grammar 12.2, Decision D167)
+#
+# `enabled` is the default so that every `{ budget_tokens }` written before the
+# adaptive form existed keeps its meaning (PRD resolved q83) — which makes an
+# `effort` with no `type:` beside it an effort on the enabled form, and the
+# message says which default the key fell into rather than naming a `type:` the
+# author never wrote.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+  settings:
+    thinking: { budget_tokens: 4000, effort: low }

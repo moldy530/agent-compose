@@ -2036,6 +2036,235 @@ fn an_agent_node_sends_its_prompt_input_and_output_schema() {
     assert_eq!(run.outputs()["verdict"], "revise");
 }
 
+/// `agent-thinking`'s three model ids: the enabled form, the adaptive form with
+/// an effort, and the adaptive form with none.
+const BUDGETED_THINKER: &str = "budgeted-thinker";
+const ADAPTIVE_THINKER: &str = "adaptive-thinker";
+const ADAPTIVE_DEFAULT_THINKER: &str = "adaptive-default-thinker";
+
+/// The one request a tool-less agent on `agent-thinking` sends, after the run
+/// answered with the scripted object.
+fn the_one_thinking_request(flow: &str, model: &str) -> Option<Value> {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        model,
+        Outcome::structured(json!({ "answer": "forty-two" })),
+    ));
+    let run = harness::invoke(
+        "agent-thinking",
+        flow,
+        &[("question", "what is six times seven?")],
+        &provider,
+    )?;
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "forty-two");
+    let recorded = provider.requests();
+    assert_eq!(recorded.len(), 1, "a tool-less agent makes one call");
+    let call = &recorded[0];
+    assert!(
+        call.is_valid(),
+        "the mock holds both thinking forms (WIRE-NOTES (29)): {:?}",
+        call.failures()
+    );
+    assert_eq!(call.model, model);
+    Some(call.body().clone())
+}
+
+/// A model on the **enabled** form sends its budget as
+/// `thinking: { type: "enabled", budget_tokens }` (grammar 12.2, Decision D167,
+/// PRD resolved q83).
+///
+/// The fixture writes the form the way every composition did before the second
+/// form existed — `{ budget_tokens: 2048 }`, no `type:` — so what this pins is
+/// the translation: the API discriminates `thinking` on its `type` and refuses
+/// one without, and a runtime that spread the authored object as written would
+/// send exactly that. The enabled form carries no effort, so `output_config`
+/// holds the native rung's format and nothing else.
+#[test]
+fn an_enabled_model_sends_its_budget_as_the_enabled_thinking_form() {
+    let Some(body) = the_one_thinking_request("flow.budgeted", BUDGETED_THINKER) else {
+        return;
+    };
+    assert_eq!(
+        body["thinking"],
+        json!({ "type": "enabled", "budget_tokens": 2048 }),
+        "the enabled form, with the `type` the wire discriminates on: {body}"
+    );
+    assert_eq!(body["max_tokens"], json!(8000));
+    let config = body["output_config"]
+        .as_object()
+        .expect("the native rung asks through `output_config`");
+    assert_eq!(
+        config.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["format"],
+        "no effort beside an enabled model's format: {body}"
+    );
+}
+
+/// A model on the **adaptive** form sends `thinking: { type: "adaptive" }`, and
+/// its effort in the same `output_config` the native rung writes its format into
+/// (grammar 12.2, Decision D167, PRD resolved q83).
+///
+/// One object holding both, rather than either written over the other: the
+/// effort is a setting the model states and the format is the mechanism the
+/// pinned call asks through, and a runtime that assigned `output_config` twice
+/// would lose whichever went first — the effort silently, or the schema, which
+/// the mock would answer as a request asking for no structured output at all.
+/// The adaptive form with no effort sends none: how hard a model thinks by
+/// default is the provider's to say, not this compiler's.
+#[test]
+fn an_adaptive_model_sends_its_effort_in_the_output_config_beside_the_format() {
+    let Some(body) = the_one_thinking_request("flow.adaptive", ADAPTIVE_THINKER) else {
+        return;
+    };
+    assert_eq!(
+        body["thinking"],
+        json!({ "type": "adaptive" }),
+        "the adaptive form carries no budget and no effort of its own: {body}"
+    );
+    let config = body["output_config"]
+        .as_object()
+        .expect("an adaptive model's pinned call carries `output_config`");
+    assert_eq!(
+        config.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+        BTreeSet::from(["effort", "format"]),
+        "one object, both keys: {body}"
+    );
+    assert_eq!(config["effort"], json!("high"));
+    assert_eq!(config["format"]["type"], json!("json_schema"));
+    assert_eq!(
+        config["format"]["schema"]["properties"]["answer"]["type"],
+        json!("string"),
+        "the format still carries the agent's schema: {body}"
+    );
+    assert!(
+        body.get("tool_choice").is_none(),
+        "the native rung pins nothing: {body}"
+    );
+
+    let Some(unspecified) =
+        the_one_thinking_request("flow.adaptive_unspecified", ADAPTIVE_DEFAULT_THINKER)
+    else {
+        return;
+    };
+    assert_eq!(unspecified["thinking"], json!({ "type": "adaptive" }));
+    assert_eq!(
+        unspecified["output_config"]
+            .as_object()
+            .expect("the native rung asks through `output_config`")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["format"],
+        "an adaptive model that states no effort sends none: {unspecified}"
+    );
+}
+
+/// The effort rides **every** call an adaptive model makes — a tool-loop turn,
+/// where nothing is pinned and `output_config` holds the effort alone, and the
+/// pinned call that follows, where it sits beside the format (Decision D167).
+///
+/// The loop turn is the one shape the single-call tests cannot reach: a runtime
+/// that only built `output_config` where it pinned a schema would drop the
+/// effort from every turn the agent spends calling tools, which is where an
+/// adaptive model does most of its thinking.
+#[test]
+fn an_adaptive_models_tool_loop_turn_carries_its_effort_alone() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(ADAPTIVE_THINKER, Outcome::text("I have what I need.")),
+        Script::new(
+            ADAPTIVE_THINKER,
+            Outcome::structured(json!({ "answer": "forty-two" })),
+        ),
+    ]);
+    let Some(run) = harness::invoke(
+        "agent-thinking",
+        "flow.research",
+        &[("question", "what is six times seven?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    let recorded = provider.requests();
+    assert_eq!(recorded.len(), 2, "one loop turn, then the pinned call");
+    for call in &recorded {
+        assert!(call.is_valid(), "{:?}", call.failures());
+        assert_eq!(call.body()["thinking"], json!({ "type": "adaptive" }));
+    }
+    let turn = recorded[0].body();
+    assert_eq!(
+        turn["output_config"],
+        json!({ "effort": "high" }),
+        "a loop turn pins no schema, and still carries the model's effort: {turn}"
+    );
+    assert!(
+        recorded[0].structured_output.is_none(),
+        "…and an effort alone asks for no structured output"
+    );
+    let pinned = recorded[1].body();
+    assert_eq!(pinned["output_config"]["effort"], json!("high"));
+    assert_eq!(
+        pinned["output_config"]["format"]["type"],
+        json!("json_schema"),
+        "{pinned}"
+    );
+    assert_eq!(run.outputs()["answer"], "forty-two");
+}
+
+/// …and on the **forced-tool** rung, where the format is not sent at all, the
+/// effort is still a setting and still rides — beside the pinned `tool_choice`,
+/// in an `output_config` that holds nothing else (Decision D167, PRD §9 resolved
+/// q53).
+///
+/// What this pins is the request, not the endpoint: an endpoint that 400s the
+/// native rung because it has never heard of `output_config` will refuse the
+/// effort on this rung too, and the run then fails with that endpoint's own
+/// words. The mock's lagging-gateway personality refuses the *mechanism* and no
+/// more, which is what lets the second request be read at all.
+///
+/// Nor is the 200 this rung gets evidence that it works for a model that
+/// thinks: a forced `tool_choice` beside thinking, in either form, is a request
+/// many models refuse, and the mock — which serves any model id — does not check
+/// it (`WIRE-NOTES` (29), grammar D167).
+#[test]
+fn an_adaptive_model_keeps_its_effort_on_the_forced_tool_rung() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.personality(ADAPTIVE_THINKER, Personality::NativeRejected);
+    provider.enqueue(Script::new(
+        ADAPTIVE_THINKER,
+        Outcome::structured(json!({ "answer": "forty-two" })),
+    ));
+    let Some(run) = harness::invoke(
+        "agent-thinking",
+        "flow.adaptive",
+        &[("question", "what is six times seven?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded.len(),
+        2,
+        "the native rung refused, then the forced tool"
+    );
+    let native = recorded[0].body();
+    assert_eq!(native["output_config"]["effort"], json!("high"));
+    assert!(native["output_config"].get("format").is_some(), "{native}");
+    let forced = recorded[1].body();
+    assert_eq!(
+        forced["output_config"],
+        json!({ "effort": "high" }),
+        "the forced rung sends no format, and keeps the effort: {forced}"
+    );
+    assert_eq!(forced["tool_choice"]["type"], json!("tool"), "{forced}");
+    assert_eq!(forced["thinking"], json!({ "type": "adaptive" }));
+    assert_eq!(run.outputs()["answer"], "forty-two");
+}
+
 /// The same agent node, compiled against the other HTTP surface: prompt, bound
 /// input, declared settings, and a structured output asked for in Chat
 /// Completions' own idiom.

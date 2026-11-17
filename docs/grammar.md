@@ -3703,9 +3703,13 @@ discovered.
 
 `model:` is the registry address (§12.2), and the adapter resolves it to three
 things: the provider-native **id**; the small subset of that model's `settings:`
-the harness has a place for — `thinking:` for `cc`, whose `budget_tokens` is its
-thinking budget, and `reasoning_effort:` for `codex`; and the **connection facts**
-of the `provider.*` behind it.
+the harness has a place for — `thinking:` for `cc`, in either of its forms
+(§12.2): the enabled form's `budget_tokens` is the Agent SDK's thinking budget
+(`maxThinkingTokens`), and the adaptive form is the SDK's own adaptive thinking
+configuration (`thinking: { type: "adaptive" }`) with its `effort` on the SDK's
+`effort` option ([D167](#d167-thinking-takes-two-forms-the-enabled-forms-budget-and-the-adaptive-forms-effort))
+— and `reasoning_effort:` for `codex`; and the **connection facts** of the
+`provider.*` behind it.
 
 **The connection crosses.** `base_url:`, the credential and `headers:` are the
 three keys of a provider that say where a client goes and how it authenticates
@@ -5463,6 +5467,12 @@ model.smart:
     max_tokens: 8000
     thinking: { budget_tokens: 4000 }
 
+model.deep:
+  provider: provider.anthropic
+  id: claude-sonnet-4-6
+  settings:
+    thinking: { type: adaptive, effort: high }
+
 model.fast:
   provider: provider.anthropic
   id: claude-haiku-4-5
@@ -5496,10 +5506,28 @@ Rules (PRD 5.9):
   other being a `coder:` node's harness config (§8.9,
   [D140](#d140-harness-settings-is-a-second-open-object-checked-in-two-tiers)).
   Known keys are typed for editors (`temperature`, `top_p`, `top_k`, `max_tokens`, `stop`,
-  `seed`, `thinking`, `reasoning_effort`, `parallel_tool_calls`), and
+  `seed`, `thinking` and its `type`, `budget_tokens` and `effort`,
+  `reasoning_effort`, `parallel_tool_calls`), and
   plugin-specific keys are accepted here and checked by the compiler against the
   provider plugin's schema. `thinking:` on an OpenAI provider is a compile error
   at the model definition (Decision [D40](#d40-settings-is-the-only-open-object-in-the-logical-layer)).
+- `thinking:` — published by the `anthropic` and `bedrock` plugins — takes **two
+  forms**, told apart by `type:`. `{ type: enabled, budget_tokens }` is a fixed
+  thinking budget, and `enabled` is the default when `type:` is absent, so
+  `{ budget_tokens: 4000 }` is this form. `{ type: adaptive, effort? }` lets the
+  model decide how much to think, at an `effort` of `low`, `medium`, `high` or
+  `max` (absent, the provider's default). Each form's key beside the other's
+  `type:` — `budget_tokens` beside `adaptive`, `effort` beside `enabled` or
+  beside no `type:` — is a compile error at the model definition
+  (`conflicting-keys`), and so is `type: enabled` declared without its
+  `budget_tokens` (`missing-key`); `thinking: {}`, which compiled before
+  `type:` existed, still does. Which form a model takes is the model's: the newer
+  models think adaptively and refuse a fixed budget, the older ones take only
+  the budget. On the Messages wire the enabled form is sent as
+  `thinking: { type: "enabled", budget_tokens }` and the adaptive form as
+  `thinking: { type: "adaptive" }` with its effort in `output_config.effort`,
+  beside the format structured output asks through there (Decision
+  [D167](#d167-thinking-takes-two-forms-the-enabled-forms-budget-and-the-adaptive-forms-effort)).
 - **No inline settings overrides on agents.** Different settings ⇒ another named
   model.
 - **Capability checking**: every model an agent references MUST come from a
@@ -11026,7 +11054,12 @@ which is PRD resolved q58: this entry originally read *"and the connection stops
 at the boundary"*, and the connection facts — `base_url:`, the credential,
 `headers:` — now cross. What stops is what this entry's own rationale is about,
 and that half is unchanged. The amended text follows; the superseded sentence is
-quoted at the end so a reader of an older citation can see what moved.
+quoted at the end so a reader of an older citation can see what moved. **Noted
+2026-11-16** for
+[D167](#d167-thinking-takes-two-forms-the-enabled-forms-budget-and-the-adaptive-forms-effort):
+`thinking:` is still the key that crosses to `cc`, and it now has two forms — the
+enabled form's budget lands on the Agent SDK's `maxThinkingTokens`, the adaptive
+form on its `thinking` and `effort` options. Nothing of this entry changes.
 
 `model:` on a `coder:` node is a `model.*` address spelled exactly as an agent
 node spells it (§12.2). The adapter resolves it to the provider-native **id**,
@@ -11462,8 +11495,10 @@ already on the node, so the message says to take the setting off rather than
 telling an author to write a line they have written. Where a
 key **addresses** the value rather than holding it, the message names where it
 points instead of naming the key: the one model setting a harness takes — `cc`'s
-thinking budget, `codex`'s reasoning effort — is written in the `model.*`
-definition `model:` names (§12.2,
+thinking budget, or the adaptive form's `effort` beside it
+([D167](#d167-thinking-takes-two-forms-the-enabled-forms-budget-and-the-adaptive-forms-effort),
+which added `effort` to the options this reading reserves), `codex`'s reasoning
+effort — is written in the `model.*` definition `model:` names (§12.2,
 [D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-ladders-stop-at-the-boundary)),
 and `model:` is required, so "write `model:`" would name a line already on the
 node. Where nothing states it, the message says so: the resume family is a named
@@ -14619,6 +14654,127 @@ no diagnostic is added or moved.
 
 **Status**: ratified — PRD resolved q82. *PRD resolved q15, q41, q45, q59, q63,
 q72, q82; `docs/distributed.md` §9.1; amends D155.*
+
+### D167. `thinking:` takes two forms: the enabled form's budget, and the adaptive form's effort
+
+A model's `thinking:` setting — published by the `anthropic` and `bedrock`
+plugins, and by no other — takes **two forms**, told apart by `type:` (§12.2):
+
+```yaml
+model.budgeted:
+  provider: provider.anthropic
+  id: claude-sonnet-4-6
+  settings:
+    thinking: { budget_tokens: 4000 }            # type: enabled, the default
+
+model.adaptive:
+  provider: provider.anthropic
+  id: claude-sonnet-4-6
+  settings:
+    thinking: { type: adaptive, effort: high }   # effort: low | medium | high | max
+```
+
+* **The enabled form**, `{ type: enabled, budget_tokens }`, is a fixed thinking
+  budget. `enabled` is the default when `type:` is absent, so every
+  `{ budget_tokens }` written before this entry keeps its meaning.
+* **The adaptive form**, `{ type: adaptive, effort? }`, lets the model decide how
+  much to think, at an `effort` of `low`, `medium`, `high` or `max`; without one,
+  the provider's default.
+
+**Each form's key beside the other's `type:` is a compile error at the model
+definition** (`conflicting-keys`): `budget_tokens` beside `type: adaptive`
+("`budget_tokens` is the enabled form's; adaptive thinking takes `effort`"), and
+`effort` beside `type: enabled` or beside no `type:` at all, which is the enabled
+form. A `type:` or an `effort` outside its closed set is `unknown-variant`, and
+`thinking:` on any other kind is the `unknown-key` it was. **`type: enabled`
+declared with no `budget_tokens` is `missing-key`**: the enabled form *is* a
+budget, and the wire refuses an enabled `thinking` without one, so that
+definition would validate clean and fail on its first call. Refusing it breaks
+nothing that compiled before, because `type:` was an unknown key of `thinking`
+until this entry. The one budgetless shape that did compile, `thinking: {}`, is
+the exception, and only it: it stays accepted as it was (a refusal of a
+composition the compiler has always taken is not this entry's to make), and it
+goes out as `{ type: "enabled" }` for the provider to answer.
+
+**On the Messages wire** the setting is the one key a request **translates**
+rather than spreads as written. The enabled form is sent as
+`thinking: { type: "enabled", budget_tokens }` — the `type` is the translation:
+the API discriminates on it, and refuses a `thinking` without one, which is the
+request every composition sent before this entry. The adaptive form is sent as
+`thinking: { type: "adaptive" }`, and its `effort` is not a field of `thinking`
+on this wire at all: it is `output_config.effort`, **merged** into the one
+`output_config` the native structured-output rung writes its `format` into
+(PRD resolved q53) rather than either replacing the other. So a pinned call on
+an adaptive model carries `output_config: { effort, format }`; a tool-loop turn,
+which pins nothing, carries `output_config: { effort }` alone; and the forced-tool
+rung, which sends no format, still carries the effort beside its `tool_choice`,
+because the effort is the model's setting and not the mechanism. That is a
+statement about what the request carries, **not** a claim that the rung works for
+a thinking model: a forced `tool_choice` (`tool` or `any`) beside thinking, in
+either form, is a request many models refuse — the ones that think only under
+`tool_choice: auto` or `none`, and the newest, which refuse a forced choice
+whether or not they think — so on such a model the forced-tool rung is no
+fallback, and an endpoint that refuses the native rung leaves its structured
+output nowhere to go. Which models refuse it is per model; the mock serves any
+model id and does not check it (`WIRE-NOTES` (29)). A
+`output_config.effort` refusal is a path *inside* the parameter, which the
+mechanism ladder already reads as not a refusal of the parameter — so it fails
+the call with the provider's words rather than laddering. Nothing else of
+`settings:` changes. The mock provider holds both forms (`WIRE-NOTES` (29)):
+`thinking` needs its `type`, each form's keys are its own, and an
+`output_config` holding an effort and no format asks for no structured output.
+`bedrock` publishes the same key and would take the same translation; this
+runtime reaches no `bedrock` provider.
+
+**Under `cc`** the setting is still the one model setting the harness takes
+([D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-ladders-stop-at-the-boundary)),
+and each form lands on the pinned Agent SDK's own option: the enabled form's
+`budget_tokens` is `maxThinkingTokens`, as before; the adaptive form is the
+SDK's `thinking: { type: "adaptive" }` — its `ThinkingConfig` arm for adaptive
+thinking, documented as taking precedence over `maxThinkingTokens` — and its
+`effort` is the SDK's `effort` option. The pinned SDK (`0.3.284`) declares that
+option, so the stderr line q83 owes where an SDK has no place for an effort is
+never written at this pin; the driver's own comment records which. `effort`
+joins `cc`'s reserved options ([D146](#d146-a-coder-nodes-permission-mode-is-a-key-bounded-by-access-and-a-reserved-setting-is-refused)),
+answered through `model:` beside `thinking` and `maxThinkingTokens`: the driver
+writes it from the `model.*` definition, so a node's own `settings: { effort }`
+would be a second spelling of what `model:` states — and, written before the
+driver's own, the one that silently lost.
+
+**Editor schema.** `thinking` is typed with its three keys — `type` (`enabled`,
+`adaptive`), `budget_tokens` (an integer of at least 1) and `effort` (the four).
+The cross-key rule is the validator's, as every provider-settings check is
+(Appendix B).
+
+**Rationale**: the setting is the provider plugin's
+([D40](#d40-settings-is-the-only-open-object-in-the-logical-layer)), so its
+shape follows the provider's wire, and the wire has two forms under one key with
+a discriminator. Some models now refuse the enabled form outright and ask for
+the adaptive one and an effort, so a grammar with the budget alone left an agent
+on them with no thinking it could ask for. Refusing each form's foreign key at
+`validate` is G3's early refusal rather than the provider's 400 on the first
+call — and rather than the worse alternative, a key one form silently drops on
+the way out. Defaulting a missing `type:` to `enabled` is what keeps every
+existing composition's meaning, which is why no migration accompanies the entry.
+
+**Collision review.** PRD resolved q53 and the structured-output ladder: the
+native rung's `output_config` is now built from two sources, the format and the
+effort, and its mechanism key is unchanged — a refusal naming the parameter
+itself still ladders, one naming a path inside it does not. q55's lowering
+table is untouched: the effort is no schema keyword. q57 and q58, and D141,
+D143: what crosses to `cc` is still `thinking:` and the connection facts;
+`thinking:` has two forms now, and the per-harness connection table is
+unchanged. q60 and D146: `effort` is a reserved `cc` option for the reason
+`thinking` already was, refused at `validate` with D146's answer through
+`model:`, and subtracted by the driver as defence in depth. D140's open tier
+loses one name it never curated. D40: the shape is the plugin's, and the editor
+schema still types the common keys and permits the rest. D122: a provider's
+server tools ride `tools`, never `output_config`, and are untouched; `thinking:`
+stays refused on every OpenAI-family kind by that kind's key row, whichever
+wire its connection speaks.
+
+**Status**: ratified — PRD resolved q83. *PRD 5.9, G3, resolved q53, q57, q58,
+q60, q83; §8.9, §12.2; builds on D40, D141, D146.*
 
 ## Appendix B — Editor integration
 

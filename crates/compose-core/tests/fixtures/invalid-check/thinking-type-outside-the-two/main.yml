@@ -1,0 +1,19 @@
+# rule: `thinking.type` is `enabled` or `adaptive` (grammar 12.2, D167)
+# code: unknown-variant
+# message: `type` of `thinking` of `model.m` is `disabled`, which the provider plugin does not accept
+# at: main.yml:19:13
+# help: the accepted values are `enabled`, `adaptive`
+#
+# The wire has a third, and this grammar does not: a model with no thinking is a
+# model whose `settings:` carry no `thinking:` key (PRD resolved q83 names two
+# forms).
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+  settings:
+    thinking:
+      type: disabled

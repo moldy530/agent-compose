@@ -1,0 +1,21 @@
+# rule: `thinking:` is the Anthropic plugins' key, refused on an OpenAI provider in either form (grammar 12.2, D40, D167)
+# code: unknown-key
+# message: `thinking` is not a setting the `openai` provider plugin publishes
+# at: main.yml:19:5
+# label: main.yml:16:13 the provider is named here
+# help: the `openai` provider plugin publishes `temperature`, `top_p`, `max_tokens`, `stop`, `seed`, `parallel_tool_calls`, `reasoning_effort`
+#
+# The adaptive form is the one an author reaching for "how hard the model
+# thinks" writes, and it is still the `anthropic` and `bedrock` plugins' key: an
+# OpenAI model's equivalent is `reasoning_effort:`, which the help names.
+version: "0.1"
+provider.p:
+  kind: openai
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+  settings:
+    thinking:
+      type: adaptive
+      effort: high

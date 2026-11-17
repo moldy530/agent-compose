@@ -127,6 +127,10 @@ pub const FIXTURES: &[&str] = &[
     "activities",
     "agent-anthropic",
     "agent-openai",
+    // A model's `thinking:` in both of its forms on the Messages wire (grammar
+    // 12.2, Decision D167, PRD resolved q83): the enabled form's budget, and the
+    // adaptive form's effort riding `output_config` beside the format.
+    "agent-thinking",
     "bounded-cycle",
     "builtin-tools",
     // Cancelling an execution (PRD resolved q75): a command that lingers under a
