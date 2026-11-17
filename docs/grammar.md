@@ -729,7 +729,11 @@ value is a string wherever a string is admitted.
 | `join` | `l.join(sep)`, `l.join()` | a list of strings; a string separator, or none for `''` | `string` |
 
 What the conversions answer is pinned by the conformance corpus against both
-evaluators (`crates/compose-core/tests/fixtures/cel-conformance/`, D168):
+evaluators (`crates/compose-core/tests/fixtures/cel-conformance/`, D168), every
+row below but one: `int()` of a double outside `int64` fails in the evaluator a
+built project embeds, while the pinned crate the corpus's other column runs
+casts it instead, so the acceptance suite pins that refusal and the divergence
+ledger carries the row (D168).
 
 - `string()` of an `int` is its decimal; of a `double`, the shortest digits that
   read back as the same double, written without an exponent (`string(1e21)` is a
@@ -15161,7 +15165,8 @@ a list of strings. Nothing else joins it. Each is typed in the compiler's walk
 (§4.1's function table: what each admits, and the forms each is written in),
 implemented in the evaluator a built project embeds, and held to the
 conformance corpus, whose `conversions.json` states every row of §4.1's
-semantics list. `string()` of a list, a map or an object is that value's
+semantics list but one — `int()` of a double outside `int64`, the ledger row
+below. `string()` of a list, a map or an object is that value's
 **canonical JSON**: object keys in code-point order, no whitespace, strings
 escaped as JSON escapes them, an `int` without a fraction, and a `double` as
 `string()` writes one on its own.
