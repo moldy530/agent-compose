@@ -2281,8 +2281,9 @@ class SqlJournal implements Journal {
       // a row of a flow the build no longer declares, which recovery leaves
       // where it is. The rows say it is running, and no process can know
       // better; what frees such a slot is its cancel, which `serve`'s cancel
-      // route records for an execution like it as for any open one (Decision
-      // D163's Status).
+      // route records first and then, for a row nothing here will take,
+      // closes `cancelled` with no finally node run (Decision D165) — the
+      // request alone frees the slot, the close only ends the row.
       //
       // **Driven from the open lifecycle rows**, never from the intake's:
       // intake rows are kept (§3.15), so a trigger's `started` rows are its
