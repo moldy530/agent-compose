@@ -227,6 +227,7 @@ import {
   refuseChildExecutions,
   releaseWorkspaces,
   remotePauseOf,
+  stopAtFrontier,
   stopEveryNodeOn,
 } from "./runtime.ts";
 
@@ -291,13 +292,20 @@ function unbounded(): AbortController {
  * Its nodes read the execution's cancel each through its own activity, as the
  * nodes of a root execution on the hub do, so the instance is not stopped
  * from outside by a cancel: each node it was running ends `cancelled` on its
- * own entry, and the instance ends on them.
+ * own entry, and the instance ends on them. And `halt`, which is the stop
+ * itself — what [`STOP_SIGNAL`] calls, and what the **end a hub stop owes** an
+ * instance calls at its frontier (§3.2's `stopped`, `runtime.stopAtFrontier`)
+ * — answering the [`DispatchStopped`] it stopped everything with.
  */
 function stoppable(
   cancel: AbortSignal,
   execution: string,
   dispatch: string,
-): { readonly placed: AbortSignal; readonly stopped: AbortSignal } {
+): {
+  readonly placed: AbortSignal;
+  readonly stopped: AbortSignal;
+  readonly halt: () => DispatchStopped;
+} {
   const stop = unbounded();
   const everyNode = unbounded();
   const follow = (): void => {
@@ -307,14 +315,19 @@ function stoppable(
   else cancel.addEventListener("abort", follow, { once: true });
   stopEveryNodeOn(everyNode.signal);
   let stopped: DispatchStopped | undefined;
+  const halt = (): DispatchStopped => {
+    if (stopped !== undefined) return stopped;
+    const reason = new DispatchStopped(dispatch);
+    stopped = reason;
+    noteStopped(execution, reason);
+    if (!stop.signal.aborted) stop.abort(reason);
+    if (!everyNode.signal.aborted) everyNode.abort(reason);
+    return reason;
+  };
   process.on(STOP_SIGNAL, () => {
-    if (stopped !== undefined) return;
-    stopped = new DispatchStopped(dispatch);
-    noteStopped(execution, stopped);
-    if (!stop.signal.aborted) stop.abort(stopped);
-    if (!everyNode.signal.aborted) everyNode.abort(stopped);
+    halt();
   });
-  return { placed: stop.signal, stopped: everyNode.signal };
+  return { placed: stop.signal, stopped: everyNode.signal, halt };
 }
 
 /** The dispatch this process was handed, as §3.2 puts it on the wire. */
@@ -351,6 +364,20 @@ interface Dispatch {
    * every other dispatch.
    */
   readonly cancelled?: boolean;
+  /**
+   * §3.2's OPTIONAL `stopped`: this dispatch is the **end** a hub stop owes a
+   * placed flow's instance that no worker was running when the hub stopped
+   * waiting for it — an end around it abandoned the question it had brought
+   * home, or its instantiating node's deadline ran out while its redispatch
+   * was parked (Decision D171). The instance is replayed to its frontier, where
+   * it is stopped as a `stop` list entry stops one a worker is running
+   * (`runtime.stopAtFrontier`): every node it reaches there ends `failed`, the
+   * instance ends `failed`, and its `finally:` node runs here — or, where the
+   * history already holds the rest of its body, it reaches no frontier and ends
+   * as the history does, its `finally:` node run at that. Absent on every other
+   * dispatch.
+   */
+  readonly stopped?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -940,7 +967,11 @@ async function main(): Promise<void> {
   // and cancels nothing (see *A stop arrives as `SIGUSR2`*).
   const cancel = executionCancelSignal(dispatch.execution_id);
   cancelOnTerminate(dispatch.execution_id);
-  const { placed, stopped } = stoppable(cancel, dispatch.execution_id, dispatch.dispatch_id);
+  const { placed, stopped, halt } = stoppable(
+    cancel,
+    dispatch.execution_id,
+    dispatch.dispatch_id,
+  );
   // …and the worker is told whenever finally work starts and stops here, so a
   // cancel's grace does not cut off a `finally:` node that runs whole (see
   // *Finally work is reported*).
@@ -954,6 +985,13 @@ async function main(): Promise<void> {
   // finally node run (`runtime.completeCancel`, the hook a recovered cancel
   // uses on the hub). Its result is then `status: "cancelled"`, below.
   if (dispatch.cancelled === true) completeCancel(dispatch.execution_id);
+  // **The end a hub stop owes an instance** (§3.2's `stopped`, Decision D171):
+  // the hub stopped waiting for this placed flow's instance while no worker was
+  // running it, so it is stopped here at the frontier, as the `stop` list
+  // stops one a worker is running (see *A stop arrives as `SIGUSR2`*): it ends
+  // `failed` there and its finally node runs, and its result is the instance's
+  // failure, below.
+  if (dispatch.stopped === true) stopAtFrontier(dispatch.execution_id, halt);
 
   let line: Record<string, unknown>;
   try {

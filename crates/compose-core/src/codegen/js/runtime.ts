@@ -1609,6 +1609,24 @@ export function completeCancel(execution: string): void {
 }
 
 /**
+ * [`completeCancel`]'s twin for the **end a hub stop owes** a placed flow's
+ * instance (`docs/distributed.md` §3.2's `stopped`, Decision D171): the hub
+ * stopped waiting for an instance no worker was running — an end around it
+ * abandoned its question, or its instantiating node's deadline ran out while
+ * its redispatch was parked — so the worker it hands the instance to replays
+ * the recorded prefix, and the first effect the record does not hold calls
+ * `stop`, which stops the instance as a `stop` list entry stops one a worker is
+ * running, and raises what it answers instead of being issued. Its nodes end
+ * `failed` there and its finally node runs, whose effects are exempt as they
+ * are from a recovered cancel ([`finallySites`]).
+ *
+ * Called by `src/worker-node.ts` for a dispatch carrying `stopped: true`.
+ */
+export function stopAtFrontier(execution: string, stop: () => Error): void {
+  cancelAtFrontier(execution, (site) => (underRunningFinally(execution, site) ? undefined : stop()));
+}
+
+/**
  * Whether an error a run or an instance ended on is a **cancel** — the outcome
  * `cancelled` — rather than a failure: a cancellation on its chain, or the end
  * a resumed generation's boundary records as cancelled ([`RecordedEnding`]).
