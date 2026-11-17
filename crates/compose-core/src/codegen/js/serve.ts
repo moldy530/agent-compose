@@ -1078,6 +1078,17 @@ function guardedBy(name: string, request: FastifyRequest): Refusal | undefined {
 }
 
 /**
+ * Whether [`guardedBy`] refuses every request about what the trigger called
+ * `name` began: a name that is no declared trigger of this build and not
+ * `manual` — the composition moved under an open execution, and the `auth:`
+ * that trigger required cannot be read.
+ */
+function undeclaredTrigger(name: string): boolean {
+  if (name === MANUAL) return false;
+  return ![...httpTriggers, ...eventTriggers, ...scheduleTriggers].some((one) => one.name === name);
+}
+
+/**
  * The refusal `GET /sources/:name` has for this request (grammar 14.4, PRD
  * resolved q32 one level up, Decision D162).
  *
@@ -3612,7 +3623,7 @@ async function recoverExecutions(
       );
       // …and which command closes it, where nobody puts the flow back (PRD
       // resolved q81): the cancel route reads such a row as the open one it is.
-      sayUnrecovered(row.id, row.flow, `this build declares no flow \`${row.flow}\``);
+      sayUnrecovered(row.id, row.flow, row.trigger, `this build declares no flow \`${row.flow}\``);
       continue;
     }
     // A **child execution** (PRD resolved q65) is recovered one of two ways,
@@ -5362,13 +5373,25 @@ const saidUnrecovered = new Set<string>();
  * Say, once per start, that this build could not recover an execution and
  * which command closes it (PRD resolved q81): one line on the serve log, the
  * reason clipped to [`LOGGED_REASON_LIMIT`] and kept to one line.
+ *
+ * **Never a close the route will refuse.** The cancel route is under the
+ * `auth:` of the trigger that started the execution (PRD resolved q32, q75
+ * ruling d), a close included, and one whose trigger this build no longer
+ * declares is refused whatever the request carries ([`guardedBy`]): the
+ * authentication that trigger required cannot be read. So for such an
+ * execution the line says what the cancel needs first — that trigger
+ * declared again — rather than naming a command that would only be answered
+ * `401`.
  */
-function sayUnrecovered(id: string, flow: string, reason: string): void {
+function sayUnrecovered(id: string, flow: string, trigger: string, reason: string): void {
   if (saidUnrecovered.has(id)) return;
   saidUnrecovered.add(id);
   const said = clipped(reason.replace(/\s*\n\s*/g, " "), LOGGED_REASON_LIMIT);
+  const guard = undeclaredTrigger(trigger)
+    ? `, which the cancel route refuses until this build declares the trigger \`${trigger}\` that started it again: a cancel is authenticated by that trigger's \`auth:\` (PRD resolved q32)`
+    : "";
   process.stderr.write(
-    `\`${id}\` (${flow}) could not be recovered by this build: ${said}; its row stays open until \`agent-compose cancel ${id}\` closes it\n`,
+    `\`${id}\` (${flow}) could not be recovered by this build: ${said}; its row stays open until \`agent-compose cancel ${id}\` closes it${guard}\n`,
   );
 }
 
@@ -5379,7 +5402,12 @@ function sayUnrecovered(id: string, flow: string, reason: string): void {
  */
 function unrecovered(execution: Execution): void {
   if (execution.status === "running" || execution.announced) return;
-  sayUnrecovered(execution.id, execution.flow, execution.error ?? "its recovery failed");
+  sayUnrecovered(
+    execution.id,
+    execution.flow,
+    execution.trigger,
+    execution.error ?? "its recovery failed",
+  );
 }
 
 /**
