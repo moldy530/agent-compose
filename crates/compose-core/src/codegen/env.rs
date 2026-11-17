@@ -1083,6 +1083,62 @@ impl References {
         references
     }
 
+    /// The references `src/env.ts` lists, read back out of the file a build
+    /// wrote — `environmentReferences`, which is the list the emitted
+    /// project's `readEnvironment()` checks at load.
+    ///
+    /// What the launcher checks under `--no-build` (PRD resolved q87, Decision
+    /// D170), where there is no IR to walk: the tree is launched as it stands,
+    /// so the variables it needs are the ones its own `src/env.ts` names —
+    /// read from the file the launched process is about to check, so the two
+    /// checks are of one list even where an operator edited it. Read by the
+    /// constant [`module`] writes it with; `None` unless the declaration is
+    /// there once, in the shape [`module`] writes.
+    #[must_use]
+    pub fn listed(source: &str) -> Option<Self> {
+        let mut lines = source.lines();
+        let opening = lines.by_ref().find(|line| line.starts_with(LIST_OPEN))?;
+        let mut references = Self::default();
+        if opening == format!("{LIST_OPEN}[];") {
+            return (!lines.any(|line| line.starts_with(LIST_OPEN))).then_some(references);
+        }
+        if opening != format!("{LIST_OPEN}[") {
+            return None;
+        }
+        let mut name: Option<String> = None;
+        let mut in_sites = false;
+        loop {
+            let line = lines.next()?.trim();
+            match line {
+                "];" if !in_sites && name.is_none() => break,
+                "{" if name.is_none() && !in_sites => {}
+                "sites: [" if name.is_some() && !in_sites => in_sites = true,
+                "]," if in_sites => in_sites = false,
+                "}," if !in_sites => {
+                    let finished = name.take()?;
+                    if references.sites(&finished).is_empty() {
+                        return None;
+                    }
+                }
+                _ if in_sites => {
+                    let site: String = serde_json::from_str(line.strip_suffix(',')?).ok()?;
+                    references.record(name.as_deref()?, &site);
+                }
+                _ => {
+                    let written = line.strip_prefix("name: ")?.strip_suffix(',')?;
+                    if name.is_some() {
+                        return None;
+                    }
+                    name = Some(serde_json::from_str(written).ok()?);
+                }
+            }
+        }
+        if lines.any(|line| line.starts_with(LIST_OPEN)) {
+            return None;
+        }
+        Some(references)
+    }
+
     /// Whether the composition references nothing.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -1168,6 +1224,10 @@ impl References {
     }
 }
 
+/// What `environmentReferences` opens with — written by [`module`], read back
+/// by [`References::listed`].
+const LIST_OPEN: &str = "export const environmentReferences: readonly EnvironmentReference[] = ";
+
 /// `src/env.ts`.
 #[must_use]
 pub fn module(ir: &Ir, references: &References) -> super::GeneratedFile {
@@ -1177,12 +1237,9 @@ pub fn module(ir: &Ir, references: &References) -> super::GeneratedFile {
     contents.push_str(DECLARATIONS);
 
     if references.is_empty() {
-        contents.push_str(
-            "export const environmentReferences: readonly EnvironmentReference[] = [];\n",
-        );
+        contents.push_str(&format!("{LIST_OPEN}[];\n"));
     } else {
-        contents
-            .push_str("export const environmentReferences: readonly EnvironmentReference[] = [\n");
+        contents.push_str(&format!("{LIST_OPEN}[\n"));
         for name in references.names() {
             contents.push_str(&format!(
                 "  {{\n    name: {},\n    sites: [\n",
@@ -2060,6 +2117,40 @@ triggers:\n  intake:\n    type: http\n    flow: flow.support\n    callback: \"pa
         let emitted = module(&ir, &References::of(&ir)).contents;
         assert!(emitted.contains("environmentReferences: readonly EnvironmentReference[] = [];"));
         assert!(emitted.contains("export function readEnvironment("));
+    }
+
+    /// The list `src/env.ts` carries reads back as the references it was
+    /// written from, names and sites both — which is what lets `--no-build`
+    /// refuse a missing variable in the words a build-first launch uses (PRD
+    /// resolved q87).
+    #[test]
+    fn the_emitted_list_reads_back_as_the_references_it_was_written_from() {
+        for source in [PROJECT, "version: \"0.1\"\n"] {
+            let ir = ir_of(source);
+            let references = References::of(&ir);
+            let emitted = module(&ir, &references).contents;
+            assert_eq!(
+                References::listed(&emitted).as_ref(),
+                Some(&references),
+                "{emitted}"
+            );
+        }
+        let ir = ir_of(PROJECT);
+        let emitted = module(&ir, &References::of(&ir)).contents;
+        assert!(
+            !References::of(&ir).is_empty(),
+            "the project references something"
+        );
+        assert_eq!(
+            References::listed(&emitted.replace("environmentReferences", "references")),
+            None,
+            "a file with no list in the written shape is not read as an empty one"
+        );
+        assert_eq!(
+            References::listed(&emitted.replace("    name: ", "    named: ")),
+            None,
+            "a line the emitter does not write is not skipped"
+        );
     }
 
     #[test]

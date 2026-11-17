@@ -52,6 +52,24 @@
 //! references ships nowhere. That is why [`module`] takes the two lists
 //! separately and hashes their union: the *tree* is the subject, and which half
 //! of it a file came from is the build's business rather than the wire's.
+//!
+//! # Reading it back
+//!
+//! Two verbs stand on a tree without the spec that produced it (PRD resolved
+//! q87, Decision D170): `run`, `serve` and `cancel` under `--no-build` launch the
+//! tree as it stands, and `build --restamp` recomputes `ARTIFACT_HASH` over the
+//! tree as it stands after a hand edit. Both need what this module wrote — which
+//! release wrote it, which files it is, what it is hashed to — and neither has
+//! an IR to re-derive it from. So the three lines are read back out of the file
+//! ([`Stamp::parse`]), by the same constants [`module`] writes them with, and
+//! the hash is recomputed by [`rehash`], which is [`hash_of`] over the bytes
+//! the listed files hold on disk. One rule, read back where it was written:
+//! there is no second implementation of the hash for a restamp to drift from,
+//! and a worker verifying a restamped tree's tarball computes the same answer
+//! the restamp wrote.
+
+use std::io;
+use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
@@ -64,6 +82,20 @@ use super::{GeneratedFile, names};
 /// Read by both ends — the emitter, which skips it when hashing, and a worker,
 /// which skips it when verifying what it unpacked (`docs/distributed.md` §4).
 pub const SELF: &str = "src/artifact.ts";
+
+/// What the `ARTIFACT_HASH` line opens with: written by [`module`], read back
+/// by [`Stamp::parse`] and rewritten by [`restamp`].
+const HASH_LINE: &str = "export const ARTIFACT_HASH = ";
+
+/// What the `COMPILER_VERSION` line opens with.
+const VERSION_LINE: &str = "export const COMPILER_VERSION = ";
+
+/// What the `ARTIFACT_FILES` list opens with; one path a line follows it, and
+/// [`FILES_CLOSE`] ends it.
+const FILES_OPEN: &str = "export const ARTIFACT_FILES: readonly string[] = [";
+
+/// The line that ends `ARTIFACT_FILES`.
+const FILES_CLOSE: &str = "];";
 
 /// The content hash of a set of emitted files, as `sha256:<hex>`.
 ///
@@ -122,17 +154,17 @@ pub fn module(ir: &Ir, files: &[GeneratedFile], carried: &[GeneratedFile]) -> Ge
     let mut contents = super::header(ir, "// ");
     contents.push_str(MODULE_DOC);
     contents.push_str(&format!(
-        "\nexport const ARTIFACT_HASH = {};\n",
+        "\n{HASH_LINE}{};\n",
         names::string(&hash_of(
             tree.iter()
                 .map(|file| (file.path.as_str(), file.contents.as_bytes()))
         ))
     ));
     contents.push_str(&format!(
-        "\nexport const COMPILER_VERSION = {};\n",
+        "\n{VERSION_LINE}{};\n",
         names::string(super::COMPILER_VERSION)
     ));
-    contents.push_str("\nexport const ARTIFACT_FILES: readonly string[] = [\n");
+    contents.push_str(&format!("\n{FILES_OPEN}\n"));
     let mut paths: Vec<&str> = tree.iter().map(|file| file.path.as_str()).collect();
     paths.push(SELF);
     paths.sort_unstable();
@@ -140,12 +172,144 @@ pub fn module(ir: &Ir, files: &[GeneratedFile], carried: &[GeneratedFile]) -> Ge
     for path in paths {
         contents.push_str(&format!("  {},\n", names::string(path)));
     }
-    contents.push_str("];\n");
+    contents.push_str(&format!("{FILES_CLOSE}\n"));
 
     GeneratedFile {
         path: SELF.to_string(),
         contents,
     }
+}
+
+/// What a built tree's `src/artifact.ts` says the tree is, read back without
+/// the spec that produced it (see the module docs' last section).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stamp {
+    /// `ARTIFACT_HASH`, as written.
+    pub hash: String,
+    /// `COMPILER_VERSION`: the release that wrote the tree.
+    pub compiler: String,
+    /// `ARTIFACT_FILES`, in the order written — [`SELF`] among them.
+    pub files: Vec<String>,
+}
+
+impl Stamp {
+    /// Read the three declarations out of `src/artifact.ts`'s text.
+    ///
+    /// `None` unless each is there exactly once, in the shape [`module`] writes
+    /// it — a string literal on its own line, and the file list one literal a
+    /// line — and every listed path stays inside the tree: an absolute path, a
+    /// backslash, or an empty, `.` or `..` component is refused, by the rule a
+    /// worker refuses a tarball entry by (`docs/distributed.md` §4), because a
+    /// restamp reads every listed file and must not read one outside it.
+    #[must_use]
+    pub fn parse(module: &str) -> Option<Self> {
+        let hash = declared(module, HASH_LINE)?;
+        let compiler = compiler_of(module)?;
+        let mut lines = module.lines();
+        lines.by_ref().find(|line| *line == FILES_OPEN)?;
+        let mut files = Vec::new();
+        loop {
+            let line = lines.next()?;
+            if line == FILES_CLOSE {
+                break;
+            }
+            let path: String = serde_json::from_str(line.trim().strip_suffix(',')?).ok()?;
+            if !inside(&path) {
+                return None;
+            }
+            files.push(path);
+        }
+        if lines.any(|line| line == FILES_OPEN) {
+            return None;
+        }
+        Some(Self {
+            hash,
+            compiler,
+            files,
+        })
+    }
+}
+
+/// `COMPILER_VERSION`, read out of `src/artifact.ts`'s text on its own.
+///
+/// Apart from [`Stamp::parse`] because it is the one declaration worth reading
+/// when the rest of the file is not: a tree another release wrote is told so by
+/// name, and that release may have spelled the file list differently.
+#[must_use]
+pub fn compiler_of(module: &str) -> Option<String> {
+    declared(module, VERSION_LINE)
+}
+
+/// The string a one-line `export const` declares, where exactly one line opens
+/// with `opening`.
+fn declared(module: &str, opening: &str) -> Option<String> {
+    let mut found = module.lines().filter_map(|line| line.strip_prefix(opening));
+    let literal = found.next()?.strip_suffix(';')?;
+    if found.next().is_some() {
+        return None;
+    }
+    serde_json::from_str(literal).ok()
+}
+
+/// Whether a listed path names a file inside the tree.
+fn inside(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && !path.contains('\0')
+        && path
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
+/// The content hash of a tree **on disk**, over the files its stamp lists, by
+/// the rule [`hash_of`] is — [`SELF`] skipped.
+///
+/// What `build --restamp` writes, and therefore what a worker verifying the
+/// tarball a hub serves of this tree computes too: the hub tars exactly
+/// `ARTIFACT_FILES` off its disk (`docs/distributed.md` §3.5), and the worker
+/// hashes the entries it unpacked with [`hash_of`].
+///
+/// # Errors
+///
+/// The filesystem's, with the path folded into the message: a listed file that
+/// is not there, or cannot be read, is a tree with no hash to give.
+pub fn rehash(tree: &Path, files: &[String]) -> io::Result<String> {
+    let mut held: Vec<(&str, Vec<u8>)> = Vec::with_capacity(files.len());
+    for path in files {
+        if path == SELF {
+            continue;
+        }
+        let mut full = tree.to_path_buf();
+        full.extend(path.split('/'));
+        let bytes = std::fs::read(&full).map_err(|error| {
+            io::Error::new(error.kind(), format!("cannot read `{path}`: {error}"))
+        })?;
+        held.push((path.as_str(), bytes));
+    }
+    Ok(hash_of(
+        held.iter().map(|(path, bytes)| (*path, bytes.as_slice())),
+    ))
+}
+
+/// `src/artifact.ts` with its `ARTIFACT_HASH` line saying `hash`, and every
+/// other byte as it was — the file list, the version and the comments included.
+///
+/// `None` where the file does not hold exactly one such line, which
+/// [`Stamp::parse`] has already refused by the time a caller gets here.
+#[must_use]
+pub fn restamp(module: &str, hash: &str) -> Option<String> {
+    declared(module, HASH_LINE)?;
+    let mut rewritten = String::with_capacity(module.len());
+    for line in module.split_inclusive('\n') {
+        if line.starts_with(HASH_LINE) {
+            let ending = &line[line.trim_end_matches(['\n', '\r']).len()..];
+            rewritten.push_str(&format!("{HASH_LINE}{};{ending}", names::string(hash)));
+        } else {
+            rewritten.push_str(line);
+        }
+    }
+    Some(rewritten)
 }
 
 const MODULE_DOC: &str = "\
@@ -270,6 +434,119 @@ tool.sign:
             ]),
             "one rule over the tree, whichever half a file came from"
         );
+    }
+
+    /// The module [`module`] writes reads back as what it says (PRD resolved
+    /// q87): the hash it carries, this release, and the file list in the order
+    /// written — [`SELF`] among them.
+    #[test]
+    fn the_artifact_module_reads_back_as_the_stamp_it_was_written_with() {
+        let ir = crate::codegen::test_support::ir_of("version: \"0.1\"\n");
+        let generated = [
+            file("src/graph.ts", "// the graph\n"),
+            file("package.json", "{}\n"),
+        ];
+        let written = module(&ir, &generated, &[]);
+        let stamp = Stamp::parse(&written.contents).expect("the module reads back");
+        assert_eq!(stamp.hash, hash(&generated));
+        assert_eq!(stamp.compiler, super::super::COMPILER_VERSION);
+        assert_eq!(stamp.files, ["package.json", SELF, "src/graph.ts"]);
+        assert_eq!(
+            compiler_of(&written.contents).as_deref(),
+            Some(super::super::COMPILER_VERSION)
+        );
+    }
+
+    /// A stamp that is not one line each, or lists a path outside the tree, is
+    /// no stamp: a restamp reads every listed file, and must read none outside
+    /// the tree it is restamping.
+    #[test]
+    fn a_stamp_that_is_not_the_written_shape_or_leaves_the_tree_does_not_read() {
+        let ir = crate::codegen::test_support::ir_of("version: \"0.1\"\n");
+        let written = module(&ir, &[file("src/graph.ts", "// the graph\n")], &[]).contents;
+        let twice = format!("{written}export const ARTIFACT_HASH = \"sha256:00\";\n");
+        assert_eq!(Stamp::parse(&twice), None, "two hash lines");
+        let unlisted = written.replace("export const ARTIFACT_FILES", "export const FILES");
+        assert_eq!(Stamp::parse(&unlisted), None, "no file list");
+        for escaping in [
+            "../outside.ts",
+            "/etc/passwd",
+            "src//graph.ts",
+            "src/./graph.ts",
+        ] {
+            let listed = written.replace(
+                "  \"src/graph.ts\",\n",
+                &format!("  {},\n", names::string(escaping)),
+            );
+            assert_eq!(Stamp::parse(&listed), None, "`{escaping}` is listed");
+        }
+    }
+
+    /// `restamp` moves the one line and nothing else: the file list, the
+    /// version and every comment are the bytes they were.
+    #[test]
+    fn a_restamp_rewrites_the_hash_line_and_nothing_else() {
+        let ir = crate::codegen::test_support::ir_of("version: \"0.1\"\n");
+        let written = module(&ir, &[file("src/graph.ts", "// the graph\n")], &[]).contents;
+        let replacement = format!("sha256:{}", "a".repeat(64));
+        let rewritten = restamp(&written, &replacement).expect("the module has its hash line");
+        let stamp = Stamp::parse(&rewritten).expect("a restamped module still reads");
+        assert_eq!(stamp.hash, replacement);
+        let before: Vec<&str> = written.lines().collect();
+        let after: Vec<&str> = rewritten.lines().collect();
+        assert_eq!(before.len(), after.len());
+        let changed: Vec<(&str, &str)> = before
+            .iter()
+            .zip(&after)
+            .filter(|(left, right)| left != right)
+            .map(|(left, right)| (*left, *right))
+            .collect();
+        assert_eq!(changed.len(), 1, "{changed:#?}");
+        assert!(changed[0].0.starts_with(HASH_LINE), "{changed:#?}");
+        assert!(rewritten.ends_with("];\n"), "the trailing newline is kept");
+    }
+
+    /// `rehash` over a tree written to disk is the hash the emitter wrote for
+    /// the same bytes — and moves when a byte on disk does.
+    #[test]
+    fn a_tree_on_disk_rehashes_to_the_hash_its_bytes_were_emitted_under() {
+        let ir = crate::codegen::test_support::ir_of("version: \"0.1\"\n");
+        let generated = [
+            file("src/graph.ts", "// the graph\n"),
+            file("package.json", "{}\n"),
+        ];
+        let written = module(&ir, &generated, &[]);
+        let tree = std::env::temp_dir().join(format!(
+            "compose-core-rehash-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&tree);
+        for each in generated.iter().chain(std::iter::once(&written)) {
+            let mut path = tree.clone();
+            path.extend(each.path.split('/'));
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("writable");
+            std::fs::write(&path, &each.contents).expect("writable");
+        }
+        let stamp = Stamp::parse(&written.contents).expect("the module reads back");
+        assert_eq!(
+            rehash(&tree, &stamp.files).expect("every listed file is there"),
+            stamp.hash
+        );
+        std::fs::write(tree.join("src/graph.ts"), "// edited by hand\n").expect("writable");
+        let moved = rehash(&tree, &stamp.files).expect("every listed file is there");
+        assert_ne!(moved, stamp.hash);
+        assert_eq!(
+            moved,
+            hash(&[
+                file("src/graph.ts", "// edited by hand\n"),
+                file("package.json", "{}\n"),
+            ])
+        );
+        std::fs::remove_file(tree.join("package.json")).expect("removable");
+        let missing = rehash(&tree, &stamp.files).expect_err("a listed file is gone");
+        assert!(missing.to_string().contains("`package.json`"), "{missing}");
+        let _ = std::fs::remove_dir_all(&tree);
     }
 
     /// The known-answer test that says this is SHA-256 rather than some other
