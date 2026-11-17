@@ -61,13 +61,15 @@
 //! [`a_cancel_of_an_execution_whose_recovery_diverged_cancels_the_child_it_runs_through_the_cascade`]
 //! and [`agent_compose_cancel_prints_why_it_closed_an_execution_this_build_cannot_run`]
 //! (the divergence and the renamed flow under `pushed`'s settle webhook and a
-//! trace sink are in `compiled_graph_acceptance.rs`).
+//! trace sink are in `compiled_graph_acceptance.rs`) — while an open row a
+//! `run` beside the `serve` is running is still not `serve`'s to cancel —
+//! [`serves_cancel_of_an_execution_a_run_beside_it_is_running_is_404_and_leaves_its_row_open`].
 
 #[path = "compiled_graph_acceptance/harness.rs"]
 mod harness;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use mock_provider::{Client, MockProvider, Request};
@@ -1749,8 +1751,11 @@ fn agent_compose_cancel_prints_why_it_closed_an_execution_this_build_cannot_run(
 /// The cancel of the parent closes it and leaves the child to the cascade: the
 /// child's command stops, its finally node runs at `cancelled` and its row
 /// settles `cancelled` on its own — no `finally_error` — while the parent's
-/// row is closed `cancelled` with the divergence in its `finally_error`, after
-/// the child's cancel was recorded.
+/// row is closed `cancelled` with the divergence in its `finally_error`, **after
+/// the child's row has closed**. The `202` says the cancel is complete, so by
+/// the time it is answered the child is settled too: its report already reads
+/// `cancelled`, its finally node has already run, and its row ended no later
+/// than its parent's.
 #[test]
 fn a_cancel_of_an_execution_whose_recovery_diverged_cancels_the_child_it_runs_through_the_cascade()
 {
@@ -1811,22 +1816,28 @@ fn a_cancel_of_an_execution_whose_recovery_diverged_cancels_the_child_it_runs_th
     assert_eq!(body["status"], "cancelled", "{body:#}");
     assert_eq!(body["cancelling"], false, "{body:#}");
 
-    let child_report = reaches(&app, &child, "cancelled", SETTLE);
+    // Asked once, not polled: the cancel was complete when it was answered,
+    // the child's settle with it.
+    let child_report: Value = app
+        .get(&format!("/executions/{child}"))
+        .expect("the status route answers")
+        .json();
+    assert_eq!(
+        child_report["status"], "cancelled",
+        "the child had settled before the cancel was answered: {child_report:#}"
+    );
     assert!(child_report.get("error").is_none(), "{child_report:#}");
     assert!(
         child_report.get("finally_error").is_none(),
         "the child's own finally node ran, and ran clean: {child_report:#}"
     );
-    assert!(!alive(rerun), "the child's command outlived the cascade");
-    let deadline = Instant::now() + SETTLE;
-    while ended(&log).len() < 2 && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
     assert_eq!(
         ended(&log),
         ["stepped|none", "cancelled|none"],
-        "the child's finally node ran at `cancelled`, and the parent's ran nowhere"
+        "the child's finally node had run at `cancelled` before the cancel was answered, \
+         and the parent's ran nowhere"
     );
+    assert!(!alive(rerun), "the child's command outlived the cascade");
 
     let rows = harness::journal_rows(
         &project,
@@ -1859,11 +1870,17 @@ fn a_cancel_of_an_execution_whose_recovery_diverged_cancels_the_child_it_runs_th
     let child_requested = child_row["requested_at"]
         .as_str()
         .expect("the child's request");
+    let child_ended = child_row["ended_at"].as_str().expect("the child's end");
     let parent_ended = parent_row["ended_at"].as_str().expect("the parent's end");
     assert!(
         child_requested <= parent_ended,
         "the child's cancel ({child_requested}) was recorded before the parent's row closed \
          ({parent_ended}): {rows:#}"
+    );
+    assert!(
+        child_ended <= parent_ended,
+        "the child's row ({child_ended}) had closed before the parent's did ({parent_ended}): \
+         {rows:#}"
     );
 
     let said = served.stop_and_read_stderr();
@@ -1879,6 +1896,124 @@ fn a_cancel_of_an_execution_whose_recovery_diverged_cancels_the_child_it_runs_th
         1,
         "{said}"
     );
+}
+
+/// **`serve`'s cancel leaves alone an execution a `run` beside it is running**
+/// (PRD resolved q75 ruling d, q28; Decision D165's "a `run`'s row is still
+/// `404`", D163's Status).
+///
+/// On SQLite a `run` opens the journal beside a `serve` that is up. Here the
+/// project's own `run` of `flow.long` is running its ten-minute command while
+/// the project is served: its row is open, its flow is declared, it is on no
+/// board of the `serve`'s and the `serve` runs no generation of it — every
+/// mark of an execution that process has not recovered, which its cancel would
+/// close, save one: its trigger is `manual`. So the cancel is the `404` of an
+/// id the app does not know; the row stays open, with no cancel request
+/// recorded and no `finally_error`; the status route does not know it; no
+/// finally node ran; and the `run` is still running its command.
+#[test]
+fn serves_cancel_of_an_execution_a_run_beside_it_is_running_is_404_and_leaves_its_row_open() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("cancel-run-beside-serve");
+    let (environment, log) = environment(&provider, &scratch);
+    let pid_file = PathBuf::from(format!("{}.pids", log.display()));
+    let Some(project) = harness::scratch_project("cancel-run-beside-serve") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, FIXTURE, &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    // The project's own `run`, launched as `agent-compose run` launches it.
+    let mut command = harness::bun();
+    command
+        .arg(project.join("src/index.ts"))
+        .args(["run", "flow.long", "--input", "linger=600"]);
+    harness::seal(&mut command, &environment);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut beside = Beside {
+        run: command.spawn().expect("bun runs"),
+        pids: pid_file.clone(),
+    };
+    let lingering = pids(&log, 1)[0];
+
+    let rows = closed_rows(&project);
+    let execution = rows
+        .as_array()
+        .and_then(|rows| rows.first())
+        .and_then(|row| row["id"].as_str())
+        .unwrap_or_else(|| panic!("the run's lifecycle row: {rows:#}"))
+        .to_string();
+    let kind = harness::journal_rows(
+        &project,
+        &format!("SELECT trigger_kind FROM executions WHERE id = '{execution}'"),
+    );
+    assert_eq!(
+        kind,
+        json!([{ "trigger_kind": "manual" }]),
+        "a `run` writes a `manual` row"
+    );
+
+    let (status, body) = cancel(&app, &execution);
+    assert_eq!(
+        status, 404,
+        "a `run`'s execution is not `serve`'s to cancel: {body:#}"
+    );
+    assert_eq!(
+        body["error"],
+        format!("no execution `{execution}` was started by this process"),
+        "{body:#}"
+    );
+    assert_eq!(
+        closed_rows(&project),
+        json!([{
+            "id": &execution,
+            "status": "open",
+            "error": null,
+            "finally_error": null,
+            "requested": 0,
+        }]),
+        "the row is the `run`'s, open, with no cancel request recorded"
+    );
+    let unknown = app
+        .get(&format!("/executions/{execution}"))
+        .expect("the status route answers");
+    assert_eq!(unknown.status, 404, "{}", unknown.text());
+    assert!(
+        ended(&log).is_empty(),
+        "no finally node ran: {:?}",
+        ended(&log)
+    );
+    assert!(
+        beside
+            .run
+            .try_wait()
+            .expect("the run can be waited on")
+            .is_none(),
+        "the `run` is still running"
+    );
+    assert!(alive(lingering), "the `run`'s command is still running");
+}
+
+/// A `run` started beside a `serve`, and the commands it started, ended when
+/// the test does, however it ends.
+struct Beside {
+    run: std::process::Child,
+    /// Where the linger shim wrote the pids of the commands the run started,
+    /// each in a process group of its own ([`kill_listed`]).
+    pids: PathBuf,
+}
+
+impl Drop for Beside {
+    fn drop(&mut self) {
+        let _ = self.run.kill();
+        let _ = self.run.wait();
+        kill_listed(&self.pids);
+    }
 }
 
 /// [`a_cancel_of_an_execution_whose_recovery_diverged_cancels_the_child_it_runs_through_the_cascade`]'s
