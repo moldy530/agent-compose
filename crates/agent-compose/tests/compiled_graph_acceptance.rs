@@ -23500,6 +23500,300 @@ fn a_cancel_closes_an_execution_whose_flow_the_build_no_longer_declares() {
     assert_eq!(receiver.of_event("settled").len(), 1, "one settle webhook");
 }
 
+/// **A cancel of an execution whose trigger the serving build no longer
+/// declares is refused until a build declares that trigger again**, and the
+/// serve log says so rather than naming a cancel the route refuses (PRD
+/// resolved q32, q75 ruling d, q81, Decision D165).
+///
+/// The parked `flow.gate`, started through `pushed`, and a next build that
+/// renames the flow **and** that trigger — removing a flow removes its
+/// triggers with it. A close is a cancel, and the cancel route is under the
+/// `auth:` of the trigger that started the execution: this build cannot read
+/// what `pushed` required, so it refuses the cancel `401` whatever the request
+/// carries, records nothing, and leaves the row open. The one line the start
+/// writes about the execution says the cancel needs that trigger declared
+/// again; no line promises a close the route refuses. A build that declares
+/// `pushed` again — the flow still renamed — closes the row, and the caller
+/// the row recorded is sent its settle webhook once.
+#[test]
+fn a_cancel_of_an_execution_whose_trigger_the_build_no_longer_declares_is_refused_until_it_is_declared_again()
+ {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "worth signing off" })),
+    ));
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    let Some(project) = harness::scratch_project("cancel-untriggered") else {
+        return;
+    };
+    let environment = harness::environment(&provider);
+    let Some(execution) = parked_and_killed(
+        &project,
+        &harness::fixture("durability"),
+        &environment,
+        &receiver,
+    ) else {
+        return;
+    };
+
+    let gone = harness::Scratch::new("cancel-untriggered-gone");
+    let untriggered = gone.path().join("main.yml");
+    std::fs::write(&untriggered, untriggered_gate()).expect("the scratch area is writable");
+    let Some(mut second) = harness::serve_entrypoint_into(&project, &untriggered, &environment)
+    else {
+        return;
+    };
+    let app = Client::new(&second.base_url).expect("a client for the generated app");
+    let refused = app
+        .send(Request::post(format!("/executions/{execution}/cancel")))
+        .expect("the cancel route answers");
+    assert_eq!(refused.status, 401, "{}", refused.text());
+    let body = refused.json();
+    assert_eq!(body["trigger"], "pushed", "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("it was started by the trigger `pushed`, which this build does not declare"),
+        "the refusal is q32's, for a trigger whose `auth:` this build cannot read: {body}"
+    );
+    let rows = harness::journal_rows(
+        &project,
+        &format!(
+            "SELECT executions.status AS status, cancellations.requested_at AS requested_at \
+             FROM executions LEFT JOIN cancellations ON cancellations.execution = executions.id \
+             WHERE executions.id = '{execution}'"
+        ),
+    );
+    assert_eq!(rows[0]["status"], "open", "the row stays open: {rows}");
+    assert!(
+        rows[0]["requested_at"].is_null(),
+        "a refused cancel records nothing: {rows}"
+    );
+
+    let said = second.stop_and_read_stderr();
+    let guarded = format!(
+        "`{execution}` (flow.gate) could not be recovered by this build: this build declares no \
+         flow `flow.gate`; its row stays open until `agent-compose cancel {execution}` closes it, \
+         which the cancel route refuses until this build declares the trigger `pushed` that \
+         started it again: a cancel is authenticated by that trigger's `auth:` (PRD resolved q32)"
+    );
+    assert_eq!(
+        said.lines().filter(|line| *line == guarded).count(),
+        1,
+        "the start says, once, what the cancel needs first:\n{said}"
+    );
+    assert!(
+        unrecovered_lines(&said, &execution, "flow.gate").is_empty(),
+        "no line names a cancel the route would refuse:\n{said}"
+    );
+    assert!(
+        receiver.of_event("settled").is_empty(),
+        "nothing settled: the row is open"
+    );
+
+    // The trigger comes back — the flow does not — and the cancel closes the
+    // row.
+    let back = harness::Scratch::new("cancel-untriggered-back");
+    let triggered = back.path().join("main.yml");
+    std::fs::write(&triggered, renamed_gate()).expect("the scratch area is writable");
+    let Some(mut third) = harness::serve_entrypoint_into(&project, &triggered, &environment) else {
+        return;
+    };
+    let app = Client::new(&third.base_url).expect("a client for the generated app");
+    let reason = "this build declares no flow `flow.gate`";
+    let closed = app
+        .send(Request::post(format!("/executions/{execution}/cancel")))
+        .expect("the cancel route answers");
+    assert_eq!(closed.status, 202, "{}", closed.text());
+    assert_closed_answer(&closed.json(), &execution, reason);
+    let expected = no_finally_ran(reason);
+    assert_closed_row(&project, &execution, &expected);
+    let pushed = receiver.wait_for_event("settled", 1, Duration::from_secs(30));
+    assert_eq!(pushed.len(), 1, "{pushed:?}");
+    assert_closed_document(&pushed[0].body, &execution, &expected);
+
+    let said = third.stop_and_read_stderr();
+    assert_eq!(
+        unrecovered_lines(&said, &execution, "flow.gate").len(),
+        1,
+        "a build that declares the trigger names the cancel that closes it:\n{said}"
+    );
+    assert!(
+        !said.contains("which the cancel route refuses"),
+        "…and says nothing of a refusal it would not make:\n{said}"
+    );
+}
+
+/// **A cancel that closes an execution lets go of what a settled execution
+/// lets go of**: the idempotency ledger rows its keyed writes left, and the
+/// partition of its `scope: execution` store (PRD resolved q69 ruling d, q81;
+/// grammar §11.3; Decisions D153, D165).
+///
+/// Two executions a `run` left open: `flow.staged`, killed while its model
+/// call is in flight, past a keyed write to the `scope: global` `store.ledger`
+/// — whose ledger row an open execution keeps, so its resume writes nothing
+/// twice — and `flow.papered`, parked at its pause, past a `put` to the
+/// `scope: execution` blob store `store.papers`, a directory a parked run
+/// leaves on disk for its resume. The next build declares neither flow, so no
+/// generation will ever end either execution: both keep what they hold while
+/// the serve runs, until a cancel closes each. Then the ledger row is pruned —
+/// the entry the write made stays — and the partition is removed.
+#[test]
+fn a_cancel_that_closes_an_execution_prunes_its_ledger_rows_and_removes_its_execution_scoped_partition()
+ {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "a staged note" })).after(Duration::from_secs(120)),
+    ));
+    let Some((project, built)) = harness::build_under_toolchain("durability", "cancel-releases")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the durability fixture did not build"
+    );
+    let shims = harness::Scratch::new("cancel-releases-tally");
+    let log = shims.path().join("tally.log");
+    harness::shim(
+        shims.path(),
+        "tally",
+        "printf 'ran\\n' >> \"$TALLY_LOG\"\nprintf 'tallied'\n",
+    );
+    let mut environment = harness::environment(&provider);
+    environment.push((
+        harness::TALLY_BIN.to_string(),
+        shims.path().display().to_string(),
+    ));
+    environment.push((harness::TALLY_LOG.to_string(), log.display().to_string()));
+
+    let staged = harness::crash_run(
+        &project,
+        &["run", "flow.staged", "--input", "topic=durability"],
+        &environment,
+        |_| provider.snapshot().requests >= 1,
+    )
+    .execution;
+    let parked = harness::run_formatted(
+        &project,
+        "durability",
+        "flow.papered",
+        &[("topic", "durability")],
+        None,
+        Some("json"),
+        &environment,
+    );
+    let said_on_stderr = parked.failed();
+    let report = parked.outputs();
+    assert_eq!(
+        report["status"], "interrupted",
+        "{report}\n{said_on_stderr}"
+    );
+    let papered = report["execution_id"]
+        .as_str()
+        .expect("a run names the execution it opened")
+        .to_string();
+
+    let ledger_file = project
+        .join(".agent-compose")
+        .join("stores")
+        .join("ledger.sqlite");
+    let ledger_rows = || {
+        harness::sqlite_rows(
+            &project,
+            &ledger_file,
+            &format!(
+                "SELECT COUNT(*) AS n FROM applied WHERE substr(idempotency_key, 1, {}) = '{staged}/'",
+                staged.len() + 1
+            ),
+        )[0]["n"]
+            .clone()
+    };
+    let partition = project
+        .join(".agent-compose")
+        .join("blobs")
+        .join("papers")
+        .join("execution")
+        .join(&papered);
+
+    let moved = harness::Scratch::new("cancel-releases-moved");
+    let entrypoint = moved.path().join("main.yml");
+    let source = std::fs::read_to_string(harness::fixture("durability")).expect("the fixture");
+    let edited = source
+        .replace("\nflow.staged:\n", "\nflow.restaged:\n")
+        .replace("\nflow.papered:\n", "\nflow.repapered:\n");
+    assert!(
+        edited.contains("\nflow.restaged:\n") && edited.contains("\nflow.repapered:\n"),
+        "both flows are renamed"
+    );
+    std::fs::write(&entrypoint, edited).expect("the scratch area is writable");
+    provider.reset();
+    let Some(mut served) = harness::serve_entrypoint_into(&project, &entrypoint, &environment)
+    else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    assert_eq!(
+        ledger_rows(),
+        json!(1),
+        "an execution the journal holds open keeps its ledger rows, though nothing here runs it"
+    );
+    assert!(
+        partition.is_dir(),
+        "…and its `scope: execution` partition: `{}` is not there",
+        partition.display()
+    );
+
+    for (execution, flow) in [(&staged, "flow.staged"), (&papered, "flow.papered")] {
+        let closed = app
+            .send(Request::post(format!("/executions/{execution}/cancel")))
+            .expect("the cancel route answers");
+        assert_eq!(closed.status, 202, "{}", closed.text());
+        let reason = format!("this build declares no flow `{flow}`");
+        assert_closed_answer(&closed.json(), execution, &reason);
+        assert_closed_row(&project, execution, &no_finally_ran(&reason));
+    }
+
+    harness::until(Duration::from_secs(30), || {
+        (ledger_rows() == json!(0)).then_some(())
+    });
+    assert_eq!(
+        harness::sqlite_rows(&project, &ledger_file, "SELECT key FROM entries"),
+        json!([{ "key": "entry" }]),
+        "the prune takes the ledger row, never the entry the write made"
+    );
+    harness::until(Duration::from_secs(30), || {
+        (!partition.exists()).then_some(())
+    });
+
+    let said = served.stop_and_read_stderr();
+    assert!(
+        !said.contains("could not be pruned") && !said.contains("could not be removed"),
+        "{said}"
+    );
+    assert_eq!(
+        provider.snapshot().requests,
+        0,
+        "nothing ran here: the close runs no node"
+    );
+}
+
+/// `durability` with `flow.gate` renamed and its `pushed` trigger renamed with
+/// it: a build that declares neither the flow an open execution ran nor the
+/// trigger that started it.
+fn untriggered_gate() -> String {
+    let edited = renamed_gate().replace("\n  pushed:\n", "\n  pushed_again:\n");
+    assert!(
+        !edited.contains("\n  pushed:\n") && edited.contains("\n  pushed_again:\n"),
+        "the trigger is renamed"
+    );
+    edited
+}
+
 /// A deploy file for `local` — the one target the `durability` fixture's
 /// detached dispatches compile under (Decision D59) — naming a trace sink at
 /// `collector`.
