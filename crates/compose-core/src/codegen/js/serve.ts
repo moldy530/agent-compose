@@ -5095,7 +5095,10 @@ const closing = new Map<string, Promise<Closed>>();
  *     finds its parent settled recovers it — by who takes it ([`takerOf`]):
  *     one a generation here runs is waited for until it has settled
  *     ([`descendantSettled`]), so a row above a descendant still being torn
- *     down never closes before it; one nothing here will take — a child whose
+ *     down never closes before it, and asked once more once it has — a
+ *     generation that settled with its row still open, its replay diverged
+ *     on the way to the frontier the cancel fires at, is one nothing here
+ *     will take any more; one nothing here will take — a child whose
  *     open parent is itself unrecoverable, a flow this build does not
  *     declare, a recovery of its own that failed — is closed the same way;
  *     and one a recovery here still takes keeps its row open with its request
@@ -5125,8 +5128,9 @@ function closeUnrecoverable(
     for (const descendant of await openDescendants(id)) {
       // Not the cancel's: no request reached it.
       if (descendant.cancelRequestedAt === undefined) continue;
-      let taker = await takerOf(executions, descendant, walked);
-      const parent = descendant.lineage?.parent;
+      let row = descendant;
+      let taker = await takerOf(executions, row, walked);
+      const parent = row.lineage?.parent;
       if (
         typeof taker !== "string" &&
         taker.kind === "owed" &&
@@ -5137,25 +5141,37 @@ function closeUnrecoverable(
         // yet re-issue it — which resumes it carrying its request. Once that
         // parent is over, it is asked again.
         await descendantSettled(executions, parent);
-        const now = await journaledExecution(descendant.id).catch(() => descendant);
+        const now = await journaledExecution(row.id).catch(() => row);
         if (now === undefined || now.status !== "open") continue;
-        taker = await takerOf(executions, now, walked);
+        row = now;
+        taker = await takerOf(executions, row, walked);
       }
       if (taker === "run") continue;
       if (taker === "here") {
         // A generation here runs it: the cascade cancelled it through its own
         // controller, and it settles `cancelled` on its own, finally node and
         // all. Nothing above it closes until it has (PRD resolved q81).
-        await descendantSettled(executions, descendant.id);
-        continue;
+        await descendantSettled(executions, row.id);
+        // …and that generation may settle with its row still open: one still
+        // waiting for its permit when the cascade reached it opens carrying
+        // the request, and its replay to the frontier can diverge, or its
+        // recorded inputs be refused, before the cancel fires (`runtime
+        // .staysOpen`). Its record is then on the board, failed and never
+        // announced, so it is asked once more — and nothing here will take
+        // it, so it is closed the same way.
+        const now = await journaledExecution(row.id).catch(() => row);
+        if (now === undefined || now.status !== "open") continue;
+        row = now;
+        taker = await takerOf(executions, row, walked);
+        if (typeof taker === "string") continue;
       }
       if (taker.kind === "owed") {
         // One this build can run: its request is down, and the recovery that
         // takes it completes the cancel (PRD resolved q75 ruling e).
-        owed.push(descendant.id);
+        owed.push(row.id);
         continue;
       }
-      await closeRow(executions, descendant, taker.reason, taker.execution);
+      await closeRow(executions, row, taker.reason, taker.execution);
     }
     const execution = await closeRow(executions, found.row, found.reason, found.execution);
     const leased = (await heldSlot(id)) ? found.row.trigger : undefined;
