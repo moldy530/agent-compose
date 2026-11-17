@@ -1728,6 +1728,13 @@ fn flow(
     if let Some(finally) = finally_descriptor(names, address, flow) {
         text.push_str(&format!("  finally: {finally},\n"));
     }
+    // A **placed** flow's every instance is dispatched to a worker claiming
+    // its placement (grammar §14.1, PRD resolved q84, Decision D171): the
+    // runtime reads this to hand the instance to the mesh instead of running
+    // it here, and the worker's own entry in `placedNodes` runs it.
+    if let Some(placement) = placement_of(ir, address) {
+        text.push_str(&format!("  placement: {},\n", names::string(&placement)));
+    }
     text.push_str(&format!(
         "  stream: (initial, options) =>\n    \
          {compiled}.stream(initial, {{\n      \
@@ -4154,6 +4161,12 @@ fn registry_source(
         if let Some(finally) = finally_descriptor(names, address, flow) {
             text.push_str(&format!("    finally: {finally},\n"));
         }
+        // A root execution of a placed flow is one dispatch to its placement
+        // (Decision D171): `runFlow` opens the row here and a worker runs the
+        // whole instance.
+        if let Some(placement) = placement_of(ir, address) {
+            text.push_str(&format!("    placement: {},\n", names::string(&placement)));
+        }
         text.push_str(&match &flow.inputs {
             Some(_) => {
                 let schema = names.value(&format!("{address}.inputs")).to_string();
@@ -4321,6 +4334,13 @@ export interface CompiledFlow {
    * in it, since no edge reaches it (grammar 7.9, `runtime.endInstance`).
    */
   readonly finally?: runtime.NodeDescriptor;
+  /**
+   * The placement that claims this flow, where one does (grammar 14.1, PRD
+   * resolved q84, Decision D171): every instance of it — a root execution of
+   * it included — runs on a worker claiming that placement, so `runFlow` opens
+   * the execution's row here and dispatches the whole instance there.
+   */
+  readonly placement?: string;
   /** Parse an invocation's inputs against the flow's own schema (grammar 13.2). */
   parse(inputs: unknown): Record<string, unknown>;
   /**
@@ -4823,6 +4843,52 @@ async function quiesceFlow(
       execution: identity,
     },
   };
+  // **A placed flow's root instance runs on a worker** (grammar 14.1, PRD
+  // resolved q84, Decision D171). The row is open; what is left is one
+  // dispatch to the placement — the instance, at the root path, keyed by this
+  // execution and the flow's address — which a worker claiming it runs whole,
+  // its `finally:` node included, journaling every effect home as a placed
+  // node's are (`docs/distributed.md` §2, §3.3). Its outputs are the dispatch's
+  // result, and the trace it made comes home with them; everything after is
+  // this function's ordinary way out — the release, the settle the caller
+  // writes, the webhook and the export. The execution's cancel is the
+  // dispatch's signal, so a cancel reaches the worker as one (§3.2); nothing
+  // else bounds it, as nothing bounds a root execution here.
+  if (flow.placement !== undefined) {
+    let answer: runtime.NodeAnswer;
+    try {
+      answer = await runtime.runPlacedRoot(flow, {
+        inputs: parsed,
+        execution: identity,
+        path: [],
+        signal: runtime.executionCancelSignal(executionId),
+      });
+    } catch (thrown) {
+      await release(thrown);
+      const ending = runtime.instanceEnding(executionId, thrown);
+      throw new runtime.FlowFailure(
+        address,
+        ending?.outcome === "cancelled"
+          ? "was cancelled"
+          : `did not complete on placement \`${flow.placement}\``,
+        runtime.instanceTrace(thrown) ?? [],
+        thrown,
+        runtime.finallyErrorOf(executionId),
+      );
+    }
+    await release(undefined);
+    const outputs = (answer.output ?? {}) as Record<string, unknown>;
+    const finallyError = runtime.finallyErrorOf(executionId);
+    return {
+      outputs,
+      trace: answer.inner ?? [],
+      // The hub holds no state of an instance it did not run: what it has is
+      // what the instance answered, laid over the state it would have started
+      // from.
+      state: { ...initial, ...outputs } as unknown as GraphState,
+      ...(finallyError === undefined ? {} : { finallyError }),
+    };
+  }
   let reached: { state?: GraphState; error?: unknown };
   try {
     reached = await runtime.quiesce(flow, initial, ceiling);
@@ -5039,6 +5105,14 @@ fn placed_source(ir: &Ir, names: &Names) -> String {
         let DefinitionBody::Flow(flow) = &definition.body else {
             continue;
         };
+        // A placed flow is dispatched under its own address wherever an
+        // instance of it starts — a root execution, a `flow:` node, a `map`
+        // item, a flow-as-tool call (Decision D171) — so it has one entry,
+        // and that entry runs the instance here, through the path an attached
+        // flow's instance takes on a worker.
+        if placement_of(ir, address).is_some() {
+            push(address.clone(), placed_flow(names, address), &mut seen);
+        }
         for node in &flow.nodes {
             let id = node.id.value.as_str();
             match &node.kind {
@@ -5140,6 +5214,37 @@ fn placed_agent(names: &Names, address: &str) -> String {
     )
 }
 
+/// One placed `flow.*`, its instance run where it was placed (Decision D171).
+///
+/// `runtime.runSubflowHere` is `runtime.runSubflow` without the placement:
+/// the instance starts in this process, under the dispatch's own instance path
+/// — empty for a root execution — and with the level-1 policy and the
+/// conversation the hub derived for it (§3.2's `policy` and `history`, the
+/// latter only on a `context: inherit` instantiation). Its finally node runs
+/// here when it ends, and what it answers carries the instance's whole trace
+/// home as `inner`, which the hub files on the entry or the dispatch record of
+/// whatever started it.
+fn placed_flow(names: &Names, address: &str) -> String {
+    format!(
+        "    async (input, context, site) => {{\n      \
+         const answer = await runtime.runSubflowHere({binding}, {{\n        \
+         inputs: (input ?? {{}}) as Record<string, unknown>,\n        \
+         execution: site.execution,\n        \
+         path: site.path,\n        \
+         signal: site.stop ?? context.signal,\n        \
+         ...(site.policy === undefined ? {{}} : {{ policy: site.policy }}),\n        \
+         ...(site.history === undefined ? {{}} : {{ history: site.history }}),\n      \
+         }});\n      \
+         return {{\n        \
+         output: answer.output,\n        \
+         ...(answer.history === undefined ? {{}} : {{ history: answer.history }}),\n        \
+         ...(answer.inner === undefined ? {{}} : {{ inner: answer.inner }}),\n      \
+         }};\n    \
+         }},\n",
+        binding = names.value(&format!("{address}.binding"))
+    )
+}
+
 /// One placed `tool.*`, run where it was placed.
 fn placed_tool(names: &Names, address: &str) -> String {
     format!(
@@ -5160,8 +5265,10 @@ const PLACED_DOC: &str = "\n\
 * placed node from meaning something different from an unplaced one.\n \
 *\n \
 * Keyed by the address a dispatch names: `<flow>.<node>` for an `agent:` or\n \
-* `function:` node, and the component's own address for a `map` dispatch target\n \
-* (grammar §14.1's three ways a graph reaches a placed component).\n \
+* `function:` node, the component's own address for a `map` dispatch target\n \
+* (grammar §14.1's three ways a graph reaches a placed component), and a placed\n \
+* `flow.*`'s own address for every instance of it, wherever one starts\n \
+* (Decision D171).\n \
 */\n";
 
 /// `registerHumanNodes`: this composition's `human` nodes, by

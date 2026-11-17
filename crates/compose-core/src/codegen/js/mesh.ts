@@ -75,14 +75,17 @@ import {
   effectKey,
   frontierRefusal,
   openJournal,
+  placedTraceOf,
   replayedFailure,
 } from "./journal.ts";
 import {
+  dispatchPlacedInstances,
   fireCancel,
   handsOutPlacedNodes,
   holdFinallyError,
   holdRemoteEnd,
   holdRemotePause,
+  placedInstanceFailure,
   registerParkedWork,
   registersHumanNode,
 } from "./runtime.ts";
@@ -387,6 +390,16 @@ export interface PlacedAnswer {
    * carry it as they would had the node run here.
    */
   readonly finallyError?: string;
+  /**
+   * The trace of the instance a **placed flow's** dispatch ran (grammar 14.1,
+   * Decision D171): the entries the instance's own nodes made on the worker,
+   * its `finally:` node's last. The hub files it where the same instance run
+   * here would have put it — the `inner` of the `flow:` node that started it,
+   * the record of the `map` item or the flow-as-tool call, or the whole trace
+   * of a root execution — so where an instance ran changes nothing a trace
+   * reports (§4.3, PRD 5.6). Absent on every other dispatch.
+   */
+  readonly inner?: readonly runtime.TraceEntry[];
 }
 
 /**
@@ -418,6 +431,17 @@ export interface PlacedSite {
    * agent unplaced instantiates it under.
    */
   readonly policy?: runtime.InstancePolicy;
+  /**
+   * The stop alone — a poll's `stop` list naming this dispatch, and never the
+   * execution's cancel — where the process runs a dispatch it was handed
+   * (`./worker-node.ts`); absent where a dispatch is answered in-process.
+   *
+   * What a **placed flow's** instance runs under (Decision D171): its nodes
+   * read the cancel each through its own activity, as a root execution's do on
+   * the hub, so a cancel ends each one `cancelled` on its own entry rather than
+   * stopping the instance from outside around them.
+   */
+  readonly stop?: AbortSignal;
 }
 
 /**
@@ -499,6 +523,58 @@ let executor: PlacedExecutor | undefined;
 export function executeLocally(run: PlacedExecutor): void {
   executor = run;
 }
+
+/**
+ * A **placed flow's** instance, dispatched (grammar 14.1, PRD resolved q84,
+ * Decision D171).
+ *
+ * `docs/distributed.md` §2 queues work to a placement and hands over a *node*,
+ * and the smallest honest change is that the node handed over is the one that
+ * instantiates the flow — a `flow:` node, a `map` item, a flow-as-tool call,
+ * or, for a root execution, the instance itself at the empty path. So this is
+ * [`dispatchPlaced`] under the flow's own address, carrying what an attached
+ * flow's instance crosses with (D79): its inputs, the instance path the worker
+ * keys its effects under, the level-1 policy, and — on a `context: inherit`
+ * instantiation — the conversation it starts from. Everything a dispatch is
+ * held to applies unchanged: it parks where nobody claims the placement, counts
+ * against a session's `max_running:`, is stopped by the instantiating node's
+ * deadline and by the execution's cancel, is superseded by a restart, and pauses
+ * at a `human:` node by settling paused. The worker answers with the instance's
+ * outputs and its whole trace.
+ *
+ * A failure keeps the trace too, and is restated as the instance's own
+ * [`runtime.SubflowFailure`], so the node that started it records its `inner`
+ * as it would have had the instance run here.
+ */
+dispatchPlacedInstances(async (flow, instance, signal) => {
+  let answer: PlacedAnswer;
+  try {
+    answer = await dispatchPlaced({
+      placement: flow.placement,
+      node: flow.address,
+      execution: instance.execution.id,
+      path: instance.path,
+      inputs: instance.inputs,
+      ...(instance.execution.item_index === undefined
+        ? {}
+        : { itemIndex: instance.execution.item_index }),
+      ...(instance.history === undefined
+        ? {}
+        : { history: instance.history as readonly runtime.Turn[] }),
+      ...(instance.policy === undefined ? {} : { policy: instance.policy }),
+      signal,
+    });
+  } catch (error) {
+    const trace = placedTraceOf(error);
+    if (trace === undefined) throw error;
+    throw placedInstanceFailure(flow.address, error, trace as readonly runtime.TraceEntry[]);
+  }
+  return {
+    output: answer.output,
+    ...(answer.history === undefined ? {} : { history: answer.history }),
+    ...(answer.inner === undefined ? {} : { inner: answer.inner }),
+  };
+});
 
 /** One placement wait, as a status report publishes it. */
 export interface PlacementWait {
@@ -655,7 +731,13 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
   // Every other ending leaves this loop on its first turn, which is why the two
   // reads that decide it are the first thing after the park.
   for (;;) {
-    const wait = `${site}/${nextOrdinal(options.execution, site)}`;
+    // A placed flow's **root** instance sits at the empty instance path
+    // (Decision D171), and its wait is keyed by the execution and the flow's
+    // address instead — `flow.build/0` — so the identity §6.1 fixes still has
+    // a frame to number, and one no node frame can spell (a node id holds no
+    // `.`).
+    const ordinal = nextOrdinal(options.execution, site);
+    const wait = site === "" ? `${options.node}/${ordinal}` : `${site}/${ordinal}`;
     const row = await journal.park({
       execution: options.execution,
       wait,
@@ -2386,7 +2468,9 @@ function recordOf(
  * and holds nothing of `stamp/0`'s.
  */
 function under(path: string, root: string): boolean {
-  return path === root || path.startsWith(`${root}/`);
+  // The empty path is a placed flow's root instance (Decision D171), and holds
+  // every path of its execution.
+  return root === "" || path === root || path.startsWith(`${root}/`);
 }
 
 /**
@@ -2620,7 +2704,14 @@ async function endingSettled(
       execution?.cancelRequestedAt !== undefined ||
       execution?.status === "cancelled";
     return asked
-      ? { kind: "error", name: CANCELLED, message: new ExecutionCancelled(row.execution).message }
+      ? {
+          kind: "error",
+          name: CANCELLED,
+          message: new ExecutionCancelled(row.execution).message,
+          // The trace a placed flow's instance made before the cancel ended
+          // it (Decision D171), beside the cancel as beside any failure.
+          ...(Array.isArray(body["inner"]) ? { inner: body["inner"] as unknown[] } : {}),
+        }
       : {
           kind: "error",
           name: "DispatchCancelledUnasked",
@@ -2665,12 +2756,17 @@ async function endingSettled(
           // with the rest of the outcome, so a replayed row reports what the
           // node's stores did as well as what its models did.
           ...(body["stores"] === undefined ? {} : { stores: body["stores"] }),
+          // A placed flow's instance trace — see [`PlacedAnswer.inner`].
+          ...(Array.isArray(body["inner"]) ? { inner: body["inner"] } : {}),
         },
       }
     : {
         kind: "error",
         name: String((body["error"] as Record<string, unknown>)["name"] ?? "Error"),
         message: String((body["error"] as Record<string, unknown>)["message"] ?? ""),
+        // …and the trace the instance made before it failed, beside the
+        // failure: kept on the row, and restated on the error a replay raises.
+        ...(Array.isArray(body["inner"]) ? { inner: body["inner"] as unknown[] } : {}),
       };
 }
 

@@ -465,6 +465,16 @@ fn execute_held(
         {
             body["finally_error"] = finally_error.clone();
         }
+        // …and the trace a placed flow's instance made before the cancel ended
+        // it (grammar 14.1, Decision D171): an OPTIONAL field the hub files
+        // where the instance's starter keeps it, and one a hub that does not
+        // read it ignores (§10.2).
+        if let Some(inner) = said
+            .and_then(|said| said.get("inner"))
+            .filter(|held| held.is_array())
+        {
+            body["inner"] = inner.clone();
+        }
         body
     };
     match handle.halted() {
