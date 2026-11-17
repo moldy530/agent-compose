@@ -227,6 +227,7 @@ import {
   dispatchPausesHome,
   executionCancelSignal,
   finallyErrorOf,
+  instanceTrace,
   onFinallyWork,
   refuseChildExecutions,
   releaseWorkspaces,
@@ -289,8 +290,19 @@ function unbounded(): AbortController {
  * hub stopped waiting for it — and recorded, it would be posted home and
  * replayed as the world's failure by the attempt the hub opens next (see *A
  * stop arrives as `SIGUSR2`*).
+ *
+ * Answers both signals: `placed`, the placed node's own, and `stopped`, the
+ * stop alone — what a **placed flow's** instance runs under (Decision D171).
+ * Its nodes read the execution's cancel each through its own activity, as the
+ * nodes of a root execution on the hub do, so the instance is not stopped
+ * from outside by a cancel: each node it was running ends `cancelled` on its
+ * own entry, and the instance ends on them.
  */
-function stoppable(cancel: AbortSignal, execution: string, dispatch: string): AbortSignal {
+function stoppable(
+  cancel: AbortSignal,
+  execution: string,
+  dispatch: string,
+): { readonly placed: AbortSignal; readonly stopped: AbortSignal } {
   const stop = unbounded();
   const everyNode = unbounded();
   const follow = (): void => {
@@ -307,7 +319,7 @@ function stoppable(cancel: AbortSignal, execution: string, dispatch: string): Ab
     if (!stop.signal.aborted) stop.abort(stopped);
     if (!everyNode.signal.aborted) everyNode.abort(stopped);
   });
-  return stop.signal;
+  return { placed: stop.signal, stopped: everyNode.signal };
 }
 
 /** The dispatch this process was handed, as §3.2 puts it on the wire. */
@@ -653,6 +665,8 @@ async function runPlaced(options: {
   readonly history?: readonly runtime.Turn[];
   readonly policy?: runtime.InstancePolicy;
   readonly signal?: AbortSignal;
+  /** [`PlacedSite.stop`], for the dispatch this process was handed. */
+  readonly stop?: AbortSignal;
 }): Promise<PlacedAnswer> {
   const run = placedNodes[options.node];
   if (run === undefined) {
@@ -704,6 +718,7 @@ async function runPlaced(options: {
     execution,
     ...(options.history === undefined ? {} : { history: options.history }),
     ...(options.policy === undefined ? {} : { policy: options.policy }),
+    ...(options.stop === undefined ? {} : { stop: options.stop }),
   });
   return {
     output: answer.output,
@@ -722,6 +737,9 @@ async function runPlaced(options: {
     // did nothing where the same agent unplaced reports what it did (PRD 5.8,
     // `docs/distributed.md` §4.3).
     ...(storeRecords.length === 0 ? {} : { stores: [...storeRecords] }),
+    // A placed flow's instance trace (Decision D171): the entries its nodes
+    // made here, which the hub files where the instance's starter keeps them.
+    ...(answer.inner === undefined ? {} : { inner: answer.inner }),
   };
 }
 
@@ -914,7 +932,7 @@ async function main(): Promise<void> {
   // and cancels nothing (see *A stop arrives as `SIGUSR2`*).
   const cancel = executionCancelSignal(dispatch.execution_id);
   cancelOnTerminate(dispatch.execution_id);
-  const placed = stoppable(cancel, dispatch.execution_id, dispatch.dispatch_id);
+  const { placed, stopped } = stoppable(cancel, dispatch.execution_id, dispatch.dispatch_id);
   // …and the worker is told whenever finally work starts and stops here, so a
   // cancel's grace does not cut off a `finally:` node that runs whole (see
   // *Finally work is reported*).
@@ -941,6 +959,7 @@ async function main(): Promise<void> {
         ? {}
         : { policy: dispatch.policy as runtime.InstancePolicy }),
       signal: placed,
+      stop: stopped,
     });
     line = {
       type: "result",
@@ -949,6 +968,7 @@ async function main(): Promise<void> {
       ...(answer.models === undefined ? {} : { models: answer.models }),
       ...(answer.toolDispatches === undefined ? {} : { tool_dispatches: answer.toolDispatches }),
       ...(answer.stores === undefined ? {} : { stores: answer.stores }),
+      ...(answer.inner === undefined ? {} : { inner: answer.inner }),
     };
   } catch (error) {
     // The node failed, which is an outcome rather than a crash: §3.4 takes "its
@@ -958,12 +978,17 @@ async function main(): Promise<void> {
     // a pause, which settles this dispatch and sends the wait home
     // ([`pausedOnAHuman`]).
     const paused = pausedOnAHuman(error);
+    // A placed flow's instance that failed — or that a cancel ended — made a
+    // trace on the way, and it goes home beside the ending, so the node that
+    // started the instance on the hub records it as it would had the instance
+    // run there (Decision D171). Nothing else a worker runs ends with one.
+    const inner = instanceTrace(error);
     line =
       // The hub's cancel, which this process stopped on: §3.4's fourth ending.
       cancelFired(dispatch.execution_id)
-        ? { type: "result", status: "cancelled" }
+        ? { type: "result", status: "cancelled", ...(inner === undefined ? {} : { inner }) }
         : paused === undefined
-          ? { type: "result", error: named(error) }
+          ? { type: "result", error: named(error), ...(inner === undefined ? {} : { inner }) }
           : { type: "result", paused };
   }
   // A `finally:` node that ran here and failed after its retries — a flow-as-tool

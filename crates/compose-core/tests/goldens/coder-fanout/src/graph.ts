@@ -608,6 +608,13 @@ export interface CompiledFlow {
    * in it, since no edge reaches it (grammar 7.9, `runtime.endInstance`).
    */
   readonly finally?: runtime.NodeDescriptor;
+  /**
+   * The placement that claims this flow, where one does (grammar 14.1, PRD
+   * resolved q84, Decision D171): every instance of it — a root execution of
+   * it included — runs on a worker claiming that placement, so `runFlow` opens
+   * the execution's row here and dispatches the whole instance there.
+   */
+  readonly placement?: string;
   /** Parse an invocation's inputs against the flow's own schema (grammar 13.2). */
   parse(inputs: unknown): Record<string, unknown>;
   /**
@@ -1174,6 +1181,52 @@ async function quiesceFlow(
       execution: identity,
     },
   };
+  // **A placed flow's root instance runs on a worker** (grammar 14.1, PRD
+  // resolved q84, Decision D171). The row is open; what is left is one
+  // dispatch to the placement — the instance, at the root path, keyed by this
+  // execution and the flow's address — which a worker claiming it runs whole,
+  // its `finally:` node included, journaling every effect home as a placed
+  // node's are (`docs/distributed.md` §2, §3.3). Its outputs are the dispatch's
+  // result, and the trace it made comes home with them; everything after is
+  // this function's ordinary way out — the release, the settle the caller
+  // writes, the webhook and the export. The execution's cancel is the
+  // dispatch's signal, so a cancel reaches the worker as one (§3.2); nothing
+  // else bounds it, as nothing bounds a root execution here.
+  if (flow.placement !== undefined) {
+    let answer: runtime.NodeAnswer;
+    try {
+      answer = await runtime.runPlacedRoot(flow, {
+        inputs: parsed,
+        execution: identity,
+        path: [],
+        signal: runtime.executionCancelSignal(executionId),
+      });
+    } catch (thrown) {
+      await release(thrown);
+      const ending = runtime.instanceEnding(executionId, thrown);
+      throw new runtime.FlowFailure(
+        address,
+        ending?.outcome === "cancelled"
+          ? "was cancelled"
+          : `did not complete on placement \`${flow.placement}\``,
+        runtime.instanceTrace(thrown) ?? [],
+        thrown,
+        runtime.finallyErrorOf(executionId),
+      );
+    }
+    await release(undefined);
+    const outputs = (answer.output ?? {}) as Record<string, unknown>;
+    const finallyError = runtime.finallyErrorOf(executionId);
+    return {
+      outputs,
+      trace: answer.inner ?? [],
+      // The hub holds no state of an instance it did not run: what it has is
+      // what the instance answered, laid over the state it would have started
+      // from.
+      state: { ...initial, ...outputs } as unknown as GraphState,
+      ...(finallyError === undefined ? {} : { finallyError }),
+    };
+  }
   let reached: { state?: GraphState; error?: unknown };
   try {
     reached = await runtime.quiesce(flow, initial, ceiling);
@@ -1304,7 +1357,9 @@ export function createBuilder() {
  * placed node from meaning something different from an unplaced one.
  *
  * Keyed by the address a dispatch names: `<flow>.<node>` for an `agent:` or
- * `function:` node, and the component's own address for a `map` dispatch target
- * (grammar §14.1's three ways a graph reaches a placed component).
+ * `function:` node, the component's own address for a `map` dispatch target
+ * (grammar §14.1's three ways a graph reaches a placed component), and a placed
+ * `flow.*`'s own address for every instance of it, wherever one starts
+ * (Decision D171).
  */
 export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {};

@@ -453,6 +453,20 @@ export const httpTriggers: readonly HttpTrigger[] = [
     sessionKey: (payload) => text("payload.body.session", roots(payload), "`session_key` of the trigger `on_conversation`"),
   },
   {
+    name: "on_coordinated",
+    flow: "flow.coordinated",
+    path: "/coordinations",
+    method: "POST",
+    respond: "async",
+    readsBody: true,
+    input: (payload) => {
+      const bound = roots(payload);
+      return {
+        "path": runtime.toJson(runtime.evaluate("payload.body.path", bound)),
+      };
+    },
+  },
+  {
     name: "on_direct_sign",
     flow: "flow.direct",
     path: "/direct-signings",
@@ -513,6 +527,90 @@ export const httpTriggers: readonly HttpTrigger[] = [
     name: "on_overdue_release",
     flow: "flow.overdue",
     path: "/overdue-releases",
+    method: "POST",
+    respond: "async",
+    readsBody: true,
+    input: (payload) => {
+      const bound = roots(payload);
+      return {
+        "path": runtime.toJson(runtime.evaluate("payload.body.path", bound)),
+      };
+    },
+  },
+  {
+    name: "on_placed_asking",
+    flow: "flow.placed_asking",
+    path: "/placed-askings",
+    method: "POST",
+    respond: "async",
+    readsBody: true,
+    input: (payload) => {
+      const bound = roots(payload);
+      return {
+        "path": runtime.toJson(runtime.evaluate("payload.body.path", bound)),
+      };
+    },
+  },
+  {
+    name: "on_placed_build",
+    flow: "flow.placed_build",
+    path: "/placed-builds",
+    method: "POST",
+    respond: "async",
+    readsBody: true,
+    input: (payload) => {
+      const bound = roots(payload);
+      return {
+        "path": runtime.toJson(runtime.evaluate("payload.body.path", bound)),
+      };
+    },
+  },
+  {
+    name: "on_placed_builds",
+    flow: "flow.placed_builds",
+    path: "/placed-build-batches",
+    method: "POST",
+    respond: "async",
+    readsBody: true,
+    input: (payload) => {
+      const bound = roots(payload);
+      return {
+        "paths": runtime.toJson(runtime.evaluate("payload.body.paths", bound)),
+      };
+    },
+  },
+  {
+    name: "on_placed_closing",
+    flow: "flow.placed_closing",
+    path: "/placed-closings",
+    method: "POST",
+    respond: "async",
+    readsBody: true,
+    input: (payload) => {
+      const bound = roots(payload);
+      return {
+        "path": runtime.toJson(runtime.evaluate("payload.body.path", bound)),
+      };
+    },
+  },
+  {
+    name: "on_placed_retried",
+    flow: "flow.placed_retried",
+    path: "/placed-retried-builds",
+    method: "POST",
+    respond: "async",
+    readsBody: true,
+    input: (payload) => {
+      const bound = roots(payload);
+      return {
+        "path": runtime.toJson(runtime.evaluate("payload.body.path", bound)),
+      };
+    },
+  },
+  {
+    name: "on_placed_tidying",
+    flow: "flow.placed_tidying",
+    path: "/placed-tidyings",
     method: "POST",
     respond: "async",
     readsBody: true,
