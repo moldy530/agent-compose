@@ -66,10 +66,13 @@
 //!    [`drive`];
 //!  * **the command's environment is its store's backend references alone**
 //!    (PRD resolved q82, Decision D166): a `count` with a model provider's and
-//!    a trigger's variables unset succeeds, the backend's own variable unset is
-//!    refused exit `2` naming only it, `run` is still refused over the
-//!    provider's — and the emitted project run by hand skips its load-time
-//!    check for `store` alone — [`environment`], once per arm;
+//!    a trigger's variables unset succeeds, and so does one with every other
+//!    backend entry's unset; the bound entry's own variable unset is refused
+//!    exit `2` naming only it — for an alias and for the `kv` default alike — a
+//!    `vector` store is refused as usage before its backend's variable is asked
+//!    for, `run` is still refused over the provider's, and the emitted project
+//!    run by hand skips its load-time check for `store` alone —
+//!    [`environment`], once per arm;
 //!  * a composition the compiler refuses, reported on stderr for an `export`
 //!    and never among its lines —
 //!    [`a_refused_composition_is_reported_beside_an_exports_summary_not_among_its_lines`];
@@ -2656,10 +2659,41 @@ const WEBHOOK_TOKEN: &str = "AGENT_COMPOSE_CLI_WEBHOOK_TOKEN";
 /// Where the dialled arm's backend entry is written, as a refusal names it.
 const STORE_SITE: &str = "deploy.storage_backends.aliases.cli_db.url";
 
-/// A composition whose hub needs three variables a `store` command spends at
-/// most one of: a model provider's `${PROVIDER_URL}`, an `http` trigger's
-/// `${WEBHOOK_TOKEN}`, and — on a dialled arm — the store's own backend's
-/// `${STORE_URL}` (PRD resolved q82).
+/// The variable the dialled arm's `kv` **default** is reached at: the entry a
+/// store naming no `backend:` falls to, beside the alias `cli_db` another store
+/// names.
+const DEFAULT_STORE_URL: &str = "AGENT_COMPOSE_CLI_DEFAULT_STORE_URL";
+
+/// …and where that default is written, as a refusal names it.
+const DEFAULT_SITE: &str = "deploy.storage_backends.defaults.kv.url";
+
+/// The variable of an alias no store of the composition binds — a backend entry
+/// the hub's manifest carries and no store command opens.
+const OTHER_STORE_URL: &str = "AGENT_COMPOSE_CLI_OTHER_STORE_URL";
+
+/// The variable the vector store's alias is reached at: a backend no store
+/// command opens either, because the command reads and writes `kv` stores.
+const DOCS_URL: &str = "AGENT_COMPOSE_CLI_DOCS_URL";
+
+/// Every variable the environment composition references on a dialled arm, the
+/// list each refusal is checked against for what it must **not** name.
+const COMPOSITION_VARIABLES: [&str; 6] = [
+    PROVIDER_URL,
+    WEBHOOK_TOKEN,
+    STORE_URL,
+    DEFAULT_STORE_URL,
+    OTHER_STORE_URL,
+    DOCS_URL,
+];
+
+/// A composition whose hub needs variables a `store` command spends at most one
+/// of: a model provider's `${PROVIDER_URL}`, an `http` trigger's
+/// `${WEBHOOK_TOKEN}`, and — on a dialled arm — four `storage_backends:`
+/// entries' (PRD resolved q82). `store.health_*` binds the alias `cli_db`
+/// (`${STORE_URL}`), `store.prefs_*` names no `backend:` and so falls to the
+/// `kv` default (`${DEFAULT_STORE_URL}`), `store.docs_*` is a `vector` store on
+/// the alias `docs_db` (`${DOCS_URL}`), and the alias `other_db`
+/// (`${OTHER_STORE_URL}`) is bound by nothing — see [`environment_deploy`].
 fn environment_composition(suffix: &str) -> String {
     format!(
         r#"version: "0.1"
@@ -2686,6 +2720,23 @@ store.health_{suffix}:
   value_schema:
     text: {{ type: string }}
 
+store.prefs_{suffix}:
+  kind: kv
+  scope: global
+  description: What the target's kv default holds.
+  value_schema:
+    text: {{ type: string }}
+
+store.docs_{suffix}:
+  kind: vector
+  scope: global
+  description: What the command does not read.
+  backend: docs_db
+  embed:
+    model: text-embedding-3-small
+    provider: provider.vendor
+    dimensions: 8
+
 flow.ask:
   inputs:
     q: {{ type: string }}
@@ -2711,6 +2762,22 @@ triggers:
     )
 }
 
+/// The dialled arm's deploy file: four backend entries, each with a variable
+/// of its own — the alias `store.health_*` binds, the `kv` default
+/// `store.prefs_*` falls to, an alias nothing binds, and the vector store's.
+fn environment_deploy(provider: &str) -> String {
+    format!(
+        "version: \"0.1\"\n\
+         storage_backends:\n  \
+           defaults:\n    \
+             kv: {{ provider: {provider}, url: \"${{{DEFAULT_STORE_URL}}}\" }}\n  \
+           aliases:\n    \
+             cli_db: {{ provider: {provider}, url: \"${{{STORE_URL}}}\" }}\n    \
+             other_db: {{ provider: {provider}, url: \"${{{OTHER_STORE_URL}}}\" }}\n    \
+             docs_db: {{ provider: chroma, url: \"${{{DOCS_URL}}}\" }}\n"
+    )
+}
+
 /// **A `store` command's environment is its store's backend references alone**
 /// (PRD resolved q82, Decision D166), on one arm.
 ///
@@ -2720,15 +2787,23 @@ triggers:
 ///
 ///  * through `agent-compose store` — the launcher's manifest and the emitted
 ///    project's both — a `count` with the provider's and the trigger's
-///    variables unset succeeds;
-///  * on a dialled arm, the same `count` with the backend's **own** variable
-///    unset is refused, exit `2`, naming only that variable and its site;
+///    variables unset succeeds, and so does one with every **other** backend
+///    entry's variable unset: the target's `kv` default, an alias nothing
+///    binds, and the vector store's;
+///  * on a dialled arm, each `kv` store's `count` with its own entry's
+///    variable unset is refused, exit `2`, naming only that variable and that
+///    entry's site — the alias for `store.health_*`, the `kv` default for
+///    `store.prefs_*`, each with the other's variable set, so neither entry's
+///    variable stands in for the other's;
+///  * a `vector` store is refused as usage — the command reads and writes `kv`
+///    stores — before any environment is read, with its backend's variable
+///    unset: no credential is demanded for a backend the command never opens;
 ///  * `agent-compose run` on the same composition is still refused naming the
 ///    provider's variable — the hub's manifest is unchanged;
 ///  * the emitted project driven by hand (`bun src/index.ts …`, which is what an
 ///    ejected project's operator types): its load-time check does not fire for
 ///    `store`, and does for `run` — and on a dialled arm its `store` verb
-///    refuses the backend's own variable itself, exit `2`, with
+///    refuses the bound entry's variable itself, exit `2`, with
 ///    `readEnvironment`'s message, before anything is opened.
 fn environment(arm: &Arm) {
     let address = match arm.variable {
@@ -2757,6 +2832,8 @@ fn environment(arm: &Arm) {
     let out = Scratch::at(out);
     let suffix = run_unique();
     let store = format!("store.health_{suffix}");
+    let prefs = format!("store.prefs_{suffix}");
+    let docs = format!("store.docs_{suffix}");
     let source = Scratch::new(&format!("store-cli-environment-{}", arm.provider));
     let entrypoint = source.path().join("main.yml");
     std::fs::write(&entrypoint, environment_composition(&suffix))
@@ -2768,10 +2845,7 @@ fn environment(arm: &Arm) {
                 .expect("the scratch area is writable");
             std::fs::write(
                 source.path().join("deploy/remote.yml"),
-                format!(
-                    "version: \"0.1\"\nstorage_backends:\n  aliases:\n    cli_db: {{ provider: {}, url: \"${{{STORE_URL}}}\" }}\n",
-                    arm.provider
-                ),
+                environment_deploy(arm.provider),
             )
             .expect("the scratch area is writable");
             ("remote", vec![(STORE_URL.to_string(), address.clone())])
@@ -2817,17 +2891,23 @@ fn environment(arm: &Arm) {
             output: command.stdin(Stdio::null()).output().expect("bun runs"),
         }
     };
-    let unrelated = |said: &str, what: &str| {
-        for variable in [PROVIDER_URL, WEBHOOK_TOKEN] {
+    // What a store command said names no variable of the composition but
+    // `needed` — the one its store's entry references, where it has one.
+    let names_only = |said: &str, what: &str, needed: Option<&str>| {
+        for variable in COMPOSITION_VARIABLES {
+            if Some(variable) == needed {
+                continue;
+            }
             assert!(
                 !said.contains(variable),
-                "{what} named `{variable}`, which the store command never spends:\n{said}"
+                "{what} named `{variable}`, which the store command does not spend:\n{said}"
             );
         }
     };
 
-    // The health check, with the provider's and the trigger's variables unset
-    // and the backend's own set where it has one.
+    // The health check, with the provider's and the trigger's variables unset,
+    // every other backend entry's unset, and the store's own entry's set where
+    // it has one.
     let counted = compose(&["store", "count"], &[&store, "--format", "json"], &backend);
     counted.exits(0);
     assert_eq!(
@@ -2835,7 +2915,23 @@ fn environment(arm: &Arm) {
         json!({ "count": 0 }),
         "the command reached the store and counted it"
     );
-    unrelated(&counted.stderr(), "`store count`");
+    names_only(&counted.stderr(), "`store count`", None);
+
+    // A vector store is the command's usage refusal, and it comes first: its
+    // backend's `${DOCS_URL}` is unset, and is not what the operator is told.
+    let vector = compose(&["store", "count"], &[&docs], &[]);
+    vector.exits(2);
+    assert!(
+        vector
+            .stderr()
+            .contains(&format!("`{docs}` is a `vector` store"))
+            && vector
+                .stderr()
+                .contains("the store command reads and writes `kv` stores"),
+        "a vector store is refused for what it is, before any environment is read:\n{}",
+        vector.stderr()
+    );
+    names_only(&vector.stderr(), "the launcher's vector refusal", None);
 
     // `run` on the same composition is still the hub, and still refused over
     // the provider's variable — before anything is spawned.
@@ -2858,7 +2954,21 @@ fn environment(arm: &Arm) {
     );
     by_hand_count.exits(0);
     assert_eq!(by_hand_count.json(), json!({ "count": 0 }));
-    unrelated(&by_hand_count.stderr(), "the emitted `store count`");
+    names_only(&by_hand_count.stderr(), "the emitted `store count`", None);
+    let by_hand_vector = by_hand(&["store", "count", "--", &docs], &[]);
+    by_hand_vector.exits(2);
+    assert!(
+        by_hand_vector
+            .stderr()
+            .contains(&format!("`{docs}` is a `vector` store")),
+        "the emitted verb refuses a vector store as usage, before its environment:\n{}",
+        by_hand_vector.stderr()
+    );
+    names_only(
+        &by_hand_vector.stderr(),
+        "the emitted verb's vector refusal",
+        None,
+    );
     // …and fires for `run`, naming the provider's variable at load.
     let by_hand_run = by_hand(&["run", "flow.ask", "--input", "q=hello"], &backend);
     assert!(
@@ -2875,41 +2985,83 @@ fn environment(arm: &Arm) {
         by_hand_run.stderr()
     );
 
-    if address.is_none() {
+    let Some(address) = address else {
         return;
-    }
+    };
+    let only = |name: &str| vec![(name.to_string(), address.clone())];
 
-    // The backend's own variable is the one the command needs: refused by the
-    // launcher, exit `2`, naming it and its site and nothing else…
-    let unset = compose(&["store", "count"], &[&store], &[]);
-    unset.exits(2);
-    assert!(
-        unset
-            .stderr()
-            .contains(&format!("`{STORE_URL}` (referenced by `{STORE_SITE}`)"))
-            && unset.stderr().contains("is not set"),
-        "the refusal names the backend's variable and where it is written:\n{}",
-        unset.stderr()
+    // The store that falls to the `kv` default needs that entry's variable and
+    // no other: counted with `${DEFAULT_STORE_URL}` alone set, by the launcher
+    // and by hand.
+    let defaulted = compose(
+        &["store", "count"],
+        &[&prefs, "--format", "json"],
+        &only(DEFAULT_STORE_URL),
     );
-    unrelated(&unset.stderr(), "the launcher's refusal");
+    defaulted.exits(0);
     assert_eq!(
-        unset.stdout(),
-        "",
-        "nothing was opened, so nothing is answered"
+        defaulted.json(),
+        json!({ "count": 0 }),
+        "the command opened the `kv` default and counted the store there"
+    );
+    names_only(&defaulted.stderr(), "`store count` on the default", None);
+    let defaulted_by_hand = by_hand(
+        &["store", "count", "--format", "json", "--", &prefs],
+        &only(DEFAULT_STORE_URL),
+    );
+    defaulted_by_hand.exits(0);
+    assert_eq!(defaulted_by_hand.json(), json!({ "count": 0 }));
+    names_only(
+        &defaulted_by_hand.stderr(),
+        "the emitted `store count` on the default",
+        None,
     );
 
-    // …and by the emitted verb itself, run by hand: `readEnvironment`'s own
-    // message, as a usage error, before the backend is opened.
-    let unset_by_hand = by_hand(&["store", "count", "--", &store], &[]);
-    unset_by_hand.exits(2);
-    assert!(
-        unset_by_hand.stderr().contains(&format!(
-            "error: missing environment variable: {STORE_URL} (referenced by {STORE_SITE})"
-        )),
-        "the emitted verb refuses the backend's variable with `readEnvironment`'s message:\n{}",
-        unset_by_hand.stderr()
-    );
-    unrelated(&unset_by_hand.stderr(), "the emitted verb's refusal");
+    // Each `kv` store's own entry's variable is the one the command needs:
+    // refused by the launcher, exit `2`, naming it and its site and nothing
+    // else — with the **other** entry's variable set, so the one cannot stand
+    // in for the other…
+    for (address, name, site, set) in [
+        (&store, STORE_URL, STORE_SITE, DEFAULT_STORE_URL),
+        (&prefs, DEFAULT_STORE_URL, DEFAULT_SITE, STORE_URL),
+    ] {
+        let unset = compose(&["store", "count"], &[address], &only(set));
+        unset.exits(2);
+        assert!(
+            unset
+                .stderr()
+                .contains(&format!("`{name}` (referenced by `{site}`)."))
+                && unset
+                    .stderr()
+                    .contains("an environment variable this composition references is not set"),
+            "the refusal names `{address}`'s entry's one variable and where it is written:\n{}",
+            unset.stderr()
+        );
+        names_only(&unset.stderr(), "the launcher's refusal", Some(name));
+        assert_eq!(
+            unset.stdout(),
+            "",
+            "nothing was opened, so nothing is answered"
+        );
+
+        // …and by the emitted verb itself, run by hand: `readEnvironment`'s own
+        // message, as a usage error, before the backend is opened.
+        let unset_by_hand = by_hand(&["store", "count", "--", address], &only(set));
+        unset_by_hand.exits(2);
+        assert!(
+            unset_by_hand.stderr().contains(&format!(
+                "error: missing environment variable: {name} (referenced by {site})\n"
+            )),
+            "the emitted verb refuses `{address}`'s entry's variable with `readEnvironment`'s \
+             message:\n{}",
+            unset_by_hand.stderr()
+        );
+        names_only(
+            &unset_by_hand.stderr(),
+            "the emitted verb's refusal",
+            Some(name),
+        );
+    }
 }
 
 #[test]
