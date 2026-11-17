@@ -1,0 +1,38 @@
+---
+source: crates/agent-compose/tests/cli.rs
+expression: stdout(&output)
+---
+Compile a spec to a TypeScript project (validates first; emits only when clean; `--restamp` instead rewrites a built tree's hash to what its files hash to)
+
+Usage: agent-compose build [OPTIONS] <PATH>
+
+Arguments:
+  <PATH>
+          Path to the spec entrypoint (conventionally `main.yml`)
+
+Options:
+      --target <NAME>
+          Deploy target to resolve and emit for
+          
+          [default: local]
+
+      --out <DIR>
+          Where to write the generated project [default: <project>/build/<target>]
+
+      --check
+          Write nothing; report whether the directory already matches the spec
+
+      --restamp
+          Recompute `ARTIFACT_HASH` over the output directory as it stands, after a hand edit; reads no spec and builds nothing
+
+      --format <FORMAT>
+          How to report what was found
+
+          Possible values:
+          - human: Written for a person, on stderr
+          - json:  One JSON object on stdout
+          
+          [default: human]
+
+  -h, --help
+          Print help (see a summary with '-h')

@@ -512,6 +512,28 @@ fn a_usage_error_exits_two() {
     assert_eq!(code(&output), 2, "a missing path is a usage error");
 }
 
+/// clap's own pages for the verbs whose flags PRD resolved q87 changed — `build`
+/// (`--restamp`) and the four that take `--no-build` — byte for byte.
+///
+/// `--help` is the first thing a coding agent reads (PRD resolved q23), so a
+/// flag added, dropped or re-described is a reviewed diff here rather than a
+/// document that quietly stopped matching. `store`'s pages are pinned in
+/// `tests/store_cli.rs`, and pin the other half of the same ruling: no
+/// `--no-build` there.
+#[test]
+fn the_help_pages_of_the_verbs_that_build_or_skip_the_build_are_pinned() {
+    for verb in ["build", "run", "serve", "cancel", "worker"] {
+        let output = Command::cargo_bin("agent-compose")
+            .expect("the binary under test is built")
+            .env("NO_COLOR", "1")
+            .args([verb, "--help"])
+            .output()
+            .expect("the command runs");
+        assert_eq!(code(&output), 0, "{verb} --help");
+        insta::assert_snapshot!(format!("{verb}_help"), stdout(&output));
+    }
+}
+
 /// `resume`'s own command-line surface: two required positionals, and neither
 /// of `run`'s two invocation flags.
 ///
@@ -542,6 +564,14 @@ fn resume_takes_an_execution_and_neither_of_runs_invocation_flags() {
     assert!(
         stdout(&help).contains("--target") && stdout(&help).contains("--out"),
         "it resolves and builds a composition like `run` does:\n{}",
+        stdout(&help)
+    );
+    // …and it always builds: PRD resolved q87 gives `--no-build` to `serve`,
+    // `run`, `worker` and `cancel`, and a resume replays a journal against the
+    // build it makes, as it always has (Decision D170).
+    assert!(
+        !stdout(&help).contains("--no-build"),
+        "`resume` takes no `--no-build`:\n{}",
         stdout(&help)
     );
 

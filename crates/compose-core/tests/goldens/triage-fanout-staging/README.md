@@ -812,6 +812,20 @@ stay at the compiler's pins either way.
 | `@types/node` | `22.20.1` |
 | `typescript` | `7.0.2` |
 
+## Launching this tree as it stands
+
+`agent-compose run`, `agent-compose serve` and `agent-compose cancel` take
+`--no-build`, which launches this directory as it stands rather than building
+it first: the spec is not read, and a directory another release of the compiler
+wrote — or one holding a file without the header above at a name a build writes
+— is refused. A generated file edited by hand still runs that way. It no longer
+matches the `ARTIFACT_HASH` in `src/artifact.ts`, though, and a worker refuses
+the artifact a hub serves of it, because the hash is how a worker knows it runs
+only what the compiler emitted. `agent-compose build <path> --restamp`
+recomputes the hash over the files as they stand and says that this tree no
+longer matches any source; the next `agent-compose build <path>` writes the
+spec's tree back over it.
+
 ## Ejecting
 
 Copy this directory somewhere else and stop regenerating it. It is a plain

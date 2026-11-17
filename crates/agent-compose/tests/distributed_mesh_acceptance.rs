@@ -104,8 +104,9 @@ struct Mesh {
     provider: MockProvider,
     /// The built project — and its journal — which outlive a restart.
     project: PathBuf,
-    /// Removed when the test ends.
-    _scratch: harness::Scratch,
+    /// Removed when the test ends — or `None` where the test owns the project
+    /// and serves it more than once ([`Mesh::start_as_built`]).
+    _scratch: Option<harness::Scratch>,
     /// The composition this hub is served from.
     ///
     /// Ordinarily the fixture where it is committed. One test serves a **copy**
@@ -153,10 +154,37 @@ impl Mesh {
         Some(Self {
             served,
             provider,
-            _scratch: harness::Scratch::at(project.clone()),
+            _scratch: Some(harness::Scratch::at(project.clone())),
             project,
             entrypoint,
             _composition: composition,
+            client,
+            base_url,
+            environment,
+        })
+    }
+
+    /// Serve a tree **already built** into `project` as it stands —
+    /// `agent-compose serve --no-build` (PRD resolved q87) — with a scripted
+    /// provider beside it.
+    ///
+    /// The project is the caller's, and outlives this hub: a test that serves
+    /// one tree twice, with an edit between, owns the directory both serve.
+    fn start_as_built(project: &Path) -> Option<Self> {
+        let provider = MockProvider::start().expect("a loopback port");
+        let environment = environment(&provider);
+        let served = harness::serve_as_built(project, &environment)?;
+        let client = Client::new(&served.base_url)
+            .expect("the hub's address parses")
+            .with_timeout(Duration::from_secs(30));
+        let base_url = served.base_url.clone();
+        Some(Self {
+            served,
+            provider,
+            _scratch: None,
+            project: project.to_path_buf(),
+            entrypoint: harness::fixture(FIXTURE),
+            _composition: None,
             client,
             base_url,
             environment,
@@ -264,6 +292,19 @@ impl Mesh {
             &self.environment,
             purpose,
             Some(data_dir.to_path_buf()),
+        )
+    }
+
+    /// The same again, with `--no-build` on the worker's command line — which
+    /// it accepts and which changes nothing, since a worker builds nothing
+    /// (PRD resolved q87, Decision D170).
+    fn worker_into_without_a_build(&self, purpose: &str, data_dir: &Path) -> Worker {
+        Worker::start_with(
+            &self.base_url,
+            &self.environment,
+            purpose,
+            Some(data_dir.to_path_buf()),
+            &["--no-build"],
         )
     }
 
@@ -410,6 +451,18 @@ impl Worker {
         purpose: &str,
         data_dir: Option<PathBuf>,
     ) -> Self {
+        Self::start_with(base_url, environment, purpose, data_dir, &[])
+    }
+
+    /// [`Worker::start`], with `extra` flags after the four every worker here
+    /// is given.
+    fn start_with(
+        base_url: &str,
+        environment: &[(String, String)],
+        purpose: &str,
+        data_dir: Option<PathBuf>,
+        extra: &[&str],
+    ) -> Self {
         let data_dir = data_dir.unwrap_or_else(|| scratch_data_dir(purpose));
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-compose"));
         command
@@ -419,6 +472,7 @@ impl Worker {
             .args(["--token-env", TOKEN_VARIABLE])
             .arg("--data-dir")
             .arg(&data_dir)
+            .args(extra)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1214,6 +1268,153 @@ fn a_worker_with_an_empty_data_directory_fetches_the_artifact_and_is_dispatched(
     // of nodes it will never run.
     assert!(tree.join("src/graph.ts").is_file());
     assert!(tree.join("manifest.json").is_file());
+}
+
+/// **A hub served without a build from a restamped tree hands its workers the
+/// restamped artifact, and they accept it** (PRD resolved q87, Decision D170).
+///
+/// The mesh's half of the integrity promise, end to end. The fixture is built
+/// for its mesh target and one byte of its tree — the `README.md` every
+/// artifact carries — is edited by hand on the hub's disk. Two serves of that
+/// one tree, each `serve --no-build`, and two workers, each started with the
+/// `--no-build` it accepts and ignores:
+///
+/// 1. **Before the restamp** the hub still names the hash the build wrote, and
+///    tars the edited bytes off its disk for it (§3.5), so the worker's
+///    verification — the compiler's own rule over the entries it unpacked —
+///    answers a different hash and the worker stops, exit `2`, naming both,
+///    having materialised nothing. That is the refusal the ruling keeps.
+/// 2. **After `build --restamp`** the hub names the restamped hash in its join
+///    answer, which is the hash of the files on disk; the worker fetches that
+///    tarball, its verification agrees, it materialises the tree under that
+///    hash — the hand edit in it — and runs the placed node to completion.
+///
+/// The worker hashes the **entries it unpacked**, not the tarball's bytes
+/// (`worker::artifact::materialise`), which is why the restamp's answer is the
+/// one it computes: both are `hash_of` over the same files' bytes.
+#[test]
+fn a_hub_served_without_a_build_from_a_restamped_tree_hands_workers_the_restamped_artifact() {
+    let Some(project) = harness::scratch_project("mesh-restamped") else {
+        return;
+    };
+    let _cleanup = harness::Scratch::at(project.clone());
+    let built = Command::new(env!("CARGO_BIN_EXE_agent-compose"))
+        .arg("build")
+        .arg(harness::fixture(FIXTURE))
+        .args(["--target", TARGET])
+        .arg("--out")
+        .arg(&project)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("the compiler runs");
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let stamp_of = |tree: &Path| {
+        compose_core::codegen::artifact::Stamp::parse(
+            &std::fs::read_to_string(tree.join("src/artifact.ts")).expect("the tree has a stamp"),
+        )
+        .expect("the stamp reads")
+    };
+    let as_built = stamp_of(&project);
+    let edit = "\n<!-- edited by hand on the hub, after the build -->\n";
+    let readme = project.join("README.md");
+    let mut text = std::fs::read_to_string(&readme).expect("the build wrote a README");
+    text.push_str(edit);
+    std::fs::write(&readme, &text).expect("the tree is writable");
+    let on_disk = compose_core::codegen::artifact::rehash(&project, &as_built.files)
+        .expect("every listed file is there");
+    assert_ne!(
+        on_disk, as_built.hash,
+        "the edit moved what the tree hashes to"
+    );
+
+    // 1. Unrestamped: the hub's name for its tree is not what its tree is.
+    {
+        let Some(mesh) = Mesh::start_as_built(&project) else {
+            return;
+        };
+        assert_eq!(mesh.artifact_hash(), as_built.hash);
+        let data_dir = scratch_data_dir("unrestamped");
+        let mut worker = mesh.worker_into_without_a_build("unrestamped", &data_dir);
+        let status = worker.waited();
+        assert_eq!(
+            status.code(),
+            Some(2),
+            "the worker refused the artifact: {}",
+            worker.transcript()
+        );
+        let said = worker.transcript();
+        assert!(
+            said.contains(&format!(
+                "the artifact this hub served hashes to `{on_disk}` and was asked for as `{}`",
+                as_built.hash
+            )),
+            "{said}"
+        );
+        assert!(
+            !data_dir.join("artifacts").join(&as_built.hash).exists()
+                && !data_dir.join("artifacts").join(&on_disk).exists(),
+            "nothing was materialised"
+        );
+    }
+
+    // 2. Restamped: the hub names the tree it has, and the worker takes it.
+    let restamped = Command::new(env!("CARGO_BIN_EXE_agent-compose"))
+        .arg("build")
+        .arg(project.join("no-spec").join("main.yml"))
+        .arg("--out")
+        .arg(&project)
+        .arg("--restamp")
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("the compiler runs");
+    assert!(
+        restamped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restamped.stderr)
+    );
+    let stamped = stamp_of(&project);
+    assert_eq!(
+        stamped.hash, on_disk,
+        "the restamp wrote the tree's own hash"
+    );
+
+    let Some(mesh) = Mesh::start_as_built(&project) else {
+        return;
+    };
+    assert_eq!(
+        mesh.artifact_hash(),
+        stamped.hash,
+        "the join handshake carries the restamped hash"
+    );
+    mesh.provider
+        .enqueue_all(signing("signed-out-of-a-restamped-tree"));
+    let data_dir = scratch_data_dir("restamped");
+    let worker = mesh.worker_into_without_a_build("restamped", &data_dir);
+    let execution = mesh.start_execution("/releases", &json!({ "path": "release.dmg" }));
+    let outputs = mesh.completed(&execution);
+    assert_eq!(
+        outputs["signature"],
+        "signed-out-of-a-restamped-tree",
+        "the placed node ran on the worker: {}",
+        worker.transcript()
+    );
+    assert_eq!(
+        std::fs::read_to_string(data_dir.join("held"))
+            .expect("the worker records which artifact it holds")
+            .trim(),
+        stamped.hash
+    );
+    let materialised = data_dir.join("artifacts").join(&stamped.hash);
+    assert!(
+        std::fs::read_to_string(materialised.join("README.md"))
+            .expect("the worker materialised the tree")
+            .ends_with(edit),
+        "the tree the worker runs out of is the hub's, hand edit and all"
+    );
 }
 
 // ---------------------------------------------------------------------------

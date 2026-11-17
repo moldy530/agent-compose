@@ -490,6 +490,179 @@ pub(crate) fn default_out(entrypoint: &Path, target: &str) -> PathBuf {
         .join(target)
 }
 
+/// A tree a build wrote, read back without the spec that produced it — what
+/// `--no-build` launches and `--restamp` restamps (PRD resolved q87, Decision
+/// D170).
+#[derive(Debug)]
+pub(crate) struct Tree {
+    /// What its `src/artifact.ts` says it is.
+    pub(crate) stamp: compose_core::codegen::artifact::Stamp,
+    /// That file's text, which a restamp rewrites one line of.
+    pub(crate) module: String,
+}
+
+/// Why a directory is not a tree this compiler launches or restamps as it
+/// stands.
+#[derive(Debug)]
+pub(crate) enum Unbuilt {
+    /// There is no `src/artifact.ts` there: no build wrote this directory.
+    Absent,
+    /// Another release wrote it — its `COMPILER_VERSION`, which this one is not.
+    OtherCompiler(String),
+    /// A file at a path the compiler claims that does not carry the
+    /// generated-file header — `src/artifact.ts` itself included. The paths,
+    /// sorted.
+    NotOurs(Vec<String>),
+    /// Files `ARTIFACT_FILES` lists that are not there. The paths, sorted.
+    Missing(Vec<String>),
+    /// `src/artifact.ts` carries the header and says this release wrote it, but
+    /// does not declare its hash and file list in the shape a build writes.
+    Unreadable,
+    /// The filesystem said no.
+    Io(io::Error),
+}
+
+/// Read the tree in `out` as a build left it, refusing one this compiler did
+/// not write as a whole.
+///
+/// The questions are asked in the order a reader needs the answers, each one
+/// only of a tree that passed the one before: whether a build wrote here at
+/// all, whether **this release** did — read off `COMPILER_VERSION` alone, so a
+/// tree an older release wrote is named as one even where that release spelled
+/// the rest of the file differently — and then, for every file `ARTIFACT_FILES`
+/// lists, whether it is there and, at a path [`EMITTED_PATHS`] claims, whether
+/// it still carries [`GENERATED_MARKER`]. A listed path outside that claim is
+/// an authored file the tree carries (PRD resolved q49): its bytes are the
+/// author's and carry no header, so it only has to be there.
+///
+/// **An edit does not refuse it.** A generated file somebody edited and whose
+/// header they kept is still the compiler's file at the compiler's name — which
+/// is exactly the tree `--restamp` exists for. What refuses is a file at one of
+/// those names that no longer says it is this compiler's, because a tree that
+/// is not wholly its own is not one it launches as its own.
+///
+/// [`EMITTED_PATHS`]: compose_core::codegen::EMITTED_PATHS
+pub(crate) fn as_built(out: &Path) -> Result<Tree, Unbuilt> {
+    use compose_core::codegen::artifact;
+
+    let module_path = at(out, artifact::SELF);
+    let module = match std::fs::read(&module_path) {
+        Ok(bytes) => String::from_utf8(bytes).map_err(|_| Unbuilt::Unreadable)?,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Err(Unbuilt::Absent);
+        }
+        Err(error) => return Err(Unbuilt::Io(error)),
+    };
+    if !generated(&module_path).map_err(Unbuilt::Io)? {
+        return Err(Unbuilt::NotOurs(vec![artifact::SELF.to_string()]));
+    }
+    match artifact::compiler_of(&module) {
+        Some(compiler) if compiler == compose_core::codegen::COMPILER_VERSION => {}
+        Some(compiler) => return Err(Unbuilt::OtherCompiler(compiler)),
+        None => return Err(Unbuilt::Unreadable),
+    }
+    let stamp = artifact::Stamp::parse(&module).ok_or(Unbuilt::Unreadable)?;
+
+    let mut missing: BTreeSet<String> = BTreeSet::new();
+    let mut foreign: BTreeSet<String> = BTreeSet::new();
+    for path in &stamp.files {
+        let claimed = compose_core::codegen::EMITTED_PATHS.contains(&path.as_str());
+        let full = at(out, path);
+        if !claimed {
+            match std::fs::metadata(&full) {
+                Ok(metadata) if metadata.is_file() => {}
+                Ok(_) => {
+                    missing.insert(path.clone());
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    missing.insert(path.clone());
+                }
+                Err(error) => return Err(Unbuilt::Io(error)),
+            }
+            continue;
+        }
+        match generated(&full) {
+            Ok(true) => {}
+            Ok(false) => {
+                foreign.insert(path.clone());
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                missing.insert(path.clone());
+            }
+            Err(error) if error.kind() == io::ErrorKind::IsADirectory => {
+                foreign.insert(path.clone());
+            }
+            Err(error) => return Err(Unbuilt::Io(error)),
+        }
+    }
+    if !foreign.is_empty() {
+        return Err(Unbuilt::NotOurs(foreign.into_iter().collect()));
+    }
+    if !missing.is_empty() {
+        return Err(Unbuilt::Missing(missing.into_iter().collect()));
+    }
+    Ok(Tree { stamp, module })
+}
+
+/// What one restamp did.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Restamped {
+    /// `ARTIFACT_HASH` as the tree carried it.
+    pub(crate) before: String,
+    /// …and as it carries it now.
+    pub(crate) after: String,
+}
+
+impl Restamped {
+    /// Whether the tree's files had moved from the hash it carried — and so
+    /// whether `src/artifact.ts` was rewritten at all.
+    pub(crate) fn moved(&self) -> bool {
+        self.before != self.after
+    }
+}
+
+/// Recompute `ARTIFACT_HASH` over `tree` as it stands in `out`, and write it
+/// into `src/artifact.ts` — that one line, and nothing else of that file or of
+/// any other (PRD resolved q87).
+///
+/// The hash is `compose_core::codegen::artifact::rehash`, which is the
+/// emitter's own rule over the bytes the listed files hold on disk — the same
+/// answer a worker computes over the tarball a hub serves of this tree
+/// (`docs/distributed.md` §3.5, §4 step 2). A tree whose files still hash to
+/// what it carries is left byte for byte as it was.
+pub(crate) fn restamp(out: &Path, tree: &Tree) -> io::Result<Restamped> {
+    use compose_core::codegen::artifact;
+
+    let after = artifact::rehash(out, &tree.stamp.files)?;
+    let stamped = Restamped {
+        before: tree.stamp.hash.clone(),
+        after,
+    };
+    if stamped.moved() {
+        let rewritten = artifact::restamp(&tree.module, &stamped.after).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "`{}` has no `ARTIFACT_HASH` line to rewrite",
+                    artifact::SELF
+                ),
+            )
+        })?;
+        std::fs::write(at(out, artifact::SELF), rewritten)?;
+    }
+    Ok(stamped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

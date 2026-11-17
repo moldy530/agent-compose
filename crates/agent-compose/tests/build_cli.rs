@@ -1,5 +1,5 @@
-//! `agent-compose build` and `build --check`, end to end through the real
-//! binary.
+//! `agent-compose build`, `build --check` and `build --restamp`, end to end
+//! through the real binary.
 //!
 //! The emitter itself is tested in `compose-core` — its unit tests own the
 //! mapping and the golden corpus owns the bytes. What this file owns is the
@@ -8,6 +8,12 @@
 //!
 //! Every run sets `NO_COLOR` and reads its streams through a pipe, like
 //! `tests/cli.rs`, so nothing here depends on a terminal.
+//!
+//! What a restamped tree does when it is **launched** — a `run --no-build` of
+//! it, edit and all — needs the JavaScript toolchain, and is
+//! `tests/launch_without_build.rs`'s `a_restamped_tree_runs_without_a_build_with_its_edit`;
+//! a hub served from one handing a worker its artifact is
+//! `tests/distributed_mesh_acceptance.rs`'s.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1697,5 +1703,330 @@ tool.sign:
         fs::read_to_string(carried.join("src/tools/sign.ts")).expect("readable"),
         "// somebody else's\n",
         "nothing is overwritten before the scan decides"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `--restamp`: the tree as it stands, hashed again (PRD resolved q87)
+// ---------------------------------------------------------------------------
+
+/// Every file under `root` with its bytes, keyed by `/`-separated path.
+fn contents_under(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    files_under(root)
+        .into_iter()
+        .map(|path| {
+            let bytes = fs::read(root.join(&path)).expect("a file the walk found is readable");
+            (path, bytes)
+        })
+        .collect()
+}
+
+/// The hash of the files `ARTIFACT_FILES` lists, computed here from the bytes
+/// on disk with the emitter's own rule — `src/artifact.ts` left out, as the
+/// rule leaves it — rather than through anything `--restamp` calls.
+fn hash_on_disk(out: &Path) -> String {
+    let stamp = stamp_in(out);
+    let held: Vec<(String, Vec<u8>)> = stamp
+        .files
+        .iter()
+        .map(|path| {
+            (
+                path.clone(),
+                fs::read(out.join(path)).expect("a listed file"),
+            )
+        })
+        .collect();
+    compose_core::codegen::artifact::hash_of(
+        held.iter()
+            .map(|(path, bytes)| (path.as_str(), bytes.as_slice())),
+    )
+}
+
+/// What `src/artifact.ts` in `out` says the tree is.
+fn stamp_in(out: &Path) -> compose_core::codegen::artifact::Stamp {
+    compose_core::codegen::artifact::Stamp::parse(
+        &fs::read_to_string(out.join("src/artifact.ts")).expect("the tree has a stamp"),
+    )
+    .expect("the stamp reads")
+}
+
+/// **`--restamp` over a hand-edited tree moves `ARTIFACT_HASH` and nothing
+/// else** (PRD resolved q87): the new hash is the emitter's rule over the files
+/// on disk, the one line of `src/artifact.ts` that carries it is the one line
+/// that changed, every other file — the edited one included — is the bytes it
+/// was, and stderr says the tree no longer matches any source.
+///
+/// The spec path is one that does not exist: a restamp reads no spec.
+#[test]
+fn a_restamp_rewrites_only_the_hash_line_to_the_hash_of_the_files_on_disk() {
+    let out = scratch("restamp");
+    let path = out.to_str().expect("a UTF-8 scratch path");
+    assert_eq!(
+        code(&build(&["examples/review-loop/main.yml", "--out", path])),
+        0
+    );
+    let built = stamp_in(&out);
+    let graph = out.join("src/graph.ts");
+    let mut edited = fs::read_to_string(&graph).expect("the build wrote the graph");
+    edited.push_str("// a hand edit\n");
+    fs::write(&graph, &edited).expect("the tree is writable");
+    let before = contents_under(&out);
+
+    let restamped = build(&["no/spec/here/main.yml", "--out", path, "--restamp"]);
+    assert_eq!(code(&restamped), 0, "{}", stderr(&restamped));
+    assert_eq!(stdout(&restamped), "", "the human format answers on stderr");
+    let now = hash_on_disk(&out);
+    assert_ne!(now, built.hash, "the edit moved the hash");
+    assert_eq!(
+        stderr(&restamped),
+        format!(
+            "restamped `{path}`: ARTIFACT_HASH is now {now}; this tree no longer matches any \
+             source — a later `build` overwrites it\n"
+        )
+    );
+
+    let after = contents_under(&out);
+    assert_eq!(
+        after.keys().collect::<Vec<_>>(),
+        before.keys().collect::<Vec<_>>(),
+        "a restamp adds and removes nothing"
+    );
+    for (file, bytes) in &before {
+        if file == "src/artifact.ts" {
+            continue;
+        }
+        assert_eq!(&after[file], bytes, "`{file}` is the bytes it was");
+    }
+    let was = String::from_utf8(before["src/artifact.ts"].clone()).expect("UTF-8");
+    let is = String::from_utf8(after["src/artifact.ts"].clone()).expect("UTF-8");
+    let changed: Vec<(&str, &str)> = was
+        .lines()
+        .zip(is.lines())
+        .filter(|(left, right)| left != right)
+        .collect();
+    assert_eq!(was.lines().count(), is.lines().count());
+    assert_eq!(
+        changed,
+        [(
+            format!("export const ARTIFACT_HASH = \"{}\";", built.hash).as_str(),
+            format!("export const ARTIFACT_HASH = \"{now}\";").as_str(),
+        )],
+        "the hash line, and only it"
+    );
+    assert_eq!(
+        stamp_in(&out).files,
+        built.files,
+        "`ARTIFACT_FILES` is untouched"
+    );
+}
+
+/// **A tree whose files still hash to its stamp is left as it was**, and the
+/// restamp says that rather than claiming the tree has stopped matching its
+/// source — and under `--format json` the answer is one document on stdout
+/// either way, the statement still on stderr.
+#[test]
+fn a_restamp_of_an_unedited_tree_rewrites_nothing_and_says_so() {
+    let out = scratch("restamp-unedited");
+    let path = out.to_str().expect("a UTF-8 scratch path");
+    assert_eq!(
+        code(&build(&["examples/review-loop/main.yml", "--out", path])),
+        0
+    );
+    let before = contents_under(&out);
+    let hash = stamp_in(&out).hash;
+
+    let unmoved = build(&["no/spec/here/main.yml", "--out", path, "--restamp"]);
+    assert_eq!(code(&unmoved), 0, "{}", stderr(&unmoved));
+    assert_eq!(
+        stderr(&unmoved),
+        format!(
+            "`{path}` already carries the ARTIFACT_HASH its files hash to ({hash}): nothing was \
+             rewritten\n"
+        )
+    );
+    assert_eq!(contents_under(&out), before, "nothing was written");
+
+    let json = build(&[
+        "no/spec/here/main.yml",
+        "--out",
+        path,
+        "--restamp",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&json), 0, "{}", stderr(&json));
+    let document: serde_json::Value =
+        serde_json::from_str(stdout(&json)).expect("one JSON document on stdout");
+    assert_eq!(
+        document,
+        serde_json::json!({ "artifact_hash": hash, "restamped": false })
+    );
+
+    fs::write(
+        out.join("README.md"),
+        "<!-- generated by agent-compose, edited -->\n",
+    )
+    .expect("the tree is writable");
+    let moved = build(&[
+        "no/spec/here/main.yml",
+        "--out",
+        path,
+        "--restamp",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&moved), 0, "{}", stderr(&moved));
+    let document: serde_json::Value =
+        serde_json::from_str(stdout(&moved)).expect("one JSON document on stdout");
+    assert_eq!(
+        document,
+        serde_json::json!({ "artifact_hash": hash_on_disk(&out), "restamped": true })
+    );
+    assert!(
+        stderr(&moved).starts_with(&format!("restamped `{path}`: ARTIFACT_HASH is now ")),
+        "the statement is made under both formats: {}",
+        stderr(&moved)
+    );
+}
+
+/// **A directory no build wrote is not restamped** — one that does not exist,
+/// and one that exists and holds nothing — exit `2`, naming the build to run,
+/// and nothing is written into either.
+#[test]
+fn a_restamp_of_a_directory_no_build_wrote_is_refused() {
+    let root = scratch("restamp-absent");
+    for out in [root.join("never-built"), root.clone()] {
+        let path = out.to_str().expect("a UTF-8 scratch path");
+        let refused = build(&["examples/review-loop/main.yml", "--out", path, "--restamp"]);
+        assert_eq!(code(&refused), 2);
+        assert_eq!(stdout(&refused), "");
+        assert_eq!(
+            stderr(&refused),
+            format!(
+                "error: `{path}` holds no built project; run `agent-compose build` first: \
+                 `--restamp` restamps a tree a build wrote\n"
+            )
+        );
+    }
+    assert_eq!(
+        files_under(&root),
+        Vec::<String>::new(),
+        "nothing was written"
+    );
+}
+
+/// **A tree another release wrote is not restamped**: its stamp is that
+/// release's statement about its own bytes, and this one's hash rule is not
+/// one it is entitled to rewrite it under. Exit `2`, naming both.
+#[test]
+fn a_restamp_of_a_tree_another_release_wrote_is_refused_naming_both() {
+    let out = scratch("restamp-other-release");
+    let path = out.to_str().expect("a UTF-8 scratch path");
+    assert_eq!(
+        code(&build(&["examples/review-loop/main.yml", "--out", path])),
+        0
+    );
+    let module = out.join("src/artifact.ts");
+    let written = fs::read_to_string(&module).expect("the build wrote its stamp");
+    let other = written.replace(
+        &format!(
+            "export const COMPILER_VERSION = \"{}\";",
+            compose_core::codegen::COMPILER_VERSION
+        ),
+        "export const COMPILER_VERSION = \"0.1.0-elsewhere\";",
+    );
+    assert_ne!(other, written);
+    fs::write(&module, &other).expect("the tree is writable");
+
+    let refused = build(&["examples/review-loop/main.yml", "--out", path, "--restamp"]);
+    assert_eq!(code(&refused), 2);
+    assert_eq!(
+        stderr(&refused),
+        format!(
+            "error: `{path}` was built by agent-compose 0.1.0-elsewhere; this is {} — rebuild, or \
+             restamp it with the compiler that built it\n",
+            compose_core::codegen::COMPILER_VERSION
+        )
+    );
+    assert_eq!(
+        fs::read_to_string(&module).expect("readable"),
+        other,
+        "the stamp was not rewritten"
+    );
+}
+
+/// **`--restamp` and `--check` are not asked together**: one writes the tree's
+/// stamp and the other writes nothing and compares the tree with the spec.
+/// clap refuses the pair, exit `2`, before anything is read.
+#[test]
+fn restamp_and_check_are_refused_together() {
+    let out = scratch("restamp-check");
+    let path = out.to_str().expect("a UTF-8 scratch path");
+    let refused = build(&[
+        "examples/review-loop/main.yml",
+        "--out",
+        path,
+        "--restamp",
+        "--check",
+    ]);
+    assert_eq!(code(&refused), 2);
+    assert!(
+        stderr(&refused)
+            .starts_with("error: the argument '--restamp' cannot be used with '--check'"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(files_under(&out), Vec::<String>::new());
+}
+
+/// **A restamped tree no longer matches any source, and a build overwrites
+/// it** — the two halves of the sentence the restamp prints. `--check` reports
+/// the edited file and the restamped stamp as drift, exit `1`; a plain build
+/// writes the spec's tree back, its stamp included.
+#[test]
+fn a_restamped_tree_is_drift_and_a_build_overwrites_it() {
+    let out = scratch("restamp-overwritten");
+    let path = out.to_str().expect("a UTF-8 scratch path");
+    assert_eq!(
+        code(&build(&["examples/review-loop/main.yml", "--out", path])),
+        0
+    );
+    let built = contents_under(&out);
+    fs::write(
+        out.join("src/state.ts"),
+        format!(
+            "{}// a hand edit\n",
+            String::from_utf8_lossy(&built["src/state.ts"])
+        ),
+    )
+    .expect("the tree is writable");
+    assert_eq!(
+        code(&build(&[
+            "examples/review-loop/main.yml",
+            "--out",
+            path,
+            "--restamp"
+        ])),
+        0
+    );
+
+    let drifted = build(&["examples/review-loop/main.yml", "--out", path, "--check"]);
+    assert_eq!(code(&drifted), 1, "{}", stderr(&drifted));
+    for file in ["src/artifact.ts", "src/state.ts"] {
+        assert!(
+            stderr(&drifted).contains(&format!("`{file}` differs from what the spec produces")),
+            "{}",
+            stderr(&drifted)
+        );
+    }
+
+    assert_eq!(
+        code(&build(&["examples/review-loop/main.yml", "--out", path])),
+        0
+    );
+    assert_eq!(
+        contents_under(&out),
+        built,
+        "the build wrote the spec's tree back"
     );
 }

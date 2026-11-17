@@ -1,0 +1,15 @@
+---
+source: crates/agent-compose/tests/cli.rs
+expression: stdout(&output)
+---
+Execute the nodes a hub has placed on the names this process claims
+
+Usage: agent-compose worker [OPTIONS] --hub <URL> --token-env <VAR>
+
+Options:
+      --hub <URL>        The hub's base URL, as the deployment publishes it
+      --claim <NAME>     One placement name this worker claims, repeatable
+      --token-env <VAR>  The variable the join token is read from — the one `hub.join_token:` names
+      --data-dir <DIR>   Where this worker keeps the artifacts it materialises [default: ~/.agent-compose/worker]
+      --no-build         Accepted, and changes nothing: a worker builds nothing — it runs the artifact its hub serves — so one deploy script can pass the flag to every verb that takes it
+  -h, --help             Print help

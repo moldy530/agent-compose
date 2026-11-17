@@ -480,7 +480,7 @@ pub fn staged_with_deploy(
 }
 
 /// Copy one directory into another, recursively.
-fn copy_tree(from: &Path, to: &Path) {
+pub fn copy_tree(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).expect("the scratch area is writable");
     for entry in std::fs::read_dir(from).expect("a readable fixture directory") {
         let entry = entry.expect("a readable directory entry");
@@ -1957,6 +1957,36 @@ pub fn serve_target_on(
         .args(["--target", target])
         .arg("--out")
         .arg(out)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    seal(&mut command, environment);
+    Some(announced(&mut command))
+}
+
+/// `agent-compose serve <spec> --no-build --out <project> --port 0`: the tree
+/// already built into `project`, served **as it stands** (PRD resolved q87,
+/// Decision D170).
+///
+/// The spec path names a file that does not exist, and that is the point of
+/// it: under `--no-build` the path only locates a default output directory —
+/// which `--out` overrides here — so a serve that read it would fail, and one
+/// that serves is one that did not. Whatever target the tree was built for is
+/// the one it serves; `--target` would only have located it.
+pub fn serve_as_built(project: &Path, environment: &[(String, String)]) -> Option<Served> {
+    installed()?;
+    let mut command = agent_compose();
+    command
+        .arg("serve")
+        .arg(project.join("no-spec-is-read-here").join("main.yml"))
+        .arg("--no-build")
+        .args(["--port", "0"])
+        .arg("--out")
+        .arg(project)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
