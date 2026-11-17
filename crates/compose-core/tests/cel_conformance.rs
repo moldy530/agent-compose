@@ -333,7 +333,9 @@ fn the_conversions_the_crate_lacks_are_supplied_by_the_shared_context() {
 ///
 /// CEL's `int()` truncates a double toward zero and **refuses** one with no
 /// `int64` — a NaN, an infinity, anything past the range — and refuses a `uint`
-/// past `int64`'s top; the emitted evaluator does both. `cel` 0.14.3's own
+/// past `int64`'s top; the emitted evaluator does both (the acceptance suite's
+/// `the_generated_cel_evaluator_refuses_an_int_conversion_outside_int64` holds
+/// it to that). `cel` 0.14.3's own
 /// overloads cast instead: a double **saturates** (a NaN to `0`) and a uint
 /// **wraps**. `Context::add_function` cannot replace them — the crate consults
 /// its typed overloads first — so `compose_core::cel::evaluation_context`

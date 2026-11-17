@@ -1582,10 +1582,21 @@ const STRATEGY: &[Criterion] = &[
     Criterion {
         bullet: Bullet::Strategy,
         phrase: "shared fixtures (expression + input + expected result) executed against both the Rust validator's interpreter and the JS evaluator embedded in generated code",
-        tests: &[(
-            "the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corpus",
-            Status::Live,
-        )],
+        tests: &[
+            (
+                "the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corpus",
+                Status::Live,
+            ),
+            // The JS column of a ledger row the corpus cannot state, because the
+            // two columns disagree there by design: the emitted evaluator
+            // refuses an `int()` with no `int64` where the pinned crate
+            // saturates (PRD resolved q85, Decision D168). The crate's side is
+            // pinned in `cel_conformance.rs`; this is the side a router runs.
+            (
+                "the_generated_cel_evaluator_refuses_an_int_conversion_outside_int64",
+                Status::Live,
+            ),
+        ],
     },
 ];
 

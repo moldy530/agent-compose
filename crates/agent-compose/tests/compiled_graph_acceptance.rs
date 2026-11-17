@@ -9492,6 +9492,110 @@ fn the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corp
     );
 }
 
+/// The JS column's half of the `int()` divergence the corpus cannot state (PRD
+/// resolved q85, Decision D168): the evaluator a compiled router embeds
+/// **refuses** an `int()` of a double past `int64`, of an infinity or a NaN, and
+/// of a `uint` past `int64`'s top, as CEL's definition does.
+///
+/// The corpus holds only cases both columns agree on, and the pinned crate
+/// saturates and wraps here instead —
+/// `crates/compose-core/tests/cel_conformance.rs`'s
+/// `the_int_of_a_number_outside_int64_still_saturates_in_the_crate` pins that
+/// side, and `codegen::cel`'s ledger carries the row. Without this case the
+/// emitted side of the row would be held by nothing: a `BigInt(Math.trunc(x))`
+/// in place of the range check would hand a router an "int" past `int64` while
+/// every corpus case stayed green. Each refusal has to be a `CelError` raised by
+/// `int` itself — `1.0 / 0.0` is an infinity rather than an error in CEL, so a
+/// refusal from the division would be the wrong one — and the edges either side
+/// are stated as answers, so the check is the range and not a blanket refusal.
+#[test]
+fn the_generated_cel_evaluator_refuses_an_int_conversion_outside_int64() {
+    let Some(mut bun) = harness::bun_command() else {
+        return;
+    };
+
+    let built = harness::build("bounded-cycle", "local");
+    built.succeeded();
+
+    // The driver imports `src/cel.ts` alone, as the corpus driver does, and
+    // reports each expression's answer or the refusal it raised.
+    let driver = built.root().join("int-conversions.mjs");
+    std::fs::write(
+        &driver,
+        r#"const cel = await import(new URL("./src/cel.ts", import.meta.url).href);
+const answers = {};
+for (const source of JSON.parse(process.argv[2])) {
+  try {
+    const value = cel.evaluate(source, {});
+    answers[source] = { type: typeof value, value: String(value) };
+  } catch (error) {
+    answers[source] = { celError: error instanceof cel.CelError, message: String(error?.message) };
+  }
+}
+process.stdout.write(JSON.stringify(answers));
+"#,
+    )
+    .expect("the driver is written");
+
+    let refused = [
+        "int(1e19)",
+        "int(-1e19)",
+        "int(9223372036854775808.0)",
+        "int(1.0 / 0.0)",
+        "int(-1.0 / 0.0)",
+        "int(double('nan'))",
+        "int(18446744073709551615u)",
+        "int(9223372036854775808u)",
+    ];
+    let answered = [
+        ("int(-9223372036854775808.0)", "-9223372036854775808"),
+        ("int(9223372036854774784.0)", "9223372036854774784"),
+        ("int(9223372036854775807u)", "9223372036854775807"),
+        ("int(-1.9)", "-1"),
+    ];
+    let sources: Vec<&str> = refused
+        .iter()
+        .copied()
+        .chain(answered.iter().map(|(source, _)| *source))
+        .collect();
+
+    let output = bun
+        .arg(&driver)
+        .arg(json!(sources).to_string())
+        .output()
+        .expect("bun runs the generated evaluator");
+    assert!(
+        output.status.success(),
+        "the driver failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let answers: Value =
+        serde_json::from_slice(&output.stdout).expect("the driver prints one JSON object");
+
+    for source in refused {
+        let answer = &answers[source];
+        assert_eq!(
+            answer["celError"],
+            json!(true),
+            "`{source}` has no `int64`, so CEL's `int()` refuses it with an evaluation error; the \
+             emitted evaluator answered {answer}"
+        );
+        assert!(
+            answer["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("`int`")),
+            "`{source}` must be refused by `int` itself: {answer}"
+        );
+    }
+    for (source, int) in answered {
+        assert_eq!(
+            answers[source],
+            json!({ "type": "bigint", "value": int }),
+            "`{source}` is inside `int64` and converts"
+        );
+    }
+}
+
 /// `examples/review-loop` — the documented project, compiled and **run**.
 ///
 /// Every other test here runs a fixture, and a fixture is written for the test.

@@ -144,7 +144,9 @@ reason `size` above gives, and the gap is safe to leave for the reason it gives
 too. `conversions.json` states the in-range cases — truncation toward zero, both
 ends of the range — where all three readings agree;
 `the_int_of_a_number_outside_int64_still_saturates_in_the_crate` pins the
-crate's answers, and `codegen::cel`'s ledger carries the row.
+crate's answers, the acceptance suite's
+`the_generated_cel_evaluator_refuses_an_int_conversion_outside_int64` pins the
+emitted evaluator's refusals, and `codegen::cel`'s ledger carries the row.
 
 **A `matches()` pattern whose engine has to be Unicode-aware** — the other gap the
 corpus cannot state, and for the same reason. The pattern is a *second* language
