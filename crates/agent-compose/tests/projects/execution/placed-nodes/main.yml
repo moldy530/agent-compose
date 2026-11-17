@@ -1396,6 +1396,38 @@ flow.placed_retried:
     - { from: start, to: build }
     - { from: build, to: end }
 
+# The placed build from a `flow:` node, and then a placed **agent's** node — what
+# a `run` tells apart (Decision D171). A `run` serves its mesh for the placed
+# flow's instance, which a worker that joins it runs; it does not serve one for
+# `agent.signer`'s node, which it refuses as it always has, mesh up or not: PRD
+# resolved q84 rules on the instances of a placed flow and on nothing else.
+flow.placed_then_signed:
+  description: A placed build from a flow node, then a placed agent's node.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+  nodes:
+    build:
+      flow: flow.placed_build
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+    sign:
+      agent: agent.signer
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: sign }
+    - { from: sign, to: end }
+
 # The placed look-over from a `flow:` node under a four-second `timeout:` — the
 # deadline half of what a placed flow's dispatch is held to (`docs/distributed.md`
 # §2, §6.5; grammar §7.9; Decision D171). The instance's body sleeps for ten
@@ -1426,6 +1458,13 @@ flow.placed_lapsed:
 # board exactly as an attached flow's does (`docs/distributed.md` §3.4): the
 # root dispatch settles *paused*, the resume surface takes the answer, and the
 # instance is dispatched again and replays past the model call it already made.
+#
+# Its finally node is what a cancel at the question owes the instance: no worker
+# is running it while the question waits on the hub, so the hub hands a worker
+# the instance's end — the effect history and `cancelled: true` — and the worker
+# replays to the question, ends the instance there `cancelled`, and runs
+# `close_out`. A cancel while the root dispatch is still parked, before any
+# worker took it, finds an instance that never began and runs nothing.
 flow.placed_asking:
   description: Inspect a release on the machine that holds it, then ask a person whether it may go ahead.
   inputs:
@@ -1454,7 +1493,11 @@ flow.placed_asking:
         path: "input.path"
       writes:
         decision: approval
+    close_out:
+      exec:
+        command: "${OPS_BIN}/true"
   edges:
     - { from: start, to: inspect }
     - { from: inspect, to: ask }
     - { from: ask, to: end }
+  finally: close_out
