@@ -212,7 +212,8 @@ Before invoking the graph it checks two preconditions: every `${ENV}` reference
 has a value, and the pinned dependency set is installed.
 
 **`--no-build` launches the tree already in `--out` as it stands** — the same
-flag on `run`, `serve` and `cancel`, and only those (PRD resolved q87). Nothing
+flag on `run`, `serve` and `cancel`; `worker` accepts it and builds nothing
+either way, and `resume` and `store` always build (PRD resolved q87). Nothing
 is validated, emitted or scaffolded and the spec is not read: its path, with
 `--target`, only locates the default output directory, so
 `agent-compose run main.yml flow.<name> --no-build` runs `build/local` whatever
@@ -304,9 +305,9 @@ debounced, started or dropped.
 `--port 0` takes one the operating system picks. Its stdout is the app's
 readiness line. `--no-build` serves the tree already in `--out` as it stands,
 under the refusals [`run`](#run) gives it — a hub then names, and serves, that
-tree's own `ARTIFACT_HASH` to every worker that joins. A target that declares a `redis_streams`, `sqs` or `nats`
-source is refused at start, exit `2`, naming the source: this release runs no
-consumer for those kinds.
+tree's own `ARTIFACT_HASH` to every worker that joins. A target that declares a
+`redis_streams`, `sqs` or `nats` source is refused at start, exit `2`, naming
+the source: this release runs no consumer for those kinds.
 
 On start it **recovers** every execution the journal holds open, before it
 accepts a connection: an execution parked on a `human` pause re-parks under the
