@@ -4917,6 +4917,46 @@ function alsoAParameterOfThisWire(wire: Wire, keyword: string): string {
   return `. One caveat, on this wire only: \`${shared}\` — a parameter this wire asks for structured output with — is spelled with \`${keyword}\` too, so a service refusing *that* under its short name words its 400 the same way: read the quoted body before editing a row`;
 }
 
+/**
+ * A model's `thinking:` setting, as the Messages wire spells it (grammar 12.2,
+ * Decision D167, PRD resolved q83).
+ *
+ * The composition writes two forms under one key, told apart by `type:`, and
+ * neither is the wire's spelling as written:
+ *
+ *  * the **enabled** form — `{ budget_tokens }`, or the same with
+ *    `type: enabled` — goes out as `thinking: { type: "enabled", budget_tokens }`.
+ *    The API requires the `type`, and a `thinking:` written before the
+ *    adaptive form existed carries none, which is why this one setting is
+ *    translated where every other travels as written;
+ *  * the **adaptive** form — `{ type: adaptive, effort? }` — goes out as
+ *    `thinking: { type: "adaptive" }`, and its `effort` is not a field of
+ *    `thinking` on this wire at all: it is `output_config.effort`, which
+ *    [`callMessages`] merges into the one `output_config` the native
+ *    structured-output rung writes its `format` into, rather than either
+ *    replacing the other.
+ *
+ * Only the shapes the compiler admits arrive here: `validate` refuses a `type:`
+ * outside the two and each form's key beside the other's `type:`
+ * (`conflicting-keys`), so an `effort` never rides the enabled form and a
+ * budget never rides the adaptive one. No setting, no `thinking` — and no
+ * effort. The `bedrock` plugin publishes the same key, and would take the same
+ * translation; this runtime reaches no `bedrock` provider ([`callDirect`]).
+ */
+function messagesThinking(setting: unknown): {
+  readonly thinking?: Record<string, unknown>;
+  readonly effort?: unknown;
+} {
+  if (typeof setting !== "object" || setting === null) return {};
+  const { type, budget_tokens: budget, effort } = setting as Record<string, unknown>;
+  if (type === "adaptive") {
+    return { thinking: { type: "adaptive" }, ...(effort === undefined ? {} : { effort }) };
+  }
+  return {
+    thinking: { type: "enabled", ...(budget === undefined ? {} : { budget_tokens: budget }) },
+  };
+}
+
 async function callMessages(
   model: ModelBinding,
   request: ModelRequest,
@@ -4939,6 +4979,11 @@ async function callMessages(
   const settings = { ...model.settings };
   const maxTokens = settings["max_tokens"] ?? ANTHROPIC_MAX_TOKENS;
   delete settings["max_tokens"];
+  // `thinking:` in the wire's own spelling (Decision D167): the one setting
+  // whose composition shape is not the request's, and the only one that also
+  // writes into `output_config` — see [`messagesThinking`].
+  const thinking = messagesThinking(settings["thinking"]);
+  if (thinking.thinking !== undefined) settings["thinking"] = thinking.thinking;
 
   const messages: Record<string, unknown>[] = [];
   // Whether the turn this loop just **dropped** is the one the next message
@@ -5130,6 +5175,15 @@ async function callMessages(
       ...server,
     ];
   }
+  // `output_config` holds two things that are not one decision, and is
+  // assembled from both rather than written by either (Decision D167): an
+  // adaptive model's `effort`, which is a **setting** and rides every call that
+  // model makes — a tool-loop turn, a pinned call on either rung — and the
+  // native rung's `format` below. A pinned call on an adaptive model sends one
+  // object carrying both; a loop turn sends the effort alone; a model with no
+  // effort sends no `output_config` at all unless the rung is the native one.
+  const outputConfig: Record<string, unknown> = {};
+  if (thinking.effort !== undefined) outputConfig["effort"] = thinking.effort;
   if (pinned !== undefined) {
     if (native) {
       // The Messages API's own structured output: `output_config`'s `format`,
@@ -5139,13 +5193,12 @@ async function callMessages(
       // format object takes its `type` and its `schema` and nothing else: the
       // pinned tool's *name* is this compiler's, not the wire's, and there is
       // no call for it to name.
-      body["output_config"] = {
-        format: { type: "json_schema", schema: pinned.schema },
-      };
+      outputConfig["format"] = { type: "json_schema", schema: pinned.schema };
     } else {
       body["tool_choice"] = { type: "tool", name: pinned.name };
     }
   }
+  if (Object.keys(outputConfig).length > 0) body["output_config"] = outputConfig;
 
   const answer = await send(
     model,
@@ -9649,8 +9702,10 @@ function connectionAsWritten(binding: HarnessConnectionBinding): Record<string, 
  * side of this boundary for most of them to be applied to.
  *
  * The two rows therefore differ, and the difference is the vendors': `cc` takes
- * `thinking:`, whose `budget_tokens` is the Agent SDK's `maxThinkingTokens`, and
- * `codex` takes `reasoning_effort:`, which is its `modelReasoningEffort`.
+ * `thinking:` in either of its forms — the enabled form's `budget_tokens` is the
+ * Agent SDK's `maxThinkingTokens`, the adaptive form is its own `thinking`
+ * option and that form's `effort` its `effort` (Decision D167) — and `codex`
+ * takes `reasoning_effort:`, which is its `modelReasoningEffort`.
  *
  * Read by the **compiler** too, which computes [`HarnessBinding.modelSettings`]
  * from the same list, so a settings key that stops crossing is one edit in one
