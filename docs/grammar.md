@@ -695,15 +695,71 @@ placement-agnostic (PRD 5.10).
 
 **Supported CEL surface.** Standard CEL operators and the standard macro/function
 set over the exposed roots: comparisons, boolean logic, arithmetic, indexing,
-`in`, `size()`, `has()`, `startsWith`/`endsWith`/`contains`/`matches`, and the
-comprehension macros (`all`, `exists`, `exists_one`, `filter`, `map`). No custom
-extension functions in v0. Expressions MUST be type-correct against the declared
-schemas; `review.output.verdict == 'aprove'` against
-`enum: [approve, revise]` is a compile error, not a silent false.
+`in`, `size()`, `has()`, `startsWith`/`endsWith`/`contains`/`matches`, CEL's four
+standard conversions `string()`, `int()`, `double()` and `bool()`, the strings
+extension's `list.join()`, and the comprehension macros (`all`, `exists`,
+`exists_one`, `filter`, `map`). Nothing else: no other conversion (`uint()`,
+`bytes()`, `timestamp()`, …), no other strings-extension function, and no custom
+extension functions in v0 (Decision
+[D168](#d168-the-surface-gains-cels-four-conversions-and-join-and-string-of-a-list-or-a-map-is-its-canonical-json)).
+Expressions MUST be type-correct against the declared schemas;
+`review.output.verdict == 'aprove'` against `enum: [approve, revise]` is a
+compile error, not a silent false.
 
 ```yaml
 when: "review.output.verdict == 'revise' && size(state.feedback) > 0"
 ```
+
+The functions, the forms each is written in, and what each takes and returns.
+A form not listed is a compile error naming the forms that are
+(`invalid-expression`), and an argument the column does not admit is a
+`type-mismatch` — `bool(1)` among them, which CEL gives no overload. An `enum`
+value is a string wherever a string is admitted.
+
+| function | forms | argument | result |
+|---|---|---|---|
+| `size` | `size(x)`, `x.size()` | a string, bytes, a list, a map or an object | `int` |
+| `has` | `has(x.f)` | one selection | `bool` |
+| `startsWith`, `endsWith`, `contains` | `s.startsWith(p)` | two strings | `bool` |
+| `matches` | `s.matches(p)`, `matches(s, p)` | two strings, the second a pattern | `bool` |
+| `string` | `string(x)` | any value | `string` |
+| `int` | `int(x)` | a number, a string, or a bool | `int` |
+| `double` | `double(x)` | a number, a string, or a bool | `double` |
+| `bool` | `bool(x)` | a bool or a string | `bool` |
+| `join` | `l.join(sep)`, `l.join()` | a list of strings; a string separator, or none for `''` | `string` |
+
+What the conversions answer is pinned by the conformance corpus against both
+evaluators (`crates/compose-core/tests/fixtures/cel-conformance/`, D168):
+
+- `string()` of an `int` is its decimal; of a `double`, the shortest digits that
+  read back as the same double, written without an exponent (`string(1e21)` is a
+  1 and twenty-one zeros, `string(2.0)` is `2`); of a bool, `true` or `false`; of
+  `null`, `null`; of a string, the string; of a **list, a map or an object, its
+  canonical JSON** — object keys in code-point order, no whitespace, strings
+  escaped as JSON escapes them, an `int` without a fraction, a `double` as
+  `string()` writes one. A value JSON has no spelling for — a NaN or an
+  infinity, bytes, a map keyed by anything but strings — fails the evaluation.
+- `int()` of a double truncates toward zero, and one outside `int64` (a NaN and
+  an infinity among them) fails; of a string, reads an optional sign and decimal
+  digits with nothing around them, and fails otherwise or past `int64`; of a
+  bool, `1` or `0`.
+- `double()` of an `int` is the nearest double; of a string, reads a decimal or
+  exponent literal (`1.5`, `.5`, `-2e3`, and `inf`, `infinity`, `nan` in any
+  case), and fails on anything else — whitespace included; of a bool, `1.0` or
+  `0.0`.
+- `bool()` of a string reads exactly `true` or `false`, case-sensitively, and
+  fails on anything else.
+- `l.join(sep)` joins the strings of `l` with `sep` between them, and `l.join()`
+  with nothing; an element that is not a string fails the evaluation.
+
+A conversion that fails is an evaluation failure, the same as an absent read and
+with the same consequence (below, Decision
+[D110](#d110-an-absent-value-fails-the-read-and-an-absent-output-field-writes-nothing)),
+and the message names the conversion. A conversion is also how a value reaches a
+model as text: a prompt is literal (Decision
+[D13](#d13-prompt-is-required-and-literal)), so the node's binding converts —
+`input: "string(state.findings)"` hands a string-in agent its list as canonical
+JSON.
 
 **Reading a value that is not there.** Presence is a runtime property, and four
 things may legitimately be absent when an expression reads them — three the
@@ -15064,6 +15120,101 @@ wire its connection speaks.
 
 **Status**: ratified — PRD resolved q83. *PRD 5.9, G3, resolved q53, q57, q58,
 q60, q83; §8.9, §12.2; builds on D40, D141, D146.*
+
+### D168. The surface gains CEL's four conversions and `join`, and `string()` of a list or a map is its canonical JSON
+
+The authored CEL surface (§4.1) gains `string(x)`, `int(x)`, `double(x)` and
+`bool(x)` — CEL's standard conversions, as global calls of one argument — and
+the strings extension's `list.join(separator)` and `list.join()`, as a method on
+a list of strings. Nothing else joins it. Each is typed in the compiler's walk
+(§4.1's function table: what each admits, and the forms each is written in),
+implemented in the evaluator a built project embeds, and held to the
+conformance corpus, whose `conversions.json` states every row of §4.1's
+semantics list. `string()` of a list, a map or an object is that value's
+**canonical JSON**: object keys in code-point order, no whitespace, strings
+escaped as JSON escapes them, an `int` without a fraction, and a `double` as
+`string()` writes one on its own.
+
+**Rationale**: the surface had no conversion and no `join`, so the one way to
+hand a list of objects to a model as text was a tool that wrote a file (PRD
+resolved q85). A prompt is literal (D13), so text reaches a model through a
+node's `input:` binding, and the binding is CEL: a conversion there is the
+smallest addition that closes the gap. The four conversions are the CEL
+specification's own, so an author who knows CEL expects them, and `join` is the
+one strings-extension function the use case needs; the surface stays closed
+otherwise for the reason it was closed — every function on it is one two
+evaluators have to agree on (PRD 5.5), so a function is admitted for a use case
+and not for completeness. Canonical JSON is what a prompt wants and what a
+corpus can pin across two evaluators: a value's text is a function of the value
+alone, never of the order a map was built in, so a replayed execution that
+converts the same value writes the same bytes (PRD resolved q29).
+
+**What the corpus pins, and the four choices in it.** The specification fixes
+the conversions' overloads and leaves their spellings open in places, and each
+place is a choice both evaluators answer the same way:
+
+- **A double is written the way the pinned `cel` crate writes one** — shortest
+  round-trip digits, positionally, never an exponent; `-0` keeps its sign, and
+  the three values with no digits are `inf`, `-inf` and `NaN`. The crate's own
+  overload cannot be replaced from outside it, so its form is the one both
+  columns can agree on, and the emitted evaluator places JavaScript's shortest
+  digits itself rather than writing `String()`'s `1e+21`.
+- **Keys sort by code point**, which is the Rust column's string order and the
+  order `compareStrings` already gives the emitted evaluator's comparisons —
+  not JavaScript's UTF-16 sort, under which an astral key would sort before
+  `U+FF61`.
+- **The string grammars are the crate's.** `int()` reads an optional sign and
+  ASCII digits; `double()` reads Rust's `f64` literal grammar, case-insensitively,
+  `inf`, `infinity` and `nan` included; `bool()` reads exactly `true` and
+  `false`. Whitespace is refused by all three.
+- **What has no JSON spelling fails.** A NaN or an infinity inside a list,
+  bytes, and a map keyed by anything but strings are evaluation errors rather
+  than a `null` or a guess.
+
+**The one row the columns cannot share.** The specification refuses `int()` of
+a double outside `int64` — a NaN and an infinity among them — and of a `uint`
+past `int64`'s top, and so does the emitted evaluator; the crate's overloads
+cast instead, saturating a double and wrapping a uint. A registration cannot
+replace a built-in overload (the crate consults its own first), so the gap is
+recorded rather than closed, exactly as `size()` of a non-ASCII string is:
+`compose_core::codegen::cel`'s divergence ledger carries it, the corpus states
+the in-range cases, and
+`the_int_of_a_number_outside_int64_still_saturates_in_the_crate` pins the
+crate's answers so a pin bump that fixes them goes red. It is safe to leave for
+`size()`'s reason — the compiler never evaluates an expression, so the crate is
+the corpus's reference column, and the evaluator a compiled graph runs is the
+one that follows the specification. Where the crate has **no** overload —
+`string()` of a bool, `null`, a list or a map; `int()` and `double()` of a bool;
+`bool()` and `join` whole — `compose_core::cel::evaluation_context` registers
+one, the way it registers the global `matches` (the corpus README's note on that
+overload is the precedent), and
+`the_conversions_the_crate_lacks_are_supplied_by_the_shared_context` pins that
+each registration is doing work.
+
+**Where it is stated.** §4.1's surface paragraph, function table and semantics
+list; the `cel` topic's supported-surface section; the corpus README;
+`codegen::cel`'s ledger; and the help an unsupported call draws, which lists the
+five names.
+
+**Collision review.** §4.1's surface is the one this amends, and only by the
+five names: the closed-surface rule, the refusal of a message literal and the
+"no custom extension functions" line are unchanged, and CEL's other conversions
+stay refused. D13 is unchanged — a prompt stays literal, and the conversion is
+the binding's. D42 is unchanged: a conversion reads what its surface's roots
+expose and nothing more. D43 is unchanged — `map.over` is a path expression, and
+a conversion is a call, which §4.2 refuses there. D57 and D98 are unchanged: a
+guard calling a conversion is a CEL exit condition like any other guard. D82's
+closed guard table is unchanged — `int(n.output.count) > 0` and
+`string(n.output.verdict) == 'a'` fall to its last row and prove nothing, which
+is the conservative answer. D110 is unchanged: a failed conversion is an
+evaluation failure, with the absent read's consequence. PRD resolved q29 is what
+makes the canonical form load-bearing rather than cosmetic: the corpus is part
+of the recovery contract, so a conversion whose text could vary from run to run
+would be a replay divergence. PRD 5.5's two-interpreter discipline is the reason
+every new function is a corpus file and not only a typing rule.
+
+**Status**: ratified — PRD resolved q85. *PRD 5.5; PRD resolved q29, q85; §4.1,
+§4.2; builds on D13, D110; leaves D42, D43, D57, D82, D98 unchanged.*
 
 ### D170. `--no-build` launches a built tree as it stands, and `build --restamp` re-hashes one
 

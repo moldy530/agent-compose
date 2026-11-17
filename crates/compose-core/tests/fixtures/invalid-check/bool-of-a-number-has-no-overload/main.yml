@@ -1,0 +1,29 @@
+# rule: `bool()` converts a bool or a string, never a number (grammar 4.1, PRD resolved q85, Decision D168)
+# code: type-mismatch
+# message: expected a bool or a string as the argument of `bool()`, found an integer
+# at: main.yml:26:22
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    flag: { type: boolean }
+  output:
+    result: { type: string }
+flow.f:
+  inputs:
+    count: { type: integer }
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { flag: "bool(input.count)" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

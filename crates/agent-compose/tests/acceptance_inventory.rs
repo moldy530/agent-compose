@@ -163,6 +163,14 @@ const CODEGEN: &[Criterion] = &[
                 "an_agent_node_sends_its_prompt_input_and_output_schema_on_chat_completions",
                 Status::Live,
             ),
+            // What reaches a model as text when the value is a list of objects:
+            // the prompt is literal (D13), so it is the node's `input:` binding
+            // that converts, and the user turn carries the canonical JSON
+            // `string()` writes (PRD resolved q85, Decision D168).
+            (
+                "a_list_of_objects_reaches_the_model_as_its_canonical_json",
+                Status::Live,
+            ),
             // What that surface's structured output cannot promise, and what it
             // still does: an `optional:` property costs `strict`, and the parse
             // is what holds the answer to the contract instead

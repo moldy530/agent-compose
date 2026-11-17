@@ -275,6 +275,99 @@ fn the_size_of_a_non_ascii_string_still_diverges_from_the_specification() {
     assert_eq!(size("size('abc')"), 3);
 }
 
+/// The conversions and `join`, **supplied** where the crate has no overload —
+/// pinned the way the global `matches` is below, and for the same two claims:
+/// the stock context still lacks each one (so the registration is doing work
+/// rather than shadowing something), and the shared context has it.
+///
+/// PRD resolved q85 put `string()`, `int()`, `double()`, `bool()` and
+/// `list.join()` on the surface, and `cel` 0.14.3 converts only some argument
+/// types and carries neither `bool()` nor `join`. Without the registration, the
+/// cases `conversions.json` states for these would be the Rust column's
+/// `Undeclared reference` — an expression `validate` accepts and this project's
+/// reference evaluator cannot run.
+#[test]
+fn the_conversions_the_crate_lacks_are_supplied_by_the_shared_context() {
+    for (source, expected) in [
+        ("string(true)", Value::String(Arc::new("true".to_string()))),
+        ("string(null)", Value::String(Arc::new("null".to_string()))),
+        (
+            "string({'b': [1], 'a': 'x'})",
+            Value::String(Arc::new(r#"{"a":"x","b":[1]}"#.to_string())),
+        ),
+        ("int(true)", Value::Int(1)),
+        ("double(false)", Value::Float(0.0)),
+        ("bool('true')", Value::Bool(true)),
+        (
+            "['a', 'b'].join('-')",
+            Value::String(Arc::new("a-b".to_string())),
+        ),
+    ] {
+        let program = Program::compile(source).expect("the expression parses");
+        assert!(
+            program.execute(&Context::default()).is_err(),
+            "cel 0.14.3 gained an overload for `{source}`: `evaluation_context` may no longer \
+             have to supply it, and the registration may be shadowing the crate's own"
+        );
+        assert_eq!(
+            program
+                .execute(&compose_core::cel::evaluation_context())
+                .expect("the shared context supplies it"),
+            expected,
+            "{source}"
+        );
+    }
+    // What the crate does carry is still the crate's, under the shared context.
+    let program = Program::compile("string(1.5) + string(2) + string('x')").expect("it parses");
+    assert_eq!(
+        program
+            .execute(&compose_core::cel::evaluation_context())
+            .expect("it evaluates"),
+        Value::String(Arc::new("1.52x".to_string()))
+    );
+}
+
+/// The divergence the conversions brought with them (PRD resolved q85,
+/// Decision D168), pinned for the reason `size` is above: the corpus cannot
+/// state it, because the columns disagree.
+///
+/// CEL's `int()` truncates a double toward zero and **refuses** one with no
+/// `int64` — a NaN, an infinity, anything past the range — and refuses a `uint`
+/// past `int64`'s top; the emitted evaluator does both. `cel` 0.14.3's own
+/// overloads cast instead: a double **saturates** (a NaN to `0`) and a uint
+/// **wraps**. `Context::add_function` cannot replace them — the crate consults
+/// its typed overloads first — so `compose_core::cel::evaluation_context`
+/// supplies only the argument types the crate has no overload for, and this
+/// row is carried in `codegen::cel`'s ledger instead. The corpus states the
+/// in-range cases, where the three readings agree.
+///
+/// An upstream fix or a pin bump turns this red and sends whoever made it to
+/// `conversions.json`, where the refusals belong as `error: true` cases.
+#[test]
+fn the_int_of_a_number_outside_int64_still_saturates_in_the_crate() {
+    let int = |source: &str| {
+        let program = Program::compile(source).expect("the expression parses");
+        match program
+            .execute(&compose_core::cel::evaluation_context())
+            .expect("the crate answers rather than refusing")
+        {
+            Value::Int(number) => number,
+            other => panic!("`{source}` is not an integer: {other:?}"),
+        }
+    };
+    // The specification, and the emitted evaluator: an error, each one.
+    assert_eq!(int("int(1e19)"), i64::MAX, "cel 0.14.3 saturated");
+    assert_eq!(int("int(-1e19)"), i64::MIN, "cel 0.14.3 saturated");
+    assert_eq!(int("int(9223372036854775808.0)"), i64::MAX, "2^63 itself");
+    assert_eq!(int("int(1.0 / 0.0)"), i64::MAX, "an infinity");
+    assert_eq!(int("int(double('nan'))"), 0, "a NaN");
+    assert_eq!(int("int(18446744073709551615u)"), -1, "cel 0.14.3 wrapped");
+    // Inside the range is where the readings agree, which is what the corpus
+    // states.
+    assert_eq!(int("int(-1.9)"), -1);
+    assert_eq!(int("int(9223372036854774784.0)"), 9_223_372_036_854_774_784);
+}
+
 /// The second recorded gap, **closed** — and pinned here so it stays closed for
 /// the reason it was closed rather than by accident.
 ///

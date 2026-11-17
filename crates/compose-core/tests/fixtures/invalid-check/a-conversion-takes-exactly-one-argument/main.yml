@@ -1,0 +1,30 @@
+# rule: a conversion is a global call of one argument (grammar 4.1, PRD resolved q85, Decision D168)
+# code: invalid-expression
+# message: `string` is called with 2 arguments, which is not a form it has
+# at: main.yml:27:22
+# help: write it as `string(x)` — the value it converts is its one argument; every other spelling has no overload to call and fails at evaluation (grammar 4.1)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+flow.f:
+  inputs:
+    goal: { type: string }
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "string(input.goal, input.goal)" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

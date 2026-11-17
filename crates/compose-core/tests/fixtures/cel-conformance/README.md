@@ -66,6 +66,45 @@ answers differently in the validator and in the router the validator admitted.
 Bytes literals are stated through `size()` and equality, because a `bytes` value
 has no JSON form for a `result` to spell.
 
+**The conversions and `join`** (PRD resolved q85, grammar Decision D168).
+`conversions.json` states `string()`, `int()`, `double()` and `bool()` over every
+argument type the surface admits, refusals included, and `strings.json` states
+`list.join()`. Four choices are pinned there, because each is a place where two
+readings of "convert this" come apart:
+
+- **`string()` of a double is the crate's own spelling** — the shortest digits
+  that read back as the same double, written positionally and never with an
+  exponent: `string(1e21)` is a 1 and twenty-one zeros, `string(1.5e-7)` is
+  `0.00000015`, `string(2.0)` is `2`, `string(-0.0)` is `-0`, and the three
+  values with no digits are `inf`, `-inf` and `NaN`. The CEL specification does
+  not fix a format, and JavaScript's `String()` writes `1e+21` — so the crate's
+  form is pinned because it is the one both columns can agree on: its overload
+  cannot be replaced from outside it, and the emitted evaluator takes
+  JavaScript's own shortest digits and places the point itself.
+- **`string()` of a list or a map is canonical JSON** — the PRD's ruling: object
+  keys in **code-point** order (the Rust column's `str` order, and the emitted
+  evaluator's `compareStrings` rather than JavaScript's UTF-16 sort — one case
+  puts `U+FF61` before `U+1F600` to hold it), no whitespace, strings escaped as
+  `JSON.stringify` escapes them, an `int` with no fraction, and a double the way
+  `string()` writes one on its own. A NaN or an infinity, `bytes`, and a map
+  keyed by anything but strings have no JSON spelling, and each is an error.
+- **The string grammars are the crate's**, which the emitted evaluator matches:
+  `int()` reads an optional sign and ASCII digits with nothing around them, and
+  `double()` reads Rust's `f64` literal grammar case-insensitively — `.5`, `5.`,
+  `1E3`, and `inf`, `infinity` and `nan`, but no whitespace, no bare `.` and no
+  `0x`. `bool()` reads exactly `true` and `false`,
+  case-sensitively; CEL's `bool()` of a number has no overload, and the corpus
+  holds it to an error.
+- **`string()` of bytes is their UTF-8, lossily** — a replacement character for
+  each maximal malformed sequence, and a leading byte-order mark kept — which is
+  `String::from_utf8_lossy` and a `TextDecoder` told not to eat the mark.
+
+The crate converts only some argument types and carries neither `bool()` nor
+`join`, so `compose_core::cel::evaluation_context` registers what it lacks, the
+way it registers the global `matches` below:
+`the_conversions_the_crate_lacks_are_supplied_by_the_shared_context` pins that
+each registration is doing work.
+
 ## What is deliberately not here
 
 `size()` over non-ASCII strings — the one gap the JS evaluator's arrival did not
@@ -95,6 +134,17 @@ follows the specification. The row is carried in the divergence ledger in
 `the_size_of_a_non_ascii_string_still_diverges_from_the_specification` pins what
 the crate does today, so an upstream fix or a pin bump goes red and sends
 whoever made it back here to add the cases.
+
+**`int()` of a number outside `int64`** — a double past the range, a NaN, an
+infinity, or a uint past `int64`'s top. The specification refuses each, and so
+does the emitted evaluator; `cel` 0.14.3's own overloads cast instead, so
+`int(1e19)` is `int64`'s maximum there, `int(double('nan'))` is `0`, and
+`int(18446744073709551615u)` is `-1`. The overloads cannot be replaced, for the
+reason `size` above gives, and the gap is safe to leave for the reason it gives
+too. `conversions.json` states the in-range cases — truncation toward zero, both
+ends of the range — where all three readings agree;
+`the_int_of_a_number_outside_int64_still_saturates_in_the_crate` pins the
+crate's answers, and `codegen::cel`'s ledger carries the row.
 
 **A `matches()` pattern whose engine has to be Unicode-aware** — the other gap the
 corpus cannot state, and for the same reason. The pattern is a *second* language

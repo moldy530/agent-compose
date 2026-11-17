@@ -1,8 +1,8 @@
-# rule: the expression surface is the set grammar 4.1 enumerates (grammar 4.1)
+# rule: the expression surface is the set grammar 4.1 enumerates (grammar 4.1, Decision D168)
 # code: invalid-expression
-# message: `string` is not a function this expression surface supports
+# message: `uint` is not a function this expression surface supports
 # at: main.yml:25:22
-# help: the supported set is `size`, `has`, `startsWith`, `endsWith`, `contains`, `matches`, `all`, `exists`, `exists_one`, `filter`, `map` plus the standard operators; there are no custom extension functions in v0 (grammar 4.1)
+# help: the supported set is `size`, `has`, `startsWith`, `endsWith`, `contains`, `matches`, `string`, `int`, `double`, `bool`, `join`, `all`, `exists`, `exists_one`, `filter`, `map` plus the standard operators; there are no custom extension functions in v0 (grammar 4.1)
 version: "0.1"
 provider.p:
   kind: anthropic
@@ -22,7 +22,7 @@ flow.f:
   nodes:
     n:
       agent: agent.a
-      input: { text: "string(1)" }
+      input: { text: "uint(1)" }
   edges:
     - { from: start, to: n }
     - { from: n, to: end }

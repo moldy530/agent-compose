@@ -88,8 +88,44 @@ through a state channel. That is what keeps node configs order-independent.
 
 Standard CEL operators and the standard macro set over those roots: comparisons,
 boolean logic, arithmetic, indexing, `in`, `size()`, `has()`,
-`startsWith`/`endsWith`/`contains`/`matches`, and the comprehension macros
-`all`, `exists`, `exists_one`, `filter`, `map`. No custom extension functions.
+`startsWith`/`endsWith`/`contains`/`matches`, the four conversions `string()`,
+`int()`, `double()`, `bool()`, the strings extension's `list.join()`, and the
+comprehension macros `all`, `exists`, `exists_one`, `filter`, `map`. Nothing
+else — no other conversion (`uint()`, `timestamp()`), no other extension
+function, no custom extension functions.
+
+| function | forms | takes | gives |
+|---|---|---|---|
+| `size` | `size(x)`, `x.size()` | a string, bytes, a list, a map or an object | `int` |
+| `has` | `has(x.f)` | one selection | `bool` |
+| `startsWith`, `endsWith`, `contains` | `s.startsWith(p)` | two strings | `bool` |
+| `matches` | `s.matches(p)`, `matches(s, p)` | two strings, the second a pattern | `bool` |
+| `string` | `string(x)` | any value | `string` |
+| `int` | `int(x)` | a number, a string, or a bool | `int` |
+| `double` | `double(x)` | a number, a string, or a bool | `double` |
+| `bool` | `bool(x)` | a bool, or the string `true` / `false` | `bool` |
+| `join` | `l.join(sep)`, `l.join()` | a list of strings; a string separator, or none | `string` |
+
+What the conversions answer:
+
+- **`string()`** of a number is its digits (a double never with an exponent:
+  `string(2.0)` is `2`), of a bool `true`/`false`, of `null` `null` — and of a
+  **list, a map or an object, its canonical JSON**: keys sorted, no whitespace,
+  strings JSON-escaped. That is how a list of objects reaches a model as text:
+  a prompt is literal, so the node's binding converts —
+  `input: "string(state.findings)"` hands a string-in agent the list.
+- **`int()`** truncates a double toward zero, reads a decimal string with an
+  optional sign and nothing around it, and makes a bool `1` or `0`; a double
+  outside `int64` or a string that is not a decimal integer fails.
+- **`double()`** reads a decimal or exponent string (`1.5`, `.5`, `-2e3`), and
+  makes a bool `1.0` or `0.0`; anything else, whitespace included, fails.
+- **`bool()`** reads exactly `true` or `false`. `bool(1)` is a compile error —
+  CEL gives a number no `bool()`.
+- **`l.join(sep)`** joins a list of strings with `sep`, and `l.join()` with
+  nothing; a non-string element fails.
+
+A conversion that fails fails the read, the way reading an absent value does
+(below).
 
 Expressions must be **type-correct against declared schemas**.
 `review.output.verdict == 'aprove'` against `enum: [approve, revise]` is a

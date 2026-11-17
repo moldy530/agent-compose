@@ -2036,6 +2036,115 @@ fn an_agent_node_sends_its_prompt_input_and_output_schema() {
     assert_eq!(run.outputs()["verdict"], "revise");
 }
 
+/// A list of objects handed to a model **as text**, which is the case PRD
+/// resolved q85 was raised for: before the conversions, the only way to put one
+/// in front of a model as a string was a tool that wrote a file.
+///
+/// A prompt is literal and carries no interpolation of any kind (Decision D13),
+/// so what converts is the node's `input:` binding — the one surface through
+/// which dynamic content reaches a model (grammar 5.3, 8.0) — and the binding
+/// evaluates the same CEL surface every other one does. The agent is string-in,
+/// so the user turn is exactly what `string()` wrote: the list's **canonical
+/// JSON**, keys in code-point order whatever order the caller sent them in, no
+/// whitespace, an `integer` without a fraction and a `number` as `string()`
+/// writes one (Decision D168). The JSON is the evaluator a built project embeds
+/// answering, under the run's own runtime — the corpus pins the same bytes
+/// against the Rust column.
+#[test]
+fn a_list_of_objects_reaches_the_model_as_its_canonical_json() {
+    let scratch = harness::Scratch::new("conversion-into-a-prompt");
+    let entrypoint = scratch.path().join("main.yml");
+    std::fs::write(
+        &entrypoint,
+        format!(
+            r#"version: "0.1"
+
+provider.mock:
+  kind: anthropic
+  api_key: ${{MOCK_API_KEY}}
+  base_url: ${{MOCK_BASE_URL}}
+
+model.smart:
+  provider: provider.mock
+  id: {SONNET}
+  settings:
+    max_tokens: 1024
+
+agent.summarizer:
+  model: model.smart
+  prompt: |
+    Summarize the items you are given.
+  output:
+    summary: {{ type: string }}
+
+flow.summarize:
+  inputs:
+    items:
+      type: array
+      items:
+        type: object
+        properties:
+          name: {{ type: string }}
+          count: {{ type: integer }}
+          weight: {{ type: number }}
+          tags:
+            type: array
+            items: {{ type: string }}
+  outputs: {{}}
+  nodes:
+    summarize:
+      agent: agent.summarizer
+      input: "string(input.items)"
+  edges:
+    - {{ from: start, to: summarize }}
+    - {{ from: summarize, to: end }}
+"#
+        ),
+    )
+    .expect("the scratch spec is writable");
+
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "summary": "two items" })),
+    ));
+    let Some(run) = harness::invoke_entrypoint(
+        &entrypoint,
+        "conversion-into-a-prompt",
+        "flow.summarize",
+        &json!({
+            "items": [
+                { "tags": ["a", "b \"quoted\""], "name": "first", "weight": 2, "count": 3 },
+                { "weight": 0.5, "count": 1, "name": "second\nline", "tags": [] },
+            ]
+        }),
+        &harness::environment(&provider),
+        None,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let recorded = provider.requests();
+    assert_eq!(recorded.len(), 1);
+    let call = &recorded[0];
+    assert!(call.is_valid(), "{:?}", call.failures());
+    assert_eq!(
+        call.body()["system"],
+        "Summarize the items you are given.\n",
+        "the prompt is literal text, sent verbatim (D13)"
+    );
+    assert_eq!(
+        call.body()["messages"][0]["content"]
+            .as_str()
+            .expect("a string-in agent's user turn is its one string (grammar 5.3)"),
+        r#"[{"count":3,"name":"first","tags":["a","b \"quoted\""],"weight":2},{"count":1,"name":"second\nline","tags":[],"weight":0.5}]"#,
+        "the user turn is the list's canonical JSON: keys sorted, no whitespace, strings \
+         escaped as JSON, an integer without a fraction and a whole `number` as `string()` \
+         writes one (PRD resolved q85, Decision D168)"
+    );
+}
+
 /// `agent-thinking`'s three model ids: the enabled form, the adaptive form with
 /// an effort, and the adaptive form with none.
 const BUDGETED_THINKER: &str = "budgeted-thinker";

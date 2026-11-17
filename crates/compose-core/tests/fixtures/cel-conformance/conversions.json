@@ -1,0 +1,505 @@
+[
+  {
+    "name": "string-of-an-int-is-its-decimal",
+    "expression": "string(42)",
+    "result": "42"
+  },
+  {
+    "name": "string-of-a-negative-int",
+    "expression": "string(-12)",
+    "result": "-12"
+  },
+  {
+    "name": "string-of-the-largest-int",
+    "expression": "string(9223372036854775807)",
+    "result": "9223372036854775807"
+  },
+  {
+    "name": "string-of-a-uint",
+    "expression": "string(7u)",
+    "result": "7"
+  },
+  {
+    "name": "string-of-a-double",
+    "expression": "string(1.5)",
+    "result": "1.5"
+  },
+  {
+    "name": "string-of-an-integral-double-has-no-fraction",
+    "expression": "string(2.0)",
+    "result": "2"
+  },
+  {
+    "name": "string-of-a-negative-double",
+    "expression": "string(-0.25)",
+    "result": "-0.25"
+  },
+  {
+    "name": "string-of-a-double-is-its-shortest-round-trip",
+    "expression": "string(0.1 + 0.2)",
+    "result": "0.30000000000000004"
+  },
+  {
+    "name": "string-of-a-third",
+    "expression": "string(1.0 / 3.0)",
+    "result": "0.3333333333333333"
+  },
+  {
+    "name": "string-of-a-large-double-is-positional",
+    "expression": "string(1e21)",
+    "result": "1000000000000000000000"
+  },
+  {
+    "name": "string-of-a-small-double-is-positional",
+    "expression": "string(1.5e-7)",
+    "result": "0.00000015"
+  },
+  {
+    "name": "string-of-negative-zero-keeps-its-sign",
+    "expression": "string(-0.0)",
+    "result": "-0"
+  },
+  {
+    "name": "string-of-the-smallest-double",
+    "expression": "string(5e-324)",
+    "result": "0.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005"
+  },
+  {
+    "name": "string-of-the-largest-double",
+    "expression": "string(1.7976931348623157e308)",
+    "result": "179769313486231570000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+  },
+  {
+    "name": "string-of-an-int-past-two-to-the-53-as-a-double",
+    "expression": "string(double(9007199254740993))",
+    "result": "9007199254740992"
+  },
+  {
+    "name": "string-of-an-infinity",
+    "expression": "string(1.0 / 0.0)",
+    "result": "inf"
+  },
+  {
+    "name": "string-of-a-negative-infinity",
+    "expression": "string(-1.0 / 0.0)",
+    "result": "-inf"
+  },
+  {
+    "name": "string-of-true",
+    "expression": "string(true)",
+    "result": "true"
+  },
+  {
+    "name": "string-of-false",
+    "expression": "string(false)",
+    "result": "false"
+  },
+  {
+    "name": "string-of-a-string-is-the-string",
+    "expression": "string('a b')",
+    "result": "a b"
+  },
+  {
+    "name": "string-of-null",
+    "expression": "string(null)",
+    "result": "null"
+  },
+  {
+    "name": "string-of-bytes-is-their-utf8",
+    "expression": "string(b'h\\xc3\\xa9')",
+    "result": "hé"
+  },
+  {
+    "name": "string-of-malformed-bytes-replaces-each-subpart",
+    "expression": "string(b'a\\xff\\xe2\\x82b')",
+    "result": "a��b"
+  },
+  {
+    "name": "string-of-bytes-keeps-a-byte-order-mark",
+    "expression": "string(b'\\xef\\xbb\\xbfa')",
+    "result": "﻿a"
+  },
+  {
+    "name": "string-of-an-empty-list",
+    "expression": "string([])",
+    "result": "[]"
+  },
+  {
+    "name": "string-of-an-empty-map",
+    "expression": "string({})",
+    "result": "{}"
+  },
+  {
+    "name": "string-of-a-list-is-canonical-json",
+    "expression": "string([1, 'a', true, null, 2.5, 3.0])",
+    "result": "[1,\"a\",true,null,2.5,3]"
+  },
+  {
+    "name": "string-of-a-nested-map-sorts-its-keys",
+    "expression": "string({'b': {'z': 1, 'y': [2, {'q': false, 'p': null}]}, 'a': 'x'})",
+    "result": "{\"a\":\"x\",\"b\":{\"y\":[2,{\"p\":null,\"q\":false}],\"z\":1}}"
+  },
+  {
+    "name": "string-of-a-map-sorts-keys-by-code-point",
+    "expression": "string({'\\U0001F600': 2, '\\uff61': 1, 'a': 0, 'B': 3})",
+    "result": "{\"B\":3,\"a\":0,\"｡\":1,\"😀\":2}"
+  },
+  {
+    "name": "string-of-a-list-escapes-its-strings-as-json",
+    "expression": "string(['\"q\"', 'a\\\\b', 'l1\\nl2', '\\t', '\\x01', '\\x1f', '\\x7f', 'café /'])",
+    "result": "[\"\\\"q\\\"\",\"a\\\\b\",\"l1\\nl2\",\"\\t\",\"\\u0001\",\"\\u001f\",\"\",\"café /\"]"
+  },
+  {
+    "name": "string-of-a-map-escapes-its-keys",
+    "expression": "string({'a\"b': 1})",
+    "result": "{\"a\\\"b\":1}"
+  },
+  {
+    "name": "string-of-a-list-writes-doubles-as-string-does",
+    "expression": "string([1e21, -0.0, 0.1 + 0.2, 1.5e-7])",
+    "result": "[1000000000000000000000,-0,0.30000000000000004,0.00000015]"
+  },
+  {
+    "name": "string-of-an-input-list-of-objects",
+    "expression": "string(input.items)",
+    "input": {"input": {"items": [{"name": "first", "n": 1, "tags": ["a", "b"]}, {"tags": [], "name": "second", "n": 2.5}]}},
+    "result": "[{\"n\":1,\"name\":\"first\",\"tags\":[\"a\",\"b\"]},{\"n\":2.5,\"name\":\"second\",\"tags\":[]}]"
+  },
+  {
+    "name": "string-of-a-map-keyed-by-ints-is-an-error",
+    "expression": "string({1: 'a'})",
+    "error": true
+  },
+  {
+    "name": "string-of-a-list-holding-bytes-is-an-error",
+    "expression": "string([b'a'])",
+    "error": true
+  },
+  {
+    "name": "string-of-a-list-holding-an-infinity-is-an-error",
+    "expression": "string([1.0 / 0.0])",
+    "error": true
+  },
+  {
+    "name": "string-of-a-map-holding-a-nan-is-an-error",
+    "expression": "string({'x': double('nan')})",
+    "error": true
+  },
+  {
+    "name": "string-has-no-receiver-form",
+    "expression": "true.string()",
+    "error": true
+  },
+  {
+    "name": "string-of-a-string-has-no-receiver-form",
+    "expression": "'a'.string()",
+    "error": true
+  },
+  {
+    "name": "string-takes-exactly-one-argument",
+    "expression": "string(1, 2)",
+    "error": true
+  },
+  {
+    "name": "int-of-a-decimal-string",
+    "expression": "int('42')",
+    "result": 42
+  },
+  {
+    "name": "int-of-a-negative-string",
+    "expression": "int('-17')",
+    "result": -17
+  },
+  {
+    "name": "int-of-a-plus-signed-string",
+    "expression": "int('+5')",
+    "result": 5
+  },
+  {
+    "name": "int-of-a-string-with-leading-zeros",
+    "expression": "int('007')",
+    "result": 7
+  },
+  {
+    "name": "int-of-the-smallest-int-string",
+    "expression": "int('-9223372036854775808')",
+    "result": -9223372036854775808
+  },
+  {
+    "name": "int-of-a-string-past-int64-is-an-error",
+    "expression": "int('9223372036854775808')",
+    "error": true
+  },
+  {
+    "name": "int-of-a-string-with-whitespace-is-an-error",
+    "expression": "int(' 1')",
+    "error": true
+  },
+  {
+    "name": "int-of-a-string-with-a-trailing-space-is-an-error",
+    "expression": "int('1 ')",
+    "error": true
+  },
+  {
+    "name": "int-of-a-fractional-string-is-an-error",
+    "expression": "int('1.5')",
+    "error": true
+  },
+  {
+    "name": "int-of-an-exponent-string-is-an-error",
+    "expression": "int('1e3')",
+    "error": true
+  },
+  {
+    "name": "int-of-a-hex-string-is-an-error",
+    "expression": "int('0x10')",
+    "error": true
+  },
+  {
+    "name": "int-of-an-empty-string-is-an-error",
+    "expression": "int('')",
+    "error": true
+  },
+  {
+    "name": "int-of-a-bare-sign-is-an-error",
+    "expression": "int('-')",
+    "error": true
+  },
+  {
+    "name": "int-of-a-double-truncates-toward-zero",
+    "expression": "int(1.9)",
+    "result": 1
+  },
+  {
+    "name": "int-of-a-negative-double-truncates-toward-zero",
+    "expression": "int(-1.9)",
+    "result": -1
+  },
+  {
+    "name": "int-of-a-negative-half-is-zero",
+    "expression": "int(-0.5)",
+    "result": 0
+  },
+  {
+    "name": "int-of-the-largest-double-below-two-to-the-63",
+    "expression": "int(9223372036854774784.0)",
+    "result": 9223372036854774784
+  },
+  {
+    "name": "int-of-minus-two-to-the-63",
+    "expression": "int(-9223372036854775808.0)",
+    "result": -9223372036854775808
+  },
+  {
+    "name": "int-of-an-int-is-the-int",
+    "expression": "int(5)",
+    "result": 5
+  },
+  {
+    "name": "int-of-a-uint-in-range",
+    "expression": "int(7u)",
+    "result": 7
+  },
+  {
+    "name": "int-of-true-is-one",
+    "expression": "int(true)",
+    "result": 1
+  },
+  {
+    "name": "int-of-false-is-zero",
+    "expression": "int(false)",
+    "result": 0
+  },
+  {
+    "name": "int-of-an-input-string-takes-arithmetic",
+    "expression": "int(input.n) + 1",
+    "input": {"input": {"n": "12"}},
+    "result": 13
+  },
+  {
+    "name": "int-of-null-is-an-error",
+    "expression": "int(null)",
+    "error": true
+  },
+  {
+    "name": "int-of-a-list-is-an-error",
+    "expression": "int([1])",
+    "error": true
+  },
+  {
+    "name": "int-has-no-receiver-form",
+    "expression": "'1'.int()",
+    "error": true
+  },
+  {
+    "name": "double-of-an-int",
+    "expression": "double(3)",
+    "result": 3.0
+  },
+  {
+    "name": "double-of-the-largest-int-rounds-to-nearest",
+    "expression": "double(9223372036854775807) == 9223372036854775808.0",
+    "result": true
+  },
+  {
+    "name": "double-of-a-uint",
+    "expression": "double(7u)",
+    "result": 7.0
+  },
+  {
+    "name": "double-of-a-decimal-string",
+    "expression": "double('1.5')",
+    "result": 1.5
+  },
+  {
+    "name": "double-of-an-exponent-string",
+    "expression": "double('-2.5e3')",
+    "result": -2500.0
+  },
+  {
+    "name": "double-of-a-capital-exponent-string",
+    "expression": "double('1E3')",
+    "result": 1000.0
+  },
+  {
+    "name": "double-of-a-string-with-no-leading-digit",
+    "expression": "double('.5')",
+    "result": 0.5
+  },
+  {
+    "name": "double-of-a-string-with-no-trailing-digit",
+    "expression": "double('5.')",
+    "result": 5.0
+  },
+  {
+    "name": "double-of-an-integral-string-is-a-double",
+    "expression": "double('2') + 0.5",
+    "result": 2.5
+  },
+  {
+    "name": "double-of-a-string-past-the-range-is-an-infinity",
+    "expression": "double('1e400') > 1.0e308",
+    "result": true
+  },
+  {
+    "name": "double-of-an-infinity-string",
+    "expression": "double('inf') > 1.0e308",
+    "result": true
+  },
+  {
+    "name": "double-of-a-negative-infinity-string",
+    "expression": "double('-Infinity') < -1.0e308",
+    "result": true
+  },
+  {
+    "name": "double-of-a-nan-string-is-not-equal-to-itself",
+    "expression": "double('nan') != double('NaN')",
+    "result": true
+  },
+  {
+    "name": "double-of-a-double-is-the-double",
+    "expression": "double(2.5)",
+    "result": 2.5
+  },
+  {
+    "name": "double-of-true-is-one",
+    "expression": "double(true)",
+    "result": 1.0
+  },
+  {
+    "name": "double-of-false-is-zero",
+    "expression": "double(false)",
+    "result": 0.0
+  },
+  {
+    "name": "double-of-a-string-with-whitespace-is-an-error",
+    "expression": "double(' 1.5')",
+    "error": true
+  },
+  {
+    "name": "double-of-a-word-is-an-error",
+    "expression": "double('abc')",
+    "error": true
+  },
+  {
+    "name": "double-of-a-bare-point-is-an-error",
+    "expression": "double('.')",
+    "error": true
+  },
+  {
+    "name": "double-of-an-empty-string-is-an-error",
+    "expression": "double('')",
+    "error": true
+  },
+  {
+    "name": "double-of-a-hex-string-is-an-error",
+    "expression": "double('0x10')",
+    "error": true
+  },
+  {
+    "name": "double-of-an-exponent-with-no-digits-is-an-error",
+    "expression": "double('1e')",
+    "error": true
+  },
+  {
+    "name": "double-of-null-is-an-error",
+    "expression": "double(null)",
+    "error": true
+  },
+  {
+    "name": "bool-of-the-string-true",
+    "expression": "bool('true')",
+    "result": true
+  },
+  {
+    "name": "bool-of-the-string-false",
+    "expression": "bool('false')",
+    "result": false
+  },
+  {
+    "name": "bool-of-a-bool-is-the-bool",
+    "expression": "bool(false)",
+    "result": false
+  },
+  {
+    "name": "bool-of-an-input-string-takes-logic",
+    "expression": "bool(input.flag) && true",
+    "input": {"input": {"flag": "true"}},
+    "result": true
+  },
+  {
+    "name": "bool-of-a-capitalised-string-is-an-error",
+    "expression": "bool('True')",
+    "error": true
+  },
+  {
+    "name": "bool-of-a-digit-string-is-an-error",
+    "expression": "bool('1')",
+    "error": true
+  },
+  {
+    "name": "bool-of-another-word-is-an-error",
+    "expression": "bool('yes')",
+    "error": true
+  },
+  {
+    "name": "bool-of-an-int-is-an-error",
+    "expression": "bool(1)",
+    "error": true
+  },
+  {
+    "name": "bool-of-a-double-is-an-error",
+    "expression": "bool(0.0)",
+    "error": true
+  },
+  {
+    "name": "bool-of-null-is-an-error",
+    "expression": "bool(null)",
+    "error": true
+  },
+  {
+    "name": "bool-takes-exactly-one-argument",
+    "expression": "bool('true', 'false')",
+    "error": true
+  }
+]

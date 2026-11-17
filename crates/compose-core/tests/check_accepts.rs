@@ -3443,3 +3443,73 @@ flow.think:
 "#,
     );
 }
+
+/// CEL's four conversions and the strings extension's `join` are on the
+/// authored surface wherever an expression is (PRD resolved q85, Decision
+/// D168): every argument type the specification gives a conversion an overload
+/// for — `int(true)` among them, where `bool(1)` is the refused half — `join`
+/// with a separator and without one, over a channel and over a mapped list,
+/// and the results flowing into a typed binding, a string-in agent and a guard.
+/// `string()` of a list of objects is the case PRD resolved q85 was raised for:
+/// a list handed to a model as text, with no tool writing a file.
+#[test]
+fn the_conversions_and_join_are_accepted_wherever_an_expression_is() {
+    accepts(
+        "conversions-and-join",
+        r#"
+agent.a:
+  model: model.m
+  prompt: Do it.
+  input:
+    text: { type: string }
+    whole: { type: integer }
+    real: { type: number }
+    flag: { type: boolean }
+    joined: { type: string }
+    bare: { type: string }
+  output:
+    count: { type: string }
+    ok: { type: boolean }
+agent.b:
+  model: model.m
+  prompt: Do it.
+  output:
+    done: { type: boolean }
+state:
+  tags:
+    type: array
+    items: { type: string }
+flow.f:
+  inputs:
+    items:
+      type: array
+      items:
+        type: object
+        properties:
+          name: { type: string }
+          n: { type: integer }
+    count: { type: string }
+    ratio: { type: number }
+    answer: { type: string }
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input:
+        text: "string(input.items)"
+        whole: "int(input.count) + int(true) + int(input.ratio) + int(7)"
+        real: "double(input.count) + double(1) + double(false) + double(input.ratio)"
+        flag: "bool(input.answer) && bool(true)"
+        joined: "state.tags.join(', ')"
+        bare: "input.items.map(i, i.name).join() + string(null) + string(input.ratio)"
+    w:
+      agent: agent.b
+      input: "string(int(input.ratio))"
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: w, when: "int(n.output.count) > 0 && bool(string(n.output.ok))" }
+    - { from: n, to: end, else: true }
+    - { from: w, to: end }
+"#,
+    );
+}

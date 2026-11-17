@@ -152,5 +152,86 @@
     "expression": "write.output.draft.startsWith('# ')",
     "input": { "write": { "output": { "draft": "# a heading" } } },
     "result": true
+  },
+  {
+    "name": "join-with-a-separator",
+    "expression": "['a', 'b', 'c'].join(', ')",
+    "result": "a, b, c"
+  },
+  {
+    "name": "join-with-no-separator-joins-with-nothing",
+    "expression": "['a', 'b', 'c'].join()",
+    "result": "abc"
+  },
+  {
+    "name": "join-with-an-empty-separator",
+    "expression": "['a', 'b'].join('')",
+    "result": "ab"
+  },
+  {
+    "name": "join-of-an-empty-list",
+    "expression": "[].join(', ')",
+    "result": ""
+  },
+  {
+    "name": "join-of-an-empty-list-with-no-separator",
+    "expression": "[].join()",
+    "result": ""
+  },
+  {
+    "name": "join-of-one-element-has-no-separator",
+    "expression": "['solo'].join(', ')",
+    "result": "solo"
+  },
+  {
+    "name": "join-keeps-empty-elements",
+    "expression": "['', 'a', ''].join('-')",
+    "result": "-a-"
+  },
+  {
+    "name": "join-of-a-channel",
+    "expression": "state.tags.join(' | ')",
+    "input": { "state": { "tags": ["x", "y", "z"] } },
+    "result": "x | y | z"
+  },
+  {
+    "name": "join-of-mapped-conversions",
+    "expression": "[1, 2, 3].map(n, string(n)).join('+')",
+    "result": "1+2+3"
+  },
+  {
+    "name": "join-of-a-non-string-element-is-an-error",
+    "expression": "['a', 1].join(',')",
+    "error": true
+  },
+  {
+    "name": "join-of-a-list-of-lists-is-an-error",
+    "expression": "[['a']].join(',')",
+    "error": true
+  },
+  {
+    "name": "join-of-a-string-is-an-error",
+    "expression": "'abc'.join(',')",
+    "error": true
+  },
+  {
+    "name": "join-of-a-map-is-an-error",
+    "expression": "{'a': 'b'}.join(',')",
+    "error": true
+  },
+  {
+    "name": "join-has-no-global-spelling",
+    "expression": "join(['a', 'b'], ',')",
+    "error": true
+  },
+  {
+    "name": "join-takes-at-most-one-separator",
+    "expression": "['a', 'b'].join(',', ';')",
+    "error": true
+  },
+  {
+    "name": "join-separator-is-a-string",
+    "expression": "['a', 'b'].join(1)",
+    "error": true
   }
 ]

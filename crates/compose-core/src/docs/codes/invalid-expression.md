@@ -8,9 +8,12 @@ went wrong.
 
 The supported surface is standard CEL over the roots the position exposes:
 comparisons, boolean logic, arithmetic, indexing, `in`, `size()`, `has()`,
-`startsWith`/`endsWith`/`contains`/`matches`, and the comprehension macros
-`all`, `exists`, `exists_one`, `filter`, `map`. There are no custom extension
-functions.
+`startsWith`/`endsWith`/`contains`/`matches`, the conversions `string()`,
+`int()`, `double()`, `bool()`, the strings extension's `list.join()`, and the
+comprehension macros `all`, `exists`, `exists_one`, `filter`, `map`. There are
+no other conversions and no custom extension functions. A supported function
+written in a form it does not have — `join(list, ', ')`, `string(a, b)` — is
+this code too, and the help names the forms it does have.
 
 ## A spec that triggers it
 
