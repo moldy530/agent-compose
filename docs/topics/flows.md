@@ -168,11 +168,11 @@ call starts an instance exactly as a `flow:` node does, and:
 
 A deploy file may name a flow in a placement's `members:` (`agent-compose docs
 targets`), and then **every instance of it runs on a worker claiming that
-placement** — the root execution a trigger starts, a `flow:` node's, a `map`
-item's, a flow-as-tool call's. The hub dispatches the whole instance and the
-worker runs every node of it, its `finally:` node too; nothing above changes
-meaning. Its inputs are bound, its outputs written, its `policy:` crosses in,
-and its trace is recorded exactly as an unplaced instance's are.
+placement** — the root execution a trigger or `run` starts, a `flow:` node's, a
+`map` item's, a flow-as-tool call's. The hub dispatches the whole instance and
+the worker runs every node of it, its `finally:` node too; nothing above
+changes meaning. Its inputs are bound, its outputs written, its `policy:`
+crosses in, and its trace is recorded exactly as an unplaced instance's are.
 What changes is the environment: what only the flow reaches — its `coder:`
 node's `env:`, an agent only it names — is that machine's to hold, and not the
 hub's. And what it reaches cannot be placed **elsewhere**: the worker running
@@ -184,12 +184,13 @@ in a placed flow's instance its `map` node fails on every run
 it does inside a flow a placed agent attaches; dispatch detached work from a
 flow the hub runs instead.
 
-A `run` is one process with no mesh behind it, so one that reaches a placed
-flow — the flow itself, or a node over it — fails there with
-`PlacementUnreachable`, as one that reaches a placed agent's node does, rather
-than run the instance on your machine. To run a placed flow, serve the target,
-join a worker claiming its placement, and start the flow through a trigger (or
-from a flow the hub runs).
+A `run` of a placed flow — or of a flow whose node reaches one — is its own
+hub: at the first dispatch to the placement it serves the worker routes at
+`--host`/`--port` (`127.0.0.1` and a free port by default), prints
+`mesh: <url> — …` on stderr with the command that joins it —
+`agent-compose worker --hub <url> --claim <placement> --token-env <VAR>` —
+and waits for that worker. The instance runs there, never in the `run`'s own
+process, and its outputs are the run's answer.
 
 ## Reachability, and no recursion
 

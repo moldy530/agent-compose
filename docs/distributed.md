@@ -242,8 +242,8 @@ the hub dispatches is the node that **instantiates** it — exactly the unit a
 placed agent's node is: a `flow:` node's instance at that node's own instance
 path, one per `map` item at the item's, and one per flow-as-tool call an agent
 the hub runs makes, at the call's. A **root** execution of a placed flow — a
-trigger's — has no instantiating node, so the hub plants a synthetic dispatch
-for it: keyed by the execution and the flow's address, at the
+trigger's, a `run`'s — has no instantiating node, so the hub plants a synthetic
+dispatch for it: keyed by the execution and the flow's address, at the
 **empty** instance path, with the flow's address and an ordinal as its wait id
 (`flow.build/0`). The poll answer's `node` is then the flow's address and its
 `instance_path` the instantiating site's (§3.2). The worker runs the whole
@@ -261,19 +261,28 @@ it (§6.3) — which fails the instantiating node's attempt under that node's ow
 root instance whose session was lost fails its execution, as a placed node with
 no `retry:` fails its own.
 
-**Every one of those is the hub's to issue, and `agent-compose run` is not a
-hub.** A `run` is one process: it builds no app, mounts none of §3's routes and
-holds no board, so no worker can join it and nothing it parked would ever be
-polled. A placed node a `run` reaches has always been refused at its dispatch
-with `PlacementUnreachable`, before anything is journaled, rather than parked
-on a board nothing reads — and a placed flow's instance is refused the same
-way, because its dispatch is the same one: a `run` of the placed flow itself
-opens the execution's row and fails it at the root dispatch ("was not
-dispatched to placement `mac`"), and a `run` of a flow whose `flow:` node,
-`map` or agent reaches a placed flow fails at that node. Neither falls back to
-running the instance in the `run`'s process; a placed flow is started on a
-mesh by a trigger of the served target (Decision D171, which amends D64 to
-say so).
+**`agent-compose run` is the hub of the work it dispatches** (Decision D171).
+Every dispatch above is made by a process serving §3's routes, and `serve`
+mounts them as it starts. A `run` — and a `resume` — mounts them **at its
+first dispatch to a placement**, on a listener at `--host` and `--port`
+(`127.0.0.1` and a port the operating system picks, as for `serve`), and says
+where on stderr, as `mesh: <url> — …` followed by the `agent-compose worker`
+command that joins it. From there the run's dispatch is the one this section
+describes: it parks while nothing claims the placement, a worker that joins the
+run's address is handed it, its effects stream home to the run's journal (§3.3)
+and its result is what the run answers with. So a `run` of a placed flow runs
+the root instance on a worker, as PRD resolved q84 states, and so does an
+instance a `run`'s `flow:` node, `map` or agent starts; the same listener serves
+a placed agent's or tool's node a `run` reaches, which an earlier release
+refused with `PlacementUnreachable`. Nothing falls back to running placed work
+in the `run`'s own process, and a run that reaches nothing placed listens on
+nothing. What a `serve` start does and a `run`'s listener does not is supersede
+the rows a dead process left `dispatched`: §5's orphan rule is a replacing
+process's, and a `run` replaced nothing — on SQLite a `serve` may be up beside
+it, holding sessions of its own. A `run` keeps resolved q28's posture
+otherwise: Ctrl-C leaves the row open, and a `resume` that reaches the same
+dispatch finds what §5 says a replacing process finds — a row some dead session
+was holding is superseded, and a row still parked is waited on again.
 
 Undispatched is a pause rather than a failure, but it is not free of the clock:
 a node's `timeout:` chain runs from dispatch (§6.5), so an item that waits out
@@ -2358,10 +2367,10 @@ dispatch with the answered pause in its history — and the environment partitio
 §9.1, emitted into the artifact, so the hub checking a join's `env_ok` and a
 worker computing one read one answer under one hash. A placed component's node is
 dispatch-and-await rather than a call (§7) — and so is every instance of a
-placed flow, the root execution a trigger starts among them, which a worker
-runs whole and answers with the instance's outputs and its trace (§2, §3.4's
-`inner`, Decision D171) — and which `agent-compose run`, having no mesh, refuses
-at the dispatch with `PlacementUnreachable` rather than run in its own process.
+placed flow, the root execution a trigger or `run` starts among them, which a
+worker runs whole and answers with the instance's outputs and its trace (§2,
+§3.4's `inner`, Decision D171) — a `run` serving §3's routes itself from its
+first dispatch to a placement.
 
 What **`agent-compose worker`** is: the spoke. `--hub <url> --claim <name>…
 --token-env <VAR> [--data-dir <path>]`, a complete protocol client — the

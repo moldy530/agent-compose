@@ -10,8 +10,10 @@ agent-compose visualize <path> [--flow <addr>] [-o <path>] [--format html|json]
 agent-compose build <path> [--target <name>] [--out <dir>] [--check | --restamp]
                            [--format human|json]
 agent-compose run <path> <flow> [--input k=v]... [--session <key>]
+                                [--host <host>] [--port <port>]
                                 [--target <name>] [--out <dir>] [--no-build] [--format human|json]
-agent-compose resume <path> <execution> [--target <name>] [--out <dir>]
+agent-compose resume <path> <execution> [--host <host>] [--port <port>]
+                                        [--target <name>] [--out <dir>]
                                         [--format human|json]
 agent-compose serve <path> [--host <host>] [--port <port>]
                            [--target <name>] [--out <dir>] [--no-build] [--format human|json]
@@ -256,6 +258,22 @@ A run that reaches a `human` pause with nobody to ask exits **3**. With a
 terminal — or `AGENT_COMPOSE_INTERACTIVE=1` — it renders the question, reads one
 JSON value per line, validates it against the node's `output:`, and carries on
 in the same process.
+
+**A run that reaches placed work serves the mesh itself.** On a target with
+`placements:`, a placed agent's or tool's node, or any instance of a placed
+flow, is dispatched to a worker claiming its placement — never run in the CLI's
+process. At the first such dispatch the run serves the worker routes at
+`--host` and `--port` (`127.0.0.1` and a port the operating system picks, as for
+`serve`) and says so on stderr:
+
+```
+mesh: http://127.0.0.1:41873 — this run dispatches placed work and waits for a worker to join it: agent-compose worker --hub http://127.0.0.1:41873 --claim mac --token-env MESH_JOIN_TOKEN
+```
+
+The work waits for that worker — start it on the machine that holds the
+placement, pointing at an address that machine can reach — and its outputs
+are the run's answer. A run that reaches nothing placed listens on nothing.
+`resume` takes the same two flags.
 
 Every run is **journaled**, and under the human format the first line it writes
 to stderr is the id `resume` takes:

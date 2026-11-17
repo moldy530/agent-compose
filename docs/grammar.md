@@ -6607,17 +6607,16 @@ documents cite them by number** (Decisions
 2. **Members are `agent.*`, `tool.*` and `flow.*`.** An `agent.*` or `tool.*`
    member places that component's dispatches. A **`flow.*`** member places
    **every instance** of that flow, wherever one is started — the root
-   execution a trigger starts, a `flow:` node's instance (§8.5), a `map`
-   item's (§8.6), a flow-as-tool call's (§5.4): the hub dispatches each one to
-   a worker claiming the placement, and the worker runs the whole instance
-   there through the path an attached flow's instance already takes inside a
-   placed agent's loop. `agent-compose run` is one process with no mesh to
-   dispatch into, so a `run` that reaches a placed flow's instance — the flow
-   itself, or a node of another flow over it — is refused at that dispatch
-   with `PlacementUnreachable`, as a `run` reaching a placed agent's node is,
-   and never runs the instance in its own process. The flow's nodes — its
-   `finally:` node (§7.9) among them — execute on that worker, and their
-   effects are journaled on the hub as any dispatch's are. The flow's `inputs:`, `outputs:` and nodes mean
+   execution a trigger or `run` starts, a `flow:` node's instance (§8.5), a
+   `map` item's (§8.6), a flow-as-tool call's (§5.4): the hub dispatches each
+   one to a worker claiming the placement, and the worker runs the whole
+   instance there through the path an attached flow's instance already takes
+   inside a placed agent's loop. A `run` is the same start: `agent-compose
+   run` (and `resume`) serves the worker routes itself once it reaches placed
+   work, so the instance waits for a worker that joins the run rather than
+   running in the CLI's process. The flow's nodes — its `finally:` node (§7.9)
+   among them — execute on that worker, and their effects are journaled on the
+   hub as any dispatch's are. The flow's `inputs:`, `outputs:` and nodes mean
    what they meant unplaced; only *where* changes (PRD resolved q84,
    [D171](#d171-a-placed-flow-runs-each-of-its-instances-whole-on-a-worker-claiming-its-placement)) —
    with one construct that does not survive the move: a `detach: true`
@@ -6654,11 +6653,11 @@ documents cite them by number** (Decisions
      which would run on the hub. A tool with the same placement, or with none,
      is fine. What an agent with no placement of its own is held to is where
      it **executes**, including for an agent that appears only inside a flow
-     some other agent attaches: manual invocation is universal — every
-     unplaced flow a composition declares is runnable on its own, named by a
-     `manual` trigger or not
+     some other agent attaches: manual invocation is universal — every flow a
+     composition declares is runnable on its own, named by a `manual` trigger
+     or not
      ([D64](#d64-implicit-manual-invocation-is-a-cli-property-not-a-declared-trigger))
-     — so that flow is one the hub can start directly, and the `agent:` node
+     — so an unplaced flow is one the hub runs directly, and the `agent:` node
      inside it is dispatched by the hub's scheduler when it does. The one
      unplaced agent with no hub execution is one named only inside **placed**
      flows ([D171](#d171-a-placed-flow-runs-each-of-its-instances-whole-on-a-worker-claiming-its-placement)): it runs where their instances run, so a tool on that same
@@ -8301,15 +8300,6 @@ and everything checked against it), while implicit manual invocation is a
 *development* affordance of the generated CLI. Defaulting the one variable input
 a CLI run carries — the session key — is what keeps the coherence check decidable
 rather than undefined. *PRD 5.11, 5.8.*
-
-**Amended by [D171](#d171-a-placed-flow-runs-each-of-its-instances-whole-on-a-worker-claiming-its-placement)** (PRD resolved q84): "every flow" now reads "every flow a
-single process can run". A placed flow (§14.1 rule 2) runs every instance on a
-worker claiming its placement, which only a served hub can dispatch to, so
-`agent-compose run flow.<name>` of a placed flow opens the execution and fails
-it at the instance's dispatch with `PlacementUnreachable` — exactly as a `run`
-that reaches a placed agent's node fails at that node — rather than run the
-instance in the CLI's own process. The flow is still named, checked and started
-the same way; it is started on a mesh by a trigger of the served target.
 
 ### D65. A tool implementation binding sees only the tool's own `input`
 
@@ -15540,14 +15530,14 @@ D151, D155, D160.*
 ### D171. A placed `flow.*` runs each of its instances whole on a worker claiming its placement
 
 A placement's `members:` may name a `flow.*` definition. Every instance of that
-flow — the root execution a trigger starts, a `flow:` node's (§8.5), a `map`
-item's (§8.6), a flow-as-tool call's (§5.4) — is dispatched by the hub to a
-worker claiming the placement, and the worker runs the whole instance through
+flow — the root execution a trigger or `run` starts, a `flow:` node's (§8.5), a
+`map` item's (§8.6), a flow-as-tool call's (§5.4) — is dispatched by the hub to
+a worker claiming the placement, and the worker runs the whole instance through
 the path an attached flow's instance takes inside a placed agent's tool loop.
-A `run` of one is the start with no hub behind it, and is refused at the
-dispatch rather than run anywhere else (*What `run` does with one*, below).
-The flow's nodes, its `finally:` node (§7.9) among them, execute there; their
-effects are journaled on the hub as a dispatch's are. Grammar §14.1 rules 2–5
+A `run` of one is the same start, with the `run` as the hub (*What `run` does
+with one*, below). The flow's nodes, its `finally:` node (§7.9) among them,
+execute there; their effects are journaled on the hub as a dispatch's are.
+Grammar §14.1 rules 2–5
 state the surface; `docs/distributed.md` §2 and §9.1 state the dispatch and the
 environment.
 
@@ -15562,17 +15552,27 @@ flow's address and an ordinal (`flow.build/0`). The board, the park, the
 deadline, the cancel and stop lists, the liveness window and a placement's
 `max_running:` ([D161](#d161-max_running-is-how-many-dispatches-one-worker-session-holds-for-a-placement)) apply to it unchanged, because it is one more dispatch.
 
-**What `run` does with one.** Every one of those dispatches is the *hub's*: a
-served app with the worker routes mounted (`docs/distributed.md` §3), which
-`agent-compose run` is not — a `run` is one process, with no board and no way
-for a worker to join it. So a `run` that reaches a placed flow's instance does
-what a `run` that reaches a placed agent's node has always done: it refuses the
-dispatch with `PlacementUnreachable`, naming the flow and its placement, and the
-node — or, for a `run` of the placed flow itself, the execution, which opened
-its row first — fails on it. It never runs the instance in its own process
-instead, which would be the one start of a placed flow that bypassed the
-placement. A placed flow is started on a mesh by a trigger of the served target
-(or by a flow the hub runs), and that is the root execution the hub dispatches.
+**What `run` does with one.** Every one of those dispatches is made by a
+process serving the worker routes (`docs/distributed.md` §3), which a `serve`
+mounts as it starts. `agent-compose run` and `resume` mount them **when their
+first dispatch to a placement is made**, at `--host` and `--port` (`127.0.0.1`
+and a port the operating system picks, as for `serve`), and say where on
+stderr — `mesh: <url> — …` with the `agent-compose worker` command that joins
+it. From there the run *is* the hub its own dispatches are made from: the
+instance parks while nothing claims the placement, a worker that joins the run
+is handed it, its effects stream home to the run's journal, and its outputs are
+the run's answer. So the root execution a `run` of a placed flow starts runs
+on a worker claiming the placement, as PRD resolved q84 states, and so does an
+instance a `run`'s `flow:` node, `map` or agent starts; nothing falls back to
+running it in the CLI's process, which would be the one start of a placed
+instance its placement did not decide. The listener is one mechanism for every
+dispatch, so a placed **agent's** or **tool's** node a `run` reaches is
+dispatched the same way — where an earlier release refused that dispatch with
+`PlacementUnreachable`, which is now left only for a process that registered no
+way to serve a mesh (a caller of the emitted modules that is neither verb). A
+`run` that reaches nothing placed listens on nothing, and a `run`'s listener
+supersedes none of the dispatch rows a dead process left, since a `run` replaced
+no process — only its own execution's rows are its business.
 
 **What the worker runs.** The instance, under the instantiation site's policy
 (the outermost site wins, [D79](#d79-the-outermost-instantiation-site-policy-wins))
@@ -15600,12 +15600,12 @@ node.
 **The environment.** What only a placed flow reaches — its nodes' bindings, the
 unplaced agents and tools it runs, their providers, a `coder:` node's
 `workspace:`, `env:` and provider — joins its placement's manifest and **leaves
-the hub's**, which runs none of it. A placed flow is the one flow the hub cannot
-run itself, so [D64](#d64-implicit-manual-invocation-is-a-cli-property-not-a-declared-trigger)'s
-"every flow is runnable as `agent-compose run flow.<name>`" now reads "every
-*unplaced* flow": a trigger of a placed one starts the execution on the hub and
-dispatches its instance, and a `run` of one is refused at that dispatch, as
-above. A deploy-layer variable a placed flow reaches — a store's backend —
+the hub's**, which runs none of it. A placed flow is the one flow whose
+instances the hub never runs itself: a trigger or a `run` of one starts the
+execution on the hub — for a `run`, the `run` is that hub — and dispatches its
+instance, so [D64](#d64-implicit-manual-invocation-is-a-cli-property-not-a-declared-trigger)'s "every flow is runnable as
+`agent-compose run flow.<name>`" holds for it unchanged. A deploy-layer variable
+a placed flow reaches — a store's backend —
 stays the hub's too (§9.1's fifth clause). Rule 5 reads the same closure, so a
 process-local store a placed flow binds is refused
 ([D131](#d131-a-process-local-store-is-refused-where-a-placement-can-open-it)).
@@ -15648,8 +15648,12 @@ like any other.
 
 **Collision review.** PRD resolved q37 (hub and spoke, no peer partition)
 holds: the hub still owns the graph, dispatches every instance and journals
-every effect; a worker runs the instance it was handed and hands nothing on,
-which is what rule 3's cross-kind refusal enforces. q40 (the whole artifact
+every effect — a `run` being the one hub of its own execution for as long as it
+lasts, as it always owned that execution's graph and journal; a worker runs the
+instance it was handed and hands nothing on, which is what rule 3's cross-kind
+refusal enforces. Resolved q28's posture for a `run` holds too: Ctrl-C leaves
+its row open for `resume`, which serves the mesh the same way, and cancel stays
+`serve`'s (resolved q75 ruling d). q40 (the whole artifact
 everywhere) is what makes it possible — the worker already holds the flow. q44
 fixed the v1 distributed scope, and q84 widens it by exactly this member;
 [D129](#d129-placement-members-are-agents-and-tools-disjoint-and-colocated-with-what-attaches-them)'s
@@ -15666,9 +15670,11 @@ and [D161](#d161-max_running-is-how-many-dispatches-one-worker-session-holds-for
 apply to the instance's dispatch as to any other — a cancel ends it
 `cancelled`, and it holds one of a session's `max_running` slots for as long as
 it runs. [D64](#d64-implicit-manual-invocation-is-a-cli-property-not-a-declared-trigger)
-is narrowed as stated above, and carries an amendment note saying so: the
-implicit `run` of a placed flow is refused rather than run in the CLI's
-process, since that process has no mesh to dispatch the instance into. [D159](#d159-finally-names-the-node-an-instance-runs-once-when-it-ends)'s
+is unchanged: every flow, a placed one included, is runnable as
+`agent-compose run flow.<name>`, and the implicit `run` of a placed flow starts
+it exactly as a trigger does — the `run` serving the worker routes itself once
+it dispatches (*What `run` does with one*) — rather than being refused or run in
+the CLI's process. [D159](#d159-finally-names-the-node-an-instance-runs-once-when-it-ends)'s
 finally node runs where its instance runs, on the worker, and its failure is
 the execution's `finally_error` as it would be on the hub. The mesh protocol's
 version does not move: `inner` is an optional field a hub of this release reads
@@ -15677,8 +15683,8 @@ a `coder:` node naming a placement of its own is not added — q84 leaves that
 form open for a later question, should a flow prove too coarse a unit.
 
 **Status**: ratified — PRD resolved q84. *PRD 5.10, resolved q37, q40, q44,
-q45, q84; §14.1; amends D129, narrows D64; builds on D79, D128, D131, D159,
-D160, D161.*
+q45, q84; §14.1; amends D129; builds on D64, D79, D128, D131, D159, D160,
+D161.*
 
 ## Appendix B — Editor integration
 
