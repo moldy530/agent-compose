@@ -59,6 +59,9 @@
 //! the cascade; and `agent-compose cancel` prints why —
 //! [`a_cancel_closes_an_execution_this_build_cannot_run_and_the_open_child_it_left`],
 //! [`a_cancel_of_an_execution_whose_recovery_diverged_cancels_the_child_it_runs_through_the_cascade`]
+//! — and one it was running whose own generation then settled with its row
+//! still open is closed too, before its parent —
+//! [`a_child_the_cascade_reached_waiting_for_its_permit_whose_replay_then_diverged_is_closed_before_its_parent`],
 //! and [`agent_compose_cancel_prints_why_it_closed_an_execution_this_build_cannot_run`]
 //! (the divergence and the renamed flow under `pushed`'s settle webhook and a
 //! trace sink are in `compiled_graph_acceptance.rs`) — while an open row a
@@ -1910,6 +1913,253 @@ fn a_cancel_of_an_execution_whose_recovery_diverged_cancels_the_child_it_runs_th
     );
 }
 
+/// **A child the cascade reached still waiting for its permit, whose own replay
+/// then diverged, is closed before its parent** (PRD resolved q81's "its open
+/// children in the lineage closed the same way", q75 ruling c; Decision D165,
+/// D160).
+///
+/// [`PARENT_OF_A_QUEUE`]'s parent detaches two children of `flow.queued` under
+/// `max_concurrency: 2`, runs a quick step and then a ten-minute command, when
+/// its `serve` is killed: the first child is in its ten-minute `work`, and the
+/// second, whose `work` was over at once, has run its quick `step` and is in
+/// its ten-minute `hold`. The next build bounds the fan-out at one and gives
+/// both steps an argument they never had. The parent's replay re-issues both
+/// dispatches: the first child takes the one permit and runs its `work` here
+/// again — its record holds nothing it would diverge at — the second is still
+/// waiting for the permit, on no board, and the parent diverges at its step.
+///
+/// The cancel of the parent cancels the first child through its controller,
+/// and the second — which this process runs, waiting — has its request
+/// recorded. When the first child gives the permit back, the second opens
+/// carrying the request, and its replay to the frontier the cancel would fire
+/// at meets the recorded step this build would not make: it diverges, and its
+/// generation ends with its row still open. That child is then one nothing
+/// here will take, and the cancel closes it — `cancelled`, the divergence in
+/// its `finally_error` — before the parent's row closes, and the `202` names no
+/// descendant left open.
+#[test]
+fn a_child_the_cascade_reached_waiting_for_its_permit_whose_replay_then_diverged_is_closed_before_its_parent()
+ {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("cancel-unrun-queued-child");
+    let (environment, log) = environment(&provider, &scratch);
+    let pid_file = PathBuf::from(format!("{}.pids", log.display()));
+    let before = scratch.path().join("before.yml");
+    std::fs::write(&before, PARENT_OF_A_QUEUE).expect("the scratch area is writable");
+    let after = scratch.path().join("after.yml");
+    let moved = PARENT_OF_A_QUEUE
+        .replace("max_concurrency: 2", "max_concurrency: 1")
+        .replace(
+            "        command: \"${TALLY_BIN}/ended\"\n      input:\n        outcome: \"'stepped'\"",
+            "        command: \"${TALLY_BIN}/ended\"\n        args: [\"--moved\"]\n      input:\n        outcome: \"'stepped'\"",
+        )
+        .replace(
+            "        command: \"${TALLY_BIN}/ended\"\n      input:\n        outcome: \"'child-stepped'\"",
+            "        command: \"${TALLY_BIN}/ended\"\n        args: [\"--moved\"]\n      input:\n        outcome: \"'child-stepped'\"",
+        );
+    assert_eq!(
+        moved.matches("--moved").count(),
+        2,
+        "both steps' bindings move"
+    );
+    assert!(
+        moved.contains("max_concurrency: 1"),
+        "the fan-out's bound moves"
+    );
+    std::fs::write(&after, moved).expect("the scratch area is writable");
+    let Some(project) = harness::scratch_project("cancel-unrun-queued-child") else {
+        return;
+    };
+
+    let parent;
+    {
+        let Some(first) = harness::serve_entrypoint_into(&project, &before, &environment) else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        parent = started(
+            &app,
+            "/parent",
+            &json!({ "firsts": [600, 0], "linger": 600 }),
+        );
+        // The first child's `work`, the second's `work` and `hold`, and the
+        // parent's `hold`.
+        pids(&log, 4);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let mut said = ended(&log);
+            said.sort();
+            if said == ["child-stepped|none", "stepped|none"] {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "both steps ran and were recorded: {said:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let children = harness::journal_rows(
+        &project,
+        &format!(
+            "SELECT execution, item_index FROM lineage WHERE parent = '{parent}' \
+             ORDER BY item_index"
+        ),
+    );
+    let child = |index: i64| -> String {
+        children
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|row| row["item_index"] == index)
+            .and_then(|row| row["execution"].as_str())
+            .unwrap_or_else(|| panic!("the parent's child at {index}: {children:#}"))
+            .to_string()
+    };
+    let (running, waiting) = (child(0), child(1));
+
+    let Some(mut served) = harness::serve_entrypoint_into(&project, &after, &environment) else {
+        kill_listed(&pid_file);
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let diverged = reaches(&app, &parent, "failed", Duration::from_secs(30));
+    assert!(
+        diverged["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ReplayDivergence: "),
+        "{diverged:#}"
+    );
+    // The first child runs its `work` here again, holding the one permit…
+    let rerun = pids(&log, 5)[4];
+    reaches(&app, &running, "running", Duration::from_secs(30));
+    // …and the second waits for it: issued, on this process's books, and on
+    // no board until it runs.
+    let queued = app
+        .get(&format!("/executions/{waiting}"))
+        .expect("the status route answers");
+    assert_eq!(
+        queued.status,
+        404,
+        "the second child is still waiting for its permit: {}",
+        queued.text()
+    );
+
+    let (status, body) = cancel(&app, &parent);
+    assert_eq!(status, 202, "{body:#}");
+    assert_eq!(body["status"], "cancelled", "{body:#}");
+    assert_eq!(body["cancelling"], false, "{body:#}");
+    let detail = body["detail"].as_str().unwrap_or_default();
+    assert!(
+        !detail.contains(&waiting) && !detail.contains("open with the cancel recorded"),
+        "no descendant is left open: {body:#}"
+    );
+    assert!(
+        !alive(rerun),
+        "the first child's command outlived the cascade"
+    );
+
+    // Asked once, not polled: the cancel was complete when it was answered.
+    let report = |id: &str| -> Value {
+        app.get(&format!("/executions/{id}"))
+            .expect("the status route answers")
+            .json()
+    };
+    let first_report = report(&running);
+    assert_eq!(first_report["status"], "cancelled", "{first_report:#}");
+    assert!(
+        first_report.get("finally_error").is_none(),
+        "the first child's own finally node ran, and ran clean: {first_report:#}"
+    );
+    let second_report = report(&waiting);
+    assert_eq!(
+        second_report["status"], "cancelled",
+        "the second child was closed before the cancel was answered: {second_report:#}"
+    );
+    assert!(second_report.get("error").is_none(), "{second_report:#}");
+    let second_detail = second_report["finally_error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        second_detail.starts_with(closed_detail("").trim_end_matches(')'))
+            && second_detail.contains("ReplayDivergence: "),
+        "{second_report:#}"
+    );
+    let mut said = ended(&log);
+    said.sort();
+    assert_eq!(
+        said,
+        ["cancelled|none", "child-stepped|none", "stepped|none"],
+        "the first child's finally node ran at `cancelled`, and neither the second child's \
+         nor the parent's ran anywhere"
+    );
+
+    let rows = harness::journal_rows(
+        &project,
+        &format!(
+            "SELECT executions.id AS id, executions.status AS status, executions.error AS error, \
+             executions.finally_error AS finally_error, executions.ended_at AS ended_at, \
+             cancellations.requested_at AS requested_at FROM executions \
+             LEFT JOIN cancellations ON cancellations.execution = executions.id \
+             WHERE executions.id IN ('{parent}', '{running}', '{waiting}')"
+        ),
+    );
+    let row = |id: &str| -> Value {
+        rows.as_array()
+            .into_iter()
+            .flatten()
+            .find(|row| row["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("{id}'s row: {rows:#}"))
+    };
+    let (parent_row, first_row, second_row) = (row(&parent), row(&running), row(&waiting));
+    for held in [&parent_row, &first_row, &second_row] {
+        assert_eq!(held["status"], "cancelled", "{rows:#}");
+        assert!(held["error"].is_null(), "{rows:#}");
+        assert!(held["requested_at"].is_string(), "{rows:#}");
+    }
+    assert!(first_row["finally_error"].is_null(), "{rows:#}");
+    assert_eq!(
+        second_row["finally_error"].as_str(),
+        Some(second_detail.as_str()),
+        "{rows:#}"
+    );
+    assert!(
+        parent_row["finally_error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ReplayDivergence: "),
+        "{rows:#}"
+    );
+    let parent_ended = parent_row["ended_at"].as_str().expect("the parent's end");
+    for held in [&first_row, &second_row] {
+        let child_ended = held["ended_at"].as_str().expect("the child's end");
+        assert!(
+            child_ended <= parent_ended,
+            "the child's row ({child_ended}) had closed before the parent's did \
+             ({parent_ended}): {rows:#}"
+        );
+    }
+
+    let said = served.stop_and_read_stderr();
+    kill_listed(&pid_file);
+    for (id, flow) in [(&parent, "flow.parent"), (&waiting, "flow.queued")] {
+        assert_eq!(
+            said.lines()
+                .filter(|line| line.starts_with(&format!(
+                    "`{id}` ({flow}) could not be recovered by this build: "
+                )) && line.ends_with(&format!(
+                    "; its row stays open until `agent-compose cancel {id}` closes it"
+                )))
+                .count(),
+            1,
+            "{said}"
+        );
+    }
+}
+
 /// **`serve`'s cancel leaves alone an execution a `run` beside it is running**
 /// (PRD resolved q75 ruling d, q28; Decision D165's "a `run`'s row is still
 /// `404`", D163's Status).
@@ -2494,6 +2744,110 @@ flow.parent:
         detach: true
         input:
           linger: "seconds"
+    step:
+      exec:
+        command: "${TALLY_BIN}/ended"
+      input:
+        outcome: "'stepped'"
+        error: "'none'"
+    hold:
+      exec:
+        command: "${TALLY_BIN}/linger"
+      input:
+        linger: "input.linger"
+    parent_end:
+      exec:
+        command: "${TALLY_BIN}/ended"
+      input:
+        outcome: "execution.outcome"
+        error: "has(execution.error) ? execution.error : 'none'"
+  edges:
+    - { from: start, to: spawn }
+    - { from: spawn, to: step }
+    - { from: step, to: hold }
+    - { from: hold, to: end }
+  finally: parent_end
+"#;
+
+/// [`a_child_the_cascade_reached_waiting_for_its_permit_whose_replay_then_diverged_is_closed_before_its_parent`]'s
+/// composition: a parent that detaches a fan-out of `flow.queued` under
+/// `max_concurrency: 2`, runs a quick step of its own — `${TALLY_BIN}/ended`,
+/// recording `stepped` — and then a command that lingers. Each child lingers
+/// for as long as its item says in `work`, records `child-stepped` in a quick
+/// `step`, and then lingers ten minutes in `hold`. The steps are the effects a
+/// moved build diverges at.
+const PARENT_OF_A_QUEUE: &str = r#"version: "0.1"
+
+defaults:
+  timeout: 300s
+
+triggers:
+  on_parent:
+    type: http
+    flow: flow.parent
+    path: /parent
+    method: POST
+    input:
+      firsts: "payload.body.firsts"
+      linger: "payload.body.linger"
+    respond: async
+
+flow.queued:
+  description: A command that lingers as long as it is told to, a quick step, then a ten-minute command.
+  inputs:
+    first:
+      type: integer
+  outputs: {}
+  nodes:
+    work:
+      exec:
+        command: "${TALLY_BIN}/linger"
+      input:
+        linger: "input.first"
+    step:
+      exec:
+        command: "${TALLY_BIN}/ended"
+      input:
+        outcome: "'child-stepped'"
+        error: "'none'"
+    hold:
+      exec:
+        command: "${TALLY_BIN}/linger"
+      input:
+        linger: "600"
+    record:
+      exec:
+        command: "${TALLY_BIN}/ended"
+      input:
+        outcome: "execution.outcome"
+        error: "has(execution.error) ? execution.error : 'none'"
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: step }
+    - { from: step, to: hold }
+    - { from: hold, to: end }
+  finally: record
+
+flow.parent:
+  description: A bounded fan-out of detached children, a quick step, then a command of the parent's own.
+  inputs:
+    firsts:
+      type: array
+      max_items: 2
+      items: { type: integer }
+    linger:
+      type: integer
+  outputs: {}
+  nodes:
+    spawn:
+      map:
+        over: input.firsts
+        as: seconds
+        node: flow.queued
+        max_concurrency: 2
+        detach: true
+        input:
+          first: "seconds"
     step:
       exec:
         command: "${TALLY_BIN}/ended"
