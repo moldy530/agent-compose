@@ -184,13 +184,23 @@ in a placed flow's instance its `map` node fails on every run
 it does inside a flow a placed agent attaches; dispatch detached work from a
 flow the hub runs instead.
 
+A cancel ends a placed instance as it ends any other — every node it was
+running `cancelled`, then its `finally:` node — and the finally node runs on a
+worker too. That holds when no worker is running the instance as the cancel
+arrives: one waiting at a `human:` question, which waits on the hub, is handed
+back to a worker as its **end**, which replays it to the question, ends it
+there and runs the finally node; the execution settles once that is done. An
+instance whose dispatch no worker ever took never began, and a cancel ends it
+with nothing run.
+
 A `run` of a placed flow — or of a flow whose node reaches one — is its own
-hub: at the first dispatch to the placement it serves the worker routes at
-`--host`/`--port` (`127.0.0.1` and a free port by default), prints
+hub: at the first dispatch of a placed flow's instance it serves the worker
+routes at `--host`/`--port` (`127.0.0.1` and a free port by default), prints
 `mesh: <url> — …` on stderr with the command that joins it —
 `agent-compose worker --hub <url> --claim <placement> --token-env <VAR>` —
 and waits for that worker. The instance runs there, never in the `run`'s own
-process, and its outputs are the run's answer.
+process, and its outputs are the run's answer. A placed agent's or tool's node
+gets no such mesh from a `run`: it is refused there, as it always was.
 
 ## Reachability, and no recursion
 

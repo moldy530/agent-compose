@@ -1933,7 +1933,13 @@ whose last node it was would settle `completed`. So is a **pause nobody answered
 a worker sent home that the replay finds on a dispatch row settled paused with
 no answer recorded — an abandoned pause writes nothing — where the cancel fires
 instead of the wait being planted on the board again. Planted, it would be a
-wait every answer is refused at and nothing ever ends. A dispatch a worker held
+wait every answer is refused at and nothing ever ends. Where that pause is a
+**placed flow's** instance's, the instance it stops has begun on a worker and
+its finally node is owed there, so the replay makes the dispatch the live
+cancel would have made — the instance's end, with `cancelled: true`, which a
+worker replays to the same frontier, ends there and runs the finally node
+(`docs/distributed.md` §2, §3.2; Decision D171) — and the row settles on that
+end's result. A dispatch a worker held
 when the process died is not superseded as an orphan at the next start, as
 every other such row is (`docs/distributed.md` §5): read as one, the node's
 attempt would fail under its `retry:` and `on_error:` — the chain a cancel is

@@ -261,22 +261,49 @@ it (§6.3) — which fails the instantiating node's attempt under that node's ow
 root instance whose session was lost fails its execution, as a placed node with
 no `retry:` fails its own.
 
-**`agent-compose run` is the hub of the work it dispatches** (Decision D171).
-Every dispatch above is made by a process serving §3's routes, and `serve`
-mounts them as it starts. A `run` — and a `resume` — mounts them **at its
-first dispatch to a placement**, on a listener at `--host` and `--port`
-(`127.0.0.1` and a port the operating system picks, as for `serve`), and says
-where on stderr, as `mesh: <url> — …` followed by the `agent-compose worker`
-command that joins it. From there the run's dispatch is the one this section
-describes: it parks while nothing claims the placement, a worker that joins the
-run's address is handed it, its effects stream home to the run's journal (§3.3)
-and its result is what the run answers with. So a `run` of a placed flow runs
-the root instance on a worker, as PRD resolved q84 states, and so does an
-instance a `run`'s `flow:` node, `map` or agent starts; the same listener serves
-a placed agent's or tool's node a `run` reaches, which an earlier release
-refused with `PlacementUnreachable`. Nothing falls back to running placed work
-in the `run`'s own process, and a run that reaches nothing placed listens on
-nothing. What a `serve` start does and a `run`'s listener does not is supersede
+**A cancel owes a placed flow's instance its end, on a worker** (PRD resolved
+q75 ruling e, q76; Decision D171). A cancel reaches an instance a worker is
+running through that worker's `cancel` list (§3.2): every node ends
+`cancelled` there and the finally node runs there. An instance no worker is
+running when the cancel arrives — one whose `human:` question waits on this
+hub's board (§3.4), or whose redispatch is parked — has still begun: its nodes
+ran on a worker, and its finally node is owed as an unplaced instance's is when
+a cancel finds it at a pause. The hub cannot run that node — nothing of a placed
+flow runs on the hub, and its environment is the placement's (§9.1) — so it
+makes one more dispatch of the instance, its **end**: the row at the next
+ordinal of the same instance path, its whole `effect_history`, and §3.2's
+`cancelled: true`. The worker replays the instance to its frontier, where the
+execution's cancel fires — the question's own claim, for one that paused — ends
+it there `cancelled`, runs its finally node, and posts `status: "cancelled"`
+with the instance's `inner` trace and any `finally_error` (§3.4); the
+instantiating node, or the root execution, settles on that. The cancel does
+not withdraw the end — it is the cancel's own, and an end under way is waited
+for, never stopped (grammar §7.9) — so it parks like any dispatch while nothing
+claims the placement, as the redispatch an answer makes does; a lost session's
+end is dispatched again. A hub restarted mid-cancel makes the same end where
+its replay stops the instance at a frontier (`docs/durability.md` §6.1). An
+instance whose dispatch no worker ever took has **not** begun, and has no end
+to run anything at (grammar §7.9): the cancel withdraws its parked row as it
+withdraws any, and it settles as the cancel with no finally node run.
+
+**`agent-compose run` is the hub of the placed flows it dispatches** (Decision
+D171). Every dispatch above is made by a process serving §3's routes, and
+`serve` mounts them as it starts. A `run` — and a `resume` — mounts them **at
+its first dispatch of a placed flow's instance**, on a listener at `--host` and
+`--port` (`127.0.0.1` and a port the operating system picks, as for `serve`),
+and says where on stderr, as `mesh: <url> — …` followed by the `agent-compose
+worker` command that joins it. From there the run's dispatch is the one this
+section describes: it parks while nothing claims the placement, a worker that
+joins the run's address is handed it, its effects stream home to the run's
+journal (§3.3) and its result is what the run answers with. So a `run` of a
+placed flow runs the root instance on a worker, as PRD resolved q84 states, and
+so does an instance a `run`'s `flow:` node, `map` or agent starts. Nothing falls
+back to running a placed instance in the `run`'s own process, and a run that
+reaches no placed flow listens on nothing. A placed **agent's** or **tool's**
+node is not what q84 ruled on, and a `run` refuses it with
+`PlacementUnreachable` as it did before a flow could be placed — whether or not
+a placed flow earlier in the same run has started the listener, so what a run
+does with such a node never depends on what it reached first. What a `serve` start does and a `run`'s listener does not is supersede
 the rows a dead process left `dispatched`: §5's orphan rule is a replacing
 process's, and a `run` replaced nothing — on SQLite a `serve` may be up beside
 it, holding sessions of its own. A `run` keeps resolved q28's posture
@@ -666,6 +693,19 @@ Carries the session. Long-polls for up to one hold (§2).
   `instance_path` the site that instantiated it; a root instance's is the
   **empty** path, which holds every path of its execution, so its
   `effect_history` is the execution's whole record.
+
+  **`cancelled`** is OPTIONAL, `true` where present, and only ever on a placed
+  flow's instance: the dispatch is that instance's **end**, owed by a cancel that
+  found no worker running it (§2). The worker opens the execution's cancel at
+  the frontier — the first effect `effect_history` does not hold fires it, as a
+  recovered cancel's frontier does on the hub (`docs/durability.md` §6.1) — so
+  the instance replays to there, ends `cancelled`, and runs its finally node, and
+  the result is `status: "cancelled"` (§3.4). It is not the `cancel` list: a
+  dispatch that list names is settled with no runner started, and this one is
+  run for the sake of what its end runs. A worker that did not read it would
+  replay the instance to its question again and settle it paused, and the hub
+  reads a paused end as the cancel it was made for — the instance ends with no
+  finally node run, which is what a hub that never sent the field gets.
 
   **The four fields between them are what makes a placed node the same node.**
   Each is OPTIONAL — a dispatch that has none of them omits all four — and each
@@ -2293,10 +2333,13 @@ or a second implementation of this document.
 **A placed flow is not a bump** (PRD resolved q84, Decision D171). Its
 instance travels as a dispatch of the instantiating node — the poll answer's
 `node` names the flow, which the artifact defines, and §10.2 puts a change to the
-artifact outside this protocol — and the one field it adds, a result's `inner`
-(§3.4), is OPTIONAL: a hub that does not read it records a placed flow's
-instance with no inner trace, and a worker that does not send it is one that
-ran no placed flow. Protocol `3` carries it unchanged.
+artifact outside this protocol — and the two fields it adds are OPTIONAL: a
+result's `inner` (§3.4), which a hub that does not read records as an instance
+with no inner trace, and a worker that does not send is one that ran no placed
+flow; and a poll answer's `cancelled` (§3.2), which a worker that does not read
+answers by settling the instance's end paused, read by the hub as the cancel it
+was — the instance ends with no finally node run, never with a wrong outcome.
+Protocol `3` carries both unchanged.
 
 **The bumps to 2 and to 3 cost nothing in practice, and saying so is the point
 of recording them.** A worker and the hub it talks to are built from one compiler
@@ -2370,7 +2413,9 @@ dispatch-and-await rather than a call (§7) — and so is every instance of a
 placed flow, the root execution a trigger or `run` starts among them, which a
 worker runs whole and answers with the instance's outputs and its trace (§2,
 §3.4's `inner`, Decision D171) — a `run` serving §3's routes itself from its
-first dispatch to a placement.
+first dispatch of a placed flow's instance, and refusing a placed agent's or
+tool's node as before; and a cancel that finds a begun placed instance with no
+worker running it hands a worker the instance's end (§2, §3.2's `cancelled`).
 
 What **`agent-compose worker`** is: the spoke. `--hub <url> --claim <name>…
 --token-env <VAR> [--data-dir <path>]`, a complete protocol client — the

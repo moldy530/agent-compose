@@ -598,12 +598,18 @@ the hub served, and its effects are journaled by the hub. A placed flow's
 instance is one such dispatch, whatever started it: it takes one of a worker's
 `max_running:` slots for the whole instance, a `human:` node inside it pauses
 on the hub's board like any other, a cancel ends each of its nodes `cancelled`
-and runs its finally node on the worker, and its outputs and its trace come home
-as the instance's. `serve` is one process that serves those routes, and a
-`run` (or `resume`) is the other: at its first dispatch to a placement it
-serves them itself, at `--host`/`--port`, says `mesh: <url> — …` on stderr
-with the `worker` command that joins it, and waits for that worker — so a
-`run` of a placed flow runs it on the build machine, not on yours. The wire is
+and runs its finally node on the worker — a cancel that finds it waiting at
+such a question, with no worker running it, hands a worker the instance's end,
+which replays to the question and runs the finally node there, while an
+instance no worker ever took never began and runs nothing — and its outputs
+and its trace come home as the instance's. `serve` is one process that serves
+those routes, and a `run` (or `resume`) is the other for a placed flow: at its
+first dispatch of a placed flow's instance it serves them itself, at
+`--host`/`--port`, says `mesh: <url> — …` on stderr with the `worker` command
+that joins it, and waits for that worker — so a `run` of a placed flow runs it
+on the build machine, not on yours. A placed agent's or tool's node a `run`
+reaches is refused (`PlacementUnreachable`), as it always was; serve the target
+for those. The wire is
 normative
 in `docs/distributed.md`, and `agent-compose docs cli` is where the verb's flags
 are.
