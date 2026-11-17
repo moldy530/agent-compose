@@ -733,7 +733,9 @@ evaluators (`crates/compose-core/tests/fixtures/cel-conformance/`, D168):
 
 - `string()` of an `int` is its decimal; of a `double`, the shortest digits that
   read back as the same double, written without an exponent (`string(1e21)` is a
-  1 and twenty-one zeros, `string(2.0)` is `2`); of a bool, `true` or `false`; of
+  1 and twenty-one zeros, `string(2.0)` is `2`), and of two such spellings
+  equally near, the one further from zero (`string(1000000000000000.25)` is
+  `1000000000000000.3`); of a bool, `true` or `false`; of
   `null`, `null`; of a string, the string; of a **list, a map or an object, its
   canonical JSON** — object keys in code-point order, no whitespace, strings
   escaped as JSON escapes them, an `int` without a fraction, a `double` as
@@ -15187,7 +15189,14 @@ place is a choice both evaluators answer the same way:
   the three values with no digits are `inf`, `-inf` and `NaN`. The crate's own
   overload cannot be replaced from outside it, so its form is the one both
   columns can agree on, and the emitted evaluator places JavaScript's shortest
-  digits itself rather than writing `String()`'s `1e+21`.
+  digits itself rather than writing `String()`'s `1e+21`. Where a double lies
+  exactly halfway between two shortest spellings, the crate (Rust's `f64`
+  `Display`) takes the one further from zero and ECMAScript's
+  `Number::toString` the one with an even last digit —
+  `string(1000000000000000.25)` is `1000000000000000.3` to the crate and
+  `…000.2` to `String()` — so the emitted evaluator finds the tie exactly, from
+  the double's bits, and moves it up; the corpus pins ties at both last digits
+  and both signs, alone and inside canonical JSON.
 - **Keys sort by code point**, which is the Rust column's string order and the
   order `compareStrings` already gives the emitted evaluator's comparisons —
   not JavaScript's UTF-16 sort, under which an astral key would sort before

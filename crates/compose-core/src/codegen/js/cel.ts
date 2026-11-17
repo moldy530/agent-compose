@@ -1100,6 +1100,13 @@ function expectBool(value: CelValue, what: string): boolean {
  * a 1 and twenty-one zeros, so the digits are JavaScript's own shortest ones
  * and the placement of the point is done here. `-0` keeps its sign, and the
  * three values with no digits are spelt as the crate spells them.
+ *
+ * One choice inside "the shortest digits" is the crate's and not JavaScript's:
+ * when the double lies exactly halfway between two spellings of that shortest
+ * length, ECMAScript's `Number::toString` takes the one with the even last digit
+ * and the crate (Rust's `f64` `Display`) takes the one further from zero —
+ * `1000000000000000.25` is `…000.2` to `String()` and `…000.3` to the crate.
+ * So a tie is looked for here, exactly, and moved up.
  */
 function doubleText(value: number): string {
   if (Number.isNaN(value)) return "NaN";
@@ -1107,17 +1114,62 @@ function doubleText(value: number): string {
   if (value === -Infinity) return "-inf";
   if (value === 0) return Object.is(value, -0) ? "-0" : "0";
   const sign = value < 0 ? "-" : "";
-  const [mantissa, exponent = "0"] = String(Math.abs(value)).split("e") as [string, string?];
+  const magnitude = Math.abs(value);
+  const [mantissa, exponent = "0"] = String(magnitude).split("e") as [string, string?];
   const [whole, fraction = ""] = mantissa.split(".") as [string, string?];
   let digits = whole + fraction;
   // Where the decimal point falls, counted in digits from the left.
   let point = whole.length + Number(exponent);
   const leading = /^0*/.exec(digits)![0].length;
-  digits = digits.slice(leading);
+  // The significant digits only: an integer's trailing zeros are put back by
+  // the placement below, and the tie is decided at the last significant digit.
+  digits = digits.slice(leading).replace(/0+$/, "");
   point -= leading;
+  // The power of ten the last digit stands for. The parse is a cheap sieve — a
+  // double exactly at the halfway point reads back from it — and `halfwayAbove`
+  // is the exact test.
+  const last = point - digits.length;
+  if (
+    Number(`${digits}5e${last - 1}`) === magnitude &&
+    halfwayAbove(magnitude, BigInt(digits), last)
+  ) {
+    const upper = String(BigInt(digits) + 1n);
+    // The crate writes only a spelling that reads back as this double. One
+    // exactly as far above as the lower one is below does whenever the lower
+    // one does, and the check keeps that from being an assumption.
+    if (upper.length === digits.length && Number(`${upper}e${last}`) === magnitude) {
+      digits = upper;
+    }
+  }
   if (point >= digits.length) return `${sign}${digits}${"0".repeat(point - digits.length)}`;
   if (point > 0) return `${sign}${digits.slice(0, point)}.${digits.slice(point)}`;
   return `${sign}0.${"0".repeat(-point)}${digits}`;
+}
+
+const doubleBits = new DataView(new ArrayBuffer(8));
+
+/**
+ * Whether a positive finite double is **exactly** `(digits + ½) × 10^exponent` —
+ * halfway between `digits` and the next spelling up at that last digit. The
+ * double's own bits give its exact value, `significand × 2^power`, and the two
+ * sides are compared as integers: the halfway point is exactly what floating
+ * point cannot be trusted to hold.
+ */
+function halfwayAbove(magnitude: number, digits: bigint, exponent: number): boolean {
+  doubleBits.setFloat64(0, magnitude);
+  const bits = doubleBits.getBigUint64(0);
+  const biased = Number((bits >> 52n) & 0x7ffn);
+  const fraction = bits & 0xfffffffffffffn;
+  const significand = biased === 0 ? fraction : fraction | (1n << 52n);
+  // 2 × magnitude = significand × 2^twos, against (2 × digits + 1) × 10^exponent.
+  const twos = (biased === 0 ? 1 : biased) - 1075 + 1;
+  let left = significand;
+  let right = 2n * digits + 1n;
+  if (twos >= 0) left <<= BigInt(twos);
+  else right <<= BigInt(-twos);
+  if (exponent >= 0) right *= 10n ** BigInt(exponent);
+  else left *= 10n ** BigInt(-exponent);
+  return left === right;
 }
 
 /**

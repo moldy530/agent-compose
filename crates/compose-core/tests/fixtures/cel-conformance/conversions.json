@@ -45,6 +45,36 @@
     "result": "0.3333333333333333"
   },
   {
+    "name": "string-of-a-double-halfway-between-two-shortest-spellings-takes-the-upper-one",
+    "expression": "string(1000000000000000.25)",
+    "result": "1000000000000000.3"
+  },
+  {
+    "name": "string-of-a-double-halfway-at-its-second-decimal-takes-the-upper-one",
+    "expression": "string(123456789012345.125)",
+    "result": "123456789012345.13"
+  },
+  {
+    "name": "string-of-a-negative-double-halfway-takes-the-one-further-from-zero",
+    "expression": "string(-1000000000000000.25)",
+    "result": "-1000000000000000.3"
+  },
+  {
+    "name": "string-of-a-double-halfway-below-an-even-digit-takes-the-upper-one",
+    "expression": "string(1000000000000000.75)",
+    "result": "1000000000000000.8"
+  },
+  {
+    "name": "string-of-a-double-one-step-past-halfway-is-the-nearer-spelling",
+    "expression": "string(1000000000000000.375)",
+    "result": "1000000000000000.4"
+  },
+  {
+    "name": "string-of-a-list-holding-a-halfway-double-spells-it-as-string-does",
+    "expression": "string([1000000000000000.25, -123456789012345.125])",
+    "result": "[1000000000000000.3,-123456789012345.13]"
+  },
+  {
     "name": "string-of-a-large-double-is-positional",
     "expression": "string(1e21)",
     "result": "1000000000000000000000"

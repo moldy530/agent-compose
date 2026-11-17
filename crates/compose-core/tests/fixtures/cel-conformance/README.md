@@ -80,7 +80,14 @@ readings of "convert this" come apart:
   not fix a format, and JavaScript's `String()` writes `1e+21` — so the crate's
   form is pinned because it is the one both columns can agree on: its overload
   cannot be replaced from outside it, and the emitted evaluator takes
-  JavaScript's own shortest digits and places the point itself.
+  JavaScript's own shortest digits and places the point itself. The two also
+  break a tie differently: a double exactly halfway between two shortest
+  spellings is written with the one further from zero by the crate (Rust's
+  `f64` `Display`) and with the even last digit by `String()` —
+  `1000000000000000.25` is `…000.3` to one and `…000.2` to the other — so the
+  emitted evaluator tests for the tie exactly and takes the crate's. The
+  `…-halfway-…` cases pin it at both last digits, at both signs and inside
+  canonical JSON; a value that is not a tie never reaches the difference.
 - **`string()` of a list or a map is canonical JSON** — the PRD's ruling: object
   keys in **code-point** order (the Rust column's `str` order, and the emitted
   evaluator's `compareStrings` rather than JavaScript's UTF-16 sort — one case
