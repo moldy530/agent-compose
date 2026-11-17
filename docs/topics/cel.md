@@ -117,8 +117,11 @@ What the conversions answer:
 - **`int()`** truncates a double toward zero, reads a decimal string with an
   optional sign and nothing around it, and makes a bool `1` or `0`; a double
   outside `int64` or a string that is not a decimal integer fails.
-- **`double()`** reads a decimal or exponent string (`1.5`, `.5`, `-2e3`), and
-  makes a bool `1.0` or `0.0`; anything else, whitespace included, fails.
+- **`double()`** reads a decimal or exponent string (`1.5`, `.5`, `-2e3`) and,
+  in any case and with an optional sign, `inf`, `infinity` and `nan` — so
+  `double('nan')` is a NaN and `double('-Infinity')` an infinity, not a failed
+  read — and makes a bool `1.0` or `0.0`; any other string, whitespace
+  included, fails.
 - **`bool()`** reads exactly `true` or `false`. `bool(1)` is a compile error —
   CEL gives a number no `bool()`.
 - **`l.join(sep)`** joins a list of strings with `sep`, and `l.join()` with
