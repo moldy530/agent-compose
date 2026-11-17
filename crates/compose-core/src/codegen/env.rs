@@ -135,6 +135,36 @@ fn store_backend_owner(ir: &Ir, store: &str) -> Option<String> {
         .map(|site| backend_owner(&site))
 }
 
+/// Whether an operator's `store` command opens a backend for the store at
+/// `store` at all, rather than refusing the address as usage before it reads
+/// any of its environment (PRD resolved q45, q72, q82, grammar Decisions D155,
+/// D166).
+///
+/// The emitted `operatorRefusal` read in Rust, clause for clause, so the
+/// launcher's manifest and the emitted verb agree on which commands reach their
+/// environment check: the command reads and writes `kv` stores alone, and a
+/// `kv` store whose rows live only in the memory of the process that opened
+/// them — one a target bound to `provider: memory`, or a `scope: execution`
+/// store on a process-local backend — leaves this process nothing to read. An
+/// address that names no store opens nothing either.
+fn an_operator_opens(ir: &Ir, store: &str) -> bool {
+    use crate::ast::definition::{StoreKind, StoreScope};
+    use crate::ast::deploy::BackendProvider;
+
+    let Some(DefinitionBody::Store(definition)) =
+        ir.definitions.get(store).map(|definition| &definition.body)
+    else {
+        return false;
+    };
+    if definition.kind != StoreKind::Kv {
+        return false;
+    }
+    let provider = crate::ir::deploy::backend_of(ir, definition).provider;
+    let in_process_only = provider.opens_in_process()
+        && (definition.scope == StoreScope::Execution || provider == BackendProvider::Memory);
+    !in_process_only
+}
+
 /// The owner key the `package_registry:` credentials are filed under
 /// (grammar 14.6, PRD resolved q59).
 ///
@@ -711,11 +741,21 @@ impl References {
     /// different entry than the command then opens. A store a target built-in
     /// decides (every store under `--target local`, and any whose kind the
     /// target neither aliases nor defaults) is opened from a file under the
-    /// build directory with no variable at all, and an address that names no
-    /// store is the emitted command's usage error to report: both answer an
-    /// empty manifest.
+    /// build directory with no variable at all, and answers an empty manifest.
+    ///
+    /// **So does a store the command opens nothing for**: an address that
+    /// names no store, a `vector` or `blob` store, and a `kv` store whose rows
+    /// live only in the memory of the process that wrote them (PRD resolved
+    /// q45, q72, grammar Decision D155) — [`an_operator_opens`]. Each is the
+    /// emitted command's usage refusal, raised before it reads any of its
+    /// environment, and a credential demanded ahead of that refusal would be
+    /// one the command never spends: the operator would set a vector backend's
+    /// address only to be told the store command does not read vector stores.
     #[must_use]
     pub fn for_store(ir: &Ir, store: &str) -> Self {
+        if !an_operator_opens(ir, store) {
+            return Self::default();
+        }
         let Some(owner) = store_backend_owner(ir, store) else {
             return Self::default();
         };
@@ -1659,6 +1699,115 @@ storage_backends:\n  aliases:\n    pg_db:\n      provider: postgres\n      url: 
             ["PROVIDER_URL", "STORE_URL", "WEBHOOK_TOKEN"],
             "the hub's manifest is unchanged: `run` and `serve` still need all three"
         );
+    }
+
+    /// **…and of no other entry**: a target with several `storage_backends:`
+    /// entries hands a store command the one its store binds, whichever of
+    /// alias and per-kind default decided it (PRD resolved q82, Decision D166).
+    ///
+    /// The case the test above cannot tell apart from "every backend entry":
+    /// there, the composition declares one entry. Here three dial out, each with
+    /// a variable of its own — the store's alias, an alias another store binds,
+    /// and the `kv` default a store naming no `backend:` falls to — so a manifest
+    /// that took every entry would name all three for each store, and one that
+    /// read the alias where the default decided (or the other way round) would
+    /// name the wrong one. A `store count` on the Postgres store refused over
+    /// the MySQL entry's `${AUDIT_URL}` is the false requirement q82 removes.
+    #[test]
+    fn a_store_commands_manifest_leaves_out_every_backend_entry_its_store_does_not_bind() {
+        let ir = ir_of_mesh(
+            "version: \"0.1\"\n\
+store.ledger:\n  kind: kv\n  scope: global\n  backend: pg_db\n  value_schema:\n    text: { type: string }\n\
+store.audit:\n  kind: kv\n  scope: global\n  backend: my_db\n  value_schema:\n    text: { type: string }\n\
+store.prefs:\n  kind: kv\n  scope: session\n  value_schema:\n    text: { type: string }\n",
+            "version: \"0.1\"\n\
+storage_backends:\n  defaults:\n    kv:\n      provider: postgres\n      url: ${PREFS_URL}\n  \
+aliases:\n    pg_db:\n      provider: postgres\n      url: ${STORE_URL}\n    \
+my_db:\n      provider: mysql\n      url: ${AUDIT_URL}\n",
+        );
+
+        for (store, name, site) in [
+            (
+                "store.ledger",
+                "STORE_URL",
+                "deploy.storage_backends.aliases.pg_db.url",
+            ),
+            (
+                "store.audit",
+                "AUDIT_URL",
+                "deploy.storage_backends.aliases.my_db.url",
+            ),
+            (
+                "store.prefs",
+                "PREFS_URL",
+                "deploy.storage_backends.defaults.kv.url",
+            ),
+        ] {
+            let references = References::for_store(&ir, store);
+            assert_eq!(
+                references.names().collect::<Vec<_>>(),
+                [name],
+                "`{store}` opens the entry it binds and no other of the target's three"
+            );
+            assert_eq!(
+                references.sites(name),
+                [site],
+                "`{store}`'s refusal names the entry it binds"
+            );
+        }
+        assert_eq!(
+            manifest(&ir, &Partition::of(&ir), &Process::Hub),
+            ["AUDIT_URL", "PREFS_URL", "STORE_URL"],
+            "the hub opens every store, so it still needs every entry"
+        );
+    }
+
+    /// **A store the command opens nothing for demands no variable**, even
+    /// where the target binds it to an entry that holds one (PRD resolved q45,
+    /// q72, q82, Decisions D155, D166).
+    ///
+    /// The emitted verb refuses a `vector` or `blob` store, and a `kv` store
+    /// whose rows live only in the memory of the process that opened them, as
+    /// usage — before it reads any of its environment. The launcher's manifest
+    /// answers nothing for them, so it does not stand in front of that refusal
+    /// demanding a credential the command never spends: an operator who typed
+    /// `store count store.docs` is told the command does not read vector
+    /// stores, not to set the vector backend's `${CHROMA_URL}` first.
+    ///
+    /// The hub's manifest is the other half: the variables are real, and the
+    /// processes that open these stores still need them.
+    #[test]
+    fn a_store_the_command_opens_nothing_for_demands_no_variable() {
+        let ir = ir_of_mesh(
+            "version: \"0.1\"\n\
+provider.embed:\n  kind: openai\n  api_key: ${EMBED_KEY}\n\
+store.docs:\n  kind: vector\n  scope: global\n  backend: docs_db\n  embed:\n    model: text-embedding-3-small\n    provider: provider.embed\n\
+store.files:\n  kind: blob\n  scope: global\n  backend: files_db\n\
+store.scratch:\n  kind: kv\n  scope: global\n  backend: mem_db\n  value_schema:\n    text: { type: string }\n",
+            "version: \"0.1\"\n\
+storage_backends:\n  aliases:\n    docs_db:\n      provider: chroma\n      url: ${CHROMA_URL}\n    \
+files_db:\n      provider: s3\n      url: ${BUCKET_URL}\n    \
+mem_db:\n      provider: memory\n      note: \"${MEMORY_NOTE}\"\n",
+        );
+
+        for store in ["store.docs", "store.files", "store.scratch"] {
+            assert!(
+                References::for_store(&ir, store).is_empty(),
+                "`{store}` is the emitted command's usage refusal, which comes before any \
+                 environment: {:?}",
+                References::for_store(&ir, store)
+                    .names()
+                    .collect::<Vec<_>>()
+            );
+        }
+        let hub = manifest(&ir, &Partition::of(&ir), &Process::Hub);
+        for name in ["CHROMA_URL", "BUCKET_URL", "MEMORY_NOTE"] {
+            assert!(
+                hub.contains(&name.to_string()),
+                "the variable is real — the hub opens the store — so an empty store manifest \
+                 is the command's answer, not a reference the walk missed: {hub:?}"
+            );
+        }
     }
 
     /// A composition with no `placements:` partitions to exactly what it always
