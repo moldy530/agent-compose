@@ -1879,7 +1879,11 @@ be read now, so the <n> executions it holds open are recovered now, before any
 tick or event is admitted`, and then one `recovered` line per execution as at a
 start. An execution this process already holds — one it started since — is
 never recovered beside itself, and a delivery it already has on its schedule
-is never put on a second one.
+is never put on a second one. A **cancel** of an execution on no board waits
+for the walk the same way (PRD resolved q81): it is taken first, where still
+owed, so the standby cancels what the first left running as a running
+execution, finally node and all, rather than reading it as one it could not
+take (§7).
 
 **A stop leaves every execution where it was**, child executions included. A
 `serve` that receives `SIGINT` or `SIGTERM` closes and exits without waiting for
@@ -2169,9 +2173,11 @@ execution of that project in a single restart.
 put back is still recovered; an operator who will not put it back says so with
 `POST /executions/:id/cancel` or `agent-compose cancel`, and the cancel **closes**
 it (PRD resolved q81, `docs/grammar.md` D165): the request is recorded as every
-cancel's is, its open children in the lineage that the process is not running
-are closed the same way — those it is running are cancelled through the
-cascade, and waited for until they have settled — and the row is ended
+cancel's is, its open children in the lineage that nothing in the process will
+take are closed the same way — those it is running are cancelled through the
+cascade, and waited for until they have settled, and one a recovery there
+still takes keeps its row open with its request recorded, for that recovery
+to complete — and the row is ended
 `cancelled` with **no finally node run** — no generation can run one against a
 record it does not describe —
 which `finallyError` says (`no finally node ran: this build could not take up
@@ -2184,6 +2190,19 @@ no longer declares, which recovery leaves in the journal (§6.1). `serve` says
 which command closes each, once per start: `` `<id>` (<flow>) could not be
 recovered by this build: <reason>; its row stays open until `agent-compose
 cancel <id>` closes it``.
+
+**Only an execution nothing in the process will ever take is closed so.** An
+open row of a flow the build declares that the process has not recovered
+*yet* — the walk a start could not finish (§6.1: a standby's, before its retry
+reads the journal), a child whose open parent's replay has still to re-issue
+it, a row the start that next recovers it will take — is one the build can
+run, and its cancel is any open execution's (PRD resolved q75): `serve` takes
+the walk it owes first, so one that walk puts on the board is cancelled as a
+running execution, and one still unrun after it has its request recorded and
+its row left open, `202` with `cancelling: true`, for the recovery that takes
+it to complete the cancel at its frontier — every instance ending `cancelled`
+and running its `finally:` node. A child on no board is closed only where its
+open parent is itself unrecoverable, since nothing will re-issue it then.
 
 The commonest cause is a composition that moved under a journal — a changed
 prompt, a renamed tool, a different `url:`. That is the diagnosis the message is

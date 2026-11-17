@@ -374,7 +374,7 @@ log names this command for it once per start:
 ```
 
 The cancel **closes** it (PRD resolved q81): the request is recorded, its open
-children this process is not running are closed the same way — one it is
+children nothing in the process will take are closed the same way — one it is
 running is cancelled through the cascade and waited for until it has settled —
 and the row is ended `cancelled` with **no finally node run** — no generation
 can run one against a record it does not describe — which its `finally_error`
@@ -388,6 +388,20 @@ cancelled `exec_9f1c8a3e-…`: this build could not take up this execution's rec
 ```
 
 Sent again, it is the `409` every ended execution gets.
+
+Only an execution nothing in the serving process will ever take is closed so.
+One of a flow the build declares that the process has not recovered *yet* — a
+standby whose walk of the journal is still owed, a child its open parent's
+replay has still to re-issue — is one the build can run: the app takes the
+recovery it owes first, and an execution that puts on the board is cancelled
+as a running one; one still unrun after it has its cancel recorded and its
+row left open, for the recovery that takes it to complete the cancel, finally
+node and all. The app answers `202` with `cancelling: true` and no status URL,
+and the command prints the app's `detail` and exits `0`:
+
+```
+cancelling `exec_9f1c8a3e-…`: this process runs no generation of this execution yet, and a recovery of this build takes it up — the recovery this process owes, which has not read the journal yet — so the cancel is recorded and its lifecycle row stays open: that recovery completes the cancel, its finally node included
+```
 
 A `run` is not cancelled this way: `Ctrl-C` stops its process and leaves its row
 open for `resume` (PRD resolved q28). A cancel is `serve`'s, and an open row a
