@@ -1572,6 +1572,21 @@ export function runsHere(execution: string): boolean {
 }
 
 /**
+ * Settles once the generation of `execution` this process runs as a child
+ * execution — issued, waiting for its permit, or running
+ * ([`runningChildren`]) — has stopped, and at once where it runs none. Never
+ * rejects ([`superviseChild`]).
+ *
+ * What `src/serve.ts`'s cancel of an execution this build's recovery could not
+ * take waits on for each open descendant the cascade cancelled here, before it
+ * closes a row above that descendant (PRD resolved q81, Decision D165): the
+ * answer says the cancel is complete, which is a claim about the lineage.
+ */
+export function childSettled(execution: string): Promise<void> {
+  return runningChildren.get(execution)?.settled ?? Promise.resolve();
+}
+
+/**
  * Arrange for a **recovered** execution whose cancel was requested to complete
  * it (PRD resolved q75, `docs/durability.md` §6.1): its controller is opened
  * and its journal's frontier hook installed, so the replay consumes the
