@@ -3996,7 +3996,11 @@ fn a_result_whose_status_is_not_cancelled_is_unreadable_and_fails_its_attempt() 
 /// detail**, because that is all a restarted hub's replay reads. Superseded with
 /// the heartbeat's detail, the row would replay as an ordinary failed attempt —
 /// a node failed under its `retry:` and `on_error:`, which a cancelled node is
-/// never routed through — rather than as the cancel that ended it.
+/// never routed through — rather than as the cancel that ended it. And it says
+/// that a worker **held** it when the cancel came, rather than that the cancel
+/// withdrew it unrun: a replay reading the second would owe a placed flow's
+/// instance an end on another worker beside the one the cancel reached
+/// (Decision D171).
 #[test]
 fn a_cancelled_dispatch_whose_session_goes_quiet_is_superseded_as_the_cancel() {
     let Some(project) = shared_project("mesh-quiet-cancel") else {
@@ -4028,10 +4032,11 @@ fn a_cancelled_dispatch_whose_session_goes_quiet_is_superseded_as_the_cancel() {
             rows,
             json!([{
                 "status": "superseded",
-                "detail": "the execution this dispatch belonged to was cancelled (docs/distributed.md §3.2)",
+                "detail": "the execution this dispatch belonged to was cancelled while a worker held it (docs/distributed.md §3.2)",
             }]),
             "the sweep superseded a cancelled dispatch as a heartbeat loss, which a replay reads \
-             as a failed attempt rather than as the cancel it was"
+             as a failed attempt rather than as the cancel it was — or as a cancel no worker \
+             held, which a replay reads as owing a placed instance an end"
         );
     }
     drop(harness::Scratch::at(project));

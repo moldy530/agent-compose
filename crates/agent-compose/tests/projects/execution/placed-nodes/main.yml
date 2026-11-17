@@ -379,6 +379,29 @@ triggers:
       path: "payload.body.path"
     respond: async
 
+  # A placed flow's question abandoned by the end of the flow around it — see
+  # `flow.placed_asking_raced`.
+  on_placed_asking_raced:
+    type: http
+    flow: flow.placed_asking_raced
+    path: /placed-asking-races
+    method: POST
+    input:
+      path: "payload.body.path"
+      gate: "payload.body.gate"
+    respond: async
+
+  # A placed flow a worker is inside for as long as a test needs — see
+  # `flow.placed_holding`.
+  on_placed_holding:
+    type: http
+    flow: flow.placed_holding
+    path: /placed-holdings
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
 provider.mock:
   kind: anthropic
   api_key: ${MOCK_API_KEY}
@@ -1501,3 +1524,73 @@ flow.placed_asking:
     - { from: inspect, to: ask }
     - { from: ask, to: end }
   finally: close_out
+
+# The placed asking flow from a `flow:` node, beside a sibling that fails once
+# the test opens its gate — by then the instance's question has come home to the
+# hub's board, and no worker is running anything of it (grammar §7.9, Decision
+# D171). The failure ends this flow, and its end abandons the question. An
+# unplaced instance waiting there would end `failed` and run its finally node,
+# so the hub hands a worker the placed instance's end — `stopped: true` — and
+# the worker replays `inspect`, stops the instance at `ask`, and runs
+# `close_out` at outcome `failed` before this flow settles.
+flow.placed_asking_raced:
+  description: A placed flow waiting on a person beside a sibling that fails once told to.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+    gate:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    asking:
+      flow: flow.placed_asking
+      input:
+        path: "input.path"
+    doomed:
+      exec:
+        command: "${OPS_BIN}/sh"
+        args: ["-c", "while [ ! -e \"$GATE\" ]; do sleep 0.05; done; exit 1"]
+      input:
+        gate: "input.gate"
+  edges:
+    - { from: start, to: asking }
+    - { from: start, to: doomed }
+    - { from: asking, to: end }
+    - { from: doomed, to: end }
+
+# A placed flow whose model call is journaled at once and whose next node
+# outlasts any test, so a worker is inside a begun instance for as long as a
+# test needs — what a hub restarted mid-cancel finds a worker holding
+# (`docs/distributed.md` §5, Decision D171). That worker ends the instance when
+# its session meets the restarted hub's `410`, and runs `settle_up` there; the
+# hub makes no end dispatch beside it.
+flow.placed_holding:
+  description: Inspect a release on the machine that holds it, then look it over at length, and settle up after it there.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+  nodes:
+    inspect:
+      agent: agent.inspector
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+    hold:
+      exec:
+        command: "${OPS_BIN}/sleep"
+        args: ["600"]
+    settle_up:
+      exec:
+        command: "${OPS_BIN}/true"
+  edges:
+    - { from: start, to: inspect }
+    - { from: inspect, to: hold }
+    - { from: hold, to: end }
+  finally: settle_up

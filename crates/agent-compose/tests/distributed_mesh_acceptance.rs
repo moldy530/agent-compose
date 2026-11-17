@@ -5899,6 +5899,396 @@ fn a_hub_restarted_mid_cancel_at_a_placed_flows_question_runs_its_finally_node_o
     );
 }
 
+/// **A hub restarted mid-cancel while a worker holds a placed flow's instance
+/// leaves the instance's end to that worker, and dispatches no end beside it**
+/// (grammar §7.9: a finally node "runs once when it ends"; PRD resolved q75
+/// ruling e; Decision D171; `docs/distributed.md` §2, §5).
+///
+/// `flow.placed_holding`'s instance makes its model call on the worker — the
+/// record reaches the hub's journal, so the instance has begun — and then sits
+/// in `hold` for ten minutes. The journal is left as a crash right after the
+/// cancel route recorded its request would leave it, with the root dispatch
+/// still `dispatched` to a session the dead process issued. The recovered
+/// replay reaches that row as the cancel's frontier and settles the execution
+/// `cancelled` — and, because a worker may still be running the instance, it
+/// makes **no end dispatch**: the worker holding it is the one that ends it.
+/// Its next request meets the restarted hub's `410`, it stops the runner (§5's
+/// stop, never a cancel), and the instance ends there `failed` and runs
+/// `settle_up` once, its boundary journaled under the renewed session. An end
+/// dispatched beside it would have run `settle_up` a second time, on whichever
+/// worker took it — the one row this test counts.
+#[test]
+fn a_restart_while_a_worker_holds_a_cancelled_placed_flow_leaves_its_end_to_that_worker() {
+    let Some(mut mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider
+        .enqueue(inspecting("release.dmg", "inspected-before-the-restart"));
+    let mut worker = mesh.worker("placed-flow-restart-while-held");
+
+    let execution = mesh.start_execution("/placed-holdings", &json!({ "path": "release.dmg" }));
+    until(
+        "the instance's model call reached the hub's journal",
+        || worker.transcript(),
+        || harness::journal_holds(&mesh.project, &["inspect/0#model/0"]),
+    );
+    mesh.until(&execution, "was taken by the worker", |report| {
+        report["placement_waits"][0]["status"] == "dispatched"
+    });
+    // Inside `hold`: the instance has begun, and a worker is running it.
+    until(
+        "the instance's long node was running on the worker",
+        || worker.transcript(),
+        || {
+            worker.runners().is_none_or(|running| {
+                running.iter().any(|runner| {
+                    u32::try_from(*runner)
+                        .ok()
+                        .and_then(|runner| children_running(runner, "sleep"))
+                        .is_some_and(|commands| !commands.is_empty())
+                })
+            })
+        },
+    );
+
+    mesh.restart_after(|project| {
+        let wrote = harness::journal_sql(
+            project,
+            &format!(
+                "INSERT INTO cancellations (execution, requested_at) \
+                 VALUES ('{execution}', '2026-11-04T00:00:00.000Z');"
+            ),
+        );
+        assert!(
+            wrote.status.success(),
+            "{}",
+            String::from_utf8_lossy(&wrote.stderr)
+        );
+    });
+
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] == "cancelled" || report["status"] == "failed"
+    });
+    assert_eq!(
+        report["status"],
+        "cancelled",
+        "the recovered execution did not complete its cancel: {report:#}\n{}",
+        worker.transcript()
+    );
+    assert!(report.get("error").is_none(), "{report:#}");
+
+    // The worker that held the instance ends it, and its finally node runs
+    // there: stopped by the `410`, so at outcome `failed` (§5).
+    until(
+        "the finally node ran on the worker that held the instance",
+        || worker.transcript(),
+        || boundary_outcome(&mesh, &execution, "settle_up/0#finally/0").is_some(),
+    );
+    assert_eq!(
+        boundary_outcome(&mesh, &execution, "settle_up/0#finally/0").as_deref(),
+        Some("failed"),
+        "{}",
+        worker.transcript()
+    );
+    until(
+        "the runner the restart orphaned is gone",
+        || worker.transcript(),
+        || worker.runners().is_none_or(|running| running.is_empty()),
+    );
+
+    let rows = mesh.dispatch_rows(&execution);
+    assert_eq!(
+        rows.len(),
+        1,
+        "the recovery dispatched an end beside the instance a worker was still running, so \
+         its finally node would run twice: {rows:#?}\n{}",
+        worker.transcript()
+    );
+    assert_eq!(rows[0]["status"], "superseded", "{rows:#?}");
+    assert!(
+        rows[0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("was cancelled while a worker held it")),
+        "the held dispatch was not ended as the cancel's, held by a worker: {rows:#?}"
+    );
+    assert_eq!(
+        mesh.provider.requests().len(),
+        1,
+        "the instance's model call was made a second time"
+    );
+    assert!(
+        worker.running(),
+        "the worker stopped somewhere across the restart: {}",
+        worker.transcript()
+    );
+}
+
+/// **A placed flow's question abandoned by the end around it ends the instance
+/// on a worker, `failed`, and its finally node runs there** (grammar §7.9:
+/// "one that was waiting on a person is stopped the same way: its pause is
+/// abandoned … and it ends failed, its finally node run"; PRD resolved q76;
+/// Decision D171; `docs/distributed.md` §3.2).
+///
+/// `flow.placed_asking_raced` runs a `flow:` node into `flow.placed_asking`
+/// beside `doomed`, which fails once the test opens its gate. The placed
+/// instance runs `inspect` on the worker and reaches `ask`: its dispatch
+/// settles *paused* and the question waits on the hub's board, with no worker
+/// running anything of the instance. Then `doomed` fails, the flow around the
+/// instance ends, and its end abandons the question. Unplaced, the instance
+/// would end `failed` there and run its finally node; the hub can run none of
+/// a placed flow, so it hands a worker the instance's **end** — a second
+/// dispatch at the instance's path, its effect history and `stopped: true` —
+/// and the worker replays `inspect`, stops the instance at `ask`, and runs
+/// `close_out` at outcome `failed`. The flow around it settles `failed` after
+/// that end, with no model call made twice and no answer journaled. Without
+/// the end dispatch the execution settles with one dispatch row and no
+/// boundary at all — the finally node run nowhere.
+#[test]
+fn a_placed_flows_question_abandoned_by_the_end_around_it_runs_its_finally_node_on_a_worker() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider.enqueue(inspecting(
+        "release.dmg",
+        "inspected-before-the-sibling-failed",
+    ));
+    let mut worker = mesh.worker("placed-flow-question-abandoned");
+    let gate = mesh.project.join("doomed.gate");
+
+    let execution = mesh.start_execution(
+        "/placed-asking-races",
+        &json!({ "path": "release.dmg", "gate": gate.display().to_string() }),
+    );
+    let asking = mesh.until(
+        &execution,
+        "published the placed instance's question",
+        |report| {
+            report["interrupts"]
+                .as_array()
+                .is_some_and(|waits| !waits.is_empty())
+                || report["status"] == "failed"
+        },
+    );
+    assert_eq!(
+        asking["interrupts"][0]["wait_id"],
+        "asking/0/ask/0",
+        "{asking:#}\n{}",
+        worker.transcript()
+    );
+    assert_holds_no_placement_wait(
+        &asking,
+        "a paused dispatch is settled, and no worker holds the instance while it asks",
+    );
+
+    std::fs::write(&gate, b"open").expect("the gate opens");
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] != "interrupted" && report["status"] != "running"
+    });
+    assert_eq!(
+        report["status"],
+        "failed",
+        "{report:#}\n{}",
+        worker.transcript()
+    );
+    assert!(
+        report["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("`doomed`")),
+        "the execution failed on its sibling, not on the abandoned question: {report:#}"
+    );
+    assert!(
+        report["interrupts"].as_array().is_none_or(Vec::is_empty),
+        "the abandoned question is still published: {report:#}"
+    );
+    assert_eq!(
+        boundary_outcome(&mesh, &execution, "asking/0/close_out/0#finally/0").as_deref(),
+        Some("failed"),
+        "the instance whose question the end around it abandoned did not run its finally node \
+         at outcome `failed`: {report:#}\n{}",
+        worker.transcript()
+    );
+
+    // The end was a dispatch a worker ran: a second dispatch at the instance's
+    // own path, settled by the instance's failure.
+    let rows = dispatches_of(&mesh, &execution);
+    assert_eq!(
+        rows.iter()
+            .map(|row| (
+                row["node"].as_str(),
+                row["site"].as_str(),
+                row["wait"].as_str(),
+                row["status"].as_str(),
+                row["outcome"].as_str()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                Some("flow.placed_asking"),
+                Some("asking/0"),
+                Some("asking/0/0"),
+                Some("settled"),
+                Some("value")
+            ),
+            (
+                Some("flow.placed_asking"),
+                Some("asking/0"),
+                Some("asking/0/1"),
+                Some("settled"),
+                Some("error")
+            ),
+        ],
+        "the abandonment did not hand the instance's end to a worker: {rows:#?}\n{}",
+        worker.transcript()
+    );
+    assert!(
+        rows[1]["session"]
+            .as_str()
+            .is_some_and(|session| session.starts_with("wrk_")),
+        "a worker session held the end: {rows:#?}"
+    );
+    assert_eq!(
+        mesh.provider.requests().len(),
+        1,
+        "the end replayed `inspect`'s model call rather than making it again"
+    );
+    let human = harness::journal_rows(
+        &mesh.project,
+        &format!(
+            "SELECT \"key\" AS k FROM effects WHERE execution = '{execution}' AND kind = 'human'"
+        ),
+    );
+    assert_eq!(
+        human,
+        json!([]),
+        "the abandoned question was journaled as answered"
+    );
+    assert!(
+        worker.running(),
+        "the worker stopped with the end it ran: {}",
+        worker.transcript()
+    );
+}
+
+/// **A placed flow's redispatch the end around it stops while it is parked is
+/// still owed its end on a worker** (grammar §7.9; PRD resolved q76; Decision
+/// D171; `docs/distributed.md` §2, §6.5).
+///
+/// The same race as above, one step later. `flow.placed_asking`'s question
+/// comes home from the first worker, which then leaves; the question is
+/// answered with no worker to take the redispatch, so it parks — the instance
+/// has begun, and nobody is running it. Then `doomed` fails, and the end around
+/// the instance stops waiting for it. The hub withdraws the parked redispatch —
+/// under a detail of its own, which says no worker took it — and makes the
+/// instance's end in its place, `stopped: true`, which parks in turn. A second
+/// worker joins and takes the end: it replays `inspect` and the answered
+/// question, the instance's body has nothing left past its record, and
+/// `close_out` runs there before the flow around it settles `failed`. Without
+/// the end the parked row is simply superseded, nothing ever runs `close_out`,
+/// and the second worker is handed nothing.
+#[test]
+fn a_placed_flows_parked_redispatch_the_end_around_it_stops_is_still_owed_its_end() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider
+        .enqueue(inspecting("release.dmg", "inspected-before-the-answer"));
+    let gate = mesh.project.join("doomed.gate");
+    let first = mesh.worker("placed-flow-redispatch-first");
+    let execution = mesh.start_execution(
+        "/placed-asking-races",
+        &json!({ "path": "release.dmg", "gate": gate.display().to_string() }),
+    );
+    let asking = mesh.until(
+        &execution,
+        "published the placed instance's question",
+        |report| {
+            report["interrupts"]
+                .as_array()
+                .is_some_and(|waits| !waits.is_empty())
+                || report["status"] == "failed"
+        },
+    );
+    let wait = asking["interrupts"][0]["wait_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the question names itself: {asking:#}"))
+        .to_string();
+    drop(first);
+
+    // Answered with no worker to take the redispatch: it parks.
+    let answered = mesh.resume(&execution, &wait, &json!({ "decision": "approve" }));
+    assert_eq!(answered.status, 202, "{}", body_of(&answered));
+    mesh.until(&execution, "parked the instance's redispatch", |report| {
+        report["placement_waits"][0]["status"] == "parked"
+    });
+
+    // The end around the instance stops waiting for the parked redispatch, and
+    // the instance's end parks in its place.
+    std::fs::write(&gate, b"open").expect("the gate opens");
+    until(
+        "the stopped redispatch was withdrawn and the instance's end parked",
+        || format!("{:#?}", dispatches_of(&mesh, &execution)),
+        || {
+            let rows = dispatches_of(&mesh, &execution);
+            rows.len() == 3 && rows[1]["status"] == "superseded" && rows[2]["status"] == "parked"
+        },
+    );
+    let withdrawn = mesh.dispatch_rows(&execution);
+    assert!(
+        withdrawn[1]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("before any worker took it")),
+        "the parked redispatch was not withdrawn as one no worker took: {withdrawn:#?}"
+    );
+
+    let mut second = mesh.worker("placed-flow-redispatch-end");
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] != "interrupted" && report["status"] != "running"
+    });
+    assert_eq!(
+        report["status"],
+        "failed",
+        "{report:#}\n{}",
+        second.transcript()
+    );
+    assert!(
+        report["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("`doomed`")),
+        "the execution failed on its sibling: {report:#}"
+    );
+    assert!(
+        boundary_outcome(&mesh, &execution, "asking/0/close_out/0#finally/0").is_some(),
+        "the instance the end around it stopped while it was parked never ran its finally \
+         node: {report:#}\n{}",
+        second.transcript()
+    );
+    let rows = dispatches_of(&mesh, &execution);
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row["wait"].as_str(), row["status"].as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (Some("asking/0/0"), Some("settled")),
+            (Some("asking/0/1"), Some("superseded")),
+            (Some("asking/0/2"), Some("settled")),
+        ],
+        "{rows:#?}\n{}",
+        second.transcript()
+    );
+    assert!(
+        rows[2]["session"]
+            .as_str()
+            .is_some_and(|session| session.starts_with("wrk_")),
+        "a worker session held the end: {rows:#?}"
+    );
+    assert_eq!(
+        mesh.provider.requests().len(),
+        1,
+        "the end replayed `inspect`'s model call rather than making it again"
+    );
+    assert!(second.running(), "{}", second.transcript());
+}
+
 /// **A `run` refuses a placed agent's node, and serves no mesh for it**
 /// (Decision D171; PRD resolved q84 rules on the instances of a placed flow and
 /// on nothing else, so a placed agent's or tool's node under `run` is what it
