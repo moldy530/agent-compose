@@ -255,7 +255,7 @@ import {
   stopSources,
   triggersOf,
 } from "./sources.ts";
-import { drainStores, sweepBoundStores } from "./stores.ts";
+import { drainStores, releaseClosedExecution, sweepBoundStores } from "./stores.ts";
 import {
   cancelExecution,
   cancelFired,
@@ -271,6 +271,7 @@ import {
   journaledExecution,
   openDescendants,
   openExecutions,
+  pruneClosedExecution,
   quiescent,
   recordDeliveryAttempt,
   refuseDelivery,
@@ -5208,7 +5209,9 @@ async function descendantSettled(executions: Map<string, Execution>, id: string)
  * row is still open** ([`announceSettle`]); and only then does the row end.
  * An execution on no board is put on it once its row has ended, so the status
  * route reports it and a second cancel is the `409` every ended execution
- * gets.
+ * gets; and what a settled execution lets go of goes then too — the ledger
+ * rows its keyed writes left (`runtime.pruneClosedExecution`, PRD resolved
+ * q69) and its `scope: execution` partitions (`releaseClosedExecution`).
  *
  * A row the journal would not end puts the record back as it was, so a cancel
  * sent again closes it then — the settle it journaled meanwhile is found and
@@ -5269,6 +5272,16 @@ async function endRow(
   // Never over a record put there meanwhile: one generation per process is
   // the rule, and a recovery that reached the row first is that generation.
   if (held === undefined && !executions.has(row.id)) executions.set(row.id, execution);
+  // What a settled execution lets go of, let go of here — **after** the row
+  // has ended, never before, as `runtime.settleExecution` orders it: an open
+  // row is one a resume still reads these for. The rows its keyed writes left
+  // in the idempotency ledger (PRD resolved q69 ruling d, Decision D153) — a
+  // closed execution never resumes, so they answer nothing again — and the
+  // partitions of its `scope: execution` stores, which die with it (grammar
+  // 11.3). Neither is the close's failure, and neither is waited for past
+  // what it takes to start it: the cancel is complete.
+  releaseClosedExecution({ id: row.id, session_key: row.sessionKey });
+  await pruneClosedExecution(row.id, row.sessionKey);
   return execution;
 }
 
