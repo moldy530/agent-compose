@@ -332,7 +332,10 @@ check is not refused over a model provider's URL — while every `${ENV}` the
 store's `storage_backends:` entry references must be set, and one that is not
 is refused with exit `2`, naming it and the site it is written at, before
 anything is opened. A store `--target local` substitutes, or one the target
-binds to no entry, needs none. The emitted project checks the same list: run
+binds to no entry, needs none; nor does one the command refuses outright — a
+`vector` or `blob` store, or one whose rows live only in a process's memory —
+which is refused for what it is, exit `2`, never over its backend's variables.
+The emitted project checks the same list: run
 by hand, `bun src/index.ts store …` skips the load-time check every other verb
 makes and refuses a missing backend variable itself, with the same exit `2`.
 The second precondition is unchanged: the pinned dependency set is installed.

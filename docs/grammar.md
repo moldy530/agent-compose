@@ -14551,7 +14551,12 @@ sit under the binding's `site` — the entry's spec address,
 emitted `BackendBinding` now carries — refusing a missing one as a usage error,
 exit `2`, with `MissingEnvironmentError`'s own message, before the backend is
 opened. A store a target built-in holds — every store under `--target local`
-(D87), and one whose kind the target neither aliases nor defaults — needs none.
+(D87), and one whose kind the target neither aliases nor defaults — needs none,
+and so does a store the command opens nothing for: an address naming no store, a
+`vector` or `blob` store, and a `kv` store whose rows live only in the memory of
+the process that opened them (D155). Each is the command's usage refusal, and
+the launcher's manifest for it is empty so that the refusal is what the operator
+reads — not a demand for the variable of a backend the command will not open.
 `run`, `resume`, `serve`, `cancel` and a worker keep their manifests exactly, and
 so does the partition.
 
@@ -14574,7 +14579,13 @@ built-in — and the manifest reads that answer rather than deriving it again:
 `Partition::of` files that entry under, through one helper the partition's
 backend clause now reads as well, and the emitted binding's `site` is written
 from the same `backend_of` result. The launcher, the partition and the emitted
-verb cannot disagree about which entry a store opens.
+verb cannot disagree about which entry a store opens. Which stores the command
+opens **at all** is the emitted `operatorRefusal`'s answer, and the launcher reads
+it clause for clause (`an_operator_opens`: `kv` only, and not process-local) — a
+second statement of one rule rather than a reading of one function, because the
+refusal is runtime code and the manifest is the compiler's; the store CLI suite
+drives a `vector` store through both with its backend's variable unset, so a
+divergence is a failing test rather than a credential demanded out of order.
 
 **Why the emitted check moves rather than narrowing at load.** Loading
 `src/index.ts` cannot know which store a `store` command names until its
@@ -14591,7 +14602,9 @@ bare load, is checked at load exactly as before.
 applied to one more process. §9.1 gains one sentence saying so; no clause of its
 executes-in list changes and no process's manifest moves. PRD resolved q45:
 untouched — the command's own refusal of a store whose rows are process-local
-(D155) runs before the environment check and is unchanged. PRD resolved q59: a
+(D155), like its refusal of a store that is not `kv`, runs before the
+environment check in both the launcher and the emitted verb, and is unchanged.
+PRD resolved q59: a
 registry token is on every *process's* manifest because every process installs;
 the store command installs nothing (the launcher checks only that an install is
 there), so the token is not on its manifest, and the hub's and each placement's
