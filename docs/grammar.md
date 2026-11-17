@@ -11495,8 +11495,10 @@ already on the node, so the message says to take the setting off rather than
 telling an author to write a line they have written. Where a
 key **addresses** the value rather than holding it, the message names where it
 points instead of naming the key: the one model setting a harness takes — `cc`'s
-thinking budget, `codex`'s reasoning effort — is written in the `model.*`
-definition `model:` names (§12.2,
+thinking budget, or the adaptive form's `effort` beside it
+([D167](#d167-thinking-takes-two-forms-the-enabled-forms-budget-and-the-adaptive-forms-effort),
+which added `effort` to the options this reading reserves), `codex`'s reasoning
+effort — is written in the `model.*` definition `model:` names (§12.2,
 [D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-ladders-stop-at-the-boundary)),
 and `model:` is required, so "write `model:`" would name a line already on the
 node. Where nothing states it, the message says so: the resume family is a named
