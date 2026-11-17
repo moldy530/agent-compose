@@ -1243,12 +1243,13 @@ function migrateStoreFile(database: Database): void {
  *
  * Through `entries_partition_expiry`, so it reads the expired rows and nothing
  * else: a partition with a backlog of a million costs a write a hundred
- * deletes, and the next write a hundred more.
+ * deletes, and the next write a hundred more. Ordered by `expires_at`, so the
+ * rows longest expired go first, as every dialect's sweep orders them.
  */
 function sweepLocalPartition(database: Database, scopeKey: string, now: number): void {
   database.run(
     "DELETE FROM entries WHERE rowid IN (SELECT rowid FROM entries WHERE scope_key = ? " +
-      `AND expires_at IS NOT NULL AND expires_at <= ? LIMIT ${SWEEP_PER_WRITE})`,
+      `AND expires_at IS NOT NULL AND expires_at <= ? ORDER BY expires_at LIMIT ${SWEEP_PER_WRITE})`,
     [scopeKey, now],
   );
 }
@@ -1267,7 +1268,7 @@ function sweepLocalPartition(database: Database, scopeKey: string, now: number):
 function sweepLocalLedger(database: Database, now: number): void {
   database.run(
     "DELETE FROM applied WHERE rowid IN (SELECT rowid FROM applied WHERE " +
-      `expires_at IS NOT NULL AND expires_at <= ? LIMIT ${SWEEP_PER_WRITE})`,
+      `expires_at IS NOT NULL AND expires_at <= ? ORDER BY expires_at LIMIT ${SWEEP_PER_WRITE})`,
     [now],
   );
 }
@@ -1298,7 +1299,7 @@ function sweepLocalHistory(database: Database, store: StoreBinding, scopeKey: st
   if (cutoff === undefined) return;
   database.run(
     "DELETE FROM history WHERE seq IN (SELECT seq FROM history WHERE scope_key = ? " +
-      `AND at <= ? LIMIT ${SWEEP_PER_WRITE})`,
+      `AND at <= ? ORDER BY at LIMIT ${SWEEP_PER_WRITE})`,
     [scopeKey, cutoff],
   );
 }

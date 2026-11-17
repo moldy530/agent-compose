@@ -347,11 +347,18 @@ const POSTGRES_STORE_CLOCK = "FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000
  * address, so the outer delete removes exactly the rows the sub-select locked;
  * they cannot move while it holds them. It reads through the partial index over
  * `(store, scope_key, expires_at)`, so it reads no row that has not expired.
+ *
+ * **Ordered by `expires_at`**, so the rows longest expired go first and a
+ * bounded sweep leaves the latest-expiring rows for the next one — the order
+ * every dialect's sweep keeps, and the one the store contract reads (a key
+ * behind a backlog of earlier-expiring rows stays a row until its turn).
+ * Without it the sub-select's `LIMIT` takes whichever rows the plan reaches
+ * first, which a seq scan and an index scan answer differently.
  */
 function postgresSweep(limit: number): string {
   return (
     "DELETE FROM store_entries WHERE ctid = ANY(ARRAY(SELECT ctid FROM store_entries " +
-    `WHERE store = ? AND scope_key = ? AND expires_at <= ? LIMIT ${limit} FOR UPDATE SKIP LOCKED))`
+    `WHERE store = ? AND scope_key = ? AND expires_at <= ? ORDER BY expires_at LIMIT ${limit} FOR UPDATE SKIP LOCKED))`
   );
 }
 
@@ -367,7 +374,7 @@ function postgresSweep(limit: number): string {
 function postgresLedgerSweep(limit: number): string {
   return (
     "DELETE FROM store_applied WHERE ctid = ANY(ARRAY(SELECT ctid FROM store_applied " +
-    `WHERE store = ? AND expires_at <= ? LIMIT ${limit} FOR UPDATE SKIP LOCKED))`
+    `WHERE store = ? AND expires_at <= ? ORDER BY expires_at LIMIT ${limit} FOR UPDATE SKIP LOCKED))`
   );
 }
 
@@ -381,7 +388,7 @@ function postgresLedgerSweep(limit: number): string {
 function postgresHistorySweep(limit: number): string {
   return (
     "DELETE FROM store_history WHERE ctid = ANY(ARRAY(SELECT ctid FROM store_history " +
-    `WHERE store = ? AND scope_key = ? AND at <= ? LIMIT ${limit} FOR UPDATE SKIP LOCKED))`
+    `WHERE store = ? AND scope_key = ? AND at <= ? ORDER BY at LIMIT ${limit} FOR UPDATE SKIP LOCKED))`
   );
 }
 
