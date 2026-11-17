@@ -27,7 +27,7 @@ The LangGraph TypeScript project `agent-compose build` produced from `main.yml`,
 | `src/deployment.ts` | what the deploy layer declares: the placements a worker may claim, the per-process environment partition the hub and a worker both read out of it (`docs/distributed.md` §9.1), and the address every settled trace ships to (grammar §14.5) |
 | `src/env.ts` | every `${ENV}` reference **this process** needs — the hub's own list, which is the whole composition's unless a placement takes something off it — and `readEnvironment()`, the presence check over them |
 | `src/journal.ts` | the execution journal: every effect a run issues, written as it happens, and what a resumed execution consumes instead of re-issuing it (`docs/durability.md`) |
-| `src/mesh.ts` | the hub half of the worker protocol: the `/workers/*` routes a serve mounts where the target declares `placements:`, the journaled dispatch board behind them, and the seam a placed node reaches a worker through (`docs/distributed.md`) |
+| `src/mesh.ts` | the hub half of the worker protocol: the `/workers/*` routes a serve mounts where the target declares `placements:` — and a `run` or `resume` mounts once it reaches placed work — the journaled dispatch board behind them, and the seam a placed node reaches a worker through (`docs/distributed.md`) |
 | `src/modules.ts` | the generated half of every `module:` binding: one contract type per module-bound tool, written from that tool's own `input:`/`output:`, the type of the `env:` that binding declared, and the typed `const` holding the authored implementation. The **only** generated module that imports code you wrote |
 | `src/otlp.ts` | the OTLP/JSON span exporter: one settled trace envelope mapped to an `ExportTraceServiceRequest`, hand-written and with no OpenTelemetry dependency behind it (`docs/trace.md` §12) |
 | `src/runtime.ts` | what every node does when it runs: the retry/timeout/error policy of grammar 9, the provider surfaces, the model failover ladder, the `exec`/`http` wrappers, and the router |
@@ -40,7 +40,7 @@ The LangGraph TypeScript project `agent-compose build` produced from `main.yml`,
 | `src/serve.ts` | the app over those triggers: start, status, resume and cancel (PRD 5.11), the one admission every trigger kind's start passes through — with the intake ledger a trigger's `dedupe_key:` and `concurrency:` decide under — `GET /sources/:name` and `GET /intakes/:id` |
 | `src/sources.ts` | what `serve` runs beside its routes: the scheduler that fires every `schedule` trigger's ticks, and the consumer that runs each `kind: command` source's program and admits what it prints (PRD resolved q78) |
 | `src/cli.ts` | this project's own command line, which `agent-compose run`, `agent-compose resume` and `agent-compose serve` launch |
-| `src/index.ts` | the project's public surface, the caller of `readEnvironment()` at load — for every verb but `store`, which checks its one backend's variables itself — and the entry point the command line hangs off |
+| `src/index.ts` | the project's public surface, the one caller of `readEnvironment()`, and the entry point the command line hangs off |
 | `src/worker-node.ts` | the worker half of the worker protocol: one placed node, executed out of this tree by `agent-compose worker`, with the dispatch on standard input and its effects and result as NDJSON on standard output (`docs/distributed.md` §3.2) |
 
 ## Running a flow
@@ -86,11 +86,9 @@ and a run that reaches it fails with a `SuperstepCeiling` saying so.
 `src/index.ts` calls `readEnvironment()` at module scope, so loading this project
 is what checks its environment: a missing variable throws before anything runs,
 naming every variable that is missing rather than the first (PRD 5.9, grammar
-4.3). One verb is the exception: `store` opens one store's backend and runs
-nothing else, so it needs that backend's variables alone and checks those once
-it knows the store (PRD resolved q82). `agent-compose build` itself reads no
-environment — no value is resolved at compile time, which is what keeps this
-directory committable and free of credentials.
+4.3). `agent-compose build` itself reads no environment — no value is resolved at
+compile time, which is what keeps this directory committable and free of
+credentials.
 
 **The file list above is the boundary.** `agent-compose build` replaces exactly
 the files in that table — every one of them, `package.json` and this README
@@ -168,8 +166,8 @@ run`, `agent-compose serve`, `agent-compose store` and `agent-compose cancel`
 launch:
 
 ```sh
-bun src/index.ts run flow.<name> --input goal=... [--session <key>] [--format json]
-bun src/index.ts resume <execution-id> [--format json]
+bun src/index.ts run flow.<name> --input goal=... [--session <key>] [--format json] [--host <host>] [--port <port>]
+bun src/index.ts resume <execution-id> [--format json] [--host <host>] [--port <port>]
 bun src/index.ts serve --port 8787
 bun src/index.ts store get store.<name> <key> [--session <key> | --execution <id>] [--format json]
 bun src/index.ts cancel <execution-id> [--url <base>] [--header 'Name: value']... [--format json]
@@ -187,6 +185,14 @@ retry, so it exits `2` like an `--input` the flow does not declare. A declared
 a payload whose one member is this argument, and what that expression answers is
 the partition the run addresses (grammar 13.2). Declared on no trigger, the
 argument is the identity.
+
+A run that reaches **placed** work — a placed agent's or tool's node, or any
+instance of a placed flow (grammar §14.1) — is the hub that work is dispatched
+from: at its first such dispatch it serves the `/workers/*` routes at `--host`
+and `--port` (`127.0.0.1` and a port the operating system picks, unless named),
+says where on stderr as `mesh: <url> — …` with the `agent-compose worker`
+command that joins it, and waits for a worker claiming the placement. A run that
+reaches nothing placed listens on nothing. `resume` takes the same two flags.
 
 `resume` carries on an execution this project's journal holds open — a run the
 machine lost, or one that stopped at a `human` pause with nobody to ask. Every
@@ -206,15 +212,11 @@ headers `--header` names, which is how the credential the starting trigger's
 `auth:` reads travels. The app stops every node the execution is running (a
 model call, a command, a harness run, a placed dispatch) and every open child
 execution it started; each open instance ends `cancelled`, running its
-`finally:` node; and the row settles `cancelled`. An execution the serving
-build's recovery could not take — a replay that diverged, recorded inputs it
-refuses, a flow it no longer declares — has nothing running it, so the app
-closes its row `cancelled` at once with no finally node run, which its
-`finally_error` says, and answers `cancelling: false`; the command prints why.
-The exit code is `0` when the app accepted the request (`202`), `1` when it
-refused it (`404`, `409` for an execution that has already ended, or the
-trigger's own refusal), and `2` when it could not be asked. A `run` is not
-cancelled this way: interrupting it leaves its row open for `resume`.
+`finally:` node; and the row settles `cancelled`. The exit code is `0` when the
+app accepted the request (`202`), `1` when it refused it (`404`, `409` for an
+execution that has already ended, or the trigger's own refusal), and `2` when
+it could not be asked. A `run` is not cancelled this way: interrupting it leaves
+its row open for `resume`.
 
 `store` reads and writes one `kv` store of this composition through this
 target's own backend, with no flow written: `get <key>`, `set <key> <json>`
@@ -236,10 +238,6 @@ under `--format json`; the exit code is `0` for a key found or a write applied,
 `1` for a key that holds nothing, a condition that declined or a backend that
 failed, and `2` for a command line it does not take — a value `value_schema`
 refuses among it, since nothing was written and the value is what is to fix.
-The environment it needs is the variables of the store's backend entry and no
-others: a model provider's key or a trigger's token is not asked for, and a
-variable the backend entry references that is unset is refused with exit `2`,
-naming it and where it is referenced, before the backend is opened.
 **An operator's write is not an effect**: it belongs to no execution, carries no
 idempotency key, and writes no journal row, no ledger row and no trace record.
 On a store that declares `history: true` it is recorded in one place, its
@@ -371,7 +369,6 @@ What `serve` writes about them goes to **stderr**, one line each:
 | ``[source <s>] <line>`` | the program writes a line to its stderr; one longer than 1 MiB is logged cut there, ending `[cut: …]` |
 | ``event trigger `<t>`: no event source `<s>` is bound under this target, so nothing consumes for it`` | a trigger's source is unbound under `local` |
 | ``this project's journal can be read now, so the <n> executions it holds open are recovered now, before any tick or event is admitted`` | a `serve` whose start could not read the journal — a standby, while another held it — can read it: what it holds open is recovered before any tick fires or event is admitted |
-| `` `<id>` (<flow>) could not be recovered by this build: <reason>; its row stays open until `agent-compose cancel <id>` closes it`` | a recovery this build could not take — a replay that diverged from its journal, recorded inputs this build's `inputs:` refuse, a flow it no longer declares — once per start for each such execution: its row stays open for a build that can run it, and `cancel` closes it `cancelled` with no finally node run; where the trigger that started it is one this build does not declare, the line goes on ``, which the cancel route refuses until this build declares the trigger `<trigger>` that started it again: a cancel is authenticated by that trigger's `auth:` (PRD resolved q32)`` |
 | ``intake `<t>`: <intake> queued for <execution>: <running> holds <group>`` | an arrival finds its group full under `on_conflict: queue` |
 | ``intake `<t>`: <intake> started <execution>`` | a queued arrival starts, as a slot of its group frees |
 | ``intake `<t>`: <intake> closed over <n> arrivals and started <execution>`` | a debounce closes and its one execution starts |
@@ -816,20 +813,6 @@ stay at the compiler's pins either way.
 | `node-sqlite3-wasm` | `0.8.60` |
 | `@types/node` | `22.20.1` |
 | `typescript` | `7.0.2` |
-
-## Launching this tree as it stands
-
-`agent-compose run`, `agent-compose serve` and `agent-compose cancel` take
-`--no-build`, which launches this directory as it stands rather than building
-it first: the spec is not read, and a directory another release of the compiler
-wrote — or one holding a file without the header above at a name a build writes
-— is refused. A generated file edited by hand still runs that way. It no longer
-matches the `ARTIFACT_HASH` in `src/artifact.ts`, though, and a worker refuses
-the artifact a hub serves of it, because the hash is how a worker knows it runs
-only what the compiler emitted. `agent-compose build <path> --restamp`
-recomputes the hash over the files as they stand and says that this tree no
-longer matches any source; the next `agent-compose build <path>` writes the
-spec's tree back over it.
 
 ## Ejecting
 

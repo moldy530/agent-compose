@@ -900,13 +900,14 @@ async function quiesceFlow(
   // dispatch's signal, so a cancel reaches the worker as one (§3.2); nothing
   // else bounds it, as nothing bounds a root execution here.
   //
-  // **A `run` has no mesh to dispatch into**, and is refused rather than
-  // obliged: `agent-compose run` mounts no worker routes, so the dispatch
-  // throws `mesh.PlacementUnreachable` before anything is journaled, and the
-  // execution fails on it — exactly as a `run` that reaches a placed agent's
-  // node fails at that node. Nothing here runs the instance in this process
-  // instead: that would be the one start of a placed flow the placement did
-  // not decide (Decision D171, D64 as amended).
+  // **A `run` is the same start** (PRD resolved q84): `agent-compose run`
+  // serves the worker routes itself once this dispatch needs them
+  // (`./mesh.ts`'s `serveWhenReached`), so the instance parks for a worker
+  // that joins the run and runs there. Only a process with no way to serve a
+  // mesh is refused — the dispatch throws `mesh.PlacementUnreachable` before
+  // anything is journaled — and nothing here runs the instance in this
+  // process instead: that would be the one start of a placed flow its
+  // placement did not decide (Decision D171).
   if (flow.placement !== undefined) {
     let answer: runtime.NodeAnswer;
     try {

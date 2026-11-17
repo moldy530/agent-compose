@@ -17,7 +17,8 @@
 //
 // ```text
 // src/index.ts run <flow> [--input k=v]... [--session <key>] [--format human|json]
-// src/index.ts resume <execution> [--format human|json]
+//                  [--host <host>] [--port <port>]
+// src/index.ts resume <execution> [--format human|json] [--host <host>] [--port <port>]
 // src/index.ts serve [--host <host>] [--port <port>]
 // src/index.ts store <sub-verb> <store> [operands] [--session <key> | --execution <id>]
 //                    [--format human|json] [options]
@@ -36,11 +37,6 @@
 // trace record. On a store that declares `history: true` it is recorded in one
 // place, its history row, as actor `cli`; on any other, nowhere. See
 // [`storeVerb`].
-//
-// Its environment is its store's backend entry's and nothing else (PRD
-// resolved q82): `./index.ts` skips the load-time check for this verb, and the
-// verb checks that entry's variables once it has resolved the store — see
-// [`storeEnvironment`].
 //
 // # What `run` prints
 //
@@ -159,6 +155,8 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
+import type { FastifyInstance } from "fastify";
+
 import {
   CallbackRetryError,
   blankSinkCredentials,
@@ -212,13 +210,8 @@ import {
   sweepBoundStores,
 } from "./stores.ts";
 import type { HistoryEntry, OperatorTarget, StoreBinding, StoreParams } from "./stores.ts";
-import { publicUrl } from "./deployment.ts";
-import {
-  type EnvironmentReference,
-  MissingEnvironmentError,
-  environmentReferences,
-  readEnvironment,
-} from "./env.ts";
+import { joinTokenEnv, placements, publicUrl } from "./deployment.ts";
+import { serveWhenReached } from "./mesh.ts";
 import { eventTriggers, httpTriggers, manualTriggers, scheduleTriggers } from "./triggers.ts";
 
 /** What a `--format` selects. */
@@ -392,10 +385,13 @@ async function run(argv: readonly string[]): Promise<number> {
     input: "repeatable",
     session: "single",
     format: "single",
+    host: "single",
+    port: "single",
   });
   const inputs = bindInputs(flow, options.repeated["input"] ?? []);
   const session = sessionOf(flow, options.single["session"] ?? "");
   const format = formatOf(options.single["format"]);
+  const mesh = meshAddress(options.single);
   requireSession(address, flow, session);
   await refuseCovered(address);
 
@@ -403,7 +399,7 @@ async function run(argv: readonly string[]): Promise<number> {
   // both of its ways out: it is what makes the trace file's name unique (see
   // [`writeTrace`]), and a failed run has no `FlowRun` to read one back off.
   const execution = `exec_${globalThis.crypto.randomUUID()}`;
-  return await execute({ address, inputs, session, format, execution, resuming: false });
+  return await execute({ address, inputs, session, format, execution, resuming: false, mesh });
 }
 
 /**
@@ -487,8 +483,9 @@ async function resumeVerb(argv: readonly string[]): Promise<number> {
       "`resume` takes an execution id: `resume <execution-id>` — a `run` prints it on stderr as `execution: exec_…`, and `serve` answers it as `execution_id`",
     );
   }
-  const options = parse("resume", rest, { format: "single" });
+  const options = parse("resume", rest, { format: "single", host: "single", port: "single" });
   const format = formatOf(options.single["format"]);
+  const mesh = meshAddress(options.single);
 
   if (!journalExists()) {
     throw new UsageError(
@@ -538,6 +535,7 @@ async function resumeVerb(argv: readonly string[]): Promise<number> {
     format,
     execution,
     resuming: true,
+    mesh,
     trigger: row.trigger,
     // What this execution's request asked to be told when it ends, off the
     // lifecycle row that recorded it (`docs/durability.md` §3.5). A `run` never
@@ -569,15 +567,11 @@ async function resumeVerb(argv: readonly string[]): Promise<number> {
  * credential is the operator's to supply, as `--header 'Authorization: Bearer
  * …'` or whatever header the trigger's `auth:` reads.
  *
- * Exit `0` on `202` — the cancel is recorded and under way, and the status
- * route says how the execution ended (or, for one the serving process has not
- * yet recovered, the `detail` printed says which recovery completes it); or,
- * for an execution the serving build's recovery could not take, already
- * complete, its row closed `cancelled` with the `detail` printed (PRD
- * resolved q81) — `1` on any refusal the app
- * answered with (a settled execution's `409`, an unknown one's `404`, a
- * `401`), and `2` where the command could not run: bad usage, no URL to send
- * to, or an app that did not answer.
+ * Exit `0` on `202` — the cancel is recorded and under way; the status route
+ * says how the execution ended — `1` on any refusal the app answered with (a
+ * settled execution's `409`, an unknown one's `404`, a `401`), and `2` where the
+ * command could not run: bad usage, no URL to send to, or an app that did not
+ * answer.
  */
 async function cancelVerb(argv: readonly string[]): Promise<number> {
   const [execution, ...rest] = argv;
@@ -620,17 +614,6 @@ async function cancelVerb(argv: readonly string[]): Promise<number> {
   const accepted = response.status === 202;
   if (format === "json") {
     process.stdout.write(`${JSON.stringify(document, null, 2)}\n`);
-  } else if (accepted && answer["cancelling"] === false) {
-    // The cancel is complete already: an execution the serving build's
-    // recovery could not take, whose row the app closed `cancelled` with no
-    // finally node run (PRD resolved q81) — and the `detail` says why.
-    process.stdout.write(`cancelled \`${execution}\`: ${String(answer["detail"] ?? "")}\n`);
-  } else if (accepted && answer["status_url"] === undefined && typeof answer["detail"] === "string") {
-    // Recorded for an execution the serving process runs no generation of
-    // yet, which a recovery there still takes and completes the cancel for —
-    // there is no status route to point at until it has, and the `detail`
-    // says which recovery that is (PRD resolved q81).
-    process.stdout.write(`cancelling \`${execution}\`: ${answer["detail"]}\n`);
   } else if (accepted) {
     process.stdout.write(
       `cancelling \`${execution}\`: the status route at ${String(answer["status_url"] ?? `/executions/${execution}`)} says how it ends\n`,
@@ -655,6 +638,8 @@ interface Job {
   readonly execution: string;
   /** Whether the journal's record is consumed rather than only written. */
   readonly resuming: boolean;
+  /** Where this run serves the mesh, if a dispatch it makes reaches a placement. */
+  readonly mesh: MeshAddress;
   /** What started it, for a fresh execution's lifecycle row. */
   readonly trigger?: string;
   /** Where its `settled` webhook goes, for a `resume` that closes one. */
@@ -677,6 +662,11 @@ interface Job {
  * construction rather than by two implementations agreeing.
  */
 async function execute(job: Job): Promise<number> {
+  // **The mesh this run serves, should it reach a placement** (Decision D171,
+  // PRD resolved q84). Registered, not started: nothing listens until the first
+  // placed node — or instance of a placed flow — this run reaches is
+  // dispatched, so a run that reaches nothing placed binds no port.
+  if (placements.length > 0) serveWhenReached(async (mount) => await servingMesh(job.mesh, mount));
   // A process start, which is half of PRD resolved q69's cleanup schedule: every
   // `kv` store the composition binds starts shedding the keys that have expired
   // in it — behind this run's ops, never in front of them, the stores this run
@@ -1775,10 +1765,8 @@ const LAST_INSTANT = 8.64e15;
  * The exit codes are the project's, read for a store: `0` found or applied;
  * `1` the answer is no — a `get` that found nothing, a condition that did not
  * hold, or a backend that failed; `2` the command could not run — a flag, a
- * store address, a sub-verb or a partition the command does not take, a
- * variable the store's backend references that is not set ([`storeEnvironment`],
- * PRD resolved q82), or a value the store's `value_schema` refuses (PRD
- * resolved q72). A refused value
+ * store address, a sub-verb or a partition the command does not take, or a
+ * value the store's `value_schema` refuses (PRD resolved q72). A refused value
  * is usage rather than an answer of no for the reason an `--input` that does
  * not fit its type is usage to `run` (grammar 13.2): nothing was read or
  * written, and what is to fix is what was typed — so a supervisor retrying on
@@ -1823,7 +1811,6 @@ async function storeVerb(argv: readonly string[]): Promise<number> {
   }
   const format = formatOf(options.single["format"]);
   const target = operatorTarget(address, options.single["session"], options.single["execution"]);
-  storeEnvironment(target.store);
   let code: number;
   try {
     code = await storeSubverb(name, target, operands, options, format);
@@ -1899,44 +1886,6 @@ async function storeSubverb(
       throw new UsageError(
         `\`store ${name}\` is not a sub-verb of \`store\`: it takes ${Object.keys(STORE_SUBVERBS).map((held) => `\`${held}\``).join(", ")}`,
       );
-  }
-}
-
-/**
- * Refuse a `store` command whose store's backend needs a variable that is not
- * set — and only such a command (PRD resolved q82, grammar Decision D166).
- *
- * An operator's `store` command is a process whose only component is the
- * backend it opens (`docs/distributed.md` §9.1), so its manifest is the
- * references `./env.ts` files under that backend's `storage_backends:` entry
- * and nothing else: `./index.ts` skips its load-time check for this verb, and
- * this is the check in its place. A model provider's key, a trigger's token or
- * the journal's address is a variable the command never spends, and a
- * `store count` used as a health check that refused over one would read as the
- * store being gone.
- *
- * The entry is the binding's own `site` — the one `operatorTarget` resolved
- * and the op then opens — and a variable is the backend's where a site it is
- * referenced at sits under that entry; each is named with those sites alone. A
- * binding with no `site` is a target's built-in, a file under the build
- * directory that needs no variable. A missing one is a usage error, exit `2`,
- * with `readEnvironment`'s own message and before the backend is opened:
- * nothing was read or written, and what is to fix is the environment the
- * command was started in.
- */
-function storeEnvironment(store: StoreBinding): void {
-  const entry = store.backend.site;
-  if (entry === undefined) return;
-  const needed: EnvironmentReference[] = [];
-  for (const reference of environmentReferences) {
-    const sites = reference.sites.filter((site) => site.startsWith(`${entry}.`));
-    if (sites.length > 0) needed.push({ name: reference.name, sites });
-  }
-  try {
-    readEnvironment(process.env, needed);
-  } catch (error) {
-    if (error instanceof MissingEnvironmentError) throw new UsageError(error.message);
-    throw error;
   }
 }
 
@@ -2916,6 +2865,53 @@ function parse(
     }
   }
   return { single, repeated, flags, operands };
+}
+
+/** `--host` and `--port`, for the mesh a `run` or `resume` serves once it needs one. */
+interface MeshAddress {
+  readonly host: string;
+  readonly port: number;
+}
+
+/**
+ * Read `--host` and `--port` the way `serve` reads them: `127.0.0.1` and a port
+ * the operating system picks, unless the command names one.
+ */
+function meshAddress(single: Readonly<Record<string, string>>): MeshAddress {
+  const port = single["port"];
+  if (port !== undefined && !/^[0-9]+$/.test(port)) {
+    throw new UsageError(`\`--port ${port}\` is not a port number`);
+  }
+  return { host: single["host"] ?? "127.0.0.1", port: port === undefined ? 0 : Number(port) };
+}
+
+/**
+ * Serve the worker routes for this run, at the first dispatch it makes to a
+ * placement (`./mesh.ts`'s `serveWhenReached`, Decision D171): a `run` is the
+ * hub its own placed work is dispatched from, so a worker claiming the
+ * placement joins **this process**, at the address said here.
+ *
+ * Said on **stderr**, under either format, because stdout is the run's answer
+ * — and said as the command a worker is started with, since that is what a
+ * reader at this terminal does next. What follows is a served hub's dispatch:
+ * the work parks until a worker joins, and the run waits for it.
+ */
+async function servingMesh(
+  address: MeshAddress,
+  mount: (app: FastifyInstance) => void,
+): Promise<void> {
+  const { meshApp } = await import("./serve.ts");
+  const app = meshApp();
+  mount(app);
+  await app.listen({ host: address.host, port: address.port });
+  const bound = app.server.address();
+  const port = typeof bound === "object" && bound !== null ? bound.port : address.port;
+  const shown = address.host === "0.0.0.0" || address.host === "::" ? "127.0.0.1" : address.host;
+  const url = `http://${shown}:${port}`;
+  const claims = placements.map((placement) => `--claim ${placement.name}`).join(" ");
+  process.stderr.write(
+    `mesh: ${url} — this run dispatches placed work and waits for a worker to join it: agent-compose worker --hub ${url} ${claims} --token-env ${joinTokenEnv ?? "<VAR>"}\n`,
+  );
 }
 
 function formatOf(given: string | undefined): Format {
