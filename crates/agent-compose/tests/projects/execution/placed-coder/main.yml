@@ -1,10 +1,20 @@
-# Acceptance fixture: a `coder:` node run on a worker.
+# Acceptance fixture: a `coder:` node run on a worker, both ways a build step
+# reaches one.
 #
-# Only `agent.*` and `tool.*` join a placement (grammar §14.1), so a build step
-# that has to run on a build machine is written the one way this release can
-# write it: a **placed agent whose only tool is a `flow.*` holding the coder
-# node**. The attached flow runs in the agent's placement (grammar §14.1 rule
-# 4), so everything it holds runs on the worker that took the agent's dispatch:
+# The first is the one a release without placed flows had to write: a **placed
+# agent whose only tool is a `flow.*` holding the coder node**. The attached
+# flow runs in the agent's placement (grammar §14.1 rule 4), so everything it
+# holds runs on the worker that took the agent's dispatch — at the cost of a
+# model call per run and a model restating the flow's outputs.
+#
+# The second is the build step as a flow of its own (PRD resolved q84,
+# Decision D171): `flow.building` is itself a member of `mac`, so the trigger
+# `on_build_step` starts it as a root execution that the hub dispatches whole —
+# coder node, finally node and all — to a worker claiming `mac`, with no agent
+# in the way. The agent's attachment stays legal beside it: a placed flow
+# attached by an agent of the same placement is the same answer written twice.
+#
+# Either way, the worker runs:
 #
 #   * `build`, the coder node, whose one harness run is journaled as a
 #     `harness` record (`docs/durability.md` §3.9) and streamed home over
@@ -46,6 +56,16 @@ triggers:
       goal: "payload.body.goal"
     respond: async
 
+  # The build step started directly, as a root execution of the placed flow.
+  on_build_step:
+    type: http
+    flow: flow.building
+    path: /build-steps
+    method: POST
+    input:
+      goal: "payload.body.goal"
+    respond: async
+
 provider.mock:
   kind: anthropic
   api_key: ${MOCK_API_KEY}
@@ -73,8 +93,11 @@ agent.builder:
       type: string
       min_length: 1
 
-# Attached, never triggered: its instance runs inside `agent.builder`'s loop on
-# the worker, coder node and finally node both.
+# Placed on `mac` itself (Decision D171), and attached by `agent.builder` of the
+# same placement: started by `on_build_step`, its instance is dispatched to a
+# worker claiming `mac`; called from `agent.builder`'s loop, it runs in that loop
+# on the worker that already holds it. Coder node and finally node run there
+# either way.
 flow.building:
   description: Run one build step with a coding agent, and tidy up after it.
   inputs:

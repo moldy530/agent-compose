@@ -299,6 +299,74 @@ triggers:
     session_key: "payload.body.session"
     respond: async
 
+  # The placed flows (grammar §14.1, PRD resolved q84, Decision D171) — every
+  # way an instance of one starts, each dispatched to `mac` whole: a root
+  # execution, a `flow:` node and a `map` item, a flow-as-tool call, and the
+  # three a dispatch is held to — its finally node, a cancel, a hub restart.
+  on_placed_build:
+    type: http
+    flow: flow.placed_build
+    path: /placed-builds
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
+  on_placed_builds:
+    type: http
+    flow: flow.placed_builds
+    path: /placed-build-batches
+    method: POST
+    input:
+      paths: "payload.body.paths"
+    respond: async
+
+  on_coordinated:
+    type: http
+    flow: flow.coordinated
+    path: /coordinations
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
+  on_placed_tidying:
+    type: http
+    flow: flow.placed_tidying
+    path: /placed-tidyings
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
+  on_placed_closing:
+    type: http
+    flow: flow.placed_closing
+    path: /placed-closings
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
+  on_placed_retried:
+    type: http
+    flow: flow.placed_retried
+    path: /placed-retried-builds
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
+  # A placed flow that asks a person itself — see `flow.placed_asking`.
+  on_placed_asking:
+    type: http
+    flow: flow.placed_asking
+    path: /placed-askings
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
 provider.mock:
   kind: anthropic
   api_key: ${MOCK_API_KEY}
@@ -1113,3 +1181,242 @@ flow.batch:
   edges:
     - { from: start, to: fan }
     - { from: fan, to: end }
+
+# ---------------------------------------------------------------------------
+# Placed flows (grammar §14.1, PRD resolved q84, Decision D171)
+# ---------------------------------------------------------------------------
+#
+# `flow.placed_build`, `flow.placed_tidying` and `flow.placed_closing` are
+# members of `mac` (deploy/mesh.yml): every instance of each — whichever
+# construct starts it — is dispatched to a worker claiming `mac` and runs there
+# whole, its nodes and its `finally:` node, through the path a placed agent's
+# attached flow already takes. The hub runs none of their nodes.
+
+# Unplaced, and named only inside a placed flow: it runs where that flow's
+# instance runs — on the worker — exactly as an unplaced agent inside a placed
+# agent's attached flow does.
+agent.inspector:
+  description: Inspect a release, and report its signature.
+  model: model.smart
+  prompt: |
+    Inspect the path you are given and report what its signature is.
+  input:
+    path:
+      type: string
+  output:
+    signature:
+      type: string
+      min_length: 1
+
+# Unplaced, so the hub runs its tool loop — and the flow it attaches is placed,
+# so a call of it is the one flow-as-tool call the hub dispatches rather than
+# runs in the loop (Decision D171).
+agent.coordinator:
+  description: Have a release inspected on the machine that holds it, and report what came back.
+  model: model.smart
+  prompt: |
+    Have the path you are given inspected, and report the signature that comes back.
+  tools: [flow.placed_build]
+  input:
+    path:
+      type: string
+  output:
+    signature:
+      type: string
+      min_length: 1
+
+# The placed build step: one agent node and a finally node, both on the worker.
+flow.placed_build:
+  description: Inspect a release on the machine that holds it, and settle up after it there.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+  nodes:
+    inspect:
+      agent: agent.inspector
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+    settle:
+      exec:
+        command: "${OPS_BIN}/true"
+  edges:
+    - { from: start, to: inspect }
+    - { from: inspect, to: end }
+  finally: settle
+
+# A placed flow whose finally node fails on the worker, started as a root
+# execution: the failure is this execution's `finally_error` on the hub.
+flow.placed_tidying:
+  description: Look a release over on the machine that holds it, and tidy up after it — which never works.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    look:
+      exec:
+        command: "${OPS_BIN}/sh"
+        args: ["-c", "test -n \"$LOOKED_AT\""]
+      input:
+        looked_at: "input.path"
+    tidy_up:
+      exec:
+        command: "${OPS_BIN}/false"
+  edges:
+    - { from: start, to: look }
+    - { from: look, to: end }
+  finally: tidy_up
+
+# A placed flow whose body outlasts any test and whose finally node fails, so a
+# cancel of the execution it roots is the worker's to stop and the finally
+# node's failure comes home on the worker's cancelled result.
+flow.placed_closing:
+  description: Look a release over at length on the machine that holds it, and close up after it — which never works.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    look_long:
+      exec:
+        command: "${OPS_BIN}/sleep"
+        args: ["600"]
+    close_up:
+      exec:
+        command: "${OPS_BIN}/sh"
+        args: ["-c", "exit 3"]
+  edges:
+    - { from: start, to: look_long }
+    - { from: look_long, to: end }
+  finally: close_up
+
+# The hub's flow over the placed build, both ways a graph instantiates one: a
+# `flow:` node, and a `map` whose items are each an instance — every one of
+# them a dispatch to `mac`.
+flow.placed_builds:
+  description: One placed build from a flow node, then one per path from a map.
+  inputs:
+    paths:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs:
+    signature:
+      type: string
+    signatures:
+      type: array
+      max_items: 12
+      items: { type: string }
+  nodes:
+    first:
+      flow: flow.placed_build
+      input:
+        path: "input.paths[0]"
+      writes:
+        signature: signature
+    every:
+      map:
+        over: input.paths
+        as: path
+        node: flow.placed_build
+        max_concurrency: 4
+        input:
+          path: "path"
+        writes:
+          signature: signatures
+  edges:
+    - { from: start, to: first }
+    - { from: first, to: every }
+    - { from: every, to: end }
+
+# A flow-as-tool call of the placed build, from an agent the hub runs.
+flow.coordinated:
+  description: An unplaced agent whose tool is a placed flow.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+  nodes:
+    coordinate:
+      agent: agent.coordinator
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+  edges:
+    - { from: start, to: coordinate }
+    - { from: coordinate, to: end }
+
+# The placed build from a `flow:` node under a `retry:` — what a hub restart in
+# the middle of the dispatch spends (§5, §6.3): the dispatch is superseded, and
+# the next attempt replays what the first streamed home.
+flow.placed_retried:
+  description: A placed build from a flow node, under a retry the hub can spend on it.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+  nodes:
+    build:
+      flow: flow.placed_build
+      retry: { max: 2, backoff: 1ms }
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }
+
+# A **placed** flow whose own `human:` node asks the question, started as a
+# root execution (Decision D171). The whole instance runs on a worker claiming
+# `mac`, so the question is asked there — and its wait comes home to the hub's
+# board exactly as an attached flow's does (`docs/distributed.md` §3.4): the
+# root dispatch settles *paused*, the resume surface takes the answer, and the
+# instance is dispatched again and replays past the model call it already made.
+flow.placed_asking:
+  description: Inspect a release on the machine that holds it, then ask a person whether it may go ahead.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+    approval:
+      type: string
+  nodes:
+    inspect:
+      agent: agent.inspector
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+    ask:
+      human:
+        input:
+          path: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input:
+        path: "input.path"
+      writes:
+        decision: approval
+  edges:
+    - { from: start, to: inspect }
+    - { from: inspect, to: ask }
+    - { from: ask, to: end }

@@ -28,4 +28,10 @@ placements:
       - agent.tidier
       - agent.closer
       - agent.lapser
+      # Placed flows (Decision D171): every instance of each runs on a worker
+      # claiming `mac`, its nodes and its finally node with it.
+      - flow.placed_build
+      - flow.placed_tidying
+      - flow.placed_closing
+      - flow.placed_asking
     description: The machine holding the signing keys.
