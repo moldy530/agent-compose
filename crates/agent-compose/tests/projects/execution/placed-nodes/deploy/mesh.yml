@@ -35,4 +35,5 @@ placements:
       - flow.placed_closing
       - flow.placed_asking
       - flow.placed_holding
+      - flow.placed_inspected_twice
     description: The machine holding the signing keys.

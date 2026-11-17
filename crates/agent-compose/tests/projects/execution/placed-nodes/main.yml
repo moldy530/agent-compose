@@ -402,6 +402,17 @@ triggers:
       path: "payload.body.path"
     respond: async
 
+  # A placed flow's instance under a `retry:` and a deadline whose first attempt
+  # is lost with its worker — see `flow.placed_reattempted`.
+  on_placed_reattempted:
+    type: http
+    flow: flow.placed_reattempted
+    path: /placed-reattempts
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
 provider.mock:
   kind: anthropic
   api_key: ${MOCK_API_KEY}
@@ -1594,3 +1605,64 @@ flow.placed_holding:
     - { from: inspect, to: hold }
     - { from: hold, to: end }
   finally: settle_up
+
+# A placed flow that asks its model twice: the first call is journaled at once,
+# and the second is one a test holds for as long as it needs — so a worker is
+# lost inside an instance that has streamed an effect home (`docs/distributed.md`
+# §6.3, Decision D171).
+flow.placed_inspected_twice:
+  description: Inspect a release twice on the machine that holds it.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+  nodes:
+    inspect:
+      agent: agent.inspector
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+    reinspect:
+      agent: agent.inspector
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+  edges:
+    - { from: start, to: inspect }
+    - { from: inspect, to: reinspect }
+    - { from: reinspect, to: end }
+
+# That placed flow from a `flow:` node under a `retry:` and a twenty-second
+# deadline — what a retry's attempt no worker took is held to (grammar §7.9,
+# §8.5; Decision D171). The first attempt runs on a worker, streams `inspect`'s
+# model call home under `build/0`, and is lost with the worker (§6.3); the next
+# attempt is a fresh instance at the same instance path, and it parks with
+# nothing claiming `mac`. A cancel, or the deadline, finds that attempt parked:
+# it never began — what is journaled under `build/0` is the lost attempt's — so
+# it is withdrawn and no end is dispatched for it.
+flow.placed_reattempted:
+  description: A placed flow from a flow node, under a retry and a deadline, whose first attempt a lost worker ends.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+  nodes:
+    build:
+      flow: flow.placed_inspected_twice
+      retry: { max: 2, backoff: 1ms }
+      timeout: 20s
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

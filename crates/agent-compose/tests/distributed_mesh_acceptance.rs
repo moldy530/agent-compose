@@ -5822,6 +5822,202 @@ fn a_cancel_of_a_placed_flows_untaken_root_dispatch_runs_no_finally_node() {
     assert!(mesh.provider.requests().is_empty(), "a model call was made");
 }
 
+/// Where `flow.placed_reattempted`'s instance stands, effect-wise, once its
+/// first attempt was lost: what that attempt's worker streamed home before it
+/// went.
+const LOST_ATTEMPTS_EFFECT: &str = "build/0/inspect/0#model/0";
+
+/// Drive `flow.placed_reattempted` to the state the two cases below start from,
+/// and answer the execution and when it started.
+///
+/// The `build` node's first attempt is a placed instance a worker runs: its
+/// `inspect` call is answered at once and journaled on the hub under `build/0`,
+/// and its `reinspect` call is held. The worker is then lost inside it — killed,
+/// runners and all, which is a machine that went away (§7.3) — so the liveness
+/// sweep supersedes `build/0/0` (§6.3) and the node's `retry:` opens the next
+/// attempt: a fresh instance at the **same** instance path (grammar §8.5),
+/// whose dispatch `build/0/1` parks with nothing claiming `mac`. That attempt
+/// never began, though the journal holds an effect under its path — the lost
+/// attempt's.
+fn reattempted_after_a_lost_worker(mesh: &Mesh, purpose: &str) -> (String, Instant) {
+    mesh.provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "signature": "inspected-by-the-lost-attempt" })),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "signature": "never delivered" }))
+                .after(Duration::from_secs(600)),
+        ),
+    ]);
+    let mut worker = mesh.worker(purpose);
+    let started = Instant::now();
+    let execution = mesh.start_execution("/placed-reattempts", &json!({ "path": "release.dmg" }));
+    until(
+        "the first attempt's `inspect` call reached the hub's journal",
+        || worker.transcript(),
+        || harness::journal_holds(&mesh.project, &[LOST_ATTEMPTS_EFFECT]),
+    );
+    until(
+        "the first attempt's `reinspect` call reached the provider",
+        || worker.transcript(),
+        || mesh.provider.requests().len() == 2,
+    );
+    let holding = mesh.until(&execution, "was taken by the worker", |report| {
+        report["placement_waits"][0]["status"] == "dispatched"
+    });
+    assert_eq!(
+        holding["placement_waits"][0]["wait_id"], "build/0/0",
+        "{holding:#}"
+    );
+    worker.kill();
+
+    let parked = mesh.until(&execution, "parked the retry's attempt", |report| {
+        (report["placement_waits"][0]["wait_id"] == "build/0/1"
+            && report["placement_waits"][0]["status"] == "parked")
+            || report["status"] != "running"
+    });
+    assert_eq!(
+        (
+            parked["status"].as_str(),
+            parked["placement_waits"][0]["wait_id"].as_str(),
+            parked["placement_waits"][0]["status"].as_str(),
+        ),
+        (Some("running"), Some("build/0/1"), Some("parked")),
+        "the retry's attempt did not park after the lost one: {parked:#}"
+    );
+    (execution, started)
+}
+
+/// The two dispatch rows `flow.placed_reattempted`'s `build` node made — the
+/// lost attempt's, superseded by the liveness sweep, and the retry's, ended by
+/// whatever stopped it while it was parked — and **no third**: an end
+/// dispatched for an instance that never began would be `build/0/2`. Answers
+/// the retry's row's detail.
+fn assert_no_end_for_the_untaken_retry(mesh: &Mesh, execution: &str) -> String {
+    let placed = dispatches_of(mesh, execution);
+    assert_eq!(
+        placed
+            .iter()
+            .map(|row| (row["wait"].as_str(), row["status"].as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (Some("build/0/0"), Some("superseded")),
+            (Some("build/0/1"), Some("superseded")),
+        ],
+        "an end was dispatched for a retry no worker took, on the strength of the effects the \
+         attempt before it made: {placed:#?}"
+    );
+    let rows = mesh.dispatch_rows(execution);
+    assert!(
+        rows[0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("made no request")),
+        "the lost attempt was not superseded by the liveness sweep: {rows:#?}"
+    );
+    assert_eq!(
+        mesh.provider.requests().len(),
+        2,
+        "something of the retry's attempt ran: only the lost attempt's two calls were made"
+    );
+    rows[1]["detail"].as_str().unwrap_or_default().to_string()
+}
+
+/// **A cancel of a placed flow's retry that no worker took ends the execution
+/// `cancelled` at once — the effects the attempt before it made do not make it
+/// begun** (grammar §7.9, §8.5; PRD resolved q75, q84; Decision D171;
+/// `docs/distributed.md` §2, §6.3).
+///
+/// `flow.placed_reattempted`'s first attempt ran on a worker and streamed a
+/// model call home under `build/0` before the worker was lost; its retry is
+/// parked at `build/0/1` with no worker claiming `mac`. Each attempt is a
+/// fresh instance at the same instance path, so the parked one has not begun:
+/// the cancel withdraws its row, as it withdraws any parked dispatch, and the
+/// execution settles `cancelled` straight away. Read off the journal's effects
+/// at `build/0`, the parked attempt would look begun, and the cancel would park
+/// an end for it — `cancelled: true`, which nothing withdraws — leaving the
+/// execution open for a worker nobody started, and handing one that did join
+/// the lost attempt's history to replay.
+#[test]
+fn a_cancel_of_a_placed_flows_untaken_retry_owes_no_end_for_the_attempt_lost_before_it() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    let (execution, _) = reattempted_after_a_lost_worker(&mesh, "placed-flow-reattempt-cancel");
+
+    let asked = Instant::now();
+    cancel(&mesh, &execution);
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] != "running"
+    });
+    assert_eq!(report["status"], "cancelled", "{report:#}");
+    assert!(
+        asked.elapsed() < Duration::from_secs(10),
+        "the cancel took {:?} to end a retry no worker took",
+        asked.elapsed()
+    );
+    assert!(report.get("finally_error").is_none(), "{report:#}");
+    assert!(
+        report["placement_waits"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "a cancelled execution still holds a placement wait: {report:#}"
+    );
+
+    let detail = assert_no_end_for_the_untaken_retry(&mesh, &execution);
+    assert!(
+        detail.contains("was cancelled") && !detail.contains("held it"),
+        "the retry's parked row was not withdrawn as the cancel's, untaken: {detail}"
+    );
+}
+
+/// **A deadline over a placed flow's retry that no worker took fails the node
+/// on its deadline — the effects the attempt before it made do not make it
+/// begun** (grammar §7.9, §8.5, §9.2; Decision D171; `docs/distributed.md` §2,
+/// §6.3, §6.5).
+///
+/// The same lost attempt and the same parked retry as the cancel's case, left
+/// for `build`'s twenty-second `timeout:` to end. The parked attempt never
+/// began, so the deadline withdraws its row as one no worker took, and the node
+/// fails on its budget: the execution settles `failed`, on the timeout, within
+/// a few seconds of the budget running out. Read off the journal's effects at
+/// `build/0`, the parked attempt would look begun, and the deadline would park
+/// a `stopped: true` end for it — which nothing withdraws and the node waits
+/// for — so the node's own deadline would stop bounding it, and the execution
+/// would wait for a worker indefinitely.
+#[test]
+fn a_deadline_over_a_placed_flows_untaken_retry_fails_the_node_and_owes_no_end() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    let (execution, started) =
+        reattempted_after_a_lost_worker(&mesh, "placed-flow-reattempt-deadline");
+
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] != "running" && report["status"] != "interrupted"
+    });
+    let settled_after = started.elapsed();
+    assert_eq!(report["status"], "failed", "{report:#}");
+    assert!(
+        report["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("`build` timed out")),
+        "the execution did not fail on `build`'s deadline: {report:#}"
+    );
+    assert!(
+        settled_after < Duration::from_secs(20 + 10),
+        "the execution took {settled_after:?} to settle on a twenty-second deadline: {report:#}"
+    );
+    assert!(report.get("finally_error").is_none(), "{report:#}");
+
+    let detail = assert_no_end_for_the_untaken_retry(&mesh, &execution);
+    assert!(
+        detail.contains("before any worker took it"),
+        "the retry's parked row was not withdrawn as one no worker took: {detail}"
+    );
+}
+
 /// **A hub restarted mid-cancel at a placed flow's question hands the
 /// instance's end to a worker, and its finally node runs there** (PRD resolved
 /// q75 ruling e, `docs/durability.md` §6.1; Decision D171).
