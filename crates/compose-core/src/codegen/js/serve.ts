@@ -172,14 +172,24 @@
 // is open in the journal with no generation here to run it, and its row stays
 // open on purpose until somebody says otherwise (`docs/durability.md` §7). The
 // cancel is that somebody (PRD resolved q81, Decision D165): the request is
-// recorded and the cascade taken as for any cancel, its open descendants this
-// process runs no generation of are closed the same way, those it does run are
+// recorded and the cascade taken as for any cancel, its open descendants
+// nothing here will take are closed the same way, those it does run are
 // waited for until the cascade has settled them, and the row is ended
 // `cancelled` here and now — no finally node ran, since no generation can run
 // one against a record it does not describe, and `finally_error` says so. The
 // settle webhook and the export go as for any settle, and the answer is `202`
 // with `cancelling: false`: the cancel is complete, the lineage's with it
 // ([`closeUnrecoverable`]).
+//
+// Only an execution **nothing here will ever take** is closed so. One this
+// process runs no generation of *yet* — the recovery this start owes has not
+// read the journal, its open parent's replay has still to re-issue it, the
+// start that next recovers it has not come — is one this build can run, and
+// its cancel is any open execution's (PRD resolved q75): the request recorded,
+// the row left open, and the recovery that takes it completes the cancel at
+// its frontier, finally node and all. So the route takes the recovery it owes
+// first ([`Recovery.before`]), and a row it then finds still unrun is asked
+// who takes it ([`takerOf`]) before anything closes it.
 //
 // # Lifecycle webhooks (grammar 13.3, PRD resolved q34, q35)
 //
@@ -717,17 +727,25 @@ export function createApp(): FastifyInstance {
     // (grammar 13.3, PRD resolved q32).
     if (execution === undefined) {
       // …save one left open in the journal that recovery put on no board
-      // here — this build has no flow of the name it ran, or has not reached
-      // it — which this cancel closes ([`unrecoverable`], PRD resolved q81).
-      const found = await unrecoverable(executions, id);
-      // Looked at again past that read: a close another cancel finished
-      // meanwhile puts the execution on the board, and it is answered there.
+      // here ([`unrun`], PRD resolved q81). The recovery this process owes is
+      // taken first, where it is still owed — a standby whose start could not
+      // read the journal another `serve` held, which has not yet retried — so
+      // an execution that walk puts on the board is cancelled there, as any
+      // running one is, finally node and all, rather than read as one nothing
+      // here will take.
+      const walked = await recoveredHere(recovery);
+      const found =
+        executions.get(id) === undefined ? await unrun(executions, id, walked) : undefined;
+      // Looked at again past those reads: the walk, or a close another cancel
+      // finished meanwhile, puts the execution on the board, and it is
+      // answered there.
       execution = executions.get(id);
       if (execution === undefined) {
         if (found === undefined) return unknownExecution(reply, id);
         const refusal = guardedBy(found.row.trigger, request);
         if (refusal !== undefined) return refuse(reply, found.row.trigger, refusal);
-        return closedUnrecoverable(reply, await closeUnrecoverable(executions, found));
+        if (found.kind === "owed") return cancelOwed(reply, found);
+        return closedUnrecoverable(reply, await closeUnrecoverable(executions, found, walked));
       }
     }
     const refusal = guarded(execution, request);
@@ -737,10 +755,13 @@ export function createApp(): FastifyInstance {
       // ([`closed`]), so open in the journal: a recovery this build could not
       // take — a replay that diverged, recorded inputs it no longer accepts —
       // which leaves the row open on purpose until a cancel closes it
-      // (`docs/durability.md` §7, PRD resolved q81).
-      const found = await unrecoverable(executions, id);
-      if (found !== undefined) {
-        return closedUnrecoverable(reply, await closeUnrecoverable(executions, found));
+      // (`docs/durability.md` §7, PRD resolved q81). The walk is finished
+      // first, where it is owed, so the descendants the close reaches are
+      // asked who takes them against a board that walk has filled.
+      const walked = await recoveredHere(recovery);
+      const found = await unrun(executions, id, walked);
+      if (found?.kind === "unrecoverable") {
+        return closedUnrecoverable(reply, await closeUnrecoverable(executions, found, walked));
       }
     }
     if (execution.status !== "running") {
@@ -3474,7 +3495,11 @@ class Recovery {
    * could not read it, the executions it holds open are recovered before the
    * scheduler claims a tick or a consumer matches an event against them. The
    * deliveries half is not waited for: no tick or event is answered by one,
-   * and the retries pick it up.
+   * and the retries pick it up. And awaited by the cancel route before it
+   * reads an open row on no board here (PRD resolved q81,
+   * [`recoveredHere`]): one this walk would put on the board is one this
+   * build can run, and its cancel is a running execution's, finally node and
+   * all.
    */
   async before(): Promise<void> {
     if (this.#executionsRead) return;
@@ -4825,49 +4850,144 @@ function unknownExecution(reply: FastifyReply, id: string): unknown {
 
 /**
  * An execution **this build's recovery could not take** (PRD resolved q81,
- * Decision D165): its lifecycle row, why no generation here can run it, and
- * this process's record of it where it has one.
+ * Decision D165) — one nothing here will ever run: its lifecycle row, why,
+ * and this process's record of it where it has one.
  */
 interface Unrecoverable {
+  readonly kind: "unrecoverable";
   readonly row: runtime.ExecutionRow;
-  /** Why, in the words its `finally_error` carries ([`unrecoveredReason`]). */
+  /** Why, in the words its `finally_error` carries. */
   readonly reason: string;
   /** The board's record, for a recovery that settled here without its row. */
   readonly execution?: Execution;
 }
 
 /**
- * The execution `id` names where **its lifecycle row is open and this process
- * runs no generation of it** — one this build's recovery could not take —
- * and `undefined` for anything else, and for a journal that cannot be read,
- * which leaves the route's answer what it was.
+ * An open execution this process runs no generation of **yet**, which a
+ * recovery here still takes — so one this build can run, whose cancel is any
+ * open execution's (PRD resolved q75 ruling d, Decision D160): recorded, with
+ * the row left open for that recovery to complete the cancel at its frontier,
+ * finally node and all ([`cancelOwed`]).
+ */
+interface Owed {
+  readonly kind: "owed";
+  readonly row: runtime.ExecutionRow;
+  /** Which recovery takes it, in the words the cancel's answer says it. */
+  readonly by: string;
+}
+
+/**
+ * Who takes an open lifecycle row up (PRD resolved q81): `"here"` for one a
+ * generation of this process runs — its own controller and the cascade
+ * cancel it, and its generation closes its row; `"run"` for one a `run`
+ * beside this `serve` wrote, which is not `serve`'s to cancel; an [`Owed`]
+ * for one a recovery here still takes; and an [`Unrecoverable`] for one
+ * nothing here ever will.
+ */
+type Taker = "here" | "run" | Unrecoverable | Owed;
+
+/**
+ * Who takes the open row `row` up, read off this process and the journal.
+ * `walked` is whether the recovery walk this process owes has read the open
+ * executions and put them on the board ([`recoveredHere`]).
  *
- * Two ways a build leaves one (PRD resolved q81):
- *
- *  * **on the board, settled without its row** — a recovery whose replay
+ *  * **A generation here** — one this process opened and has not closed, or a
+ *    child execution on its books (`runtime.runsHere`), or a record on the
+ *    board still running, or one whose settle is being journaled — is
+ *    `"here"`.
+ *  * **On the board, settled without its row** — a recovery whose replay
  *    diverged, or whose recorded inputs this build's `inputs:` refuse, which
  *    this process reports `failed` while the row stays open on purpose
  *    (`docs/durability.md` §7): the run stopped short of the hook that closes
- *    rows ([`closed`]), so [`Execution.announced`] is `false`;
- *  * **on no board** — a row of a flow this build does not declare, which
- *    recovery leaves in the journal and puts on no board at all; or one of a
- *    flow it does declare that this process has not recovered: a child whose
- *    recovery waits on its parent's replay to re-issue it — which finds the
- *    row closed and delivers the dispatch, as for any settled child — a row a
- *    recovery this start could not finish has yet to reach. Save a row a **`run`**
- *    wrote — its trigger is `manual` — beside this `serve`: that execution is
- *    the `run`'s, its interrupt leaves the row for `resume`, and its cancel is
- *    not `serve`'s (PRD resolved q75 ruling d, Decision D163's Status), so it
- *    is still `404` here. A `manual` row this process recovered is on its
- *    board, and answered by the first case.
+ *    rows ([`closed`]) — is unrecoverable, for what its recovery failed on.
+ *  * **On no board, of a flow this build does not declare** — which every
+ *    recovery of this build leaves in the journal — is unrecoverable.
+ *  * **A row a `run` wrote** beside this `serve` — its trigger is `manual`,
+ *    as its children's are — is the `run`'s: its interrupt leaves the row for
+ *    `resume`, and its cancel is not `serve`'s (PRD resolved q75 ruling d,
+ *    Decision D163's Status). A `manual` row this process recovered is on its
+ *    board, and answered by the cases above.
+ *  * **On no board, of a flow this build declares**, is one this build can
+ *    run, and it is owed — taken by the walk this process still owes; by the
+ *    start that next recovers it, for a root, or for a child whose parent has
+ *    settled; or, for a child whose parent is open, by that parent's replay,
+ *    which re-issues its dispatch — **save a child whose open parent is
+ *    itself unrecoverable**: nothing re-issues that child, and a cancel
+ *    closes it with its parent's lineage or alone.
+ *
+ * A journal that cannot answer a parent's row is read as one that would have
+ * it owed: a cancel recorded is one a later look can still close, and a row
+ * closed is not one a later look can open.
+ */
+async function takerOf(
+  executions: Map<string, Execution>,
+  row: runtime.ExecutionRow,
+  walked: boolean,
+  passed: ReadonlySet<string> = new Set(),
+): Promise<Taker> {
+  if (runsHere(row.id)) return "here";
+  const execution = executions.get(row.id);
+  if (execution !== undefined) {
+    if (execution.status === "running" || execution.announced) return "here";
+    return {
+      kind: "unrecoverable",
+      row,
+      execution,
+      reason: clipped(execution.error ?? "its recovery failed", REASON_LIMIT),
+    };
+  }
+  if (flows[row.flow] === undefined) {
+    return { kind: "unrecoverable", row, reason: `this build declares no flow \`${row.flow}\`` };
+  }
+  if (row.trigger === MANUAL) return "run";
+  if (!walked) {
+    return { kind: "owed", row, by: "the recovery this process owes, which has not read the journal yet" };
+  }
+  const parent = row.lineage?.parent;
+  const next = { kind: "owed", row, by: "the start that next recovers it" } as const;
+  // Bounded by the lineage's depth; the set is for a journal whose rows name
+  // each other in a cycle, which no runtime writes and a walk must still end.
+  if (parent === undefined || passed.has(parent)) return next;
+  let above: runtime.ExecutionRow | undefined;
+  try {
+    above = await journaledExecution(parent);
+  } catch {
+    return next;
+  }
+  // A parent that has settled re-issues nothing: the start that next finds it
+  // settled resumes the child itself (`docs/durability.md` §6.1).
+  if (above === undefined || above.status !== "open") return next;
+  const taken = await takerOf(executions, above, walked, new Set([...passed, row.id]));
+  if (taken === "run") return "run";
+  if (taken === "here") {
+    return { kind: "owed", row, by: `its open parent \`${parent}\`'s replay here, which re-issues it` };
+  }
+  if (taken.kind === "owed") {
+    return { kind: "owed", row, by: `its open parent \`${parent}\`'s recovery, whose replay re-issues it` };
+  }
+  return {
+    kind: "unrecoverable",
+    row,
+    reason: `its open parent \`${parent}\` is one this build's recovery could not take, so nothing here re-issues it`,
+  };
+}
+
+/**
+ * The open execution `id` names where **this process runs no generation of
+ * it** — one nothing here will take ([`Unrecoverable`]), or one a recovery
+ * here still takes ([`Owed`]) — and `undefined` for anything else: an id the
+ * journal holds no open row of, a generation here, a `run`'s row, and a
+ * journal that cannot be read, which leaves the route's answer what it was
+ * ([`takerOf`]).
  *
  * Whether it held a slot of a trigger's lease is not asked here: a `started`
- * intake row decides only whether the close frees one ([`closeUnrecoverable`]).
+ * intake row decides only whether its cancel frees one ([`heldSlot`]).
  */
-async function unrecoverable(
+async function unrun(
   executions: Map<string, Execution>,
   id: string,
-): Promise<Unrecoverable | undefined> {
+  walked: boolean,
+): Promise<Unrecoverable | Owed | undefined> {
   let row: runtime.ExecutionRow | undefined;
   try {
     row = await journaledExecution(id);
@@ -4875,29 +4995,54 @@ async function unrecoverable(
     return undefined;
   }
   if (row === undefined || row.status !== "open") return undefined;
-  // A generation this process runs closes its own row, and is cancelled
-  // through the cascade like any running execution.
-  if (runsHere(id)) return undefined;
-  const execution = executions.get(id);
-  if (execution !== undefined) {
-    if (execution.status === "running" || execution.announced) return undefined;
-    return { row, execution, reason: unrecoveredReason(row, execution) };
-  }
-  if (flows[row.flow] === undefined) return { row, reason: unrecoveredReason(row, undefined) };
-  if (row.trigger === MANUAL) return undefined;
-  return { row, reason: unrecoveredReason(row, undefined) };
+  const taker = await takerOf(executions, row, walked);
+  return typeof taker === "string" ? undefined : taker;
 }
 
 /**
- * Why no generation here can run an execution, as its `finally_error` says it:
- * what its recovery failed on — the divergence the status route reports, or the
- * inputs this build refused — clipped to [`REASON_LIMIT`]; the flow this build
- * does not declare; or that this process has not recovered it.
+ * Whether the executions this project's journal holds open are on the board:
+ * the walk [`Recovery`] owes, taken first where it is still owed
+ * ([`Recovery.before`]), and `false` where the journal still cannot be read.
+ * What the cancel route asks before it reads a row on no board as one nothing
+ * here will take: an open row that walk would put on the board is one this
+ * build can run.
  */
-function unrecoveredReason(row: runtime.ExecutionRow, execution: Execution | undefined): string {
-  if (execution !== undefined) return clipped(execution.error ?? "its recovery failed", REASON_LIMIT);
-  if (flows[row.flow] === undefined) return `this build declares no flow \`${row.flow}\``;
-  return "this process has not recovered it";
+async function recoveredHere(recovery: Recovery): Promise<boolean> {
+  try {
+    await recovery.before();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Cancel an execution a recovery here still takes ([`Owed`]): the request
+ * recorded and the cascade taken, as every cancel is
+ * (`runtime.cancelExecution`) — which frees its slot of a trigger's lease the
+ * moment the request is down, since a slot is held by an execution nobody has
+ * asked to cancel — and its trigger's queue looked at where it held one.
+ * Nothing fires here, because nothing here runs it yet: the row stays open,
+ * and the recovery that takes it finds the request and completes the cancel
+ * at its frontier — every instance it had open ends `cancelled` and runs its
+ * finally node (`docs/durability.md` §6.1, PRD resolved q75 ruling e). `202`,
+ * as for any open execution (ruling d), with the journal's `open` and
+ * `cancelling: true`; no `status_url`, since this build's status route does
+ * not know it until that recovery puts it on the board.
+ */
+async function cancelOwed(reply: FastifyReply, owed: Owed): Promise<unknown> {
+  const { row } = owed;
+  await cancelExecution(row.id);
+  const leased = await heldSlot(row.id);
+  if (leased) released(row.trigger);
+  return reply.code(202).send({
+    execution_id: row.id,
+    status: "open",
+    cancelling: true,
+    detail: `this process runs no generation of this execution yet, and a recovery of this build takes it up — ${owed.by} — so the cancel is recorded and its lifecycle row stays open: that recovery completes the cancel, its finally node included${
+      leased ? `; the cancel frees the slot it held of the trigger \`${row.trigger}\`'s lease` : ""
+    }`,
+  });
 }
 
 /** The most of a recovery's failure an execution's `finally_error` carries. */
@@ -4922,6 +5067,11 @@ interface Closed {
   readonly reason: string;
   /** The trigger whose lease the close freed a slot of, where it held one. */
   readonly leased?: string;
+  /**
+   * The open descendants the cancel reached that a recovery here still takes
+   * ([`Owed`]), left open with their requests recorded for it to complete.
+   */
+  readonly owed: readonly string[];
 }
 
 /**
@@ -4931,25 +5081,29 @@ interface Closed {
 const closing = new Map<string, Promise<Closed>>();
 
 /**
- * Close an execution [`unrecoverable`] found (PRD resolved q81, Decision D165),
- * each step durable before the next:
+ * Close an execution [`unrun`] found nothing here will take (PRD resolved
+ * q81, Decision D165), each step durable before the next:
  *
  *  1. **the request is recorded and the cascade taken**, as every cancel's is
  *     (`runtime.cancelExecution`): which frees its slot of a trigger's lease
  *     the moment the request is down, and cancels every open descendant this
  *     process *is* running through that descendant's own controller — which
  *     settles `cancelled` on its own, finally node and all;
- *  2. **its open descendants this process runs no generation of are closed the
- *     same way**, deepest first (`runtime.openDescendants`) — each one the
- *     cascade reached, which a dispatch a finally node issued is not: that one
- *     runs whole (grammar 7.9, Decision D160), and the start that next finds
- *     its parent settled recovers it — and each one the cascade cancelled
- *     **here** is waited for, in the same deepest-first order, until it has
- *     settled ([`descendantSettled`]): a row above a descendant still being
- *     torn down never closes before it, so the answer's "the cancel is
- *     complete" is true of the whole lineage;
+ *  2. **each open descendant the cascade reached is taken up, deepest first**
+ *     (`runtime.openDescendants`) — a dispatch a finally node issued is not
+ *     one: it runs whole (grammar 7.9, Decision D160), and the start that next
+ *     finds its parent settled recovers it — by who takes it ([`takerOf`]):
+ *     one a generation here runs is waited for until it has settled
+ *     ([`descendantSettled`]), so a row above a descendant still being torn
+ *     down never closes before it; one nothing here will take — a child whose
+ *     open parent is itself unrecoverable, a flow this build does not
+ *     declare, a recovery of its own that failed — is closed the same way;
+ *     and one a recovery here still takes keeps its row open with its request
+ *     recorded, for that recovery to complete the cancel, finally node and
+ *     all — asked once more, where its open parent runs here, after that
+ *     parent has settled without re-issuing it;
  *  3. **the execution's own row closes** ([`closeRow`]), after every
- *     descendant the cancel reached has;
+ *     descendant the cancel reached has been taken up;
  *  4. **its trigger's queue is looked at**, where a `started` intake row says
  *     it held a slot of the lease.
  *
@@ -4960,29 +5114,53 @@ const closing = new Map<string, Promise<Closed>>();
 function closeUnrecoverable(
   executions: Map<string, Execution>,
   found: Unrecoverable,
+  walked: boolean,
 ): Promise<Closed> {
   const id = found.row.id;
   const held = closing.get(id);
   if (held !== undefined) return held;
   const closes = (async (): Promise<Closed> => {
     await cancelExecution(id);
+    const owed: string[] = [];
     for (const descendant of await openDescendants(id)) {
       // Not the cancel's: no request reached it.
       if (descendant.cancelRequestedAt === undefined) continue;
-      const record = executions.get(descendant.id);
-      if (runsHere(descendant.id) || record?.status === "running" || record?.announced === true) {
+      let taker = await takerOf(executions, descendant, walked);
+      const parent = descendant.lineage?.parent;
+      if (
+        typeof taker !== "string" &&
+        taker.kind === "owed" &&
+        parent !== undefined &&
+        (runsHere(parent) || executions.get(parent)?.status === "running")
+      ) {
+        // Its open parent runs here, cancelled by the same cascade, and may
+        // yet re-issue it — which resumes it carrying its request. Once that
+        // parent is over, it is asked again.
+        await descendantSettled(executions, parent);
+        const now = await journaledExecution(descendant.id).catch(() => descendant);
+        if (now === undefined || now.status !== "open") continue;
+        taker = await takerOf(executions, now, walked);
+      }
+      if (taker === "run") continue;
+      if (taker === "here") {
         // A generation here runs it: the cascade cancelled it through its own
         // controller, and it settles `cancelled` on its own, finally node and
         // all. Nothing above it closes until it has (PRD resolved q81).
         await descendantSettled(executions, descendant.id);
         continue;
       }
-      await closeRow(executions, descendant, unrecoveredReason(descendant, record), record);
+      if (taker.kind === "owed") {
+        // One this build can run: its request is down, and the recovery that
+        // takes it completes the cancel (PRD resolved q75 ruling e).
+        owed.push(descendant.id);
+        continue;
+      }
+      await closeRow(executions, descendant, taker.reason, taker.execution);
     }
     const execution = await closeRow(executions, found.row, found.reason, found.execution);
     const leased = (await heldSlot(id)) ? found.row.trigger : undefined;
     if (leased !== undefined) released(leased);
-    return { execution, reason: found.reason, ...(leased === undefined ? {} : { leased }) };
+    return { execution, reason: found.reason, owed, ...(leased === undefined ? {} : { leased }) };
   })().finally(() => {
     closing.delete(id);
   });
@@ -5123,16 +5301,21 @@ async function heldSlot(id: string): Promise<boolean> {
  * The cancel route's answer for a close — PRD resolved q75 ruling d's `202`
  * for an open execution — `cancelled` and `cancelling: false`, because the
  * cancel is complete, and a `detail` saying why the row was closed here and
- * that no finally node ran.
+ * that no finally node ran — and, where the cascade reached a descendant a
+ * recovery here still takes, which ones keep their rows open for it.
  */
 function closedUnrecoverable(reply: FastifyReply, closed: Closed): unknown {
-  const { execution } = closed;
+  const { execution, owed } = closed;
+  const left =
+    owed.length === 0
+      ? ""
+      : `; ${owed.map((id) => `\`${id}\``).join(", ")} in its lineage ${owed.length === 1 ? "is one" : "are ones"} this build can run, so ${owed.length === 1 ? "its row stays" : "their rows stay"} open with the cancel recorded, for the recovery that takes ${owed.length === 1 ? "it" : "them"} to complete it, finally node and all`;
   return reply.code(202).send({
     execution_id: execution.id,
     status: "cancelled",
     cancelling: false,
     status_url: `/executions/${execution.id}`,
-    detail: `this build could not take up this execution's recovery (${closed.reason}), so no generation of it can run here: its lifecycle row is closed \`cancelled\` and no finally node ran, which its \`finally_error\` says${
+    detail: `this build could not take up this execution's recovery (${closed.reason}), so no generation of it can run here: its lifecycle row is closed \`cancelled\` and no finally node ran, which its \`finally_error\` says${left}${
       closed.leased === undefined
         ? ""
         : `; the slot it held of the trigger \`${closed.leased}\`'s lease is free`

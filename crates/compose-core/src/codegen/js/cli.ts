@@ -564,9 +564,11 @@ async function resumeVerb(argv: readonly string[]): Promise<number> {
  * …'` or whatever header the trigger's `auth:` reads.
  *
  * Exit `0` on `202` — the cancel is recorded and under way, and the status
- * route says how the execution ended; or, for an execution the serving build's
- * recovery could not take, already complete, its row closed `cancelled` with
- * the `detail` printed (PRD resolved q81) — `1` on any refusal the app
+ * route says how the execution ended (or, for one the serving process has not
+ * yet recovered, the `detail` printed says which recovery completes it); or,
+ * for an execution the serving build's recovery could not take, already
+ * complete, its row closed `cancelled` with the `detail` printed (PRD
+ * resolved q81) — `1` on any refusal the app
  * answered with (a settled execution's `409`, an unknown one's `404`, a
  * `401`), and `2` where the command could not run: bad usage, no URL to send
  * to, or an app that did not answer.
@@ -617,6 +619,12 @@ async function cancelVerb(argv: readonly string[]): Promise<number> {
     // recovery could not take, whose row the app closed `cancelled` with no
     // finally node run (PRD resolved q81) — and the `detail` says why.
     process.stdout.write(`cancelled \`${execution}\`: ${String(answer["detail"] ?? "")}\n`);
+  } else if (accepted && answer["status_url"] === undefined && typeof answer["detail"] === "string") {
+    // Recorded for an execution the serving process runs no generation of
+    // yet, which a recovery there still takes and completes the cancel for —
+    // there is no status route to point at until it has, and the `detail`
+    // says which recovery that is (PRD resolved q81).
+    process.stdout.write(`cancelling \`${execution}\`: ${answer["detail"]}\n`);
   } else if (accepted) {
     process.stdout.write(
       `cancelling \`${execution}\`: the status route at ${String(answer["status_url"] ?? `/executions/${execution}`)} says how it ends\n`,
