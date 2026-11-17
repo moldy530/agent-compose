@@ -1233,22 +1233,30 @@ mod tests {
     /// §3's table while §4 went on naming four. That drift has a reader: a key
     /// is `<site>#<kind>/<ordinal>`, and anything parsing one against §4's
     /// stated vocabulary treats every key of the unnamed kind as malformed.
-    /// So the list is read off the type the runtime writes, in both directions
-    /// — every member is named, and nothing else is.
+    /// So the list is read off the constant the runtime writes — `EFFECT_KINDS`,
+    /// which the type and the hub's batch route both read — in both directions:
+    /// every member is named, and nothing else is.
     #[test]
     fn the_documented_key_vocabulary_is_the_one_the_journal_writes() {
         let document = include_str!("../../../../docs/durability.md");
 
-        let union = SOURCE
-            .split_once("export type EffectKind =")
+        let list = SOURCE
+            .split_once("export const EFFECT_KINDS = [")
             .expect("`src/journal.ts` declares the kinds a key can carry")
             .1;
-        let union = &union[..union.find(';').expect("…as one union type")];
-        let kinds: Vec<&str> = union
-            .split('|')
+        let list = &list[..list.find("] as const;").expect("…as one constant list")];
+        let kinds: Vec<&str> = list
+            .split(',')
             .map(|member| member.trim().trim_matches('"'))
             .filter(|member| !member.is_empty())
             .collect();
+        // …and the type is that list's, rather than a second copy of it: a
+        // union written out beside the constant is the drift this test exists
+        // to stop, one declaration further in.
+        assert!(
+            SOURCE.contains("export type EffectKind = (typeof EFFECT_KINDS)[number];"),
+            "`EffectKind` is no longer derived from `EFFECT_KINDS`, so the two can part company"
+        );
 
         let bullet = document
             .split_once("* `<kind>` is one of")

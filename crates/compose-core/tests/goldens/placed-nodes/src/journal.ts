@@ -256,9 +256,10 @@ export function journalLocation(): string {
 // ---------------------------------------------------------------------------
 
 /**
- * The five families of effect a compiled graph issues.
+ * The kinds of effect a compiled graph records: four families of call to the
+ * world, the one harness run, and the boundary an instance crosses when it ends.
  *
- * They are families rather than node kinds on purpose: what a replay has to
+ * The families are families rather than node kinds on purpose: what a replay has to
  * answer is a *call to the world*, and the same family is reached from more
  * than one construct — a `tool` is an `exec:`, an `http:` or a `function:`
  * binding, whether it is a node's own activity or a tool an agent's model
@@ -279,7 +280,19 @@ export function journalLocation(): string {
  * through the same seam because what it needs is the seam's: a key a resumed
  * generation derives again, and a recorded value it compares and reads back.
  */
-export type EffectKind = "model" | "tool" | "store" | "human" | "harness" | "finally";
+export const EFFECT_KINDS = ["model", "tool", "store", "human", "harness", "finally"] as const;
+
+/**
+ * One member of [`EFFECT_KINDS`]: what a key's `<kind>` segment is.
+ *
+ * Derived from the list rather than written beside it, because the list has a
+ * reader the type does not: the hub's `POST /workers/effects` takes a record
+ * only if its kind is one this journal writes (`./mesh.ts`'s `recordOf`), and a
+ * second, hand-written copy of the list there is how a worker's `harness` record
+ * — a `coder:` node inside a placed agent's attached flow — came to be refused
+ * while this type named it.
+ */
+export type EffectKind = (typeof EFFECT_KINDS)[number];
 
 /** How one recorded effect ended. */
 export type JournalOutcome =

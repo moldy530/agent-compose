@@ -2828,6 +2828,151 @@ fn the_store_command_line_refuses_what_it_cannot_parse() {
     }
 }
 
+/// **A flag spelled as the op parameter it stands for is refused naming the
+/// flag it is written as** (D155, PRD resolved q72).
+///
+/// The sub-verbs' flags mirror grammar 11.4's op parameters without being
+/// spelled as them: `list`'s `--values` is `include_values:`, and
+/// `--if-version` is `if_version:`. An operator who wrote the parameter —
+/// `--include-values` — was told only that the argument was unexpected, and to
+/// pass it with `--` as a value, which would have made it a key. Each spelling
+/// here is refused exit `2` as before, nothing built, and the refusal names the
+/// flag that stands for it; a flag that spells nothing the sub-verb takes keeps
+/// clap's own words, and none is accepted.
+#[test]
+fn a_store_flag_spelled_as_its_op_parameter_is_refused_naming_the_flag_it_is_written_as() {
+    let source = Scratch::new("store-cli-spelled");
+    let entrypoint = source.path().join("main.yml");
+    let suffix = run_unique();
+    std::fs::write(&entrypoint, composition(&suffix)).expect("the scratch area is writable");
+    let main = entrypoint.to_str().expect("a UTF-8 scratch path");
+    let notes = format!("store.notes_{suffix}");
+    let out = source.path().join("build");
+    let built = out.to_str().expect("a UTF-8 scratch path");
+    let value = r#"{"text":"x"}"#;
+    let cases: [(Vec<&str>, &str); 5] = [
+        (
+            vec![
+                "store",
+                "list",
+                "--out",
+                built,
+                main,
+                &notes,
+                "--include-values",
+            ],
+            "tip: `--include-values` is written `--values`",
+        ),
+        (
+            vec![
+                "store",
+                "list",
+                "--out",
+                built,
+                main,
+                &notes,
+                "--include_values",
+            ],
+            "tip: `--include_values` is written `--values`",
+        ),
+        (
+            vec![
+                "store",
+                "set",
+                "--out",
+                built,
+                main,
+                &notes,
+                "k",
+                value,
+                "--if_version",
+                "1",
+            ],
+            "tip: `--if_version` is written `--if-version`",
+        ),
+        (
+            vec![
+                "store",
+                "delete",
+                "--out",
+                built,
+                main,
+                &notes,
+                "k",
+                "--if_version",
+                "1",
+            ],
+            "tip: `--if_version` is written `--if-version`",
+        ),
+        (
+            vec![
+                "store",
+                "import",
+                "--out",
+                built,
+                main,
+                &notes,
+                "--if_absent",
+            ],
+            "tip: `--if_absent` is written `--if-absent`",
+        ),
+    ];
+    let refused = |arguments: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_agent-compose"))
+            .args(arguments)
+            .current_dir(source.path())
+            .env("NO_COLOR", "1")
+            .stdin(Stdio::null())
+            .output()
+            .expect("the command runs");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "`agent-compose {}` is a usage error:\n{stderr}",
+            arguments.join(" "),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "",
+            "`agent-compose {}` answers nothing on stdout",
+            arguments.join(" "),
+        );
+        assert!(
+            !out.exists(),
+            "`agent-compose {}` was refused before anything was built",
+            arguments.join(" "),
+        );
+        stderr
+    };
+    for (arguments, says) in cases {
+        let stderr = refused(&arguments);
+        assert!(
+            stderr.contains(says),
+            "`agent-compose {}` names the flag the parameter is written as, `{says}`:\n{stderr}",
+            arguments.join(" "),
+        );
+        assert!(
+            !stderr.contains("to pass") && !stderr.contains("a similar argument exists"),
+            "the tip is the one about the spelling, and only that one:\n{stderr}"
+        );
+    }
+    // A flag that spells nothing `list` takes is clap's to word.
+    let stderr = refused(&[
+        "store",
+        "list",
+        "--out",
+        built,
+        main,
+        &notes,
+        "--include-keys",
+    ]);
+    assert!(
+        stderr.contains("unexpected argument '--include-keys'") && !stderr.contains("is written"),
+        "a flag that spells no parameter of the sub-verb is not given one:\n{stderr}"
+    );
+}
+
 /// A composition the compiler refuses is reported where the sub-verb keeps its
 /// failures: as one JSON object on stdout for an op, whose answer the report
 /// stands in for — as `validate`'s does — and on **stderr** for an `export`,

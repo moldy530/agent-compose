@@ -1,0 +1,133 @@
+# Acceptance fixture: a `coder:` node run on a worker.
+#
+# Only `agent.*` and `tool.*` join a placement (grammar §14.1), so a build step
+# that has to run on a build machine is written the one way this release can
+# write it: a **placed agent whose only tool is a `flow.*` holding the coder
+# node**. The attached flow runs in the agent's placement (grammar §14.1 rule
+# 4), so everything it holds runs on the worker that took the agent's dispatch:
+#
+#   * `build`, the coder node, whose one harness run is journaled as a
+#     `harness` record (`docs/durability.md` §3.9) and streamed home over
+#     `/workers/effects` (`docs/distributed.md` §3.3) — the record a hub that
+#     took only the four calls and the `finally` boundary refused, settling the
+#     dispatch `WorkerEffectsRefused` and losing the run;
+#   * `tidy_up`, the flow's `finally:` node, whose boundary is the flow
+#     instance's end, journaled from the worker too (grammar §7.9,
+#     `docs/durability.md` §3.10).
+#
+# `access: full_access` because that is what a build step on a machine of its
+# own is given, and because it is the preset under which the harness SDK reports
+# its permission callback as shadowed — the warning a run prints once, on one
+# line (`src/harness.ts`'s `CC_DRIVER`).
+#
+# The harness SDK speaks its own wire, which the mock provider never sees (PRD
+# resolved q57), so the test that serves this fixture stands a scripted
+# `@anthropic-ai/claude-agent-sdk` in for it on the worker alone: the hub never
+# runs the coder node, which is the point.
+version: "0.1"
+
+defaults:
+  timeout: 60s
+  on_error: fail
+
+state:
+  summary:
+    description: What the build step says it did, as the hub's flow received it.
+    type: string
+    default: ""
+
+triggers:
+  on_build:
+    type: http
+    flow: flow.built
+    path: /builds
+    method: POST
+    input:
+      goal: "payload.body.goal"
+    respond: async
+
+provider.mock:
+  kind: anthropic
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+
+model.smart:
+  provider: provider.mock
+  id: claude-sonnet-4-6
+  settings:
+    max_tokens: 4096
+
+# Placed, and what it attaches is the flow holding the coder node — the shape a
+# build step on a worker has to take while a coder node cannot be placed itself.
+agent.builder:
+  description: Run one build step on the machine that holds the checkout, and report it.
+  model: model.smart
+  prompt: |
+    Run the build step for the goal you are given, and report what it did.
+  tools: [flow.building]
+  input:
+    goal:
+      type: string
+  output:
+    summary:
+      type: string
+      min_length: 1
+
+# Attached, never triggered: its instance runs inside `agent.builder`'s loop on
+# the worker, coder node and finally node both.
+flow.building:
+  description: Run one build step with a coding agent, and tidy up after it.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+  outputs:
+    summary:
+      type: string
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: fresh
+        access: full_access
+        prompt: |
+          Run the build step the goal describes in the directory you have been
+          given, and report what it did.
+        input:
+          goal: { type: string }
+        output:
+          summary: { type: string }
+        allow_tools: [Bash, Read]
+      input:
+        goal: "input.goal"
+      writes: { summary: summary }
+      timeout: 5m
+    tidy_up:
+      exec:
+        command: "${OPS_BIN}/true"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }
+  finally: tidy_up
+
+# The hub's flow: one placed node, dispatched to whichever worker claims `mac`.
+flow.built:
+  description: Run a build step on a worker, through a placed agent that attaches it.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+  outputs:
+    summary:
+      type: string
+  nodes:
+    build:
+      agent: agent.builder
+      input:
+        goal: "input.goal"
+      writes:
+        summary: summary
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

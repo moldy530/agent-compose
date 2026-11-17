@@ -693,8 +693,80 @@ enum Artifact {
     Json,
 }
 
+/// The command line, parsed — or refused the way clap refuses it, with one
+/// exception: a `store` flag that spells an op parameter the sub-verb takes
+/// under another name ([`store_spelling`]).
+fn parsed() -> Cli {
+    let arguments: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    match Cli::try_parse_from(&arguments) {
+        Ok(cli) => cli,
+        Err(mut error) => {
+            if let Some(tip) = store_spelling(&arguments, &error) {
+                use clap::error::{ContextKind, ContextValue};
+                // The tip replaces clap's own: "a similar argument exists" where
+                // it found one, and — where it did not — "to pass it as a value,
+                // use `--`", which sends a reader who mistyped a flag to make it
+                // an operand instead.
+                error.remove(ContextKind::SuggestedArg);
+                error.insert(
+                    ContextKind::Suggested,
+                    ContextValue::StyledStrs(vec![tip.into()]),
+                );
+            }
+            error.exit()
+        }
+    }
+}
+
+/// The flag a `store` sub-verb takes for the op parameter an unknown flag
+/// spells, as the tip that says so (D155, PRD resolved q72).
+///
+/// The flags are spelled after grammar 11.4's op parameters, but not as them:
+/// `--if-version` is `if_version:`, and `--values` is a `list`'s
+/// `include_values:`. An operator who wrote the parameter — `--if_version`,
+/// `--include-values`, `--include_values` — was told only that the flag is
+/// unknown, and for `--include-values` was told to pass it as a value. So a
+/// flag that is one of the sub-verb's own once `_` is read as `-` and an
+/// `include-` prefix is dropped is named in the refusal: `` `--include-values`
+/// is written `--values` ``. Nothing is accepted that was not: D155 names the
+/// flags, and an alias would be a second spelling of each.
+fn store_spelling(arguments: &[std::ffi::OsString], error: &clap::Error) -> Option<String> {
+    use clap::CommandFactory;
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+
+    if error.kind() != ErrorKind::UnknownArgument {
+        return None;
+    }
+    if arguments.get(1).and_then(|word| word.to_str()) != Some("store") {
+        return None;
+    }
+    let sub_verb = arguments.get(2)?.to_str()?;
+    let Some(ContextValue::String(given)) = error.get(ContextKind::InvalidArg) else {
+        return None;
+    };
+    let given = given.split('=').next().unwrap_or(given);
+    let plain = |flag: &str| -> String {
+        let flag = flag
+            .trim_start_matches('-')
+            .to_ascii_lowercase()
+            .replace('_', "-");
+        if let Some(rest) = flag.strip_prefix("include-") {
+            return rest.to_string();
+        }
+        flag
+    };
+    let command = Cli::command();
+    let taken = command
+        .find_subcommand("store")?
+        .find_subcommand(sub_verb)?
+        .get_arguments()
+        .filter_map(|argument| argument.get_long())
+        .find(|long| format!("--{long}") != given && plain(long) == plain(given))?;
+    Some(format!("`{given}` is written `--{taken}`"))
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = parsed();
     match cli.command {
         Command::Validate {
             path,

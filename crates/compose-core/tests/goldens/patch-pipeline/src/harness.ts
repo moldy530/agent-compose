@@ -852,6 +852,16 @@ function ccEnvironment(run: runtime.HarnessRun): Record<string, string> {
  * about is approved. What the gate never holds under that mode is the bound
  * itself: `tools` holds it.
  *
+ * **And the report is one line.** The pinned SDK raises it with
+ * `process.emitWarning`, inside `query()` itself, on every run — and a runtime
+ * prints a warning its own way: Bun with the whole stack beneath it, so every
+ * `full_access` run of a deliberate, documented pairing printed a stack trace a
+ * reader took for a failure. So the call is made under [`shadowNoted`], which
+ * takes that one warning — by its code, and no other — and writes one line to
+ * stderr in its place, once per run; every other warning reaches the runtime
+ * exactly as the SDK raised it. The SDK offers no option that acknowledges the
+ * pairing, so there is nothing to pass it instead.
+ *
  * # How a refusal reaches the trace
  *
  * `"refused"` is the harness's own permission surface declining a call, and
@@ -930,8 +940,11 @@ const CC_DRIVER: runtime.HarnessDriver = {
       const refused = new Set<string>();
 
       const config = ccOptions(run, refusals, refused);
+      const answered = shadowNoted(run, config, () =>
+        query({ prompt: run.input, options: config }),
+      );
 
-      for await (const message of query({ prompt: run.input, options: config })) {
+      for await (const message of answered) {
         while (refusals.length > 0) yield refusals.shift() as runtime.HarnessEvent;
         yield* ccEvents(message, calls, refused);
       }
@@ -939,6 +952,63 @@ const CC_DRIVER: runtime.HarnessDriver = {
     })();
   },
 };
+
+/** The code the pinned SDK reports a shadowed permission callback under. */
+const CC_SHADOWED = "CLAUDE_SDK_CAN_USE_TOOL_SHADOWED";
+
+/**
+ * The code a `process.emitWarning` call carries, in each of the three forms the
+ * call takes: an `Error` with a `code`, an options object, or the legacy
+ * `(warning, type, code)` positions.
+ */
+function warningCode(warning: unknown, rest: readonly unknown[]): string | undefined {
+  const own = (warning as { code?: unknown } | null)?.code;
+  if (warning instanceof Error && typeof own === "string") return own;
+  const [second, third] = rest;
+  if (typeof second === "object" && second !== null) {
+    const code = (second as { code?: unknown }).code;
+    return typeof code === "string" ? code : undefined;
+  }
+  return typeof third === "string" ? third : undefined;
+}
+
+/**
+ * Make `call` — the run's `query()` — with the SDK's shadowed-callback report
+ * written as **one line** to stderr, once, and every other warning left as the
+ * SDK raised it (see [`CC_DRIVER`]).
+ *
+ * The SDK raises the report synchronously inside `query()`, while it reads its
+ * options, so the runtime's `process.emitWarning` is replaced for exactly that
+ * call and put back before it returns: two runs in one process each make their
+ * own call, and neither is inside the other's. Under `bypassPermissions` — the
+ * `full_access` preset — the pairing is the deliberate one this driver
+ * documents, and the line says so; under any other mode it is not, and the line
+ * carries the SDK's own words.
+ */
+function shadowNoted<T>(run: runtime.HarnessRun, config: Options, call: () => T): T {
+  const original = process.emitWarning;
+  let said = false;
+  const noted = (warning: string | Error, ...rest: unknown[]): void => {
+    if (warningCode(warning, rest) !== CC_SHADOWED) {
+      Reflect.apply(original, process, [warning, ...rest]);
+      return;
+    }
+    if (said) return;
+    said = true;
+    const words = (typeof warning === "string" ? warning : warning.message).replace(/\s+/g, " ");
+    process.stderr.write(
+      config.permissionMode === "bypassPermissions"
+        ? `\`${run.node}\`: the harness SDK reports its permission callback shadowed (${CC_SHADOWED}) — expected under \`bypassPermissions\`, the \`access: full_access\` mode, which approves an ordinary tool call without asking it; the callback still answers the checks that mode asks about, and \`allow_tools:\` is held by the tool set\n`
+        : `\`${run.node}\`: the harness SDK reports its permission callback shadowed (${CC_SHADOWED}): ${words}\n`,
+    );
+  };
+  process.emitWarning = noted as typeof process.emitWarning;
+  try {
+    return call();
+  } finally {
+    process.emitWarning = original;
+  }
+}
 
 /**
  * The `Options` one `cc` run is made of — the config map of grammar 8.9, as one

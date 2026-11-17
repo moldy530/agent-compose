@@ -722,22 +722,27 @@ key**: a record the journal already holds is accepted and dropped. A batch is
 therefore safe to re-send after a transport failure, and a worker SHOULD re-send
 rather than guess.
 
-A record's `kind` is one of five: `model`, `tool`, `store` and `human` — the
-calls a placed node makes — and `finally`, the **boundary** a flow instance
+A record's `kind` is any kind the journal writes — the six of
+`docs/durability.md` §4, read off the one list the runtime declares them in
+(`EFFECT_KINDS` in `src/journal.ts`): `model`, `tool`, `store` and `human` — the
+calls a placed node makes — `harness`, the one run of a `coder:` node
+(`docs/durability.md` §3.9), and `finally`, the **boundary** a flow instance
 crosses when it ends and its `finally:` node begins (grammar §7.9,
-`docs/durability.md` §3.10). The fifth reaches this route because an instance can
-end on a worker: everything a placed agent's attached `flow.*` reaches runs in
-the agent's placement (grammar §14.1 rule 4), so an instance of that flow ends
-there, and its boundary is journaled from there under the key the hub would have
-derived — `<finally node's site>#finally/<ordinal>` — exactly as the finally
-node's own effects are. A record of any other kind is the `400` row below.
+`docs/durability.md` §3.10). The last two reach this route because a flow
+instance can run, and end, on a worker: everything a placed agent's attached
+`flow.*` reaches runs in the agent's placement (grammar §14.1 rule 4), so a
+`coder:` node in that flow runs there and journals its run from there, and the
+instance ends there and its boundary is journaled from there — each under the
+key the hub would have derived, `<site>#harness/<ordinal>` and `<finally node's
+site>#finally/<ordinal>`, exactly as the flow's other effects are. A record of
+any other kind is the `400` row below.
 
 | condition | status | body |
 |---|---|---|
 | the batch is journaled | `204` | empty. Every record in it was inserted or was already held |
 | the token does not verify | `401` | no detail, as everywhere (§3.1) |
 | the session is unknown | `410` | names the rule of §3: join again, and send this batch again under the new session |
-| the body is not a batch — a missing `dispatch_id`, a missing `effects` array, or a record short of a field, of a `kind` outside the five above, naming a `site` outside the dispatch's, or carrying a `key` its own `site`, `kind` and `ordinal` do not derive | `400` | names what a batch and a record carry |
+| the body is not a batch — a missing `dispatch_id`, a missing `effects` array, or a record short of a field, of a `kind` outside the six above, naming a `site` outside the dispatch's, or carrying a `key` its own `site`, `kind` and `ordinal` do not derive | `400` | names what a batch and a record carry; a refused record is named first, by its position in the batch and the one field it failed on — the `kind` received and the kinds the journal writes, or the `site` and the dispatch's `instance_path` — ahead of the rule every record is held to |
 | the `dispatch_id` names no dispatch this hub holds | `409` | names the dispatch. The batch is discarded, as at §3.4 |
 
 The last two rows are not about the batch's *contents* the way the first three
@@ -758,6 +763,27 @@ the model call §7.3 promises is not paid for twice would be paid for twice.
 A worker SHOULD send a batch as soon as an effect completes rather than
 accumulating until the node ends, because an effect that never reached the hub is
 an effect the replay of §7 cannot skip.
+
+**A refused batch ends the attempt, and stops the runner as a stop does.** A
+batch answered `400` — or with any `4xx` this table does not give the route — is
+one no re-send improves: its records are not in the journal and nothing the
+worker does will put them there, so the dispatch is settled with a
+`WorkerEffectsRefused` failure (§3.4) and the node's own `retry:`/`on_error:`
+decide the run. What it costs is the attempt and nothing more: the worker does
+**not** kill the runner, which would run no `finally:` node and leave the
+instances the placed node began there — an attached `flow.*` whose finally node
+stops a server or puts a working tree back — ended nowhere. It stops the runner
+as a poll's `stop` list does (§3.2, grammar D160, D161): the runner is sent
+`SIGUSR2`, the placed node fails, every instance it began ends `failed` and runs
+its finally node **on the worker**, and the worker reads the runner on to its
+end — holding the grace while a finally node runs, and ending the group only
+once the grace runs out with the runner still running. Nothing the runner
+journals after the refused batch is sent, the finally boundaries those
+instances cross included: a record past a refused one would land beyond a hole
+in the frontier, and a stop's posture is already that what it cuts off is kept
+out of the journal (grammar D160). So the finally nodes run, and the hub's
+journal holds no record of them; the `finally_error` one raised travels on the
+result all the same (§3.4).
 
 ### 3.4 `POST /workers/result`
 
@@ -1067,6 +1093,12 @@ the process that was told. A value that is not a string is not a failure to
 report, and is dropped rather than costing the node its attempt. A peer that
 does not send it is one whose finally nodes did not fail — an OPTIONAL field a
 peer of the previous version ignores, which §10.2 makes no bump.
+
+**A dispatch whose effects the hub refused** is one more ending that carries it.
+The worker settles such a dispatch with its `WorkerEffectsRefused` failure only
+once the runner it stopped has ended (§3.3), so the finally nodes the stop
+started have run on the worker by then, and the first failure among them is
+`finally_error` beside that failure — as it is beside a stopped dispatch's.
 
 **An end on the hub is not waited for across the wire.** The instances a placed
 node begins are the worker's: they end there, under the placed node's own clock.

@@ -3724,3 +3724,237 @@ fn a_stop_on_a_worker_leaves_none_of_the_commands_its_attached_flow_ran() {
     );
     assert!(worker.running(), "{}", worker.transcript());
 }
+
+// ---------------------------------------------------------------------------
+// A `coder:` node on a worker
+// ---------------------------------------------------------------------------
+
+/// The `placed-coder` fixture: a placed agent whose only tool is a flow holding
+/// a `coder:` node and a `finally:` node.
+const CODER_FIXTURE: &str = "placed-coder";
+
+/// The code the pinned Agent SDK reports a shadowed permission callback under.
+const SHADOWED: &str = "CLAUDE_SDK_CAN_USE_TOOL_SHADOWED";
+
+/// The Agent SDK's `query`, stood in on the worker.
+///
+/// A harness SDK speaks its own wire, which the mock provider never sees (PRD
+/// resolved q57), so the run is scripted at the SDK: the two messages the `cc`
+/// driver reads a run off — a top-level assistant turn, and a successful result
+/// carrying the structured output the node's `output:` asked for. It answers
+/// the options it is handed **the way the pinned SDK does** in the one respect
+/// a `full_access` run meets on every call: a permission callback set beside
+/// `bypassPermissions` is reported with `process.emitWarning` under the SDK's
+/// own code, synchronously, while `query()` reads its options.
+const CC_STAND_IN: &str = r#"export function query({ prompt, options }) {
+  if (options.canUseTool !== undefined && options.permissionMode === "bypassPermissions") {
+    process.emitWarning(
+      "canUseTool will not be invoked: permissionMode 'bypassPermissions' auto-approves every tool call (except explicit deny rules) before the callback is consulted. To gate every tool call, use a PreToolUse hook instead.",
+      { code: "CLAUDE_SDK_CAN_USE_TOOL_SHADOWED" },
+    );
+  }
+  return (async function* answered() {
+    yield { type: "assistant", parent_tool_use_id: null, message: { content: [] } };
+    yield {
+      type: "result",
+      subtype: "success",
+      parent_tool_use_id: null,
+      usage: { input_tokens: 10, output_tokens: 5 },
+      total_cost_usd: 0.001,
+      stop_reason: "end_turn",
+      structured_output: { summary: `built on the worker for ${JSON.parse(prompt).goal}` },
+    };
+  })();
+}
+"#;
+
+/// Install [`CC_STAND_IN`] where a worker's runner resolves the SDK from: the
+/// worker's own data directory, above every artifact it materialises.
+///
+/// Module resolution takes the nearest `node_modules` holding the package, and
+/// the materialised tree has none of its own — so the runner imports this one,
+/// while the dependency set it does not shadow (LangGraph, and the check the
+/// worker makes for it) still resolves from the suite's toolchain above. The
+/// hub never runs the coder node, so the hub is left with the real SDK.
+fn stand_in_the_agent_sdk(data_dir: &Path) {
+    let package = data_dir
+        .join("node_modules")
+        .join("@anthropic-ai")
+        .join("claude-agent-sdk");
+    std::fs::create_dir_all(&package).expect("the data directory is writable");
+    std::fs::write(
+        package.join("package.json"),
+        serde_json::to_vec_pretty(&json!({
+            "name": "@anthropic-ai/claude-agent-sdk",
+            "version": "0.0.0-stood-in",
+            "type": "module",
+            "main": "./sdk.mjs",
+            "exports": { ".": "./sdk.mjs" },
+        }))
+        .expect("the manifest serializes"),
+    )
+    .expect("the stand-in's manifest is written");
+    std::fs::write(package.join("sdk.mjs"), CC_STAND_IN).expect("the stand-in is written");
+}
+
+/// The three calls `agent.builder` makes on the worker: the attached flow, a
+/// turn after it, and the structured answer.
+fn building(summary: &str) -> Vec<Script> {
+    vec![
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "building",
+                json!({ "goal": "make the release build" }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("built, and here is what it did")),
+        Script::new(SONNET, Outcome::structured(json!({ "summary": summary }))),
+    ]
+}
+
+/// **A `coder:` node runs on a worker, and its run comes home** (grammar §8.9,
+/// §14.1 rule 4, `docs/distributed.md` §3.3, §3.4, `docs/durability.md` §3.9,
+/// §3.10).
+///
+/// The whole of the shape a build step on a build machine takes in this
+/// release: `agent.builder` is placed on `mac`, and its only tool is
+/// `flow.building`, whose `build` node is a `full_access` coder node and whose
+/// `finally:` node tidies up. The attached flow runs in the agent's placement,
+/// so all of it runs **on the worker** — and every half of it has to reach the
+/// hub:
+///
+/// * the coder's run, journaled as a `harness` record and streamed home over
+///   `/workers/effects`. A hub that took only the four calls and the `finally`
+///   boundary refused that batch `400`, the worker settled the dispatch
+///   `WorkerEffectsRefused`, and the run was lost — the defect this test would
+///   have caught;
+/// * the flow instance's end, journaled as its `finally` record from the
+///   worker, after the finally node ran there;
+/// * the dispatch, settled with the node's value, and the hub's flow completed
+///   with it.
+///
+/// And the run's stderr — the runner's, which the worker inherits — holds the
+/// SDK's shadowed-callback report on **one line**, once: `full_access` pairs the
+/// callback with `bypassPermissions` deliberately, and a runtime printing the
+/// warning with its stack beneath it made every such run look like a failure.
+#[test]
+fn a_coder_node_in_a_placed_agents_attached_flow_runs_on_the_worker_and_its_run_comes_home() {
+    let Some(mesh) = Mesh::start_from("mesh-coder", harness::fixture(CODER_FIXTURE), None) else {
+        return;
+    };
+    mesh.provider
+        .enqueue_all(building("the release build ran on the worker"));
+    let data_dir = scratch_data_dir("placed-coder");
+    stand_in_the_agent_sdk(&data_dir);
+    let worker = mesh.worker_into("placed-coder", &data_dir);
+
+    let execution = mesh.start_execution("/builds", &json!({ "goal": "make the release build" }));
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] == "completed" || report["status"] == "failed"
+    });
+    assert_eq!(
+        report["status"],
+        "completed",
+        "the build step on the worker did not complete the hub's flow: {report:#}\n{}",
+        worker.transcript()
+    );
+    assert_eq!(
+        report["outputs"]["summary"], "the release build ran on the worker",
+        "{report:#}"
+    );
+    assert!(
+        report.get("finally_error").is_none_or(Value::is_null),
+        "the finally node ran clean on the worker: {report:#}"
+    );
+
+    // The coder's run, journaled from the worker.
+    let records = harness::journal_rows(
+        &mesh.project,
+        &format!(
+            "SELECT \"key\" AS k, kind, payload FROM effects \
+             WHERE execution = '{execution}' AND kind IN ('harness', 'finally') ORDER BY \"key\""
+        ),
+    );
+    let records = records.as_array().cloned().unwrap_or_default();
+    let harness_run = records
+        .iter()
+        .find(|row| row["kind"] == "harness")
+        .unwrap_or_else(|| {
+            panic!(
+                "the coder's `harness` record never reached the hub's journal: {records:#?}\n{}",
+                worker.transcript()
+            )
+        });
+    assert_eq!(
+        harness_run["k"], "build/0/building/0/build/0#harness/0",
+        "the run is keyed under the placed node, as an unplaced loop keys it: {records:#?}"
+    );
+    assert!(
+        harness_run["payload"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("built on the worker for make the release build"),
+        "the record holds the run's answer as the worker's harness gave it: {harness_run:#}"
+    );
+
+    // The flow instance's end, journaled from the worker after its finally node.
+    let boundary = records
+        .iter()
+        .find(|row| row["kind"] == "finally")
+        .unwrap_or_else(|| {
+            panic!("the attached flow's `finally` record never reached the hub: {records:#?}")
+        });
+    assert_eq!(
+        boundary["k"], "build/0/building/0/tidy_up/0#finally/0",
+        "{records:#?}"
+    );
+    let ended: Value = serde_json::from_str(boundary["payload"].as_str().unwrap_or_default())
+        .expect("the payload is JSON");
+    assert_eq!(
+        ended["outcome"], "completed",
+        "the instance that ran the coder ended completed on the worker: {boundary:#}"
+    );
+
+    // The dispatch, settled with the node's value — not `WorkerEffectsRefused`.
+    let rows = mesh.dispatch_rows(&execution);
+    assert_eq!(rows.len(), 1, "one placed node, one dispatch: {rows:#?}");
+    assert_eq!(
+        (rows[0]["status"].as_str(), rows[0]["outcome"].as_str()),
+        (Some("settled"), Some("value")),
+        "the dispatch did not settle with the node's value: {rows:#?}\n{}",
+        worker.transcript()
+    );
+    assert!(
+        rows[0]["payload"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("the release build ran on the worker"),
+        "{rows:#?}"
+    );
+
+    // One line for the SDK's report, and no stack beneath it.
+    let transcript = worker.transcript();
+    let reported: Vec<&str> = transcript
+        .lines()
+        .filter(|line| line.contains(SHADOWED) || line.contains("canUseTool will not be invoked"))
+        .collect();
+    assert_eq!(
+        reported.len(),
+        1,
+        "the SDK's shadowed-callback report is one line per run: {reported:#?}\n{transcript}"
+    );
+    assert!(
+        reported[0].contains("flow.building") && reported[0].contains("full_access"),
+        "the line names the node and the preset that pairs the callback deliberately: {}",
+        reported[0]
+    );
+    let frames: Vec<&str> = transcript
+        .lines()
+        .filter(|line| line.trim_start().starts_with("at "))
+        .collect();
+    assert!(
+        frames.is_empty(),
+        "the run printed a stack trace: {frames:#?}\n{transcript}"
+    );
+}

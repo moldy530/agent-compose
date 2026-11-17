@@ -1675,6 +1675,262 @@ fn an_effect_and_a_result_larger_than_a_megabyte_are_taken_rather_than_refused()
 }
 
 // ---------------------------------------------------------------------------
+// §3.3 — which records a batch may carry
+// ---------------------------------------------------------------------------
+
+/// The kinds this build's journal writes, read off the emitted `src/journal.ts`
+/// — the one list the runtime declares them in (`EFFECT_KINDS`), which the
+/// `EffectKind` type and the hub's batch route both read.
+///
+/// Read rather than written out, so a kind added to the journal is a kind these
+/// tests post without anyone remembering to add it here — which is the drift
+/// that once left the route refusing a kind the journal wrote.
+fn kinds_the_journal_writes() -> Vec<String> {
+    let project = emitted();
+    let journal = project
+        .file("src/journal.ts")
+        .expect("the project emits its journal module");
+    let list = journal
+        .contents
+        .split_once("export const EFFECT_KINDS = [")
+        .expect("`src/journal.ts` declares the kinds a record can carry")
+        .1;
+    let list = &list[..list.find("] as const;").expect("…as one constant list")];
+    list.split(',')
+        .map(|kind| kind.trim().trim_matches('"').to_string())
+        .filter(|kind| !kind.is_empty())
+        .collect()
+}
+
+/// One well-formed record of `kind` at `site`, as a worker of this release
+/// writes one (`src/worker-node.ts`'s `wireRecord`).
+fn record_of_kind(kind: &str, site: &str) -> Value {
+    json!({
+        "key": format!("{site}#{kind}/0"),
+        "site": site,
+        "kind": kind,
+        "ordinal": 0,
+        "request": format!("{{\"kind\":\"{kind}\"}}"),
+        "outcome": { "kind": "value", "value": { "answered": kind } },
+        "refused": false,
+        "recorded_at": "2026-11-16T00:00:00.000Z",
+    })
+}
+
+/// The `effects` rows one execution holds, by key: kind and payload.
+fn effect_rows(project: &Path, execution: &str) -> BTreeMap<String, (String, String)> {
+    harness::journal_rows(
+        project,
+        &format!("SELECT \"key\" AS k, kind, payload FROM effects WHERE execution = '{execution}'"),
+    )
+    .as_array()
+    .cloned()
+    .unwrap_or_default()
+    .into_iter()
+    .map(|row| {
+        (
+            row["k"].as_str().unwrap_or_default().to_string(),
+            (
+                row["kind"].as_str().unwrap_or_default().to_string(),
+                row["payload"].as_str().unwrap_or_default().to_string(),
+            ),
+        )
+    })
+    .collect()
+}
+
+/// **A worker's `harness` record is journaled** (§3.3, grammar §8.9, §14.1
+/// rule 4, `docs/durability.md` §3.9).
+///
+/// The record a `coder:` node writes when it runs inside a placed agent's
+/// attached `flow.*` — which runs in the agent's placement, so on the worker,
+/// and journals its run from there. A hub that took only the four calls and the
+/// `finally` boundary refused this batch `400`, the worker settled the dispatch
+/// `WorkerEffectsRefused`, and the coder's whole run was lost: the shape a
+/// placed build step takes, and one `docs/durability.md` §4's vocabulary
+/// already named.
+#[test]
+fn a_batch_carrying_a_harness_record_is_journaled() {
+    let Some(project) = shared_project("mesh-harness-record") else {
+        return;
+    };
+    {
+        let Some(hub) = hub_into(&project, &[]) else {
+            return;
+        };
+        let worker = hub.worker();
+        let execution = hub.start("/releases", &json!({ "path": "dist/app" }));
+        let dispatch = worker.dispatch(&hub);
+        let id = dispatch["dispatch_id"].as_str().expect("an id").to_string();
+        assert_eq!(dispatch["instance_path"], json!("sign/0"));
+
+        let site = "sign/0/building/0/build/0";
+        let batch = worker.effects(&hub, &id, &json!([record_of_kind("harness", site)]));
+        assert_eq!(
+            batch.status,
+            204,
+            "a worker's `harness` record was refused, so the coder run it holds is lost: {}",
+            body_of(&batch)
+        );
+
+        let rows = effect_rows(&project, &execution);
+        let key = format!("{site}#harness/0");
+        let (kind, payload) = rows
+            .get(&key)
+            .unwrap_or_else(|| panic!("`{key}` is not in the hub's journal: {rows:#?}"));
+        assert_eq!(kind, "harness", "{rows:#?}");
+        assert!(
+            payload.contains("\"answered\":\"harness\""),
+            "the journal holds the run's answer as the worker sent it: {payload}"
+        );
+    }
+    drop(harness::Scratch::at(project));
+}
+
+/// **A record of every kind the journal writes is taken** (§3.3,
+/// `docs/durability.md` §4).
+///
+/// Table-driven over the list the emitted journal declares, one batch per kind,
+/// so the route and the journal cannot part company again: a kind the runtime
+/// writes into a key is a kind some placed node can produce on a worker — a
+/// placed agent's attached flow reaches every construct a flow can hold — and a
+/// batch the hub refuses for its kind is a dispatch that fails on its effects.
+#[test]
+fn a_record_of_every_kind_the_journal_writes_is_taken() {
+    let kinds = kinds_the_journal_writes();
+    // The six `docs/durability.md` §4 names, the two a placed node reaches only
+    // through an attached flow among them.
+    assert_eq!(
+        kinds,
+        ["model", "tool", "store", "human", "harness", "finally"],
+        "the journal's kinds moved; `docs/distributed.md` §3.3 and `docs/durability.md` §4 \
+         move with them"
+    );
+    let Some(project) = shared_project("mesh-every-kind") else {
+        return;
+    };
+    {
+        let Some(hub) = hub_into(&project, &[]) else {
+            return;
+        };
+        let worker = hub.worker();
+        let execution = hub.start("/releases", &json!({ "path": "dist/app" }));
+        let dispatch = worker.dispatch(&hub);
+        let id = dispatch["dispatch_id"].as_str().expect("an id").to_string();
+
+        let site = "sign/0/every/0";
+        for kind in &kinds {
+            let batch = worker.effects(&hub, &id, &json!([record_of_kind(kind, site)]));
+            assert_eq!(
+                batch.status,
+                204,
+                "a `{kind}` record — a kind this hub's own journal writes — was refused: {}",
+                body_of(&batch)
+            );
+        }
+
+        let rows = effect_rows(&project, &execution);
+        for kind in &kinds {
+            let key = format!("{site}#{kind}/0");
+            assert_eq!(
+                rows.get(&key).map(|(held, _)| held.as_str()),
+                Some(kind.as_str()),
+                "the `{kind}` record was answered 204 and is not in the journal: {rows:#?}"
+            );
+        }
+    }
+    drop(harness::Scratch::at(project));
+}
+
+/// **A record of a kind the journal does not write is refused, naming its
+/// `kind`** (§3.3's `400` row).
+///
+/// The refusal opens on the record that failed — its position in the batch and
+/// the field — and names the kind it received beside the kinds the journal
+/// writes, ahead of the rule every record is held to. A refusal that opened on
+/// that rule sent its reader to `site`, the first field it names. And the batch
+/// is refused **whole**: the well-formed record ahead of the bad one is not in
+/// the journal either.
+#[test]
+fn a_record_of_a_kind_the_journal_does_not_write_is_refused_naming_its_kind() {
+    let Some(project) = shared_project("mesh-unknown-kind") else {
+        return;
+    };
+    {
+        let Some(hub) = hub_into(&project, &[]) else {
+            return;
+        };
+        let worker = hub.worker();
+        let execution = hub.start("/releases", &json!({ "path": "dist/app" }));
+        let dispatch = worker.dispatch(&hub);
+        let id = dispatch["dispatch_id"].as_str().expect("an id").to_string();
+
+        let batch = worker.effects(
+            &hub,
+            &id,
+            &json!([
+                record_of_kind("model", "sign/0"),
+                record_of_kind("subagent", "sign/0"),
+            ]),
+        );
+        assert_eq!(batch.status, 400, "{}", body_of(&batch));
+        let answered = batch.json();
+        assert_eq!(answered["dispatch_id"], json!(id), "{answered:#}");
+        let error = answered["error"].as_str().unwrap_or_default();
+        assert!(
+            error.starts_with("record 1 of the batch: its `kind` is `subagent`"),
+            "the refusal does not open on the record and the field that failed: {error}"
+        );
+        for kind in kinds_the_journal_writes() {
+            assert!(
+                error.contains(&format!("`{kind}`")),
+                "the refusal does not name `{kind}` among the kinds the journal writes: {error}"
+            );
+        }
+        assert!(
+            error.contains("every record carries a `site`"),
+            "the rule every record is held to follows the field that failed: {error}"
+        );
+        assert!(
+            effect_rows(&project, &execution).is_empty(),
+            "a refused batch wrote part of itself"
+        );
+    }
+    drop(harness::Scratch::at(project));
+}
+
+/// **A record whose `site` is outside the dispatch is refused, naming its
+/// `site`** (§3.3, §8's single writer).
+///
+/// The record is well formed and its key is the one its own fields derive; it
+/// belongs to some other node's instance. So the refusal names the site it
+/// carried and the `instance_path` it is held to, both.
+#[test]
+fn a_record_whose_site_is_outside_the_dispatch_is_refused_naming_its_site() {
+    let Some(hub) = hub() else {
+        return;
+    };
+    let worker = hub.worker();
+    hub.start("/releases", &json!({ "path": "dist/app" }));
+    let dispatch = worker.dispatch(&hub);
+    let id = dispatch["dispatch_id"].as_str().expect("an id").to_string();
+
+    let batch = worker.effects(&hub, &id, &json!([record_of_kind("model", "stamp/0")]));
+    assert_eq!(batch.status, 400, "{}", body_of(&batch));
+    let error = batch.json()["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        error.starts_with(
+            "record 0 of the batch: its `site` `stamp/0` is not at or inside the dispatch's \
+             `instance_path` `sign/0`"
+        ),
+        "the refusal does not name the site and the path it is held to: {error}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // §6.3, §7.2, §7.3 — the mid-node disconnect
 // ---------------------------------------------------------------------------
 

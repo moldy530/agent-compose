@@ -178,6 +178,12 @@ pub const FIXTURES: &[&str] = &[
     // no deploy file for — it places nothing and is an ordinary single-process
     // project, which is exactly the claim grammar §14 makes about the layer.
     "placed-nodes",
+    // A `coder:` node run on a worker: a placed agent whose only tool is a
+    // `flow.*` holding the coder node and a `finally:` node — the one way this
+    // release can put a build step on a build machine. `deploy/mesh.yml` places
+    // the agent, and the test that serves it is in
+    // `tests/distributed_mesh_acceptance.rs`. Under `local` it places nothing.
+    "placed-coder",
     "provider-kinds",
     // A `schedule` trigger `serve` fires every minute (grammar 13.4, PRD
     // resolved q78).

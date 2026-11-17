@@ -13534,8 +13534,11 @@ above read into the ruling besides remains the implementation's, recorded for
 the owner: that `execution.error` is absent on `cancelled`; that a cancel
 arriving after the root's body ended changes no outcome; that a detached
 `agent.*`/`tool.*` delivery is stopped as a running node; that an effect the
-cancel stops in flight is not recorded; and that a recovered cancel completes at
-the replay's frontier. *PRD resolved
+cancel stops in flight is not recorded; that a recovered cancel completes at
+the replay's frontier; and that a batch the hub refuses stops the runner as a
+stop does — its finally nodes run on the worker, under the stop's grace, and
+nothing the runner journals after the refused batch is sent
+(`docs/distributed.md` §3.3). *PRD resolved
 q28, q29, q32, q34, q65, q75, q76; §7.6.3, §7.9, §8.6, §13.3; amends D70, D124,
 D159; builds on D94, D102, D150.*
 

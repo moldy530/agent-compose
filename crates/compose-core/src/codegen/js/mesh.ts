@@ -69,6 +69,7 @@ import {
   type Journal,
   type JournalOutcome,
   type JournalRecord,
+  EFFECT_KINDS,
   ExecutionCancelled,
   cancellationOf,
   effectKey,
@@ -2248,16 +2249,20 @@ async function effects(request: FastifyRequest, reply: FastifyReply): Promise<un
     return reply.code(409).send({ dispatch_id: id, error: `no dispatch \`${id}\`` });
   }
   const records: JournalRecord[] = [];
-  for (const entry of batch) {
-    const record = recordOf(row, entry);
-    if (record === undefined) {
+  for (const [index, entry] of batch.entries()) {
+    const read = recordOf(row, entry);
+    if ("reason" in read) {
+      // **The field that failed, first**, and then the rule the whole record is
+      // held to. A refusal that opened on the general sentence sent its reader
+      // to whichever field that sentence named first — `site` — when what a
+      // worker of another release most often gets wrong is the `kind` it
+      // journals, and the record's position is what finds it in a batch.
       return reply.code(400).send({
         dispatch_id: id,
-        error:
-          "every record carries a `site` at or inside the dispatch's `instance_path`, a `kind`, an `ordinal`, a canonical `request`, an `outcome`, and the `key` those three derive — `<site>#<kind>/<ordinal>`",
+        error: `record ${index} of the batch: ${read.reason}; ${RECORD_RULE}`,
       });
     }
-    records.push(record);
+    records.push(read.record);
   }
   for (const record of records) {
     // **Workers SEND, the hub INSERTS** (§3.3), idempotently by effect key: a
@@ -2276,9 +2281,30 @@ async function effects(request: FastifyRequest, reply: FastifyReply): Promise<un
   return reply.code(204).send();
 }
 
-/** One record off the wire, or `undefined` where it is not one. */
-function recordOf(row: DispatchRow, entry: unknown): JournalRecord | undefined {
-  if (entry === null || typeof entry !== "object") return undefined;
+/** What every record of a batch is held to (§3.3), as a `400` states it. */
+const RECORD_RULE =
+  "every record carries a `site` at or inside the dispatch's `instance_path`, a `kind`, an `ordinal`, a canonical `request`, an `outcome`, and the `key` those three derive — `<site>#<kind>/<ordinal>`";
+
+/** The kinds a record may carry, as a refusal names them. */
+function kindsNamed(): string {
+  return EFFECT_KINDS.map((kind) => `\`${kind}\``).join(", ");
+}
+
+/**
+ * One record off the wire, or **the reason it is not one** — the one field
+ * that failed, named, so the `400` it becomes says which (§3.3).
+ *
+ * Each check is its own reason, in the order the fields are read: a reader of
+ * the refusal is looking for the one thing to change, and a sentence listing
+ * every rule a record is held to does not say which of them this one broke.
+ */
+function recordOf(
+  row: DispatchRow,
+  entry: unknown,
+): { readonly record: JournalRecord } | { readonly reason: string } {
+  if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+    return { reason: "it is not an object" };
+  }
   const held = entry as Record<string, unknown>;
   const key = held["key"];
   const site = held["site"];
@@ -2286,21 +2312,32 @@ function recordOf(row: DispatchRow, entry: unknown): JournalRecord | undefined {
   const ordinal = held["ordinal"];
   const request = held["request"];
   const outcome = held["outcome"];
-  if (typeof key !== "string" || typeof site !== "string" || typeof request !== "string") {
-    return undefined;
+  if (typeof key !== "string") return { reason: "its `key` is not a string" };
+  if (typeof site !== "string") return { reason: "its `site` is not a string" };
+  if (typeof request !== "string") {
+    return {
+      reason: "its `request` is not a string (the canonical JSON of what identified the call)",
+    };
   }
-  // `finally` beside the four calls: the boundary a flow instance crosses when
-  // it ends (grammar 7.9, `docs/durability.md` §3.10), which a placed agent's
-  // attached `flow.*` reaches on the worker exactly as it would here — the
-  // instance runs in the agent's placement (grammar 14.1 rule 4), so its end is
-  // journaled from there.
-  if (
-    typeof kind !== "string" ||
-    !["model", "tool", "store", "human", "finally"].includes(kind)
-  ) {
-    return undefined;
+  // **Every kind this hub's journal writes**, read off the one list the journal
+  // itself declares (`./journal.ts`'s `EFFECT_KINDS`) rather than a copy of it:
+  // a worker journals exactly what a hub-side run of the same node would, which
+  // is any of them — a `harness` record from a `coder:` node inside a placed
+  // agent's attached `flow.*`, and the `finally` boundary that flow's instance
+  // crosses when it ends (grammar 7.9, 8.9, 14.1 rule 4, `docs/durability.md`
+  // §3.9, §3.10). A copy here is how the hub once refused the first of those.
+  if (typeof kind !== "string" || !(EFFECT_KINDS as readonly string[]).includes(kind)) {
+    const received =
+      typeof kind === "string"
+        ? `\`${kind}\``
+        : `not a string (${JSON.stringify(kind) ?? "absent"})`;
+    return {
+      reason: `its \`kind\` is ${received}, which is not one of the kinds this hub's journal writes: ${kindsNamed()}`,
+    };
   }
-  if (typeof ordinal !== "number" || !Number.isInteger(ordinal)) return undefined;
+  if (typeof ordinal !== "number" || !Number.isInteger(ordinal)) {
+    return { reason: "its `ordinal` is not an integer" };
+  }
   // **The execution is the hub's, never the batch's.** A worker names a dispatch
   // and the hub reads the execution off the row, so no session can write an
   // effect into an execution it was never dispatched — and the site is held to
@@ -2309,21 +2346,35 @@ function recordOf(row: DispatchRow, entry: unknown): JournalRecord | undefined {
   // inside this dispatch carrying a key outside it would put this record in
   // another node's slot, where that node's replay claims it and diverges. See
   // [`pauseOf`], which holds the other ledger to the same derivation.
-  if (!under(site, row.site)) return undefined;
-  if (key !== effectKey(site, kind as EffectKind, ordinal)) return undefined;
+  if (!under(site, row.site)) {
+    return {
+      reason: `its \`site\` \`${site}\` is not at or inside the dispatch's \`instance_path\` \`${row.site}\``,
+    };
+  }
+  if (key !== effectKey(site, kind as EffectKind, ordinal)) {
+    return {
+      reason: `its \`key\` \`${key}\` is not \`${effectKey(site, kind as EffectKind, ordinal)}\`, the \`<site>#<kind>/<ordinal>\` its own \`site\`, \`kind\` and \`ordinal\` derive`,
+    };
+  }
   const settled = outcomeOf(outcome);
-  if (settled === undefined) return undefined;
+  if (settled === undefined) {
+    return {
+      reason: "its `outcome` is not one this hub can read — an object whose `kind` is `value` or `error`",
+    };
+  }
   const at = held["recorded_at"];
   return {
-    execution: row.execution,
-    key,
-    site,
-    kind: kind as EffectKind,
-    ordinal,
-    request,
-    outcome: settled,
-    refused: held["refused"] === true,
-    recordedAt: typeof at === "string" ? at : new Date().toISOString(),
+    record: {
+      execution: row.execution,
+      key,
+      site,
+      kind: kind as EffectKind,
+      ordinal,
+      request,
+      outcome: settled,
+      refused: held["refused"] === true,
+      recordedAt: typeof at === "string" ? at : new Date().toISOString(),
+    },
   };
 }
 
