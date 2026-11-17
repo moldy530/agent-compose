@@ -5851,7 +5851,9 @@ a flow input field can accept it.
   row stays open, or a flow the build no longer declares, on no board — is
   open, and its cancel **closes** it: its open children in the lineage this
   process is not running the same way, those it is running through the
-  cascade and waited for until they settle, and then its row is ended
+  cascade and waited for until they settle — one that settles with its row
+  still open, its own replay diverged before the cancel fired, closed the same
+  way then — and then its row is ended
   `cancelled` with no finally node run, which its `finally_error` says (`no finally node
   ran: this build could not take up the execution's recovery (<reason>)`); the
   settle webhook and the export go as for any settle, a slot it held of a
@@ -14678,8 +14680,12 @@ lease, never whether the cancel closes it.
 2. every **open descendant** the cascade reached — through any number of
    settled ones (D160's walk) — is taken up, deepest first, by who takes it:
    one this process **runs** is waited for until the cascade has settled it,
-   so no row closes before a descendant below it is down; one **nothing here
-   will take** is closed the same way; and one a recovery here **still takes**
+   so no row closes before a descendant below it is down, and asked again once
+   it has — a generation that settled with its row still open (one the cascade
+   reached still waiting for its permit, whose replay to the frontier the
+   cancel fires at then diverged, or whose recorded inputs were refused) is
+   one nothing here will take any more; one **nothing here will take** is
+   closed the same way; and one a recovery here **still takes**
    — its open parent runs here, cancelled by the same cascade, and the
    descendant is asked again once that parent has settled without re-issuing
    it; or the start that next recovers it will take it — keeps its row open

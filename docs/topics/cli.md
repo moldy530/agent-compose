@@ -375,7 +375,8 @@ log names this command for it once per start:
 
 The cancel **closes** it (PRD resolved q81): the request is recorded, its open
 children nothing in the process will take are closed the same way — one it is
-running is cancelled through the cascade and waited for until it has settled —
+running is cancelled through the cascade and waited for until it has settled,
+and closed the same way if it settled with its row still open —
 and the row is ended `cancelled` with **no finally node run** — no generation
 can run one against a record it does not describe — which its `finally_error`
 says.

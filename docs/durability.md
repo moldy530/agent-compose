@@ -2175,7 +2175,9 @@ put back is still recovered; an operator who will not put it back says so with
 it (PRD resolved q81, `docs/grammar.md` D165): the request is recorded as every
 cancel's is, its open children in the lineage that nothing in the process will
 take are closed the same way — those it is running are cancelled through the
-cascade, and waited for until they have settled, and one a recovery there
+cascade, and waited for until they have settled (one that settled with its row
+still open, its own replay diverged on the way to the frontier the cancel
+fires at, is then closed the same way), and one a recovery there
 still takes keeps its row open with its request recorded, for that recovery
 to complete — and the row is ended
 `cancelled` with **no finally node run** — no generation can run one against a
