@@ -179,11 +179,13 @@
 // open on purpose until somebody says otherwise (`docs/durability.md` §7). The
 // cancel is that somebody (PRD resolved q81, Decision D165): the request is
 // recorded and the cascade taken as for any cancel, its open descendants this
-// process runs no generation of are closed the same way, and the row is ended
+// process runs no generation of are closed the same way, those it does run are
+// waited for until the cascade has settled them, and the row is ended
 // `cancelled` here and now — no finally node ran, since no generation can run
 // one against a record it does not describe, and `finally_error` says so. The
 // settle webhook and the export go as for any settle, and the answer is `202`
-// with `cancelling: false`: the cancel is complete ([`closeUnrecoverable`]).
+// with `cancelling: false`: the cancel is complete, the lineage's with it
+// ([`closeUnrecoverable`]).
 //
 // # Lifecycle webhooks (grammar 13.3, PRD resolved q34, q35)
 //
@@ -253,6 +255,7 @@ import { drainStores, sweepBoundStores } from "./stores.ts";
 import {
   cancelExecution,
   cancelFired,
+  childSettled,
   deliverHumanAnswer,
   deliveriesOf,
   endedByCancel,
@@ -4946,8 +4949,13 @@ const closing = new Map<string, Promise<Closed>>();
  *     same way**, deepest first (`runtime.openDescendants`) — each one the
  *     cascade reached, which a dispatch a finally node issued is not: that one
  *     runs whole (grammar 7.9, Decision D160), and the start that next finds
- *     its parent settled recovers it;
- *  3. **the execution's own row closes** ([`closeRow`]);
+ *     its parent settled recovers it — and each one the cascade cancelled
+ *     **here** is waited for, in the same deepest-first order, until it has
+ *     settled ([`descendantSettled`]): a row above a descendant still being
+ *     torn down never closes before it, so the answer's "the cancel is
+ *     complete" is true of the whole lineage;
+ *  3. **the execution's own row closes** ([`closeRow`]), after every
+ *     descendant the cancel reached has;
  *  4. **its trigger's queue is looked at**, where a `started` intake row says
  *     it held a slot of the lease.
  *
@@ -4969,6 +4977,10 @@ function closeUnrecoverable(
       if (descendant.cancelRequestedAt === undefined) continue;
       const record = executions.get(descendant.id);
       if (runsHere(descendant.id) || record?.status === "running" || record?.announced === true) {
+        // A generation here runs it: the cascade cancelled it through its own
+        // controller, and it settles `cancelled` on its own, finally node and
+        // all. Nothing above it closes until it has (PRD resolved q81).
+        await descendantSettled(executions, descendant.id);
         continue;
       }
       await closeRow(executions, descendant, unrecoveredReason(descendant, record), record);
@@ -4982,6 +4994,23 @@ function closeUnrecoverable(
   });
   closing.set(id, closes);
   return closes;
+}
+
+/**
+ * Settles once this process's generation of the descendant `id` has stopped —
+ * the child execution the runtime supervises (`runtime.childSettled`), then
+ * the board's record of it, whose report is written as it settles, and a
+ * close of its row another cancel has under way ([`closeRow`]) — and never
+ * rejects: what became of the descendant is its own (grammar 8.6 rule 7), and
+ * [`closeUnrecoverable`] only needs it to be over before it closes a row above
+ * it.
+ */
+async function descendantSettled(executions: Map<string, Execution>, id: string): Promise<void> {
+  await childSettled(id);
+  // Read after the wait: a child still waiting for its permit is put on the
+  // board only once it runs ([`trackChild`]).
+  await executions.get(id)?.settled.catch(() => undefined);
+  await closingRows.get(id)?.catch(() => undefined);
 }
 
 /**
