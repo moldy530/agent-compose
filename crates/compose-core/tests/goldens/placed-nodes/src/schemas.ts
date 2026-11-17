@@ -532,6 +532,18 @@ export const flowPlacedClosingNodeCloseUpOutput = z.object({
 }).strict();
 export type FlowPlacedClosingNodeCloseUpOutput = z.infer<typeof flowPlacedClosingNodeCloseUpOutput>;
 
+/** `flow.placed_lapsed` — the module's parameters (grammar 7.5). */
+export const flowPlacedLapsedInputs = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type FlowPlacedLapsedInputs = z.infer<typeof flowPlacedLapsedInputs>;
+
+/**
+ * `flow.placed_lapsed` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowPlacedLapsedOutputs = z.object({}).strict();
+export type FlowPlacedLapsedOutputs = z.infer<typeof flowPlacedLapsedOutputs>;
+
 /** `flow.placed_retried` — the module's parameters (grammar 7.5). */
 export const flowPlacedRetriedInputs = z.object({
   path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),

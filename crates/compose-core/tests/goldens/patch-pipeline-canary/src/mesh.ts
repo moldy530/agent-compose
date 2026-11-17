@@ -656,16 +656,26 @@ const waitWatchers = new Map<string, Set<() => void>>();
  * is the shape `runtime.HumanInterrupt` already has for a pause a run has no way
  * to answer. The alternative — parking on a board nothing will ever poll — is a
  * command that never returns.
+ *
+ * A **placed flow's** instance is refused the same way, because its dispatch is
+ * this one (Decision D171): a `flow:` node, a `map` item or a flow-as-tool call
+ * over a placed flow fails where a placed agent's node would, and a `run` of the
+ * placed flow itself fails its execution at the root dispatch. None of them
+ * falls back to running the instance in this process — the placement decides
+ * where every instance runs, and a process with no mesh is not one of them.
  */
 let mounted = false;
 
-/** A placed node reached by a run with no mesh to dispatch it into. */
+/**
+ * A placed node — or a placed flow's instance (Decision D171) — reached by a
+ * run with no mesh to dispatch it into.
+ */
 export class PlacementUnreachable extends Error {
   readonly placement: string;
 
   constructor(node: string, placement: string) {
     super(
-      `\`${node}\` is placed on \`${placement}\`, and this invocation has no mesh for a worker to join: a placed node executes on whichever worker claims its placement, so it needs a served hub with a worker beside it rather than a single process (docs/distributed.md §1, §3)`,
+      `\`${node}\` is placed on \`${placement}\`, and this invocation has no mesh for a worker to join: a placed node — and every instance of a placed flow — executes on whichever worker claims its placement, so it needs a served hub with a worker beside it rather than a single process (docs/distributed.md §1, §3; grammar §14.1)`,
     );
     this.name = "PlacementUnreachable";
     this.placement = placement;

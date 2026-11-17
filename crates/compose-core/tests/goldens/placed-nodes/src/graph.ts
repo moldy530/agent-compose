@@ -65,6 +65,8 @@ import {
   flowPlacedClosingInputs,
   flowPlacedClosingNodeCloseUpOutput,
   flowPlacedClosingNodeLookLongOutput,
+  flowPlacedClosingOutputs,
+  flowPlacedLapsedInputs,
   flowPlacedRetriedInputs,
   flowPlacedTidyingInputs,
   flowPlacedTidyingNodeLookOutput,
@@ -461,6 +463,20 @@ const flowPlacedClosingNodeCloseUpShape: runtime.Shape = {
     "exit_code": "int",
     "stdout": "string"
   }
+};
+
+/** `flow.placed_lapsed` — the `input` root inside it (grammar 7.5). */
+const flowPlacedLapsedShape: runtime.Shape = {
+  "properties": {
+    "path": "string"
+  }
+};
+
+/**
+ * `flow.placed_lapsed` node `bounded` — the `bounded.output` root its guards read.
+ */
+const flowPlacedLapsedNodeBoundedShape: runtime.Shape = {
+  "properties": {}
 };
 
 /** `flow.placed_retried` — the `input` root inside it (grammar 7.5). */
@@ -2935,6 +2951,68 @@ const flowPlacedClosingBinding: runtime.SubflowBinding = {
     }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
 };
 
+// --- flow.placed_lapsed ---
+
+/** `flow.placed_lapsed` node `bounded` — `flow.placed_closing` (grammar 8.5). */
+const flowPlacedLapsedNodeBounded: runtime.NodeDescriptor = {
+  flow: "flow.placed_lapsed",
+  node: "bounded",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from the node, `on_error` from `defaults:`.
+  policy: {
+    timeoutMs: 4000,
+    onError: "fail",
+  },
+  shapes: { input: flowPlacedLapsedShape, state: stateShape, output: flowPlacedLapsedNodeBoundedShape },
+  input: (roots) => ({
+    "path": runtime.toJson(runtime.evaluate("input.path", roots)),
+  }),
+  run: async (input, context, view) =>
+    runtime.runSubflow(flowPlacedClosingBinding, {
+      inputs: input as Record<string, unknown>,
+      execution: view.run.execution,
+      path: runtime.instancePath(view, "bounded"),
+      signal: context.signal,
+      bodyEnded: context.bodyEnded,
+      policy: runtime.instancePolicy(view.run.policy, undefined),
+    }),
+  writes: [],
+  edges: [
+    { to: END },
+  ],
+};
+
+/**
+ * `flow.placed_lapsed` — its nodes, its `start` edges, and the compiled graph.
+ */
+function flowPlacedLapsed() {
+  return new StateGraph(State)
+    .addNode("bounded", (state: GraphState) => runtime.runNode(flowPlacedLapsedNodeBounded, state), {
+      ends: [END],
+    })
+    .addEdge(START, "bounded")
+    .compile();
+}
+
+/**
+ * `flow.placed_lapsed`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowPlacedLapsedGraph = flowPlacedLapsed();
+
+/**
+ * `flow.placed_lapsed` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowPlacedLapsedBinding: runtime.SubflowBinding = {
+  address: "flow.placed_lapsed",
+  outputs: [],
+  recursionLimit: 26,
+  stream: (initial, options) =>
+    flowPlacedLapsedGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowPlacedLapsedGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
+
 // --- flow.placed_retried ---
 
 /** `flow.placed_retried` node `build` — `flow.placed_build` (grammar 8.5). */
@@ -4122,6 +4200,22 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
         outputKeys: flowPlacedClosingGraph.outputChannels,
       }) as unknown as Promise<AsyncIterable<GraphState>>,
   },
+  "flow.placed_lapsed": {
+    address: "flow.placed_lapsed",
+    inputs: ["path"],
+    inputKinds: { "path": "string", },
+    outputs: [],
+    sessionStores: [],
+    recursionLimit: 26,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowPlacedLapsedInputs, inputs, "the `inputs:` of `flow.placed_lapsed`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowPlacedLapsedGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowPlacedLapsedGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
   "flow.placed_retried": {
     address: "flow.placed_retried",
     inputs: ["path"],
@@ -4756,6 +4850,14 @@ async function quiesceFlow(
   // writes, the webhook and the export. The execution's cancel is the
   // dispatch's signal, so a cancel reaches the worker as one (§3.2); nothing
   // else bounds it, as nothing bounds a root execution here.
+  //
+  // **A `run` has no mesh to dispatch into**, and is refused rather than
+  // obliged: `agent-compose run` mounts no worker routes, so the dispatch
+  // throws `mesh.PlacementUnreachable` before anything is journaled, and the
+  // execution fails on it — exactly as a `run` that reaches a placed agent's
+  // node fails at that node. Nothing here runs the instance in this process
+  // instead: that would be the one start of a placed flow the placement did
+  // not decide (Decision D171, D64 as amended).
   if (flow.placement !== undefined) {
     let answer: runtime.NodeAnswer;
     try {
@@ -4772,7 +4874,9 @@ async function quiesceFlow(
         address,
         ending?.outcome === "cancelled"
           ? "was cancelled"
-          : `did not complete on placement \`${flow.placement}\``,
+          : thrown instanceof mesh.PlacementUnreachable
+            ? `was not dispatched to placement \`${flow.placement}\``
+            : `did not complete on placement \`${flow.placement}\``,
         runtime.instanceTrace(thrown) ?? [],
         thrown,
         runtime.finallyErrorOf(executionId),

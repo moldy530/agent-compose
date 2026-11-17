@@ -1967,6 +1967,14 @@ async function quiesceFlow(
   // writes, the webhook and the export. The execution's cancel is the
   // dispatch's signal, so a cancel reaches the worker as one (§3.2); nothing
   // else bounds it, as nothing bounds a root execution here.
+  //
+  // **A `run` has no mesh to dispatch into**, and is refused rather than
+  // obliged: `agent-compose run` mounts no worker routes, so the dispatch
+  // throws `mesh.PlacementUnreachable` before anything is journaled, and the
+  // execution fails on it — exactly as a `run` that reaches a placed agent's
+  // node fails at that node. Nothing here runs the instance in this process
+  // instead: that would be the one start of a placed flow the placement did
+  // not decide (Decision D171, D64 as amended).
   if (flow.placement !== undefined) {
     let answer: runtime.NodeAnswer;
     try {
@@ -1983,7 +1991,9 @@ async function quiesceFlow(
         address,
         ending?.outcome === "cancelled"
           ? "was cancelled"
-          : `did not complete on placement \`${flow.placement}\``,
+          : thrown instanceof mesh.PlacementUnreachable
+            ? `was not dispatched to placement \`${flow.placement}\``
+            : `did not complete on placement \`${flow.placement}\``,
         runtime.instanceTrace(thrown) ?? [],
         thrown,
         runtime.finallyErrorOf(executionId),
