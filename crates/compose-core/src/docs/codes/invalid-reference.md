@@ -31,11 +31,8 @@ Name something the position accepts. Above, an agent's `model:` takes a
 calls, and the tool belongs in its `tools:` list if it wants it at all.
 
 A deploy file's `placements:` reads the same way one level along: a placement's
-`members:` are `agent.*` and `tool.*` addresses, so `store.docs` there is this
-code — a store is not a placeable component (§14.1). A `flow.*` member is
-refused too, but with a message naming the deferral rather than this one, since
-placing a flow is a feature this release does not have rather than a spelling
-mistake (`unsupported-placement`).
+`members:` are `agent.*`, `tool.*` and `flow.*` addresses, so `store.docs` there
+is this code — a store is not a placeable component (§14.1).
 
 Two positions take a **flow-local node id** rather than an address, and a typed
 address there is this error too: `on_error: { fallback: … }` and a `human`

@@ -32,13 +32,15 @@ use super::files::Composition;
 use super::index::Index;
 use super::references::Cx;
 
-/// Namespaces a placement `members:` entry accepts (grammar 14.1).
+/// Namespaces a placement `members:` entry accepts (grammar 14.1, Decisions
+/// D129, D171).
 ///
-/// `flow.*` is refused by the parser with a message naming the deferral
-/// (Decision D129), so nothing that reaches here can be one — but the list
-/// stated for `Cx::address` is what a *resolution* failure's message reads
-/// from, and it must name the namespaces this position really accepts.
-const COMPONENTS: &[Namespace] = &[Namespace::Agent, Namespace::Tool];
+/// The parser reads the same three ([`crate::parse`]'s `MEMBERS`), and the list
+/// stated for `Cx::address` is what a *resolution* failure's message reads from,
+/// so it names the namespaces this position really accepts: the two leaves that
+/// hold a machine's capability, and a `flow.*`, whose every instance the
+/// placement then runs (PRD resolved q84).
+const COMPONENTS: &[Namespace] = &[Namespace::Agent, Namespace::Tool, Namespace::Flow];
 
 /// Check the deploy layer against the composition it deploys.
 pub(crate) fn check(composition: &Composition, index: &Index<'_>, diagnostics: &mut Diagnostics) {

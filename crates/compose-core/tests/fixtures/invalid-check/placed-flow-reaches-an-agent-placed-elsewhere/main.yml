@@ -1,0 +1,46 @@
+# rule: what a placed flow's instance runs is held to the flow's placement, across kinds (grammar 14.1 rules 3 and 4, Decision D171)
+# code: conflicting-placement
+# message: `agent.signer` runs where `flow.build` runs (placement `mac`), so its own placement `gpu` can never take it
+# at: main.yml:40:14
+# label: deploy/mesh.yml:8:15 `flow.build` is a member of placement `mac`
+# label: deploy/mesh.yml:10:15 `agent.signer` is a member of placement `gpu`
+# help: a placed flow's instance runs on a worker claiming its placement, and every node of it executes there — a worker hands nothing on to another placement, because only the hub dispatches: put the two in one placement, drop the inner one's placement so it runs where the flow runs, or reach it from a flow the hub runs, where its own placement is the whole answer (grammar 14.1 rules 3 and 4, Decision D171)
+# target: mesh
+#
+# The placed flow's `agent:` node would be dispatched by its own placement if
+# the hub ran the flow — but the hub does not: the whole instance runs on the
+# worker that took `flow.build`'s dispatch, and that worker cannot hand a node
+# on to `gpu`.
+version: "0.1"
+state:
+  signature:
+    type: string
+    default: ""
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.signer:
+  model: model.m
+  prompt: Sign the build.
+  input:
+    log: { type: string }
+  output:
+    signature: { type: string }
+flow.build:
+  description: Build, then sign what was built.
+  inputs:
+    log: { type: string }
+  outputs:
+    signature: { type: string }
+  nodes:
+    sign:
+      agent: agent.signer
+      input:
+        log: "input.log"
+      writes: { signature: signature }
+  edges:
+    - { from: start, to: sign }
+    - { from: sign, to: end }

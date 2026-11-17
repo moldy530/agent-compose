@@ -3221,18 +3221,18 @@
     },
 
     "placement": {
-      "description": "One named claim a worker asserts at join, and the components that claim runs. Nothing here is an address: which machine satisfies a claim is decided by whoever joins asserting it, so a placement is capability affinity rather than load assignment. Two rules this schema cannot express: placements are disjoint, and an attached tool colocates with the agent that attaches it (grammar 14.1, Decisions D128, D129 / PRD resolved q38, q40).",
+      "description": "One named claim a worker asserts at join, and the components that claim runs. Nothing here is an address: which machine satisfies a claim is decided by whoever joins asserting it, so a placement is capability affinity rather than load assignment. Two rules this schema cannot express: placements are disjoint, and an attached tool colocates with the agent that attaches it, as does everything a placed flow runs with the flow (grammar 14.1, Decisions D128, D129, D171 / PRD resolved q38, q40, q84).",
       "type": "object",
       "required": ["members"],
       "properties": {
         "members": {
-          "description": "The components this claim runs. Non-empty, each address distinct, and each must resolve in the composition. v1 places agent.* and tool.* - the leaves that hold a machine's capability - while placing a flow.* is deferred, named (PRD resolved q44).",
+          "description": "The components this claim runs. Non-empty, each address distinct, and each must resolve in the composition. agent.* and tool.* are the leaves that hold a machine's capability, and a flow.* places every instance of that flow: its nodes run on a worker claiming the placement (grammar 14.1, Decision D171 / PRD resolved q84).",
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
           "items": {
             "type": "string",
-            "pattern": "^(agent|tool)\\.[a-z][a-z0-9_]{0,63}$"
+            "pattern": "^(agent|tool|flow)\\.[a-z][a-z0-9_]{0,63}$"
           }
         },
         "max_running": {

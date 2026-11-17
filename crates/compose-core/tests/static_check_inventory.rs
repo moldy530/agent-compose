@@ -267,12 +267,13 @@ const GRAMMAR: &[Check] = &[
     Check {
         // The half of grammar 14.1's placement rules that needs two files. The
         // parser owns everything decidable from the deploy file alone — the
-        // member forms, the `flow.*` deferral, disjointness, repeated members,
-        // and the conditional join token — and the resolver owns whether a
-        // member resolves. This is the rule that is about neither file on its
-        // own: which agents attach what, and what those attachments reach, is
-        // the composition's; which placement claims each is the active target's.
-        rule: "an attachment colocates with the agent that attaches it, transitively through a `flow.*` (14.1, D129)",
+        // member forms, disjointness, repeated members, and the conditional
+        // join token — and the resolver owns whether a member resolves. This is
+        // the rule that is about neither file on its own: which agents attach
+        // what, what those attachments reach, and what a placed `flow.*`'s
+        // instance runs, is the composition's; which placement claims each is
+        // the active target's.
+        rule: "an attachment colocates with the agent that attaches it, transitively through a `flow.*`, and a placed flow's instance runs nothing placed elsewhere (14.1, D129, D171)",
         pass: "check/placements.rs, over check/reach.rs",
         codes: &["conflicting-placement"],
         evidence: Evidence::Fixture,

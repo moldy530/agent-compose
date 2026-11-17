@@ -110,7 +110,8 @@ const DEPLOY_OWNER: &str = "deploy:";
 /// attaches is opened in that agent's process, so the credential that opens it
 /// is spent there. §9.1's fifth clause still holds — a deploy-layer variable is
 /// the hub's — and this only ever *adds* processes, never moves one off the
-/// hub's list, exactly as the unplaced-agent clause does for a component.
+/// hub's list, exactly as a placed agent's attached flow does for the unplaced
+/// agent it names.
 ///
 /// `site` is the spec address `References::backend` records the reference under,
 /// so the two cannot name different entries.
@@ -186,12 +187,18 @@ const REGISTRY_OWNER: &str = "deploy:package_registry";
 /// component that **can execute in it**", and the same component can execute in
 /// two: an unplaced `tool.*` two placed agents attach runs on both their
 /// workers, and an unplaced `agent.*` a placed agent reaches through an attached
-/// `flow.*` runs on that worker **and** on the hub, because every flow a
-/// composition declares is startable on the hub (grammar Decision D64). The two
-/// worked examples §9.1 closes with are those two directions, and
+/// `flow.*` runs on that worker **and** on the hub, because every unplaced flow
+/// a composition declares is startable on the hub (grammar Decision D64). The
+/// two worked examples §9.1 closes with are those two directions, and
 /// [`the_keychain_password_of_a_placed_agents_attached_tool_is_that_placements_alone`]
 /// and [`a_key_an_attached_flow_reaches_belongs_to_the_worker_and_to_the_hub`]
 /// are them.
+///
+/// A **placed** `flow.*` is the one surface whose reach the hub never runs: its
+/// every instance is dispatched to its placement and executes whole there
+/// (grammar §14.1, Decision D171), so what only it reaches is that placement's
+/// alone —
+/// [`a_placed_flows_reach_is_its_placements_manifest_and_off_the_hubs`].
 ///
 /// # What an owner is
 ///
@@ -331,8 +338,8 @@ impl Partition {
             }
         }
 
-        // Membership — §9.1's first clause — and unconditional hub
-        // dispatchability, its second.
+        // Membership — §9.1's first clause — and hub dispatchability, its
+        // second.
         for (address, claim) in &claims {
             arrive(
                 &mut runs,
@@ -341,31 +348,38 @@ impl Partition {
                 own(Some(&claim.at)),
             );
         }
+        // Every **unplaced** flow a composition declares is startable on the
+        // hub (grammar Decision D64), so its own nodes' bindings are the hub's
+        // whatever else reaches them. A **placed** one is not: wherever its
+        // instance is started — a trigger, a `run`, a `flow:` node, a `map`
+        // item, a flow-as-tool call — it is dispatched to its placement and its
+        // nodes execute there (grammar §14.1, PRD resolved q84, Decision D171),
+        // so the hub runs none of them and holds none of their variables.
+        //
+        // An unplaced agent is carried to the hub by the closure below rather
+        // than by a clause of its own: every construct that reaches an agent is
+        // a node of some flow, so one an unplaced flow names is the hub's
+        // through that flow, and one nothing names at all is the hub's by the
+        // floor at the end. What that leaves off the hub's list is exactly an
+        // agent that only ever runs inside a placed flow's instance.
         for (address, definition) in &ir.definitions {
-            match &definition.body {
-                // Every flow a composition declares is startable on the hub
-                // (grammar Decision D64), so its own nodes' bindings are the
-                // hub's whatever else reaches them.
-                DefinitionBody::Flow(_) => {
-                    arrive(&mut runs, address, Process::Hub, own(None));
-                }
-                // …and so is every unplaced agent, for the same reason read one
-                // level in: an `agent:` node of some flow is a node the hub's
-                // scheduler starts.
-                DefinitionBody::Agent(_) if !claims.contains_key(address) => {
-                    arrive(&mut runs, address, Process::Hub, own(None));
-                }
-                _ => {}
+            if matches!(definition.body, DefinitionBody::Flow(_)) && !claims.contains_key(address) {
+                arrive(&mut runs, address, Process::Hub, own(None));
             }
         }
         // An unplaced `tool.*` the hub itself dispatches: the one a `function:`
         // node names (grammar §8.4) and the one a `map` dispatches to
-        // (grammar §8.6). A **placed** one is dispatched to its placement
-        // instead, which is what placing it means, so it is left alone.
-        for definition in ir.definitions.values() {
+        // (grammar §8.6), in a flow the hub runs. A **placed** one is
+        // dispatched to its placement instead, which is what placing it means,
+        // so it is left alone — and so is every node of a placed flow, whose
+        // instance the hub never runs.
+        for (address, definition) in &ir.definitions {
             let DefinitionBody::Flow(flow) = &definition.body else {
                 continue;
             };
+            if claims.contains_key(address) {
+                continue;
+            }
             for node in &flow.nodes {
                 let mut hub_dispatched = |address: &crate::ast::common::Address| {
                     let key = address.to_string();
@@ -393,7 +407,10 @@ impl Partition {
         // (grammar §5.4, §14.1 rule 4), and what a flow's own nodes name runs
         // in the process running that flow's instance — except where the thing
         // named is **placed**, which is the hub handing it to a worker rather
-        // than running it (grammar §14.1). A provider is neither: it is reached
+        // than running it (grammar §14.1). A placed `flow.*` is one of those
+        // too, whether a node names it or an agent attaches it: its instance is
+        // dispatched to its own placement, whose closure it starts (Decision
+        // D171). A provider is neither: it is reached
         // through a `model:` and its credential is spent wherever the model is
         // called, so it follows its callers unconditionally.
         let mut moved = true;
@@ -1459,10 +1476,13 @@ placements:\n  mac:\n    members: [agent.signer]\n",
     /// > `agent.inner` itself.
     ///
     /// The clause that produces the second half is the unconditional one: an
-    /// unplaced `agent.*` is dispatched by the hub whatever else reaches it
-    /// (grammar Decision D64). A partition that read "reached by something
-    /// placed" as "therefore not the hub's" would pass `readEnvironment()` and
-    /// fail at the first direct run's first model call.
+    /// unplaced `flow.*` is startable on the hub whatever else reaches it
+    /// (grammar Decision D64), and the hub dispatches the unplaced agent its
+    /// node names. A partition that read "reached by something placed" as
+    /// "therefore not the hub's" would pass `readEnvironment()` and fail at the
+    /// first direct run's first model call. (Placing `flow.review` itself is
+    /// what takes it off the hub — Decision D171,
+    /// [`a_placed_flows_reach_is_its_placements_manifest_and_off_the_hubs`].)
     #[test]
     fn a_key_an_attached_flow_reaches_belongs_to_the_worker_and_to_the_hub() {
         let (ir, partition) = partitioned(
@@ -1669,6 +1689,87 @@ storage_backends:\n  aliases:\n    docs_db:\n      provider: chroma\n      url: 
         assert!(
             !hub.contains(&"VENDOR_KEY".to_string()),
             "the only agent is placed, so the hub calls no model: {hub:?}"
+        );
+    }
+
+    /// **A placed `flow.*`'s reach is its placement's manifest, and off the
+    /// hub's** (grammar §14.1, PRD resolved q84, Decision D171).
+    ///
+    /// `flow.build` is a member of `mac`, so every instance of it — the root
+    /// execution a trigger or `run` starts, the `flow:` node and the `map` item
+    /// of `flow.release`, a flow-as-tool call — is dispatched to a worker
+    /// claiming `mac` and runs whole there. Everything only it reaches executes
+    /// on that worker: the unplaced `agent.inspector` and its provider, the
+    /// `tool.package` that agent attaches, the `coder:` node's workspace, `env:`
+    /// and provider, and the store its agent opens.
+    ///
+    /// Both halves are asserted, because each is a different failure. `mac`'s
+    /// is the machine §9.2's join-time check exists to refuse: a manifest
+    /// without `PACKAGE_TOKEN` lets a worker with no packaging credential join
+    /// clean and fail on the first build. The hub's is the false requirement
+    /// §9.1 exists to prevent: before D171 every flow was startable on the hub
+    /// (Decision D64) and every unplaced agent was the hub's whatever reached
+    /// it, and either clause read unchanged here would refuse a hub launch over
+    /// `BUILDER_KEY`, which the hub never spends — it dispatches `flow.build`
+    /// and runs none of its nodes.
+    ///
+    /// The store's **backend** is the exception, and the one that is not new:
+    /// a deploy-layer variable stays the hub's whatever else reaches it (§9.1's
+    /// fifth clause), so the placement is added beside the hub, never
+    /// substituted for it.
+    #[test]
+    fn a_placed_flows_reach_is_its_placements_manifest_and_off_the_hubs() {
+        let (ir, partition) = partitioned(
+            "version: \"0.1\"\n\
+provider.builder:\n  kind: anthropic\n  api_key: ${BUILDER_KEY}\n\
+provider.announcer:\n  kind: openai\n  api_key: ${ANNOUNCER_KEY}\n\
+model.builder:\n  provider: provider.builder\n  id: some-model\n\
+model.announcer:\n  provider: provider.announcer\n  id: some-model\n\
+tool.package:\n  description: Package one build.\n  input: { path: { type: string } }\n  output: { archive: { type: string } }\n  exec:\n    command: pack\n    env:\n      PACKAGE_TOKEN: ${PACKAGE_TOKEN}\n\
+store.builds:\n  kind: kv\n  scope: global\n  backend: builds_db\n  value_schema:\n    status: { type: string }\n\
+agent.inspector:\n  model: model.builder\n  prompt: Inspect the build.\n  tools: [tool.package]\n  stores: [store.builds]\n  input: { path: { type: string } }\n  output: { verdict: { type: string } }\n\
+agent.announcer:\n  model: model.announcer\n  prompt: Announce the release.\n  input: { path: { type: string } }\n  output: { note: { type: string } }\n\
+flow.build:\n  inputs:\n    path: { type: string }\n  outputs: {}\n  nodes:\n    compile:\n      coder:\n        harness: cc\n        model: model.builder\n        workspace: \"'${BUILD_ROOT}'\"\n        prompt: Build it.\n        output:\n          log: { type: string }\n        env:\n          BUILD_SECRET: ${BUILD_SECRET}\n      input: \"input.path\"\n    inspect:\n      agent: agent.inspector\n      input:\n        path: \"input.path\"\n  edges:\n    - { from: start, to: compile }\n    - { from: compile, to: inspect }\n    - { from: inspect, to: end }\n\
+flow.release:\n  inputs:\n    paths: { type: array, max_items: 4, items: { type: string } }\n  outputs: {}\n  nodes:\n    first:\n      flow: flow.build\n      input:\n        path: \"input.paths[0]\"\n    every:\n      map:\n        over: \"input.paths\"\n        node: flow.build\n        max_concurrency: 1\n        input:\n          path: \"item\"\n    announce:\n      agent: agent.announcer\n      input:\n        path: \"input.paths[0]\"\n  edges:\n    - { from: start, to: first }\n    - { from: first, to: every }\n    - { from: every, to: announce }\n    - { from: announce, to: end }\n",
+            "version: \"0.1\"\n\
+hub:\n  join_token: ${MESH_TOKEN}\n\
+placements:\n  mac:\n    members: [flow.build]\n\
+storage_backends:\n  aliases:\n    builds_db:\n      provider: postgres\n      url: ${BUILDS_DB_URL}\n",
+        );
+
+        assert_eq!(
+            manifest(&ir, &partition, &Process::Placement("mac".to_string())),
+            [
+                "BUILDER_KEY",
+                "BUILDS_DB_URL",
+                "BUILD_ROOT",
+                "BUILD_SECRET",
+                "PACKAGE_TOKEN"
+            ],
+            "the worker runs `flow.build`'s every instance whole: its coder node's workspace, \
+             env and provider, the unplaced agent it names and that agent's tool, and the store \
+             that agent opens"
+        );
+        assert_eq!(
+            manifest(&ir, &partition, &Process::Hub),
+            ["ANNOUNCER_KEY", "BUILDS_DB_URL", "MESH_TOKEN"],
+            "the hub dispatches `flow.build` and runs none of its nodes, so of its reach the hub \
+             holds only the store's backend, which is the deploy layer's (§9.1's fifth clause); \
+             `agent.announcer` is a node of `flow.release`, which the hub does run"
+        );
+
+        // The route into `mac` starts at the `members:` entry, which is what
+        // grammar 14.1 rule 5's refusal draws for an author (Decision D131).
+        let route: Vec<&str> = partition
+            .route("tool.package", &Process::Placement("mac".to_string()))
+            .into_iter()
+            .map(|step| step.owner)
+            .collect();
+        assert_eq!(route, ["flow.build", "agent.inspector", "tool.package"]);
+        assert!(
+            partition.route("agent.inspector", &Process::Hub).is_empty(),
+            "an agent only a placed flow names has no hub execution, so there is no route into \
+             one"
         );
     }
 

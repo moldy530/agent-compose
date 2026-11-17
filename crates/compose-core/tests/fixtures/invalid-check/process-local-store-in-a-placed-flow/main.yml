@@ -1,0 +1,39 @@
+# rule: a store on a process-local backend is refused where a placed flow's own `store:` node binds it (grammar 14.1 rule 5, Decisions D131, D171)
+# code: process-local-store
+# message: `store.builds` is on the process-local `sqlite` backend (the `kv` default of the `mesh` target), and `flow.build` that binds it executes in placement `mac`
+# at: main.yml:31:14
+# label: deploy/mesh.yml:8:15 `flow.build` is a member of placement `mac`
+# help: a mesh runs this store's component in more than one process — several workers may claim one placement, and the hub dispatches whatever else reaches the store — and each one opens its own copy, so a write on one side is never a read on another: bind `redis`, `postgres` or `mysql` instead, whose variables the environment partition already carries to every placement that reaches the store, or take the component that binds it out of `placements:` so only the hub ever opens it. Of those, this release opens `postgres` and `mysql`; the others compile and then refuse at the first store op, since they land behind the store plugin interface in M3 (PRD §7) (grammar 14.1 rule 5, PRD resolved q45)
+# target: mesh
+#
+# A placed flow's instance runs on a worker claiming its placement, so its
+# `store:` node opens the store there — a SQLite file of that worker's own,
+# beside the hub's.
+version: "0.1"
+store.builds:
+  kind: kv
+  scope: global
+  description: The last build each scheme produced.
+  value_schema:
+    log: { type: string }
+flow.build:
+  description: Build one scheme and remember what it said.
+  inputs:
+    scheme: { type: string }
+  outputs: {}
+  nodes:
+    compile:
+      exec:
+        command: make
+      input:
+        scheme: "input.scheme"
+    remember:
+      store: store.builds
+      op: set
+      key: "input.scheme"
+      value:
+        log: "'built'"
+  edges:
+    - { from: start, to: compile }
+    - { from: compile, to: remember }
+    - { from: remember, to: end }

@@ -21,27 +21,26 @@ use super::reader::{
 };
 use super::section;
 
-/// Namespaces a `members:` entry may name (grammar 14.1, Decision D129).
+/// Namespaces a `members:` entry may name (grammar 14.1, Decisions D129, D171).
 ///
-/// `flow.*` is deliberately not one of them, and is deliberately not left to
-/// this list to refuse: a `flow.` prefix is intercepted before the address is
-/// read and answered with the **deferral**, because a reader who wrote one
-/// named a real component in a real position, and "expected an `agent.*` or
-/// `tool.*` reference" would read as a spelling correction for a decision the
-/// PRD took deliberately (PRD resolved q44's out-list). Every other namespace
-/// here really is a mistake, and this list is what tells its author what the
-/// position takes.
-const MEMBERS: &[Namespace] = &[Namespace::Agent, Namespace::Tool];
+/// `agent.*` and `tool.*` are the leaves that hold a machine's capability, and
+/// `flow.*` places **every instance** of that flow (PRD resolved q84): the
+/// instance runs on a worker claiming the placement, through the attached-flow
+/// path a placed agent's `flow.*` tool already takes, with its nodes executing
+/// there. Every other namespace really is a mistake, and this list is what tells
+/// its author what the position takes.
+const MEMBERS: &[Namespace] = &[Namespace::Agent, Namespace::Tool, Namespace::Flow];
 
 /// Read the `placements:` section (grammar 14.1).
 ///
 /// A placement is a **named** claim, and its members are the components a
-/// worker asserting that name runs (PRD resolved q38). Three rules are decided
+/// worker asserting that name runs (PRD resolved q38). Two rules are decided
 /// here because each is decidable from this file alone: the members' lexical
-/// form, the `flow.*` deferral, and disjointness across the section. Whether a
+/// form, and disjointness across the section. Whether a
 /// member *resolves* needs the composition and is
 /// [`resolve::target`](crate::resolve)'s; whether a placed tool agrees with the
-/// agents that attach it needs both and is `check::placements`'s.
+/// agents that attach it, and whether what a placed flow reaches agrees with the
+/// flow, needs both and is `check::placements`'s.
 pub(crate) fn placements(node: &Node, cx: &mut Cx) -> Option<PlacementsSection> {
     let mapping = expect_mapping(node, "`placements`", cx)?;
     let mut placements = Vec::new();
@@ -121,11 +120,9 @@ fn members_of(
         // the string is taken and the address is the only judgement passed on
         // it. Reading it as literal text instead would add the env-ref rule to
         // that judgement, and `members: [${SOME_AGENT}]` would draw two
-        // diagnostics — "not an `agent.*` or `tool.*` reference" *and* "never
-        // interpolates environment references" — for the one mistake that
-        // `tools: [${SOME_TOOL}]` draws one for. `lexical::reference` is not
-        // called only because the `flow.` prefix is intercepted below, before
-        // the address is read, and that interception needs the string.
+        // diagnostics — "not an `agent.*`, `tool.*` or `flow.*` reference"
+        // *and* "never interpolates environment references" — for the one
+        // mistake that `tools: [${SOME_TOOL}]` draws one for.
         let Yaml::String(value) = &item.value else {
             cx.wrong_type(
                 item,
@@ -135,22 +132,6 @@ fn members_of(
             continue;
         };
         let text = Spanned::new(value.clone(), item.span.clone());
-        if text.value.starts_with("flow.") {
-            cx.push(
-                Diagnostic::error(
-                    DiagnosticCode::UnsupportedPlacement,
-                    text.span.clone(),
-                    format!(
-                        "`{}` may not be a placement member: placing a flow is deferred",
-                        text.value
-                    ),
-                )
-                .with_help(
-                    "v1 places `agent.*` and `tool.*` — the leaves that hold a machine's capability — while a flow is a subgraph the hub schedules; place the nodes it reaches instead (grammar 14.1, PRD resolved q44)",
-                ),
-            );
-            continue;
-        }
         let Some(address) = lexical::address(&text, "a placement member", MEMBERS, cx) else {
             continue;
         };

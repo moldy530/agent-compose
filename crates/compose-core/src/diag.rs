@@ -648,12 +648,10 @@ pub enum DiagnosticCode {
     MissingCallbackAllowlist,
 
     // --- placements (grammar 14.1, 14.2) ----------------------------------
-    /// A `placements:` entry names a member this release cannot place: a
-    /// `flow.*`, whose placement is deferred (grammar 14.1, PRD resolved q44).
-    UnsupportedPlacement,
-    /// Two placements claim one component, or a placed `tool.*` is attached to
-    /// an agent placed somewhere else — either way, two answers to which worker
-    /// runs one piece of work (grammar 14.1, Decision D129).
+    /// Two placements claim one component, a placed `tool.*` or `flow.*` is
+    /// attached to an agent placed somewhere else, or a placed `flow.*` reaches
+    /// a component placed somewhere else — either way, two answers to which
+    /// worker runs one piece of work (grammar 14.1, Decisions D129, D171).
     ConflictingPlacement,
     /// A target declares `placements:` and no `hub.join_token:` (grammar 14.2,
     /// PRD resolved q38). Its own class rather than a
@@ -818,7 +816,6 @@ impl DiagnosticCode {
         Self::ConcurrencyOnManual,
         Self::CoalescedInKey,
         Self::MissingCallbackAllowlist,
-        Self::UnsupportedPlacement,
         Self::ConflictingPlacement,
         Self::MissingJoinToken,
         Self::ProcessLocalStore,
@@ -915,7 +912,6 @@ impl DiagnosticCode {
             Self::ConcurrencyOnManual => "concurrency-on-manual",
             Self::CoalescedInKey => "coalesced-in-key",
             Self::MissingCallbackAllowlist => "missing-callback-allowlist",
-            Self::UnsupportedPlacement => "unsupported-placement",
             Self::ConflictingPlacement => "conflicting-placement",
             Self::MissingJoinToken => "missing-join-token",
             Self::ProcessLocalStore => "process-local-store",
