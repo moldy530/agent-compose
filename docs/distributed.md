@@ -281,10 +281,48 @@ not withdraw the end — it is the cancel's own, and an end under way is waited
 for, never stopped (grammar §7.9) — so it parks like any dispatch while nothing
 claims the placement, as the redispatch an answer makes does; a lost session's
 end is dispatched again. A hub restarted mid-cancel makes the same end where
-its replay stops the instance at a frontier (`docs/durability.md` §6.1). An
-instance whose dispatch no worker ever took has **not** begun, and has no end
-to run anything at (grammar §7.9): the cancel withdraws its parked row as it
-withdraws any, and it settles as the cancel with no finally node run.
+its replay stops the instance at a frontier no worker holds — an unanswered
+question, a parked redispatch (`docs/durability.md` §6.1). An instance whose
+dispatch no worker ever took has **not** begun, and has no end to run anything
+at (grammar §7.9): the cancel withdraws its parked row as it withdraws any, and
+it settles as the cancel with no finally node run.
+
+**A hub stop owes one the same end.** The hub *stops* waiting for an instance
+— not a cancel, which is the execution's — when an end around it abandons its
+question (a sibling branch failed, and the instance around it ended), or when
+its instantiating node's `timeout:` runs out while its redispatch is parked
+(§6.5). Unplaced, that instance ends `failed` there and runs its finally node
+(grammar §7.9: "its pause is abandoned … and it ends failed, its finally node
+run"); a worker running it is told on the poll's `stop` list (§3.2) and ends
+it the same way. One no worker is running is handed to a worker as its end
+exactly as the cancel's is, carrying §3.2's `stopped: true` instead: the worker
+replays it to its frontier and stops it there as the `stop` list stops one, so
+it ends `failed`, its finally node runs, and the result is the instance's
+failure with its `inner` trace and any `finally_error` — or, where the record
+already holds the rest of its body (a parked redispatch whose answer was the
+last thing it needed), it ends as the record does and its finally node runs at
+that. The instantiating node
+leaves on the stop once that end has run — the end around it waits for it, as
+it waits for any instance ending inside it — and the stop's own failure, not
+the end's, is what it leaves with. A redispatch the hub stopped while it was
+parked is superseded under a detail of its own, so a restarted hub's replay
+finds the end it was owed.
+
+**Never an end where a worker may still be running the instance.** A row a
+replaced process left `dispatched` names a session that ended with that process,
+and the worker that took it is still running the instance — its next request
+meets the restarted hub's `410`, and it stops what that session held, finally
+node and all (§5). An end dispatched beside it would run the finally node a
+second time, on whichever worker took the end. So a hub restarted mid-cancel
+that finds the instance's dispatch held that way ends it as the cancel's and
+dispatches nothing more: the instance's end is that worker's, as a placed
+node's attached instances are (§5). The same holds for an end dispatch a
+replaced process had handed out — the worker holding it is running that end —
+and for a dispatch whose session the liveness sweep gave up on while the worker
+was stopping it for the cancel (§6.3): the cancel reached a worker, and that
+worker is the one that ends the instance. Such a row is superseded as **the
+cancel's, held by a worker**, a detail of its own, so a replay reads it as the
+cancel it was and owes nothing more.
 
 **`agent-compose run` is the hub of the placed flows it dispatches** (Decision
 D171). Every dispatch above is made by a process serving §3's routes, and
@@ -706,6 +744,21 @@ Carries the session. Long-polls for up to one hold (§2).
   replay the instance to its question again and settle it paused, and the hub
   reads a paused end as the cancel it was made for — the instance ends with no
   finally node run, which is what a hub that never sent the field gets.
+
+  **`stopped`** is OPTIONAL, `true` where present, and the same kind of end for a
+  **hub stop** that found no worker running the instance — an end around it
+  abandoned its question, or its node's deadline ran out while its redispatch
+  was parked (§2). The worker stops the instance at the frontier as the `stop`
+  list stops one it is running — every node it reaches there ends `failed`, the
+  instance ends `failed`, and its finally node runs — and the result is the
+  instance's failure; an instance whose record holds the rest of its body
+  reaches no frontier before its end and ends as the record does. Never beside
+  `cancelled`. A worker that did not read it
+  would run the instance on from its frontier — to its question again, or on to
+  its end — rather than stop it there; the hub reads whatever that end answers
+  as the stop it was made for, so the node leaves on the stop either way, and
+  what such a worker gets wrong is only whether the finally node ran at
+  `failed`.
 
   **The four fields between them are what makes a placed node the same node.**
   Each is OPTIONAL — a dispatch that has none of them omits all four — and each
@@ -1597,7 +1650,10 @@ that the execution was cancelled, and a cancel the worker inferred from a
 instances the placed node began there therefore end `failed`, their finally
 nodes reading `execution.outcome == "failed"`, and the boundary each crosses is
 journaled from the worker under its renewed session — into an execution whose
-row settles `cancelled`. The same holds where the hub dies between recording a
+row settles `cancelled`. A **placed flow's** instance the worker was running is
+one of them: it ends there `failed` and runs its finally node, and the restarted
+hub makes no end dispatch beside it, which would run that finally node a second
+time (§2, Decision D171). The same holds where the hub dies between recording a
 cancel and writing the poll answer that names it. Telling the worker the
 cancel across the restart — a restarted hub naming, on the first answer under
 the new session, every row it left `dispatched` for a cancel's frontier, and a
@@ -2333,13 +2389,15 @@ or a second implementation of this document.
 **A placed flow is not a bump** (PRD resolved q84, Decision D171). Its
 instance travels as a dispatch of the instantiating node — the poll answer's
 `node` names the flow, which the artifact defines, and §10.2 puts a change to the
-artifact outside this protocol — and the two fields it adds are OPTIONAL: a
+artifact outside this protocol — and the fields it adds are OPTIONAL: a
 result's `inner` (§3.4), which a hub that does not read records as an instance
 with no inner trace, and a worker that does not send is one that ran no placed
-flow; and a poll answer's `cancelled` (§3.2), which a worker that does not read
+flow; a poll answer's `cancelled` (§3.2), which a worker that does not read
 answers by settling the instance's end paused, read by the hub as the cancel it
-was — the instance ends with no finally node run, never with a wrong outcome.
-Protocol `3` carries both unchanged.
+was — the instance ends with no finally node run, never with a wrong outcome;
+and a poll answer's `stopped` (§3.2), whose end the hub reads as the stop it was
+made for whatever such a worker answers. Protocol `3` carries all three
+unchanged.
 
 **The bumps to 2 and to 3 cost nothing in practice, and saying so is the point
 of recording them.** A worker and the hub it talks to are built from one compiler
@@ -2414,8 +2472,9 @@ placed flow, the root execution a trigger or `run` starts among them, which a
 worker runs whole and answers with the instance's outputs and its trace (§2,
 §3.4's `inner`, Decision D171) — a `run` serving §3's routes itself from its
 first dispatch of a placed flow's instance, and refusing a placed agent's or
-tool's node as before; and a cancel that finds a begun placed instance with no
-worker running it hands a worker the instance's end (§2, §3.2's `cancelled`).
+tool's node as before; and a cancel, or a hub stop, that finds a begun placed
+instance with no worker running it hands a worker the instance's end (§2, §3.2's
+`cancelled` and `stopped`) — never one a worker may still be running.
 
 What **`agent-compose worker`** is: the spoke. `--hub <url> --claim <name>…
 --token-env <VAR> [--data-dir <path>]`, a complete protocol client — the

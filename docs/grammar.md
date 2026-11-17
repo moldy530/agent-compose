@@ -15616,6 +15616,37 @@ with an environment the hub does not hold (*The environment*, below, and
 `docs/distributed.md` §9.1); and ending the instance with its finally node
 skipped is the outcome q75 ruling e rules out.
 
+**The end a stop owes.** The cancel is not the only way the hub ends an
+instance it is not running. An end around a placed instance — a sibling branch
+failed, and the instance around it ended — abandons the question the placed
+instance brought home; and its instantiating node's `timeout:` can run out while
+its redispatch is parked. Unplaced, either ends the instance `failed` and runs
+its finally node (§7.9: "its pause is abandoned … and it ends failed, its
+finally node run"), and a worker running it is stopped on the poll's `stop`
+list to the same effect. So the instance no worker is running is handed to a
+worker as its end exactly as the cancel's is, with the optional `stopped: true`
+in place of `cancelled: true` (`docs/distributed.md` §2, §3.2): the worker stops
+it at its frontier as the `stop` list would, it ends `failed`, and its finally
+node runs there — or, where its record already holds the rest of its body, it
+ends as the record does, and its finally node runs at that. The instantiating node leaves on the stop once that end has
+run — the end around it waits for it, innermost first — so a placed flow's
+nodes, its finally node among them, mean at a stop what they meant unplaced.
+
+**Never an end beside a worker that may still be running the instance.** A hub
+restarted mid-cancel finds the instance's dispatch either somewhere no worker
+holds it — an unanswered question, a parked redispatch — and makes the end
+there; or still `dispatched` to a session the dead process issued, and then the
+worker that took it is running the instance and is told by its next request's
+`410` to stop it, which ends it there and runs its finally node
+(`docs/distributed.md` §5). An end dispatched beside that worker would run the
+finally node a second time — §7.9 runs it "once when it ends" — so the restarted
+hub ends such a dispatch as the cancel's and makes no end: the instance's end is
+that worker's, as a placed node's attached instances' are, under the limitation
+D160 records for them (they end `failed`, not `cancelled`, because a `410` says
+that a session ended and not why). An end dispatch a replaced process had handed
+out is the same case, and so is a dispatch whose session the liveness sweep gave
+up on while its worker was stopping it for the cancel.
+
 **What comes home.** The instance's outputs as the dispatch's value, and its
 trace beside the value — on a failure or a cancel, beside the failure — as an
 optional `inner` field of the worker's result (`docs/distributed.md` §3.4). The
@@ -15708,10 +15739,11 @@ it dispatches (*What `run` does with one*) — rather than being refused or run 
 the CLI's process. [D159](#d159-finally-names-the-node-an-instance-runs-once-when-it-ends)'s
 finally node runs where its instance runs, on the worker, and its failure is
 the execution's `finally_error` as it would be on the hub. The mesh protocol's
-version does not move: `inner` on a result and `cancelled` on a poll answer are
-optional fields a peer of this release reads and an older one ignores — an older
-worker settles an end paused, which the hub reads as the cancel it was, with no
-finally node run (`docs/distributed.md` §10.2, §10.4). And the **non-case**:
+version does not move: `inner` on a result and `cancelled` and `stopped` on a
+poll answer are optional fields a peer of this release reads and an older one
+ignores — an older worker settles a cancel's end paused, which the hub reads as
+the cancel it was, with no finally node run, and whatever it answers a stop's
+end with is read as the stop (`docs/distributed.md` §10.2, §10.4). And the **non-case**:
 a `coder:` node naming a placement of its own is not added — q84 leaves that
 form open for a later question, should a flow prove too coarse a unit.
 

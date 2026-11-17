@@ -1944,7 +1944,11 @@ when the process died is not superseded as an orphan at the next start, as
 every other such row is (`docs/distributed.md` §5): read as one, the node's
 attempt would fail under its `retry:` and `on_error:` — the chain a cancel is
 never routed through — and the execution would end `failed`. It is left
-`dispatched` for the replay, which ends it as the cancel's. And a body whose
+`dispatched` for the replay, which ends it as the cancel's — and, where it is a
+placed flow's instance, makes no end dispatch for it: the worker that held it is
+still running it, and ends it when its session meets the restarted hub's `410`,
+so an end beside it would run its finally node twice (`docs/distributed.md` §2,
+§5). And a body whose
 whole record replays to its end had ended before the cancel could reach it, and
 settles as it ended — the cancel changes no outcome it arrives after.
 

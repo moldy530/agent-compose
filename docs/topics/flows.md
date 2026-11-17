@@ -191,7 +191,11 @@ arrives: one waiting at a `human:` question, which waits on the hub, is handed
 back to a worker as its **end**, which replays it to the question, ends it
 there and runs the finally node; the execution settles once that is done. An
 instance whose dispatch no worker ever took never began, and a cancel ends it
-with nothing run.
+with nothing run. The same end is made when the flow around a placed instance
+ends while it waits at its question — a sibling branch failed — and the instance
+ends `failed` there, running its finally node on a worker, as it would
+unplaced. A hub restarted while a worker was running the instance leaves its
+end to that worker rather than making a second one.
 
 A `run` of a placed flow — or of a flow whose node reaches one — is its own
 hub: at the first dispatch of a placed flow's instance it serves the worker

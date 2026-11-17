@@ -600,9 +600,11 @@ instance is one such dispatch, whatever started it: it takes one of a worker's
 on the hub's board like any other, a cancel ends each of its nodes `cancelled`
 and runs its finally node on the worker — a cancel that finds it waiting at
 such a question, with no worker running it, hands a worker the instance's end,
-which replays to the question and runs the finally node there, while an
-instance no worker ever took never began and runs nothing — and its outputs
-and its trace come home as the instance's. `serve` is one process that serves
+which replays to the question and runs the finally node there, as does an end
+of the flow around it that abandons that question (the instance then ends
+`failed`), while an instance no worker ever took never began and runs nothing,
+and one a worker is still running when a hub restarts is that worker's to end —
+and its outputs and its trace come home as the instance's. `serve` is one process that serves
 those routes, and a `run` (or `resume`) is the other for a placed flow: at its
 first dispatch of a placed flow's instance it serves them itself, at
 `--host`/`--port`, says `mesh: <url> — …` on stderr with the `worker` command
