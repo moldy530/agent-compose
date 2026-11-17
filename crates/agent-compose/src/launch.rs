@@ -20,6 +20,12 @@
 //! 4. **launch** the emitted project's own command line — `bun src/index.ts run …`
 //!    or `… serve …`, falling back to `node` where Bun is absent (PRD §9.18).
 //!
+//! Under `--no-build` (PRD resolved q87, Decision D170) the first two steps are
+//! not taken: the tree in the output directory is launched as it stands, once
+//! `build::as_built` has said it is one this release wrote, and step 3 reads the
+//! references out of that tree's own `src/env.ts` ([`environment_listed`])
+//! rather than out of an IR there is none of. Steps 3 and 4 are the same steps.
+//!
 //! # Why the verbs launch rather than link
 //!
 //! Nothing about invoking a compiled graph lives in this binary. The emitted
@@ -154,6 +160,37 @@ pub(crate) fn environment(ir: &Ir, manifest: &Manifest<'_>) -> Result<(), Refusa
         ),
         Manifest::Store(store) => compose_core::codegen::env::References::for_store(ir, store),
     };
+    environment_of(&references)
+}
+
+/// The same check, for a tree launched **as it stands** (`--no-build`, PRD
+/// resolved q87, Decision D170): the hub's references are read out of the
+/// tree's own `src/env.ts` rather than walked out of an IR there is none of.
+///
+/// That file is the one the launched process checks itself against at load —
+/// its `environmentReferences` is exactly the list [`environment`] computes, by
+/// construction — so reading it is two checks of one manifest still, and of the
+/// tree's own copy where an operator edited it. `manifest.json` is not where
+/// this is read from, because it carries the **placements'** manifests and not
+/// the hub's: it is what a worker reads, and a hub is not a placement.
+pub(crate) fn environment_listed(out: &Path) -> Result<(), Refusal> {
+    let path = out.join("src").join("env.ts");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| Refusal::Unusable(format!("cannot read `{}`: {error}", path.display())))?;
+    let references = compose_core::codegen::env::References::listed(&text).ok_or_else(|| {
+        Refusal::Unusable(format!(
+            "`{}` does not list its environment references the way a build writes them, so \
+                 the variables this tree needs cannot be checked before it is launched: rebuild \
+                 it with `agent-compose build`, or drop `--no-build`",
+            path.display()
+        ))
+    })?;
+    environment_of(&references)
+}
+
+/// Refuse naming every variable of `references` that is not set, each with the
+/// sites it is written at.
+fn environment_of(references: &compose_core::codegen::env::References) -> Result<(), Refusal> {
     let mut missing: Vec<String> = Vec::new();
     for name in references.names() {
         if std::env::var_os(name).is_none() {

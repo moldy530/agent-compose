@@ -13,7 +13,7 @@
 //! codegen (PRD §7 M1):
 //!
 //! ```text
-//! agent-compose build <path> [--target <name>] [--out <dir>] [--check]
+//! agent-compose build <path> [--target <name>] [--out <dir>] [--check | --restamp]
 //!                            [--format human|json]
 //! ```
 //!
@@ -27,6 +27,12 @@
 //! and have no TypeScript project. The work is all `compose-core`'s; what lives
 //! here is the surface — argument parsing, the choice of report format, writing
 //! the files, and the exit code.
+//!
+//! `--restamp` is the one form of `build` that reads no spec (PRD resolved q87,
+//! Decision D170): it recomputes `ARTIFACT_HASH` over the output directory as
+//! it stands — a tree somebody edited by hand — rewrites that one line of
+//! `src/artifact.ts`, and says on stderr that the tree no longer matches any
+//! source. See [`restamp_project`].
 //!
 //! The third reads **two** specs rather than one (PRD §7 M2):
 //!
@@ -67,12 +73,12 @@
 //!
 //! ```text
 //! agent-compose run <path> <flow> [--input k=v]... [--session <key>]
-//!                                 [--target <name>] [--out <dir>]
+//!                                 [--target <name>] [--out <dir>] [--no-build]
 //!                                 [--format human|json]
 //! agent-compose resume <path> <execution> [--target <name>] [--out <dir>]
 //!                                         [--format human|json]
 //! agent-compose serve <path> [--host <host>] [--port <port>]
-//!                            [--target <name>] [--out <dir>]
+//!                            [--target <name>] [--out <dir>] [--no-build]
 //!                            [--format human|json]
 //! ```
 //!
@@ -82,7 +88,11 @@
 //! compiled graph lives in this binary — see [`launch`], which is also where the
 //! two preconditions of *starting* something are checked: every `${ENV}`
 //! reference has a value (PRD §9.15) and the pinned dependency set is installed
-//! where the project can resolve it.
+//! where the project can resolve it. `run` and `serve` — and `cancel` below —
+//! take `--no-build`, which skips the build and launches the tree already in
+//! the output directory as it stands, once it has been checked to be a whole
+//! build of this release ([`launch_as_built`], PRD resolved q87); `resume` and
+//! `store` always build.
 //!
 //! The eighth reads and writes one `kv` store through the target's own backend,
 //! with no flow written (PRD resolved q72):
@@ -107,20 +117,22 @@
 //!
 //! ```text
 //! agent-compose worker --hub <url> --claim <name>... --token-env <VAR>
-//!                      [--data-dir <dir>]
+//!                      [--data-dir <dir>] [--no-build]
 //! ```
 //!
 //! A worker holds no checkout and no YAML: it joins the hub at `--hub`, is
 //! served the compiled project, and executes the nodes placed on the names it
 //! claims. It is grouped with the verbs that act on a composition because it
 //! runs one — the composition simply arrives over the wire rather than off
-//! disk — and everything about the protocol lives in [`worker`].
+//! disk — and everything about the protocol lives in [`worker`]. It builds
+//! nothing, so the `--no-build` it accepts changes nothing: it is there so one
+//! deploy script can pass the flag to every verb the ruling names (D170).
 //!
 //! `cancel` stops an execution a `serve` is running (PRD resolved q75):
 //!
 //! ```text
 //! agent-compose cancel <path> <execution> [--url <base>] [--header 'Name: value']...
-//!                      [--target <name>] [--out <dir>] [--format human|json]
+//!                      [--target <name>] [--out <dir>] [--no-build] [--format human|json]
 //! ```
 //!
 //! It builds the project as `resume` does and launches the emitted command line's
@@ -349,6 +361,10 @@ enum Command {
         /// Write nothing; report whether the directory already matches the spec
         #[arg(long)]
         check: bool,
+        /// Recompute `ARTIFACT_HASH` over the output directory as it stands, after a hand edit;
+        /// reads no spec and builds nothing
+        #[arg(long, conflicts_with = "check")]
+        restamp: bool,
         /// How to report what was found
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
@@ -371,6 +387,10 @@ enum Command {
         /// Where to write the generated project [default: <project>/build/<target>]
         #[arg(long, value_name = "DIR")]
         out: Option<PathBuf>,
+        /// Launch the project already built in the output directory as it stands: no validation,
+        /// no build, and the spec is not read
+        #[arg(long)]
+        no_build: bool,
         /// How to report what was found, and how the run answers
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
@@ -409,6 +429,10 @@ enum Command {
         /// Where to write the generated project [default: <project>/build/<target>]
         #[arg(long, value_name = "DIR")]
         out: Option<PathBuf>,
+        /// Launch the project already built in the output directory as it stands: no validation,
+        /// no build, and the spec is not read
+        #[arg(long)]
+        no_build: bool,
         /// How to report what was found
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
@@ -433,6 +457,10 @@ enum Command {
         /// Where to write the generated project [default: <project>/build/<target>]
         #[arg(long, value_name = "DIR")]
         out: Option<PathBuf>,
+        /// Launch the project already built in the output directory as it stands: no validation,
+        /// no build, and the spec is not read
+        #[arg(long)]
+        no_build: bool,
         /// How to report what was found, and what the app answered
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
@@ -457,6 +485,10 @@ enum Command {
         /// Where this worker keeps the artifacts it materialises [default: ~/.agent-compose/worker]
         #[arg(long, value_name = "DIR")]
         data_dir: Option<PathBuf>,
+        /// Accepted, and changes nothing: a worker builds nothing — it runs the artifact its hub
+        /// serves — so one deploy script can pass the flag to every verb that takes it
+        #[arg(long)]
+        no_build: bool,
     },
     // The five that teach, after the five that act on a composition. Clap lists
     // subcommands in declaration order, and `--help` is the first thing a
@@ -789,9 +821,13 @@ fn main() -> ExitCode {
             target,
             out,
             check,
+            restamp,
             format,
         } => {
             let out = out.unwrap_or_else(|| build::default_out(&path, &target));
+            if restamp {
+                return restamp_project(&out, format);
+            }
             build_project(&path, &target, &out, check, format)
         }
         Command::Run {
@@ -801,6 +837,7 @@ fn main() -> ExitCode {
             session,
             target,
             out,
+            no_build,
             format,
         } => {
             let out = out.unwrap_or_else(|| build::default_out(&path, &target));
@@ -829,6 +866,7 @@ fn main() -> ExitCode {
                 format.into(),
                 &launch::Manifest::Hub,
                 &arguments,
+                Prepare::from_flag(no_build),
             )
         }
         Command::Resume {
@@ -862,13 +900,20 @@ fn main() -> ExitCode {
                 format.into(),
                 &launch::Manifest::Hub,
                 &arguments,
+                Prepare::Build,
             )
         }
+        // `--no-build` is read and dropped: a worker compiles nothing — it runs
+        // the artifact its hub serves (`docs/distributed.md` §4) — so there is
+        // no build for the flag to skip, and it is accepted so that one deploy
+        // script can hand it to every verb the ruling names (PRD resolved q87,
+        // Decision D170).
         Command::Worker {
             hub,
             claims,
             token_env,
             data_dir,
+            no_build: _,
         } => worker::run(&worker::Options {
             hub,
             claims,
@@ -881,6 +926,7 @@ fn main() -> ExitCode {
             port,
             target,
             out,
+            no_build,
             format,
         } => {
             let out = out.unwrap_or_else(|| build::default_out(&path, &target));
@@ -899,6 +945,7 @@ fn main() -> ExitCode {
                 format.into(),
                 &launch::Manifest::Hub,
                 &arguments,
+                Prepare::from_flag(no_build),
             )
         }
         Command::Cancel {
@@ -908,6 +955,7 @@ fn main() -> ExitCode {
             headers,
             target,
             out,
+            no_build,
             format,
         } => {
             let out = out.unwrap_or_else(|| build::default_out(&path, &target));
@@ -940,6 +988,7 @@ fn main() -> ExitCode {
                 format.into(),
                 &launch::Manifest::Hub,
                 &arguments,
+                Prepare::from_flag(no_build),
             )
         }
         Command::Store { operation } => store(operation),
@@ -1113,6 +1162,8 @@ fn store(operation: StoreOperation) -> ExitCode {
     // nothing else of the composition (PRD resolved q82, Decision D166): it
     // opens that one backend and runs no flow, calls no model and serves no
     // trigger, so a variable only those spend is not one to refuse over.
+    // No `--no-build`: PRD resolved q87 names `serve`, `run`, `worker` and
+    // `cancel`, and a store command builds first, as it always has (D170).
     launch(
         &path,
         "store",
@@ -1121,6 +1172,7 @@ fn store(operation: StoreOperation) -> ExitCode {
         refused,
         &launch::Manifest::Store(&store),
         &arguments,
+        Prepare::Build,
     )
 }
 
@@ -1146,8 +1198,26 @@ impl From<Format> for Refused {
     }
 }
 
-/// `agent-compose run`, `agent-compose resume`, `agent-compose serve` and
-/// `agent-compose store`: build, then start.
+/// What [`launch`] does to the output directory before it starts the tree there.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Prepare {
+    /// Validate and build into it first, as every launching verb does by default.
+    Build,
+    /// Launch it as it stands (`--no-build`, PRD resolved q87): read no spec,
+    /// build nothing, and refuse a tree that is missing or not this release's.
+    AsBuilt,
+}
+
+impl Prepare {
+    /// The `--no-build` flag, read.
+    const fn from_flag(no_build: bool) -> Self {
+        if no_build { Self::AsBuilt } else { Self::Build }
+    }
+}
+
+/// `agent-compose run`, `agent-compose resume`, `agent-compose serve`,
+/// `agent-compose cancel` and `agent-compose store`: build, then start — or,
+/// under `--no-build`, start the tree that is already there ([`launch_as_built`]).
 ///
 /// The build half is [`build_project`]'s, run in the same order and refusing on
 /// the same report — a composition the compiler has something to say about is
@@ -1165,6 +1235,9 @@ impl From<Format> for Refused {
 /// answers, which is when the composition was refused and nothing was launched
 /// — and never for `store export`, whose stdout is only ever its lines
 /// ([`Refused::JsonOnStderr`]).
+// Eight arguments: the manifest (q82) and the prepare mode (q87) joined the six the
+// verb already handed over, and a struct for two flags would say less than the names do.
+#[allow(clippy::too_many_arguments)]
 fn launch(
     entrypoint: &Path,
     command: &str,
@@ -1173,7 +1246,11 @@ fn launch(
     refused: Refused,
     manifest: &launch::Manifest<'_>,
     arguments: &[String],
+    prepare: Prepare,
 ) -> ExitCode {
+    if prepare == Prepare::AsBuilt {
+        return launch_as_built(out, arguments);
+    }
     // The verb is the caller's, not this function's: every launching command
     // (`run`, `resume`, `serve`, `store`) comes through here, and a `serve` told that "`run` takes a spec entrypoint" names
     // a command the caller did not type.
@@ -1265,6 +1342,165 @@ fn launch(
         Ok(code) => ExitCode::from(code),
         Err(launch::Refusal::Unusable(reason)) => fail(&reason),
     }
+}
+
+/// `run`, `serve` and `cancel` under `--no-build`: launch the tree in `out` as
+/// it stands (PRD resolved q87, Decision D170).
+///
+/// What [`launch`] does after its build, and nothing before it. The spec is not
+/// read — its path only located `out` — so nothing is validated, emitted,
+/// scaffolded or written; what is checked is that a build of **this release**
+/// wrote the tree, whole ([`build::as_built`]), because a tree another release
+/// wrote runs a runtime this binary does not describe and a tree that is not
+/// wholly the compiler's is not one it launches as its own. Then the two
+/// preconditions of starting anything, exactly as after a build: the hub's
+/// environment, read out of the tree's own `src/env.ts`, and the dependency
+/// set.
+fn launch_as_built(out: &Path, arguments: &[String]) -> ExitCode {
+    if let Err(unbuilt) = build::as_built(out) {
+        return fail(&unbuilt_refusal(out, &unbuilt, Asking::NoBuild));
+    }
+    let runtime = match launch::runtime()
+        .and_then(|runtime| launch::environment_listed(out).map(|()| runtime))
+        .and_then(|runtime| launch::dependencies(out).map(|()| runtime))
+    {
+        Ok(runtime) => runtime,
+        Err(launch::Refusal::Unusable(reason)) => return fail(&reason),
+    };
+    match launch::spawn(&runtime, out, arguments) {
+        Ok(code) => ExitCode::from(code),
+        Err(launch::Refusal::Unusable(reason)) => fail(&reason),
+    }
+}
+
+/// Which flag asked for a tree as it stands — the remedy a refusal names is
+/// that flag's.
+#[derive(Clone, Copy)]
+enum Asking {
+    /// `run`, `serve` or `cancel` under `--no-build`.
+    NoBuild,
+    /// `build --restamp`.
+    Restamp,
+}
+
+/// The sentence a tree [`build::as_built`] refused is reported with (exit `2`).
+fn unbuilt_refusal(out: &Path, unbuilt: &build::Unbuilt, asking: Asking) -> String {
+    let shown = out.display();
+    let remedy = match asking {
+        Asking::NoBuild => "run `agent-compose build` first or drop `--no-build`",
+        Asking::Restamp => {
+            "run `agent-compose build` first: `--restamp` restamps a tree a build wrote"
+        }
+    };
+    let listed = |paths: &[String]| {
+        paths
+            .iter()
+            .map(|path| format!("`{path}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match unbuilt {
+        build::Unbuilt::Absent => format!("`{shown}` holds no built project; {remedy}"),
+        build::Unbuilt::OtherCompiler(built_by) => format!(
+            "`{shown}` was built by agent-compose {built_by}; this is {} — rebuild, or {} it \
+             with the compiler that built it",
+            compose_core::codegen::COMPILER_VERSION,
+            match asking {
+                Asking::NoBuild => "run",
+                Asking::Restamp => "restamp",
+            }
+        ),
+        build::Unbuilt::NotOurs(paths) => {
+            let (noun, verb) = if paths.len() == 1 {
+                ("a file", "carries")
+            } else {
+                ("files", "carry")
+            };
+            format!(
+                "`{shown}` holds {noun} this compiler did not write at a name a build writes ({}): \
+                 {} no generated-file header, which is how the compiler tells its work from \
+                 yours, and a tree that is not wholly its own is not one it {} as it stands. \
+                 Rebuild it with `agent-compose build`{}",
+                listed(paths),
+                if paths.len() == 1 {
+                    format!("it {verb}")
+                } else {
+                    format!("they {verb}")
+                },
+                match asking {
+                    Asking::NoBuild => "launches",
+                    Asking::Restamp => "restamps",
+                },
+                match asking {
+                    Asking::NoBuild => ", or drop `--no-build`",
+                    Asking::Restamp => "",
+                }
+            )
+        }
+        build::Unbuilt::Missing(paths) => format!(
+            "`{shown}` is not a whole build: `{}` lists {} that {} not there; {remedy}",
+            compose_core::codegen::artifact::SELF,
+            listed(paths),
+            if paths.len() == 1 { "is" } else { "are" }
+        ),
+        build::Unbuilt::Unreadable => format!(
+            "`{shown}`'s `{}` does not declare its hash, compiler and file list the way a build \
+             writes them; {remedy}",
+            compose_core::codegen::artifact::SELF
+        ),
+        build::Unbuilt::Io(error) => format!("cannot read `{shown}`: {error}"),
+    }
+}
+
+/// `agent-compose build --restamp`: recompute `ARTIFACT_HASH` over the output
+/// directory as it stands, and say so (PRD resolved q87, Decision D170).
+///
+/// The operator's explicit, logged statement that the tree is theirs now: no
+/// spec is read and nothing is validated or emitted, and the tree must be one a
+/// build of this release wrote ([`build::as_built`]) — the same refusals as
+/// `--no-build`'s, with this flag's remedy. The statement goes to **stderr**
+/// under both formats, because it is the record the ruling asks for; under
+/// `--format json` the answer is also one document on stdout,
+/// `{"artifact_hash": …, "restamped": …}`, so a deploy script can read the hash
+/// it is about to serve. A tree whose files still hash to what it carries is
+/// left untouched, and says that instead.
+fn restamp_project(out: &Path, format: Format) -> ExitCode {
+    let tree = match build::as_built(out) {
+        Ok(tree) => tree,
+        Err(unbuilt) => return fail(&unbuilt_refusal(out, &unbuilt, Asking::Restamp)),
+    };
+    let stamped = match build::restamp(out, &tree) {
+        Ok(stamped) => stamped,
+        Err(error) => return fail(&format!("cannot restamp `{}`: {error}", out.display())),
+    };
+    let said = if stamped.moved() {
+        format!(
+            "restamped `{}`: ARTIFACT_HASH is now {}; this tree no longer matches any source — a \
+             later `build` overwrites it\n",
+            out.display(),
+            stamped.after
+        )
+    } else {
+        format!(
+            "`{}` already carries the ARTIFACT_HASH its files hash to ({}): nothing was \
+             rewritten\n",
+            out.display(),
+            stamped.after
+        )
+    };
+    let _ = write(&mut io::stderr().lock(), &said);
+    if let Format::Json = format {
+        let document = serde_json::json!({
+            "artifact_hash": stamped.after,
+            "restamped": stamped.moved(),
+        });
+        match write(&mut io::stdout().lock(), &format!("{document}\n")) {
+            Ok(()) => {}
+            Err(error) if departed(&error) => {}
+            Err(error) => return fail(&format!("cannot write the report: {error}")),
+        }
+    }
+    ExitCode::from(CLEAN)
 }
 
 /// Print the warnings of a composition that was accepted, on the one stream a
