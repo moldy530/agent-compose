@@ -14,7 +14,9 @@
 //!    emitted project checks itself at process start too (`src/index.ts` calls
 //!    `readEnvironment()`), and both are wanted: the compiler knows every
 //!    reference statically, so it can name all of them and the site each is
-//!    written at *before* spawning anything;
+//!    written at *before* spawning anything. The references are those of the
+//!    process being started: the hub's for every verb but `store`, whose are
+//!    its store's backend entry's alone (PRD resolved q82, [`environment`]);
 //! 4. **launch** the emitted project's own command line — `bun src/index.ts run …`
 //!    or `… serve …`, falling back to `node` where Bun is absent (PRD §9.18).
 //!
@@ -103,8 +105,20 @@ fn answers(program: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// Refuse before spawning when a `${ENV}` reference the composition makes is not
-/// set (PRD 5.9, §9.15).
+/// Which manifest a launch is checked against: the one of the process the child
+/// is going to be (`docs/distributed.md` §9.1).
+pub(crate) enum Manifest<'a> {
+    /// `run`, `resume`, `serve` and `cancel`: the hub's, which is what each of
+    /// them starts.
+    Hub,
+    /// `store`: an operator's command over the store at this address, whose
+    /// only component is the backend it opens (PRD resolved q82, grammar
+    /// Decision D166).
+    Store(&'a str),
+}
+
+/// Refuse before spawning when a `${ENV}` reference the launched process needs
+/// is not set (PRD 5.9, §9.15).
 ///
 /// Every reference at once, each with the site it is written at: a run that
 /// stopped at the first would take as many attempts to configure as the project
@@ -112,22 +126,34 @@ fn answers(program: &str) -> bool {
 /// which is what covers a project run by hand; this one covers the case the
 /// milestone names, and covers it before a graph is built.
 ///
-/// **The list is the hub's**, which is what this process is going to be
-/// (`docs/distributed.md` §9.1, PRD resolved q41). A variable only a placement's
-/// worker spends is one this process never reads — the whole point of the
-/// partition is that "the hub cannot leak what it never held" — so demanding it
-/// here would refuse to start a deployment over a value that belongs on another
-/// machine. It is exactly `env::References::of` for every composition that
-/// places nothing, which is every composition until a deploy file says
-/// otherwise, and it is the same list `readEnvironment()` checks inside the
-/// emitted project: two checks of one manifest rather than two manifests.
-pub(crate) fn environment(ir: &Ir) -> Result<(), Refusal> {
-    let partition = compose_core::codegen::env::Partition::of(ir);
-    let references = compose_core::codegen::env::References::for_process(
-        ir,
-        &partition,
-        &compose_core::codegen::env::Process::Hub,
-    );
+/// **The list is the hub's** for every verb that starts the hub, which is what
+/// that process is going to be (`docs/distributed.md` §9.1, PRD resolved q41). A
+/// variable only a placement's worker spends is one this process never reads —
+/// the whole point of the partition is that "the hub cannot leak what it never
+/// held" — so demanding it here would refuse to start a deployment over a value
+/// that belongs on another machine. It is exactly `env::References::of` for
+/// every composition that places nothing, which is every composition until a
+/// deploy file says otherwise, and it is the same list `readEnvironment()`
+/// checks inside the emitted project: two checks of one manifest rather than two
+/// manifests.
+///
+/// **A `store` command's is its store's backend entry alone**
+/// ([`Manifest::Store`], PRD resolved q82): the command opens one backend and
+/// executes nothing else of the composition, so a model provider's key or a
+/// trigger's token is a variable it never spends, and refusing over one would
+/// fail a `store count` used as a health check over a value that has nothing to
+/// do with the store. The emitted `store` verb checks the same subset once it
+/// has resolved the store, and its load-time check stands aside for that verb —
+/// two checks of one manifest again.
+pub(crate) fn environment(ir: &Ir, manifest: &Manifest<'_>) -> Result<(), Refusal> {
+    let references = match manifest {
+        Manifest::Hub => compose_core::codegen::env::References::for_process(
+            ir,
+            &compose_core::codegen::env::Partition::of(ir),
+            &compose_core::codegen::env::Process::Hub,
+        ),
+        Manifest::Store(store) => compose_core::codegen::env::References::for_store(ir, store),
+    };
     let mut missing: Vec<String> = Vec::new();
     for name in references.names() {
         if std::env::var_os(name).is_none() {

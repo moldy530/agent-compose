@@ -534,6 +534,18 @@ export interface BackendBinding {
    * target's built-in decided — which is every process-local one.
    */
   readonly urlEnv?: string;
+  /**
+   * The `storage_backends:` entry the binding was read from, as a spec
+   * address — `deploy.storage_backends.aliases.<alias>` or
+   * `deploy.storage_backends.defaults.<kind>` — and absent where a target's
+   * built-in decided it.
+   *
+   * The prefix of every site `./env.ts` files this entry's `${ENV}` references
+   * under, which is how an operator's `store` command finds the variables its
+   * one backend needs and checks those alone (PRD resolved q82): the command
+   * opens this entry and nothing else of the composition.
+   */
+  readonly site?: string;
 }
 
 /** A resolved `store.*` (grammar 11.1), as `./graph.ts` binds it. */

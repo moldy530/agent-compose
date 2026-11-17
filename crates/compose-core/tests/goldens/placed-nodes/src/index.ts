@@ -15,6 +15,12 @@
 // means for this project: any `bun src/index.ts` or `node src/index.ts`, and any
 // import of it, throws naming every missing variable before a graph is built or
 // a model is called.
+// One launch stands aside: `bun src/index.ts store …`, an operator's command
+// over one store. It opens that store's backend and executes nothing else, so
+// its manifest is that backend's variables alone (PRD resolved q82) — and the
+// verb checks those once it knows the store, before the backend is opened. A
+// `store count` used as a health check is not refused over a model provider's
+// key it never spends.
 // The compiler never runs it — `agent-compose build` reads no environment, which
 // is what keeps a build on one machine reproducible on another and keeps a
 // credential out of every file it writes (PRD 5.9: refs "survive into the IR
@@ -54,10 +60,12 @@ export * from "./graph.ts";
 export * from "./schemas.ts";
 export * from "./state.ts";
 
-readEnvironment();
-
 const entry = process.argv[1];
-if (entry !== undefined && pathToFileURL(entry).href === import.meta.url && process.argv.length > 2) {
+const launched = entry !== undefined && pathToFileURL(entry).href === import.meta.url;
+
+if (!launched || process.argv[2] !== "store") readEnvironment();
+
+if (launched && process.argv.length > 2) {
   const { runMain } = await import("./cli.ts");
   await runMain(process.argv.slice(2));
 }

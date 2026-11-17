@@ -1999,6 +1999,13 @@ the partition is computed that way. The two worked cases are the two directions
 of that one sentence: the hub's list is narrowed by what the hub **cannot run**,
 never by what some placement also happens to reach.
 
+An operator's `agent-compose store` command is a process too, and the rule
+reads the same for it: its only component is the backend it opens, so its
+manifest is the `${ENV}` references of that store's `storage_backends:` entry
+and nothing else of the composition — no provider's, no trigger's, no
+journal's — which both the launcher and the emitted project's `store` verb
+check (PRD resolved q82, `docs/grammar.md` Decision D166).
+
 ### 9.2 The join-time check is self-reported presence
 
 A worker claiming `mac` without `SIGNING_KEY` set is refused at join with the

@@ -189,8 +189,13 @@ partition a flow would address, named by `--session <key>` or
 to `value_schema` like any other, and is not an effect of any execution: no
 journal or trace records it. On a store declaring `history: true` the key's
 history records it as actor `cli` — its only record anywhere ("A key's
-history", below) — and on any other store nothing does. `agent-compose docs cli`
-has the flags.
+history", below) — and on any other store nothing does. The command needs only
+the environment its store's backend entry references — the `${…}` in the
+`storage_backends:` entry the target binds the store to, and none on a store a
+built-in holds — so a `store count` used as a health check runs with a model
+provider's key or a trigger's token unset, and a backend variable that is unset
+is refused (exit `2`) naming it, before anything is opened (PRD resolved q82).
+`agent-compose docs cli` has the flags.
 
 ## Ops
 

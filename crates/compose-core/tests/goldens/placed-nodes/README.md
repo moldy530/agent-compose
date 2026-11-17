@@ -38,7 +38,7 @@ The LangGraph TypeScript project `agent-compose build` produced from `main.yml`,
 | `src/serve.ts` | the app over those triggers: start, status, resume and cancel (PRD 5.11), the one admission every trigger kind's start passes through — with the intake ledger a trigger's `dedupe_key:` and `concurrency:` decide under — `GET /sources/:name` and `GET /intakes/:id` |
 | `src/sources.ts` | what `serve` runs beside its routes: the scheduler that fires every `schedule` trigger's ticks, and the consumer that runs each `kind: command` source's program and admits what it prints (PRD resolved q78) |
 | `src/cli.ts` | this project's own command line, which `agent-compose run`, `agent-compose resume` and `agent-compose serve` launch |
-| `src/index.ts` | the project's public surface, the one caller of `readEnvironment()`, and the entry point the command line hangs off |
+| `src/index.ts` | the project's public surface, the caller of `readEnvironment()` at load — for every verb but `store`, which checks its one backend's variables itself — and the entry point the command line hangs off |
 | `src/worker-node.ts` | the worker half of the worker protocol: one placed node, executed out of this tree by `agent-compose worker`, with the dispatch on standard input and its effects and result as NDJSON on standard output (`docs/distributed.md` §3.2) |
 
 ## Running a flow
@@ -84,9 +84,11 @@ and a run that reaches it fails with a `SuperstepCeiling` saying so.
 `src/index.ts` calls `readEnvironment()` at module scope, so loading this project
 is what checks its environment: a missing variable throws before anything runs,
 naming every variable that is missing rather than the first (PRD 5.9, grammar
-4.3). `agent-compose build` itself reads no environment — no value is resolved at
-compile time, which is what keeps this directory committable and free of
-credentials.
+4.3). One verb is the exception: `store` opens one store's backend and runs
+nothing else, so it needs that backend's variables alone and checks those once
+it knows the store (PRD resolved q82). `agent-compose build` itself reads no
+environment — no value is resolved at compile time, which is what keeps this
+directory committable and free of credentials.
 
 **The file list above is the boundary.** `agent-compose build` replaces exactly
 the files in that table — every one of them, `package.json` and this README
@@ -228,6 +230,10 @@ under `--format json`; the exit code is `0` for a key found or a write applied,
 `1` for a key that holds nothing, a condition that declined or a backend that
 failed, and `2` for a command line it does not take — a value `value_schema`
 refuses among it, since nothing was written and the value is what is to fix.
+The environment it needs is the variables of the store's backend entry and no
+others: a model provider's key or a trigger's token is not asked for, and a
+variable the backend entry references that is unset is refused with exit `2`,
+naming it and where it is referenced, before the backend is opened.
 **An operator's write is not an effect**: it belongs to no execution, carries no
 idempotency key, and writes no journal row, no ledger row and no trace record.
 On a store that declares `history: true` it is recorded in one place, its

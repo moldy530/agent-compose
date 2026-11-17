@@ -739,6 +739,14 @@ fn stores(ir: &Ir, names: &Names, imported: &mut Vec<String>) -> String {
         if let Some(variable) = &backend.url_env {
             text.push_str(&format!("    urlEnv: {},\n", names::string(variable)));
         }
+        // The entry it was read from, as a spec address: the prefix of every
+        // site `./env.ts` files the entry's references under, which is what an
+        // operator's `store` command checks its environment against (PRD
+        // resolved q82). Absent where a target built-in decided, which is every
+        // binding of a `--target local` build.
+        if let Some(site) = &backend.site {
+            text.push_str(&format!("    site: {},\n", names::string(site)));
+        }
         text.push_str("  },\n");
         text.push_str("};\n");
     }
@@ -6423,11 +6431,14 @@ flow.f:
         assert!(!surface.contains("docs_upsert"), "{surface}");
 
         // …and the binding under it names the variable its backend dials with,
-        // as a **name** and never a value (grammar 4.3).
+        // as a **name** and never a value (grammar 4.3), and the entry it was
+        // read from — the prefix of the sites an operator's `store` command
+        // checks its environment against (PRD resolved q82).
         assert!(
             dialled.contains(
                 "    provider: \"postgres\",\n    from: \"the `kv` default of the `staging` \
-                 target\",\n    urlEnv: \"PREFS_URL\",\n"
+                 target\",\n    urlEnv: \"PREFS_URL\",\n    site: \
+                 \"deploy.storage_backends.defaults.kv\",\n  },\n"
             ),
             "{dialled}"
         );

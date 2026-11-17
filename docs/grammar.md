@@ -12587,6 +12587,14 @@ D154 are what it is built on, and none is amended.
 
 **Status**: shipped. *PRD 5.12, resolved q23, q68, q69, q70, q72, q74; §11.1, §11.3, §11.4.*
 
+**Amended by [D166](#d166-a-store-commands-environment-is-its-stores-backend-references-alone)**
+(PRD resolved q82), by one clause: the command no longer inherits `run`'s
+environment precondition. "With that target's environment variables" above is
+its store's backend entry's variables and no others — the precondition is the
+backend's — so a provider's key or a trigger's token unset does not refuse it,
+and a backend variable unset is refused, exit `2`, by the launcher and by the
+emitted verb alike, before anything is opened.
+
 ### D156. A `kv` batch is one write of many keys, and its list is a literal
 
 A `batch` op on a `kv` store takes `ops:` — a literal list of 1 to 100 entries,
@@ -14526,6 +14534,91 @@ expected to keep it, unchecked, as every other driver contract is.
 
 **Status**: ratified — PRD resolved q67. *PRD resolved q54, q57, q60, q66, q67;
 §8.9; builds on D138, D140, D146.*
+
+### D166. A `store` command's environment is its store's backend references alone
+
+An operator's `agent-compose store` command needs the `${ENV}` references of
+the `storage_backends:` entry its store binds on the target — the references
+`codegen/env.rs` files under that entry's own owner — and nothing else of the
+composition. Both checks read that one manifest for the verb. The launcher's
+(`References::for_store`) refuses before the built project is started, exit
+`2`, naming each missing variable and the site it is written at, in the words
+the hub's refusal uses. The emitted project's module-scope `readEnvironment()`
+stands aside when `src/index.ts` is launched with `store`, and the verb, once it
+has resolved the store, checks the subset of `environmentReferences` whose sites
+sit under the binding's `site` — the entry's spec address,
+`deploy.storage_backends.aliases.<alias>` or `…defaults.<kind>`, which the
+emitted `BackendBinding` now carries — refusing a missing one as a usage error,
+exit `2`, with `MissingEnvironmentError`'s own message, before the backend is
+opened. A store a target built-in holds — every store under `--target local`
+(D87), and one whose kind the target neither aliases nor defaults — needs none,
+and so does a store the command opens nothing for: an address naming no store, a
+`vector` or `blob` store, and a `kv` store whose rows live only in the memory of
+the process that opened them (D155). Each is the command's usage refusal, and
+the launcher's manifest for it is empty so that the refusal is what the operator
+reads — not a demand for the variable of a backend the command will not open.
+`run`, `resume`, `serve`, `cancel` and a worker keep their manifests exactly, and
+so does the partition.
+
+**Rationale**: `docs/distributed.md` §9.1's rule is that a process's manifest is
+the variables referenced by every component that can execute in it, and an
+operator's store command is a process that executes one: the backend it opens.
+It calls no model, serves no trigger, opens no journal (D155: no journal row),
+joins no mesh and installs nothing, so a provider's key, a trigger's token, the
+journal's address, the join token and a registry token are variables it never
+spends. Demanding them was PRD resolved q72's reading — the store command
+inherits `run`'s environment precondition — and it made a `store count` used
+as a health check fail over a model provider's URL, which read as data loss. A
+credential the command never spends is one it must not demand: the reasoning
+that keeps a placement's keys off the hub (PRD resolved q41).
+
+**One resolution, three readers.** Which entry a store opens is
+`ir::deploy::backend_of`'s answer — its alias, else its kind's default, else the
+built-in — and the manifest reads that answer rather than deriving it again:
+`References::for_store` filters the one `collect` walk to the owner
+`Partition::of` files that entry under, through one helper the partition's
+backend clause now reads as well, and the emitted binding's `site` is written
+from the same `backend_of` result. The launcher, the partition and the emitted
+verb cannot disagree about which entry a store opens. Which stores the command
+opens **at all** is the emitted `operatorRefusal`'s answer, and the launcher reads
+it clause for clause (`an_operator_opens`: `kv` only, and not process-local) — a
+second statement of one rule rather than a reading of one function, because the
+refusal is runtime code and the manifest is the compiler's; the store CLI suite
+drives a `vector` store through both with its backend's variable unset, so a
+divergence is a failing test rather than a credential demanded out of order.
+
+**Why the emitted check moves rather than narrowing at load.** Loading
+`src/index.ts` cannot know which store a `store` command names until its
+arguments are parsed, and a load-time check of every store's backends together
+would demand a variable of a backend the command does not open — the false
+requirement again, one level down. So the load-time check stands aside for the
+verb, keyed on the entry module's own `process.argv[2]` exactly as the dispatch
+beneath it already is (an import of the barrel from a host script is checked as
+before), and the verb checks first thing after resolving the address — before
+any op, so "refused before anything is opened" holds. Every other verb, and a
+bare load, is checked at load exactly as before.
+
+**Collision review.** PRD resolved q41 and `docs/distributed.md` §9.1: the rule
+applied to one more process. §9.1 gains one sentence saying so; no clause of its
+executes-in list changes and no process's manifest moves. PRD resolved q45:
+untouched — the command's own refusal of a store whose rows are process-local
+(D155), like its refusal of a store that is not `kv`, runs before the
+environment check in both the launcher and the emitted verb, and is unchanged.
+PRD resolved q59: a
+registry token is on every *process's* manifest because every process installs;
+the store command installs nothing (the launcher checks only that an install is
+there), so the token is not on its manifest, and the hub's and each placement's
+are unchanged. PRD resolved q63: a dialled arm opens with its entry's `url:`
+variable, which is exactly what this manifest requires. PRD resolved q72 and
+[D155](#d155-an-operator-reads-and-writes-a-kv-store-from-the-command-line-and-the-write-is-not-an-effect):
+**amended** — the command no longer inherits `run`'s environment precondition;
+everything else D155 states stands, and its Status carries the note. PRD
+resolved q15: presence is still a launch-time check and never a build-time one,
+reported all at once with sites. No grammar changes: no key, no static check and
+no diagnostic is added or moved.
+
+**Status**: ratified — PRD resolved q82. *PRD resolved q15, q41, q45, q59, q63,
+q72, q82; `docs/distributed.md` §9.1; amends D155.*
 
 ## Appendix B — Editor integration
 

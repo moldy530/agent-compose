@@ -821,7 +821,15 @@ fn main() -> ExitCode {
                 }
                 .to_string(),
             );
-            launch(&path, "run", &target, &out, format.into(), &arguments)
+            launch(
+                &path,
+                "run",
+                &target,
+                &out,
+                format.into(),
+                &launch::Manifest::Hub,
+                &arguments,
+            )
         }
         Command::Resume {
             path,
@@ -846,7 +854,15 @@ fn main() -> ExitCode {
                 }
                 .to_string(),
             ];
-            launch(&path, "resume", &target, &out, format.into(), &arguments)
+            launch(
+                &path,
+                "resume",
+                &target,
+                &out,
+                format.into(),
+                &launch::Manifest::Hub,
+                &arguments,
+            )
         }
         Command::Worker {
             hub,
@@ -875,7 +891,15 @@ fn main() -> ExitCode {
                 "--port".to_string(),
                 port.to_string(),
             ];
-            launch(&path, "serve", &target, &out, format.into(), &arguments)
+            launch(
+                &path,
+                "serve",
+                &target,
+                &out,
+                format.into(),
+                &launch::Manifest::Hub,
+                &arguments,
+            )
         }
         Command::Cancel {
             path,
@@ -908,7 +932,15 @@ fn main() -> ExitCode {
                 }
                 .to_string(),
             );
-            launch(&path, "cancel", &target, &out, format.into(), &arguments)
+            launch(
+                &path,
+                "cancel",
+                &target,
+                &out,
+                format.into(),
+                &launch::Manifest::Hub,
+                &arguments,
+            )
         }
         Command::Store { operation } => store(operation),
         Command::Docs { topic } => docs(topic.as_deref()),
@@ -925,7 +957,10 @@ fn main() -> ExitCode {
 /// The compiler carries no database driver (PRD 5.12), so it does for a store
 /// exactly what it does for a flow: [`launch`] validates, builds into the
 /// directory `build` would, checks the environment and the dependency set, and
-/// hands the child the arguments — whose exit code is this command's. Every
+/// hands the child the arguments — whose exit code is this command's. The
+/// environment is the one thing it checks differently: a `store` command's is
+/// its store's backend entry's alone, never the hub's (PRD resolved q82,
+/// [`launch::Manifest::Store`]). Every
 /// option goes ahead of the operands and the operands after a bare `--`, so a
 /// key that begins with `--` reaches the child as a key; and `--file` is made
 /// absolute first, because the child runs in the build directory rather than
@@ -1064,7 +1099,7 @@ fn store(operation: StoreOperation) -> ExitCode {
         .to_string(),
     );
     arguments.push("--".to_string());
-    arguments.push(store);
+    arguments.push(store.clone());
     arguments.extend(operands);
     // An export's stdout is only ever its lines, which an operator redirects
     // into a file for an import to read back — so a composition refused before
@@ -1074,7 +1109,19 @@ fn store(operation: StoreOperation) -> ExitCode {
         (Format::Json, "export") => Refused::JsonOnStderr,
         (format, _) => format.into(),
     };
-    launch(&path, "store", &target, &out, refused, &arguments)
+    // The environment the command needs is its store's backend entry's and
+    // nothing else of the composition (PRD resolved q82, Decision D166): it
+    // opens that one backend and runs no flow, calls no model and serves no
+    // trigger, so a variable only those spend is not one to refuse over.
+    launch(
+        &path,
+        "store",
+        &target,
+        &out,
+        refused,
+        &launch::Manifest::Store(&store),
+        &arguments,
+    )
 }
 
 /// How [`launch`] reports a composition it refuses before launching anything —
@@ -1106,8 +1153,10 @@ impl From<Format> for Refused {
 /// the same report — a composition the compiler has something to say about is
 /// not one to launch. What it adds is the two preconditions of *starting*
 /// something, both of them PRD §9.15's ("`run`/`serve` fail fast before invoking
-/// the graph"): every `${ENV}` reference the composition makes has a value, and
-/// the pinned dependency set is installed where the project can resolve it.
+/// the graph"): every `${ENV}` reference the launched process needs has a value
+/// — `manifest` names which process that is: the hub, or a `store` command's
+/// one backend (PRD resolved q82) — and the pinned dependency set is installed
+/// where the project can resolve it.
 ///
 /// Nothing is written to stdout on this side. The child's stdout **is** the
 /// command's answer — the flow's outputs for `run`, the readiness line for
@@ -1122,6 +1171,7 @@ fn launch(
     target: &str,
     out: &Path,
     refused: Refused,
+    manifest: &launch::Manifest<'_>,
     arguments: &[String],
 ) -> ExitCode {
     // The verb is the caller's, not this function's: every launching command
@@ -1205,7 +1255,7 @@ fn launch(
     }
 
     let runtime = match launch::runtime()
-        .and_then(|runtime| launch::environment(&ir).map(|()| runtime))
+        .and_then(|runtime| launch::environment(&ir, manifest).map(|()| runtime))
         .and_then(|runtime| launch::dependencies(out).map(|()| runtime))
     {
         Ok(runtime) => runtime,
