@@ -62,13 +62,13 @@ compiled project.
 | `validate <path>` | parse, resolve imports, run every static check. **The loop.** |
 | `plan <before> <after>` | diff two specs: components, topology, interfaces, validation |
 | `visualize <path>` | draw the flows as one self-contained HTML page; `--flow`, `-o`, `--format html\|json` |
-| `build <path>` | emit the TypeScript project; `--check` reports drift instead of writing |
-| `run <path> <flow>` | build, then run one flow; `--input k=v`, `--session <key>` |
+| `build <path>` | emit the TypeScript project; `--check` reports drift instead of writing; `--restamp` re-hashes a hand-edited build in place, reading no spec |
+| `run <path> <flow>` | build, then run one flow; `--input k=v`, `--session <key>`; `--no-build` runs the tree already built instead |
 | `resume <path> <execution>` | build, then carry on a journaled execution — replaying its recorded effects rather than re-issuing them |
-| `serve <path>` | build, then serve the project's triggers: `http` routes, `schedule` ticks, and `kind: command` event sources |
-| `cancel <path> <execution>` | stop an execution a `serve` is running, and every open child execution it started; `--url <base>` (or the target's `hub.public_url`), `--header 'Name: value'` for the starting trigger's `auth:` |
+| `serve <path>` | build, then serve the project's triggers: `http` routes, `schedule` ticks, and `kind: command` event sources; `--no-build` serves the tree already built |
+| `cancel <path> <execution>` | stop an execution a `serve` is running, and every open child execution it started; `--url <base>` (or the target's `hub.public_url`), `--header 'Name: value'` for the starting trigger's `auth:`; `--no-build` as `run`'s |
 | `store <sub-verb> <path> <store>` | build, then read or write one `kv` store through the target's own backend with no flow: `get`, `set`, `delete`, `list`, `count`, `export`, `import`, `log`; `--session <key>` or `--execution <id>` names the partition |
-| `worker --hub <url> --claim <name> --token-env <VAR>` | join a hub and run the nodes placed on the names it claims; takes no spec |
+| `worker --hub <url> --claim <name> --token-env <VAR>` | join a hub and run the nodes placed on the names it claims; takes no spec, and accepts `--no-build`, which changes nothing |
 | `docs [<topic>]` | the topic index, or one topic |
 | `explain <code>` | the expanded account of one diagnostic code |
 | `schema` | the published JSON Schema, for an editor's `$schema` |
@@ -92,7 +92,7 @@ answers what changed in the composition.
 |---|---|
 | `0` | clean, or **warnings** only, or a plan was produced, or a document was printed, or a cancel was accepted |
 | `1` | the answer is no: **errors**, drift, a run with no answer, a resume that diverged from its journal, an occupied directory, a cancel the app refused (`404`, `409` for an execution already ended, or the trigger's auth) |
-| `2` | the command could not run at all: bad usage, unreadable entrypoint, missing dependency, an execution id the journal does not hold open (a cancelled one among them), a cancel that reached no app |
+| `2` | the command could not run at all: bad usage, unreadable entrypoint, missing dependency, an execution id the journal does not hold open (a cancelled one among them), a cancel that reached no app, a `--no-build` or `--restamp` directory holding no whole build of this release |
 | `3` | a `run` or `resume` stopped at a `human` pause and had nobody to ask |
 
 Branch on these rather than on message text: codes and exit codes are stable,
@@ -204,7 +204,11 @@ normative text.
   build so they travel with the artifact. Running one is running a tool: the
   node's policy chain, the journal and the trace treat it exactly as they treat
   an `exec:`. `agent-compose docs tools` has the rules, including the `env:` and
-  exactly-pinned `dependencies:` a module declares.
+  exactly-pinned `dependencies:` a module declares. Where a built tree has been
+  edited by hand anyway, `agent-compose build main.yml --restamp` re-hashes it
+  as it stands so a worker accepts it, and
+  `agent-compose serve main.yml --no-build` serves it without rebuilding — until
+  the next `build`, which overwrites it.
 - **Never put a credential in a spec.** Where a secret may come from is a rule
   the compiler enforces rather than a convention you can keep by being careful;
   `agent-compose docs models` is where it is written.

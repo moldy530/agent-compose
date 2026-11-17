@@ -14776,6 +14776,120 @@ wire its connection speaks.
 **Status**: ratified — PRD resolved q83. *PRD 5.9, G3, resolved q53, q57, q58,
 q60, q83; §8.9, §12.2; builds on D40, D141, D146.*
 
+### D170. `--no-build` launches a built tree as it stands, and `build --restamp` re-hashes one
+
+`serve`, `run` and `cancel` take **`--no-build`**: the tree already in the output
+directory is launched as it stands — nothing validated, emitted or scaffolded,
+and the spec not read — once it has been checked to be a whole build of **this
+release**; a tree that is missing, that another release wrote, or that holds a
+file without the generated-file header at a name a build writes is refused,
+exit `2`. `worker` takes the flag too, and it changes nothing there. `build`
+takes **`--restamp`**: `ARTIFACT_HASH` is recomputed over the output directory
+as it stands, by the rule a build hashes it with, that one line of
+`src/artifact.ts` is rewritten, and stderr says the tree no longer matches any
+source. Without either flag every verb does what it did.
+
+**What `--no-build` checks, in order.** The output directory is located as it
+always is — `--out`, or `<project>/build/<target>` off the spec path and
+`--target`, which is the one thing the path is still for — and then:
+
+1. `src/artifact.ts` is there, or the directory "holds no built project";
+2. it carries the generated-file header, or it is a file this compiler did not
+   write;
+3. its `COMPILER_VERSION` is this binary's, read off that one declaration alone
+   so that a tree an older release wrote is named as that release's even where
+   the release spelled the rest of the file differently — "built by
+   agent-compose `<v>`; this is `<w>`";
+4. its `ARTIFACT_HASH`, `COMPILER_VERSION` and `ARTIFACT_FILES` are each
+   declared once in the shape a build writes, every listed path inside the tree;
+5. every path `ARTIFACT_FILES` lists is there, and every one of them that
+   `EMITTED_PATHS` claims still carries the header. A listed path outside that
+   claim is an authored file the tree carries (PRD resolved q49): its bytes are
+   the author's and carry no header, so it only has to be there.
+
+Then the two preconditions of starting anything, as after a build: the hub's
+environment and the dependency set. The environment is read out of the tree's
+own `src/env.ts` — its `environmentReferences`, names and sites, which is
+exactly the list a build-first launch computes from the IR and the list the
+launched process checks itself against at load — so the refusal is the same
+sentence, and the two checks are of one list even where an operator edited it.
+`manifest.json` is not where it is read from: it carries the *placements'*
+manifests, for a worker, and a hub is not a placement.
+
+**What `--restamp` writes.** Nothing but the one line. The same five checks
+gate it, with its own remedy; the hash is
+`compose_core::codegen::artifact::rehash` — `hash_of` over the bytes each listed
+file holds on disk, `src/artifact.ts` skipped as the rule always skips it — and
+`ARTIFACT_FILES`, `COMPILER_VERSION` and every comment stay the bytes they were.
+The statement goes to stderr under both formats, because it is the record the
+ruling asks for; under `--format json` stdout also carries
+`{"artifact_hash": …, "restamped": …}`. A tree whose files still hash to what it
+carries is written nothing, and says so rather than claiming it stopped
+matching its source. `--restamp` beside `--check` is a clap conflict: one writes
+the stamp, the other writes nothing and compares the tree with the spec.
+
+**Why the hub and the worker agree after a restamp.** The hub tars exactly
+`ARTIFACT_FILES` off its own disk for `/workers/artifact/{hash}`
+(`docs/distributed.md` §3.5), and a worker hashes the **entries it unpacked** —
+not the tarball's bytes — with the same `hash_of` before it writes anything (§4
+step 2). So the hash a restamp writes is the hash a worker computes for the
+tarball a hub serves of that tree, and a hand-edited tree that was *not*
+restamped is the one it refuses, naming both hashes.
+
+**Rationale**: the hash check is the integrity promise — an artifact a worker
+runs is what the compiler emitted — and it stays whole: `--no-build` launches
+what the compiler emitted without emitting it again, and `--restamp` is the
+operator's explicit, logged statement that the tree is theirs now, which is the
+honest spelling of what a user otherwise did by hand (recompute the hash, start
+`bun src/index.ts serve`). Refusing another release's tree under both flags is
+what keeps the handshake triple's second member true: `COMPILER_VERSION` still
+names the release that generated the tree a worker is handed, and the runtime it
+needs is still the one that release pins (q40). Reading the environment out of
+the tree rather than skipping the check keeps PRD resolved q15's "fail fast
+before invoking the graph" on the one path that has no IR to walk.
+
+**The worker's flag.** `agent-compose worker` takes no spec and builds nothing:
+it joins a hub and runs the artifact the hub serves (`docs/distributed.md` §4).
+So there is no build for `--no-build` to skip, and the flag is accepted so that
+one deploy script can pass it to every verb the ruling names; it is read and
+dropped, and `--help` says so.
+
+**Non-cases.** `resume` and `store` are not given the flag: the ruling names
+`serve`, `run`, `worker` and `cancel`, and both keep building first — a resume
+replays a journal against the build it makes, and a store command opens the
+backend the build it makes binds (D155). `--no-build` does not check
+`ARTIFACT_HASH` against the tree: a run or a hub serving a hand-edited,
+unrestamped tree runs it, and it is a **worker** that refuses such a tree's
+artifact, which is where the promise is kept. Neither flag is a way to adopt a
+tree another release wrote. `build --check` is unchanged, and reports a
+restamped tree as drift like any other edit; the `NotOurs` refusal of a plain
+build is unchanged; the hash definition is unchanged.
+
+**Collision review.** PRD resolved q40 (the artifact hash and the handshake
+triple): unamended — the hash rule, the hub's one served artifact and the
+worker's verification are the ones it ruled, and a restamp produces a hash by
+that rule. q44 (v1 distributed's invariants): unaffected — no hub state moves
+into the tree, and nothing here forecloses HA. q47 and
+[D132](#d132-the-emitted-file-list-is-the-boundary-and-module-is-the-way-across-it)
+(the emitted file list is the boundary): read at their own words — the
+generated-file header is still the only evidence a file is the compiler's, and
+`--no-build`'s fifth check is that rule applied to a tree read rather than
+written. q48 and q49 (authored files inside the artifact and its hash):
+unamended — a carried file is on `ARTIFACT_FILES`, inside a restamp's hash, and
+needs no header. q15 and q41 (launch-time environment, the hub's own manifest):
+the check runs on the hub's list, read out of the tree. q72 and
+[D155](#d155-an-operator-reads-and-writes-a-kv-store-from-the-command-line-and-the-write-is-not-an-effect)
+(the store command): unaffected, and named as a non-case above. q75 and
+[D160](#d160-a-cancel-ends-an-execution-cancelled-through-one-controller-every-node-chains-to)
+(the `cancel` verb): `--no-build` launches the same emitted verb out of the
+tree. [D145](#d145-the-package-registry-is-a-deploy-layer-slot-and-build-writes-both-installers-configuration)
+(a target's installer files): unaffected — they are emitted paths on
+`ARTIFACT_FILES` like any other, and checked so.
+
+**Status**: ratified — PRD resolved q87. *PRD resolved q15, q40, q41, q44, q47,
+q48, q49, q72, q75, q87; `docs/distributed.md` §3.5, §4, §4.1; builds on D132,
+D155, D160.*
+
 ## Appendix B — Editor integration
 
 [`schemas/agent-compose.schema.json`](../schemas/agent-compose.schema.json) is a

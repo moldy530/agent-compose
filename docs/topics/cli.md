@@ -7,19 +7,21 @@ compositions in general and take no spec at all.
 agent-compose validate <path> [--target <name>] [--format human|json]
 agent-compose plan <before> <after> [--format human|json]
 agent-compose visualize <path> [--flow <addr>] [-o <path>] [--format html|json]
-agent-compose build <path> [--target <name>] [--out <dir>] [--check] [--format human|json]
+agent-compose build <path> [--target <name>] [--out <dir>] [--check | --restamp]
+                           [--format human|json]
 agent-compose run <path> <flow> [--input k=v]... [--session <key>]
-                                [--target <name>] [--out <dir>] [--format human|json]
+                                [--target <name>] [--out <dir>] [--no-build] [--format human|json]
 agent-compose resume <path> <execution> [--target <name>] [--out <dir>]
                                         [--format human|json]
 agent-compose serve <path> [--host <host>] [--port <port>]
-                           [--target <name>] [--out <dir>] [--format human|json]
+                           [--target <name>] [--out <dir>] [--no-build] [--format human|json]
 agent-compose cancel <path> <execution> [--url <base>] [--header 'Name: value']...
-                                        [--target <name>] [--out <dir>] [--format human|json]
+                                        [--target <name>] [--out <dir>] [--no-build]
+                                        [--format human|json]
 agent-compose store <sub-verb> <path> <store> [operands] [--session <key> | --execution <id>]
                     [--target <name>] [--out <dir>] [--format human|json]
 agent-compose worker --hub <url> --claim <name>... --token-env <VAR>
-                     [--data-dir <dir>]
+                     [--data-dir <dir>] [--no-build]
 
 agent-compose docs [<topic>]
 agent-compose explain <code>
@@ -161,6 +163,30 @@ of the tree's content hash, so an edited implementation is a build to re-run and
 a new artifact. How many a build carried is on its verdict line, beside the count
 of what it emitted.
 
+**`--restamp` re-hashes a tree somebody edited by hand.** A generated file
+edited in place no longer matches the tree's `ARTIFACT_HASH`, and a worker
+refuses the artifact a hub serves of it, because the hash is how a worker knows
+it runs only what the compiler emitted. `--restamp` reads no spec and validates
+nothing: it reads `src/artifact.ts` out of `--out`, recomputes the hash over the
+files its `ARTIFACT_FILES` lists exactly as they stand, by the rule a build
+hashes them with, and rewrites that one line — the file list and every other
+byte stay as they are. It is your statement, logged, that the tree is yours now,
+and it says so on stderr in both formats:
+
+```
+restamped `build/local`: ARTIFACT_HASH is now sha256:6822…; this tree no longer matches any source — a later `build` overwrites it
+```
+
+A tree whose files still hash to what it carries is left untouched, and the line
+says that instead. Under `--format json` the answer is also one document on
+stdout, `{"artifact_hash": …, "restamped": …}`, with `restamped` `false` when
+nothing was rewritten. A directory no build wrote, a tree another release wrote,
+and one holding a file without the generated-file header at a name a build
+writes are refused, exit `2` — the same refusals `--no-build` makes (see
+[`run`](#run)). It cannot be asked beside `--check`, which writes nothing; and a
+restamped tree is drift to `--check` like any other edit, so a later
+`agent-compose build main.yml` writes the spec's tree back over it.
+
 `build --format json` writes `validate`'s two keys and two more:
 `{"diagnostics": [ … ], "warnings": [ … ], "drift": [ … ], "scaffolded": [ … ]}`,
 where `drift` names the files that do not match and `scaffolded` names the
@@ -184,6 +210,27 @@ key off.
 
 Before invoking the graph it checks two preconditions: every `${ENV}` reference
 has a value, and the pinned dependency set is installed.
+
+**`--no-build` launches the tree already in `--out` as it stands** — the same
+flag on `run`, `serve` and `cancel`, and only those (PRD resolved q87). Nothing
+is validated, emitted or scaffolded and the spec is not read: its path, with
+`--target`, only locates the default output directory, so
+`agent-compose run main.yml flow.<name> --no-build` runs `build/local` whatever
+`main.yml` now says. The tree has to be a whole build of this release, and is
+refused before anything is launched — exit `2` — when it is not:
+
+```
+error: `build/local` holds no built project; run `agent-compose build` first or drop `--no-build`
+error: `build/local` was built by agent-compose 0.17.0; this is 0.18.0 — rebuild, or run it with the compiler that built it
+```
+
+and likewise when a file `src/artifact.ts` lists is not there, or one at a name
+a build writes no longer carries the generated-file header. A generated file
+edited with its header kept is still the compiler's, and is launched as edited.
+The two preconditions still run: the variables are the ones the tree's own
+`src/env.ts` lists, refused in the words above, and the dependency set is
+checked where it always is. A hand edit and a mesh need one more step before a
+worker will take the tree — `--restamp`, under [`build`](#build).
 
 **A run is refused rather than queued when a trigger's group is full.** A run
 reads the slots off the project's journal before it starts: where an `http`,
@@ -255,7 +302,9 @@ event source an `event` trigger binds — with `GET /sources/:name` reporting it
 and `GET /intakes/:id` reporting an arrival a trigger's `concurrency:` queued,
 debounced, started or dropped.
 `--port 0` takes one the operating system picks. Its stdout is the app's
-readiness line. A target that declares a `redis_streams`, `sqs` or `nats`
+readiness line. `--no-build` serves the tree already in `--out` as it stands,
+under the refusals [`run`](#run) gives it — a hub then names, and serves, that
+tree's own `ARTIFACT_HASH` to every worker that joins. A target that declares a `redis_streams`, `sqs` or `nats`
 source is refused at start, exit `2`, naming the source: this release runs no
 consumer for those kinds.
 
@@ -282,7 +331,9 @@ instead — each instance ends `cancelled` and runs its `finally:` node once.
 
 Stops an execution a `serve` is running, and every open child execution it
 started, recursively (PRD resolved q75). Same build as `run`, then the emitted
-project's own `cancel` verb sends `POST /executions/:id/cancel` to the app.
+project's own `cancel` verb sends `POST /executions/:id/cancel` to the app —
+or, under `--no-build`, that verb out of the tree already in `--out`, as
+[`run`](#run) launches one.
 
 ```sh
 agent-compose cancel main.yml exec_9f1c8a3e-1b7d-4a20-9d61-1f0e8a2c4d55 \
@@ -474,7 +525,9 @@ is read from — the same one that target's `hub.join_token:` names; the worker 
 told the name by its invocation because the artifact that would have named it is
 what the hub serves *after* the join. `--data-dir` is where materialised
 artifacts are kept, keyed by content hash, so a redeployment and a rollback are
-both a directory that is already there.
+both a directory that is already there. `--no-build` is accepted and changes
+nothing: a worker builds nothing — it runs what its hub serves — so a deploy
+script may pass the flag to every verb that takes it.
 
 It runs **every dispatch it holds at once**, and keeps polling while any is
 running, so a placement's `max_running:` (how many of its dispatches one worker
@@ -556,9 +609,9 @@ dropped would leave you believing something had been installed under `$HOME`.
 
 | code | meaning |
 |---|---|
-| `0` | clean: nothing was reported, or nothing but **warnings** was, or a `plan` was produced, or a document was printed, or a `store` op found or applied, or a `cancel` was accepted |
+| `0` | clean: nothing was reported, or nothing but **warnings** was, or a `plan` was produced, or a document was printed, or a `store` op found or applied, or a `cancel` was accepted, or a `build --restamp` restamped its tree or found nothing to rewrite |
 | `1` | **errors** were reported, `build --check` found drift, a `run` produced no answer, a `resume` diverged from its journal, a `store` op found nothing, declined its condition or met a failing backend, a `store export` could not write its lines (a full disk, never a reader that left), a `plan`'s spec did not resolve, a `cancel` was refused (an execution that had already ended, an id the app does not know, a credential the trigger refused), or a discovery verb found something already there and would not replace it |
-| `2` | the command could not run: bad usage, an unreadable entrypoint, an unwritable output directory, a missing or malformed environment variable (for `store`, one its store's backend entry references — no other is asked for), an uninstalled dependency set, no JavaScript runtime to launch, a `resume` naming an execution the journal does not hold open (a cancelled one among them), a `cancel` that reached no app or had no URL to send to, a `store` address, sub-verb or partition flag the composition does not take, a `store log` of a store that keeps no history, or a `store` value its `value_schema` refuses |
+| `2` | the command could not run: bad usage, an unreadable entrypoint, an unwritable output directory, a missing or malformed environment variable (for `store`, one its store's backend entry references — no other is asked for), an uninstalled dependency set, no JavaScript runtime to launch, a `resume` naming an execution the journal does not hold open (a cancelled one among them), a `cancel` that reached no app or had no URL to send to, a `store` address, sub-verb or partition flag the composition does not take, a `store log` of a store that keeps no history, a `store` value its `value_schema` refuses, or a `--no-build` or `--restamp` output directory that holds no whole build of this release (none at all, another release's, or one with a file the compiler did not write at a name a build writes) |
 | `3` | a `run` or `resume` with nobody to ask stopped at a `human` pause |
 
 The split between `1` and `2` is *the answer is no* versus *the command could

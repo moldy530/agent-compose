@@ -1285,6 +1285,24 @@ version on every worker exactly as it installs every other pin — and the
 artifact hash moves with it, because a different SDK release is a different
 artifact.
 
+**A tree edited by hand is restamped, not exempted** (PRD resolved q87,
+`docs/grammar.md` D170). The hub tars `ARTIFACT_FILES` off its own disk when a
+worker fetches (§3.5), so a file edited in place after the build is served
+under a hash its bytes no longer have, and step 2 refuses it — the worker stops,
+naming the hash it computed and the one it asked for, and writes nothing. That
+refusal is the integrity promise working, and nothing here relaxes it. The
+operator's way through is `agent-compose build <path> --restamp`, which
+recomputes `ARTIFACT_HASH` over the tree as it stands — the same rule over the
+same files' bytes that step 2 runs over the entries it unpacked, so the two
+answers are one — and says on stderr that the tree no longer matches
+any source; `agent-compose serve <path> --no-build` then serves that tree
+without re-emitting it. A restamped tree is an ordinary artifact from there on:
+a new hash, reached by every worker through this handshake, with `COMPILER_VERSION`
+unchanged — a restamp refuses a tree another release wrote, so the triple's
+second member still names the release that generated the tree, and the
+runtime a worker needs is still the one that release pins. The next `build`
+overwrites it.
+
 ### 4.1 The handshake triple
 
 A join agrees on three values, and all three are on the wire, in the join §3.1
