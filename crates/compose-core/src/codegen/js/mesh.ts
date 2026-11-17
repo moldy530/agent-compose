@@ -79,6 +79,7 @@ import {
   replayedFailure,
 } from "./journal.ts";
 import {
+  cancelFired,
   dispatchPlacedInstances,
   fireCancel,
   handsOutPlacedNodes,
@@ -650,6 +651,14 @@ type Ending =
 /** The dispatches this process is awaiting, by `dispatch_id`. */
 const awaiting = new Map<string, Awaiting>();
 
+/**
+ * The dispatches among them that are the **end** a cancel owes a placed flow's
+ * instance ([`dispatchPlaced`]), by `dispatch_id`: what the poll that hands one
+ * over marks `cancelled: true`, so the worker replays the instance to its
+ * frontier and ends it there as the cancel ended it (§3.2, Decision D171).
+ */
+const ends = new Set<string>();
+
 /** Next placement-wait ordinal per execution and instance path (§6.1). */
 const ordinals = new Map<string, Map<string, number>>();
 
@@ -859,6 +868,34 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
   //
   // Every other ending leaves this loop on its first turn, which is why the two
   // reads that decide it are the first thing after the park.
+  //
+  // **Save the end a cancel owes a placed flow's instance** (PRD resolved q75
+  // ruling e, q76, q84; Decision D171). A cancel ends an instance a worker is
+  // running through that worker (§3.2's `cancel` list), and its finally node
+  // runs there. An instance whose pause came home, or whose redispatch is
+  // parked, has no worker running it when the cancel arrives — and it has
+  // begun: its nodes ran on a worker, and its finally node is owed exactly as an
+  // unplaced instance's is when the cancel finds it at a pause. The hub cannot
+  // run that node itself, because nothing of a placed flow runs on the hub
+  // (grammar §14.1 rule 2) and its environment is the placement's, not the
+  // hub's. So the loop goes round once more as an **end dispatch**: the
+  // instance, handed to a worker claiming the placement with its whole effect
+  // history and `cancelled: true` (§3.2), which replays to the frontier, ends
+  // there `cancelled` and runs its finally node, and comes home `status:
+  // "cancelled"` with the trace and the `finally_error` (§3.4). The cancel does
+  // not withdraw it — it is the cancel's own end, which grammar §7.9 waits for
+  // and never stops — and it parks while nothing claims the placement, as the
+  // redispatch an answer makes does. An instance whose dispatch no worker ever
+  // took has not begun, and has no end to run anything at (grammar §7.9): the
+  // cancel withdraws it, and it settles as the cancel with no finally node run.
+  let paused = false;
+  let ending = false;
+  // Whether a cancel that has just ended this instance owes it an end on a
+  // worker: a placed flow's, that has begun — a pause of it came home, or the
+  // journal holds an effect it made.
+  const owesEnd = async (): Promise<boolean> =>
+    options.instance === true &&
+    (paused || (await journal.effectsUnder(options.execution, site)).length > 0);
   for (;;) {
     // A placed flow's **root** instance sits at the empty instance path
     // (Decision D171), and its wait is keyed by the execution and the flow's
@@ -899,8 +936,16 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
         fireCancel(options.execution);
         throw replayedFailure(row.outcome);
       }
-      const ending = endingOf(row);
-      if (ending.kind === "answer") return absorb(options, ending.answer);
+      const ended = endingOf(row);
+      if (ended.kind === "answer") return absorb(options, ended.answer);
+      // An end dispatch is never settled paused — its replay stops at the
+      // frontier, where the cancel fires — so one that was is read as the
+      // cancel it was made for.
+      if (ending) {
+        fireCancel(options.execution);
+        throw new ExecutionCancelled(options.execution);
+      }
+      paused = true;
       // **A pause a dead hub was holding**, re-derived rather than remembered
       // (§5's first rule). Which of the two things this generation owes it is
       // decided by the journal and by nothing else: an answered pause has its
@@ -921,21 +966,43 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
       // wait re-planted on a cancelled execution would be one every resume
       // refuses and nothing ever releases (PRD resolved q75 ruling e,
       // `docs/durability.md` §6.1).
-      if ((await journal.lookup(options.execution, ending.pause.effect.key)) === undefined) {
+      //
+      // …and a placed flow's instance it stops there is owed its end on a
+      // worker, as the live cancel's is (above): the loop goes round as the end
+      // dispatch.
+      if ((await journal.lookup(options.execution, ended.pause.effect.key)) === undefined) {
         const refusal = frontierRefusal(options.execution, site);
-        if (refusal !== undefined) throw refusal;
-        await answered(journal, options, ending.pause);
+        if (refusal !== undefined) {
+          if (!(await owesEnd())) throw refusal;
+          ending = true;
+          continue;
+        }
+        if (await planted(journal, options, ended.pause)) {
+          ending = true;
+          continue;
+        }
       }
       continue;
     }
     if (row.status === "superseded") {
+      // An end dispatch whose session the hub lost — or that a dead process was
+      // holding — is dispatched again: the end is still owed, and the next
+      // worker replays whatever the last one streamed home.
+      if (ending) continue;
       // A dispatch this execution's **cancel** withdrew — parked, or reached
       // still open by a generation completing the cancel (below) — is read back
       // as the cancel it was, exactly as a row a worker settled cancelled is
       // above, and never as a failure a `retry:` or an `on_error:` would act on
       // (PRD resolved q75, `docs/durability.md` §6.1).
+      //
+      // …and where it withdrew a begun instance's redispatch, the end that
+      // instance is owed is the next row (above).
       if (row.detail === CANCELLED_DETAIL) {
         fireCancel(options.execution);
+        if (await owesEnd()) {
+          ending = true;
+          continue;
+        }
         throw new ExecutionCancelled(options.execution);
       }
       throw new DispatchSuperseded(
@@ -953,10 +1020,15 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
     // this question ([`supersedeOrphans`]): read as an orphan first, it would
     // fail the node's attempt under its `retry:`/`on_error:` chain, the one
     // thing a cancelled node is never routed through.
-    const refusal = frontierRefusal(options.execution, site);
+    //
+    // An end dispatch is the one open row this does not ask about: it is the
+    // cancel's own end, which the cancel does not stop (above).
+    const refusal = ending ? undefined : frontierRefusal(options.execution, site);
     if (refusal !== undefined) {
       await journal.supersedeDispatch(row.id, CANCELLED_DETAIL);
-      throw refusal;
+      if (!(await owesEnd())) throw refusal;
+      ending = true;
+      continue;
     }
     // …and a row some dead process had handed to a session: sessions are this
     // process's only (§5), so one it did not issue is one whose holder this hub
@@ -967,13 +1039,60 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
     // for the frontier above.
     if (row.status === "dispatched" && !sessions.has(row.session ?? "")) {
       await journal.supersedeDispatch(row.id, ORPHANED);
+      if (ending) continue;
       throw new DispatchSuperseded(options.node, options.placement, ORPHANED);
     }
     rows.set(row.id, row);
 
-    const ending = await awaited(journal, options, row, site);
-    if (ending.kind === "answer") return absorb(options, ending.answer);
-    await answered(journal, options, ending.pause);
+    let withdrawn = false;
+    let settled: Ending;
+    try {
+      settled = await awaited(journal, options, row, site, {
+        end: ending,
+        withdrawn: () => {
+          withdrawn = true;
+        },
+      });
+    } catch (error) {
+      // The cancel withdrew this row while it was parked — no worker held it,
+      // so none ran the instance's end — and the instance had begun: its end
+      // is the next row.
+      if (withdrawn && !ending && (await owesEnd())) {
+        ending = true;
+        continue;
+      }
+      // An end dispatch whose session the hub lost (§6.3) is made again.
+      if (ending && error instanceof Error && error.name === "DispatchSuperseded") continue;
+      throw error;
+    }
+    if (settled.kind === "answer") return absorb(options, settled.answer);
+    if (ending) {
+      fireCancel(options.execution);
+      throw new ExecutionCancelled(options.execution);
+    }
+    paused = true;
+    if (await planted(journal, options, settled.pause)) ending = true;
+  }
+}
+
+/**
+ * [`answered`], for a dispatch the loop above owns: plant the pause and wait for
+ * its answer — answering `false` once it has one — or answer `true` where the
+ * execution's cancel released the wait while it was on the board and the
+ * instance it belongs to is a placed flow's, which is then owed its end on a
+ * worker. Every other way the wait ends is thrown, as [`answered`] throws it.
+ */
+async function planted(
+  journal: Journal,
+  options: DispatchOptions,
+  pause: runtime.RemotePause,
+): Promise<boolean> {
+  try {
+    await answered(journal, options, pause);
+    return false;
+  } catch (error) {
+    if (options.instance === true && cancelFired(options.execution)) return true;
+    throw error;
   }
 }
 
@@ -1036,13 +1155,21 @@ function releaseStopped(id: string, finallyError?: string): void {
  * report and the parked-work counter read, the abort that supersedes a dispatch
  * whose node ran out of time, and the stir that hands a held poll the wait that
  * has just gone on the board.
+ *
+ * `how.end` marks the row as the **end dispatch** a cancel owes a placed flow's
+ * instance ([`dispatchPlaced`]): no signal reaches it — it is the cancel's own
+ * end, which nothing stops — and the poll that hands it over says
+ * `cancelled: true` ([`ends`]). `how.withdrawn` is told when a cancel withdraws
+ * the row while it is still parked, which no worker has run any of.
  */
 function awaited(
   journal: Journal,
   options: DispatchOptions,
   row: DispatchRow,
   site: string,
+  how: { readonly end: boolean; readonly withdrawn: () => void },
 ): Promise<Ending> {
+  const signal = how.end ? undefined : options.signal;
   return new Promise<Ending>((resolve, reject) => {
     // Settles when this wait is over, however it ends — what a cancel that
     // reached a worker holds the node's site open on ([`holdRemoteEnd`]).
@@ -1074,7 +1201,7 @@ function awaited(
       // against that session's capacity, while the worker is told on its next
       // poll and stops the process running it; its `status: "cancelled"` result
       // is what settles the row (§3.4).
-      if (cancellationOf(options.signal?.reason) !== undefined) {
+      if (cancellationOf(signal?.reason) !== undefined) {
         // **And what settles the node.** A node a worker is running began its
         // instances there — an attached `flow.*`, whose finally node the cancel
         // starts in the runner — and a cancelled node settles only once every
@@ -1091,6 +1218,7 @@ function awaited(
           stirPolls();
           return;
         }
+        how.withdrawn();
         held.settle({
           kind: "error",
           name: CANCELLED,
@@ -1110,8 +1238,8 @@ function awaited(
       // the row is ended rather than left for a worker to take work nothing
       // will read the answer of.
       const reason =
-        options.signal?.reason instanceof Error
-          ? options.signal.reason.message
+        signal?.reason instanceof Error
+          ? signal.reason.message
           : "the node execution ended";
       // **The board is cleared in this turn, and the row is ended after it.**
       // `rows` is what a poll reads, so dropping the entry here is what stops a
@@ -1165,7 +1293,8 @@ function awaited(
     };
     const finish = (): void => {
       awaiting.delete(row.id);
-      options.signal?.removeEventListener("abort", abort);
+      ends.delete(row.id);
+      signal?.removeEventListener("abort", abort);
       announceWaits(options.execution);
       over();
     };
@@ -1173,11 +1302,12 @@ function awaited(
     // for its worker's result ([`stopOnHolder`]) leaves one the result can
     // settle.
     awaiting.set(row.id, held);
-    if (options.signal?.aborted === true) {
+    if (how.end) ends.add(row.id);
+    if (signal?.aborted === true) {
       abort();
       return;
     }
-    options.signal?.addEventListener("abort", abort, { once: true });
+    signal?.addEventListener("abort", abort, { once: true });
     announceWaits(options.execution);
     // A worker may already be holding a poll: this is a wait that has just gone
     // on the board, and §6.2's wake is "a joining worker's claims are scanned
@@ -2238,6 +2368,10 @@ async function taken(session: Session): Promise<Record<string, unknown> | undefi
       ...(claimed.itemIndex === undefined ? {} : { item_index: claimed.itemIndex }),
       ...(claimed.history === undefined ? {} : { history: claimed.history }),
       ...(claimed.policy === undefined ? {} : { policy: claimed.policy }),
+      // The end a cancel owes a placed flow's instance (Decision D171): the
+      // worker replays it to its frontier, where the cancel fires, and runs its
+      // finally node. OPTIONAL, and absent on every other dispatch (§3.2).
+      ...(ends.has(claimed.id) ? { cancelled: true } : {}),
       // What a redispatched node replays to the frontier before going live
       // (§3.2, §7.2). Read out of the journal at the moment it is handed over,
       // which is §5's first rule: nothing is held from an earlier session.
