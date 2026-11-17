@@ -9097,6 +9097,16 @@ carve-out, and it costs nothing — a fork has finitely many pairs, and the
 per-pair distances are the same walk the per-fork version already did. *PRD 5.3,
 5.6, G3.*
 
+**Amended by [D169](#d169-two-guards-are-exclusive-when-one-holds-a-boolean-read-and-the-other-its-negation)** (PRD resolved q86), by one clause: the exclusivity
+relation co-takeability is read against gains §7.6.1's rule 3 — two guards are
+exclusive when one holds a `bool`-typed read `q` as a top-level `&&` conjunct
+and the other holds `!q` — beside rule 1's `else:` and rule 2's disjoint
+variant sets. Nothing above moves: co-takeability is still a relation on a pair,
+named per sibling, and a pair rule 3 proves exclusive leaves `dist` and the
+concurrency relation exactly as `e₃`'s pairs do here — so `a.output.ok &&
+input.x` and `a.output.ok && !input.x` converging on one node is no longer an
+unbalanced convergence, and fewer pairs reach D112's comparison.
+
 ### D100. Both accepted-outcome lists are non-empty and distinct
 
 `expect_exit` and `expect_status` are each a **non-empty** list of **distinct**
