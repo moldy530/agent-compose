@@ -446,8 +446,9 @@ fn negate_each_other(one: &BTreeSet<guards::Literal>, other: &BTreeSet<guards::L
         .any(|literal| other.contains(&literal.negation()))
 }
 
-/// The enum-typed fields of a fork's output, with their variant sets. `start`
-/// has no output, so its edges are only ever proved exclusive by rule 1.
+/// The enum-typed fields of a fork's output, with their variant sets — what
+/// rule 2 reads. `start` has no output, so rule 2 never applies to its edges;
+/// rules 1 and 3 do, as they do to any other vertex's (the module header).
 fn source_enums<'a>(
     ctx: &Ctx<'a>,
     graph: &Graph<'a>,
