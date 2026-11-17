@@ -20,6 +20,12 @@ Options:
       --session <KEY>
           The session identity session-scoped stores key off (grammar 11.3)
 
+      --host <HOST>
+          Where a worker joins this run, once it reaches a placed flow [default: 127.0.0.1]
+
+      --port <PORT>
+          The port a worker joins this run on; `0` takes one the operating system picks [default: 0]
+
       --target <NAME>
           Deploy target to resolve and emit for
           
