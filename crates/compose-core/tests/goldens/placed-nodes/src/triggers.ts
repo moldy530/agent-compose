@@ -552,6 +552,21 @@ export const httpTriggers: readonly HttpTrigger[] = [
     },
   },
   {
+    name: "on_placed_asking_raced",
+    flow: "flow.placed_asking_raced",
+    path: "/placed-asking-races",
+    method: "POST",
+    respond: "async",
+    readsBody: true,
+    input: (payload) => {
+      const bound = roots(payload);
+      return {
+        "path": runtime.toJson(runtime.evaluate("payload.body.path", bound)),
+        "gate": runtime.toJson(runtime.evaluate("payload.body.gate", bound)),
+      };
+    },
+  },
+  {
     name: "on_placed_build",
     flow: "flow.placed_build",
     path: "/placed-builds",
@@ -583,6 +598,20 @@ export const httpTriggers: readonly HttpTrigger[] = [
     name: "on_placed_closing",
     flow: "flow.placed_closing",
     path: "/placed-closings",
+    method: "POST",
+    respond: "async",
+    readsBody: true,
+    input: (payload) => {
+      const bound = roots(payload);
+      return {
+        "path": runtime.toJson(runtime.evaluate("payload.body.path", bound)),
+      };
+    },
+  },
+  {
+    name: "on_placed_holding",
+    flow: "flow.placed_holding",
+    path: "/placed-holdings",
     method: "POST",
     respond: "async",
     readsBody: true,

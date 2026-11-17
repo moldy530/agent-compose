@@ -473,6 +473,28 @@ export const flowPlacedAskingNodeCloseOutOutput = z.object({
 }).strict();
 export type FlowPlacedAskingNodeCloseOutOutput = z.infer<typeof flowPlacedAskingNodeCloseOutOutput>;
 
+/** `flow.placed_asking_raced` — the module's parameters (grammar 7.5). */
+export const flowPlacedAskingRacedInputs = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+  gate: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type FlowPlacedAskingRacedInputs = z.infer<typeof flowPlacedAskingRacedInputs>;
+
+/**
+ * `flow.placed_asking_raced` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowPlacedAskingRacedOutputs = z.object({}).strict();
+export type FlowPlacedAskingRacedOutputs = z.infer<typeof flowPlacedAskingRacedOutputs>;
+
+/**
+ * `flow.placed_asking_raced` node `doomed` — what the subprocess produces (grammar 8.2), which it does not declare, so this is the kind default.
+ */
+export const flowPlacedAskingRacedNodeDoomedOutput = z.object({
+  exit_code: z.number().int(),
+  stdout: z.string(),
+}).strict();
+export type FlowPlacedAskingRacedNodeDoomedOutput = z.infer<typeof flowPlacedAskingRacedNodeDoomedOutput>;
+
 /** `flow.placed_build` — the module's parameters (grammar 7.5). */
 export const flowPlacedBuildInputs = z.object({
   path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
@@ -540,6 +562,38 @@ export const flowPlacedClosingNodeCloseUpOutput = z.object({
   stdout: z.string(),
 }).strict();
 export type FlowPlacedClosingNodeCloseUpOutput = z.infer<typeof flowPlacedClosingNodeCloseUpOutput>;
+
+/** `flow.placed_holding` — the module's parameters (grammar 7.5). */
+export const flowPlacedHoldingInputs = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type FlowPlacedHoldingInputs = z.infer<typeof flowPlacedHoldingInputs>;
+
+/**
+ * `flow.placed_holding` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowPlacedHoldingOutputs = z.object({
+  signature: z.string(),
+}).strict();
+export type FlowPlacedHoldingOutputs = z.infer<typeof flowPlacedHoldingOutputs>;
+
+/**
+ * `flow.placed_holding` node `hold` — what the subprocess produces (grammar 8.2), which it does not declare, so this is the kind default.
+ */
+export const flowPlacedHoldingNodeHoldOutput = z.object({
+  exit_code: z.number().int(),
+  stdout: z.string(),
+}).strict();
+export type FlowPlacedHoldingNodeHoldOutput = z.infer<typeof flowPlacedHoldingNodeHoldOutput>;
+
+/**
+ * `flow.placed_holding` node `settle_up` — what the subprocess produces (grammar 8.2), which it does not declare, so this is the kind default.
+ */
+export const flowPlacedHoldingNodeSettleUpOutput = z.object({
+  exit_code: z.number().int(),
+  stdout: z.string(),
+}).strict();
+export type FlowPlacedHoldingNodeSettleUpOutput = z.infer<typeof flowPlacedHoldingNodeSettleUpOutput>;
 
 /** `flow.placed_lapsed` — the module's parameters (grammar 7.5). */
 export const flowPlacedLapsedInputs = z.object({

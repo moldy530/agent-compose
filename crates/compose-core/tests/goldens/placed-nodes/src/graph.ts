@@ -59,6 +59,9 @@ import {
   flowPlacedAskingInputs,
   flowPlacedAskingNodeAskOutput,
   flowPlacedAskingNodeCloseOutOutput,
+  flowPlacedAskingOutputs,
+  flowPlacedAskingRacedInputs,
+  flowPlacedAskingRacedNodeDoomedOutput,
   flowPlacedBuildInputs,
   flowPlacedBuildNodeSettleOutput,
   flowPlacedBuildOutputs,
@@ -67,6 +70,9 @@ import {
   flowPlacedClosingNodeCloseUpOutput,
   flowPlacedClosingNodeLookLongOutput,
   flowPlacedClosingOutputs,
+  flowPlacedHoldingInputs,
+  flowPlacedHoldingNodeHoldOutput,
+  flowPlacedHoldingNodeSettleUpOutput,
   flowPlacedLapsedInputs,
   flowPlacedRetriedInputs,
   flowPlacedThenSignedInputs,
@@ -406,6 +412,34 @@ const flowPlacedAskingNodeCloseOutShape: runtime.Shape = {
   }
 };
 
+/** `flow.placed_asking_raced` — the `input` root inside it (grammar 7.5). */
+const flowPlacedAskingRacedShape: runtime.Shape = {
+  "properties": {
+    "gate": "string",
+    "path": "string"
+  }
+};
+
+/**
+ * `flow.placed_asking_raced` node `asking` — the `asking.output` root its guards read.
+ */
+const flowPlacedAskingRacedNodeAskingShape: runtime.Shape = {
+  "properties": {
+    "approval": "string",
+    "signature": "string"
+  }
+};
+
+/**
+ * `flow.placed_asking_raced` node `doomed` — the `doomed.output` root its guards read.
+ */
+const flowPlacedAskingRacedNodeDoomedShape: runtime.Shape = {
+  "properties": {
+    "exit_code": "int",
+    "stdout": "string"
+  }
+};
+
 /** `flow.placed_build` — the `input` root inside it (grammar 7.5). */
 const flowPlacedBuildShape: runtime.Shape = {
   "properties": {
@@ -471,6 +505,42 @@ const flowPlacedClosingNodeLookLongShape: runtime.Shape = {
  * `flow.placed_closing` node `close_up` — the `close_up.output` root its guards read.
  */
 const flowPlacedClosingNodeCloseUpShape: runtime.Shape = {
+  "properties": {
+    "exit_code": "int",
+    "stdout": "string"
+  }
+};
+
+/** `flow.placed_holding` — the `input` root inside it (grammar 7.5). */
+const flowPlacedHoldingShape: runtime.Shape = {
+  "properties": {
+    "path": "string"
+  }
+};
+
+/**
+ * `flow.placed_holding` node `inspect` — the `inspect.output` root its guards read.
+ */
+const flowPlacedHoldingNodeInspectShape: runtime.Shape = {
+  "properties": {
+    "signature": "string"
+  }
+};
+
+/**
+ * `flow.placed_holding` node `hold` — the `hold.output` root its guards read.
+ */
+const flowPlacedHoldingNodeHoldShape: runtime.Shape = {
+  "properties": {
+    "exit_code": "int",
+    "stdout": "string"
+  }
+};
+
+/**
+ * `flow.placed_holding` node `settle_up` — the `settle_up.output` root its guards read.
+ */
+const flowPlacedHoldingNodeSettleUpShape: runtime.Shape = {
   "properties": {
     "exit_code": "int",
     "stdout": "string"
@@ -2693,6 +2763,114 @@ const flowPlacedAskingBinding: runtime.SubflowBinding = {
     }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
 };
 
+// --- flow.placed_asking_raced ---
+
+/**
+ * `flow.placed_asking_raced` node `asking` — `flow.placed_asking` (grammar 8.5).
+ */
+const flowPlacedAskingRacedNodeAsking: runtime.NodeDescriptor = {
+  flow: "flow.placed_asking_raced",
+  node: "asking",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from `defaults:`, `on_error` from `defaults:`.
+  policy: {
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowPlacedAskingRacedShape, state: stateShape, output: flowPlacedAskingRacedNodeAskingShape },
+  input: (roots) => ({
+    "path": runtime.toJson(runtime.evaluate("input.path", roots)),
+  }),
+  run: async (input, context, view) =>
+    runtime.runSubflow(flowPlacedAskingBinding, {
+      inputs: input as Record<string, unknown>,
+      execution: view.run.execution,
+      path: runtime.instancePath(view, "asking"),
+      signal: context.signal,
+      bodyEnded: context.bodyEnded,
+      policy: runtime.instancePolicy(view.run.policy, undefined),
+    }),
+  writes: [
+    { field: "signature", channel: "signature", reduce: "set" },
+    { field: "approval", channel: "approval", reduce: "set" },
+  ],
+  edges: [
+    { to: END },
+  ],
+};
+
+/**
+ * `flow.placed_asking_raced` node `doomed` — an inline subprocess (grammar 8.2).
+ */
+const flowPlacedAskingRacedNodeDoomed: runtime.NodeDescriptor = {
+  flow: "flow.placed_asking_raced",
+  node: "doomed",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from `defaults:`, `on_error` from `defaults:`.
+  policy: {
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowPlacedAskingRacedShape, state: stateShape, output: flowPlacedAskingRacedNodeDoomedShape },
+  input: (roots) => ({
+    "gate": runtime.toJson(runtime.evaluate("input.gate", roots)),
+  }),
+  run: async (input, context) => ({
+    output: runtime.parseResult(
+      flowPlacedAskingRacedNodeDoomedOutput,
+      await runtime.runExec({
+        command: [{ env: "OPS_BIN", site: "flow.placed_asking_raced.node.doomed.exec.command" }, "/sh"],
+        args: [
+          ["-c"],
+          ["while [ ! -e \"$GATE\" ]; do sleep 0.05; done; exit 1"],
+        ],
+        env: [],
+        expectExit: [0],
+        decoding: { envelope: ["exit_code", "stdout"], decoded: [], empty: false },
+      }, input, context),
+      "the result of `flow.placed_asking_raced` node `doomed`",
+    ),
+  }),
+  writes: [],
+  edges: [
+    { to: END },
+  ],
+};
+
+/**
+ * `flow.placed_asking_raced` — its nodes, its `start` edges, and the compiled graph.
+ */
+function flowPlacedAskingRaced() {
+  return new StateGraph(State)
+    .addNode("asking", (state: GraphState) => runtime.runNode(flowPlacedAskingRacedNodeAsking, state), {
+      ends: [END],
+    })
+    .addNode("doomed", (state: GraphState) => runtime.runNode(flowPlacedAskingRacedNodeDoomed, state), {
+      ends: [END],
+    })
+    .addEdge(START, "asking")
+    .addEdge(START, "doomed")
+    .compile();
+}
+
+/**
+ * `flow.placed_asking_raced`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowPlacedAskingRacedGraph = flowPlacedAskingRaced();
+
+/**
+ * `flow.placed_asking_raced` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowPlacedAskingRacedBinding: runtime.SubflowBinding = {
+  address: "flow.placed_asking_raced",
+  outputs: [],
+  recursionLimit: 27,
+  stream: (initial, options) =>
+    flowPlacedAskingRacedGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowPlacedAskingRacedGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
+
 // --- flow.placed_build ---
 
 /** `flow.placed_build` node `inspect` — `agent.inspector` (grammar 8.1). */
@@ -3017,6 +3195,144 @@ const flowPlacedClosingBinding: runtime.SubflowBinding = {
       ...options,
       streamMode: "values",
       outputKeys: flowPlacedClosingGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
+
+// --- flow.placed_holding ---
+
+/** `flow.placed_holding` node `inspect` — `agent.inspector` (grammar 8.1). */
+const flowPlacedHoldingNodeInspect: runtime.NodeDescriptor = {
+  flow: "flow.placed_holding",
+  node: "inspect",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from `defaults:`, `on_error` from `defaults:`.
+  policy: {
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowPlacedHoldingShape, state: stateShape, output: flowPlacedHoldingNodeInspectShape },
+  input: (roots, view) => ({
+    "path": runtime.toJson(runtime.evaluate("input.path", roots)),
+  }),
+  run: async (input, context, view) => {
+    const answer = await runtime.callAgent(
+      agentInspector,
+      input,
+      runtime.historyTurns(view.state["messages"] as unknown[]),
+      context,
+      { path: runtime.instancePath(view, "inspect"), policy: view.run.policy },
+    );
+    return {
+      output: runtime.parseResult(agentInspectorOutput, answer.output, "the answer of `agent.inspector`"),
+      history: answer.history,
+      models: answer.models,
+      toolDispatches: answer.toolDispatches,
+    };
+  },
+  writes: [
+    { field: "signature", channel: "signature", reduce: "set" },
+  ],
+  edges: [
+    { to: "hold" },
+  ],
+};
+
+/** `flow.placed_holding` node `hold` — an inline subprocess (grammar 8.2). */
+const flowPlacedHoldingNodeHold: runtime.NodeDescriptor = {
+  flow: "flow.placed_holding",
+  node: "hold",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from `defaults:`, `on_error` from `defaults:`.
+  policy: {
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowPlacedHoldingShape, state: stateShape, output: flowPlacedHoldingNodeHoldShape },
+  input: () => ({}),
+  run: async (input, context) => ({
+    output: runtime.parseResult(
+      flowPlacedHoldingNodeHoldOutput,
+      await runtime.runExec({
+        command: [{ env: "OPS_BIN", site: "flow.placed_holding.node.hold.exec.command" }, "/sleep"],
+        args: [
+          ["600"],
+        ],
+        env: [],
+        expectExit: [0],
+        decoding: { envelope: ["exit_code", "stdout"], decoded: [], empty: false },
+      }, input, context),
+      "the result of `flow.placed_holding` node `hold`",
+    ),
+  }),
+  writes: [],
+  edges: [
+    { to: END },
+  ],
+};
+
+/**
+ * `flow.placed_holding` node `settle_up` — an inline subprocess (grammar 8.2).
+ */
+const flowPlacedHoldingNodeSettleUp: runtime.NodeDescriptor = {
+  flow: "flow.placed_holding",
+  node: "settle_up",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from `defaults:`, `on_error` from no level, as a `finally:` node's failure is `finally_error` (Decision D159).
+  policy: {
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowPlacedHoldingShape, state: stateShape, output: flowPlacedHoldingNodeSettleUpShape },
+  input: () => ({}),
+  run: async (input, context) => ({
+    output: runtime.parseResult(
+      flowPlacedHoldingNodeSettleUpOutput,
+      await runtime.runExec({
+        command: [{ env: "OPS_BIN", site: "flow.placed_holding.node.settle_up.exec.command" }, "/true"],
+        args: [],
+        env: [],
+        expectExit: [0],
+        decoding: { envelope: ["exit_code", "stdout"], decoded: [], empty: false },
+      }, input, context),
+      "the result of `flow.placed_holding` node `settle_up`",
+    ),
+  }),
+  writes: [],
+  edges: [
+  ],
+};
+
+/**
+ * `flow.placed_holding` — its nodes, its `start` edges, and the compiled graph.
+ */
+function flowPlacedHolding() {
+  return new StateGraph(State)
+    .addNode("inspect", (state: GraphState) => runtime.runNode(flowPlacedHoldingNodeInspect, state), {
+      ends: ["hold"],
+    })
+    .addNode("hold", (state: GraphState) => runtime.runNode(flowPlacedHoldingNodeHold, state), {
+      ends: [END],
+    })
+    .addEdge(START, "inspect")
+    .compile();
+}
+
+/**
+ * `flow.placed_holding`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowPlacedHoldingGraph = flowPlacedHolding();
+
+/**
+ * `flow.placed_holding` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowPlacedHoldingBinding: runtime.SubflowBinding = {
+  address: "flow.placed_holding",
+  outputs: ["signature"],
+  recursionLimit: 28,
+  finally: flowPlacedHoldingNodeSettleUp,
+  placement: "mac",
+  stream: (initial, options) =>
+    flowPlacedHoldingGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowPlacedHoldingGraph.outputChannels,
     }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
 };
 
@@ -4328,6 +4644,22 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
         outputKeys: flowPlacedAskingGraph.outputChannels,
       }) as unknown as Promise<AsyncIterable<GraphState>>,
   },
+  "flow.placed_asking_raced": {
+    address: "flow.placed_asking_raced",
+    inputs: ["path", "gate"],
+    inputKinds: { "path": "string", "gate": "string", },
+    outputs: [],
+    sessionStores: [],
+    recursionLimit: 27,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowPlacedAskingRacedInputs, inputs, "the `inputs:` of `flow.placed_asking_raced`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowPlacedAskingRacedGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowPlacedAskingRacedGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
   "flow.placed_build": {
     address: "flow.placed_build",
     inputs: ["path"],
@@ -4378,6 +4710,24 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
         ...options,
         streamMode: "values",
         outputKeys: flowPlacedClosingGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
+  "flow.placed_holding": {
+    address: "flow.placed_holding",
+    inputs: ["path"],
+    inputKinds: { "path": "string", },
+    outputs: ["signature"],
+    sessionStores: [],
+    recursionLimit: 28,
+    finally: flowPlacedHoldingNodeSettleUp,
+    placement: "mac",
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowPlacedHoldingInputs, inputs, "the `inputs:` of `flow.placed_holding`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowPlacedHoldingGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowPlacedHoldingGraph.outputChannels,
       }) as unknown as Promise<AsyncIterable<GraphState>>,
   },
   "flow.placed_lapsed": {
@@ -5414,6 +5764,22 @@ export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {
   "flow.placed_closing":
     async (input, context, site) => {
       const answer = await runtime.runSubflowHere(flowPlacedClosingBinding, {
+        inputs: (input ?? {}) as Record<string, unknown>,
+        execution: site.execution,
+        path: site.path,
+        signal: site.stop ?? context.signal,
+        ...(site.policy === undefined ? {} : { policy: site.policy }),
+        ...(site.history === undefined ? {} : { history: site.history }),
+      });
+      return {
+        output: answer.output,
+        ...(answer.history === undefined ? {} : { history: answer.history }),
+        ...(answer.inner === undefined ? {} : { inner: answer.inner }),
+      };
+    },
+  "flow.placed_holding":
+    async (input, context, site) => {
+      const answer = await runtime.runSubflowHere(flowPlacedHoldingBinding, {
         inputs: (input ?? {}) as Record<string, unknown>,
         execution: site.execution,
         path: site.path,

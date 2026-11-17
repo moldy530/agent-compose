@@ -163,6 +163,7 @@ export const placements: readonly PlacementManifest[] = [
       "flow.placed_tidying",
       "flow.placed_closing",
       "flow.placed_asking",
+      "flow.placed_holding",
     ],
     maxRunning: 1,
     environment: [
