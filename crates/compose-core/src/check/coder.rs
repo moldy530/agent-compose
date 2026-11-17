@@ -1946,7 +1946,7 @@ pub(crate) fn concurrent_workspaces<'a>(
     // The fork enumeration is the one `convergence::check` just ran over this
     // same graph, handed in rather than repeated: this rule contributes no pair
     // of its own, and re-deriving them would re-read every guard of every fork
-    // — the per-edge pass `convergence::possible` exists to avoid
+    // — the per-edge pass `convergence::readings` exists to avoid
     // (`tests/check_scale.rs`, PRD 5.12).
     let concurrent = super::convergence::concurrent_among(graph, forks, &of_interest);
     // …so the walk happens for the steps a pair actually named, once each.

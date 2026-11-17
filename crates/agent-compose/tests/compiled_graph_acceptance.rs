@@ -2036,6 +2036,115 @@ fn an_agent_node_sends_its_prompt_input_and_output_schema() {
     assert_eq!(run.outputs()["verdict"], "revise");
 }
 
+/// A list of objects handed to a model **as text**, which is the case PRD
+/// resolved q85 was raised for: before the conversions, the only way to put one
+/// in front of a model as a string was a tool that wrote a file.
+///
+/// A prompt is literal and carries no interpolation of any kind (Decision D13),
+/// so what converts is the node's `input:` binding — the one surface through
+/// which dynamic content reaches a model (grammar 5.3, 8.0) — and the binding
+/// evaluates the same CEL surface every other one does. The agent is string-in,
+/// so the user turn is exactly what `string()` wrote: the list's **canonical
+/// JSON**, keys in code-point order whatever order the caller sent them in, no
+/// whitespace, an `integer` without a fraction and a `number` as `string()`
+/// writes one (Decision D168). The JSON is the evaluator a built project embeds
+/// answering, under the run's own runtime — the corpus pins the same bytes
+/// against the Rust column.
+#[test]
+fn a_list_of_objects_reaches_the_model_as_its_canonical_json() {
+    let scratch = harness::Scratch::new("conversion-into-a-prompt");
+    let entrypoint = scratch.path().join("main.yml");
+    std::fs::write(
+        &entrypoint,
+        format!(
+            r#"version: "0.1"
+
+provider.mock:
+  kind: anthropic
+  api_key: ${{MOCK_API_KEY}}
+  base_url: ${{MOCK_BASE_URL}}
+
+model.smart:
+  provider: provider.mock
+  id: {SONNET}
+  settings:
+    max_tokens: 1024
+
+agent.summarizer:
+  model: model.smart
+  prompt: |
+    Summarize the items you are given.
+  output:
+    summary: {{ type: string }}
+
+flow.summarize:
+  inputs:
+    items:
+      type: array
+      items:
+        type: object
+        properties:
+          name: {{ type: string }}
+          count: {{ type: integer }}
+          weight: {{ type: number }}
+          tags:
+            type: array
+            items: {{ type: string }}
+  outputs: {{}}
+  nodes:
+    summarize:
+      agent: agent.summarizer
+      input: "string(input.items)"
+  edges:
+    - {{ from: start, to: summarize }}
+    - {{ from: summarize, to: end }}
+"#
+        ),
+    )
+    .expect("the scratch spec is writable");
+
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "summary": "two items" })),
+    ));
+    let Some(run) = harness::invoke_entrypoint(
+        &entrypoint,
+        "conversion-into-a-prompt",
+        "flow.summarize",
+        &json!({
+            "items": [
+                { "tags": ["a", "b \"quoted\""], "name": "first", "weight": 2, "count": 3 },
+                { "weight": 0.5, "count": 1, "name": "second\nline", "tags": [] },
+            ]
+        }),
+        &harness::environment(&provider),
+        None,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let recorded = provider.requests();
+    assert_eq!(recorded.len(), 1);
+    let call = &recorded[0];
+    assert!(call.is_valid(), "{:?}", call.failures());
+    assert_eq!(
+        call.body()["system"],
+        "Summarize the items you are given.\n",
+        "the prompt is literal text, sent verbatim (D13)"
+    );
+    assert_eq!(
+        call.body()["messages"][0]["content"]
+            .as_str()
+            .expect("a string-in agent's user turn is its one string (grammar 5.3)"),
+        r#"[{"count":3,"name":"first","tags":["a","b \"quoted\""],"weight":2},{"count":1,"name":"second\nline","tags":[],"weight":0.5}]"#,
+        "the user turn is the list's canonical JSON: keys sorted, no whitespace, strings \
+         escaped as JSON, an integer without a fraction and a whole `number` as `string()` \
+         writes one (PRD resolved q85, Decision D168)"
+    );
+}
+
 /// `agent-thinking`'s three model ids: the enabled form, the adaptive form with
 /// an effort, and the adaptive form with none.
 const BUDGETED_THINKER: &str = "budgeted-thinker";
@@ -9381,6 +9490,110 @@ fn the_generated_cel_evaluator_agrees_with_the_validator_on_the_conformance_corp
         "[]",
         "the two CEL implementations must not diverge (CLAUDE.md)"
     );
+}
+
+/// The JS column's half of the `int()` divergence the corpus cannot state (PRD
+/// resolved q85, Decision D168): the evaluator a compiled router embeds
+/// **refuses** an `int()` of a double past `int64`, of an infinity or a NaN, and
+/// of a `uint` past `int64`'s top, as CEL's definition does.
+///
+/// The corpus holds only cases both columns agree on, and the pinned crate
+/// saturates and wraps here instead —
+/// `crates/compose-core/tests/cel_conformance.rs`'s
+/// `the_int_of_a_number_outside_int64_still_saturates_in_the_crate` pins that
+/// side, and `codegen::cel`'s ledger carries the row. Without this case the
+/// emitted side of the row would be held by nothing: a `BigInt(Math.trunc(x))`
+/// in place of the range check would hand a router an "int" past `int64` while
+/// every corpus case stayed green. Each refusal has to be a `CelError` raised by
+/// `int` itself — `1.0 / 0.0` is an infinity rather than an error in CEL, so a
+/// refusal from the division would be the wrong one — and the edges either side
+/// are stated as answers, so the check is the range and not a blanket refusal.
+#[test]
+fn the_generated_cel_evaluator_refuses_an_int_conversion_outside_int64() {
+    let Some(mut bun) = harness::bun_command() else {
+        return;
+    };
+
+    let built = harness::build("bounded-cycle", "local");
+    built.succeeded();
+
+    // The driver imports `src/cel.ts` alone, as the corpus driver does, and
+    // reports each expression's answer or the refusal it raised.
+    let driver = built.root().join("int-conversions.mjs");
+    std::fs::write(
+        &driver,
+        r#"const cel = await import(new URL("./src/cel.ts", import.meta.url).href);
+const answers = {};
+for (const source of JSON.parse(process.argv[2])) {
+  try {
+    const value = cel.evaluate(source, {});
+    answers[source] = { type: typeof value, value: String(value) };
+  } catch (error) {
+    answers[source] = { celError: error instanceof cel.CelError, message: String(error?.message) };
+  }
+}
+process.stdout.write(JSON.stringify(answers));
+"#,
+    )
+    .expect("the driver is written");
+
+    let refused = [
+        "int(1e19)",
+        "int(-1e19)",
+        "int(9223372036854775808.0)",
+        "int(1.0 / 0.0)",
+        "int(-1.0 / 0.0)",
+        "int(double('nan'))",
+        "int(18446744073709551615u)",
+        "int(9223372036854775808u)",
+    ];
+    let answered = [
+        ("int(-9223372036854775808.0)", "-9223372036854775808"),
+        ("int(9223372036854774784.0)", "9223372036854774784"),
+        ("int(9223372036854775807u)", "9223372036854775807"),
+        ("int(-1.9)", "-1"),
+    ];
+    let sources: Vec<&str> = refused
+        .iter()
+        .copied()
+        .chain(answered.iter().map(|(source, _)| *source))
+        .collect();
+
+    let output = bun
+        .arg(&driver)
+        .arg(json!(sources).to_string())
+        .output()
+        .expect("bun runs the generated evaluator");
+    assert!(
+        output.status.success(),
+        "the driver failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let answers: Value =
+        serde_json::from_slice(&output.stdout).expect("the driver prints one JSON object");
+
+    for source in refused {
+        let answer = &answers[source];
+        assert_eq!(
+            answer["celError"],
+            json!(true),
+            "`{source}` has no `int64`, so CEL's `int()` refuses it with an evaluation error; the \
+             emitted evaluator answered {answer}"
+        );
+        assert!(
+            answer["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("`int`")),
+            "`{source}` must be refused by `int` itself: {answer}"
+        );
+    }
+    for (source, int) in answered {
+        assert_eq!(
+            answers[source],
+            json!({ "type": "bigint", "value": int }),
+            "`{source}` is inside `int64` and converts"
+        );
+    }
 }
 
 /// `examples/review-loop` — the documented project, compiled and **run**.

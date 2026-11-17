@@ -290,6 +290,13 @@ pub(crate) struct Ctx<'a> {
     /// report is true, and both tell an author to make a repair they have
     /// already made (PRD G3).
     rejected: BTreeSet<(String, usize)>,
+    /// The `bool`-typed reads of every edge guard that type-checked, by the
+    /// position it was written at — what grammar 7.6.1's third exclusivity rule
+    /// asks a guard's conjuncts, and a question about a path's checked type that
+    /// only the CEL front-end's walk answers (see [`convergence`], Decision
+    /// D169). Kept from the walk the guard already had, so the rule types
+    /// nothing a second time.
+    guard_booleans: BTreeMap<(String, usize), Vec<crate::cel::Read>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -306,6 +313,7 @@ impl<'a> Ctx<'a> {
             diagnostics: Diagnostics::new(),
             channels,
             rejected: BTreeSet::new(),
+            guard_booleans: BTreeMap::new(),
         }
     }
 
@@ -318,6 +326,34 @@ impl<'a> Ctx<'a> {
     /// Whether the guard written at this position type-checked.
     pub(crate) fn guard_type_checked(&self, at: &Span) -> bool {
         self.type_checked(at)
+    }
+
+    /// Keep the `bool`-typed reads of the guard written at this position.
+    ///
+    /// One position can be checked more than once — a YAML alias puts one
+    /// scalar on several edges, each with a scope of its own — and a read is
+    /// kept only where **every** check typed it `bool`, which is the reading
+    /// that cannot claim a type one of the sites does not give it.
+    pub(crate) fn record_guard_booleans(&mut self, at: &Span, booleans: Vec<crate::cel::Read>) {
+        match self
+            .guard_booleans
+            .entry((at.source.as_str().to_string(), at.bytes.start))
+        {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(booleans);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().retain(|read| booleans.contains(read));
+            }
+        }
+    }
+
+    /// The `bool`-typed reads of the guard written at this position — empty for
+    /// one that reads none, and for one that did not type-check.
+    pub(crate) fn guard_booleans(&self, at: &Span) -> &[crate::cel::Read] {
+        self.guard_booleans
+            .get(&(at.source.as_str().to_string(), at.bytes.start))
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Record that a `coder:` node's `workspace:` did not type-check, so the

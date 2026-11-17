@@ -1,0 +1,31 @@
+# rule: `join()` joins strings, so its list holds strings (grammar 4.1, PRD resolved q85, Decision D168)
+# code: type-mismatch
+# message: expected a list of strings as the receiver of `join()`, found a list of integers
+# at: main.yml:28:22
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.a:
+  model: model.m
+  prompt: Do the thing.
+  input:
+    text: { type: string }
+  output:
+    result: { type: string }
+flow.f:
+  inputs:
+    counts:
+      type: array
+      items: { type: integer }
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: { text: "input.counts.join(', ')" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

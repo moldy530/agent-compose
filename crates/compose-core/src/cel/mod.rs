@@ -33,11 +33,13 @@
 //!   named, and an unknown member of the `state` root is reported as an
 //!   undefined channel (grammar 10.3);
 //! * every **construct** is one the surface admits: the operators, `size()`,
-//!   `has()`, the four string predicates, and the comprehension macros grammar
-//!   4.1 enumerates. Anything else — a conversion function, a message literal,
-//!   a name no plugin registers — is refused rather than accepted for one
-//!   interpreter to implement and the other not (PRD 5.5's two-interpreter
-//!   discipline, and PRD's own CEL-drift risk row);
+//!   `has()`, the four string predicates, CEL's four standard conversions and
+//!   the strings extension's `join` (PRD resolved q85, Decision D168), and the
+//!   comprehension macros grammar 4.1 enumerates. Anything else — another
+//!   conversion (`uint()`, `timestamp()`), a message literal, a name no plugin
+//!   registers — is refused rather than accepted for one interpreter to
+//!   implement and the other not (PRD 5.5's two-interpreter discipline, and
+//!   PRD's own CEL-drift risk row);
 //! * the **types** an operator relates: comparisons and arithmetic over
 //!   compatible operands, a string predicate over strings, and — the case
 //!   grammar 4.1 names outright — a literal compared against an `enum`-typed
@@ -76,6 +78,7 @@
 //! grammar 4.1's "with the offending sub-path named" asks for and is stable
 //! across all three spellings.
 
+mod conversions;
 pub mod ty;
 
 use std::sync::Arc;
@@ -102,12 +105,21 @@ use ::cel::common::ast::{Expr, IdedExpr, LiteralValue};
 /// registration is the crate's own implementation under the second name, so the
 /// two spellings cannot answer differently.
 ///
-/// The **other** recorded gap is not closed here, because it cannot be: `size`
-/// over a string counts bytes in `cel` 0.14.3 and code points in the
-/// specification, and `add_function` does not override a built-in — the
-/// registry is consulted after the standard set. See
+/// It also carries **the conversions and `join`** for the argument types the
+/// crate has no overload for (PRD resolved q85, Decision D168): `string()` of a
+/// bool, `null`, a list or a map — the last two as canonical JSON — `int()` and
+/// `double()` of a bool, and `bool()` and `list.join()` whole, which the crate
+/// does not carry at all. [`conversions`] is that half, and says which argument
+/// types reach it.
+///
+/// The **other** recorded gaps are not closed here, because they cannot be:
+/// `add_function` does not override a built-in — the registry is consulted after
+/// the standard set, overload by overload. So `size` over a string still counts
+/// bytes in `cel` 0.14.3 and code points in the specification, and `int()` of a
+/// double outside `int64` — or of a NaN or an infinity — still saturates there
+/// where the specification and the emitted evaluator refuse it. See
 /// `tests/fixtures/cel-conformance/README.md` for what follows from that, and
-/// `codegen::cel` for the ledger row.
+/// `codegen::cel` for the ledger rows.
 ///
 /// # Panics
 ///
@@ -116,6 +128,7 @@ use ::cel::common::ast::{Expr, IdedExpr, LiteralValue};
 pub fn evaluation_context() -> ::cel::Context<'static> {
     let mut context = ::cel::Context::default();
     context.add_function("matches", ::cel::functions::matches);
+    conversions::register(&mut context);
     context
 }
 
@@ -240,6 +253,11 @@ pub struct Analysis {
     pub ty: Type,
     /// Every root-anchored path the expression reads.
     pub reads: Vec<Read>,
+    /// The reads among those whose checked type is `bool` — what grammar
+    /// 7.6.1's third exclusivity rule asks of a guard's conjuncts, which is a
+    /// question about a path's *type* that only this walk can answer (Decision
+    /// D169).
+    pub booleans: Vec<Read>,
     /// Everything wrong with it.
     pub problems: Vec<Problem>,
 }
@@ -252,6 +270,11 @@ const AUTHORED_SURFACE: &[&str] = &[
     "endsWith",
     "contains",
     "matches",
+    "string",
+    "int",
+    "double",
+    "bool",
+    "join",
     "all",
     "exists",
     "exists_one",
@@ -318,6 +341,7 @@ pub fn analyze(source: &str, scope: &Scope) -> Analysis {
     let refused = |problem: Problem| Analysis {
         ty: Type::Dyn,
         reads: Vec::new(),
+        booleans: Vec::new(),
         problems: vec![problem],
     };
     let shape = shape(source);
@@ -380,14 +404,17 @@ pub fn analyze(source: &str, scope: &Scope) -> Analysis {
     let mut walk = Walk {
         scope,
         reads: Vec::new(),
+        booleans: Vec::new(),
         problems: Vec::new(),
         bindings: Vec::new(),
     };
     let (ty, path) = walk.expr(program.expression());
+    walk.typed(&ty, path.as_ref());
     walk.record(path.as_ref());
     Analysis {
         ty,
         reads: walk.reads,
+        booleans: walk.booleans,
         problems: walk.problems,
     }
 }
@@ -555,6 +582,73 @@ fn shape(source: &str) -> Shape {
     shape
 }
 
+/// Whether the source applies a unary `!` to a unary `!` directly — `!!x`,
+/// `! !x`, a `!` ending a line whose comment the next `!x` follows — which the
+/// pinned parser does not read as written.
+///
+/// `cel` 0.14.3's parser collapses a run of unary operators into **one**
+/// application whatever its length: `!!x` arrives as `!x`, `!!!x` as `!x` too
+/// (and `--1` as `-1`), where the specification and the emitted evaluator apply
+/// each one. A parenthesised operand is read correctly — `!(!x)` is two calls —
+/// because the run is broken by the group. So a reading of a guard's AST that
+/// gives a negation meaning has to know the parse lied about it, and this is
+/// how: a lexical test over the source, skipping string literals the way
+/// [`shape`] does, for a `!` that is not `!=` followed by another with nothing
+/// between the two but what the lexer hides from the parser. That is CEL's
+/// whitespace **and its `//` line comments** (the grammar's `WHITESPACE` and
+/// `COMMENT`, both on the hidden channel), so a comment is passed over here as
+/// whitespace is — and before a string literal is looked for, so a quote inside
+/// a comment opens nothing. Grammar 7.6.1's third exclusivity rule reads
+/// nothing from such a guard (Decision D169).
+#[must_use]
+pub fn repeats_a_negation(source: &str) -> bool {
+    let characters: Vec<char> = source.chars().collect();
+    let mut after_negation = false;
+    let mut index = 0usize;
+    while index < characters.len() {
+        if let Some(after) = line_comment(&characters, index) {
+            index = after;
+            continue;
+        }
+        if let Some(after) = string_literal(&characters, index) {
+            index = after;
+            after_negation = false;
+            continue;
+        }
+        let character = characters[index];
+        index += 1;
+        if character.is_whitespace() {
+            continue;
+        }
+        if character == '!' && characters.get(index) != Some(&'=') {
+            if after_negation {
+                return true;
+            }
+            after_negation = true;
+        } else {
+            after_negation = false;
+        }
+    }
+    false
+}
+
+/// Where the `//` line comment starting at `index` ends, if one starts there:
+/// at its line break, as the lexer's `COMMENT : '//' (~'\n')*` ends it, or at
+/// the end of the source. Only code is asked — a string literal is skipped
+/// whole before its contents could be — and in code a `//` is always a
+/// comment: no CEL operator starts with it.
+fn line_comment(characters: &[char], index: usize) -> Option<usize> {
+    if characters.get(index) != Some(&'/') || characters.get(index + 1) != Some(&'/') {
+        return None;
+    }
+    Some(
+        characters[index..]
+            .iter()
+            .position(|character| *character == '\n')
+            .map_or(characters.len(), |offset| index + offset),
+    )
+}
+
 /// Where the string literal starting at `index` ends, if one starts there.
 ///
 /// Grammar 4.1's expressions are CEL's, so the literals are CEL's eight: single
@@ -695,6 +789,8 @@ impl Path {
 struct Walk<'a> {
     scope: &'a Scope,
     reads: Vec<Read>,
+    /// The finished paths whose type is `bool` ([`Analysis::booleans`]).
+    booleans: Vec<Read>,
     problems: Vec<Problem>,
     /// Comprehension bindings, innermost last.
     bindings: Vec<(String, Type)>,
@@ -717,9 +813,20 @@ impl Walk<'_> {
         }
     }
 
+    /// Record a finished path as a boolean read, if its checked type is `bool`.
+    fn typed(&mut self, ty: &Type, path: Option<&Path>) {
+        if let (Type::Bool, Some(path)) = (ty, path) {
+            let read = path.read();
+            if !self.booleans.contains(&read) {
+                self.booleans.push(read);
+            }
+        }
+    }
+
     /// The type of a sub-expression whose path, if any, ends here.
     fn value(&mut self, expr: &IdedExpr) -> Type {
         let (ty, path) = self.expr(expr);
+        self.typed(&ty, path.as_ref());
         self.record(path.as_ref());
         ty
     }
@@ -1078,6 +1185,65 @@ impl Walk<'_> {
                 }
                 Type::Bool
             }
+            // CEL's four standard conversions (PRD resolved q85, Decision D168).
+            // `string()` takes any value — a list, a map or an object becomes
+            // its canonical JSON — and the other three take what the
+            // specification gives them an overload for. `bool()` of a number is
+            // one it does not, and the surface refuses it with the
+            // specification rather than reading `0` as `false`.
+            "string" | "int" | "double" | "bool" => {
+                if !self.arity(name, call) {
+                    return Type::Dyn;
+                }
+                let types = self.operands(call);
+                let Some(ty) = types.first() else {
+                    return Type::Dyn;
+                };
+                let argument = format!("the argument of `{name}()`");
+                match name {
+                    "string" => Type::String,
+                    "int" | "double" => {
+                        if !(ty.is_numeric() || ty.is_stringy() || matches!(ty, Type::Bool)) {
+                            self.mismatch("a number, a string, or a bool", ty, &argument);
+                        }
+                        if name == "int" {
+                            Type::Int
+                        } else {
+                            Type::Double
+                        }
+                    }
+                    _ => {
+                        if !(ty.is_stringy() || matches!(ty, Type::Bool)) {
+                            self.mismatch("a bool or a string", ty, &argument);
+                        }
+                        Type::Bool
+                    }
+                }
+            }
+            // The strings extension's `join` (PRD resolved q85, Decision D168):
+            // a list of strings in, one string out, the separator optional.
+            "join" => {
+                if !self.arity(name, call) {
+                    return Type::Dyn;
+                }
+                let types = self.operands(call);
+                if let Some(receiver) = types.first() {
+                    let joinable = match receiver {
+                        Type::Dyn => true,
+                        Type::List(items) => items.is_stringy(),
+                        _ => false,
+                    };
+                    if !joinable {
+                        self.mismatch("a list of strings", receiver, "the receiver of `join()`");
+                    }
+                }
+                if let Some(separator) = types.get(1)
+                    && !separator.is_stringy()
+                {
+                    self.mismatch("a string", separator, "the separator of `join()`");
+                }
+                Type::String
+            }
             // `has(x.y)` the parser expands into a presence test, so a `has`
             // that reaches here is one written in a form it does not expand —
             // no argument, or two. Saying it is unsupported would contradict
@@ -1144,7 +1310,10 @@ impl Walk<'_> {
     /// The accepted forms are CEL's standard definitions: `size(x)` and
     /// `x.size()`; `startsWith`, `endsWith` and `contains` as methods on the
     /// string they test; `matches`, the one string predicate the specification
-    /// also gives a global spelling, either way round.
+    /// also gives a global spelling, either way round; the four conversions as
+    /// global calls of one argument, which is the only spelling the
+    /// specification declares for them; and the strings extension's `join` as a
+    /// method on the list it joins, with a separator or without one.
     ///
     /// A call refused here is refused *at the call*, before its operands are
     /// walked, for the reason the closed-surface arm gives above: one mistake
@@ -1166,6 +1335,15 @@ impl Walk<'_> {
             "matches" => (
                 &[(true, 1), (false, 2)],
                 "`state.draft.matches('^a')` or `matches(state.draft, '^a')`".to_string(),
+            ),
+            "string" | "int" | "double" | "bool" => (
+                &[(false, 1)],
+                format!("`{name}(x)` — the value it converts is its one argument"),
+            ),
+            "join" => (
+                &[(true, 0), (true, 1)],
+                "`names.join(', ')` or `names.join()` — the list it joins is the receiver"
+                    .to_string(),
             ),
             _ => (
                 &[(true, 1)],
@@ -1676,11 +1854,189 @@ mod tests {
         ok("review.output.verdict in ['approve', 'revise']");
     }
 
+    /// The surface gained four conversions and `join` (PRD resolved q85) and
+    /// nothing else: CEL's other standard conversions are still refused.
     #[test]
     fn the_supported_surface_is_closed() {
-        let problem = problem("string(state.draft) == 'x'");
-        assert_eq!(problem.code, DiagnosticCode::InvalidExpression);
-        assert!(problem.message.contains("`string` is not a function"));
+        for name in ["uint", "timestamp", "duration", "bytes", "dyn", "type"] {
+            let problem = problem(&format!("{name}(state.draft) == 'x'"));
+            assert_eq!(problem.code, DiagnosticCode::InvalidExpression);
+            assert_eq!(
+                problem.message,
+                format!("`{name}` is not a function this expression surface supports")
+            );
+        }
+        // …and the strings extension stops at `join`.
+        let problem = problem("state.draft.lowerAscii() == 'x'");
+        assert_eq!(
+            problem.message,
+            "`lowerAscii` is not a function this expression surface supports"
+        );
+        assert_eq!(
+            problem.help.as_deref(),
+            Some(
+                "the supported set is `size`, `has`, `startsWith`, `endsWith`, `contains`, `matches`, `string`, `int`, `double`, `bool`, `join`, `all`, `exists`, `exists_one`, `filter`, `map` plus the standard operators; there are no custom extension functions in v0 (grammar 4.1)"
+            )
+        );
+    }
+
+    /// The four conversions type by their result, and each takes what CEL's
+    /// standard definitions give it an overload for (PRD resolved q85,
+    /// Decision D168). `string()` takes anything — a list, a map or an object
+    /// becomes canonical JSON.
+    #[test]
+    fn a_conversion_is_typed_by_its_result() {
+        for (source, ty) in [
+            ("string(size(state.patches))", Type::String),
+            ("string(state.patches)", Type::String),
+            ("string(review.output)", Type::String),
+            ("string(review.output.verdict)", Type::String),
+            ("string(null)", Type::String),
+            ("string(b'ab')", Type::String),
+            ("string(1.5)", Type::String),
+            ("int(state.draft)", Type::Int),
+            ("int(1.5)", Type::Int),
+            ("int(true)", Type::Int),
+            ("int(review.output.verdict)", Type::Int),
+            ("int(1u)", Type::Int),
+            ("double(state.draft)", Type::Double),
+            ("double(1)", Type::Double),
+            ("double(false)", Type::Double),
+            ("bool(state.draft)", Type::Bool),
+            ("bool(true)", Type::Bool),
+            ("bool('true')", Type::Bool),
+        ] {
+            assert_eq!(ok(source).ty, ty, "{source}");
+        }
+        // The result flows through the operators like any other value.
+        assert_eq!(ok("int(state.draft) + 1 > 2").ty, Type::Bool);
+        assert_eq!(ok("string(state.patches).startsWith('[')").ty, Type::Bool);
+    }
+
+    /// What a conversion has no overload for is a mismatch at validate, not a
+    /// `no such overload` in a generated router. `bool()` of a number is the
+    /// one the specification leaves out, and the surface leaves it out with it.
+    #[test]
+    fn a_conversion_refuses_what_it_has_no_overload_for() {
+        for (source, message) in [
+            (
+                "bool(1)",
+                "expected a bool or a string as the argument of `bool()`, found an integer",
+            ),
+            (
+                "bool(2.5)",
+                "expected a bool or a string as the argument of `bool()`, found a number",
+            ),
+            (
+                "bool(state.patches)",
+                "expected a bool or a string as the argument of `bool()`, found a list of strings",
+            ),
+            (
+                "int(state.patches) > 0",
+                "expected a number, a string, or a bool as the argument of `int()`, found a list of strings",
+            ),
+            (
+                "double(review.output) > 0.0",
+                "expected a number, a string, or a bool as the argument of `double()`, found `review`'s output",
+            ),
+            (
+                "int(null) > 0",
+                "expected a number, a string, or a bool as the argument of `int()`, found null",
+            ),
+        ] {
+            let refused = problem(source);
+            assert_eq!(refused.code, DiagnosticCode::TypeMismatch, "{source}");
+            assert_eq!(refused.message, message, "{source}");
+        }
+    }
+
+    /// The conversions are global calls of one argument and nothing else, and
+    /// `join` is a method on the list it joins.
+    #[test]
+    fn a_conversion_and_join_are_called_in_a_form_they_have() {
+        for name in ["string", "int", "double", "bool"] {
+            let help = format!(
+                "write it as `{name}(x)` — the value it converts is its one argument; every other spelling has no overload to call and fails at evaluation (grammar 4.1)"
+            );
+            for (source, message) in [
+                (
+                    format!("{name}(state.draft, state.draft)"),
+                    format!("`{name}` is called with 2 arguments, which is not a form it has"),
+                ),
+                (
+                    format!("{name}()"),
+                    format!("`{name}` is called with no arguments, which is not a form it has"),
+                ),
+                (
+                    format!("state.draft.{name}()"),
+                    format!(
+                        "`{name}` is called with no arguments on a receiver, which is not a form it has"
+                    ),
+                ),
+            ] {
+                let refused = problem(&source);
+                assert_eq!(refused.code, DiagnosticCode::InvalidExpression, "{source}");
+                assert_eq!(refused.message, message, "{source}");
+                assert_eq!(refused.help.as_deref(), Some(help.as_str()), "{source}");
+            }
+        }
+        assert_eq!(ok("state.patches.join(', ')").ty, Type::String);
+        assert_eq!(ok("state.patches.join()").ty, Type::String);
+        assert_eq!(ok("['a', 'b'].join('-')").ty, Type::String);
+        assert_eq!(ok("[].join()").ty, Type::String);
+        assert_eq!(
+            ok("state.patches.map(p, string(size(p))).join(',')").ty,
+            Type::String
+        );
+        let help = "write it as `names.join(', ')` or `names.join()` — the list it joins is the receiver; every other spelling has no overload to call and fails at evaluation (grammar 4.1)";
+        for (source, message) in [
+            (
+                "join(state.patches, ', ')",
+                "`join` is called with 2 arguments, which is not a form it has",
+            ),
+            (
+                "state.patches.join(', ', ', ')",
+                "`join` is called with 2 arguments on a receiver, which is not a form it has",
+            ),
+        ] {
+            let refused = problem(source);
+            assert_eq!(refused.code, DiagnosticCode::InvalidExpression, "{source}");
+            assert_eq!(refused.message, message, "{source}");
+            assert_eq!(refused.help.as_deref(), Some(help), "{source}");
+        }
+    }
+
+    /// `join` joins strings: a list of anything else, a value that is not a
+    /// list, and a separator that is not a string are each a mismatch.
+    #[test]
+    fn join_takes_a_list_of_strings_and_a_string() {
+        for (source, message) in [
+            (
+                "[1, 2].join(',')",
+                "expected a list of strings as the receiver of `join()`, found a list of integers",
+            ),
+            (
+                "state.draft.join(',')",
+                "expected a list of strings as the receiver of `join()`, found a string",
+            ),
+            (
+                "review.output.join(',')",
+                "expected a list of strings as the receiver of `join()`, found `review`'s output",
+            ),
+            (
+                "state.patches.join(1)",
+                "expected a string as the separator of `join()`, found an integer",
+            ),
+        ] {
+            let refused = problem(source);
+            assert_eq!(refused.code, DiagnosticCode::TypeMismatch, "{source}");
+            assert_eq!(refused.message, message, "{source}");
+        }
+        // A list of enum values is a list of strings, as everywhere else.
+        assert_eq!(
+            ok("[review.output.verdict, 'x'].join('/')").ty,
+            Type::String
+        );
     }
 
     #[test]
@@ -1767,11 +2123,11 @@ mod tests {
         );
         // A name the surface really does not have keeps its own message, and
         // an argument that would not resolve on its own does not add a second.
-        let unsupported = problem("string(nope.at.all)");
+        let unsupported = problem("uint(nope.at.all)");
         assert_eq!(unsupported.code, DiagnosticCode::InvalidExpression);
         assert_eq!(
             unsupported.message,
-            "`string` is not a function this expression surface supports"
+            "`uint` is not a function this expression surface supports"
         );
     }
 

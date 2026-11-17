@@ -131,11 +131,26 @@ Two properties hold: a node's edges are evaluated only after it completes
 **once** (**one run per step**).
 
 Two sibling out-edges are **exclusive** when the validator can prove they are
-never taken together: one carries `else:` and the other `when:`, or both carry
-guards whose `possible` sets for some enum field are disjoint. Any other pair is
-**co-takeable**, and a node with a co-takeable pair is a **fork**. Two nodes are
-**concurrent** when both are reachable from one co-takeable pair of a fork, one
-through each edge, and neither is reachable from the other.
+never taken together, by one of three rules:
+
+1. one carries `else:` and the other `when:`;
+2. both carry guards whose `possible` sets for some enum field are disjoint —
+   `verdict == 'approve'` and `verdict == 'revise'`;
+3. both carry guards, and one holds a boolean read `q` as a top-level `&&`
+   conjunct while the other holds `!q` — `a.output.ok && input.x` and
+   `a.output.ok && !input.x`, whatever else either conjoins. `q` is a boolean
+   field, channel or input read by path, or a `has(…)` test; it is compared as
+   written, so spacing and parentheses do not matter. Nothing wider counts:
+   `q == true` against `q == false`, a `!q` under an `||`, `!!q` (a `//`
+   comment between the two `!` included), and the same
+   field read two ways (`input['x']` against `!input.x`) are not proved
+   exclusive.
+
+Any other pair is **co-takeable**, and a node with a co-takeable pair is a
+**fork**. Two nodes are **concurrent** when both are reachable from one
+co-takeable pair of a fork, one through each edge, and neither is reachable from
+the other. `start` forks too; rule 2 never applies there, because `start` has no
+output, but rules 1 and 3 do.
 
 A node with two or more incoming edges is a **convergence**. Within one step it
 gets AND-join behaviour for free. A branch whose guard was false delivers

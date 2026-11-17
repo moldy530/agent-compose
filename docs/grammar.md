@@ -695,15 +695,77 @@ placement-agnostic (PRD 5.10).
 
 **Supported CEL surface.** Standard CEL operators and the standard macro/function
 set over the exposed roots: comparisons, boolean logic, arithmetic, indexing,
-`in`, `size()`, `has()`, `startsWith`/`endsWith`/`contains`/`matches`, and the
-comprehension macros (`all`, `exists`, `exists_one`, `filter`, `map`). No custom
-extension functions in v0. Expressions MUST be type-correct against the declared
-schemas; `review.output.verdict == 'aprove'` against
-`enum: [approve, revise]` is a compile error, not a silent false.
+`in`, `size()`, `has()`, `startsWith`/`endsWith`/`contains`/`matches`, CEL's four
+standard conversions `string()`, `int()`, `double()` and `bool()`, the strings
+extension's `list.join()`, and the comprehension macros (`all`, `exists`,
+`exists_one`, `filter`, `map`). Nothing else: no other conversion (`uint()`,
+`bytes()`, `timestamp()`, …), no other strings-extension function, and no custom
+extension functions in v0 (Decision
+[D168](#d168-the-surface-gains-cels-four-conversions-and-join-and-string-of-a-list-or-a-map-is-its-canonical-json)).
+Expressions MUST be type-correct against the declared schemas;
+`review.output.verdict == 'aprove'` against `enum: [approve, revise]` is a
+compile error, not a silent false.
 
 ```yaml
 when: "review.output.verdict == 'revise' && size(state.feedback) > 0"
 ```
+
+The functions, the forms each is written in, and what each takes and returns.
+A form not listed is a compile error naming the forms that are
+(`invalid-expression`), and an argument the column does not admit is a
+`type-mismatch` — `bool(1)` among them, which CEL gives no overload. An `enum`
+value is a string wherever a string is admitted.
+
+| function | forms | argument | result |
+|---|---|---|---|
+| `size` | `size(x)`, `x.size()` | a string, bytes, a list, a map or an object | `int` |
+| `has` | `has(x.f)` | one selection | `bool` |
+| `startsWith`, `endsWith`, `contains` | `s.startsWith(p)` | two strings | `bool` |
+| `matches` | `s.matches(p)`, `matches(s, p)` | two strings, the second a pattern | `bool` |
+| `string` | `string(x)` | any value | `string` |
+| `int` | `int(x)` | a number, a string, or a bool | `int` |
+| `double` | `double(x)` | a number, a string, or a bool | `double` |
+| `bool` | `bool(x)` | a bool or a string | `bool` |
+| `join` | `l.join(sep)`, `l.join()` | a list of strings; a string separator, or none for `''` | `string` |
+
+What the conversions answer is pinned by the conformance corpus against both
+evaluators (`crates/compose-core/tests/fixtures/cel-conformance/`, D168), every
+row below but one: `int()` of a double outside `int64` fails in the evaluator a
+built project embeds, while the pinned crate the corpus's other column runs
+casts it instead, so the acceptance suite pins that refusal and the divergence
+ledger carries the row (D168).
+
+- `string()` of an `int` is its decimal; of a `double`, the shortest digits that
+  read back as the same double, written without an exponent (`string(1e21)` is a
+  1 and twenty-one zeros, `string(2.0)` is `2`), and of two such spellings
+  equally near, the one further from zero (`string(1000000000000000.25)` is
+  `1000000000000000.3`); of a bool, `true` or `false`; of
+  `null`, `null`; of a string, the string; of a **list, a map or an object, its
+  canonical JSON** — object keys in code-point order, no whitespace, strings
+  escaped as JSON escapes them, an `int` without a fraction, a `double` as
+  `string()` writes one. A value JSON has no spelling for — a NaN or an
+  infinity, bytes, a map keyed by anything but strings — fails the evaluation.
+- `int()` of a double truncates toward zero, and one outside `int64` (a NaN and
+  an infinity among them) fails; of a string, reads an optional sign and decimal
+  digits with nothing around them, and fails otherwise or past `int64`; of a
+  bool, `1` or `0`.
+- `double()` of an `int` is the nearest double; of a string, reads a decimal or
+  exponent literal (`1.5`, `.5`, `-2e3`, and `inf`, `infinity`, `nan` in any
+  case), and fails on anything else — whitespace included; of a bool, `1.0` or
+  `0.0`.
+- `bool()` of a string reads exactly `true` or `false`, case-sensitively, and
+  fails on anything else.
+- `l.join(sep)` joins the strings of `l` with `sep` between them, and `l.join()`
+  with nothing; an element that is not a string fails the evaluation.
+
+A conversion that fails is an evaluation failure, the same as an absent read and
+with the same consequence (below, Decision
+[D110](#d110-an-absent-value-fails-the-read-and-an-absent-output-field-writes-nothing)),
+and the message names the conversion. A conversion is also how a value reaches a
+model as text: a prompt is literal (Decision
+[D13](#d13-prompt-is-required-and-literal)), so the node's binding converts —
+`input: "string(state.findings)"` hands a string-in agent its list as canonical
+JSON.
 
 **Reading a value that is not there.** Presence is a runtime property, and four
 things may legitimately be absent when an expression reads them — three the
@@ -1990,7 +2052,24 @@ prove they are never taken together:
    `verdict == 'approve' && size(state.xs) > 0` and `verdict == 'revise'`,
    because an unrecognized conjunct widens nothing (`{approve} ∩ V`).
    `verdict == 'approve'` and `size(state.xs) > 0` are **not**: the second guard
-   is possible for every variant, which is the conservative answer.
+   is possible for every variant, which is the conservative answer; or
+3. both carry `when:` guards, and — each read as the conjunction of its
+   top-level `&&` operands, a parenthesised `&&` group flattening into the
+   conjunction around it — one holds a conjunct `q` and the other a conjunct
+   `!q`, for the same **boolean-typed read** `q`: a selection path with no index
+   in it whose checked type is `bool` (`a.output.ok`, `input.x`, `state.done`),
+   or a presence test `has(p)`. The read is compared as the parse spells it, so
+   whitespace and grouping change nothing, and the other conjuncts of either
+   guard are irrelevant: `a.output.ok && input.x` and `a.output.ok && !input.x`
+   are exclusive, and so are `has(state.hint) && size(state.hint) > 0` and
+   `!has(state.hint)`. Nothing wider is read (Decision
+   [D169](#d169-two-guards-are-exclusive-when-one-holds-a-boolean-read-and-the-other-its-negation)):
+   a guard whose top is `||` is a single conjunct, so `!x || y` holds no `!x`;
+   `x == true` and `x == false` are comparisons, not the read; `!!x` is not `x`
+   for this rule, and a guard that writes a negation of a negation holds no
+   literal at all; and `input['x']` is not the `input.x` another guard negates.
+   Rule 3 reads `start`'s edges as it reads any other vertex's — a guard leaving
+   `start` reads `input` and `state` — where rule 2 has no output to read.
 
 Any other pair is **co-takeable**. Co-takeability is a relation on a **pair** of
 sibling out-edges and is never a property of one edge on its own: an edge is not
@@ -2118,9 +2197,11 @@ Adding `- { from: plan, to: merge, when: "plan.output.trivial" }` makes
 `{2}`: `merge` would run in step 1 and again in step 2. That is the
 unbalanced-convergence compile error; the fixes are to route the short branch
 through the same depth, or to make the pair exclusive
-(`else: true` on the short edge, or guards §7.6.1 rule 2 can prove disjoint),
-which removes it from the check because two edges that cannot both fire cannot
-both deliver.
+(`else: true` on the short edge, or guards §7.6.1 rule 2 or rule 3 can prove
+disjoint — `plan.output.trivial` on the short edge and
+`!plan.output.trivial && …` on each long one is rule 3's spelling), which
+removes it from the check because two edges that cannot both fire cannot both
+deliver.
 
 Both guards false is a *different* error — §7.3 rule 7's "no viable route" at
 `plan` — which is what §7.4's escape rule and an `else:` edge exist to prevent.
@@ -8533,6 +8614,12 @@ than on *coverage* is deliberate: a node whose only enum guard is
 `f == 'a' && …` is routing on `f` in every sense the author meant, and the fix
 is one keyword. *PRD 5.3, G3, G4.*
 
+**Amended by [D169](#d169-two-guards-are-exclusive-when-one-holds-a-boolean-read-and-the-other-its-negation)** (PRD resolved q86): §7.6.1's exclusivity test is no
+longer the table alone — beside its disjoint `possible` sets (rule 2) and the
+`else:` edge (rule 1), two guards are exclusive when one holds a `bool`-typed
+read as a top-level `&&` conjunct and the other its negation (rule 3). The
+table, and exhaustiveness, are unchanged.
+
 ### D83. Item-derivation is traced through the dispatch binding
 
 An expression is item-derived, per dispatch site, when it references
@@ -9021,6 +9108,16 @@ fork is what makes that fall out of the definition instead of needing a
 carve-out, and it costs nothing — a fork has finitely many pairs, and the
 per-pair distances are the same walk the per-fork version already did. *PRD 5.3,
 5.6, G3.*
+
+**Amended by [D169](#d169-two-guards-are-exclusive-when-one-holds-a-boolean-read-and-the-other-its-negation)** (PRD resolved q86), by one clause: the exclusivity
+relation co-takeability is read against gains §7.6.1's rule 3 — two guards are
+exclusive when one holds a `bool`-typed read `q` as a top-level `&&` conjunct
+and the other holds `!q` — beside rule 1's `else:` and rule 2's disjoint
+variant sets. Nothing above moves: co-takeability is still a relation on a pair,
+named per sibling, and a pair rule 3 proves exclusive leaves `dist` and the
+concurrency relation exactly as `e₃`'s pairs do here — so `a.output.ok &&
+input.x` and `a.output.ok && !input.x` converging on one node is no longer an
+unbalanced convergence, and fewer pairs reach D112's comparison.
 
 ### D100. Both accepted-outcome lists are non-empty and distinct
 
@@ -15064,6 +15161,189 @@ wire its connection speaks.
 
 **Status**: ratified — PRD resolved q83. *PRD 5.9, G3, resolved q53, q57, q58,
 q60, q83; §8.9, §12.2; builds on D40, D141, D146.*
+
+### D168. The surface gains CEL's four conversions and `join`, and `string()` of a list or a map is its canonical JSON
+
+The authored CEL surface (§4.1) gains `string(x)`, `int(x)`, `double(x)` and
+`bool(x)` — CEL's standard conversions, as global calls of one argument — and
+the strings extension's `list.join(separator)` and `list.join()`, as a method on
+a list of strings. Nothing else joins it. Each is typed in the compiler's walk
+(§4.1's function table: what each admits, and the forms each is written in),
+implemented in the evaluator a built project embeds, and held to the
+conformance corpus, whose `conversions.json` states every row of §4.1's
+semantics list but one — `int()` of a double outside `int64`, the ledger row
+below. `string()` of a list, a map or an object is that value's
+**canonical JSON**: object keys in code-point order, no whitespace, strings
+escaped as JSON escapes them, an `int` without a fraction, and a `double` as
+`string()` writes one on its own.
+
+**Rationale**: the surface had no conversion and no `join`, so the one way to
+hand a list of objects to a model as text was a tool that wrote a file (PRD
+resolved q85). A prompt is literal (D13), so text reaches a model through a
+node's `input:` binding, and the binding is CEL: a conversion there is the
+smallest addition that closes the gap. The four conversions are the CEL
+specification's own, so an author who knows CEL expects them, and `join` is the
+one strings-extension function the use case needs; the surface stays closed
+otherwise for the reason it was closed — every function on it is one two
+evaluators have to agree on (PRD 5.5), so a function is admitted for a use case
+and not for completeness. Canonical JSON is what a prompt wants and what a
+corpus can pin across two evaluators: a value's text is a function of the value
+alone, never of the order a map was built in, so a replayed execution that
+converts the same value writes the same bytes (PRD resolved q29).
+
+**What the corpus pins, and the four choices in it.** The specification fixes
+the conversions' overloads and leaves their spellings open in places, and each
+place is a choice both evaluators answer the same way:
+
+- **A double is written the way the pinned `cel` crate writes one** — shortest
+  round-trip digits, positionally, never an exponent; `-0` keeps its sign, and
+  the three values with no digits are `inf`, `-inf` and `NaN`. The crate's own
+  overload cannot be replaced from outside it, so its form is the one both
+  columns can agree on, and the emitted evaluator places JavaScript's shortest
+  digits itself rather than writing `String()`'s `1e+21`. Where a double lies
+  exactly halfway between two shortest spellings, the crate (Rust's `f64`
+  `Display`) takes the one further from zero and ECMAScript's
+  `Number::toString` the one with an even last digit —
+  `string(1000000000000000.25)` is `1000000000000000.3` to the crate and
+  `…000.2` to `String()` — so the emitted evaluator finds the tie exactly, from
+  the double's bits, and moves it up; the corpus pins ties at both last digits
+  and both signs, alone and inside canonical JSON.
+- **Keys sort by code point**, which is the Rust column's string order and the
+  order `compareStrings` already gives the emitted evaluator's comparisons —
+  not JavaScript's UTF-16 sort, under which an astral key would sort before
+  `U+FF61`.
+- **The string grammars are the crate's.** `int()` reads an optional sign and
+  ASCII digits; `double()` reads Rust's `f64` literal grammar, case-insensitively,
+  `inf`, `infinity` and `nan` included; `bool()` reads exactly `true` and
+  `false`. Whitespace is refused by all three.
+- **What has no JSON spelling fails.** A NaN or an infinity inside a list,
+  bytes, and a map keyed by anything but strings are evaluation errors rather
+  than a `null` or a guess.
+
+**The one row the columns cannot share.** The specification refuses `int()` of
+a double outside `int64` — a NaN and an infinity among them — and of a `uint`
+past `int64`'s top, and so does the emitted evaluator; the crate's overloads
+cast instead, saturating a double and wrapping a uint. A registration cannot
+replace a built-in overload (the crate consults its own first), so the gap is
+recorded rather than closed, exactly as `size()` of a non-ASCII string is:
+`compose_core::codegen::cel`'s divergence ledger carries it, the corpus states
+the in-range cases, and
+`the_int_of_a_number_outside_int64_still_saturates_in_the_crate` pins the
+crate's answers so a pin bump that fixes them goes red. It is safe to leave for
+`size()`'s reason — the compiler never evaluates an expression, so the crate is
+the corpus's reference column, and the evaluator a compiled graph runs is the
+one that follows the specification. Where the crate has **no** overload —
+`string()` of a bool, `null`, a list or a map; `int()` and `double()` of a bool;
+`bool()` and `join` whole — `compose_core::cel::evaluation_context` registers
+one, the way it registers the global `matches` (the corpus README's note on that
+overload is the precedent), and
+`the_conversions_the_crate_lacks_are_supplied_by_the_shared_context` pins that
+each registration is doing work.
+
+**Where it is stated.** §4.1's surface paragraph, function table and semantics
+list; the `cel` topic's supported-surface section; the corpus README;
+`codegen::cel`'s ledger; and the help an unsupported call draws, which lists the
+five names.
+
+**Collision review.** §4.1's surface is the one this amends, and only by the
+five names: the closed-surface rule, the refusal of a message literal and the
+"no custom extension functions" line are unchanged, and CEL's other conversions
+stay refused. D13 is unchanged — a prompt stays literal, and the conversion is
+the binding's. D42 is unchanged: a conversion reads what its surface's roots
+expose and nothing more. D43 is unchanged — `map.over` is a path expression, and
+a conversion is a call, which §4.2 refuses there. D57 and D98 are unchanged: a
+guard calling a conversion is a CEL exit condition like any other guard. D82's
+closed guard table is unchanged — `int(n.output.count) > 0` and
+`string(n.output.verdict) == 'a'` fall to its last row and prove nothing, which
+is the conservative answer. D110 is unchanged: a failed conversion is an
+evaluation failure, with the absent read's consequence. D115 is unchanged: a
+conversion over `execution.item_index` reads it where that decision makes it
+present, and §4.2's refusal of a call in a path expression is what keeps the
+index itself a plain read. PRD resolved q29 is what
+makes the canonical form load-bearing rather than cosmetic: the corpus is part
+of the recovery contract, so a conversion whose text could vary from run to run
+would be a replay divergence. PRD 5.5's two-interpreter discipline is the reason
+every new function is a corpus file and not only a typing rule.
+
+**Status**: ratified — PRD resolved q85. *PRD 5.5; PRD resolved q29, q85; §4.1,
+§4.2; builds on D13, D110; leaves D42, D43, D57, D82, D98, D115 unchanged.*
+
+### D169. Two guards are exclusive when one holds a boolean read and the other its negation
+
+§7.6.1 gains a third exclusivity rule: two `when:` guards are exclusive when,
+each read as the conjunction of its top-level `&&` operands, one holds a
+conjunct `q` and the other a conjunct `!q` for the same **boolean-typed read**
+`q` — a selection path with no index in it whose checked type is `bool`, or a
+presence test `has(p)` — compared as the parse spells it, whatever the other
+conjuncts are. That rule and no wider one: a guard whose top is `||` is one
+conjunct; `q == true` against `q == false` is two comparisons, not the read and
+its negation; `!!q` is not `q`; arithmetic, comparisons and every other shape
+contribute nothing; and nothing is decided by satisfiability.
+
+**Rationale**: D99's relation proved two guards exclusive only through an
+enum-typed field's `possible` sets (rule 2), so `a.output.ok && input.x` and
+`a.output.ok && !input.x` read as co-takeable and the convergence they share was
+`unbalanced-convergence`, which an author could only answer with a routing node
+carrying `else:` (PRD resolved q86). A boolean read and its negation cannot both
+hold, which is as provable as two disjoint variant sets; a read that fails —
+an absent value — fails the execution (D110), so neither guard is taken and the
+pair is still never taken together. A wider rule would be a satisfiability check,
+and `validate`'s millisecond budget forbids one (PRD 5.12).
+
+**What "boolean-typed" is decided by.** The type is the CEL front-end's: the walk
+that already type-checks every guard records which of its finished paths it typed
+`bool` (`Analysis::booleans`), and the rule reads that record rather than typing
+anything a second time. A path the walk could not type — a value of unknown type
+under a decoded payload — is not `bool`-typed and proves nothing, which is the
+conservative answer. A presence test needs no record: it is `bool` by
+construction, and `has(p)` is a different read from `p` — one asks whether the
+member is there, the other what it holds. A guard the front-end refused is read
+by neither rule 2 nor rule 3, as before.
+
+**Compared as the parse spells it.** The read is carried as its root and member
+names, so whitespace and grouping — which the parse has already discarded —
+change nothing, and an index is not a selection: `input['x']` is not the
+`input.x` another guard negates. One parse is not read as written: the pinned
+`cel` crate collapses a run of unary `!` into one application, so `!!q` arrives
+as `!q`. A guard whose source applies a `!` directly to a `!` — `!!q`, `! !q`,
+or a `!` and a `!` with only a `//` comment and a line break between them, since
+a comment is hidden from the parser as whitespace is — therefore holds no
+literal for this rule at all, because its AST carries a negation its source
+does not, and `!!q` against `q` would otherwise read as exclusive where the two
+guards are the same guard. `!(!q)` parses as written and
+is simply not a literal.
+
+**Where it is asked.** Beside rule 2, in the per-edge reading `convergence.rs`
+already hoists out of the pair loop: each guard is parsed once for both rules,
+and a pair costs the disjointness test plus one lookup per literal. Rule 3 needs
+a `!` on one side, so a fork none of whose guards writes one — and whose source
+has no enum-typed output field for rule 2 — parses nothing, as before. The rule
+changes only which pairs are exclusive: balanced convergence (§7.6.2), the
+concurrent-writer half of the reduced-channel rule (§10.2) and the shared-
+workspace refusal (D147) all read the co-takeable pairs one function decides, so
+all three follow it, and none of their diagnostics' text changes for a pair that
+stays co-takeable. `plan` and `visualize` print no fork pairs, so neither output
+moves. `start` is read by rule 3 like any other vertex — its guards read `input`
+and `state` — where rule 2 has no output to read there.
+
+**Collision review.** D99 is **amended by one clause**: its exclusivity relation
+gains rule 3; co-takeability stays a relation on a pair, named per sibling, and
+the pairwise reading of `dist` is unchanged. D112 is unchanged — balanced
+convergence still compares one distance from each edge of a co-takeable pair,
+and fewer pairs reach it. D82's closed table is unchanged: rule 3 is a second
+reading of a guard beside the table rather than a new row of it, it says nothing
+about coverage, and exhaustiveness (§7.3.1) still reads the table alone. D69's
+stepwise execution and D32's reduce policies are unchanged; a channel two
+exclusive branches write needs no policy, which is D32's own reading of a pair
+that cannot race. D107 is unchanged — an `else:` still requires a guarded
+sibling, and rule 1 still reads it. D147's shared-workspace rule reads the same
+pairs and follows the rule without a change of its own. §7.6.1 and §10.2 are the
+sections amended and read; §7.6.2's worked example names rule 3 beside rule 2
+as a way to make a pair exclusive.
+
+**Status**: ratified — PRD resolved q86. *PRD 5.12; PRD resolved q86; §7.6.1,
+§7.6.2, §10.2; amends D99; builds on D82, D110; leaves D32, D69, D107, D112,
+D147 unchanged.*
 
 ### D170. `--no-build` launches a built tree as it stands, and `build --restamp` re-hashes one
 

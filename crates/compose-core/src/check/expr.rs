@@ -250,7 +250,11 @@ pub(crate) fn edge_guard(ctx: &mut Ctx, cx: &FlowCx, edge: &Edge) {
     // (see `routing`, `convergence`).
     if !analysis.problems.is_empty() || !analysis.ty.assignable_to(&Type::Bool) {
         ctx.reject_guard(&guard.span);
+        return;
     }
+    // What grammar 7.6.1's third exclusivity rule reads off a guard that did
+    // type-check: which of its paths are `bool`-typed (Decision D169).
+    ctx.record_guard_booleans(&guard.span, analysis.booleans);
 }
 
 /// The scope of a `map.over` path: every node of the flow, plus `input` and
