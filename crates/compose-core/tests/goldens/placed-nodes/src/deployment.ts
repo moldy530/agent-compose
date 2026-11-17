@@ -159,6 +159,12 @@ export const placements: readonly PlacementManifest[] = [
       "agent.tidier",
       "agent.closer",
       "agent.lapser",
+      "flow.placed_build",
+      "flow.placed_tidying",
+      "flow.placed_closing",
+      "flow.placed_asking",
+      "flow.placed_holding",
+      "flow.placed_inspected_twice",
     ],
     maxRunning: 1,
     environment: [

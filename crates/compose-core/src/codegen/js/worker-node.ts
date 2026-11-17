@@ -218,13 +218,16 @@ import type * as runtime from "./runtime.ts";
 import {
   cancelFired,
   cancelOnTerminate,
+  completeCancel,
   dispatchPausesHome,
   executionCancelSignal,
   finallyErrorOf,
+  instanceTrace,
   onFinallyWork,
   refuseChildExecutions,
   releaseWorkspaces,
   remotePauseOf,
+  stopAtFrontier,
   stopEveryNodeOn,
 } from "./runtime.ts";
 
@@ -283,8 +286,26 @@ function unbounded(): AbortController {
  * hub stopped waiting for it — and recorded, it would be posted home and
  * replayed as the world's failure by the attempt the hub opens next (see *A
  * stop arrives as `SIGUSR2`*).
+ *
+ * Answers both signals: `placed`, the placed node's own, and `stopped`, the
+ * stop alone — what a **placed flow's** instance runs under (Decision D171).
+ * Its nodes read the execution's cancel each through its own activity, as the
+ * nodes of a root execution on the hub do, so the instance is not stopped
+ * from outside by a cancel: each node it was running ends `cancelled` on its
+ * own entry, and the instance ends on them. And `halt`, which is the stop
+ * itself — what [`STOP_SIGNAL`] calls, and what the **end a hub stop owes** an
+ * instance calls at its frontier (§3.2's `stopped`, `runtime.stopAtFrontier`)
+ * — answering the [`DispatchStopped`] it stopped everything with.
  */
-function stoppable(cancel: AbortSignal, execution: string, dispatch: string): AbortSignal {
+function stoppable(
+  cancel: AbortSignal,
+  execution: string,
+  dispatch: string,
+): {
+  readonly placed: AbortSignal;
+  readonly stopped: AbortSignal;
+  readonly halt: () => DispatchStopped;
+} {
   const stop = unbounded();
   const everyNode = unbounded();
   const follow = (): void => {
@@ -294,14 +315,19 @@ function stoppable(cancel: AbortSignal, execution: string, dispatch: string): Ab
   else cancel.addEventListener("abort", follow, { once: true });
   stopEveryNodeOn(everyNode.signal);
   let stopped: DispatchStopped | undefined;
+  const halt = (): DispatchStopped => {
+    if (stopped !== undefined) return stopped;
+    const reason = new DispatchStopped(dispatch);
+    stopped = reason;
+    noteStopped(execution, reason);
+    if (!stop.signal.aborted) stop.abort(reason);
+    if (!everyNode.signal.aborted) everyNode.abort(reason);
+    return reason;
+  };
   process.on(STOP_SIGNAL, () => {
-    if (stopped !== undefined) return;
-    stopped = new DispatchStopped(dispatch);
-    noteStopped(execution, stopped);
-    if (!stop.signal.aborted) stop.abort(stopped);
-    if (!everyNode.signal.aborted) everyNode.abort(stopped);
+    halt();
   });
-  return stop.signal;
+  return { placed: stop.signal, stopped: everyNode.signal, halt };
 }
 
 /** The dispatch this process was handed, as §3.2 puts it on the wire. */
@@ -327,6 +353,31 @@ interface Dispatch {
   readonly history?: readonly unknown[];
   readonly policy?: unknown;
   readonly effect_history?: readonly Record<string, unknown>[];
+  /**
+   * §3.2's OPTIONAL `cancelled`: this dispatch is the **end** a cancel owes a
+   * placed flow's instance that no worker was running when the cancel came —
+   * it had brought a question home, or its redispatch was parked (Decision
+   * D171). The instance is replayed to its frontier, where the execution's
+   * cancel fires exactly as a recovered cancel fires it on the hub
+   * (`runtime.completeCancel`): every node it reaches there ends `cancelled`,
+   * the instance ends `cancelled`, and its `finally:` node runs here. Absent on
+   * every other dispatch.
+   */
+  readonly cancelled?: boolean;
+  /**
+   * §3.2's OPTIONAL `stopped`: this dispatch is the **end** a hub stop owes a
+   * placed flow's instance that no worker was running when the hub stopped
+   * waiting for it — an end around it abandoned the question it had brought
+   * home, or its instantiating node's deadline ran out while its redispatch
+   * was parked (Decision D171). The instance is replayed to its frontier, where
+   * it is stopped as a `stop` list entry stops one a worker is running
+   * (`runtime.stopAtFrontier`): every node it reaches there ends `failed`, the
+   * instance ends `failed`, and its `finally:` node runs here — or, where the
+   * history already holds the rest of its body, it reaches no frontier and ends
+   * as the history does, its `finally:` node run at that. Absent on every other
+   * dispatch.
+   */
+  readonly stopped?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -647,6 +698,8 @@ async function runPlaced(options: {
   readonly history?: readonly runtime.Turn[];
   readonly policy?: runtime.InstancePolicy;
   readonly signal?: AbortSignal;
+  /** [`PlacedSite.stop`], for the dispatch this process was handed. */
+  readonly stop?: AbortSignal;
 }): Promise<PlacedAnswer> {
   const run = placedNodes[options.node];
   if (run === undefined) {
@@ -698,6 +751,7 @@ async function runPlaced(options: {
     execution,
     ...(options.history === undefined ? {} : { history: options.history }),
     ...(options.policy === undefined ? {} : { policy: options.policy }),
+    ...(options.stop === undefined ? {} : { stop: options.stop }),
   });
   return {
     output: answer.output,
@@ -716,6 +770,9 @@ async function runPlaced(options: {
     // did nothing where the same agent unplaced reports what it did (PRD 5.8,
     // `docs/distributed.md` §4.3).
     ...(storeRecords.length === 0 ? {} : { stores: [...storeRecords] }),
+    // A placed flow's instance trace (Decision D171): the entries its nodes
+    // made here, which the hub files where the instance's starter keeps them.
+    ...(answer.inner === undefined ? {} : { inner: answer.inner }),
   };
 }
 
@@ -889,8 +946,10 @@ async function main(): Promise<void> {
   // would issue it fails with a sentence that says what to change
   // (`runtime.ChildOnAWorker`) — the node's own failure, which grammar 8.6 rule
   // 7 leaves to its `on_error:` and which travels home with this dispatch like
-  // any other. It is the one construct a flow attached to a placed agent can
-  // reach that only the hub may begin.
+  // any other. It is the one construct that only the hub may begin and that a
+  // worker can still reach — inside a flow a placed agent attaches (grammar
+  // §14.1 rule 4), or anywhere in a placed flow's instance, which runs here
+  // whole (grammar §14.1 rule 2, Decision D171).
   refuseChildExecutions();
   executeLocally(runPlaced);
   // …and a pause reached under any of it settles this dispatch rather than
@@ -908,13 +967,31 @@ async function main(): Promise<void> {
   // and cancels nothing (see *A stop arrives as `SIGUSR2`*).
   const cancel = executionCancelSignal(dispatch.execution_id);
   cancelOnTerminate(dispatch.execution_id);
-  const placed = stoppable(cancel, dispatch.execution_id, dispatch.dispatch_id);
+  const { placed, stopped, halt } = stoppable(
+    cancel,
+    dispatch.execution_id,
+    dispatch.dispatch_id,
+  );
   // …and the worker is told whenever finally work starts and stops here, so a
   // cancel's grace does not cut off a `finally:` node that runs whole (see
   // *Finally work is reported*).
   onFinallyWork((running) => {
     writing = writing.then(() => say({ type: "finally", running }));
   });
+  // **The end a cancel owes an instance** (§3.2's `cancelled`, Decision D171):
+  // the cancel was made while no worker was running this placed flow's
+  // instance, so it fires here at the frontier — the first effect the history
+  // does not hold — and the instance ends there as the cancel ended it, its
+  // finally node run (`runtime.completeCancel`, the hook a recovered cancel
+  // uses on the hub). Its result is then `status: "cancelled"`, below.
+  if (dispatch.cancelled === true) completeCancel(dispatch.execution_id);
+  // **The end a hub stop owes an instance** (§3.2's `stopped`, Decision D171):
+  // the hub stopped waiting for this placed flow's instance while no worker was
+  // running it, so it is stopped here at the frontier, as the `stop` list
+  // stops one a worker is running (see *A stop arrives as `SIGUSR2`*): it ends
+  // `failed` there and its finally node runs, and its result is the instance's
+  // failure, below.
+  if (dispatch.stopped === true) stopAtFrontier(dispatch.execution_id, halt);
 
   let line: Record<string, unknown>;
   try {
@@ -935,6 +1012,7 @@ async function main(): Promise<void> {
         ? {}
         : { policy: dispatch.policy as runtime.InstancePolicy }),
       signal: placed,
+      stop: stopped,
     });
     line = {
       type: "result",
@@ -943,6 +1021,7 @@ async function main(): Promise<void> {
       ...(answer.models === undefined ? {} : { models: answer.models }),
       ...(answer.toolDispatches === undefined ? {} : { tool_dispatches: answer.toolDispatches }),
       ...(answer.stores === undefined ? {} : { stores: answer.stores }),
+      ...(answer.inner === undefined ? {} : { inner: answer.inner }),
     };
   } catch (error) {
     // The node failed, which is an outcome rather than a crash: §3.4 takes "its
@@ -952,12 +1031,17 @@ async function main(): Promise<void> {
     // a pause, which settles this dispatch and sends the wait home
     // ([`pausedOnAHuman`]).
     const paused = pausedOnAHuman(error);
+    // A placed flow's instance that failed — or that a cancel ended — made a
+    // trace on the way, and it goes home beside the ending, so the node that
+    // started the instance on the hub records it as it would had the instance
+    // run there (Decision D171). Nothing else a worker runs ends with one.
+    const inner = instanceTrace(error);
     line =
       // The hub's cancel, which this process stopped on: §3.4's fourth ending.
       cancelFired(dispatch.execution_id)
-        ? { type: "result", status: "cancelled" }
+        ? { type: "result", status: "cancelled", ...(inner === undefined ? {} : { inner }) }
         : paused === undefined
-          ? { type: "result", error: named(error) }
+          ? { type: "result", error: named(error), ...(inner === undefined ? {} : { inner }) }
           : { type: "result", paused };
   }
   // A `finally:` node that ran here and failed after its retries — a flow-as-tool

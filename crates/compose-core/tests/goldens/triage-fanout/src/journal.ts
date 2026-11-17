@@ -309,6 +309,15 @@ export type JournalOutcome =
        * back with the failure it travelled beside. Never on an effect record.
        */
       readonly finallyError?: string;
+      /**
+       * On a **placement dispatch's** settled failure only, where the dispatch
+       * ran a placed flow's instance (grammar 14.1, Decision D171): the trace
+       * that instance made before it failed, which the worker sent home beside
+       * the failure (`docs/distributed.md` §3.4). Kept on the row for
+       * `finallyError`'s reason, and restated on the error a replay raises
+       * ([`replayedFailure`], [`placedTraceOf`]). Never on an effect record.
+       */
+      readonly inner?: readonly unknown[];
     };
 
 /** One effect, as the journal holds it. */
@@ -1900,6 +1909,7 @@ class SqlJournal implements Journal {
             name: outcome.name,
             message: outcome.message,
             ...(outcome.finallyError === undefined ? {} : { finallyError: outcome.finallyError }),
+            ...(outcome.inner === undefined ? {} : { inner: outcome.inner }),
           });
     return this.#serial(async () => {
       // **Read first, and the read is what answers.** The `WHERE` clause is still
@@ -1942,6 +1952,18 @@ class SqlJournal implements Journal {
     // Postgres' `"C"` and MySQL's `ascii_bin`, so a key is never equal to a key
     // spelled with different case and `ORDER BY "key"` is the order a reader of
     // `docs/durability.md` §4 derives.
+    // **The root instance path holds every effect of the execution** — a
+    // placed flow's root execution is one dispatch at the empty path
+    // (grammar 14.1, Decision D171), and its redispatch replays all of it.
+    if (site === "") {
+      return this.#serial(async () => {
+        const rows = await this.#all(
+          `SELECT * FROM effects WHERE execution = ? ORDER BY "key" ASC`,
+          [execution],
+        );
+        return rows.map((row) => recordOf(row));
+      });
+    }
     const inside = `${site}/`;
     // The prefix **length** is written into the statement rather than bound,
     // and it is a number this module computed rather than anything a caller
@@ -3053,12 +3075,14 @@ function errorOutcome(payload: string): JournalOutcome {
     name?: unknown;
     message?: unknown;
     finallyError?: unknown;
+    inner?: unknown;
   };
   return {
     kind: "error",
     name: typeof held.name === "string" ? held.name : "Error",
     message: typeof held.message === "string" ? held.message : payload,
     ...(typeof held.finallyError === "string" ? { finallyError: held.finallyError } : {}),
+    ...(Array.isArray(held.inner) ? { inner: held.inner as unknown[] } : {}),
   };
 }
 
@@ -4346,7 +4370,30 @@ function named(error: unknown): { name: string; message: string } {
 export function replayedFailure(outcome: Extract<JournalOutcome, { kind: "error" }>): Error {
   const error = new Error(outcome.message);
   error.name = outcome.name;
+  // The trace a placed flow's instance made before it failed, where the
+  // dispatch ran one (Decision D171): carried on the error, never in its text,
+  // so `./runtime.ts` can restate the failure as the instance's own.
+  if (outcome.inner !== undefined) {
+    Object.defineProperty(error, PLACED_TRACE, {
+      value: outcome.inner,
+      enumerable: false,
+      configurable: true,
+    });
+  }
   return error;
+}
+
+/** Where [`replayedFailure`] keeps a placed instance's trace. */
+const PLACED_TRACE = Symbol.for("agent-compose.placedTrace");
+
+/**
+ * The trace a placed flow's failed instance made on its worker, where `error`
+ * is a dispatch's failure that carried one ([`replayedFailure`]).
+ */
+export function placedTraceOf(error: unknown): readonly unknown[] | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const held = (error as Record<symbol, unknown>)[PLACED_TRACE];
+  return Array.isArray(held) ? held : undefined;
 }
 
 /**

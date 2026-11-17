@@ -182,10 +182,12 @@ pub const FIXTURES: &[&str] = &[
     // no deploy file for — it places nothing and is an ordinary single-process
     // project, which is exactly the claim grammar §14 makes about the layer.
     "placed-nodes",
-    // A `coder:` node run on a worker: a placed agent whose only tool is a
-    // `flow.*` holding the coder node and a `finally:` node — the one way this
-    // release can put a build step on a build machine. `deploy/mesh.yml` places
-    // the agent, and the test that serves it is in
+    // A `coder:` node run on a worker, each way a build step reaches one: a
+    // placed agent whose only tool is an unplaced `flow.*` holding the coder
+    // node and a `finally:` node; that flow placed itself (Decision D171) and
+    // started as a root execution; and the placed flow attached by an agent of
+    // its own placement. `deploy/mesh.yml` places both agents and the placed
+    // flow, and the tests that serve it are in
     // `tests/distributed_mesh_acceptance.rs`. Under `local` it places nothing.
     "placed-coder",
     "provider-kinds",
@@ -536,12 +538,28 @@ pub fn run_target_spawned(
     inputs: &[(&str, &str)],
     environment: &[(String, String)],
 ) -> Running {
+    run_target_spawned_with(out, entrypoint, target, flow, inputs, &[], environment)
+}
+
+/// [`run_target_spawned`], with `extra` arguments after the target's — the
+/// `--host`/`--port` a run serves its mesh at, for one (grammar §14.1,
+/// Decision D171).
+pub fn run_target_spawned_with(
+    out: &Path,
+    entrypoint: &Path,
+    target: &str,
+    flow: &str,
+    inputs: &[(&str, &str)],
+    extra: &[&str],
+    environment: &[(String, String)],
+) -> Running {
     let mut command = agent_compose();
     command.arg("run").arg(entrypoint).arg(flow);
     for (field, value) in inputs {
         command.arg("--input").arg(format!("{field}={value}"));
     }
     command.args(["--target", target]).arg("--out").arg(out);
+    command.args(extra);
     seal(&mut command, environment);
     command
         .stdin(Stdio::null())

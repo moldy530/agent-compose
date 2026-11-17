@@ -1615,6 +1615,24 @@ export function completeCancel(execution: string): void {
 }
 
 /**
+ * [`completeCancel`]'s twin for the **end a hub stop owes** a placed flow's
+ * instance (`docs/distributed.md` §3.2's `stopped`, Decision D171): the hub
+ * stopped waiting for an instance no worker was running — an end around it
+ * abandoned its question, or its instantiating node's deadline ran out while
+ * its redispatch was parked — so the worker it hands the instance to replays
+ * the recorded prefix, and the first effect the record does not hold calls
+ * `stop`, which stops the instance as a `stop` list entry stops one a worker is
+ * running, and raises what it answers instead of being issued. Its nodes end
+ * `failed` there and its finally node runs, whose effects are exempt as they
+ * are from a recovered cancel ([`finallySites`]).
+ *
+ * Called by `src/worker-node.ts` for a dispatch carrying `stopped: true`.
+ */
+export function stopAtFrontier(execution: string, stop: () => Error): void {
+  cancelAtFrontier(execution, (site) => (underRunningFinally(execution, site) ? undefined : stop()));
+}
+
+/**
  * Whether an error a run or an instance ended on is a **cancel** — the outcome
  * `cancelled` — rather than a failure: a cancellation on its chain, or the end
  * a resumed generation's boundary records as cancelled ([`RecordedEnding`]).
@@ -11062,6 +11080,39 @@ function traceOf(error: unknown): readonly TraceEntry[] | undefined {
 }
 
 /**
+ * [`traceOf`], for the two readers outside this module that need the trace a
+ * **placed** flow's failed instance made (Decision D171): a worker sending it
+ * home beside the failure (`./worker-node.ts`), and `runFlow` reading it off a
+ * placed root that failed on its worker. On the hub the instance's failure is
+ * one a dispatch replayed, and [`placedInstanceFailure`] is what put the trace
+ * back on it.
+ */
+export function instanceTrace(error: unknown): readonly TraceEntry[] | undefined {
+  return traceOf(error);
+}
+
+/**
+ * The failure a **placed** flow's instance came home with, restated as the
+ * [`SubflowFailure`] it was on the worker (Decision D171).
+ *
+ * A dispatch's failure reaches the hub as a name and a message
+ * (`./journal.ts`'s `replayedFailure`) — and, where the dispatch ran an
+ * instance, the trace that instance made, which the worker sent beside it
+ * (`placedTraceOf`). Restated, the instantiating node's entry carries that
+ * trace as its `inner` exactly as it does when the instance ran here
+ * ([`traceOf`]), and the text is the worker's own, unwrapped once more.
+ */
+export function placedInstanceFailure(
+  flow: string,
+  error: unknown,
+  trace: readonly TraceEntry[],
+): SubflowFailure {
+  const failure = new SubflowFailure(flow, "failed", trace, error);
+  if (error instanceof Error) failure.message = error.message;
+  return failure;
+}
+
+/**
  * What a `map` node dispatched, read off the **plan** rather than off an answer
  * or a failure (grammar 8.6, PRD 5.3, 5.6).
  *
@@ -11620,6 +11671,71 @@ export interface SubflowBinding extends Quiescible<GraphStateLike> {
    * an edge to it (grammar 7.9, [`endInstance`]).
    */
   readonly finally?: NodeDescriptor;
+  /**
+   * The placement that claims this flow, where one does (grammar 14.1, PRD
+   * resolved q84, Decision D171).
+   *
+   * Every instance of a placed flow runs on a worker claiming its placement, so
+   * [`runSubflow`] hands the instance to the mesh ([`dispatchPlacedInstances`])
+   * rather than running it here — whichever construct started it: a `flow:`
+   * node, a `map` item, a flow-as-tool call. The worker runs it through
+   * [`runSubflowHere`], which is the same instance without this question.
+   */
+  readonly placement?: string;
+}
+
+/**
+ * How a process hands a **placed** flow's instance to the mesh
+ * (Decision D171) — registered by `./mesh.ts` as it loads, because the import
+ * graph runs the other way: `./mesh.ts` imports this module, and this module
+ * imports nothing that imports it.
+ *
+ * `signal` is the instance's own stop ([`runSubflow`]'s), which follows the
+ * instantiating node's clock and is what an enclosing end pulls; a dispatch
+ * reads it as `./mesh.ts`'s `dispatchPlaced` reads a placed node's.
+ */
+export type PlacedInstanceDispatch = (
+  flow: { readonly address: string; readonly placement: string },
+  instance: Instantiation,
+  signal: AbortSignal,
+) => Promise<NodeAnswer>;
+
+/** See [`dispatchPlacedInstances`]. */
+let placedInstances: PlacedInstanceDispatch | undefined;
+
+/**
+ * Register how this process dispatches a placed flow's instance. Called once,
+ * by `./mesh.ts`, and by nothing else.
+ */
+export function dispatchPlacedInstances(dispatch: PlacedInstanceDispatch): void {
+  placedInstances = dispatch;
+}
+
+/**
+ * A placed flow's **root** instance, dispatched to its placement — what
+ * `runFlow` does with an execution of a placed flow once its row is open
+ * (Decision D171).
+ *
+ * Not [`runSubflow`]: a root instance has no instantiating node to be refused
+ * under, no instance around it, and nothing on this process's books to wait for
+ * it, because the execution's own way out is what waits. What it shares is the
+ * dispatch: the instance at the root path, keyed by the execution and the
+ * flow's address, run whole on a worker claiming the placement.
+ */
+export async function runPlacedRoot(
+  flow: { readonly address: string; readonly placement?: string },
+  instance: Instantiation,
+): Promise<NodeAnswer> {
+  if (flow.placement === undefined || placedInstances === undefined) {
+    throw new Error(
+      `\`${flow.address}\` is not a placed flow this process can dispatch (grammar 14.1)`,
+    );
+  }
+  return await placedInstances(
+    { address: flow.address, placement: flow.placement },
+    instance,
+    instance.signal ?? new AbortController().signal,
+  );
 }
 
 /** What one instantiation supplies to the instance it starts (grammar 7.5). */
@@ -11707,6 +11823,49 @@ export async function runSubflow(
   binding: SubflowBinding,
   instance: Instantiation,
 ): Promise<NodeAnswer> {
+  return await beginInstance(binding, instance, (signal) => {
+    // **A placed flow's instance is dispatched** (grammar 14.1, PRD resolved
+    // q84, Decision D171): a worker claiming the placement runs it, through
+    // [`runSubflowHere`], and its answer — outputs, the turns a `context:
+    // inherit` instance added, its whole trace — comes home as this one's.
+    // Everything around it is unchanged and is the reason this is a branch
+    // inside [`beginInstance`] rather than a call before it: the refusals an
+    // instance that should not begin meets, the stop that follows the
+    // instantiating node's clock, and the entry on this process's books that
+    // every end around it waits for. On a worker, the same dispatch is answered
+    // by running the instance in that worker's own process (`./mesh.ts`'s
+    // `executeLocally`), which is what a placed flow reached inside another of
+    // its own placement does.
+    const placement = binding.placement;
+    if (placement !== undefined && placedInstances !== undefined) {
+      return placedInstances({ address: binding.address, placement }, instance, signal);
+    }
+    return runInstance(binding, instance, signal);
+  });
+}
+
+/**
+ * [`runSubflow`] **here**, whatever the flow's placement — the instance a
+ * worker runs for a placed flow's dispatch (Decision D171), started in this
+ * process under the dispatch's own instance path.
+ */
+export async function runSubflowHere(
+  binding: SubflowBinding,
+  instance: Instantiation,
+): Promise<NodeAnswer> {
+  return await beginInstance(binding, instance, (signal) => runInstance(binding, instance, signal));
+}
+
+/**
+ * Begin one instance, or refuse to: the half of [`runSubflow`] that is about
+ * whether an instance may start at all and what it is held to once it has —
+ * `run` is what the instance then is, here or on a worker.
+ */
+async function beginInstance(
+  binding: SubflowBinding,
+  instance: Instantiation,
+  run: (signal: AbortSignal) => Promise<NodeAnswer>,
+): Promise<NodeAnswer> {
   // **An instance whose clock has already run out is not started.** What
   // reaches here with an aborted signal is work the instantiating node had
   // stopped waiting for before it began — a `map` item still queued for a
@@ -11753,9 +11912,7 @@ export async function runSubflow(
   const clock = instance.signal;
   const follow = (): void => stop.abort(clock?.reason);
   clock?.addEventListener("abort", follow, { once: true });
-  const ended = runInstance(binding, instance, stop.signal).finally(() =>
-    clock?.removeEventListener("abort", follow),
-  );
+  const ended = run(stop.signal).finally(() => clock?.removeEventListener("abort", follow));
   instanceBegun(execution, path, ended, stop, detached);
   return ended;
 }
@@ -15230,12 +15387,14 @@ export function dispatchPausesHome(): void {
  * and a child execution is begun, journaled, recovered and exported through
  * the journal's single writer — the hub (`docs/distributed.md` §3.3, PRD
  * resolved q42) — which a worker is not and cannot stand in for. A worker
- * reaches a detached `flow.*` dispatch only through a flow a placed agent
+ * reaches a detached `flow.*` dispatch two ways: through a flow a placed agent
  * attaches as a tool (grammar 14.1 rule 4 runs it in the agent's process), and
- * there the dispatch cannot be issued: [`runMap`] fails the map node that would
- * have issued it, by name, before anything is dispatched — the failure grammar
- * 8.6 rule 7 leaves to that node's own `on_error:` — rather than beginning a
- * child nobody can recover on a journal nobody reads.
+ * inside a placed flow's instance, every node of which — and of the unplaced
+ * flows it instantiates — the worker runs (grammar 14.1 rule 2, Decision
+ * D171). Either way the dispatch cannot be issued: [`runMap`] fails the map
+ * node that would have issued it, by name, before anything is dispatched — the
+ * failure grammar 8.6 rule 7 leaves to that node's own `on_error:` — rather
+ * than beginning a child nobody can recover on a journal nobody reads.
  */
 let childrenBeginHere = true;
 
@@ -15252,7 +15411,7 @@ export function refuseChildExecutions(): void {
 export class ChildOnAWorker extends Error {
   constructor(flow: string, idempotencyKey: string) {
     super(
-      `\`${flow}\` is dispatched with \`detach: true\` (key \`${idempotencyKey}\`) inside a placed node, on the worker running it, and a detached \`flow.*\` dispatch starts a child execution — which the hub alone begins, journals and recovers, as the single writer of this deployment's journal (docs/distributed.md §3.3, PRD resolved q42, q65). It could not be issued, so the map node that would have issued it fails, and its \`on_error:\` decides what follows (grammar 8.6 rule 7). Drop \`detach:\` so the dispatch is joined inside the placed node, or dispatch the flow from a flow the hub runs rather than from one a placed agent attaches as a tool (grammar 14.1 rule 4)`,
+      `\`${flow}\` is dispatched with \`detach: true\` (key \`${idempotencyKey}\`) inside a placed node, on the worker running it, and a detached \`flow.*\` dispatch starts a child execution — which the hub alone begins, journals and recovers, as the single writer of this deployment's journal (docs/distributed.md §3.3, PRD resolved q42, q65). It could not be issued, so the map node that would have issued it fails, and its \`on_error:\` decides what follows (grammar 8.6 rule 7). Drop \`detach:\` so the dispatch is joined inside the placed node, or dispatch the flow from a flow the hub runs — not from inside a placed flow's instance, every node of which runs on its worker (grammar 14.1 rule 2, Decision D171), nor from a flow a placed agent attaches as a tool, which runs in the agent's own loop (grammar 14.1 rule 4)`,
     );
     this.name = "ChildOnAWorker";
   }
@@ -16357,8 +16516,10 @@ export async function holdRemotePause(
   const board = humanBoards.get(execution);
   if (board === undefined || !board.resumable) {
     // The same answer a local pause gets on a run with no answer surface, and
-    // the same nothing is journaled. Unreachable through `serve`, which is the
-    // only invocation that mounts a mesh at all (`./mesh.ts`'s `mounted`).
+    // the same nothing is journaled. Reached by a `run` or a `resume`, which
+    // serve a mesh once they dispatch a placed flow's instance (`./mesh.ts`'s
+    // `serveWhenReached`) and may have nobody to ask; never through `serve`,
+    // whose board is always resumable.
     throw new HumanInterrupt(remote.flow, remote.node, remote.wait, opened);
   }
 
@@ -16962,16 +17123,19 @@ async function placedRunnerMayOutlive(journal: Journal, execution: string): Prom
 
 /**
  * Whether this process hands placed nodes to workers — set by `./mesh.ts` as
- * it mounts the worker routes ([`handsOutPlacedNodes`]), so in a `serve` whose
- * target places something and nowhere else.
+ * it mounts the worker routes ([`handsOutPlacedNodes`]): in a `serve` whose
+ * target places something, and in a `run` or a `resume` from its first
+ * dispatch to a placement (Decision D171).
  *
  * What it decides is whether a settled execution's prune, waiting behind
  * detached deliveries, asks [`placedRunnerMayOutlive`] again as it starts
  * ([`settleExecution`]): a delivery still in flight can reach a placed node,
  * and only a process that hands them out can have handed one over since the
- * settlement asked. One that hands none out has nothing new to find — and is a
- * `run` or a `resume`, whose journal is closed by the time its exit starts the
- * prune.
+ * settlement asked. One that hands none out has nothing new to find. A `run`
+ * or a `resume` that does hand them out may have let go of its journal by the
+ * time its exit starts the prune, and a journal that cannot answer is read as
+ * "it may" — the rows are kept, which is the side that costs storage rather
+ * than a write applied twice.
  */
 let handsOut = false;
 

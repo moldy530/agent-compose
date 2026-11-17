@@ -1,0 +1,39 @@
+# rule: a placed flow attached as a tool colocates with the placed agent that attaches it (grammar 14.1 rule 4, Decision D171)
+# code: conflicting-placement
+# message: `flow.build` is a member of placement `mac`, and `agent.reviewer` that attaches it has placement `gpu`
+# at: main.yml:35:11
+# label: deploy/mesh.yml:7:3 `mac` is declared here
+# help: a flow attached as a tool runs its instance inside the agent's own tool loop (grammar 5.4): an agent the hub runs dispatches a placed flow to the flow's own placement, but an agent a worker runs can only run it on that worker, which hands nothing on to another placement: put the two in one placement, drop one of the two placements, or reach the flow from a `flow:` node of a flow the hub runs, where its placement is the whole answer (grammar 14.1 rule 4, Decision D171)
+# target: mesh
+#
+# The same flow attached to an agent with **no** placement is legal: the hub
+# runs that agent, and the hub dispatches the flow's instance to `mac`.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+flow.build:
+  description: Build the requested scheme.
+  inputs:
+    scheme: { type: string }
+  outputs: {}
+  nodes:
+    compile:
+      exec:
+        command: make
+      input:
+        scheme: "input.scheme"
+  edges:
+    - { from: start, to: compile }
+    - { from: compile, to: end }
+agent.reviewer:
+  model: model.m
+  prompt: Review the release, building what you need.
+  tools: [flow.build]
+  input:
+    scheme: { type: string }
+  output:
+    verdict: { type: string }

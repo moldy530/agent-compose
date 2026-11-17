@@ -1,0 +1,54 @@
+# rule: a placed flow whose agent attaches a flow placed elsewhere would run that flow on its own worker (grammar 14.1 rules 3 and 4, Decision D171)
+# code: conflicting-placement
+# message: `flow.notarize` runs where `flow.release` runs (placement `mac`), so its own placement `gpu` can never take it
+# at: main.yml:50:11
+# label: deploy/mesh.yml:8:15 `flow.release` is a member of placement `mac`
+# label: deploy/mesh.yml:10:15 `flow.notarize` is a member of placement `gpu`
+# target: mesh
+#
+# `agent.packager` claims nothing, so it runs where the flow naming it runs —
+# on `mac`'s worker — and the flow it attaches starts its instance in that
+# agent's own tool loop. A worker hands nothing on to another placement, so
+# `gpu` could never take it.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+flow.notarize:
+  description: Notarize one artifact.
+  inputs:
+    path: { type: string }
+  outputs: {}
+  nodes:
+    submit:
+      exec:
+        command: notarytool
+      input:
+        path: "input.path"
+  edges:
+    - { from: start, to: submit }
+    - { from: submit, to: end }
+flow.release:
+  description: Package the release.
+  inputs:
+    path: { type: string }
+  outputs: {}
+  nodes:
+    package:
+      agent: agent.packager
+      input:
+        path: "input.path"
+  edges:
+    - { from: start, to: package }
+    - { from: package, to: end }
+agent.packager:
+  model: model.m
+  prompt: Package and notarize the release.
+  tools: [flow.notarize]
+  input:
+    path: { type: string }
+  output:
+    done: { type: boolean }

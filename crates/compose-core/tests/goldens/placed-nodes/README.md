@@ -25,7 +25,7 @@ The LangGraph TypeScript project `agent-compose build` produced from `main.yml`,
 | `src/deployment.ts` | what the deploy layer declares: the placements a worker may claim, the per-process environment partition the hub and a worker both read out of it (`docs/distributed.md` §9.1), and the address every settled trace ships to (grammar §14.5) |
 | `src/env.ts` | every `${ENV}` reference **this process** needs — the hub's own list, which is the whole composition's unless a placement takes something off it — and `readEnvironment()`, the presence check over them |
 | `src/journal.ts` | the execution journal: every effect a run issues, written as it happens, and what a resumed execution consumes instead of re-issuing it (`docs/durability.md`) |
-| `src/mesh.ts` | the hub half of the worker protocol: the `/workers/*` routes a serve mounts where the target declares `placements:`, the journaled dispatch board behind them, and the seam a placed node reaches a worker through (`docs/distributed.md`) |
+| `src/mesh.ts` | the hub half of the worker protocol: the `/workers/*` routes a serve mounts where the target declares `placements:` — and a `run` or `resume` mounts once it reaches a placed flow — the journaled dispatch board behind them, and the seam a placed node reaches a worker through (`docs/distributed.md`) |
 | `src/modules.ts` | the generated half of every `module:` binding: one contract type per module-bound tool, written from that tool's own `input:`/`output:`, the type of the `env:` that binding declared, and the typed `const` holding the authored implementation. The **only** generated module that imports code you wrote |
 | `src/otlp.ts` | the OTLP/JSON span exporter: one settled trace envelope mapped to an `ExportTraceServiceRequest`, hand-written and with no OpenTelemetry dependency behind it (`docs/trace.md` §12) |
 | `src/runtime.ts` | what every node does when it runs: the retry/timeout/error policy of grammar 9, the provider surfaces, the model failover ladder, the `exec`/`http` wrappers, and the router |
@@ -166,8 +166,8 @@ run`, `agent-compose serve`, `agent-compose store` and `agent-compose cancel`
 launch:
 
 ```sh
-bun src/index.ts run flow.<name> --input goal=... [--session <key>] [--format json]
-bun src/index.ts resume <execution-id> [--format json]
+bun src/index.ts run flow.<name> --input goal=... [--session <key>] [--format json] [--host <host>] [--port <port>]
+bun src/index.ts resume <execution-id> [--format json] [--host <host>] [--port <port>]
 bun src/index.ts serve --port 8787
 bun src/index.ts store get store.<name> <key> [--session <key> | --execution <id>] [--format json]
 bun src/index.ts cancel <execution-id> [--url <base>] [--header 'Name: value']... [--format json]
@@ -185,6 +185,15 @@ retry, so it exits `2` like an `--input` the flow does not declare. A declared
 a payload whose one member is this argument, and what that expression answers is
 the partition the run addresses (grammar 13.2). Declared on no trigger, the
 argument is the identity.
+
+A run that reaches an instance of a **placed flow** (grammar §14.1) is the hub
+that instance is dispatched from: at its first such dispatch it serves the
+`/workers/*` routes at `--host` and `--port` (`127.0.0.1` and a port the
+operating system picks, unless named), says where on stderr as `mesh: <url> — …`
+with the `agent-compose worker` command that joins it, and waits for a worker
+claiming the placement. A run that reaches no placed flow listens on nothing, and
+a placed agent's or tool's node a run reaches is refused, naming its placement —
+serve the target for those. `resume` takes the same two flags.
 
 `resume` carries on an execution this project's journal holds open — a run the
 machine lost, or one that stopped at a `human` pause with nobody to ask. Every
@@ -608,8 +617,8 @@ resume route instead.
 ## A pause a worker opens
 
 A placed component can reach a `human` node — an agent placed on a machine, with
-a `flow.*` in its `tools:` that asks somebody a question — and everything above
-is still true of it. The wait board is the hub's, so the question comes home: the
+a `flow.*` in its `tools:` that asks somebody a question, or a flow placed on a
+machine that asks one itself — and everything above is still true of it. The wait board is the hub's, so the question comes home: the
 worker settles its dispatch *paused*, the hub puts the wait on the same board a
 local pause goes on, and the status route publishes it with the same `wait_id`,
 the same `output_schema` and the same `resume_url`. Answer it at that URL.
@@ -617,7 +626,8 @@ the same `output_schema` and the same `resume_url`. Answer it at that URL.
 Two things are worth knowing about what happens next, because they are visible in
 the status route while they happen. The worker is **free** the moment it asks —
 the dispatch is over, and that machine may be given other work, or be switched
-off, while a person thinks. And the answer sends the node **back through
+off, while a person thinks. And the answer sends the node — for a placed flow,
+its whole instance — **back through
 dispatch**: it is queued to its placement again, and if nothing is claiming that
 placement at that moment the execution shows a `placement_waits` entry until a
 worker joins. What the node does *not* do is start over — the effects it had

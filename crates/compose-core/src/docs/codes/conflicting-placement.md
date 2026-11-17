@@ -34,18 +34,35 @@ not — a placement written, accepted, and silently ignored.
 
 It is the last row even where the agent *looks* like it can only ever run inside
 somebody else's process — an agent named by a flow that a placed agent attaches,
-and by nothing else. Every flow a composition declares is runnable on its own,
-whether or not a `manual` trigger names it, so that flow is one the hub can start
-directly and the `agent:` node inside it is dispatched by the hub when it does.
-The repair is the same as any other last row: name the agent in the placement
-too.
+and by nothing else. Every unplaced flow a composition declares is runnable on
+its own, whether or not a `manual` trigger names it, so that flow is one the hub
+can start directly and the `agent:` node inside it is dispatched by the hub when
+it does. The repair is the same as any other last row: name the agent in the
+placement too. The one unplaced agent that really does run only on a worker is
+one named only inside **placed** flows — it runs where their instances run, so
+a tool on that same placement is fine, and a tool anywhere else is refused as
+running "where `flow.f` runs (placement `A`)".
 
 **A placement reached through a flow the agent attaches.** The same table, one
-indirection out. A `flow.*` in a `tools:` list cannot itself be placed — placing
-a flow is deferred — but a flow-as-tool call starts an instance *inside the same
-tool loop*, so every agent and tool that instance reaches runs in the attaching
-agent's process too. A `mac` tool reached only that way is the last row again,
-with a flow standing between the two lines.
+indirection out. An unplaced `flow.*` in a `tools:` list claims nothing, but a
+flow-as-tool call starts an instance *inside the same tool loop*, so every agent
+and tool that instance reaches runs in the attaching agent's process too. A
+`mac` tool reached only that way is the last row again, with a flow standing
+between the two lines. A **placed** flow in a `tools:` list is dispatched
+instead of run in the loop — fine on an agent the hub runs, which hands it to
+the flow's placement, and refused on an agent placed somewhere else, whose
+worker could only run it there.
+
+**Something a placed flow reaches, placed elsewhere.** A `flow.*` member's
+instance runs whole on a worker claiming its placement, every node of it — and a
+worker hands nothing on to another placement; only the hub dispatches. So an
+`agent:` node's agent, a `function:` node's tool, a `flow:` node's flow or a
+`map` target that a placed flow reaches, with a placement of its own that is not
+the flow's, is the two-answers failure across kinds: "`agent.x` runs where
+`flow.f` runs (placement `A`), so its own placement `B` can never take it". The
+repairs are the usual ones — one placement for both, or drop the inner one's
+placement so it runs where the flow runs — or reach it from a flow the hub runs,
+where its own placement is the whole answer.
 
 What is **not** refused is anything the hub schedules. A `function:` node names
 a `tool.*` directly, and there its own placement is the whole of the answer —
@@ -137,5 +154,5 @@ placements:
     description: the machine with the signing keys
 ```
 
-Grammar: `docs/grammar.md` §14.1, §14.2, Decisions D128, D129. Topic:
+Grammar: `docs/grammar.md` §14.1, §14.2, Decisions D128, D129, D171. Topic:
 `agent-compose docs targets`. Protocol: `docs/distributed.md`.

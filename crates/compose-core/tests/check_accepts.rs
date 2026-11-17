@@ -3608,3 +3608,118 @@ flow.f:
 "#,
     );
 }
+
+/// A placed `flow.*` (grammar 14.1, PRD resolved q84, Decision D171): the build
+/// step the coder-node report asked for, written as a flow of its own.
+///
+/// The flow holds a `coder:` node and an `agent:` node over an **unplaced**
+/// agent, and both run where the flow runs — on the worker that took its
+/// dispatch — exactly as they do inside a flow a placed agent attaches. Every
+/// way a graph reaches the flow is here too, each of which the hub answers by
+/// dispatching the instance to the placement: a `flow:` node, a `map` over it,
+/// a flow-as-tool call from an agent with no placement, and a trigger that
+/// starts it as a root execution. A placed flow is not a placed agent's tool,
+/// so none of these is rule 4's business: the hub dispatches what it reaches.
+#[test]
+fn a_placed_flow_holding_a_coder_node_and_an_unplaced_agent() {
+    accepts_with_local(
+        "placed-flow",
+        r#"
+triggers:
+  on_build:
+    type: http
+    flow: flow.build
+    path: /builds
+    method: POST
+    input:
+      goal: "payload.body.goal"
+    respond: async
+agent.summarizer:
+  model: model.m
+  prompt: Summarize the build log.
+  input:
+    log: { type: string }
+  output:
+    summary: { type: string }
+agent.coordinator:
+  model: model.m
+  prompt: Build what the goal needs.
+  tools: [flow.build]
+  input:
+    goal: { type: string }
+  output:
+    summary: { type: string }
+flow.build:
+  description: Run one build step on the build machine, and summarize it.
+  inputs:
+    goal: { type: string }
+  outputs: {}
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.m
+        workspace: fresh
+        access: full_access
+        prompt: Run the build step the goal describes.
+        output:
+          log: { type: string }
+        allow_tools: [Bash, Read]
+      input: "input.goal"
+      writes: { log: build_log }
+    summarize:
+      agent: agent.summarizer
+      input:
+        log: "state.build_log"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: summarize }
+    - { from: summarize, to: end }
+flow.release:
+  inputs:
+    goals: { type: array, max_items: 4, items: { type: string } }
+  outputs: {}
+  nodes:
+    first:
+      flow: flow.build
+      input:
+        goal: "input.goals[0]"
+    every:
+      map:
+        over: "input.goals"
+        node: flow.build
+        max_concurrency: 2
+        input:
+          goal: "item"
+    coordinate:
+      agent: agent.coordinator
+      input:
+        goal: "input.goals[0]"
+  edges:
+    - { from: start, to: first }
+    - { from: first, to: every }
+    - { from: every, to: coordinate }
+    - { from: coordinate, to: end }
+state:
+  summary:
+    type: string
+    default: ""
+  build_log:
+    type: string
+    default: ""
+"#,
+        Some(
+            r#"version: "0.1"
+
+hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
+placements:
+  builder:
+    members: [flow.build]
+    description: The machine holding the checkout.
+"#,
+        ),
+    );
+}

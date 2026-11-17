@@ -736,3 +736,108 @@ fn a_flow_reached_from_a_flow_node_keeps_its_own_placements() {
         &mesh("  mac:\n    members: [tool.xcodebuild]\n"),
     );
 }
+
+// ---------------------------------------------------------------------------
+// An unplaced agent a placed flow's instance runs (grammar 14.1, Decision D171).
+// ---------------------------------------------------------------------------
+
+/// A placed flow whose one `agent:` node names `agent.builder`, so the agent
+/// runs wherever the flow's instance runs.
+const BUILDING_FLOW: &str = r#"flow.build:
+  description: Build the requested scheme on the build machine.
+  inputs:
+    scheme: { type: string }
+  outputs: {}
+  nodes:
+    build:
+      agent: agent.builder
+      input:
+        scheme: "input.scheme"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }
+"#;
+
+/// Row 2, reached through a placed flow: an unplaced agent that only a placed
+/// flow's instance runs executes on the workers claiming that flow's placement,
+/// so a tool on the same placement is the same answer written twice.
+///
+/// Read off the agent's own `members:` line, the agent "has no placement, so it
+/// runs on the hub", and row 4 would refuse a composition whose every process
+/// agrees — the hub dispatches each instance of `flow.build` to `mac` and runs
+/// none of its nodes (PRD resolved q84). What the rule compares against is where
+/// the agent executes, which is the environment partition's answer
+/// (`docs/distributed.md` §9.1).
+#[test]
+fn an_unplaced_agent_only_a_placed_flow_runs_may_attach_a_tool_on_that_placement() {
+    accepts(
+        "placed-flow-agent-same-placement",
+        &format!(
+            "{BACKEND}{BUILDING_FLOW}{}",
+            agent("builder", "tool.xcodebuild")
+        ),
+        &mesh("  mac:\n    members: [flow.build, tool.xcodebuild]\n"),
+    );
+}
+
+/// …and the transitive case agrees: a flow that agent attaches runs in its
+/// loop, on the same worker, so the same-placement tool it reaches is fine.
+#[test]
+fn an_unplaced_agent_only_a_placed_flow_runs_may_reach_a_tool_on_that_placement() {
+    accepts(
+        "placed-flow-agent-attached-flow",
+        &format!(
+            "{BACKEND}{BUILDING_FLOW}{SIGNING_FLOW}{}",
+            agent("builder", "flow.sign")
+        ),
+        &mesh("  mac:\n    members: [flow.build, tool.xcodebuild]\n"),
+    );
+}
+
+/// Row 3, reached through a placed flow: the agent runs on `mac`'s worker, so a
+/// tool on `gpu` is two answers, and the message says where the agent runs and
+/// why — not "on the hub", which this agent never is.
+#[test]
+fn an_unplaced_agent_only_a_placed_flow_runs_attaching_a_tool_placed_elsewhere_is_refused() {
+    refuses(
+        "placed-flow-agent-other-placement",
+        &format!(
+            "{BACKEND}{BUILDING_FLOW}{}",
+            agent("builder", "tool.xcodebuild")
+        ),
+        &mesh("  mac:\n    members: [flow.build]\n  gpu:\n    members: [tool.xcodebuild]\n"),
+        "`tool.xcodebuild` is a member of placement `gpu`, and `agent.builder` that attaches it \
+         has no placement, so it runs where `flow.build` runs (placement `mac`)",
+    );
+}
+
+/// The over-acceptance guard: an agent a placed flow **and** a flow the hub runs
+/// both name executes on the hub too, so row 4 still refuses a tool placed on
+/// the flow's placement — the hub's own execution of the agent would call it
+/// there.
+#[test]
+fn an_unplaced_agent_a_placed_flow_and_the_hub_both_run_still_runs_on_the_hub() {
+    let spec = format!(
+        r#"{BACKEND}{BUILDING_FLOW}flow.release:
+  inputs:
+    scheme: {{ type: string }}
+  outputs: {{}}
+  nodes:
+    build:
+      agent: agent.builder
+      input:
+        scheme: "input.scheme"
+  edges:
+    - {{ from: start, to: build }}
+    - {{ from: build, to: end }}
+{}"#,
+        agent("builder", "tool.xcodebuild")
+    );
+    refuses(
+        "placed-flow-agent-and-hub",
+        &spec,
+        &mesh("  mac:\n    members: [flow.build, tool.xcodebuild]\n"),
+        "`tool.xcodebuild` is a member of placement `mac`, and `agent.builder` that attaches it \
+         has no placement, so it runs on the hub",
+    );
+}

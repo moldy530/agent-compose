@@ -41,10 +41,10 @@ use super::index::Index;
 
 /// Namespaces a `map` dispatch target accepts (grammar 8.6, Decision D29).
 ///
-/// A placement's `members:` used to share this list and no longer does:
-/// `flow.*` is refused there with a message naming the deferral, so that
-/// position keeps its own two-namespace list in `resolve::target`
-/// (grammar 14.1, Decision D129).
+/// A placement's `members:` names the same three namespaces, and keeps its own
+/// list in `resolve::target` all the same: the two positions are two rules that
+/// happen to agree, and a change to one is not a change to the other (grammar
+/// 14.1, Decisions D129, D171).
 const COMPONENTS: &[Namespace] = &[Namespace::Agent, Namespace::Tool, Namespace::Flow];
 
 /// Resolve every reference in the composition's definitions and triggers.

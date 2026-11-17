@@ -1020,13 +1020,13 @@ holding what a worker is handed and how the wait ended:
 
 | field | meaning |
 |---|---|
-| `execution`, `wait` | the identity, and the primary key. `wait` is `<instance path>/<ordinal>`, the deterministic identity `docs/distributed.md` §6.1 fixes, derived exactly the way §3.4's re-parking wait id is — so a resumed generation reaching the node again finds the row its predecessor left instead of opening a second dispatch for work a worker may already be running |
+| `execution`, `wait` | the identity, and the primary key. `wait` is `<instance path>/<ordinal>`, the deterministic identity `docs/distributed.md` §6.1 fixes, derived exactly the way §3.4's re-parking wait id is — so a resumed generation reaching the node again finds the row its predecessor left instead of opening a second dispatch for work a worker may already be running. A **placed flow's root instance** sits at the empty instance path, so its `wait` is the flow's address and the ordinal instead (`flow.build/0`, grammar Decision D171) |
 | `id` | `dsp_…`, the handle the wire attributes a result by. The issuing hub's own, opaque to a worker, and **not** the identity: a re-park after a supersede is a new `id` at the same `wait` |
 | `placement`, `node`, `site` | where the work is queued — a placement, never a worker — and what it is |
 | `inputs`, `itemIndex`, `history`, `policy` | the dispatch payload: what the node's input phase built, plus the three facts about the node execution the hub holds that a worker cannot derive. On the row rather than in memory, so a hub restarted mid-dispatch hands over what its predecessor would have |
 | `status` | `parked`, `dispatched`, `settled` or `superseded` — the vocabulary below |
 | `session`, `parkedAt`, `dispatchedAt`, `settledAt`, `detail` | which worker session is holding it while one is, and the three instants of the wait, for the reason §3.4 keeps all three of a human wait's |
-| `outcome` | what the worker answered, once one did: a value or a failure, in the shape §3.1's outcomes take — or, on a dispatch a **pause** ended, the wait itself (`docs/distributed.md` §3.4). Any of the three may carry `finallyError` beside it: what a `finally:` node that ran inside the placed node raised, which a resumed generation reading the row holds as the execution's own `finallyError` (§3.5), exactly as the live one did when the result came home |
+| `outcome` | what the worker answered, once one did: a value or a failure, in the shape §3.1's outcomes take — or, on a dispatch a **pause** ended, the wait itself (`docs/distributed.md` §3.4). Any of the three may carry `finallyError` beside it: what a `finally:` node that ran inside the placed node raised, which a resumed generation reading the row holds as the execution's own `finallyError` (§3.5), exactly as the live one did when the result came home. A value or a failure may also carry `inner`: the trace a **placed flow's** instance recorded on the worker (`docs/distributed.md` §3.4, grammar Decision D171), which a resumed generation records as the instance's trace exactly as the live one did |
 
 **What `status` means** is the same kind of statement §3.6 makes about an
 execution, and the four are not interchangeable:
@@ -1933,12 +1933,22 @@ whose last node it was would settle `completed`. So is a **pause nobody answered
 a worker sent home that the replay finds on a dispatch row settled paused with
 no answer recorded — an abandoned pause writes nothing — where the cancel fires
 instead of the wait being planted on the board again. Planted, it would be a
-wait every answer is refused at and nothing ever ends. A dispatch a worker held
+wait every answer is refused at and nothing ever ends. Where that pause is a
+**placed flow's** instance's, the instance it stops has begun on a worker and
+its finally node is owed there, so the replay makes the dispatch the live
+cancel would have made — the instance's end, with `cancelled: true`, which a
+worker replays to the same frontier, ends there and runs the finally node
+(`docs/distributed.md` §2, §3.2; Decision D171) — and the row settles on that
+end's result. A dispatch a worker held
 when the process died is not superseded as an orphan at the next start, as
 every other such row is (`docs/distributed.md` §5): read as one, the node's
 attempt would fail under its `retry:` and `on_error:` — the chain a cancel is
 never routed through — and the execution would end `failed`. It is left
-`dispatched` for the replay, which ends it as the cancel's. And a body whose
+`dispatched` for the replay, which ends it as the cancel's — and, where it is a
+placed flow's instance, makes no end dispatch for it: the worker that held it is
+still running it, and ends it when its session meets the restarted hub's `410`,
+so an end beside it would run its finally node twice (`docs/distributed.md` §2,
+§5). And a body whose
 whole record replays to its end had ended before the cancel could reach it, and
 settles as it ended — the cancel changes no outcome it arrives after.
 

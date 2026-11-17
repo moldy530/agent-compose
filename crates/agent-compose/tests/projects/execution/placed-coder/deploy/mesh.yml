@@ -1,6 +1,6 @@
 # The deploy layer this fixture is served under: one hub, and one placement
-# holding the agent that attaches the coder node's flow (grammar §14.1,
-# `docs/distributed.md` §1.1).
+# holding the agents that attach the coder node's flows and the placed one of
+# those flows itself (grammar §14.1, `docs/distributed.md` §1.1).
 version: "0.1"
 
 hub:
@@ -10,4 +10,10 @@ placements:
   mac:
     members:
       - agent.builder
+      - agent.placed_builder
+      # The build step as a flow of its own (Decision D171): every instance of
+      # it runs on a worker claiming `mac`. `flow.building`, which
+      # `agent.builder` attaches, stays unplaced: its instance runs in that
+      # agent's loop (grammar §14.1 rule 4).
+      - flow.placed_building
     description: The machine holding the checkout the build step runs in.

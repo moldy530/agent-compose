@@ -114,12 +114,17 @@ one name form a **pool** the hub dispatches across.
 
 The static surface is grammar §14.1 and §14.2, and its rules are enforced by
 `validate` today: a placement is a named entry whose `members:` are distinct
-`agent.*` and `tool.*` addresses that resolve; placements are disjoint; whatever
-an agent attaches colocates with it — an attached tool, and everything an
-attached flow reaches, since a flow-as-tool call runs inside the same tool loop;
-`hub.join_token:` is required wherever placements are. **A component in no
-placement executes on the hub.** That is the default, and it is why a project
-with no `placements:` is an ordinary single-process deployment.
+`agent.*`, `tool.*` and `flow.*` addresses that resolve; placements are
+disjoint, across kinds as well as within one; whatever an agent attaches
+colocates with it — an attached tool, and everything an attached unplaced flow
+reaches, since a flow-as-tool call runs inside the same tool loop;
+`hub.join_token:` is required wherever placements are. A **`flow.*` member**
+places every instance of that flow: each is dispatched whole to a worker
+claiming the placement, which runs every node of it (§2, grammar Decision
+D171). **A component in no placement executes on the hub** — or, reached only
+from inside a placed flow's instance, where that instance runs. That is the
+default, and it is why a project with no `placements:` is an ordinary
+single-process deployment.
 
 ### 1.2 What the hub's load is made of
 
@@ -230,6 +235,125 @@ hold eight and one-wide against a pool that can hold one, with no edit to the
 graph. What the spec deliberately cannot express is how many workers show up,
 because resolved q38 put machines and their addresses outside the spec on
 purpose; what a machine can run at once, it can — that is `max_running:`.
+
+**A placed flow's instance is one dispatch** (grammar §14.1, PRD resolved q84,
+Decision D171). A `flow.*` member places every instance of the flow, and what
+the hub dispatches is the node that **instantiates** it — exactly the unit a
+placed agent's node is: a `flow:` node's instance at that node's own instance
+path, one per `map` item at the item's, and one per flow-as-tool call an agent
+the hub runs makes, at the call's. A **root** execution of a placed flow — a
+trigger's, a `run`'s — has no instantiating node, so the hub plants a synthetic
+dispatch for it: keyed by the execution and the flow's address, at the
+**empty** instance path, with the flow's address and an ordinal as its wait id
+(`flow.build/0`). The poll answer's `node` is then the flow's address and its
+`instance_path` the instantiating site's (§3.2). The worker runs the whole
+instance through the path an attached flow's instance takes inside a placed
+agent's loop, every node of it on that worker — a worker hands nothing on, which
+is why grammar §14.1 rule 3 refuses a placed flow that reaches a component placed
+elsewhere — and posts the instance's outputs as the dispatch's value. Everything
+above applies to it unchanged, because it is one more dispatch: it parks with no
+worker to take it (§6.4), it holds one of a session's `max_running:` slots for as
+long as the whole instance runs, its instantiating node's `timeout:` runs from
+dispatch (§6.5), a cancel and a stop reach it through the poll's lists (§3.2), a
+`human:` node inside it settles it *paused* (§3.4), and a lost session supersedes
+it (§6.3) — which fails the instantiating node's attempt under that node's own
+`retry:`. A root dispatch has no instantiating node and so no `retry:` ladder: a
+root instance whose session was lost fails its execution, as a placed node with
+no `retry:` fails its own.
+
+**A cancel owes a placed flow's instance its end, on a worker** (PRD resolved
+q75 ruling e, q76; Decision D171). A cancel reaches an instance a worker is
+running through that worker's `cancel` list (§3.2): every node ends
+`cancelled` there and the finally node runs there. An instance no worker is
+running when the cancel arrives — one whose `human:` question waits on this
+hub's board (§3.4), or whose redispatch is parked — has still begun: its nodes
+ran on a worker, and its finally node is owed as an unplaced instance's is when
+a cancel finds it at a pause. The hub cannot run that node — nothing of a placed
+flow runs on the hub, and its environment is the placement's (§9.1) — so it
+makes one more dispatch of the instance, its **end**: the row at the next
+ordinal of the same instance path, its whole `effect_history`, and §3.2's
+`cancelled: true`. The worker replays the instance to its frontier, where the
+execution's cancel fires — the question's own claim, for one that paused — ends
+it there `cancelled`, runs its finally node, and posts `status: "cancelled"`
+with the instance's `inner` trace and any `finally_error` (§3.4); the
+instantiating node, or the root execution, settles on that. The cancel does
+not withdraw the end — it is the cancel's own, and an end under way is waited
+for, never stopped (grammar §7.9) — so it parks like any dispatch while nothing
+claims the placement, as the redispatch an answer makes does; a lost session's
+end is dispatched again. A hub restarted mid-cancel makes the same end where
+its replay stops the instance at a frontier no worker holds — an unanswered
+question, a parked redispatch (`docs/durability.md` §6.1). An instance whose
+dispatch no worker ever took has **not** begun, and has no end to run anything
+at (grammar §7.9): the cancel withdraws its parked row as it withdraws any, and
+it settles as the cancel with no finally node run. Whether an instance began is
+read off its own rows — a pause of it that came home — and never off the
+effects journaled under its instance path: every `retry:` attempt of one
+`flow:` node is a fresh instance at that same path (`build/0/0`, then
+`build/0/1`), so an attempt whose worker was lost (§6.3) followed by one parked
+with nothing claiming the placement is an instance that never began, and a
+cancel or a deadline that finds it parked withdraws it and dispatches no end.
+
+**A hub stop owes one the same end.** The hub *stops* waiting for an instance
+— not a cancel, which is the execution's — when an end around it abandons its
+question (a sibling branch failed, and the instance around it ended), or when
+its instantiating node's `timeout:` runs out while its redispatch is parked
+(§6.5). Unplaced, that instance ends `failed` there and runs its finally node
+(grammar §7.9: "its pause is abandoned … and it ends failed, its finally node
+run"); a worker running it is told on the poll's `stop` list (§3.2) and ends
+it the same way. One no worker is running is handed to a worker as its end
+exactly as the cancel's is, carrying §3.2's `stopped: true` instead: the worker
+replays it to its frontier and stops it there as the `stop` list stops one, so
+it ends `failed`, its finally node runs, and the result is the instance's
+failure with its `inner` trace and any `finally_error` — or, where the record
+already holds the rest of its body (a parked redispatch whose answer was the
+last thing it needed), it ends as the record does and its finally node runs at
+that. The instantiating node
+leaves on the stop once that end has run — the end around it waits for it, as
+it waits for any instance ending inside it — and the stop's own failure, not
+the end's, is what it leaves with. A redispatch the hub stopped while it was
+parked is superseded under a detail of its own, so a restarted hub's replay
+finds the end it was owed.
+
+**Never an end where a worker may still be running the instance.** A row a
+replaced process left `dispatched` names a session that ended with that process,
+and the worker that took it is still running the instance — its next request
+meets the restarted hub's `410`, and it stops what that session held, finally
+node and all (§5). An end dispatched beside it would run the finally node a
+second time, on whichever worker took the end. So a hub restarted mid-cancel
+that finds the instance's dispatch held that way ends it as the cancel's and
+dispatches nothing more: the instance's end is that worker's, as a placed
+node's attached instances are (§5). The same holds for an end dispatch a
+replaced process had handed out — the worker holding it is running that end —
+and for a dispatch whose session the liveness sweep gave up on while the worker
+was stopping it for the cancel (§6.3): the cancel reached a worker, and that
+worker is the one that ends the instance. Such a row is superseded as **the
+cancel's, held by a worker**, a detail of its own, so a replay reads it as the
+cancel it was and owes nothing more.
+
+**`agent-compose run` is the hub of the placed flows it dispatches** (Decision
+D171). Every dispatch above is made by a process serving §3's routes, and
+`serve` mounts them as it starts. A `run` — and a `resume` — mounts them **at
+its first dispatch of a placed flow's instance**, on a listener at `--host` and
+`--port` (`127.0.0.1` and a port the operating system picks, as for `serve`),
+and says where on stderr, as `mesh: <url> — …` followed by the `agent-compose
+worker` command that joins it. From there the run's dispatch is the one this
+section describes: it parks while nothing claims the placement, a worker that
+joins the run's address is handed it, its effects stream home to the run's
+journal (§3.3) and its result is what the run answers with. So a `run` of a
+placed flow runs the root instance on a worker, as PRD resolved q84 states, and
+so does an instance a `run`'s `flow:` node, `map` or agent starts. Nothing falls
+back to running a placed instance in the `run`'s own process, and a run that
+reaches no placed flow listens on nothing. A placed **agent's** or **tool's**
+node is not what q84 ruled on, and a `run` refuses it with
+`PlacementUnreachable` as it did before a flow could be placed — whether or not
+a placed flow earlier in the same run has started the listener, so what a run
+does with such a node never depends on what it reached first. What a `serve` start does and a `run`'s listener does not is supersede
+the rows a dead process left `dispatched`: §5's orphan rule is a replacing
+process's, and a `run` replaced nothing — on SQLite a `serve` may be up beside
+it, holding sessions of its own. A `run` keeps resolved q28's posture
+otherwise: Ctrl-C leaves the row open, and a `resume` that reaches the same
+dispatch finds what §5 says a replacing process finds — a row some dead session
+was holding is superseded, and a row still parked is waited on again.
 
 Undispatched is a pause rather than a failure, but it is not free of the clock:
 a node's `timeout:` chain runs from dispatch (§6.5), so an item that waits out
@@ -608,7 +732,39 @@ Carries the session. Long-polls for up to one hold (§2).
   `instance_path` is the flattened path grammar §9.4 fixes as the idempotency
   key, so the worker computes the same keys the hub would. `effect_history` is
   the journaled record of effects this node instance already issued, and is what
-  a redispatched node replays to the frontier before going live (§7).
+  a redispatched node replays to the frontier before going live (§7). For a
+  **placed flow's** instance (§2, Decision D171) `node` is the flow's address and
+  `instance_path` the site that instantiated it; a root instance's is the
+  **empty** path, which holds every path of its execution, so its
+  `effect_history` is the execution's whole record.
+
+  **`cancelled`** is OPTIONAL, `true` where present, and only ever on a placed
+  flow's instance: the dispatch is that instance's **end**, owed by a cancel that
+  found no worker running it (§2). The worker opens the execution's cancel at
+  the frontier — the first effect `effect_history` does not hold fires it, as a
+  recovered cancel's frontier does on the hub (`docs/durability.md` §6.1) — so
+  the instance replays to there, ends `cancelled`, and runs its finally node, and
+  the result is `status: "cancelled"` (§3.4). It is not the `cancel` list: a
+  dispatch that list names is settled with no runner started, and this one is
+  run for the sake of what its end runs. A worker that did not read it would
+  replay the instance to its question again and settle it paused, and the hub
+  reads a paused end as the cancel it was made for — the instance ends with no
+  finally node run, which is what a hub that never sent the field gets.
+
+  **`stopped`** is OPTIONAL, `true` where present, and the same kind of end for a
+  **hub stop** that found no worker running the instance — an end around it
+  abandoned its question, or its node's deadline ran out while its redispatch
+  was parked (§2). The worker stops the instance at the frontier as the `stop`
+  list stops one it is running — every node it reaches there ends `failed`, the
+  instance ends `failed`, and its finally node runs — and the result is the
+  instance's failure; an instance whose record holds the rest of its body
+  reaches no frontier before its end and ends as the record does. Never beside
+  `cancelled`. A worker that did not read it
+  would run the instance on from its frontier — to its question again, or on to
+  its end — rather than stop it there; the hub reads whatever that end answers
+  as the stop it was made for, so the node leaves on the stop either way, and
+  what such a worker gets wrong is only whether the finally node ran at
+  `failed`.
 
   **The four fields between them are what makes a placed node the same node.**
   Each is OPTIONAL — a dispatch that has none of them omits all four — and each
@@ -699,11 +855,14 @@ can open, and that journal refuses by name every operation that is the hub's: a
 lifecycle row, a delivery, the dispatch board. The one construct a placed node
 can reach that would need one is a detached `flow.*` dispatch, which starts a
 **child execution** (PRD resolved q65, `docs/durability.md` §3.2) — begun,
-journaled and recovered by the single writer. A worker reaches one only inside a
-flow a placed agent attaches as a tool (grammar §14.1 rule 4), and there the
-dispatch **cannot be issued**, rather than being begun on a journal the hub never
-reads. That is the one detached-dispatch failure grammar §8.6 rule 7 leaves to
-the `map` node itself — its `on_error:` "still covers the node's own failures,
+journaled and recovered by the single writer. A worker reaches one two ways —
+inside a flow a placed agent attaches as a tool (grammar §14.1 rule 4), and
+anywhere in a **placed flow's** instance, every node of which (and of the
+unplaced flows it instantiates) runs on the worker that took its dispatch
+(grammar §14.1 rule 2, Decision D171) — and either way the dispatch **cannot be
+issued**, rather than being begun on a journal the hub never reads. That is the
+one detached-dispatch failure grammar §8.6 rule 7 leaves to the `map` node
+itself — its `on_error:` "still covers the node's own failures,
 including a dispatch that could not be issued at all" — so the map node fails
 before it dispatches anything, with no stub `"detached"` record claiming a
 dispatch was made, and the error names the flow, the dispatch's key and what to
@@ -711,7 +870,9 @@ change. The failure is the node's like any other: on its trace entry, under its
 `retry:` and `on_error:`, and home with the placed node's settled dispatch —
 never only on the worker's stderr. A composition that needs the child dispatches
 it from a flow the hub runs, or drops `detach:` so the dispatch is joined inside
-the placed node.
+the placed node. The compiler accepts the construct in both places and leaves it
+to this failure — and inside a placed flow, every instance of which runs on a
+worker, that means every run: a placed flow is no place for a detached dispatch.
 
 Each record carries its **effect key**, derived by the execution-derived rule
 grammar §9.4 fixes — `<site>#<kind>/<ordinal>`, which the hub re-derives from the
@@ -791,7 +952,9 @@ Carries the session and the `dispatch_id`. The node's outcome: its output, its
 failure, **the pause it stopped at**, or **that it was cancelled**.
 
 **A cancelled result** is `{ "dispatch_id": "dsp_…", "status": "cancelled" }`
-and nothing else (PRD resolved q75, Decision D160): the worker's statement
+and nothing else but the two OPTIONAL fields every ending may carry,
+`finally_error` and `inner` (below) (PRD resolved q75, Decision D160): the
+worker's statement
 that it stopped the work the hub named in a poll's `cancel` list (§3.2). It
 **settles** the dispatch — the `204` row — and it is what takes the dispatch off
 its session's capacity (§2): until it arrives the process is still stopping, so
@@ -1124,6 +1287,25 @@ different thing (PRD resolved q75): the poll response's `cancel` list (§3.2)
 stops the dispatched node and every instance it began on the worker — each
 ending `cancelled` and running its own finally node there — and the hub waits
 for the cancelled result that settles it.
+
+#### `inner`: the trace a placed flow's instance made
+
+A result MAY carry `inner`, an array, beside whichever ending it carries —
+`output`, `error`, or `status: "cancelled"` — present exactly when the dispatch
+was a **placed flow's** instance (§2, grammar Decision D171): the trace entries
+that instance recorded on the worker, in the shape `docs/trace.md` gives a
+`flow:` node's `inner` trace. The hub records it where it records the trace of
+an instance it ran itself: as the instantiating `flow:` node's `inner`, a map
+item's, a flow-as-tool call's — and, for a root instance, as the execution's own
+trace. So a placed flow's trace reads as the same flow's trace unplaced, and the
+`trace_version` does not move: no field of the envelope or of an entry is new,
+and *where* the instance ran is the dispatch row's and the status report's
+`placement_waits` (§6.4), as it is for a placed agent's node. It is kept on the
+settled outcome beside `finally_error`, so a hub restarted before the execution
+settles reads it back off the row it replays (`docs/durability.md` §3.8). A
+value that is not an array is dropped rather than costing the node its attempt;
+a peer that never sends it is one that ran no placed flow — an OPTIONAL field a
+peer of the previous version ignores, which §10.2 makes no bump.
 
 #### The two verbs
 
@@ -1474,7 +1656,10 @@ that the execution was cancelled, and a cancel the worker inferred from a
 instances the placed node began there therefore end `failed`, their finally
 nodes reading `execution.outcome == "failed"`, and the boundary each crosses is
 journaled from the worker under its renewed session — into an execution whose
-row settles `cancelled`. The same holds where the hub dies between recording a
+row settles `cancelled`. A **placed flow's** instance the worker was running is
+one of them: it ends there `failed` and runs its finally node, and the restarted
+hub makes no end dispatch beside it, which would run that finally node a second
+time (§2, Decision D171). The same holds where the hub dies between recording a
 cancel and writing the poll answer that names it. Telling the worker the
 cancel across the restart — a restarted hub naming, on the first answer under
 the new session, every row it left `dispatched` for a cancel's frontier, and a
@@ -1865,14 +2050,20 @@ A process's manifest is therefore the variables referenced by every component
 that **can execute in it**, and a component executes in a process exactly when:
 
 - **it is a member of that placement** — the direct case;
-- **it is dispatched with no placement of its own, and the process is the
-  hub** — the default of §1.1, and unconditional: what *else* reaches that
-  component narrows nothing, because dispatch is the hub's scheduler starting a
-  node and every flow a composition declares is startable on the hub (grammar
-  Decision D64);
+- **it is dispatched with no placement of its own by a flow the hub runs, and
+  the process is the hub** — the default of §1.1, and unconditional: what *else*
+  reaches that component narrows nothing, because dispatch is the hub's scheduler
+  starting a node and every **unplaced** flow a composition declares is
+  startable on the hub (grammar Decision D64);
 - **an agent that runs in that process attaches it** — an attached `tool.*`, and
-  every `agent.*` and `tool.*` an attached `flow.*` reaches, all of which run
-  inside the agent's tool loop (grammar §5.4, §14.1 rule 4).
+  every `agent.*` and `tool.*` an attached unplaced `flow.*` reaches, all of
+  which run inside the agent's tool loop (grammar §5.4, §14.1 rule 4);
+- **a placed flow whose placement that process claims reaches it** — every node
+  of the flow's instance and everything those nodes reach, since the whole
+  instance runs on the worker that took its dispatch (grammar §14.1 rule 2,
+  Decision D171). The hub runs none of it: it dispatches a placed flow's every
+  instance and starts none itself, so what **only** a placed flow reaches is its
+  placement's alone.
 
 Which gives, concretely:
 
@@ -1880,15 +2071,19 @@ Which gives, concretely:
 - a variable referenced by a tool that only ever runs inside placed agents'
   processes belongs to **their placements'** manifests — and to the hub's only
   if some unplaced agent or `function:` node also reaches it;
-- a variable referenced by an **unplaced `agent.*`** belongs to the **hub's**
-  manifest, and belongs there whether or not something placed also reaches it.
-  Manual invocation is universal — every flow a composition declares is runnable
-  on its own (grammar Decision D64, which §14.1 rule 4 rests on too) — and every
-  construct that reaches an agent is a node of some flow, so an unplaced agent
-  always has a hub dispatch to be. Being reached from a placed agent's tool loop
-  as well **adds** that agent's placement to its variables' membership; it never
-  moves them off the hub's. An unplaced `tool.*` a `function:` node names is the
-  same case for the same reason;
+- a variable referenced by an **unplaced `agent.*`** that some **unplaced**
+  flow names belongs to the **hub's** manifest, and belongs there whether or not
+  something placed also reaches it. Manual invocation is universal — every
+  unplaced flow a composition declares is runnable on its own (grammar Decision
+  D64, which §14.1 rule 4 rests on too) — and every construct that reaches an
+  agent is a node of some flow, so such an agent always has a hub dispatch to be.
+  Being reached from a placed agent's tool loop as well **adds** that agent's
+  placement to its variables' membership; it never moves them off the hub's. An
+  unplaced `tool.*` a `function:` node names is the same case for the same
+  reason. An unplaced agent named **only** inside placed flows is the one with no
+  hub dispatch to be — the hub dispatches those flows' instances and runs none of
+  their nodes — so its variables are their placements' and not the hub's
+  (Decision D171);
 - a variable referenced from the deploy layer itself — a storage backend, an
   event source, `hub.join_token:`, a **journal** — belongs to the hub's. The
   journal is the sharpest case and the one worth naming, because the plausible
@@ -1929,16 +2124,19 @@ Which gives, concretely:
 - a variable a **`coder:` node** declares — every reference inside its
   `workspace:` expression, and every value of its `env:` (grammar §8.9, PRD
   resolved q57, q61) — belongs to the manifest of every
-  process that runs the node's **flow**. That is the hub's, always and
-  unconditionally, because every flow a composition declares is startable on the
-  hub (grammar Decision D64); and it is **also** the manifest of every placement
-  whose components reach that flow — a placed agent attaching it as a tool, or a
-  placed component naming it — because §14.1 rule 4 starts the attached flow's
-  instance inside that agent's own loop, on the worker. A coder node is
-  *declared* in a flow rather than defined, so §14.1's `members:` has nothing to
-  claim and the node is never placed **on its own**; what carries it to a worker
-  is the flow around it, exactly as the `store:` nodes of an attached flow are
-  carried. Its references are filed under the node's own address inside that
+  process that runs the node's **flow**. For an unplaced flow that is the hub's,
+  always and unconditionally, because every unplaced flow a composition declares
+  is startable on the hub (grammar Decision D64); and it is **also** the manifest
+  of every placement whose components reach that flow — a placed agent attaching
+  it as a tool — because §14.1 rule 4 starts the attached flow's instance inside
+  that agent's own loop, on the worker. For a **placed** flow it is that
+  placement's manifest **alone**: every instance of the flow runs on a worker
+  claiming it, and the hub runs none (Decision D171) — which is the shape PRD
+  resolved q84 was raised for, one build step on one build machine with no agent
+  in the way. A coder node is *declared* in a flow rather than defined, so
+  §14.1's `members:` has nothing to claim and the node is never placed **on its
+  own**; what carries it to a worker is the flow around it — attached, or a
+  member itself — exactly as the `store:` nodes of such a flow are carried. Its references are filed under the node's own address inside that
   flow rather than under a definition's for the same reason. The addition works
   the way the storage-backend clause above works: it **adds** placements and
   never moves the variables off the hub's list. Its `model:`'s **provider**
@@ -1951,9 +2149,12 @@ Which gives, concretely:
   the variables those nodes declare **and** the connection behind each one's
   model. The walk follows it the way it follows an agent's: a `coder:` node's
   `model:` is a reference site, and the provider it names joins the executes-in
-  closure of the flow holding the node. Should a later release make a coder node
-  placeable in its own right, this bullet is where the rule moves, and the walk
-  needs no other edit — a coder node's references enter the closure exactly as a
+  closure of the flow holding the node. PRD resolved q84 met the need this
+  bullet once reserved room for with the smaller change — a `flow.*` member
+  (grammar Decision D171), whose closure the walk already followed — and left
+  the node form open: should a later release make a coder node placeable in its
+  own right, this bullet is still where the rule moves, and the walk needs no
+  other edit — a coder node's references enter the closure exactly as a
   `builtin:` tool's do.
 
 **One of a tool's `${ENV}` references is declared rather than walked, and the
@@ -2009,6 +2210,21 @@ with no placement of its own, on the hub — and that clause is unconditional fo
 exactly this reason. `validate` accepts this composition, which is the other half
 of why the manifest has to: nothing refuses it, so nothing else stands between
 `INNER_KEY` and the hub's list.
+
+Worked a third way, because it is the one case where the hub's list is
+**narrowed** by a placement rather than only left alone: `flow.build` is a
+member of `mac`, its `coder:` node declares `env: { BUILD_SECRET: ${BUILD_SECRET} }`,
+and its `inspect` node names `agent.inspector`, unplaced and nowhere else,
+whose provider reads `${INSPECTOR_KEY}`. Every instance of `flow.build` — a
+trigger's root execution, a `flow:` node's, a `map` item's — is dispatched to
+`mac` and runs there whole, so both variables belong to **`mac`'s** manifest and
+**neither** to the hub's: the hub dispatches the instance and runs no node of
+it. Read under the second clause as written before Decision D171 — every flow
+startable on the hub, every unplaced agent the hub's — the hub would refuse to
+start over two secrets it never spends. What stays on the hub's list is what the
+fifth clause keeps there: a store backend `flow.build` reaches is the hub's
+**and** `mac`'s. (`a_placed_flows_reach_is_its_placements_manifest_and_off_the_hubs`
+in the compiler's environment module is this case.)
 
 This is §7 M3's least-privilege line in its sharpest form: blast-radius
 containment falls out of the manifest, because **the hub cannot leak what it
@@ -2176,6 +2392,19 @@ or a second implementation of this document.
 | **2** | §3.4's **paused** result (PRD resolved q46, 2026-08-31). A result may settle a dispatch with the wait a `human:` node opened, and a peer of `1` would read one as a node that answered with no output — a node that "quietly means something else", which is §10.3's first row exactly, and its third: `paused` changes what a result *is*. The same release also **enforces** §3.3's effect-key derivation at `/workers/effects`: a record carrying a `key` its own `site`, `kind` and `ordinal` do not derive is `400` where it was journaled before. That is not what the bump is for and needs none of its own — the derivation is the rule §3.3 and grammar §9.4 already stated, so a conforming `1` peer sends what it always sent, and one that spelled a key its own fields do not derive is now *refused* rather than left to write into another node's slot, which is what §10 says a protocol check is for. It is recorded here because this table is where a second implementation reads what moved |
 | **3** | PRD resolved q75 and q79, one bump for both (2026-11-04). The poll's `200` gains **`cancel`** (§3.2) — the dispatches this session holds that the hub has cancelled — and **`stop`** — those it has stopped waiting for, which the worker stops without a cancel — and may be those lists alone; the result gains its fourth ending, **`status: "cancelled"`** (§3.4); and the hub may hand a session **more than one** unsettled dispatch of a placement, up to its `max_running:` (§2), so the poll answer's "`204` while a dispatch is unsettled" sentence is gone. A peer of `2` would be *wrong* rather than refused on each: it ignores a `cancel` list and a `stop` list, so a cancelled node, or one whose budget ran out on the hub, runs on to its end and its process is never stopped — the dispatch holds its session's capacity for as long as the node takes rather than for the moments a stop takes, and since that worker goes on polling, the liveness window never ends it; it never posts the cancelled ending, but posts its ordinary result once the node finishes — and that result is what the cancel waits for, because the hub keeps a cancelled placed node open at its site until that dispatch's result comes home (§3.4), so the cancel completes only when the node ends by itself, not within the moments a stop takes: until then the execution stays open, it does not settle `cancelled`, and no finally node around the cancelled one runs — for a `coder:` node, hours past the ten seconds PRD resolved q75 sets; it reads a `200` carrying only the lists — no `dispatch_id`, none of a dispatch's fields — as a dispatch handed over, and tries to run it; and it queues a second dispatch behind the first, where the hub counted on both running. That is §10.3's first and second rows, and a protocol `2` worker is refused at the join with `409` naming both versions. The `stop` list was the implementation's reading of the two rulings, not something either named, and the owner ratified it, freezing protocol `3` with it (PRD resolved q75 and q79 as amended 2026-11-06; §3.2, grammar D161) |
 
+**A placed flow is not a bump** (PRD resolved q84, Decision D171). Its
+instance travels as a dispatch of the instantiating node — the poll answer's
+`node` names the flow, which the artifact defines, and §10.2 puts a change to the
+artifact outside this protocol — and the fields it adds are OPTIONAL: a
+result's `inner` (§3.4), which a hub that does not read records as an instance
+with no inner trace, and a worker that does not send is one that ran no placed
+flow; a poll answer's `cancelled` (§3.2), which a worker that does not read
+answers by settling the instance's end paused, read by the hub as the cancel it
+was — the instance ends with no finally node run, never with a wrong outcome;
+and a poll answer's `stopped` (§3.2), whose end the hub reads as the stop it was
+made for whatever such a worker answers. Protocol `3` carries all three
+unchanged.
+
 **The bumps to 2 and to 3 cost nothing in practice, and saying so is the point
 of recording them.** A worker and the hub it talks to are built from one compiler
 release, so the handshake triple (§4.1) already refuses a mixed pair at the join
@@ -2224,9 +2453,10 @@ cite as settled.
 describes.
 
 What `validate` enforces: everything grammar §14.1 and §14.2 state — a
-placement's name and members, the `flow.*` deferral, disjointness, repeated
-members, the colocation rule for an attached tool and for what an attached flow
-reaches, the refusal of a store on a process-local backend that a placement's
+placement's name and members (`flow.*` among them, PRD resolved q84),
+disjointness across kinds, repeated members, the colocation rule for an attached
+tool and for what an attached flow reaches, a placed flow's rule that its
+instance reaches nothing placed elsewhere, the refusal of a store on a process-local backend that a placement's
 process could open (§14.1 rule 5, PRD resolved q45), the conditional join token,
 and the `public_url:` shape. A deploy file that breaks one of those is a
 compile error.
@@ -2243,7 +2473,14 @@ answered through the ordinary resume surface, and sends the node back through
 dispatch with the answered pause in its history — and the environment partition of
 §9.1, emitted into the artifact, so the hub checking a join's `env_ok` and a
 worker computing one read one answer under one hash. A placed component's node is
-dispatch-and-await rather than a call (§7).
+dispatch-and-await rather than a call (§7) — and so is every instance of a
+placed flow, the root execution a trigger or `run` starts among them, which a
+worker runs whole and answers with the instance's outputs and its trace (§2,
+§3.4's `inner`, Decision D171) — a `run` serving §3's routes itself from its
+first dispatch of a placed flow's instance, and refusing a placed agent's or
+tool's node as before; and a cancel, or a hub stop, that finds a begun placed
+instance with no worker running it hands a worker the instance's end (§2, §3.2's
+`cancelled` and `stopped`) — never one a worker may still be running.
 
 What **`agent-compose worker`** is: the spoke. `--hub <url> --claim <name>…
 --token-env <VAR> [--data-dir <path>]`, a complete protocol client — the

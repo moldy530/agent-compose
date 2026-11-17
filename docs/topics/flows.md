@@ -164,6 +164,48 @@ call starts an instance exactly as a `flow:` node does, and:
   output — **fails the agent node**. It is never answered with a plausible
   result and never quietly dropped.
 
+## On a placed machine
+
+A deploy file may name a flow in a placement's `members:` (`agent-compose docs
+targets`), and then **every instance of it runs on a worker claiming that
+placement** — the root execution a trigger or `run` starts, a `flow:` node's, a
+`map` item's, a flow-as-tool call's. The hub dispatches the whole instance and
+the worker runs every node of it, its `finally:` node too; nothing above
+changes meaning. Its inputs are bound, its outputs written, its `policy:`
+crosses in, and its trace is recorded exactly as an unplaced instance's are.
+What changes is the environment: what only the flow reaches — its `coder:`
+node's `env:`, an agent only it names — is that machine's to hold, and not the
+hub's. And what it reaches cannot be placed **elsewhere**: the worker running
+the instance runs all of it, so a component another placement claims is a
+compile error naming both. One construct does not come along: a `detach: true`
+`flow.*` dispatch starts a child execution only the hub can begin, so anywhere
+in a placed flow's instance its `map` node fails on every run
+(`ChildOnAWorker`, under that node's `on_error:`). The compiler accepts it, as
+it does inside a flow a placed agent attaches; dispatch detached work from a
+flow the hub runs instead.
+
+A cancel ends a placed instance as it ends any other — every node it was
+running `cancelled`, then its `finally:` node — and the finally node runs on a
+worker too. That holds when no worker is running the instance as the cancel
+arrives: one waiting at a `human:` question, which waits on the hub, is handed
+back to a worker as its **end**, which replays it to the question, ends it
+there and runs the finally node; the execution settles once that is done. An
+instance whose dispatch no worker ever took never began, and a cancel ends it
+with nothing run. The same end is made when the flow around a placed instance
+ends while it waits at its question — a sibling branch failed — and the instance
+ends `failed` there, running its finally node on a worker, as it would
+unplaced. A hub restarted while a worker was running the instance leaves its
+end to that worker rather than making a second one.
+
+A `run` of a placed flow — or of a flow whose node reaches one — is its own
+hub: at the first dispatch of a placed flow's instance it serves the worker
+routes at `--host`/`--port` (`127.0.0.1` and a free port by default), prints
+`mesh: <url> — …` on stderr with the command that joins it —
+`agent-compose worker --hub <url> --claim <placement> --token-env <VAR>` —
+and waits for that worker. The instance runs there, never in the `run`'s own
+process, and its outputs are the run's answer. A placed agent's or tool's node
+gets no such mesh from a `run`: it is refused there, as it always was.
+
 ## Reachability, and no recursion
 
 A flow **reaches** its own nodes' components, its maps' dispatch targets, the
@@ -305,4 +347,4 @@ outcome that was recorded.
 an edge guard, another node's `input:`, a store key — are a compile error
 (`outcome-outside-finally`).
 
-Normative source: `docs/grammar.md` §7, §7.1, §7.5, §7.7, §7.9, §8.5, Decision D159
+Normative source: `docs/grammar.md` §7, §7.1, §7.5, §7.7, §7.9, §8.5, §14.1, Decisions D159, D171

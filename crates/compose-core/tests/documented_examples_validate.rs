@@ -221,7 +221,6 @@ const EXPLANATIONS_WITH_A_DEPLOY_EXAMPLE: &[&str] = &[
     "process-local-store",
     "unbound-harness-sdk",
     "unsupported-journal-key",
-    "unsupported-placement",
 ];
 
 /// The topics that teach a deploy file, and must keep one that resolves.

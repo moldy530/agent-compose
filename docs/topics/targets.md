@@ -494,7 +494,7 @@ tool — rather than load assignment.
 
 | Key | Shape |
 |---|---|
-| `placements.<name>.members` | non-empty list of distinct `agent.*` / `tool.*` addresses that must resolve |
+| `placements.<name>.members` | non-empty list of distinct `agent.*` / `tool.*` / `flow.*` addresses that must resolve |
 | `placements.<name>.max_running` | integer ≥ 1, default `1` — how many of this placement's dispatches **one worker session** may hold at once; not a trigger's `concurrency.max_running:` (`agent-compose docs triggers`), which bounds that trigger's running executions |
 | `placements.<name>.description` | documentation |
 | `hub.join_token` | the bearer credential a worker joins with, as an `${ENV}` reference — required wherever `placements:` is non-empty |
@@ -523,28 +523,46 @@ its numbering, and then §14.2's about the token:
 
 - **§14.1 rule 1** — `members:` is required, non-empty, and names each component
   once.
-- **rule 2** — a `flow.*` member is refused, naming the deferral: v1 places the
-  leaves that hold a machine's capability, and a flow is a subgraph the hub
-  schedules. Place the nodes it reaches instead.
+- **rule 2** — members are `agent.*`, `tool.*` and `flow.*`. A **`flow.*`**
+  member places **every instance** of the flow — the root execution a trigger
+  or `run` starts, a `flow:` node's, a `map` item's, a flow-as-tool call's: the
+  hub dispatches each one whole to a worker claiming the placement, every node
+  of it — its `finally:` node too — runs there, and its effects are journaled on
+  the hub as any dispatch's are. That is how one build step runs on one build
+  machine with no agent in the way: put the step in a flow — a `coder:` node, an
+  `exec:` node — and name the flow. One construct does not move with it: a
+  `detach: true` `flow.*` dispatch starts a child execution only the hub can
+  begin, so anywhere in a placed flow's instance it fails its `map` node on
+  every run (`ChildOnAWorker`, under the node's `on_error:`) — leave detached
+  dispatches to a flow the hub runs.
 - **rule 3** — placements are **disjoint**. One component in two of them is two
-  answers to which worker runs it.
+  answers to which worker runs it — and so is a component placed elsewhere that
+  a placed flow's instance reaches, since a worker runs every node of the
+  instance and hands nothing on: "`agent.x` runs where `flow.f` runs (placement
+  `A`), so its own placement `B` can never take it". An unplaced agent or tool
+  the instance reaches simply runs where the flow runs.
 - **rule 4** — an attachment **colocates with its agent**. The whole artifact reaches every
   worker, so a placement decides which process runs a node, and an agent's
   `tools:` list is what runs a component inside the agent's own process. A tool
   placed somewhere other than the agent attaching it — including a placed tool on
   an *unplaced* agent, which would run on the hub — is refused; so is a placement
-  reached only through a `flow.*` that agent attaches, because a flow-as-tool
-  call starts its instance in the same tool loop. What the hub schedules is
+  reached only through an unplaced `flow.*` that agent attaches, because a
+  flow-as-tool call starts its instance in the same tool loop. A **placed** flow
+  attached as a tool is dispatched instead: fine on an agent the hub runs,
+  refused on an agent placed somewhere else, whose worker could only run it
+  there. An unplaced agent is held to where it actually runs — on the hub, or,
+  named only inside placed flows, on their placement. What the hub schedules is
   untouched: a placed tool reached from a `function:` node, or anything inside a
-  flow instantiated by a `flow:` node, keeps its own placement, and there its own
-  placement is the whole answer.
+  flow instantiated by a `flow:` node of a flow the hub runs, keeps its own
+  placement, and there its own placement is the whole answer.
 - **rule 5** — a store on a **process-local** backend is refused where a
   placement can open it. `memory`, `sqlite`, `sqlite_vec` and `local_fs` have no
   server in the middle: the process that reaches the store opens the bytes, and a
   mesh runs a placed component in more than one process by design — several
   workers may claim one placement, and the hub dispatches whatever else reaches
   the same store. Each would open its own copy, so a write on one side is never a
-  read on another. The rule reads rule 4's closure rather than `members:`, refuses
+  read on another. The rule reads rule 4's closure rather than `members:` —
+  everything a placed flow's instance runs included — refuses
   at every `scope:`, and applies under `--target local` too, where a hub and its
   workers are still separate processes. The repair is to bind a **networked**
   backend — whose variables the environment partition already carries to every
@@ -559,8 +577,9 @@ its numbering, and then §14.2's about the token:
   mesh**: the whole artifact, the right to claim any placement, and the journal's
   effect stream.
 
-A component in **no** placement executes on the hub. That is the default, is
-never a diagnostic, and is why the list above stops where it does —
+A component in **no** placement executes on the hub — or, reached only from
+inside a placed flow's instance, where that instance runs. That is the default,
+is never a diagnostic, and is why the list above stops where it does —
 `placements:` names the exceptions — so a target with no `placements:` is an
 ordinary single-process deployment.
 
@@ -575,7 +594,25 @@ agent-compose worker --hub <url> --claim <name> --token-env <VAR>
 
 A placed node is dispatched rather than called: it parks on the board until a
 worker claiming its placement takes it, the worker runs it out of the artifact
-the hub served, and its effects are journaled by the hub. The wire is normative
+the hub served, and its effects are journaled by the hub. A placed flow's
+instance is one such dispatch, whatever started it: it takes one of a worker's
+`max_running:` slots for the whole instance, a `human:` node inside it pauses
+on the hub's board like any other, a cancel ends each of its nodes `cancelled`
+and runs its finally node on the worker — a cancel that finds it waiting at
+such a question, with no worker running it, hands a worker the instance's end,
+which replays to the question and runs the finally node there, as does an end
+of the flow around it that abandons that question (the instance then ends
+`failed`), while an instance no worker ever took never began and runs nothing,
+and one a worker is still running when a hub restarts is that worker's to end —
+and its outputs and its trace come home as the instance's. `serve` is one process that serves
+those routes, and a `run` (or `resume`) is the other for a placed flow: at its
+first dispatch of a placed flow's instance it serves them itself, at
+`--host`/`--port`, says `mesh: <url> — …` on stderr with the `worker` command
+that joins it, and waits for that worker — so a `run` of a placed flow runs it
+on the build machine, not on yours. A placed agent's or tool's node a `run`
+reaches is refused (`PlacementUnreachable`), as it always was; serve the target
+for those. The wire is
+normative
 in `docs/distributed.md`, and `agent-compose docs cli` is where the verb's flags
 are.
 

@@ -30,23 +30,32 @@
 //! site**, and it survives the shape that looks like a counterexample: an agent
 //! reachable *only* from inside some other agent's process — named by a flow
 //! that a placed agent attaches, and by nothing else. Manual invocation is
-//! universal. Every flow a composition declares is runnable on its own, whether
-//! or not a `manual` trigger names it (PRD 5.11, Decision D64), and
+//! universal. Every unplaced flow a composition declares is runnable on its
+//! own, whether or not a `manual` trigger names it (PRD 5.11, Decision D64), and
 //! `codegen::graph`'s registry is every flow rather than every triggered one —
 //! so a flow attached as a tool is also a flow the hub starts directly, and the
 //! `agent:` node inside it is then dispatched by the hub's scheduler like any
-//! other. That is why this pass reads the attaching agent's **own** placement
-//! and nothing else: an unplaced agent named anywhere has an execution on the
-//! hub, so there is no composition in which a wider question would answer
-//! differently.
+//! other.
+//!
+//! The one composition in which an unplaced agent has **no** execution on the
+//! hub is the one Decision D171 adds: an agent named only inside **placed**
+//! flows runs only where their instances run, on the workers claiming their
+//! placements, since the hub dispatches every instance of a placed flow and
+//! runs none of its nodes. So what an unplaced agent is compared against is
+//! where it *executes* — the environment partition's answer
+//! (`codegen::env::Partition`, `docs/distributed.md` §9.1), the same closure
+//! rule 5 reads — and not its own `members:` line alone. For every agent with a
+//! hub execution that answer is the hub, exactly as before; for one that runs
+//! only inside a placed flow's instance it is that flow's placement, and an
+//! attachment on the same placement is the same answer written twice.
 //!
 //! # The transitive case: an attached `flow.*`
 //!
-//! A `flow.*` in a `tools:` list cannot itself be placed — placing a flow is
-//! deferred (PRD resolved q44) — but the components it reaches can be, and the
-//! flow's instance runs in the agent's process just as a tool call does. Every
-//! `agent.*` and `tool.*` that instance reaches therefore executes wherever the
-//! attaching agent executes, and the same four rows apply to each of them.
+//! An unplaced `flow.*` in a `tools:` list claims nothing, but the components it
+//! reaches can, and the flow's instance runs in the agent's process just as a
+//! tool call does. Every `agent.*` and `tool.*` that instance reaches therefore
+//! executes wherever the attaching agent executes, and the same four rows apply
+//! to each of them.
 //!
 //! Reading the flow's own address as "carries no claim, so nothing to disagree
 //! with" is what would leave the hole: the flow claims nothing and the nodes
@@ -56,7 +65,9 @@
 //!
 //! What the walk collects is grammar 7.7 clauses 1 and 2 — the components a
 //! flow's own nodes and maps name — and it stops at an agent's attached
-//! `tool.*`, exactly where clauses 3 and 4 stop. That boundary is deliberate: an
+//! `tool.*`, exactly where clauses 3 and 4 stop, and at a **placed** `flow.*`,
+//! whose instance is dispatched to its own placement rather than run in the
+//! agent's loop (Decision D171). That boundary is deliberate: an
 //! attached tool is already governed by the direct case above, so following it
 //! here would report one contradiction twice, and the second report would point
 //! at a line whose repair is the first report's.
@@ -81,14 +92,41 @@
 //! genuinely separate contradictions — two placed tools it cannot run — still
 //! gets one report for each of them.
 //!
+//! # A placed `flow.*` (PRD resolved q84, Decision D171)
+//!
+//! A `flow.*` member places **every instance** of that flow: wherever one is
+//! started — a trigger or a `run`, a `flow:` node, a `map` item, a flow-as-tool
+//! call — the hub dispatches it to a worker claiming the placement, and the
+//! worker runs the whole instance there. Two rules follow, and both are the
+//! rules above read for the one more member kind:
+//!
+//! | where the placed flow is reached | verdict |
+//! |---|---|
+//! | from a flow the hub runs, or attached by an agent with no placement | fine — the hub dispatches it to its own placement |
+//! | attached by an agent placed on the same placement | fine — the same answer written twice |
+//! | attached by an agent placed elsewhere, directly or through an attached unplaced flow | **refused** — the agent's worker would have to hand it on, and only the hub dispatches |
+//! | run by another placed flow's instance, on another placement | **refused**, below |
+//!
+//! And everything the flow's own instance runs is held to the flow's
+//! placement: a component it reaches with a placement of its own — an `agent:`
+//! node's agent, a `function:` node's tool, a `flow:` node's flow, a `map`
+//! target, a placed flow an unplaced agent of it attaches — runs on the worker
+//! that took the flow's dispatch, so a different placement can never take it.
+//! That is rule 3's two answers to one question, across kinds, and the message
+//! says so: "`agent.x` runs where `flow.f` runs (placement `A`), so its own
+//! placement `B` can never take it". A component on the flow's own placement is
+//! fine and its own rules then govern it; an unplaced one runs where the flow
+//! runs, as it does inside an attached flow.
+//!
 //! # What is not here
 //!
 //! The tool reached without an agent. A `function:` node names a `tool.*`
 //! directly (Decision D24), and there its own placement is the whole of the
 //! answer — nothing to disagree with, so nothing to check. That is the case a
-//! placed tool exists for. A `flow:` node is the same story one level up: the
-//! hub schedules the nodes of the instance it starts, so every placement inside
-//! it is honoured.
+//! placed tool exists for. A `flow:` node of a flow the hub runs is the same
+//! story one level up: the hub schedules the nodes of the instance it starts —
+//! or dispatches the whole instance, where the flow is placed — so every
+//! placement inside it is honoured.
 //!
 //! The pass needs the composition (which agents attach what, and what those
 //! attachments reach) and the active target's deploy layer (which placement
@@ -119,41 +157,61 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ast::common::Namespace;
+use crate::ast::common::{Address, Namespace};
 use crate::codegen::env::{Partition, Process};
-use crate::diag::{Diagnostic, DiagnosticCode, Spanned};
+use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
+use crate::ir::Ir;
 use crate::ir::definition::DefinitionBody;
+use crate::ir::flow::NodeKind;
 
 use super::{Ctx, reach};
 
-/// Refuse every attachment whose placement disagrees with the agent's.
+/// One placement's claim on a component: the placement's name, and the
+/// `members:` entry that wrote the claim.
+#[derive(Clone, Copy)]
+struct Claimed<'a> {
+    /// The placement's name, as its key spells it.
+    placement: &'a Spanned<crate::ast::common::Ident>,
+    /// The `members:` entry naming the component.
+    member: &'a Span,
+}
+
+/// Refuse every attachment whose placement disagrees with the agent's, and
+/// everything a placed flow runs whose own placement disagrees with the flow's.
 pub(crate) fn check(ctx: &mut Ctx<'_>) {
     // Which placement claims each component, by address. Built once: a
     // composition with no placements does no work here at all.
     let Some(section) = ctx.ir.deploy.placements.as_ref() else {
         return;
     };
-    let mut claim: BTreeMap<String, &Spanned<crate::ast::common::Ident>> = BTreeMap::new();
+    let mut claim: BTreeMap<String, Claimed<'_>> = BTreeMap::new();
     for placement in section.entries.values() {
         for member in &placement.members {
             // A component named by two placements has already been reported
             // (Decision D129); the first claim stands so this pass reports the
             // mismatch once rather than once per duplicate.
-            claim
-                .entry(member.value.to_string())
-                .or_insert(&placement.name);
+            claim.entry(member.value.to_string()).or_insert(Claimed {
+                placement: &placement.name,
+                member: &member.span,
+            });
         }
     }
     if claim.is_empty() {
         return;
     }
 
+    // Where each unplaced agent executes, which is the hub's answer for every
+    // agent with a hub execution and a placement's for one only a placed
+    // flow's instance runs (Decision D171). Rule 5 reads the same partition.
+    let partition = Partition::of(ctx.ir);
+
     let mut reports = Vec::new();
     for (address, definition) in &ctx.ir.definitions {
         let DefinitionBody::Agent(agent) = &definition.body else {
             continue;
         };
-        let on = claim.get(address);
+        let on = claim.get(address).map(|held| held.placement);
+        let runs = on.map_or_else(|| Runs::unplaced(&partition, address), Runs::Placed);
         // The `tool.*` this agent attaches itself, and the addresses an attached
         // flow has already been reported for. Both keep one contradiction to one
         // diagnostic; `direct` is built before the loop so the report kept is
@@ -173,7 +231,8 @@ pub(crate) fn check(ctx: &mut Ctx<'_>) {
                         // runs wherever the agent that called it runs.
                         continue;
                     };
-                    if on.is_some_and(|held| held.value == runs_on.value) {
+                    let runs_on = runs_on.placement;
+                    if runs.agrees(runs_on.value.as_str()) {
                         continue;
                     }
                     reports.push(
@@ -184,7 +243,7 @@ pub(crate) fn check(ctx: &mut Ctx<'_>) {
                                 "`{}` is a member of placement `{}`, and `{address}` that attaches it has {}",
                                 attached.value,
                                 runs_on.value,
-                                where_it_runs(on)
+                                runs.describe(runs_on.value.as_str())
                             ),
                         )
                         .with_label(
@@ -197,15 +256,53 @@ pub(crate) fn check(ctx: &mut Ctx<'_>) {
                     );
                 }
                 Namespace::Flow => {
-                    // The flow carries no claim of its own — placing one is
-                    // deferred — but the instance it starts runs here, so every
-                    // placed component it reaches is holding a second answer.
-                    let inside = reach::reached(ctx.ir, &attached.value.to_string());
+                    let target = attached.value.to_string();
+                    // **A placed flow attached as a tool** (grammar 14.1 rule 4,
+                    // Decision D171). Its instance starts in the attaching
+                    // agent's loop: an agent the hub runs hands it to the
+                    // flow's own placement — the hub is the one process that
+                    // dispatches — and an agent a worker runs can only run it on
+                    // that worker, so the flow's placement has to be the
+                    // agent's. What the flow's own nodes reach is its own
+                    // placement's to answer for, below.
+                    if let Some(runs_on) = claim.get(&target) {
+                        let runs_on = runs_on.placement;
+                        let Some(held) = on else {
+                            continue;
+                        };
+                        if held.value == runs_on.value {
+                            continue;
+                        }
+                        reports.push(
+                            Diagnostic::error(
+                                DiagnosticCode::ConflictingPlacement,
+                                attached.span.clone(),
+                                format!(
+                                    "`{target}` is a member of placement `{}`, and `{address}` that attaches it has {}",
+                                    runs_on.value,
+                                    runs.describe(runs_on.value.as_str())
+                                ),
+                            )
+                            .with_label(
+                                runs_on.span.clone(),
+                                format!("`{}` is declared here", runs_on.value),
+                            )
+                            .with_help(PLACED_FLOW_ATTACHED),
+                        );
+                        continue;
+                    }
+                    // The flow carries no claim of its own, but the instance it
+                    // starts runs here, so every placed component it reaches is
+                    // holding a second answer — up to a placed flow, whose
+                    // instance is dispatched to its own placement rather than
+                    // run in this loop.
+                    let inside = colocated(ctx.ir, &claim, &target);
                     for (reached, site) in &inside.placeable {
                         let Some(runs_on) = claim.get(reached) else {
                             continue;
                         };
-                        if on.is_some_and(|held| held.value == runs_on.value) {
+                        let runs_on = runs_on.placement;
+                        if runs.agrees(runs_on.value.as_str()) {
                             continue;
                         }
                         // The same contradiction reached a second way — by the
@@ -223,7 +320,7 @@ pub(crate) fn check(ctx: &mut Ctx<'_>) {
                                     "`{reached}` is a member of placement `{}`, and `{address}` that reaches it through the attached `{}` has {}",
                                     runs_on.value,
                                     attached.value,
-                                    where_it_runs(on)
+                                    runs.describe(runs_on.value.as_str())
                                 ),
                             )
                             .with_label(
@@ -239,8 +336,99 @@ pub(crate) fn check(ctx: &mut Ctx<'_>) {
                             ),
                         );
                     }
+                    // …and a placed flow it reaches, which the hub dispatches to
+                    // its own placement and a worker cannot: an agent with a
+                    // placement runs this instance on a worker, so a placed flow
+                    // inside it has to be that worker's own.
+                    let Some(held) = on else {
+                        continue;
+                    };
+                    for (reached, site) in &inside.flows {
+                        let Some(runs_on) = claim.get(reached) else {
+                            continue;
+                        };
+                        let runs_on = runs_on.placement;
+                        if held.value == runs_on.value || !reported.insert(reached.clone()) {
+                            continue;
+                        }
+                        reports.push(
+                            Diagnostic::error(
+                                DiagnosticCode::ConflictingPlacement,
+                                attached.span.clone(),
+                                format!(
+                                    "`{reached}` is a member of placement `{}`, and `{address}` that reaches it through the attached `{}` has {}",
+                                    runs_on.value,
+                                    attached.value,
+                                    runs.describe(runs_on.value.as_str())
+                                ),
+                            )
+                            .with_label(
+                                site.clone(),
+                                format!("`{}` reaches `{reached}` here", attached.value),
+                            )
+                            .with_label(
+                                runs_on.span.clone(),
+                                format!("`{}` is declared here", runs_on.value),
+                            )
+                            .with_help(PLACED_FLOW_ATTACHED),
+                        );
+                    }
                 }
                 _ => {}
+            }
+        }
+    }
+
+    // **A placed flow, and everything its instance runs** (grammar 14.1 rules
+    // 3 and 4, PRD resolved q84, Decision D171). Every node of the instance
+    // executes on the worker that took its dispatch, and a worker hands nothing
+    // on — only the hub dispatches — so a component the instance reaches with a
+    // placement of its own is one that placement can never take.
+    for placement in section.entries.values() {
+        for member in &placement.members {
+            if member.value.namespace != Namespace::Flow {
+                continue;
+            }
+            let flow = member.value.to_string();
+            let Some(held) = claim.get(&flow).copied() else {
+                continue;
+            };
+            // A flow two placements name has already been reported, and the
+            // first claim is the one this pass reads.
+            if held.member != &member.span {
+                continue;
+            }
+            for (reached, site) in runs_with(ctx.ir, &claim, &flow, &held) {
+                let Some(runs_on) = claim.get(&reached) else {
+                    continue;
+                };
+                reports.push(
+                    Diagnostic::error(
+                        DiagnosticCode::ConflictingPlacement,
+                        site,
+                        format!(
+                            "`{reached}` runs where `{flow}` runs (placement `{}`), so its own placement `{}` can never take it",
+                            held.placement.value, runs_on.placement.value
+                        ),
+                    )
+                    .with_label(
+                        held.member.clone(),
+                        format!(
+                            "`{flow}` is a member of placement `{}`",
+                            held.placement.value
+                        ),
+                    )
+                    .with_label(
+                        runs_on.member.clone(),
+                        format!(
+                            "`{reached}` is a member of placement `{}`",
+                            runs_on.placement.value
+                        ),
+                    )
+                    .with_help(
+                        "a placed flow's instance runs on a worker claiming its placement, and every node of it executes there — a worker hands nothing on to another placement, because only the hub dispatches: put the two in one placement, drop the inner one's placement so it runs where the flow runs, or reach it from a flow the hub runs, where its own placement is the whole answer (grammar 14.1 rules 3 and 4, Decision D171)",
+                    ),
+                );
             }
         }
     }
@@ -249,12 +437,248 @@ pub(crate) fn check(ctx: &mut Ctx<'_>) {
     }
 }
 
-/// Where the attaching agent runs, as the clause that completes both messages.
-fn where_it_runs(on: Option<&&Spanned<crate::ast::common::Ident>>) -> String {
-    on.map_or_else(
-        || "no placement, so it runs on the hub".to_string(),
-        |held| format!("placement `{}`", held.value),
-    )
+/// Why a placed flow cannot be attached to an agent placed elsewhere.
+const PLACED_FLOW_ATTACHED: &str = "a flow attached as a tool runs its instance inside the agent's own tool loop (grammar 5.4): an agent the hub runs dispatches a placed flow to the flow's own placement, but an agent a worker runs can only run it on that worker, which hands nothing on to another placement: put the two in one placement, drop one of the two placements, or reach the flow from a `flow:` node of a flow the hub runs, where its placement is the whole answer (grammar 14.1 rule 4, Decision D171)";
+
+/// What one attached flow's instance runs in the attaching agent's loop: the
+/// `agent.*` and `tool.*` its own nodes and maps name (grammar 7.7 clauses 1
+/// and 2), and the **placed** flows it reaches, where the walk stops.
+#[derive(Default)]
+struct Colocated {
+    /// The placeable leaves, each at the earliest site naming it.
+    placeable: BTreeMap<String, Span>,
+    /// The placed flows, each at the earliest site naming it.
+    flows: BTreeMap<String, Span>,
+}
+
+/// Record `address` at `site`, the earliest site winning — by source name and
+/// byte offset, the order `reach::Reached` keeps for the same reason: the
+/// walk's own order is not a property of the composition, and a diagnostic's
+/// label may not depend on it.
+fn earliest(into: &mut BTreeMap<String, Span>, address: &str, site: &Span) {
+    let position = |span: &Span| (span.source.as_str().to_string(), span.bytes.start);
+    match into.get(address) {
+        Some(held) if position(held) <= position(site) => {}
+        _ => {
+            into.insert(address.to_string(), site.clone());
+        }
+    }
+}
+
+/// The addresses one node names that this module is about: an `agent:`,
+/// `function:` or `flow:` node's, and every dispatch target of a `map`.
+fn named(node: &crate::ir::flow::Node) -> Vec<&Spanned<Address>> {
+    match &node.kind {
+        NodeKind::Agent { agent } => vec![agent],
+        NodeKind::Function { function } => vec![function],
+        NodeKind::Flow { flow, .. } => vec![flow],
+        NodeKind::Map { map } => reach::targets(&map.dispatch),
+        _ => Vec::new(),
+    }
+}
+
+/// The `flow.*` tools an agent attaches.
+fn attached_flows<'a>(ir: &'a Ir, agent: &str) -> Vec<&'a Spanned<Address>> {
+    match ir.definitions.get(agent).map(|held| &held.body) {
+        Some(DefinitionBody::Agent(agent)) => agent
+            .tools
+            .iter()
+            .filter(|tool| tool.value.namespace == Namespace::Flow)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `reach::reached`'s placeable half for one attached flow, stopping at a
+/// **placed** flow (Decision D171).
+///
+/// A placed flow's instance is dispatched to its own placement wherever it is
+/// started, so what it reaches does not run in the attaching agent's loop, and
+/// following it would report a placement that is honoured as one that is
+/// ignored. It is recorded instead: an agent a worker runs cannot dispatch it.
+fn colocated(ir: &Ir, claim: &BTreeMap<String, Claimed<'_>>, flow: &str) -> Colocated {
+    let mut found = Colocated::default();
+    let mut seen = BTreeSet::new();
+    let mut pending = vec![flow.to_string()];
+    while let Some(address) = pending.pop() {
+        if !seen.insert(address.clone()) {
+            continue;
+        }
+        let Some(body) = reach::flow_at(ir, &address) else {
+            continue;
+        };
+        for node in &body.nodes {
+            for target in named(node) {
+                let key = target.value.to_string();
+                match target.value.namespace {
+                    Namespace::Flow if claim.contains_key(&key) => {
+                        earliest(&mut found.flows, &key, &target.span);
+                    }
+                    Namespace::Flow => pending.push(key),
+                    Namespace::Tool => earliest(&mut found.placeable, &key, &target.span),
+                    Namespace::Agent => {
+                        earliest(&mut found.placeable, &key, &target.span);
+                        // An agent reaches its `flow.*` tools — flow-as-tool
+                        // attachment is a call (grammar 7.7 clauses 3, 4).
+                        for attached in attached_flows(ir, &key) {
+                            let inner = attached.value.to_string();
+                            if claim.contains_key(&inner) {
+                                earliest(&mut found.flows, &inner, &attached.span);
+                            } else {
+                                pending.push(inner);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Every placed component a placed flow's instance runs whose placement is not
+/// the flow's own, each at the earliest site naming it (Decision D171).
+///
+/// The instance runs on a worker claiming the flow's placement, and so does
+/// everything it runs rather than dispatches — which, on a worker, is
+/// everything: a worker hands nothing on to another placement. So the walk
+/// follows the flow's own nodes and maps, the `flow:` nodes and `map` targets
+/// into unplaced flows, and the `flow.*` tools of the unplaced agents it runs,
+/// and stops at anything placed, which either agrees with the flow — its own
+/// rules then govern what it reaches — or is reported here.
+///
+/// **What an unplaced agent's attached flow reaches is reported only for a
+/// placed flow.** A placed `agent.*` or `tool.*` an unplaced agent's attachment
+/// reaches is already rule 4's — which holds it against everywhere that agent
+/// executes, this flow's placement among them ([`Runs`]) — so reporting it
+/// again here would draw one contradiction twice. A placed flow reached that
+/// way is not refused by rule 4, which lets the hub dispatch one an unplaced
+/// agent attaches, and is refused here, where the agent runs on a worker that
+/// cannot.
+fn runs_with(
+    ir: &Ir,
+    claim: &BTreeMap<String, Claimed<'_>>,
+    flow: &str,
+    held: &Claimed<'_>,
+) -> Vec<(String, Span)> {
+    let mut found: BTreeMap<String, Span> = BTreeMap::new();
+    let mut seen: BTreeSet<(String, bool)> = BTreeSet::new();
+    // Each pending flow carries whether it was reached through an unplaced
+    // agent's `tools:` — see this function's own note.
+    let mut pending: Vec<(String, bool)> = vec![(flow.to_string(), false)];
+    // `Some(true)` for a component placed elsewhere, `Some(false)` for one
+    // placed here, and `None` for one placed nowhere.
+    let elsewhere = |address: &str| {
+        claim
+            .get(address)
+            .map(|other| other.placement.value != held.placement.value)
+    };
+    while let Some((address, attached)) = pending.pop() {
+        if !seen.insert((address.clone(), attached)) {
+            continue;
+        }
+        let Some(body) = reach::flow_at(ir, &address) else {
+            continue;
+        };
+        for node in &body.nodes {
+            for target in named(node) {
+                let key = target.value.to_string();
+                match (target.value.namespace, elsewhere(&key)) {
+                    // Placed elsewhere: a flow always, and a leaf where rule 4
+                    // has not already said so.
+                    (Namespace::Flow, Some(true)) => earliest(&mut found, &key, &target.span),
+                    (Namespace::Agent | Namespace::Tool, Some(true)) if !attached => {
+                        earliest(&mut found, &key, &target.span);
+                    }
+                    // Placed here, or placed elsewhere and already rule 4's:
+                    // either way its own rules govern what it reaches.
+                    (_, Some(_)) => {}
+                    (Namespace::Flow, None) => pending.push((key, attached)),
+                    // An unplaced agent runs here, and so does what it attaches.
+                    (Namespace::Agent, None) => {
+                        for tool in attached_flows(ir, &key) {
+                            let inner = tool.value.to_string();
+                            match elsewhere(&inner) {
+                                Some(true) => earliest(&mut found, &inner, &tool.span),
+                                Some(false) => {}
+                                None => pending.push((inner, true)),
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
+/// Where an attaching agent executes, which is what every rule-4 verdict
+/// compares an attachment's placement against.
+enum Runs<'a> {
+    /// A member of this placement: its own `members:` line is the answer.
+    Placed(&'a Spanned<crate::ast::common::Ident>),
+    /// No placement, and an execution on the hub — every unplaced agent a flow
+    /// the hub runs names, and every one nothing names at all (Decision D64).
+    Hub,
+    /// No placement, and executed **only** by placed flows' instances, on the
+    /// workers claiming their placements (Decision D171): each placement, with
+    /// the `members:` entry whose instance carries the agent there.
+    Carried(Vec<(&'a str, &'a str)>),
+}
+
+impl<'a> Runs<'a> {
+    /// Where an agent with no placement of its own executes, read off the
+    /// environment partition.
+    fn unplaced(partition: &'a Partition, address: &str) -> Self {
+        let mut carried = Vec::new();
+        for process in partition.processes_of(address) {
+            match process {
+                Process::Hub => return Self::Hub,
+                Process::Placement(name) => {
+                    let by = partition
+                        .route(address, process)
+                        .first()
+                        .map_or(name.as_str(), |step| step.owner);
+                    carried.push((name.as_str(), by));
+                }
+            }
+        }
+        if carried.is_empty() {
+            Self::Hub
+        } else {
+            Self::Carried(carried)
+        }
+    }
+
+    /// Whether an attachment placed on `placement` runs where this agent does —
+    /// the same answer written twice.
+    fn agrees(&self, placement: &str) -> bool {
+        match self {
+            Self::Placed(held) => held.value.as_str() == placement,
+            Self::Hub => false,
+            Self::Carried(on) => on.iter().all(|(name, _)| *name == placement),
+        }
+    }
+
+    /// The clause that completes every rule-4 message: where the attaching agent
+    /// runs, naming the placement that disagrees with `placement` first.
+    fn describe(&self, placement: &str) -> String {
+        match self {
+            Self::Placed(held) => format!("placement `{}`", held.value),
+            Self::Hub => "no placement, so it runs on the hub".to_string(),
+            Self::Carried(on) => {
+                let (name, by) = on
+                    .iter()
+                    .find(|(name, _)| *name != placement)
+                    .or_else(|| on.first())
+                    .copied()
+                    .unwrap_or((placement, placement));
+                format!("no placement, so it runs where `{by}` runs (placement `{name}`)")
+            }
+        }
+    }
 }
 
 /// Refuse every store on a process-local backend that a placement's process can

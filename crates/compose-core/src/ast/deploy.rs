@@ -41,7 +41,8 @@ pub struct Placement {
     /// The name a worker claims, from the section key.
     pub name: Spanned<Ident>,
     /// `members:` — the component addresses this placement runs. Non-empty,
-    /// `agent.*` and `tool.*` only in v1 (Decision D129).
+    /// `agent.*`, `tool.*` and `flow.*` (Decisions D129, D171): a `flow.*`
+    /// places every instance of that flow.
     pub members: Vec<Spanned<Address>>,
     /// `description:`
     pub description: Option<Spanned<String>>,

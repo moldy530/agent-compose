@@ -3930,8 +3930,10 @@ fn a_stop_on_a_worker_leaves_none_of_the_commands_its_attached_flow_ran() {
 // A `coder:` node on a worker
 // ---------------------------------------------------------------------------
 
-/// The `placed-coder` fixture: a placed agent whose only tool is a flow holding
-/// a `coder:` node and a `finally:` node.
+/// The `placed-coder` fixture: a placed agent whose only tool is an unplaced
+/// flow holding a `coder:` node and a `finally:` node; the same build step as a
+/// placed flow of its own (Decision D171); and a placed agent attaching that
+/// placed flow on its own placement.
 const CODER_FIXTURE: &str = "placed-coder";
 
 /// The code the pinned Agent SDK reports a shadowed permission callback under.
@@ -4001,11 +4003,17 @@ fn stand_in_the_agent_sdk(data_dir: &Path) {
 /// The three calls `agent.builder` makes on the worker: the attached flow, a
 /// turn after it, and the structured answer.
 fn building(summary: &str) -> Vec<Script> {
+    building_through("building", summary)
+}
+
+/// The three calls an agent attaching a build-step flow as the tool `tool`
+/// makes on the worker: the call, a turn after it, and the structured answer.
+fn building_through(tool: &str, summary: &str) -> Vec<Script> {
     vec![
         Script::new(
             SONNET,
             Outcome::tool_calls(vec![ToolCall::new(
-                "building",
+                tool,
                 json!({ "goal": "make the release build" }),
             )]),
         ),
@@ -4018,12 +4026,13 @@ fn building(summary: &str) -> Vec<Script> {
 /// §14.1 rule 4, `docs/distributed.md` §3.3, §3.4, `docs/durability.md` §3.9,
 /// §3.10).
 ///
-/// The whole of the shape a build step on a build machine takes in this
-/// release: `agent.builder` is placed on `mac`, and its only tool is
-/// `flow.building`, whose `build` node is a `full_access` coder node and whose
-/// `finally:` node tidies up. The attached flow runs in the agent's placement,
-/// so all of it runs **on the worker** — and every half of it has to reach the
-/// hub:
+/// The shape a build step on a build machine took before a flow could be
+/// placed itself, and which stays legal beside it: `agent.builder` is placed on
+/// `mac`, and its only tool is `flow.building` — **unplaced** — whose `build`
+/// node is a `full_access` coder node and whose `finally:` node tidies up. The
+/// attached flow runs in the agent's placement (grammar §14.1 rule 4) and in
+/// its loop, never dispatched, so all of it runs **on the worker** — and every
+/// half of it has to reach the hub:
 ///
 /// * the coder's run, journaled as a `harness` record and streamed home over
 ///   `/workers/effects`. A hub that took only the four calls and the `finally`
@@ -4157,5 +4166,2414 @@ fn a_coder_node_in_a_placed_agents_attached_flow_runs_on_the_worker_and_its_run_
     assert!(
         frames.is_empty(),
         "the run printed a stack trace: {frames:#?}\n{transcript}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Placed flows (grammar §14.1, PRD resolved q84, Decision D171)
+// ---------------------------------------------------------------------------
+
+/// The dispatch rows one execution parked, with the columns that say where each
+/// went and what it carried: the placement, the address the worker looks the
+/// work up under, and the instance path it keys its effects by.
+fn dispatches_of(mesh: &Mesh, execution: &str) -> Vec<Value> {
+    harness::journal_rows(
+        &mesh.project,
+        &format!(
+            "SELECT placement, node, site, wait, status, session, outcome FROM dispatches \
+             WHERE execution = '{execution}' ORDER BY parked_at, wait"
+        ),
+    )
+    .as_array()
+    .cloned()
+    .unwrap_or_default()
+}
+
+/// The node ids of one trace's entries, in order.
+fn nodes_of(trace: &Value) -> Vec<String> {
+    trace
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry["node"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// `agent.inspector`'s one call — no tools, so the pinned answer is the whole of
+/// it — matched to the path it was asked about, so instances that run side by
+/// side are each answered with their own.
+fn inspecting(path: &str, signature: &str) -> Script {
+    Script::new(
+        SONNET,
+        Outcome::structured(json!({ "signature": signature })),
+    )
+    .matching(path)
+}
+
+/// **A placed flow's root execution runs whole on a worker, and its outputs
+/// come home** (Decision D171, `docs/distributed.md` §2).
+///
+/// `flow.placed_build` is a member of `mac`, and the trigger starts it as a
+/// root execution: the hub opens the lifecycle row and dispatches the instance
+/// — one row, at the empty instance path, keyed by the execution and the
+/// flow's address — and a worker claiming `mac` runs its `agent:` node and its
+/// `finally:` node. What the hub then holds is the worker's: the outputs, the
+/// effects the instance journaled over `/workers/effects` under the keys the hub
+/// would have derived, and the instance's trace. The hub calls no provider and
+/// runs no node of it.
+#[test]
+fn a_placed_flows_root_execution_runs_whole_on_a_worker_and_its_outputs_come_home() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider
+        .enqueue(inspecting("release.dmg", "inspected-on-the-worker"));
+    let worker = mesh.worker("placed-flow-root");
+
+    let execution = mesh.start_execution("/placed-builds", &json!({ "path": "release.dmg" }));
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] == "completed" || report["status"] == "failed"
+    });
+    assert_eq!(
+        report["status"],
+        "completed",
+        "{report:#}\n{}",
+        worker.transcript()
+    );
+    assert_eq!(
+        report["outputs"]["signature"], "inspected-on-the-worker",
+        "the instance's outputs are the execution's: {report:#}"
+    );
+    assert_eq!(
+        nodes_of(&report["trace"]),
+        ["inspect", "settle"],
+        "the trace is the instance's own, its finally node's entry last: {report:#}"
+    );
+
+    // One dispatch: the instance, to `mac`, at the root path — and a worker
+    // session settled it with the instance's value.
+    let rows = dispatches_of(&mesh, &execution);
+    assert_eq!(rows.len(), 1, "one instance, one dispatch: {rows:#?}");
+    assert_eq!(rows[0]["placement"], PLACEMENT, "{rows:#?}");
+    assert_eq!(rows[0]["node"], "flow.placed_build", "{rows:#?}");
+    assert_eq!(
+        rows[0]["site"], "",
+        "a root instance sits at the empty path: {rows:#?}"
+    );
+    assert_eq!(rows[0]["wait"], "flow.placed_build/0", "{rows:#?}");
+    assert_eq!(
+        (rows[0]["status"].as_str(), rows[0]["outcome"].as_str()),
+        (Some("settled"), Some("value")),
+        "{rows:#?}"
+    );
+    assert!(
+        rows[0]["session"]
+            .as_str()
+            .is_some_and(|session| session.starts_with("wrk_")),
+        "a worker session held the dispatch: {rows:#?}"
+    );
+
+    // The instance's effects, streamed home and keyed as the hub keys a root.
+    until(
+        "the instance's effects reached the hub's journal",
+        || worker.transcript(),
+        || harness::journal_holds(&mesh.project, &["inspect/0#model/0", "settle/0#finally/0"]),
+    );
+    let snapshot = mesh.provider.snapshot();
+    assert!(
+        snapshot.is_drained() && mesh.provider.requests().len() == 1,
+        "the instance's one model call was made once: {snapshot:#?}"
+    );
+}
+
+/// **A `flow:` node and a `map` over a placed flow each dispatch the instance**
+/// (Decision D171).
+///
+/// `flow.placed_builds` runs on the hub; its `first` node instantiates the
+/// placed flow once and its `every` map once per path. Each instance is a
+/// dispatch of its own to `mac`, at the instance path of whatever started it,
+/// and each one's outputs reach the hub's channels the way an instance run
+/// here would write them — the `flow:` node's into `signature`, the map's items
+/// element-wise into `signatures`. The instances' traces come home too: the
+/// `flow:` node's entry carries its instance as `inner`, and each map item's
+/// dispatch record carries its own.
+#[test]
+fn a_flow_node_and_a_map_over_a_placed_flow_dispatch_each_instance_to_its_placement() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider.enqueue_all([
+        inspecting("a.dmg", "first a.dmg"),
+        inspecting("a.dmg", "item a.dmg"),
+        inspecting("b.dmg", "item b.dmg"),
+    ]);
+    let worker = mesh.worker("placed-flow-nodes");
+
+    let execution = mesh.start_execution(
+        "/placed-build-batches",
+        &json!({ "paths": ["a.dmg", "b.dmg"] }),
+    );
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] == "completed" || report["status"] == "failed"
+    });
+    assert_eq!(
+        report["status"],
+        "completed",
+        "{report:#}\n{}",
+        worker.transcript()
+    );
+    assert_eq!(report["outputs"]["signature"], "first a.dmg", "{report:#}");
+    assert_eq!(
+        report["outputs"]["signatures"],
+        json!(["item a.dmg", "item b.dmg"]),
+        "{report:#}"
+    );
+
+    let rows = dispatches_of(&mesh, &execution);
+    assert_eq!(
+        rows.len(),
+        3,
+        "three instances, three dispatches: {rows:#?}"
+    );
+    for row in &rows {
+        assert_eq!(row["placement"], PLACEMENT, "{rows:#?}");
+        assert_eq!(row["node"], "flow.placed_build", "{rows:#?}");
+        assert_eq!(row["status"], "settled", "{rows:#?}");
+    }
+    assert_eq!(
+        rows[0]["site"], "first/0",
+        "the `flow:` node's instance: {rows:#?}"
+    );
+    assert!(
+        rows[1..].iter().all(|row| row["site"]
+            .as_str()
+            .is_some_and(|site| site.starts_with("every/0/"))),
+        "the map's instances sit under the map node: {rows:#?}"
+    );
+
+    let first = report["trace"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["node"] == "first")
+        .unwrap_or_else(|| panic!("the `flow:` node has an entry: {report:#}"));
+    assert_eq!(
+        nodes_of(&first["inner"]),
+        ["inspect", "settle"],
+        "the instance's trace came home as the node's `inner`: {first:#}"
+    );
+    let every = report["trace"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["node"] == "every")
+        .unwrap_or_else(|| panic!("the map node has an entry: {report:#}"));
+    let records = every["dispatches"].as_array().cloned().unwrap_or_default();
+    assert_eq!(records.len(), 2, "{every:#}");
+    for record in &records {
+        assert_eq!(record["outcome"], "completed", "{record:#}");
+        assert_eq!(
+            nodes_of(&record["inner"]),
+            ["inspect", "settle"],
+            "{record:#}"
+        );
+    }
+}
+
+/// **A placed flow attached to an agent the hub runs is dispatched, not run in
+/// the loop** (Decision D171).
+///
+/// `agent.coordinator` has no placement, so its tool loop runs on the hub, and
+/// its one tool is `flow.placed_build`. The model's call of it is a flow-as-tool
+/// call like any other — the arguments parsed against the flow's `inputs:`, an
+/// instance under the call's own frame — except that the instance is
+/// dispatched to `mac` and run there. Its outputs are the tool's result the
+/// model is handed, and its trace is the call's dispatch record.
+#[test]
+fn a_placed_flow_attached_to_an_unplaced_agent_runs_each_call_on_a_worker() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "placed_build",
+                json!({ "path": "release.dmg" }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "signature": "inspected-for-the-coordinator" })),
+        ),
+        Script::new(SONNET, Outcome::text("the build came back inspected")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "signature": "coordinated" })),
+        ),
+    ]);
+    let worker = mesh.worker("placed-flow-tool");
+
+    let execution = mesh.start_execution("/coordinations", &json!({ "path": "release.dmg" }));
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] == "completed" || report["status"] == "failed"
+    });
+    assert_eq!(
+        report["status"],
+        "completed",
+        "{report:#}\n{}",
+        worker.transcript()
+    );
+    assert_eq!(report["outputs"]["signature"], "coordinated", "{report:#}");
+
+    let rows = dispatches_of(&mesh, &execution);
+    assert_eq!(rows.len(), 1, "one call, one dispatch: {rows:#?}");
+    assert_eq!(rows[0]["placement"], PLACEMENT, "{rows:#?}");
+    assert_eq!(rows[0]["node"], "flow.placed_build", "{rows:#?}");
+    assert_eq!(
+        rows[0]["site"], "coordinate/0/placed_build/0",
+        "the instance sits under the call's own frame: {rows:#?}"
+    );
+
+    // The model was handed what the worker's instance answered.
+    let handed = mesh
+        .provider
+        .requests()
+        .iter()
+        .any(|request| request.body_text.contains("inspected-for-the-coordinator"));
+    assert!(
+        handed,
+        "the tool result the model saw was not the instance's outputs"
+    );
+
+    let coordinate = report["trace"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["node"] == "coordinate")
+        .unwrap_or_else(|| panic!("the agent node has an entry: {report:#}"));
+    let calls = coordinate["toolDispatches"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(calls.len(), 1, "{coordinate:#}");
+    assert_eq!(calls[0]["target"], "flow.placed_build", "{coordinate:#}");
+    assert_eq!(
+        nodes_of(&calls[0]["inner"]),
+        ["inspect", "settle"],
+        "the call's record carries the instance's trace: {coordinate:#}"
+    );
+}
+
+/// **A placed flow's finally node runs on the worker, and its failure reaches
+/// the hub** (grammar §7.9, Decision D171, `docs/distributed.md` §3.4).
+///
+/// `flow.placed_tidying` is started as a root execution; its body succeeds and
+/// its finally node fails, both on the worker. The run completes — a finally
+/// node changes no outcome — and what the finally node raised comes home on the
+/// dispatch's result as `finally_error`, onto the lifecycle row the hub alone
+/// writes. The instance's boundary is journaled from the worker at the key a
+/// root's finally node takes.
+#[test]
+fn a_placed_flows_finally_node_runs_on_the_worker_and_its_failure_is_the_executions() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    let worker = mesh.worker("placed-flow-finally");
+
+    let execution = mesh.start_execution("/placed-tidyings", &json!({ "path": "release.dmg" }));
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] == "completed" || report["status"] == "failed"
+    });
+    assert_eq!(
+        report["status"],
+        "completed",
+        "a finally node changes no outcome, on a worker as anywhere: {report:#}\n{}",
+        worker.transcript()
+    );
+    let finally_error = report["finally_error"].as_str().unwrap_or_else(|| {
+        panic!(
+            "the finally node's failure on the worker is the execution's: {report:#}\n{}",
+            worker.transcript()
+        )
+    });
+    assert!(
+        finally_error.starts_with("flow.placed_tidying node `tidy_up` failed: "),
+        "{finally_error}"
+    );
+    assert_eq!(
+        nodes_of(&report["trace"]),
+        ["look", "tidy_up"],
+        "{report:#}"
+    );
+
+    let boundary = harness::journal_rows(
+        &mesh.project,
+        &format!(
+            "SELECT \"key\" AS k, payload FROM effects \
+             WHERE execution = '{execution}' AND kind = 'finally'"
+        ),
+    );
+    let boundary = boundary.as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        boundary.len(),
+        1,
+        "one instance ended, one boundary: {boundary:?}"
+    );
+    assert_eq!(boundary[0]["k"], "tidy_up/0#finally/0", "{boundary:?}");
+    let recorded: Value = serde_json::from_str(boundary[0]["payload"].as_str().unwrap_or_default())
+        .expect("the payload is JSON");
+    assert_eq!(recorded["outcome"], "completed", "{recorded:#}");
+
+    let lifecycle = harness::journal_rows(
+        &mesh.project,
+        &format!("SELECT status, finally_error FROM executions WHERE id = '{execution}'"),
+    );
+    assert_eq!(
+        lifecycle,
+        json!([{ "status": "completed", "finally_error": finally_error }]),
+        "the hub wrote the worker's failure into the row it alone writes"
+    );
+}
+
+/// **A cancel of a running placed-flow execution reaches its worker, and the
+/// execution settles `cancelled` on the worker's result** (PRD resolved q75,
+/// Decision D160, D171, `docs/distributed.md` §3.2, §3.4).
+///
+/// `flow.placed_closing`'s body runs for ten minutes on the worker. The cancel
+/// is the execution's, and it is the root dispatch's signal: the hub names the
+/// dispatch in the worker's next poll's `cancel` list, the worker stops the
+/// runner, the instance ends `cancelled` there and runs its finally node — which
+/// fails — and the worker's `status: "cancelled"` result, carrying that failure,
+/// is what settles the dispatch and so the execution.
+#[test]
+fn a_cancel_ends_a_placed_flows_execution_cancelled_with_its_workers_result() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    let mut worker = mesh.worker("placed-flow-cancel");
+
+    let execution = mesh.start_execution("/placed-closings", &json!({ "path": "release.dmg" }));
+    mesh.until(&execution, "was taken by the worker", |report| {
+        report["placement_waits"][0]["status"] == "dispatched"
+    });
+    // Inside the instance's body: the runner the worker spawned for the dispatch
+    // is running the body's ten-minute command, so the cancel reaches an
+    // instance rather than a runner still loading.
+    until(
+        "the instance's body was running on the worker",
+        || worker.transcript(),
+        || {
+            worker.runners().is_none_or(|running| {
+                running.iter().any(|runner| {
+                    u32::try_from(*runner)
+                        .ok()
+                        .and_then(|runner| children_running(runner, "sleep"))
+                        .is_some_and(|commands| !commands.is_empty())
+                })
+            })
+        },
+    );
+
+    let asked = Instant::now();
+    let cancelled = mesh.send(Request::post(format!("/executions/{execution}/cancel")));
+    assert_eq!(cancelled.status, 202, "{}", body_of(&cancelled));
+    let report = mesh.until(&execution, "was cancelled", |report| {
+        report["status"] == "cancelled" || report["status"] == "failed"
+    });
+    assert_eq!(
+        report["status"],
+        "cancelled",
+        "{report:#}\n{}",
+        worker.transcript()
+    );
+    // Settled by the worker's cancelled result, which the execution waited for.
+    let rows = mesh.settled_cancelled(&execution, 1, Duration::ZERO);
+    assert!(
+        asked.elapsed() < Duration::from_secs(10),
+        "the cancel took {:?} to settle a placed flow",
+        asked.elapsed()
+    );
+    assert!(report.get("error").is_none(), "{report:#}");
+    let finally_error = report["finally_error"].as_str().unwrap_or_else(|| {
+        panic!(
+            "the finally node the cancel started on the worker failed, and said so: {report:#}\n\
+             {rows:#?}\n{}",
+            worker.transcript()
+        )
+    });
+    // The instance's trace came home on the cancelled result: the body node the
+    // cancel stopped, and the finally node it started.
+    assert_eq!(
+        nodes_of(&report["trace"]),
+        ["look_long", "close_up"],
+        "{report:#}"
+    );
+    assert_eq!(report["trace"][0]["outcome"], "cancelled", "{report:#}");
+    assert!(
+        finally_error.starts_with("flow.placed_closing node `close_up` failed: "),
+        "{finally_error}"
+    );
+    let boundary = harness::journal_rows(
+        &mesh.project,
+        &format!(
+            "SELECT payload FROM effects \
+             WHERE execution = '{execution}' AND \"key\" = 'close_up/0#finally/0'"
+        ),
+    );
+    let recorded: Value = serde_json::from_str(boundary[0]["payload"].as_str().unwrap_or_default())
+        .expect("the boundary was journaled from the worker");
+    assert_eq!(
+        recorded["outcome"], "cancelled",
+        "the instance ended as the cancel ended it: {recorded:#}"
+    );
+    assert!(
+        worker.running(),
+        "the worker stopped with the instance it was asked to cancel: {}",
+        worker.transcript()
+    );
+}
+
+/// **A deadline on a `flow:` node over a placed flow stops the instance on its
+/// worker, ends it `failed`, and waits for its finally node there** (grammar
+/// §7.9, §9.2; PRD resolved q76, q79, q84; Decisions D159, D171;
+/// `docs/distributed.md` §2, §3.2, §6.5).
+///
+/// `flow.placed_lapsed`'s `bounded` node instantiates `flow.placed_closing`
+/// under four seconds, and the instance is a dispatch to `mac`: its body's
+/// ten-minute command runs on the worker, and its finally node fails there at
+/// once. At four seconds the node's deadline is the instance's stop — the
+/// clock `runtime.runSubflow` hands the instance follows the instantiating
+/// node's — so the hub stops waiting for the dispatch, supersedes it, and names
+/// it on the worker's next `stop` list. The runner is sent `SIGUSR2`, and what a
+/// placed flow's instance runs under is that stop (`PlacedSite.stop`): every
+/// node of it ends, its command with it, and the instance ends **`failed`** —
+/// the outcome nobody's cancel would give it — and runs its finally node on the
+/// worker at that outcome.
+///
+/// **And the node waits for that end**, as a node whose deadline ran out waits
+/// for every instance it began (q76's "a timed-out instantiating node waits for
+/// its instance's finally"): the hub holds `bounded` open until the worker's
+/// result for the stopped dispatch is home. That result is refused `409` — the
+/// dispatch is no longer the one the hub awaits — but the finally node's failure
+/// it carries is the execution's `finally_error`, on the report and on the
+/// lifecycle row, and the boundary is in the journal before the execution
+/// settles. A hub that settled the node the moment its budget ran out would
+/// close the execution with neither; a runner whose stop reached neither the
+/// instance nor the nodes it runs (`runtime.stopEveryNodeOn`) would leave the
+/// command running past the deadline, and the instance would end only when the
+/// worker's grace killed the runner — with no finally node and no result.
+#[test]
+fn a_deadline_over_a_placed_flow_stops_its_instance_on_the_worker_and_waits_for_its_finally() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    let mut worker = mesh.worker("placed-flow-deadline");
+    let started = Instant::now();
+    let execution = mesh.start_execution("/placed-lapsings", &json!({ "path": "release.dmg" }));
+
+    // The instance's body, running on the worker under the runner the dispatch
+    // spawned — off `/proc`, where there is one to ask.
+    let body = worker.runners().map(|_| {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let held = worker.runners().unwrap_or_default();
+            let running = held.iter().find_map(|runner| {
+                u32::try_from(*runner)
+                    .ok()
+                    .and_then(|runner| children_running(runner, "sleep"))
+                    .and_then(|commands| commands.first().copied())
+                    .map(|command| (*runner, command))
+            });
+            if let Some(running) = running {
+                break running;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the placed instance's body never started on the worker: {}",
+                worker.transcript()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] != "running" && report["status"] != "interrupted"
+    });
+    let settled_after = started.elapsed();
+    assert_eq!(
+        report["status"],
+        "failed",
+        "a `flow:` node that ran out of time over a placed flow fails its execution, and \
+         cancels nothing: {report:#}\n{}",
+        worker.transcript()
+    );
+    assert!(
+        report["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("timed out")),
+        "{report:#}"
+    );
+    // Settled by the stop's own path, not by the worker's grace running out on
+    // a runner that ignored it: four seconds of budget, then the runner's
+    // finally node, well inside the five-second grace that would follow.
+    assert!(
+        settled_after < Duration::from_secs(4 + 5),
+        "the execution took {settled_after:?} to settle — as long as the worker's grace, so the \
+         instance did not stop on the stop: {}",
+        worker.transcript()
+    );
+
+    // The instance ended on the worker, and the node waited for it: its
+    // boundary came home over `/workers/effects` **before** the execution
+    // settled, at the key the `flow:` node's instance takes.
+    const BOUNDARY: &str = "bounded/0/close_up/0#finally/0";
+    assert!(
+        harness::journal_holds(&mesh.project, &[BOUNDARY]),
+        "the execution settled before the placed instance its `flow:` node began on the worker \
+         had ended: {report:#}\n{}",
+        worker.transcript()
+    );
+    let finally_error = report["finally_error"].as_str().unwrap_or_else(|| {
+        panic!(
+            "the execution carries no `finally_error`, though the finally node the stop started \
+             on the worker failed and its result said so: {report:#}\n{}",
+            worker.transcript()
+        )
+    });
+    assert!(
+        finally_error.starts_with("flow.placed_closing node `close_up` failed: ")
+            && finally_error.contains("exited 3"),
+        "the execution's `finally_error` is not the one the worker's result carried: \
+         {finally_error}"
+    );
+    let lifecycle = harness::journal_rows(
+        &mesh.project,
+        &format!("SELECT status, finally_error FROM executions WHERE id = '{execution}'"),
+    );
+    assert_eq!(
+        lifecycle,
+        json!([{ "status": "failed", "finally_error": finally_error }]),
+        "the journal's lifecycle row does not carry the worker's finally failure"
+    );
+    let rows = harness::journal_rows(
+        &mesh.project,
+        &format!(
+            "SELECT \"key\" AS k, payload FROM effects \
+             WHERE execution = '{execution}' AND kind = 'finally'"
+        ),
+    );
+    let rows = rows.as_array().cloned().unwrap_or_default();
+    assert_eq!(rows.len(), 1, "one instance ended, one boundary: {rows:?}");
+    assert_eq!(rows[0]["k"], BOUNDARY, "{rows:?}");
+    let recorded: Value = serde_json::from_str(rows[0]["payload"].as_str().unwrap_or_default())
+        .expect("the payload is JSON");
+    assert_eq!(
+        recorded["outcome"],
+        "failed",
+        "the placed instance ended as its instantiating node's deadline ends it, and not as a \
+         cancel nobody made: {recorded:#}\n{}",
+        worker.transcript()
+    );
+
+    // One dispatch — the instance, to `mac`, at the `flow:` node's own instance
+    // path — ended by the hub's deadline, never settled as a cancel.
+    let placed = dispatches_of(&mesh, &execution);
+    assert_eq!(placed.len(), 1, "one instance, one dispatch: {placed:#?}");
+    assert_eq!(placed[0]["placement"], PLACEMENT, "{placed:#?}");
+    assert_eq!(placed[0]["node"], "flow.placed_closing", "{placed:#?}");
+    assert_eq!(placed[0]["site"], "bounded/0", "{placed:#?}");
+    let dispatches = mesh.dispatch_rows(&execution);
+    assert!(
+        dispatches.len() == 1
+            && dispatches[0]["status"] == "superseded"
+            && dispatches[0]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("stopped waiting")),
+        "{dispatches:#?}"
+    );
+
+    // The stop reached the instance's command, and the runner went with the
+    // result it posted rather than with the worker's grace.
+    if let Some((runner, command)) = body {
+        assert!(
+            gone_within(command, Duration::from_secs(2)),
+            "the placed instance's command outlived the stop that ended its instance: {}",
+            std::fs::read_to_string(format!("/proc/{command}/stat")).unwrap_or_default()
+        );
+        assert!(
+            gone_within(runner, Duration::from_secs(10)),
+            "the runner outlived the result it posted: {}",
+            worker.transcript()
+        );
+    }
+    assert!(worker.running(), "{}", worker.transcript());
+}
+
+/// The address a `run` says it serves its mesh at, once it has said so.
+///
+/// The run writes one `mesh: <url> — …` line on stderr when the first dispatch
+/// of a placed flow's instance it makes starts its listener (Decision D171); everything
+/// after the url on that line is the `agent-compose worker` command a reader
+/// starts next. Waits for the line rather than for the process, which is still
+/// running — it is waiting for the worker this answer is used to start.
+fn mesh_of(running: &harness::Running) -> String {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let said = running.said();
+        if let Some(url) = said.lines().find_map(|line| {
+            line.strip_prefix("mesh: ")
+                .and_then(|rest| rest.split_whitespace().next())
+                .map(str::to_string)
+        }) {
+            return url;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the run never said where a worker joins it\nstderr: {said}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// One `run`'s dispatch rows, with the columns [`dispatches_of`] reads.
+fn run_dispatches(project: &Path, flow: &str) -> Vec<Value> {
+    harness::journal_rows(
+        project,
+        &format!(
+            "SELECT d.placement, d.node, d.site, d.wait, d.status, d.session, d.outcome \
+             FROM dispatches d JOIN executions e ON e.id = d.execution \
+             WHERE e.flow = '{flow}' ORDER BY d.parked_at, d.wait"
+        ),
+    )
+    .as_array()
+    .cloned()
+    .unwrap_or_default()
+}
+
+/// **`agent-compose run` of a placed flow serves the mesh itself, and a worker
+/// that joins it runs the instance** (PRD resolved q84 — "a root execution a
+/// trigger or `run` starts … runs on a worker claiming the placement"; grammar
+/// §14.1 rule 2; Decision D171; `docs/distributed.md` §2).
+///
+/// A `run` is one process, and the placed instance it starts is still a
+/// dispatch a hub makes: onto a board, through the routes a worker joins. So the
+/// run is that hub for as long as it lasts. Its first dispatch to `mac` starts a
+/// listener for the worker routes and says where on stderr, the instance
+/// **parks** there — at the empty instance path, keyed by the execution and the
+/// flow's address, held by no session — and the run waits. A worker started
+/// against the address it named joins, is handed the dispatch, runs the
+/// instance's `agent:` node and its `finally:` node, streams their effects home
+/// to the run's journal and posts the instance's outputs, which are the run's
+/// answer on stdout. The CLI's own process called no provider: the one model
+/// call the provider answered was the worker's.
+///
+/// Both ways a `run` reaches a placed flow are driven, each with a worker of its
+/// own:
+///
+///  * a `run` of `flow.placed_build` itself — the root dispatch;
+///  * a `run` of `flow.placed_retried`, which the run executes, whose `build`
+///    node instantiates the placed flow — at that node's instance path — with
+///    `--host` and `--port` given, which the mesh line names back.
+#[test]
+fn a_run_of_a_placed_flow_serves_the_mesh_and_the_worker_that_joins_it_runs_the_instance() {
+    let Some(project) = harness::scratch_project("placed-flow-run") else {
+        return;
+    };
+    let _scratch = harness::Scratch::at(project.clone());
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        inspecting("release.dmg", "inspected-on-the-runs-worker"),
+        inspecting("hotfix.dmg", "inspected-from-the-runs-node"),
+    ]);
+    let entrypoint = harness::fixture(FIXTURE);
+    let environment = environment(&provider);
+
+    // The placed flow as the run's own root.
+    let running = harness::run_target_spawned_with(
+        &project,
+        &entrypoint,
+        TARGET,
+        "flow.placed_build",
+        &[("path", "release.dmg")],
+        &[],
+        &environment,
+    );
+    let hub = mesh_of(&running);
+    assert!(
+        running.said().contains(&format!(
+            "agent-compose worker --hub {hub} --claim {PLACEMENT} --token-env {TOKEN_VARIABLE}"
+        )),
+        "the run names the command a worker joins it with: {}",
+        running.said()
+    );
+    // Parked on the run's board while nothing claims `mac` (§6.4), and nothing
+    // of the instance has run anywhere.
+    until(
+        "the run parked the instance on its own board",
+        || running.said(),
+        || {
+            run_dispatches(&project, "flow.placed_build")
+                .first()
+                .is_some_and(|row| row["status"] == "parked")
+        },
+    );
+    assert!(
+        provider.requests().is_empty(),
+        "the run's own process ran the placed instance's `agent:` node: {:#?}",
+        provider.snapshot()
+    );
+    let worker = Worker::start(&hub, &environment, "placed-flow-run-root", None);
+    let run = running.finish();
+    run.succeeded();
+    assert_eq!(
+        run.outputs()["signature"],
+        "inspected-on-the-runs-worker",
+        "the instance's outputs are the run's answer: {}\n{}",
+        run.stderr(),
+        worker.transcript()
+    );
+    assert_eq!(
+        run.trace()
+            .iter()
+            .filter_map(|entry| entry["node"].as_str().map(str::to_string))
+            .collect::<Vec<_>>(),
+        ["inspect", "settle"],
+        "the run's trace is the instance's own, its finally node's entry last"
+    );
+    let rows = run_dispatches(&project, "flow.placed_build");
+    assert_eq!(rows.len(), 1, "one instance, one dispatch: {rows:#?}");
+    assert_eq!(rows[0]["placement"], PLACEMENT, "{rows:#?}");
+    assert_eq!(rows[0]["node"], "flow.placed_build", "{rows:#?}");
+    assert_eq!(
+        rows[0]["site"], "",
+        "a root instance sits at the empty path: {rows:#?}"
+    );
+    assert_eq!(rows[0]["wait"], "flow.placed_build/0", "{rows:#?}");
+    assert_eq!(
+        (rows[0]["status"].as_str(), rows[0]["outcome"].as_str()),
+        (Some("settled"), Some("value")),
+        "{rows:#?}"
+    );
+    assert!(
+        rows[0]["session"]
+            .as_str()
+            .is_some_and(|session| session.starts_with("wrk_")),
+        "a worker session held the dispatch: {rows:#?}"
+    );
+    assert!(
+        harness::journal_holds(&project, &["inspect/0#model/0", "settle/0#finally/0"]),
+        "the instance's effects were streamed home to the run's journal: {}",
+        harness::journal_rows(&project, "SELECT \"key\" AS k FROM effects")
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "the instance's one model call was made once, by the worker"
+    );
+    drop(worker);
+
+    // A `flow:` node over it, in a flow the run executes itself, at the
+    // address the command names.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("a loopback port")
+        .port();
+    let running = harness::run_target_spawned_with(
+        &project,
+        &entrypoint,
+        TARGET,
+        "flow.placed_retried",
+        &[("path", "hotfix.dmg")],
+        &["--host", "127.0.0.1", "--port", &port.to_string()],
+        &environment,
+    );
+    let hub = mesh_of(&running);
+    assert_eq!(
+        hub,
+        format!("http://127.0.0.1:{port}"),
+        "the run serves its mesh where `--host` and `--port` say: {}",
+        running.said()
+    );
+    let worker = Worker::start(&hub, &environment, "placed-flow-run-node", None);
+    let run = running.finish();
+    run.succeeded();
+    assert_eq!(
+        run.outputs()["signature"],
+        "inspected-from-the-runs-node",
+        "the `flow:` node's instance ran on the worker and its outputs reached the run: {}\n{}",
+        run.stderr(),
+        worker.transcript()
+    );
+    let rows = run_dispatches(&project, "flow.placed_retried");
+    assert_eq!(rows.len(), 1, "one instance, one dispatch: {rows:#?}");
+    assert_eq!(rows[0]["placement"], PLACEMENT, "{rows:#?}");
+    assert_eq!(rows[0]["node"], "flow.placed_build", "{rows:#?}");
+    assert_eq!(
+        rows[0]["site"], "build/0",
+        "a `flow:` node's instance is dispatched at the node's own instance path: {rows:#?}"
+    );
+    assert_eq!(
+        (rows[0]["status"].as_str(), rows[0]["outcome"].as_str()),
+        (Some("settled"), Some("value")),
+        "{rows:#?}"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "each instance's one model call was made once, by a worker"
+    );
+}
+
+/// **A placed flow's dispatch parks while nothing claims its placement, and a
+/// worker's join wakes it** (`docs/distributed.md` §6, Decision D171).
+///
+/// The root dispatch is a placement wait like a placed node's: on the board,
+/// under the identity the execution and the flow's address give it, `parked`
+/// while no session holds it — and the execution `running`, since undispatched
+/// is a pause rather than a failure (§6.4). A worker joining is the whole of
+/// the wake.
+#[test]
+fn a_placed_flows_dispatch_parks_with_no_worker_and_a_join_runs_it() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider
+        .enqueue(inspecting("release.dmg", "inspected-after-parking"));
+
+    let execution = mesh.start_execution("/placed-builds", &json!({ "path": "release.dmg" }));
+    let parked = mesh.until(&execution, "parked on its placement", |report| {
+        !report["placement_waits"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+    });
+    let wait = &parked["placement_waits"][0];
+    assert_eq!(wait["placement"], PLACEMENT, "{parked:#}");
+    assert_eq!(wait["node"], "flow.placed_build", "{parked:#}");
+    assert_eq!(wait["wait_id"], "flow.placed_build/0", "{parked:#}");
+    assert_eq!(wait["status"], "parked", "{parked:#}");
+    assert_eq!(parked["status"], "running", "{parked:#}");
+
+    let _worker = mesh.worker("placed-flow-wake");
+    let outputs = mesh.completed(&execution);
+    assert_eq!(outputs["signature"], "inspected-after-parking");
+}
+
+/// **A hub restarted over a placed flow's dispatch supersedes it, and the
+/// instantiating node's retry dispatches the instance again** (§5, §6.3,
+/// Decision D171).
+///
+/// `flow.placed_retried`'s `build` node instantiates `flow.placed_build` under
+/// a `retry:`. The worker is inside the instance — its model call held three
+/// seconds — when the process behind the hub's name is replaced: the dispatch
+/// the dead process issued is superseded at start, the node's retry opens a
+/// second attempt at the next ordinal of the same instance path, and the worker
+/// that survived the restart re-joins and runs it.
+#[test]
+fn a_hub_restarted_over_a_placed_flows_dispatch_recovers_it_through_the_retry() {
+    let Some(mut mesh) = Mesh::start() else {
+        return;
+    };
+    const SIGNED: &str = "inspected-across-a-restart";
+    mesh.provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "signature": SIGNED })).after(Duration::from_secs(3)),
+        ),
+        Script::new(SONNET, Outcome::structured(json!({ "signature": SIGNED }))),
+    ]);
+    let mut worker = mesh.worker("placed-flow-restart");
+
+    let execution =
+        mesh.start_execution("/placed-retried-builds", &json!({ "path": "release.dmg" }));
+    let holding = mesh.until(&execution, "was taken by the worker", |report| {
+        report["placement_waits"][0]["status"] == "dispatched"
+    });
+    assert_eq!(
+        holding["placement_waits"][0]["wait_id"], "build/0/0",
+        "{holding:#}"
+    );
+    let superseded = holding["placement_waits"][0]["dispatch_id"]
+        .as_str()
+        .expect("a dispatched wait names the dispatch holding it")
+        .to_string();
+    until(
+        "the instance's model call reached the provider",
+        || worker.transcript(),
+        || !mesh.provider.requests().is_empty(),
+    );
+
+    mesh.restart();
+
+    let retried = mesh.until(&execution, "opened a second attempt", |report| {
+        report["placement_waits"][0]["dispatch_id"]
+            .as_str()
+            .is_some_and(|held| held != superseded)
+    });
+    assert_eq!(
+        retried["placement_waits"][0]["wait_id"], "build/0/1",
+        "the attempt after a superseded one is a wait of its own (§6.1): {retried:#}"
+    );
+    let outputs = mesh.completed(&execution);
+    assert_eq!(
+        outputs["signature"],
+        SIGNED,
+        "the retry did not reach the worker that survived the restart; it said:\n{}",
+        worker.transcript()
+    );
+    assert!(
+        worker.running(),
+        "the worker stopped somewhere across the restart: {}",
+        worker.transcript()
+    );
+}
+
+/// **A hub restarted over a placed flow's root dispatch fails the execution
+/// once, and nothing runs the instance again** (§2, §5, §6.3, Decision D171).
+///
+/// `flow.placed_build` started as a root execution: the hub opens the lifecycle
+/// row and dispatches the instance at the empty path, keyed by the execution and
+/// the flow's address. The worker is inside it — its model call held three
+/// seconds — when the process behind the hub's name is replaced. The replacing
+/// process supersedes the dispatch the dead one issued, and recovery replays the
+/// execution to that dispatch and finds it superseded. A root instance has no
+/// instantiating node and so no `retry:` ladder: the execution fails on the
+/// lost session, its lifecycle row closes `failed`, and **no second dispatch is
+/// issued** — the long step is not run twice. The worker that survived the
+/// restart is still running, and whatever its old runner was doing is never
+/// asked of the provider again.
+#[test]
+fn a_hub_restarted_over_a_placed_flows_root_dispatch_fails_the_execution_without_a_second_run() {
+    let Some(mut mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider.enqueue(
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "signature": "inspected-before-the-restart" }))
+                .after(Duration::from_secs(3)),
+        )
+        .matching("release.dmg"),
+    );
+    let mut worker = mesh.worker("placed-flow-root-restart");
+
+    let execution = mesh.start_execution("/placed-builds", &json!({ "path": "release.dmg" }));
+    let holding = mesh.until(&execution, "was taken by the worker", |report| {
+        report["placement_waits"][0]["status"] == "dispatched"
+    });
+    assert_eq!(
+        holding["placement_waits"][0]["wait_id"], "flow.placed_build/0",
+        "the root instance's wait is keyed by the flow's address: {holding:#}"
+    );
+    let superseded = holding["placement_waits"][0]["dispatch_id"]
+        .as_str()
+        .expect("a dispatched wait names the dispatch holding it")
+        .to_string();
+    until(
+        "the instance's model call reached the provider",
+        || worker.transcript(),
+        || !mesh.provider.requests().is_empty(),
+    );
+
+    mesh.restart();
+
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] == "completed" || report["status"] == "failed"
+    });
+    assert_eq!(
+        report["status"],
+        "failed",
+        "a root instance whose session was lost has no retry to recover through, so its \
+         execution fails (§2): {report:#}\n{}",
+        worker.transcript()
+    );
+    let error = report["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("DispatchSuperseded") && error.contains("was replaced"),
+        "the execution's failure is not the superseded dispatch's: {report:#}"
+    );
+    let lifecycle = harness::journal_rows(
+        &mesh.project,
+        &format!("SELECT status FROM executions WHERE id = '{execution}'"),
+    );
+    assert_eq!(
+        lifecycle,
+        json!([{ "status": "failed" }]),
+        "the lifecycle row the hub opened for the root did not close failed"
+    );
+
+    // The worker's old runner ends — stopped on its re-join, or answering a
+    // session that is over — and nothing it did after the restart is anyone's.
+    until(
+        "the runner the restart orphaned is gone",
+        || worker.transcript(),
+        || worker.runners().is_none_or(|running| running.is_empty()),
+    );
+    let rows = mesh.dispatch_rows(&execution);
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row["id"].as_str(), row["status"].as_str()))
+            .collect::<Vec<_>>(),
+        [(Some(superseded.as_str()), Some("superseded"))],
+        "the one root dispatch is the one superseded, and none was issued after it: {rows:#?}\n{}",
+        worker.transcript()
+    );
+    assert_eq!(
+        mesh.report(&execution)["status"],
+        "failed",
+        "the worker's late answer reopened an execution that had failed"
+    );
+    let requests = mesh.provider.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the instance's model call was made again after the restart: {requests:#?}"
+    );
+    assert!(
+        worker.running(),
+        "the worker stopped somewhere across the restart: {}",
+        worker.transcript()
+    );
+}
+
+/// **A placed flow's dispatches count against its placement's `max_running:`**
+/// (`docs/distributed.md` §2, Decision D161, D171).
+///
+/// A one-worker pool whose placement says `max_running: 2`, and a map over the
+/// placed flow admitting four: each item's instance is one dispatch, held for a
+/// second and a half on the worker, so the session holds two of them at once and
+/// never three, and the fan-out completes.
+#[test]
+fn a_placed_flows_dispatches_count_against_its_placements_max_running() {
+    let Some(mesh) = capped("placed-flow-capacity", 2) else {
+        return;
+    };
+    let held = Duration::from_millis(1500);
+    mesh.provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "signature": "first a.dmg" })),
+        )
+        .matching("a.dmg"),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "signature": "item a.dmg" })).after(held),
+        )
+        .matching("a.dmg"),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "signature": "item b.dmg" })).after(held),
+        )
+        .matching("b.dmg"),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "signature": "item c.dmg" })).after(held),
+        )
+        .matching("c.dmg"),
+    ]);
+    let _worker = mesh.worker("placed-flow-capacity");
+    let execution = mesh.start_execution(
+        "/placed-build-batches",
+        &json!({ "paths": ["a.dmg", "b.dmg", "c.dmg"] }),
+    );
+    let most = most_dispatched_at_once(&mesh, &execution, 2);
+    assert_eq!(
+        most, 2,
+        "one session at a cap of two never held two instances"
+    );
+    let outputs = mesh.completed(&execution);
+    assert_eq!(
+        outputs["signatures"].as_array().map(Vec::len),
+        Some(3),
+        "{outputs:#}"
+    );
+}
+
+/// **A `coder:` node in a placed flow runs on the worker, with no agent in the
+/// way** (PRD resolved q84, Decision D171).
+///
+/// The report's use case. `flow.placed_building` is a member of `mac` itself,
+/// so the trigger that starts it starts a root execution the hub dispatches
+/// whole: the coder node's run happens on the worker and its `harness` record
+/// comes home, the finally node runs there and its boundary comes home, and the
+/// summary the coder produced is the execution's output. No model is called for
+/// it at all — the placed agent the coder node used to need, and its extra
+/// model call, are gone.
+#[test]
+fn a_coder_node_in_a_placed_flow_runs_on_the_worker_with_no_agent_in_the_way() {
+    let Some(mesh) = Mesh::start_from("mesh-coder-flow", harness::fixture(CODER_FIXTURE), None)
+    else {
+        return;
+    };
+    let data_dir = scratch_data_dir("placed-coder-flow");
+    stand_in_the_agent_sdk(&data_dir);
+    let worker = mesh.worker_into("placed-coder-flow", &data_dir);
+
+    let execution =
+        mesh.start_execution("/build-steps", &json!({ "goal": "make the release build" }));
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] == "completed" || report["status"] == "failed"
+    });
+    assert_eq!(
+        report["status"],
+        "completed",
+        "{report:#}\n{}",
+        worker.transcript()
+    );
+    assert_eq!(
+        report["outputs"]["summary"], "built on the worker for make the release build",
+        "the coder's summary is the execution's output: {report:#}"
+    );
+
+    let records = harness::journal_rows(
+        &mesh.project,
+        &format!(
+            "SELECT \"key\" AS k, kind FROM effects \
+             WHERE execution = '{execution}' AND kind IN ('harness', 'finally') ORDER BY \"key\""
+        ),
+    );
+    assert_eq!(
+        records,
+        json!([
+            { "k": "build/0#harness/0", "kind": "harness" },
+            { "k": "tidy_up/0#finally/0", "kind": "finally" },
+        ]),
+        "the run and the instance's end came home, keyed at the root: {}",
+        worker.transcript()
+    );
+
+    let rows = dispatches_of(&mesh, &execution);
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(rows[0]["node"], "flow.placed_building", "{rows:#?}");
+    assert_eq!(rows[0]["placement"], PLACEMENT, "{rows:#?}");
+    assert!(
+        mesh.provider.requests().is_empty(),
+        "a placed build step called a model: {:#?}",
+        mesh.provider.requests()
+    );
+}
+
+/// **A placed flow attached by an agent of its own placement runs on the worker
+/// already running the agent** (grammar §14.1 rule 4, Decision D171).
+///
+/// `agent.placed_builder` is a member of `mac`, and its one tool is
+/// `flow.placed_building`, a member of `mac` too — the same answer written
+/// twice. The call's instance is a placed flow's, so the runtime dispatches it
+/// rather than running it in the loop; but the dispatch is issued on the worker
+/// that took the agent's node, the one process a worker can hand it to, so that
+/// worker runs the instance itself. Nothing about it reaches the hub's board:
+/// one dispatch — the agent node's — settles with the node's value, while the
+/// coder node's `harness` record and the instance's `finally` boundary come
+/// home keyed under the call inside that node, exactly as an unplaced attached
+/// flow's do. The model is handed the coder's summary as the tool's result.
+#[test]
+fn a_placed_flow_attached_by_an_agent_of_its_own_placement_runs_on_the_agents_worker() {
+    let Some(mesh) = Mesh::start_from(
+        "mesh-coder-same-placement",
+        harness::fixture(CODER_FIXTURE),
+        None,
+    ) else {
+        return;
+    };
+    mesh.provider.enqueue_all(building_through(
+        "placed_building",
+        "the placed build ran in the agent's loop",
+    ));
+    let data_dir = scratch_data_dir("placed-coder-same-placement");
+    stand_in_the_agent_sdk(&data_dir);
+    let worker = mesh.worker_into("placed-coder-same-placement", &data_dir);
+
+    let execution = mesh.start_execution(
+        "/placed-builds",
+        &json!({ "goal": "make the release build" }),
+    );
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] == "completed" || report["status"] == "failed"
+    });
+    assert_eq!(
+        report["status"],
+        "completed",
+        "{report:#}\n{}",
+        worker.transcript()
+    );
+    assert_eq!(
+        report["outputs"]["summary"], "the placed build ran in the agent's loop",
+        "{report:#}"
+    );
+    assert!(
+        report.get("finally_error").is_none_or(Value::is_null),
+        "the finally node ran clean on the worker: {report:#}"
+    );
+
+    // The coder's run and the instance's end, journaled from the worker under
+    // the call inside the placed agent node.
+    let records = harness::journal_rows(
+        &mesh.project,
+        &format!(
+            "SELECT \"key\" AS k, kind FROM effects \
+             WHERE execution = '{execution}' AND kind IN ('harness', 'finally') ORDER BY \"key\""
+        ),
+    );
+    assert_eq!(
+        records,
+        json!([
+            { "k": "build/0/placed_building/0/build/0#harness/0", "kind": "harness" },
+            { "k": "build/0/placed_building/0/tidy_up/0#finally/0", "kind": "finally" },
+        ]),
+        "the run and the instance's end came home under the call: {}",
+        worker.transcript()
+    );
+
+    // One dispatch, the agent node's: the instance its loop started was run by
+    // the worker holding it, not handed back to the hub's board.
+    let rows = dispatches_of(&mesh, &execution);
+    assert_eq!(
+        rows.iter()
+            .map(|row| (
+                row["placement"].as_str(),
+                row["node"].as_str(),
+                row["status"].as_str(),
+                row["outcome"].as_str()
+            ))
+            .collect::<Vec<_>>(),
+        [(
+            Some(PLACEMENT),
+            Some("flow.placed_built.build"),
+            Some("settled"),
+            Some("value")
+        )],
+        "the placed agent node is the one dispatch, settled with its value: {rows:#?}\n{}",
+        worker.transcript()
+    );
+
+    // The model was handed what the instance answered, and asked three times.
+    let requests = mesh.provider.requests();
+    assert_eq!(requests.len(), 3, "{requests:#?}");
+    assert!(
+        requests.iter().any(|request| request
+            .body_text
+            .contains("built on the worker for make the release build")),
+        "the tool result the model saw was not the instance's outputs: {requests:#?}"
+    );
+}
+
+/// **A `human:` node inside a placed flow pauses on the hub's board, and the
+/// answer dispatches the instance again** (Decision D171, `docs/distributed.md`
+/// §3.4, PRD resolved q46).
+///
+/// `flow.placed_asking` is a member of `mac` and is started as a root
+/// execution, so its `ask` node is reached on the worker — the same shape as
+/// an attached flow's question inside a placed agent's loop, one level out. The
+/// wait is the hub's, so the root dispatch settles *paused* rather than holding
+/// the worker while a person thinks; the ordinary resume surface takes the
+/// answer; and the instance re-enters dispatch at the root path and replays its
+/// `inspect` node out of the effect history rather than paying for the model
+/// call again.
+#[test]
+fn a_human_node_in_a_placed_flow_pauses_on_the_hub_and_its_answer_redispatches_the_instance() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider
+        .enqueue(inspecting("release.dmg", "inspected-before-asking"));
+    let worker = mesh.worker("placed-flow-asking");
+
+    let execution = mesh.start_execution("/placed-askings", &json!({ "path": "release.dmg" }));
+    let wait = mesh.paused(&execution);
+    assert_eq!(
+        (
+            wait["flow"].as_str(),
+            wait["node"].as_str(),
+            wait["wait_id"].as_str()
+        ),
+        (Some("flow.placed_asking"), Some("ask"), Some("ask/0")),
+        "the wait is not the placed flow's own `human:` node at the root instance's path: \
+         {wait:#}\n{}",
+        worker.transcript()
+    );
+
+    // **Settled, not parked**: the root dispatch ended paused, so the hub holds
+    // no placement wait and the worker is free.
+    let report = mesh.report(&execution);
+    assert_holds_no_placement_wait(
+        &report,
+        "the hub is still holding a placement wait for a root dispatch a paused result settled",
+    );
+    let rows = dispatches_of(&mesh, &execution);
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(
+        (
+            rows[0]["node"].as_str(),
+            rows[0]["site"].as_str(),
+            rows[0]["status"].as_str()
+        ),
+        (Some("flow.placed_asking"), Some(""), Some("settled")),
+        "the paused root instance is not settled on the board: {rows:#?}"
+    );
+
+    let id = wait["wait_id"].as_str().expect("the wait names itself");
+    let answered = mesh.resume(&execution, id, &json!({ "decision": "approve" }));
+    assert_eq!(answered.status, 202, "{}", body_of(&answered));
+
+    let outputs = mesh.completed(&execution);
+    assert_eq!(
+        (outputs["signature"].as_str(), outputs["approval"].as_str()),
+        (Some("inspected-before-asking"), Some("approve")),
+        "the instance did not finish after the answer; the worker said:\n{}",
+        worker.transcript()
+    );
+
+    // The answer sent the **whole instance** back through dispatch: a second
+    // root dispatch, to the same placement, settled with the instance's value.
+    let rows = dispatches_of(&mesh, &execution);
+    assert_eq!(
+        rows.iter()
+            .map(|row| (
+                row["placement"].as_str(),
+                row["node"].as_str(),
+                row["site"].as_str(),
+                row["status"].as_str()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                Some(PLACEMENT),
+                Some("flow.placed_asking"),
+                Some(""),
+                Some("settled")
+            ),
+            (
+                Some(PLACEMENT),
+                Some("flow.placed_asking"),
+                Some(""),
+                Some("settled")
+            ),
+        ],
+        "the answered pause did not redispatch the instance: {rows:#?}"
+    );
+
+    // **Replayed, not re-issued**: one script, one request — the redispatch read
+    // the pre-pause model call out of the effect history (§7.2).
+    let requests = mesh.provider.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the redispatch paid for a model call the journal already held: {requests:#?}"
+    );
+    // …and the answer is the pause's own effect record, at the wait's own site.
+    let human = harness::journal_rows(
+        &mesh.project,
+        "SELECT key FROM effects WHERE kind = 'human'",
+    );
+    assert_eq!(
+        human,
+        json!([{ "key": format!("{id}#human/0") }]),
+        "the answer is not journaled once at the pause's own site: {human:#}"
+    );
+}
+
+/// The cancel route, answered `202` for an execution still open.
+fn cancel(mesh: &Mesh, execution: &str) {
+    let cancelled = mesh.send(Request::post(format!("/executions/{execution}/cancel")));
+    assert_eq!(cancelled.status, 202, "{}", body_of(&cancelled));
+}
+
+/// The outcome the finally boundary at `key` recorded in this execution, read
+/// off the hub's journal — `None` where no boundary was journaled.
+fn boundary_outcome(mesh: &Mesh, execution: &str, key: &str) -> Option<String> {
+    let rows = harness::journal_rows(
+        &mesh.project,
+        &format!(
+            "SELECT payload FROM effects \
+             WHERE execution = '{execution}' AND kind = 'finally' AND \"key\" = '{key}'"
+        ),
+    );
+    let payload = rows.as_array()?.first()?["payload"].as_str()?.to_string();
+    let recorded: Value = serde_json::from_str(&payload).expect("a boundary's payload is JSON");
+    recorded["outcome"].as_str().map(str::to_string)
+}
+
+/// **A cancel at a placed flow's question ends the instance on a worker, and
+/// its finally node runs there** (PRD resolved q75 ruling e: "releases its
+/// waits, runs its `finally:`"; q76, q84; grammar §7.9; Decision D171;
+/// `docs/distributed.md` §3.2, §3.4).
+///
+/// `flow.placed_asking`'s instance runs `inspect` on the worker and reaches
+/// `ask`: the root dispatch settles *paused*, and the question waits on the
+/// hub's board with no worker running anything of the instance. The cancel
+/// releases the question — and finds an instance that has begun with nobody to
+/// end it. The hub cannot run `close_out` itself (nothing of a placed flow runs
+/// on the hub), so it hands a worker the instance's **end**: a second root
+/// dispatch, carrying the effect history and `cancelled: true`. The worker
+/// replays `inspect` out of the history, the cancel fires at `ask` — the
+/// frontier — and the instance ends `cancelled` there and runs its finally
+/// node. The execution settles `cancelled` on that dispatch's cancelled result:
+/// its trace is the instance's, `ask` cancelled and `close_out` last, the
+/// boundary was journaled from the worker at outcome `cancelled`, no model call
+/// was made a second time, and the answer the question waited for is refused
+/// naming the status. Without the end dispatch the execution settles with one
+/// dispatch row, no `close_out` entry and no boundary at all.
+#[test]
+fn a_cancel_at_a_placed_flows_question_runs_its_finally_node_on_a_worker() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider
+        .enqueue(inspecting("release.dmg", "inspected-before-the-cancel"));
+    let mut worker = mesh.worker("placed-flow-cancel-at-question");
+
+    let execution = mesh.start_execution("/placed-askings", &json!({ "path": "release.dmg" }));
+    let wait = mesh.paused(&execution);
+    let id = wait["wait_id"]
+        .as_str()
+        .expect("the wait names itself")
+        .to_string();
+    assert_holds_no_placement_wait(
+        &mesh.report(&execution),
+        "a paused root dispatch is settled, and no worker holds the instance while it asks",
+    );
+
+    let asked = Instant::now();
+    cancel(&mesh, &execution);
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] != "interrupted" && report["status"] != "running"
+    });
+    assert_eq!(
+        report["status"],
+        "cancelled",
+        "{report:#}\n{}",
+        worker.transcript()
+    );
+    assert!(
+        asked.elapsed() < Duration::from_secs(10),
+        "the cancel took {:?} to end a placed flow at its question",
+        asked.elapsed()
+    );
+    assert!(report.get("error").is_none(), "{report:#}");
+    assert!(report.get("finally_error").is_none(), "{report:#}");
+    assert!(
+        report["interrupts"].as_array().is_none_or(Vec::is_empty),
+        "the released question is still published: {report:#}"
+    );
+    assert!(
+        report["placement_waits"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "a cancelled execution still holds a placement wait: {report:#}"
+    );
+    assert_eq!(
+        nodes_of(&report["trace"]),
+        ["inspect", "ask", "close_out"],
+        "the instance's end did not come home with its finally node's entry last: {report:#}\n{}",
+        worker.transcript()
+    );
+    assert_eq!(report["trace"][1]["outcome"], "cancelled", "{report:#}");
+    assert_eq!(report["trace"][2]["outcome"], "completed", "{report:#}");
+    assert_eq!(
+        boundary_outcome(&mesh, &execution, "close_out/0#finally/0").as_deref(),
+        Some("cancelled"),
+        "the finally node did not run at outcome `cancelled`: {}",
+        worker.transcript()
+    );
+
+    // The end was a dispatch a worker ran: a second root dispatch at the empty
+    // path, settled by the worker's cancelled result.
+    let rows = dispatches_of(&mesh, &execution);
+    assert_eq!(
+        rows.iter()
+            .map(|row| (
+                row["node"].as_str(),
+                row["site"].as_str(),
+                row["wait"].as_str(),
+                row["status"].as_str(),
+                row["outcome"].as_str()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                Some("flow.placed_asking"),
+                Some(""),
+                Some("flow.placed_asking/0"),
+                Some("settled"),
+                Some("value")
+            ),
+            (
+                Some("flow.placed_asking"),
+                Some(""),
+                Some("flow.placed_asking/1"),
+                Some("settled"),
+                Some("error")
+            ),
+        ],
+        "the cancel did not hand the instance's end to a worker: {rows:#?}"
+    );
+    assert!(
+        rows[1]["session"]
+            .as_str()
+            .is_some_and(|session| session.starts_with("wrk_")),
+        "a worker session held the end: {rows:#?}"
+    );
+    assert_eq!(
+        mesh.provider.requests().len(),
+        1,
+        "the end replayed `inspect`'s model call rather than making it again"
+    );
+    let human = harness::journal_rows(
+        &mesh.project,
+        &format!(
+            "SELECT \"key\" AS k FROM effects WHERE execution = '{execution}' AND kind = 'human'"
+        ),
+    );
+    assert_eq!(
+        human,
+        json!([]),
+        "the released question was journaled as answered"
+    );
+    let refused = mesh.resume(&execution, &id, &json!({ "decision": "approve" }));
+    assert_eq!(refused.status, 409, "{}", body_of(&refused));
+    assert_eq!(
+        refused.json()["status"],
+        "cancelled",
+        "{}",
+        body_of(&refused)
+    );
+    assert!(
+        worker.running(),
+        "the worker stopped with the end it ran: {}",
+        worker.transcript()
+    );
+}
+
+/// **A cancel of a placed flow's root dispatch that no worker ever took ends the
+/// execution `cancelled` and runs no finally node** (grammar §7.9: an instance
+/// "never begun … has no end to run anything at"; PRD resolved q75; Decision
+/// D171; `docs/distributed.md` §6.4).
+///
+/// With no worker claiming `mac`, `flow.placed_asking`'s root dispatch parks,
+/// and nothing of the instance runs anywhere. The cancel withdraws the parked
+/// row, as it withdraws any parked dispatch, and the execution settles
+/// `cancelled` at once: the instance never began, so there is no end to hand a
+/// worker — no second dispatch, no boundary, no effect of any kind — where an
+/// end dispatch made anyway would have left the execution open, parked for a
+/// worker nobody started.
+#[test]
+fn a_cancel_of_a_placed_flows_untaken_root_dispatch_runs_no_finally_node() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    let execution = mesh.start_execution("/placed-askings", &json!({ "path": "release.dmg" }));
+    let parked = mesh.until(&execution, "parked on its placement", |report| {
+        !report["placement_waits"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+    });
+    assert_eq!(
+        parked["placement_waits"][0]["status"], "parked",
+        "{parked:#}"
+    );
+
+    let asked = Instant::now();
+    cancel(&mesh, &execution);
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] != "running"
+    });
+    assert_eq!(report["status"], "cancelled", "{report:#}");
+    assert!(
+        asked.elapsed() < Duration::from_secs(10),
+        "the cancel took {:?} to end a parked placed flow",
+        asked.elapsed()
+    );
+    assert!(report.get("error").is_none(), "{report:#}");
+    assert!(report.get("finally_error").is_none(), "{report:#}");
+    assert!(
+        report["placement_waits"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "a cancelled execution still holds a placement wait: {report:#}"
+    );
+    assert_eq!(
+        nodes_of(&report["trace"]),
+        Vec::<String>::new(),
+        "{report:#}"
+    );
+
+    let rows = mesh.dispatch_rows(&execution);
+    assert_eq!(
+        rows.len(),
+        1,
+        "an end was dispatched for an instance that never began: {rows:#?}"
+    );
+    assert_eq!(rows[0]["status"], "superseded", "{rows:#?}");
+    assert!(
+        rows[0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("was cancelled")),
+        "the parked row was not withdrawn as the cancel: {rows:#?}"
+    );
+    let effects = harness::journal_rows(
+        &mesh.project,
+        &format!("SELECT \"key\" AS k FROM effects WHERE execution = '{execution}'"),
+    );
+    assert_eq!(
+        effects,
+        json!([]),
+        "something of an instance that never began ran"
+    );
+    assert!(mesh.provider.requests().is_empty(), "a model call was made");
+}
+
+/// Where `flow.placed_reattempted`'s instance stands, effect-wise, once its
+/// first attempt was lost: what that attempt's worker streamed home before it
+/// went.
+const LOST_ATTEMPTS_EFFECT: &str = "build/0/inspect/0#model/0";
+
+/// Drive `flow.placed_reattempted` to the state the two cases below start from,
+/// and answer the execution and when it started.
+///
+/// The `build` node's first attempt is a placed instance a worker runs: its
+/// `inspect` call is answered at once and journaled on the hub under `build/0`,
+/// and its `reinspect` call is held. The worker is then lost inside it — killed,
+/// runners and all, which is a machine that went away (§7.3) — so the liveness
+/// sweep supersedes `build/0/0` (§6.3) and the node's `retry:` opens the next
+/// attempt: a fresh instance at the **same** instance path (grammar §8.5),
+/// whose dispatch `build/0/1` parks with nothing claiming `mac`. That attempt
+/// never began, though the journal holds an effect under its path — the lost
+/// attempt's.
+fn reattempted_after_a_lost_worker(mesh: &Mesh, purpose: &str) -> (String, Instant) {
+    mesh.provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "signature": "inspected-by-the-lost-attempt" })),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "signature": "never delivered" }))
+                .after(Duration::from_secs(600)),
+        ),
+    ]);
+    let mut worker = mesh.worker(purpose);
+    let started = Instant::now();
+    let execution = mesh.start_execution("/placed-reattempts", &json!({ "path": "release.dmg" }));
+    until(
+        "the first attempt's `inspect` call reached the hub's journal",
+        || worker.transcript(),
+        || harness::journal_holds(&mesh.project, &[LOST_ATTEMPTS_EFFECT]),
+    );
+    until(
+        "the first attempt's `reinspect` call reached the provider",
+        || worker.transcript(),
+        || mesh.provider.requests().len() == 2,
+    );
+    let holding = mesh.until(&execution, "was taken by the worker", |report| {
+        report["placement_waits"][0]["status"] == "dispatched"
+    });
+    assert_eq!(
+        holding["placement_waits"][0]["wait_id"], "build/0/0",
+        "{holding:#}"
+    );
+    worker.kill();
+
+    let parked = mesh.until(&execution, "parked the retry's attempt", |report| {
+        (report["placement_waits"][0]["wait_id"] == "build/0/1"
+            && report["placement_waits"][0]["status"] == "parked")
+            || report["status"] != "running"
+    });
+    assert_eq!(
+        (
+            parked["status"].as_str(),
+            parked["placement_waits"][0]["wait_id"].as_str(),
+            parked["placement_waits"][0]["status"].as_str(),
+        ),
+        (Some("running"), Some("build/0/1"), Some("parked")),
+        "the retry's attempt did not park after the lost one: {parked:#}"
+    );
+    (execution, started)
+}
+
+/// The two dispatch rows `flow.placed_reattempted`'s `build` node made — the
+/// lost attempt's, superseded by the liveness sweep, and the retry's, ended by
+/// whatever stopped it while it was parked — and **no third**: an end
+/// dispatched for an instance that never began would be `build/0/2`. Answers
+/// the retry's row's detail.
+fn assert_no_end_for_the_untaken_retry(mesh: &Mesh, execution: &str) -> String {
+    let placed = dispatches_of(mesh, execution);
+    assert_eq!(
+        placed
+            .iter()
+            .map(|row| (row["wait"].as_str(), row["status"].as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (Some("build/0/0"), Some("superseded")),
+            (Some("build/0/1"), Some("superseded")),
+        ],
+        "an end was dispatched for a retry no worker took, on the strength of the effects the \
+         attempt before it made: {placed:#?}"
+    );
+    let rows = mesh.dispatch_rows(execution);
+    assert!(
+        rows[0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("made no request")),
+        "the lost attempt was not superseded by the liveness sweep: {rows:#?}"
+    );
+    assert_eq!(
+        mesh.provider.requests().len(),
+        2,
+        "something of the retry's attempt ran: only the lost attempt's two calls were made"
+    );
+    rows[1]["detail"].as_str().unwrap_or_default().to_string()
+}
+
+/// **A cancel of a placed flow's retry that no worker took ends the execution
+/// `cancelled` at once — the effects the attempt before it made do not make it
+/// begun** (grammar §7.9, §8.5; PRD resolved q75, q84; Decision D171;
+/// `docs/distributed.md` §2, §6.3).
+///
+/// `flow.placed_reattempted`'s first attempt ran on a worker and streamed a
+/// model call home under `build/0` before the worker was lost; its retry is
+/// parked at `build/0/1` with no worker claiming `mac`. Each attempt is a
+/// fresh instance at the same instance path, so the parked one has not begun:
+/// the cancel withdraws its row, as it withdraws any parked dispatch, and the
+/// execution settles `cancelled` straight away. Read off the journal's effects
+/// at `build/0`, the parked attempt would look begun, and the cancel would park
+/// an end for it — `cancelled: true`, which nothing withdraws — leaving the
+/// execution open for a worker nobody started, and handing one that did join
+/// the lost attempt's history to replay.
+#[test]
+fn a_cancel_of_a_placed_flows_untaken_retry_owes_no_end_for_the_attempt_lost_before_it() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    let (execution, _) = reattempted_after_a_lost_worker(&mesh, "placed-flow-reattempt-cancel");
+
+    let asked = Instant::now();
+    cancel(&mesh, &execution);
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] != "running"
+    });
+    assert_eq!(report["status"], "cancelled", "{report:#}");
+    assert!(
+        asked.elapsed() < Duration::from_secs(10),
+        "the cancel took {:?} to end a retry no worker took",
+        asked.elapsed()
+    );
+    assert!(report.get("finally_error").is_none(), "{report:#}");
+    assert!(
+        report["placement_waits"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "a cancelled execution still holds a placement wait: {report:#}"
+    );
+
+    let detail = assert_no_end_for_the_untaken_retry(&mesh, &execution);
+    assert!(
+        detail.contains("was cancelled") && !detail.contains("held it"),
+        "the retry's parked row was not withdrawn as the cancel's, untaken: {detail}"
+    );
+}
+
+/// **A deadline over a placed flow's retry that no worker took fails the node
+/// on its deadline — the effects the attempt before it made do not make it
+/// begun** (grammar §7.9, §8.5, §9.2; Decision D171; `docs/distributed.md` §2,
+/// §6.3, §6.5).
+///
+/// The same lost attempt and the same parked retry as the cancel's case, left
+/// for `build`'s twenty-second `timeout:` to end. The parked attempt never
+/// began, so the deadline withdraws its row as one no worker took, and the node
+/// fails on its budget: the execution settles `failed`, on the timeout, within
+/// a few seconds of the budget running out. Read off the journal's effects at
+/// `build/0`, the parked attempt would look begun, and the deadline would park
+/// a `stopped: true` end for it — which nothing withdraws and the node waits
+/// for — so the node's own deadline would stop bounding it, and the execution
+/// would wait for a worker indefinitely.
+#[test]
+fn a_deadline_over_a_placed_flows_untaken_retry_fails_the_node_and_owes_no_end() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    let (execution, started) =
+        reattempted_after_a_lost_worker(&mesh, "placed-flow-reattempt-deadline");
+
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] != "running" && report["status"] != "interrupted"
+    });
+    let settled_after = started.elapsed();
+    assert_eq!(report["status"], "failed", "{report:#}");
+    assert!(
+        report["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("`build` timed out")),
+        "the execution did not fail on `build`'s deadline: {report:#}"
+    );
+    assert!(
+        settled_after < Duration::from_secs(20 + 10),
+        "the execution took {settled_after:?} to settle on a twenty-second deadline: {report:#}"
+    );
+    assert!(report.get("finally_error").is_none(), "{report:#}");
+
+    let detail = assert_no_end_for_the_untaken_retry(&mesh, &execution);
+    assert!(
+        detail.contains("before any worker took it"),
+        "the retry's parked row was not withdrawn as one no worker took: {detail}"
+    );
+}
+
+/// **A hub restarted mid-cancel at a placed flow's question hands the
+/// instance's end to a worker, and its finally node runs there** (PRD resolved
+/// q75 ruling e, `docs/durability.md` §6.1; Decision D171).
+///
+/// The journal is left as a `SIGKILL` right after the cancel route recorded its
+/// request would leave it: the request on the `cancellations` table, the root
+/// dispatch settled paused with no answer recorded. The recovered replay
+/// reaches the unanswered question — the frontier, where the cancel fires —
+/// and the instance it stops there is a placed flow's that has begun, so the
+/// recovery makes the end dispatch the live cancel would have made, and the
+/// worker that re-joins the restarted hub runs `close_out` at outcome
+/// `cancelled`. Without it the recovered execution settles `cancelled` having
+/// never run the finally node.
+#[test]
+fn a_hub_restarted_mid_cancel_at_a_placed_flows_question_runs_its_finally_node_on_a_worker() {
+    let Some(mut mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider
+        .enqueue(inspecting("release.dmg", "inspected-before-the-restart"));
+    let worker = mesh.worker("placed-flow-restart-mid-cancel");
+    let execution = mesh.start_execution("/placed-askings", &json!({ "path": "release.dmg" }));
+    mesh.paused(&execution);
+
+    mesh.restart_after(|project| {
+        let wrote = harness::journal_sql(
+            project,
+            &format!(
+                "INSERT INTO cancellations (execution, requested_at) \
+                 VALUES ('{execution}', '2026-11-04T00:00:00.000Z');"
+            ),
+        );
+        assert!(
+            wrote.status.success(),
+            "{}",
+            String::from_utf8_lossy(&wrote.stderr)
+        );
+    });
+
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] == "cancelled" || report["status"] == "failed"
+    });
+    assert_eq!(
+        report["status"],
+        "cancelled",
+        "the recovered execution did not complete its cancel: {report:#}\n{}",
+        worker.transcript()
+    );
+    assert_eq!(
+        boundary_outcome(&mesh, &execution, "close_out/0#finally/0").as_deref(),
+        Some("cancelled"),
+        "the recovery completed the cancel without running the finally node: {report:#}\n{}",
+        worker.transcript()
+    );
+    assert_eq!(
+        nodes_of(&report["trace"]),
+        ["inspect", "ask", "close_out"],
+        "{report:#}"
+    );
+    let rows = dispatches_of(&mesh, &execution);
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row["wait"].as_str(), row["status"].as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (Some("flow.placed_asking/0"), Some("settled")),
+            (Some("flow.placed_asking/1"), Some("settled")),
+        ],
+        "the recovery did not hand the instance's end to a worker: {rows:#?}"
+    );
+    assert_eq!(
+        mesh.provider.requests().len(),
+        1,
+        "the end made `inspect`'s model call a second time"
+    );
+}
+
+/// **A hub restarted mid-cancel while a worker holds a placed flow's instance
+/// leaves the instance's end to that worker, and dispatches no end beside it**
+/// (grammar §7.9: a finally node "runs once when it ends"; PRD resolved q75
+/// ruling e; Decision D171; `docs/distributed.md` §2, §5).
+///
+/// `flow.placed_holding`'s instance makes its model call on the worker — the
+/// record reaches the hub's journal, so the instance has begun — and then sits
+/// in `hold` for ten minutes. The journal is left as a crash right after the
+/// cancel route recorded its request would leave it, with the root dispatch
+/// still `dispatched` to a session the dead process issued. The recovered
+/// replay reaches that row as the cancel's frontier and settles the execution
+/// `cancelled` — and, because a worker may still be running the instance, it
+/// makes **no end dispatch**: the worker holding it is the one that ends it.
+/// Its next request meets the restarted hub's `410`, it stops the runner (§5's
+/// stop, never a cancel), and the instance ends there `failed` and runs
+/// `settle_up` once, its boundary journaled under the renewed session. An end
+/// dispatched beside it would have run `settle_up` a second time, on whichever
+/// worker took it — the one row this test counts.
+#[test]
+fn a_restart_while_a_worker_holds_a_cancelled_placed_flow_leaves_its_end_to_that_worker() {
+    let Some(mut mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider
+        .enqueue(inspecting("release.dmg", "inspected-before-the-restart"));
+    let mut worker = mesh.worker("placed-flow-restart-while-held");
+
+    let execution = mesh.start_execution("/placed-holdings", &json!({ "path": "release.dmg" }));
+    until(
+        "the instance's model call reached the hub's journal",
+        || worker.transcript(),
+        || harness::journal_holds(&mesh.project, &["inspect/0#model/0"]),
+    );
+    mesh.until(&execution, "was taken by the worker", |report| {
+        report["placement_waits"][0]["status"] == "dispatched"
+    });
+    // Inside `hold`: the instance has begun, and a worker is running it.
+    until(
+        "the instance's long node was running on the worker",
+        || worker.transcript(),
+        || {
+            worker.runners().is_none_or(|running| {
+                running.iter().any(|runner| {
+                    u32::try_from(*runner)
+                        .ok()
+                        .and_then(|runner| children_running(runner, "sleep"))
+                        .is_some_and(|commands| !commands.is_empty())
+                })
+            })
+        },
+    );
+
+    mesh.restart_after(|project| {
+        let wrote = harness::journal_sql(
+            project,
+            &format!(
+                "INSERT INTO cancellations (execution, requested_at) \
+                 VALUES ('{execution}', '2026-11-04T00:00:00.000Z');"
+            ),
+        );
+        assert!(
+            wrote.status.success(),
+            "{}",
+            String::from_utf8_lossy(&wrote.stderr)
+        );
+    });
+
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] == "cancelled" || report["status"] == "failed"
+    });
+    assert_eq!(
+        report["status"],
+        "cancelled",
+        "the recovered execution did not complete its cancel: {report:#}\n{}",
+        worker.transcript()
+    );
+    assert!(report.get("error").is_none(), "{report:#}");
+
+    // The worker that held the instance ends it, and its finally node runs
+    // there: stopped by the `410`, so at outcome `failed` (§5).
+    until(
+        "the finally node ran on the worker that held the instance",
+        || worker.transcript(),
+        || boundary_outcome(&mesh, &execution, "settle_up/0#finally/0").is_some(),
+    );
+    assert_eq!(
+        boundary_outcome(&mesh, &execution, "settle_up/0#finally/0").as_deref(),
+        Some("failed"),
+        "{}",
+        worker.transcript()
+    );
+    until(
+        "the runner the restart orphaned is gone",
+        || worker.transcript(),
+        || worker.runners().is_none_or(|running| running.is_empty()),
+    );
+
+    let rows = mesh.dispatch_rows(&execution);
+    assert_eq!(
+        rows.len(),
+        1,
+        "the recovery dispatched an end beside the instance a worker was still running, so \
+         its finally node would run twice: {rows:#?}\n{}",
+        worker.transcript()
+    );
+    assert_eq!(rows[0]["status"], "superseded", "{rows:#?}");
+    assert!(
+        rows[0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("was cancelled while a worker held it")),
+        "the held dispatch was not ended as the cancel's, held by a worker: {rows:#?}"
+    );
+    assert_eq!(
+        mesh.provider.requests().len(),
+        1,
+        "the instance's model call was made a second time"
+    );
+    assert!(
+        worker.running(),
+        "the worker stopped somewhere across the restart: {}",
+        worker.transcript()
+    );
+}
+
+/// **A placed flow's question abandoned by the end around it ends the instance
+/// on a worker, `failed`, and its finally node runs there** (grammar §7.9:
+/// "one that was waiting on a person is stopped the same way: its pause is
+/// abandoned … and it ends failed, its finally node run"; PRD resolved q76;
+/// Decision D171; `docs/distributed.md` §3.2).
+///
+/// `flow.placed_asking_raced` runs a `flow:` node into `flow.placed_asking`
+/// beside `doomed`, which fails once the test opens its gate. The placed
+/// instance runs `inspect` on the worker and reaches `ask`: its dispatch
+/// settles *paused* and the question waits on the hub's board, with no worker
+/// running anything of the instance. Then `doomed` fails, the flow around the
+/// instance ends, and its end abandons the question. Unplaced, the instance
+/// would end `failed` there and run its finally node; the hub can run none of
+/// a placed flow, so it hands a worker the instance's **end** — a second
+/// dispatch at the instance's path, its effect history and `stopped: true` —
+/// and the worker replays `inspect`, stops the instance at `ask`, and runs
+/// `close_out` at outcome `failed`. The flow around it settles `failed` after
+/// that end, with no model call made twice and no answer journaled. Without
+/// the end dispatch the execution settles with one dispatch row and no
+/// boundary at all — the finally node run nowhere.
+#[test]
+fn a_placed_flows_question_abandoned_by_the_end_around_it_runs_its_finally_node_on_a_worker() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider.enqueue(inspecting(
+        "release.dmg",
+        "inspected-before-the-sibling-failed",
+    ));
+    let mut worker = mesh.worker("placed-flow-question-abandoned");
+    let gate = mesh.project.join("doomed.gate");
+
+    let execution = mesh.start_execution(
+        "/placed-asking-races",
+        &json!({ "path": "release.dmg", "gate": gate.display().to_string() }),
+    );
+    let asking = mesh.until(
+        &execution,
+        "published the placed instance's question",
+        |report| {
+            report["interrupts"]
+                .as_array()
+                .is_some_and(|waits| !waits.is_empty())
+                || report["status"] == "failed"
+        },
+    );
+    assert_eq!(
+        asking["interrupts"][0]["wait_id"],
+        "asking/0/ask/0",
+        "{asking:#}\n{}",
+        worker.transcript()
+    );
+    assert_holds_no_placement_wait(
+        &asking,
+        "a paused dispatch is settled, and no worker holds the instance while it asks",
+    );
+
+    std::fs::write(&gate, b"open").expect("the gate opens");
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] != "interrupted" && report["status"] != "running"
+    });
+    assert_eq!(
+        report["status"],
+        "failed",
+        "{report:#}\n{}",
+        worker.transcript()
+    );
+    assert!(
+        report["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("`doomed`")),
+        "the execution failed on its sibling, not on the abandoned question: {report:#}"
+    );
+    assert!(
+        report["interrupts"].as_array().is_none_or(Vec::is_empty),
+        "the abandoned question is still published: {report:#}"
+    );
+    assert_eq!(
+        boundary_outcome(&mesh, &execution, "asking/0/close_out/0#finally/0").as_deref(),
+        Some("failed"),
+        "the instance whose question the end around it abandoned did not run its finally node \
+         at outcome `failed`: {report:#}\n{}",
+        worker.transcript()
+    );
+
+    // The end was a dispatch a worker ran: a second dispatch at the instance's
+    // own path, settled by the instance's failure.
+    let rows = dispatches_of(&mesh, &execution);
+    assert_eq!(
+        rows.iter()
+            .map(|row| (
+                row["node"].as_str(),
+                row["site"].as_str(),
+                row["wait"].as_str(),
+                row["status"].as_str(),
+                row["outcome"].as_str()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                Some("flow.placed_asking"),
+                Some("asking/0"),
+                Some("asking/0/0"),
+                Some("settled"),
+                Some("value")
+            ),
+            (
+                Some("flow.placed_asking"),
+                Some("asking/0"),
+                Some("asking/0/1"),
+                Some("settled"),
+                Some("error")
+            ),
+        ],
+        "the abandonment did not hand the instance's end to a worker: {rows:#?}\n{}",
+        worker.transcript()
+    );
+    assert!(
+        rows[1]["session"]
+            .as_str()
+            .is_some_and(|session| session.starts_with("wrk_")),
+        "a worker session held the end: {rows:#?}"
+    );
+    assert_eq!(
+        mesh.provider.requests().len(),
+        1,
+        "the end replayed `inspect`'s model call rather than making it again"
+    );
+    let human = harness::journal_rows(
+        &mesh.project,
+        &format!(
+            "SELECT \"key\" AS k FROM effects WHERE execution = '{execution}' AND kind = 'human'"
+        ),
+    );
+    assert_eq!(
+        human,
+        json!([]),
+        "the abandoned question was journaled as answered"
+    );
+    assert!(
+        worker.running(),
+        "the worker stopped with the end it ran: {}",
+        worker.transcript()
+    );
+}
+
+/// **A placed flow's redispatch the end around it stops while it is parked is
+/// still owed its end on a worker** (grammar §7.9; PRD resolved q76; Decision
+/// D171; `docs/distributed.md` §2, §6.5).
+///
+/// The same race as above, one step later. `flow.placed_asking`'s question
+/// comes home from the first worker, which then leaves; the question is
+/// answered with no worker to take the redispatch, so it parks — the instance
+/// has begun, and nobody is running it. Then `doomed` fails, and the end around
+/// the instance stops waiting for it. The hub withdraws the parked redispatch —
+/// under a detail of its own, which says no worker took it — and makes the
+/// instance's end in its place, `stopped: true`, which parks in turn. A second
+/// worker joins and takes the end: it replays `inspect` and the answered
+/// question, the instance's body has nothing left past its record, and
+/// `close_out` runs there before the flow around it settles `failed`. Without
+/// the end the parked row is simply superseded, nothing ever runs `close_out`,
+/// and the second worker is handed nothing.
+#[test]
+fn a_placed_flows_parked_redispatch_the_end_around_it_stops_is_still_owed_its_end() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider
+        .enqueue(inspecting("release.dmg", "inspected-before-the-answer"));
+    let gate = mesh.project.join("doomed.gate");
+    let first = mesh.worker("placed-flow-redispatch-first");
+    let execution = mesh.start_execution(
+        "/placed-asking-races",
+        &json!({ "path": "release.dmg", "gate": gate.display().to_string() }),
+    );
+    let asking = mesh.until(
+        &execution,
+        "published the placed instance's question",
+        |report| {
+            report["interrupts"]
+                .as_array()
+                .is_some_and(|waits| !waits.is_empty())
+                || report["status"] == "failed"
+        },
+    );
+    let wait = asking["interrupts"][0]["wait_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the question names itself: {asking:#}"))
+        .to_string();
+    drop(first);
+
+    // Answered with no worker to take the redispatch: it parks.
+    let answered = mesh.resume(&execution, &wait, &json!({ "decision": "approve" }));
+    assert_eq!(answered.status, 202, "{}", body_of(&answered));
+    mesh.until(&execution, "parked the instance's redispatch", |report| {
+        report["placement_waits"][0]["status"] == "parked"
+    });
+
+    // The end around the instance stops waiting for the parked redispatch, and
+    // the instance's end parks in its place.
+    std::fs::write(&gate, b"open").expect("the gate opens");
+    until(
+        "the stopped redispatch was withdrawn and the instance's end parked",
+        || format!("{:#?}", dispatches_of(&mesh, &execution)),
+        || {
+            let rows = dispatches_of(&mesh, &execution);
+            rows.len() == 3 && rows[1]["status"] == "superseded" && rows[2]["status"] == "parked"
+        },
+    );
+    let withdrawn = mesh.dispatch_rows(&execution);
+    assert!(
+        withdrawn[1]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("before any worker took it")),
+        "the parked redispatch was not withdrawn as one no worker took: {withdrawn:#?}"
+    );
+
+    let mut second = mesh.worker("placed-flow-redispatch-end");
+    let report = mesh.until(&execution, "settled", |report| {
+        report["status"] != "interrupted" && report["status"] != "running"
+    });
+    assert_eq!(
+        report["status"],
+        "failed",
+        "{report:#}\n{}",
+        second.transcript()
+    );
+    assert!(
+        report["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("`doomed`")),
+        "the execution failed on its sibling: {report:#}"
+    );
+    assert!(
+        boundary_outcome(&mesh, &execution, "asking/0/close_out/0#finally/0").is_some(),
+        "the instance the end around it stopped while it was parked never ran its finally \
+         node: {report:#}\n{}",
+        second.transcript()
+    );
+    let rows = dispatches_of(&mesh, &execution);
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row["wait"].as_str(), row["status"].as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (Some("asking/0/0"), Some("settled")),
+            (Some("asking/0/1"), Some("superseded")),
+            (Some("asking/0/2"), Some("settled")),
+        ],
+        "{rows:#?}\n{}",
+        second.transcript()
+    );
+    assert!(
+        rows[2]["session"]
+            .as_str()
+            .is_some_and(|session| session.starts_with("wrk_")),
+        "a worker session held the end: {rows:#?}"
+    );
+    assert_eq!(
+        mesh.provider.requests().len(),
+        1,
+        "the end replayed `inspect`'s model call rather than making it again"
+    );
+    assert!(second.running(), "{}", second.transcript());
+}
+
+/// **A `run` refuses a placed agent's node, and serves no mesh for it**
+/// (Decision D171; PRD resolved q84 rules on the instances of a placed flow and
+/// on nothing else, so a placed agent's or tool's node under `run` is what it
+/// was before a flow could be placed: `PlacementUnreachable`).
+///
+/// `flow.release`'s `sign` node is `agent.signer`'s, a member of `mac`. A `run`
+/// of it fails at that node at once — no `mesh:` line on stderr, no listener,
+/// no dispatch row — rather than opening a mesh and parking for a worker
+/// nobody started. And a `run` whose mesh is already up refuses the same node
+/// the same way: `flow.placed_then_signed`'s `build` instance runs on the
+/// worker that joined the run, and its `sign` node is then refused, so whether
+/// a placed agent's node is dispatched does not depend on what the run reached
+/// before it.
+#[test]
+fn a_run_refuses_a_placed_agents_node_and_serves_no_mesh_for_it() {
+    let Some(project) = harness::scratch_project("placed-agent-run") else {
+        return;
+    };
+    let _scratch = harness::Scratch::at(project.clone());
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(inspecting("hotfix.dmg", "inspected-before-the-refusal"));
+    let entrypoint = harness::fixture(FIXTURE);
+    let environment = environment(&provider);
+    let refused = |node: &str| {
+        format!(
+            "`{node}` is placed on `{PLACEMENT}`, and this process has no mesh for a worker to \
+             join"
+        )
+    };
+
+    let mut running = harness::run_target_spawned(
+        &project,
+        &entrypoint,
+        TARGET,
+        "flow.release",
+        &[("path", "release.dmg")],
+        &environment,
+    );
+    let deadline = Instant::now() + PATIENCE;
+    while running.still_running() {
+        assert!(
+            Instant::now() < deadline,
+            "the run of a placed agent's node is still going — parked for a worker — rather \
+             than refused: {}",
+            running.said()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let run = running.finish();
+    let said = run.failed();
+    assert!(
+        said.contains(&refused("flow.release.sign")),
+        "the run was not refused with `PlacementUnreachable` at the placed agent's node: {said}"
+    );
+    assert!(
+        !said.lines().any(|line| line.starts_with("mesh: ")),
+        "the run served a mesh for a placed agent's node: {said}"
+    );
+    assert_eq!(
+        run_dispatches(&project, "flow.release"),
+        Vec::<Value>::new(),
+        "the run dispatched a placed agent's node"
+    );
+
+    // The mesh up for a placed flow's instance first, and the agent's node after.
+    let running = harness::run_target_spawned(
+        &project,
+        &entrypoint,
+        TARGET,
+        "flow.placed_then_signed",
+        &[("path", "hotfix.dmg")],
+        &environment,
+    );
+    let hub = mesh_of(&running);
+    let worker = Worker::start(&hub, &environment, "placed-flow-before-agent", None);
+    let run = running.finish();
+    let said = run.failed();
+    assert!(
+        said.contains(&refused("flow.placed_then_signed.sign")),
+        "a run whose mesh was up dispatched a placed agent's node rather than refusing it: \
+         {said}\n{}",
+        worker.transcript()
+    );
+    let rows = run_dispatches(&project, "flow.placed_then_signed");
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row["node"].as_str(), row["status"].as_str()))
+            .collect::<Vec<_>>(),
+        [(Some("flow.placed_build"), Some("settled"))],
+        "the placed flow's instance ran on the worker and nothing else was dispatched: {rows:#?}"
     );
 }
