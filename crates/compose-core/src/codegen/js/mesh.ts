@@ -493,6 +493,20 @@ interface DispatchOptions {
   readonly policy?: runtime.InstancePolicy;
   readonly signal?: AbortSignal;
   /**
+   * Whether what is dispatched is a **placed flow's instance** (Decision D171)
+   * rather than a placed agent's or tool's node — set by the dispatch
+   * `runtime.runSubflow` and `runtime.runPlacedRoot` make, and by nothing else.
+   *
+   * Two things read it. A `run` or `resume` serves its mesh for one and for
+   * nothing else ([`reachMesh`]): PRD resolved q84 rules that an instance of a
+   * placed flow a `run` starts runs on a worker, and it rules nothing about a
+   * placed agent's or tool's node, which a `run` refuses as it always has. And
+   * an instance a cancel ends while no worker is running it — at a question it
+   * brought home, or parked for a redispatch — is owed its end on a worker, its
+   * finally node with it ([`dispatchPlaced`]'s end dispatch).
+   */
+  readonly instance?: true;
+  /**
    * The node execution's own store-record collector — `context.storeRecords`.
    *
    * Where [`PlacedAnswer.stores`] is emptied into, which is what puts a placed
@@ -563,6 +577,7 @@ dispatchPlacedInstances(async (flow, instance, signal) => {
         : { history: instance.history as readonly runtime.Turn[] }),
       ...(instance.policy === undefined ? {} : { policy: instance.policy }),
       signal,
+      instance: true,
     });
   } catch (error) {
     const trace = placedTraceOf(error);
@@ -647,21 +662,32 @@ const waitWatchers = new Map<string, Set<() => void>>();
  *
  * `serve` mounts them as it starts, on a target that declares `placements:`
  * ([`mountWorkerRoutes`]). `agent-compose run` and `resume` build no app of
- * their own, so they mount them **when a dispatch first needs them**
- * ([`serveWhenReached`]): the first placed node — or instance of a placed flow
- * (Decision D171) — that the run reaches starts a listener carrying exactly
- * these routes, and from then on the run is the hub its dispatches are made
- * from. A run that reaches nothing placed listens on nothing, which is every run
- * of a composition that places nothing.
+ * their own, so they mount them **when a placed flow's instance first needs
+ * them** ([`serveWhenReached`], Decision D171): the first instance of a placed
+ * flow the run reaches starts a listener carrying exactly these routes, and
+ * from then on the run is the hub its instances are dispatched from. A run that
+ * reaches no placed flow listens on nothing, which is every run of a
+ * composition that places no flow.
  *
- * What is left with no mesh is a process that registered no way to serve one —
- * a caller of the emitted modules that is neither verb — and there a placed node
- * is refused with [`PlacementUnreachable`], which is the shape
- * `runtime.HumanInterrupt` already has for a pause a run has no way to answer.
- * The alternative — parking on a board nothing will ever poll — is a command that
- * never returns.
+ * What a `run` or `resume` does **not** serve a mesh for is a placed agent's or
+ * tool's node: PRD resolved q84 rules on the instances of a placed flow and on
+ * nothing else, so such a node is refused with [`PlacementUnreachable`], as it
+ * was before a flow could be placed — and so is every placed dispatch in a
+ * process that registered no way to serve a mesh, a caller of the emitted
+ * modules that is neither verb. That is the shape `runtime.HumanInterrupt`
+ * already has for a pause a run has no way to answer; the alternative — parking
+ * on a board nothing will ever poll — is a command that never returns.
  */
 let mounted = false;
+
+/**
+ * Whether the routes were mounted as this process started — `serve`
+ * ([`mountWorkerRoutes`]) — rather than by a `run` or `resume` when a dispatch
+ * first needed them ([`reachMesh`]). Only the second kind of process tells a
+ * placed flow's instance, which it serves a mesh for, from a placed agent's or
+ * tool's node, which it does not.
+ */
+let servedFromStart = false;
 
 /**
  * How a process with no app of its own serves the mesh, once a dispatch needs
@@ -677,10 +703,12 @@ let listener: MeshListener | undefined;
 let reaching: Promise<void> | undefined;
 
 /**
- * Serve this process's mesh the first time a dispatch reaches a placement, for a
- * process that does not serve one from its start — `agent-compose run` and
- * `resume` (Decision D171, PRD resolved q84: "a root execution a trigger or
- * `run` starts … runs on a worker claiming the placement").
+ * Serve this process's mesh the first time it dispatches an instance of a
+ * placed flow, for a process that does not serve one from its start —
+ * `agent-compose run` and `resume` (Decision D171, PRD resolved q84: "a root
+ * execution a trigger or `run` starts … runs on a worker claiming the
+ * placement"). A placed agent's or tool's node is not what the ruling is about,
+ * and such a process refuses it ([`reachMesh`]).
  *
  * A `run` is one process, and a placed instance it starts is still a dispatch
  * a hub makes: onto a board, through the routes a worker joins (§3). So the run
@@ -707,11 +735,21 @@ export function serveWhenReached(listen: MeshListener): void {
  * a listener was registered — or refuse the dispatch.
  */
 async function reachMesh(options: DispatchOptions): Promise<void> {
-  if (mounted) return;
+  // `serve` mounted the routes as it started: every dispatch is its to make.
+  if (servedFromStart) return;
   const listen = listener;
-  if (listen === undefined || placements.length === 0) {
+  // **Only a placed flow's instance is served a mesh by a `run`** (PRD resolved
+  // q84, Decision D171). The ruling is about the instances of a placed flow —
+  // "a root execution a trigger or `run` starts … runs on a worker claiming the
+  // placement" — and rules nothing about a placed agent's or tool's node, which
+  // a `run` refuses with [`PlacementUnreachable`] exactly as it did before a flow
+  // could be placed. Asked on every dispatch, before whether the mesh is up, so
+  // the answer for such a node does not depend on whether an instance earlier
+  // in the same run happened to start it: it is the refusal either way.
+  if (listen === undefined || placements.length === 0 || options.instance !== true) {
     throw new PlacementUnreachable(options.node, options.placement);
   }
+  if (mounted) return;
   reaching ??= (async () => {
     let timings: ReturnType<typeof meshTimings> | undefined;
     await listen((app) => {
@@ -737,9 +775,11 @@ async function reachMesh(options: DispatchOptions): Promise<void> {
 }
 
 /**
- * A placed node — or a placed flow's instance (Decision D171) — reached by a
- * process with no mesh to dispatch it into, or by a run whose mesh could not be
- * served.
+ * A placed node reached by a process with no mesh to dispatch it into — a
+ * placed agent's or tool's node under `run` or `resume`, which serve a mesh only
+ * for a placed flow's instance (Decision D171), or any placed dispatch in a
+ * process that registered no way to serve one — or a placed flow's instance
+ * reached by a run whose mesh could not be served.
  */
 export class PlacementUnreachable extends Error {
   readonly placement: string;
@@ -747,7 +787,7 @@ export class PlacementUnreachable extends Error {
   constructor(node: string, placement: string, why?: string) {
     super(
       why === undefined
-        ? `\`${node}\` is placed on \`${placement}\`, and this process has no mesh for a worker to join: a placed node — and every instance of a placed flow — executes on whichever worker claims its placement, and a worker joins a process serving the worker routes — \`agent-compose serve\`, or a \`run\` or \`resume\` that reached it (docs/distributed.md §1, §3; grammar §14.1)`
+        ? `\`${node}\` is placed on \`${placement}\`, and this process has no mesh for a worker to join: a placed node executes on whichever worker claims its placement, and a worker joins a process serving the worker routes — \`agent-compose serve\` for every placed node, and a \`run\` or \`resume\` only for an instance of a placed flow (docs/distributed.md §1, §3; grammar §14.1)`
         : `\`${node}\` is placed on \`${placement}\`, and this run could not serve the mesh a worker joins to run it: ${why} (docs/distributed.md §3; grammar §14.1)`,
     );
     this.name = "PlacementUnreachable";
@@ -806,7 +846,7 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
   // journal of this execution is the hub's alone (§3.3, §8 rule 3).
   if (executor !== undefined) return absorb(options, await executor(options));
   const site = options.path.join("/");
-  if (!mounted) await reachMesh(options);
+  await reachMesh(options);
   const journal = await openJournal();
   // **A loop, because a pause is not the end of the node** (§3.4, PRD resolved
   // q46). A dispatch that settles paused hands this node a question rather than
@@ -1666,6 +1706,7 @@ export function mountWorkerRoutes(app: FastifyInstance): void {
   if (placements.length === 0) return;
   const timings = routes(app);
   mounted = true;
+  servedFromStart = true;
   // From here this process hands placed nodes to workers, so a settled
   // execution's ledger prune asks again, as it starts, whether one is still
   // being run under its keys (`./runtime.ts`, PRD resolved q69).

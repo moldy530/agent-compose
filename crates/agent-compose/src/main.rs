@@ -385,7 +385,7 @@ enum Command {
         /// The session identity session-scoped stores key off (grammar 11.3)
         #[arg(long, value_name = "KEY")]
         session: Option<String>,
-        /// Where a worker joins this run, once it reaches placed work [default: 127.0.0.1]
+        /// Where a worker joins this run, once it reaches a placed flow [default: 127.0.0.1]
         #[arg(long, value_name = "HOST")]
         host: Option<String>,
         /// The port a worker joins this run on; `0` takes one the operating system picks
@@ -413,7 +413,7 @@ enum Command {
         /// The execution to resume, as `run` printed it (`execution: exec_…`)
         #[arg(value_name = "EXECUTION")]
         execution: String,
-        /// Where a worker joins this resume, once it reaches placed work [default: 127.0.0.1]
+        /// Where a worker joins this resume, once it reaches a placed flow [default: 127.0.0.1]
         #[arg(long, value_name = "HOST")]
         host: Option<String>,
         /// The port a worker joins this resume on; `0` takes one the operating system picks
@@ -1243,11 +1243,12 @@ impl Prepare {
 /// Hand a `run` or `resume` the address it serves its mesh at, where the command
 /// named one (grammar §14.1, Decision D171).
 ///
-/// A run is the hub its own placed work is dispatched from: the first placed
-/// node — or instance of a placed flow — it reaches starts a listener for the
-/// worker routes, and a worker claiming the placement joins **it**. Nothing
-/// listens until then, so a run that reaches nothing placed binds no port and
-/// these two flags change nothing about it. Left out, the emitted CLI takes what
+/// A run is the hub its own placed flows' instances are dispatched from: the
+/// first instance of a placed flow it reaches starts a listener for the worker
+/// routes, and a worker claiming the placement joins **it**. Nothing listens
+/// until then, so a run that reaches no placed flow binds no port and these two
+/// flags change nothing about it; a placed agent's or tool's node it reaches is
+/// refused, as it was before a flow could be placed. Left out, the emitted CLI takes what
 /// `serve` takes: `127.0.0.1`, and a port the operating system picks.
 fn mesh_address(arguments: &mut Vec<String>, host: Option<String>, port: Option<u16>) {
     if let Some(host) = host {
