@@ -16371,7 +16371,7 @@ export async function holdRemotePause(
   if (board === undefined || !board.resumable) {
     // The same answer a local pause gets on a run with no answer surface, and
     // the same nothing is journaled. Reached by a `run` or a `resume`, which
-    // serve a mesh once they dispatch placed work (`./mesh.ts`'s
+    // serve a mesh once they dispatch a placed flow's instance (`./mesh.ts`'s
     // `serveWhenReached`) and may have nobody to ask; never through `serve`,
     // whose board is always resumable.
     throw new HumanInterrupt(remote.flow, remote.node, remote.wait, opened);

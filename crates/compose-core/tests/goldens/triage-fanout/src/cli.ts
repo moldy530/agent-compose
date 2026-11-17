@@ -662,10 +662,12 @@ interface Job {
  * construction rather than by two implementations agreeing.
  */
 async function execute(job: Job): Promise<number> {
-  // **The mesh this run serves, should it reach a placement** (Decision D171,
+  // **The mesh this run serves, should it reach a placed flow** (Decision D171,
   // PRD resolved q84). Registered, not started: nothing listens until the first
-  // placed node — or instance of a placed flow — this run reaches is
-  // dispatched, so a run that reaches nothing placed binds no port.
+  // instance of a placed flow this run reaches is dispatched, so a run that
+  // reaches no placed flow binds no port. A placed agent's or tool's node is
+  // not served one: a run refuses it (`./mesh.ts`'s `PlacementUnreachable`), as
+  // it did before a flow could be placed.
   if (placements.length > 0) serveWhenReached(async (mount) => await servingMesh(job.mesh, mount));
   // A process start, which is half of PRD resolved q69's cleanup schedule: every
   // `kv` store the composition binds starts shedding the keys that have expired
@@ -2886,10 +2888,10 @@ function meshAddress(single: Readonly<Record<string, string>>): MeshAddress {
 }
 
 /**
- * Serve the worker routes for this run, at the first dispatch it makes to a
- * placement (`./mesh.ts`'s `serveWhenReached`, Decision D171): a `run` is the
- * hub its own placed work is dispatched from, so a worker claiming the
- * placement joins **this process**, at the address said here.
+ * Serve the worker routes for this run, at the first instance of a placed flow
+ * it dispatches (`./mesh.ts`'s `serveWhenReached`, Decision D171): a `run` is
+ * the hub its own placed flows' instances are dispatched from, so a worker
+ * claiming the placement joins **this process**, at the address said here.
  *
  * Said on **stderr**, under either format, because stdout is the run's answer
  * — and said as the command a worker is started with, since that is what a
@@ -2910,7 +2912,7 @@ async function servingMesh(
   const url = `http://${shown}:${port}`;
   const claims = placements.map((placement) => `--claim ${placement.name}`).join(" ");
   process.stderr.write(
-    `mesh: ${url} — this run dispatches placed work and waits for a worker to join it: agent-compose worker --hub ${url} ${claims} --token-env ${joinTokenEnv ?? "<VAR>"}\n`,
+    `mesh: ${url} — this run dispatches a placed flow and waits for a worker to join it: agent-compose worker --hub ${url} ${claims} --token-env ${joinTokenEnv ?? "<VAR>"}\n`,
   );
 }
 

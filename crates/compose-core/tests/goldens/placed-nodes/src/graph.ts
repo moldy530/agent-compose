@@ -58,6 +58,7 @@ import {
   flowOverdueInputs,
   flowPlacedAskingInputs,
   flowPlacedAskingNodeAskOutput,
+  flowPlacedAskingNodeCloseOutOutput,
   flowPlacedBuildInputs,
   flowPlacedBuildNodeSettleOutput,
   flowPlacedBuildOutputs,
@@ -68,6 +69,7 @@ import {
   flowPlacedClosingOutputs,
   flowPlacedLapsedInputs,
   flowPlacedRetriedInputs,
+  flowPlacedThenSignedInputs,
   flowPlacedTidyingInputs,
   flowPlacedTidyingNodeLookOutput,
   flowPlacedTidyingNodeTidyUpOutput,
@@ -394,6 +396,16 @@ const flowPlacedAskingNodeAskShape: runtime.Shape = {
   }
 };
 
+/**
+ * `flow.placed_asking` node `close_out` — the `close_out.output` root its guards read.
+ */
+const flowPlacedAskingNodeCloseOutShape: runtime.Shape = {
+  "properties": {
+    "exit_code": "int",
+    "stdout": "string"
+  }
+};
+
 /** `flow.placed_build` — the `input` root inside it (grammar 7.5). */
 const flowPlacedBuildShape: runtime.Shape = {
   "properties": {
@@ -490,6 +502,31 @@ const flowPlacedRetriedShape: runtime.Shape = {
  * `flow.placed_retried` node `build` — the `build.output` root its guards read.
  */
 const flowPlacedRetriedNodeBuildShape: runtime.Shape = {
+  "properties": {
+    "signature": "string"
+  }
+};
+
+/** `flow.placed_then_signed` — the `input` root inside it (grammar 7.5). */
+const flowPlacedThenSignedShape: runtime.Shape = {
+  "properties": {
+    "path": "string"
+  }
+};
+
+/**
+ * `flow.placed_then_signed` node `build` — the `build.output` root its guards read.
+ */
+const flowPlacedThenSignedNodeBuildShape: runtime.Shape = {
+  "properties": {
+    "signature": "string"
+  }
+};
+
+/**
+ * `flow.placed_then_signed` node `sign` — the `sign.output` root its guards read.
+ */
+const flowPlacedThenSignedNodeSignShape: runtime.Shape = {
   "properties": {
     "signature": "string"
   }
@@ -2589,6 +2626,37 @@ const flowPlacedAskingNodeAsk: runtime.NodeDescriptor = {
 };
 
 /**
+ * `flow.placed_asking` node `close_out` — an inline subprocess (grammar 8.2).
+ */
+const flowPlacedAskingNodeCloseOut: runtime.NodeDescriptor = {
+  flow: "flow.placed_asking",
+  node: "close_out",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from `defaults:`, `on_error` from no level, as a `finally:` node's failure is `finally_error` (Decision D159).
+  policy: {
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowPlacedAskingShape, state: stateShape, output: flowPlacedAskingNodeCloseOutShape },
+  input: () => ({}),
+  run: async (input, context) => ({
+    output: runtime.parseResult(
+      flowPlacedAskingNodeCloseOutOutput,
+      await runtime.runExec({
+        command: [{ env: "OPS_BIN", site: "flow.placed_asking.node.close_out.exec.command" }, "/true"],
+        args: [],
+        env: [],
+        expectExit: [0],
+        decoding: { envelope: ["exit_code", "stdout"], decoded: [], empty: false },
+      }, input, context),
+      "the result of `flow.placed_asking` node `close_out`",
+    ),
+  }),
+  writes: [],
+  edges: [
+  ],
+};
+
+/**
  * `flow.placed_asking` — its nodes, its `start` edges, and the compiled graph.
  */
 function flowPlacedAsking() {
@@ -2614,7 +2682,8 @@ const flowPlacedAskingGraph = flowPlacedAsking();
 const flowPlacedAskingBinding: runtime.SubflowBinding = {
   address: "flow.placed_asking",
   outputs: ["signature", "approval"],
-  recursionLimit: 27,
+  recursionLimit: 28,
+  finally: flowPlacedAskingNodeCloseOut,
   placement: "mac",
   stream: (initial, options) =>
     flowPlacedAskingGraph.stream(initial, {
@@ -3080,6 +3149,116 @@ const flowPlacedRetriedBinding: runtime.SubflowBinding = {
       ...options,
       streamMode: "values",
       outputKeys: flowPlacedRetriedGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
+
+// --- flow.placed_then_signed ---
+
+/**
+ * `flow.placed_then_signed` node `build` — `flow.placed_build` (grammar 8.5).
+ */
+const flowPlacedThenSignedNodeBuild: runtime.NodeDescriptor = {
+  flow: "flow.placed_then_signed",
+  node: "build",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from `defaults:`, `on_error` from `defaults:`.
+  policy: {
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowPlacedThenSignedShape, state: stateShape, output: flowPlacedThenSignedNodeBuildShape },
+  input: (roots) => ({
+    "path": runtime.toJson(runtime.evaluate("input.path", roots)),
+  }),
+  run: async (input, context, view) =>
+    runtime.runSubflow(flowPlacedBuildBinding, {
+      inputs: input as Record<string, unknown>,
+      execution: view.run.execution,
+      path: runtime.instancePath(view, "build"),
+      signal: context.signal,
+      bodyEnded: context.bodyEnded,
+      policy: runtime.instancePolicy(view.run.policy, undefined),
+    }),
+  writes: [
+    { field: "signature", channel: "signature", reduce: "set" },
+  ],
+  edges: [
+    { to: "sign" },
+  ],
+};
+
+/** `flow.placed_then_signed` node `sign` — `agent.signer` (grammar 8.1). */
+const flowPlacedThenSignedNodeSign: runtime.NodeDescriptor = {
+  flow: "flow.placed_then_signed",
+  node: "sign",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from `defaults:`, `on_error` from `defaults:`.
+  policy: {
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowPlacedThenSignedShape, state: stateShape, output: flowPlacedThenSignedNodeSignShape },
+  input: (roots, view) => ({
+    "path": runtime.toJson(runtime.evaluate("input.path", roots)),
+  }),
+  run: async (input, context, view) => {
+    const answer = await mesh.dispatchPlaced({
+      placement: "mac",
+      node: "flow.placed_then_signed.sign",
+      execution: view.run.execution.id,
+      itemIndex: view.run.execution.item_index,
+      path: runtime.instancePath(view, "sign"),
+      inputs: input,
+      history: runtime.historyTurns(view.state["messages"] as unknown[]),
+      policy: view.run.policy,
+      signal: context.signal,
+      stores: context.storeRecords,
+    });
+    return {
+      output: runtime.parseResult(agentSignerOutput, answer.output, "the answer of `agent.signer`"),
+      history: answer.history,
+      models: answer.models,
+      toolDispatches: answer.toolDispatches,
+    };
+  },
+  writes: [
+    { field: "signature", channel: "signature", reduce: "set" },
+  ],
+  edges: [
+    { to: END },
+  ],
+};
+
+/**
+ * `flow.placed_then_signed` — its nodes, its `start` edges, and the compiled graph.
+ */
+function flowPlacedThenSigned() {
+  return new StateGraph(State)
+    .addNode("build", (state: GraphState) => runtime.runNode(flowPlacedThenSignedNodeBuild, state), {
+      ends: ["sign"],
+    })
+    .addNode("sign", (state: GraphState) => runtime.runNode(flowPlacedThenSignedNodeSign, state), {
+      ends: [END],
+    })
+    .addEdge(START, "build")
+    .compile();
+}
+
+/**
+ * `flow.placed_then_signed`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowPlacedThenSignedGraph = flowPlacedThenSigned();
+
+/**
+ * `flow.placed_then_signed` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowPlacedThenSignedBinding: runtime.SubflowBinding = {
+  address: "flow.placed_then_signed",
+  outputs: ["signature"],
+  recursionLimit: 27,
+  stream: (initial, options) =>
+    flowPlacedThenSignedGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowPlacedThenSignedGraph.outputChannels,
     }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
 };
 
@@ -4137,7 +4316,8 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
     inputKinds: { "path": "string", },
     outputs: ["signature", "approval"],
     sessionStores: [],
-    recursionLimit: 27,
+    recursionLimit: 28,
+    finally: flowPlacedAskingNodeCloseOut,
     placement: "mac",
     parse: (inputs: unknown) =>
       runtime.parseResult(flowPlacedAskingInputs, inputs, "the `inputs:` of `flow.placed_asking`") as Record<string, unknown>,
@@ -4230,6 +4410,22 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
         ...options,
         streamMode: "values",
         outputKeys: flowPlacedRetriedGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
+  "flow.placed_then_signed": {
+    address: "flow.placed_then_signed",
+    inputs: ["path"],
+    inputKinds: { "path": "string", },
+    outputs: ["signature"],
+    sessionStores: [],
+    recursionLimit: 27,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowPlacedThenSignedInputs, inputs, "the `inputs:` of `flow.placed_then_signed`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowPlacedThenSignedGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowPlacedThenSignedGraph.outputChannels,
       }) as unknown as Promise<AsyncIterable<GraphState>>,
   },
   "flow.placed_tidying": {
@@ -4849,7 +5045,12 @@ async function quiesceFlow(
   // this function's ordinary way out — the release, the settle the caller
   // writes, the webhook and the export. The execution's cancel is the
   // dispatch's signal, so a cancel reaches the worker as one (§3.2); nothing
-  // else bounds it, as nothing bounds a root execution here.
+  // else bounds it, as nothing bounds a root execution here. A cancel that
+  // finds no worker running the instance — at a question it brought home, or
+  // with its redispatch parked — is still the instance's end, and its finally
+  // node still runs on a worker: `./mesh.ts`'s `dispatchPlaced` hands one the
+  // instance's end before this call returns. Only an instance no worker ever
+  // took has nothing to end (grammar 7.9).
   //
   // **A `run` is the same start** (PRD resolved q84): `agent-compose run`
   // serves the worker routes itself once this dispatch needs them
@@ -5224,6 +5425,22 @@ export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {
         output: answer.output,
         ...(answer.history === undefined ? {} : { history: answer.history }),
         ...(answer.inner === undefined ? {} : { inner: answer.inner }),
+      };
+    },
+  "flow.placed_then_signed.sign":
+    async (input, context, site) => {
+      const answer = await runtime.callAgent(
+        agentSigner,
+        input,
+        site.history ?? [],
+        context,
+        { path: site.path, policy: site.policy },
+      );
+      return {
+        output: answer.output,
+        history: answer.history,
+        models: answer.models,
+        toolDispatches: answer.toolDispatches,
       };
     },
   "flow.placed_tidying":

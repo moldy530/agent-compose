@@ -1966,7 +1966,12 @@ async function quiesceFlow(
   // this function's ordinary way out — the release, the settle the caller
   // writes, the webhook and the export. The execution's cancel is the
   // dispatch's signal, so a cancel reaches the worker as one (§3.2); nothing
-  // else bounds it, as nothing bounds a root execution here.
+  // else bounds it, as nothing bounds a root execution here. A cancel that
+  // finds no worker running the instance — at a question it brought home, or
+  // with its redispatch parked — is still the instance's end, and its finally
+  // node still runs on a worker: `./mesh.ts`'s `dispatchPlaced` hands one the
+  // instance's end before this call returns. Only an instance no worker ever
+  // took has nothing to end (grammar 7.9).
   //
   // **A `run` is the same start** (PRD resolved q84): `agent-compose run`
   // serves the worker routes itself once this dispatch needs them

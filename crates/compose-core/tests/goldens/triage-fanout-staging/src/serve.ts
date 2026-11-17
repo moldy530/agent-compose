@@ -1163,9 +1163,9 @@ function question(execution: Execution, wait: runtime.HumanWait): Record<string,
 }
 
 /**
- * An app for a `run` or `resume` to serve its mesh from, once a dispatch it
- * makes first reaches a placement (`./mesh.ts`'s `serveWhenReached`, Decision
- * D171): no trigger route, no status route and no recovery — a run is one
+ * An app for a `run` or `resume` to serve its mesh from, once it first
+ * dispatches an instance of a placed flow (`./mesh.ts`'s `serveWhenReached`,
+ * Decision D171): no trigger route, no status route and no recovery — a run is one
  * execution, reported on its own terminal — and the bodies decoded exactly as
  * [`createApp`]'s are, so a worker meets the same app whichever verb it joined.
  */

@@ -464,6 +464,15 @@ export const flowPlacedAskingNodeAskOutput = z.object({
 }).strict();
 export type FlowPlacedAskingNodeAskOutput = z.infer<typeof flowPlacedAskingNodeAskOutput>;
 
+/**
+ * `flow.placed_asking` node `close_out` — what the subprocess produces (grammar 8.2), which it does not declare, so this is the kind default.
+ */
+export const flowPlacedAskingNodeCloseOutOutput = z.object({
+  exit_code: z.number().int(),
+  stdout: z.string(),
+}).strict();
+export type FlowPlacedAskingNodeCloseOutOutput = z.infer<typeof flowPlacedAskingNodeCloseOutOutput>;
+
 /** `flow.placed_build` — the module's parameters (grammar 7.5). */
 export const flowPlacedBuildInputs = z.object({
   path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
@@ -557,6 +566,20 @@ export const flowPlacedRetriedOutputs = z.object({
   signature: z.string(),
 }).strict();
 export type FlowPlacedRetriedOutputs = z.infer<typeof flowPlacedRetriedOutputs>;
+
+/** `flow.placed_then_signed` — the module's parameters (grammar 7.5). */
+export const flowPlacedThenSignedInputs = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type FlowPlacedThenSignedInputs = z.infer<typeof flowPlacedThenSignedInputs>;
+
+/**
+ * `flow.placed_then_signed` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowPlacedThenSignedOutputs = z.object({
+  signature: z.string(),
+}).strict();
+export type FlowPlacedThenSignedOutputs = z.infer<typeof flowPlacedThenSignedOutputs>;
 
 /** `flow.placed_tidying` — the module's parameters (grammar 7.5). */
 export const flowPlacedTidyingInputs = z.object({

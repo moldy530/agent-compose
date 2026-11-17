@@ -224,6 +224,7 @@ import type * as runtime from "./runtime.ts";
 import {
   cancelFired,
   cancelOnTerminate,
+  completeCancel,
   dispatchPausesHome,
   executionCancelSignal,
   finallyErrorOf,
@@ -345,6 +346,17 @@ interface Dispatch {
   readonly history?: readonly unknown[];
   readonly policy?: unknown;
   readonly effect_history?: readonly Record<string, unknown>[];
+  /**
+   * §3.2's OPTIONAL `cancelled`: this dispatch is the **end** a cancel owes a
+   * placed flow's instance that no worker was running when the cancel came —
+   * it had brought a question home, or its redispatch was parked (Decision
+   * D171). The instance is replayed to its frontier, where the execution's
+   * cancel fires exactly as a recovered cancel fires it on the hub
+   * (`runtime.completeCancel`): every node it reaches there ends `cancelled`,
+   * the instance ends `cancelled`, and its `finally:` node runs here. Absent on
+   * every other dispatch.
+   */
+  readonly cancelled?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -941,6 +953,13 @@ async function main(): Promise<void> {
   onFinallyWork((running) => {
     writing = writing.then(() => say({ type: "finally", running }));
   });
+  // **The end a cancel owes an instance** (§3.2's `cancelled`, Decision D171):
+  // the cancel was made while no worker was running this placed flow's
+  // instance, so it fires here at the frontier — the first effect the history
+  // does not hold — and the instance ends there as the cancel ended it, its
+  // finally node run (`runtime.completeCancel`, the hook a recovered cancel
+  // uses on the hub). Its result is then `status: "cancelled"`, below.
+  if (dispatch.cancelled === true) completeCancel(dispatch.execution_id);
 
   let line: Record<string, unknown>;
   try {
