@@ -15363,12 +15363,14 @@ export function dispatchPausesHome(): void {
  * and a child execution is begun, journaled, recovered and exported through
  * the journal's single writer — the hub (`docs/distributed.md` §3.3, PRD
  * resolved q42) — which a worker is not and cannot stand in for. A worker
- * reaches a detached `flow.*` dispatch only through a flow a placed agent
+ * reaches a detached `flow.*` dispatch two ways: through a flow a placed agent
  * attaches as a tool (grammar 14.1 rule 4 runs it in the agent's process), and
- * there the dispatch cannot be issued: [`runMap`] fails the map node that would
- * have issued it, by name, before anything is dispatched — the failure grammar
- * 8.6 rule 7 leaves to that node's own `on_error:` — rather than beginning a
- * child nobody can recover on a journal nobody reads.
+ * inside a placed flow's instance, every node of which — and of the unplaced
+ * flows it instantiates — the worker runs (grammar 14.1 rule 2, Decision
+ * D171). Either way the dispatch cannot be issued: [`runMap`] fails the map
+ * node that would have issued it, by name, before anything is dispatched — the
+ * failure grammar 8.6 rule 7 leaves to that node's own `on_error:` — rather
+ * than beginning a child nobody can recover on a journal nobody reads.
  */
 let childrenBeginHere = true;
 
@@ -15385,7 +15387,7 @@ export function refuseChildExecutions(): void {
 export class ChildOnAWorker extends Error {
   constructor(flow: string, idempotencyKey: string) {
     super(
-      `\`${flow}\` is dispatched with \`detach: true\` (key \`${idempotencyKey}\`) inside a placed node, on the worker running it, and a detached \`flow.*\` dispatch starts a child execution — which the hub alone begins, journals and recovers, as the single writer of this deployment's journal (docs/distributed.md §3.3, PRD resolved q42, q65). It could not be issued, so the map node that would have issued it fails, and its \`on_error:\` decides what follows (grammar 8.6 rule 7). Drop \`detach:\` so the dispatch is joined inside the placed node, or dispatch the flow from a flow the hub runs rather than from one a placed agent attaches as a tool (grammar 14.1 rule 4)`,
+      `\`${flow}\` is dispatched with \`detach: true\` (key \`${idempotencyKey}\`) inside a placed node, on the worker running it, and a detached \`flow.*\` dispatch starts a child execution — which the hub alone begins, journals and recovers, as the single writer of this deployment's journal (docs/distributed.md §3.3, PRD resolved q42, q65). It could not be issued, so the map node that would have issued it fails, and its \`on_error:\` decides what follows (grammar 8.6 rule 7). Drop \`detach:\` so the dispatch is joined inside the placed node, or dispatch the flow from a flow the hub runs — not from inside a placed flow's instance, every node of which runs on its worker (grammar 14.1 rule 2, Decision D171), nor from a flow a placed agent attaches as a tool, which runs in the agent's own loop (grammar 14.1 rule 4)`,
     );
     this.name = "ChildOnAWorker";
   }

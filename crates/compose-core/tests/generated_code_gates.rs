@@ -2145,7 +2145,12 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
             "node `hand_off` failed: ChildOnAWorker: `flow.review` is dispatched with `detach: \
              true` (key `{refused}`) inside a placed node, on the worker running it"
         )) && said.contains("PRD resolved q42, q65")
-            && said.contains("the map node that would have issued it fails"),
+            && said.contains("the map node that would have issued it fails")
+            && said.contains(
+                "not from inside a placed flow's instance, every node of which runs on its worker \
+                 (grammar 14.1 rule 2, Decision D171), nor from a flow a placed agent attaches \
+                 as a tool"
+            ),
         "a detached `flow.*` dispatch on a worker is not the map node's own failure, by name: \
          {said:?}"
     );
