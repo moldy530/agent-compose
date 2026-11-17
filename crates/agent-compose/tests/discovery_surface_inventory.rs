@@ -1389,6 +1389,21 @@ fn the_cli_topic_names_every_key_the_json_report_writes() {
     let out =
         std::env::temp_dir().join(format!("agent-compose-report-keys-{}", std::process::id()));
     let _ = fs::remove_dir_all(&out);
+    // A tree for `--restamp` to answer about: it reads no spec, only a tree a
+    // build wrote (PRD resolved q87).
+    let built = std::env::temp_dir().join(format!(
+        "agent-compose-report-keys-built-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&built);
+    let wrote = Command::cargo_bin("agent-compose")
+        .expect("the binary under test is built")
+        .current_dir(repository())
+        .args(["build", "examples/review-loop/main.yml", "--out"])
+        .arg(&built)
+        .output()
+        .expect("the command runs");
+    assert!(wrote.status.success(), "the tree to restamp was built");
     let reports = [
         vec![
             "validate",
@@ -1403,6 +1418,16 @@ fn the_cli_topic_names_every_key_the_json_report_writes() {
             "--out",
             out.to_str().expect("a UTF-8 temporary path"),
             "--check",
+            "--format",
+            "json",
+        ],
+        // `--restamp` answers with a document of its own.
+        vec![
+            "build",
+            "examples/review-loop/main.yml",
+            "--out",
+            built.to_str().expect("a UTF-8 temporary path"),
+            "--restamp",
             "--format",
             "json",
         ],
@@ -1428,6 +1453,7 @@ fn the_cli_topic_names_every_key_the_json_report_writes() {
                 .cloned(),
         );
     }
+    let _ = fs::remove_dir_all(&built);
     assert!(
         keys.len() >= 3,
         "the reports still carry their keys, found {keys:?}"

@@ -1,0 +1,44 @@
+---
+source: crates/agent-compose/tests/cli.rs
+expression: stdout(&output)
+---
+Run one flow, declared manual trigger or not (validates, builds, then launches)
+
+Usage: agent-compose run [OPTIONS] <PATH> <FLOW>
+
+Arguments:
+  <PATH>
+          Path to the spec entrypoint (conventionally `main.yml`)
+
+  <FLOW>
+          The flow to run, as a typed address (`flow.<name>`)
+
+Options:
+      --input <FIELD=VALUE>
+          One input binding, repeatable: `--input goal=ship it`
+
+      --session <KEY>
+          The session identity session-scoped stores key off (grammar 11.3)
+
+      --target <NAME>
+          Deploy target to resolve and emit for
+          
+          [default: local]
+
+      --out <DIR>
+          Where to write the generated project [default: <project>/build/<target>]
+
+      --no-build
+          Launch the project already built in the output directory as it stands: no validation, no build, and the spec is not read
+
+      --format <FORMAT>
+          How to report what was found, and how the run answers
+
+          Possible values:
+          - human: Written for a person, on stderr
+          - json:  One JSON object on stdout
+          
+          [default: human]
+
+  -h, --help
+          Print help (see a summary with '-h')

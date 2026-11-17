@@ -1306,6 +1306,77 @@ fn agent_compose_cancel_exits_by_what_the_app_answered() {
     );
 }
 
+/// **`serve --no-build` and `cancel --no-build` launch a built tree as it
+/// stands** (PRD resolved q87, Decision D170): the fixture is built once, and
+/// then served and cancelled out of that tree with a spec path that names no
+/// file at all — so neither command read a spec, and neither built one.
+///
+/// The cancel is the real thing rather than a refusal: the execution started
+/// on the served tree reaches `cancelled`, so the `cancel` verb launched out of
+/// the tree (the emitted project's own) sent the route its request, exit `0`
+/// and the `202`. The tree is the one directory both commands launch out of,
+/// and it is left as the build wrote it — `--no-build` writes nothing into it.
+#[test]
+fn serve_and_cancel_without_a_build_launch_the_built_tree_as_it_stands() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let scratch = harness::Scratch::new("cancel-no-build");
+    let (environment, log) = environment(&provider, &scratch);
+    let Some((project, built)) = harness::build_under_toolchain(FIXTURE, "cancel-no-build") else {
+        return;
+    };
+    let _cleanup = harness::Scratch::at(project.clone());
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let stamp = std::fs::read(project.join("src/artifact.ts")).expect("the build wrote a stamp");
+    let graph = std::fs::read(project.join("src/graph.ts")).expect("the build wrote a graph");
+
+    let Some(served) = harness::serve_as_built(&project, &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let execution = started(&app, "/long", &json!({ "linger": 600 }));
+    pids(&log, 1);
+
+    let nowhere = project.join("no-spec-is-read-here").join("main.yml");
+    let accepted = compiler(&environment)
+        .arg("cancel")
+        .arg(&nowhere)
+        .arg(&execution)
+        .args(["--url", &served.base_url, "--format", "json", "--no-build"])
+        .arg("--out")
+        .arg(&project)
+        .output()
+        .expect("the compiler runs");
+    assert_eq!(
+        accepted.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    let document: Value =
+        serde_json::from_slice(&accepted.stdout).expect("`--format json` prints one document");
+    assert_eq!(document["http_status"], 202, "{document:#}");
+    reaches(&app, &execution, "cancelled", SETTLE);
+
+    assert_eq!(
+        std::fs::read(project.join("src/artifact.ts")).expect("readable"),
+        stamp,
+        "the tree's stamp is the build's"
+    );
+    assert_eq!(
+        std::fs::read(project.join("src/graph.ts")).expect("readable"),
+        graph,
+        "…and so is everything it stamps"
+    );
+    assert!(
+        !nowhere.exists(),
+        "nothing was written where the spec path pointed"
+    );
+}
+
 /// **`agent-compose cancel` sends the cancel to the target's `hub.public_url`
 /// when no `--url` is given, and is a usage error where the target declares
 /// none** (PRD resolved q75 ruling d: "`--url`, defaulting to
