@@ -14885,10 +14885,16 @@ the check runs on the hub's list, read out of the tree. q72 and
 tree. [D145](#d145-the-package-registry-is-a-deploy-layer-slot-and-build-writes-both-installers-configuration)
 (a target's installer files): unaffected — they are emitted paths on
 `ARTIFACT_FILES` like any other, and checked so.
+[D151](#d151-a-target-may-pin-a-harness-sdk-inside-the-range-the-compiler-audited-it-for)
+(the hash moves with a pin override, because that is a different artifact):
+read with one more case — the hash also moves when a restamp rewrites it over
+a hand edit, with no pin change, and by the same reasoning: the edited tree is
+a different artifact. A restamp reads no spec, so the pin the tree carries is
+the one the build it came from audited.
 
 **Status**: ratified — PRD resolved q87. *PRD resolved q15, q40, q41, q44, q47,
 q48, q49, q72, q75, q87; `docs/distributed.md` §3.5, §4, §4.1; builds on D132,
-D155, D160.*
+D151, D155, D160.*
 
 ## Appendix B — Editor integration
 

@@ -2,7 +2,7 @@
 source: crates/agent-compose/tests/cli.rs
 expression: stdout(&output)
 ---
-Cancel an execution a `serve` is running, and every open child execution it started (validates, builds, then launches)
+Cancel an execution a `serve` is running, and every open child execution it started (validates, builds, then launches; `--no-build` launches the built tree as it stands)
 
 Usage: agent-compose cancel [OPTIONS] <PATH> <EXECUTION>
 

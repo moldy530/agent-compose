@@ -2,7 +2,7 @@
 source: crates/agent-compose/tests/cli.rs
 expression: stdout(&output)
 ---
-Compile a spec to a TypeScript project (validates first; emits only when clean)
+Compile a spec to a TypeScript project (validates first; emits only when clean; `--restamp` instead rewrites a built tree's hash to what its files hash to)
 
 Usage: agent-compose build [OPTIONS] <PATH>
 

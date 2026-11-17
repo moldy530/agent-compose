@@ -2,7 +2,7 @@
 source: crates/agent-compose/tests/cli.rs
 expression: stdout(&output)
 ---
-Serve the project's triggers: `http` routes, `schedule` ticks, `kind: command` event sources (validates, builds, then launches the app)
+Serve the project's triggers: `http` routes, `schedule` ticks, `kind: command` event sources (validates, builds, then launches the app; `--no-build` launches the built tree as it stands)
 
 Usage: agent-compose serve [OPTIONS] <PATH>
 

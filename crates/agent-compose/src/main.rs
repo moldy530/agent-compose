@@ -348,7 +348,8 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Artifact::Html)]
         format: Artifact,
     },
-    /// Compile a spec to a TypeScript project (validates first; emits only when clean)
+    /// Compile a spec to a TypeScript project (validates first; emits only when clean;
+    /// `--restamp` instead rewrites a built tree's hash to what its files hash to)
     Build {
         /// Path to the spec entrypoint (conventionally `main.yml`)
         path: PathBuf,
@@ -369,7 +370,8 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
     },
-    /// Run one flow, declared manual trigger or not (validates, builds, then launches)
+    /// Run one flow, declared manual trigger or not (validates, builds, then launches;
+    /// `--no-build` launches the built tree as it stands)
     Run {
         /// Path to the spec entrypoint (conventionally `main.yml`)
         path: PathBuf,
@@ -413,7 +415,8 @@ enum Command {
         format: Format,
     },
     /// Serve the project's triggers: `http` routes, `schedule` ticks, `kind: command` event
-    /// sources (validates, builds, then launches the app)
+    /// sources (validates, builds, then launches the app; `--no-build` launches the built
+    /// tree as it stands)
     Serve {
         /// Path to the spec entrypoint (conventionally `main.yml`)
         path: PathBuf,
@@ -438,7 +441,7 @@ enum Command {
         format: Format,
     },
     /// Cancel an execution a `serve` is running, and every open child execution it started
-    /// (validates, builds, then launches)
+    /// (validates, builds, then launches; `--no-build` launches the built tree as it stands)
     Cancel {
         /// Path to the spec entrypoint (conventionally `main.yml`)
         path: PathBuf,
