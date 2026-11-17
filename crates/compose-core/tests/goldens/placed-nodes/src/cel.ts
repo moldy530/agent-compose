@@ -23,9 +23,9 @@
 //     evaluator that reaches for `number` fails there rather than rounding
 //     somebody's id in production. Every integer here is a `bigint`.
 //   * **The surface is closed.** Grammar 4.1 admits the standard operators,
-//     `size()`, `has()`, four string predicates and five comprehension macros,
-//     and nothing else — the validator refuses anything further before a router
-//     is ever emitted. A general-purpose evaluator would accept what the
+//     `size()`, `has()`, four string predicates, four conversions and `join`
+//     (PRD resolved q85), and five comprehension macros, and nothing else — the
+//     validator refuses anything further before a router is ever emitted. A general-purpose evaluator would accept what the
 //     compiler refuses, which is drift pointing the other way.
 //   * **No new pinned dependency.** PRD 5.12 pins every version per compiler
 //     release; a dependency whose CEL reading changed in a patch would move the
@@ -1087,6 +1087,190 @@ function expectBool(value: CelValue, what: string): boolean {
   return value;
 }
 
+// ---------------------------------------------------------------------------
+// Conversions and `join` (PRD resolved q85)
+// ---------------------------------------------------------------------------
+//
+// CEL's four standard conversions and the strings extension's `join`, written to
+// answer what the pinned Rust column answers — `conversions.json` in the corpus
+// is what holds the two together. Where the crate's own overload answers
+// something the specification does not, the row is in `codegen::cel`'s ledger
+// and this side follows the specification: `int()` of a double outside `int64`,
+// or of a NaN or an infinity, is an error here, as `int()` of a uint past
+// `int64`'s top is.
+
+/**
+ * A double as `string()` writes it: the shortest digits that read back as the
+ * same double, positionally — never an exponent — which is what the pinned
+ * crate's `f64` formatting writes. `String(1e21)` is `1e+21` and the crate's is
+ * a 1 and twenty-one zeros, so the digits are JavaScript's own shortest ones
+ * and the placement of the point is done here. `-0` keeps its sign, and the
+ * three values with no digits are spelt as the crate spells them.
+ */
+function doubleText(value: number): string {
+  if (Number.isNaN(value)) return "NaN";
+  if (value === Infinity) return "inf";
+  if (value === -Infinity) return "-inf";
+  if (value === 0) return Object.is(value, -0) ? "-0" : "0";
+  const sign = value < 0 ? "-" : "";
+  const [mantissa, exponent = "0"] = String(Math.abs(value)).split("e") as [string, string?];
+  const [whole, fraction = ""] = mantissa.split(".") as [string, string?];
+  let digits = whole + fraction;
+  // Where the decimal point falls, counted in digits from the left.
+  let point = whole.length + Number(exponent);
+  const leading = /^0*/.exec(digits)![0].length;
+  digits = digits.slice(leading);
+  point -= leading;
+  if (point >= digits.length) return `${sign}${digits}${"0".repeat(point - digits.length)}`;
+  if (point > 0) return `${sign}${digits.slice(0, point)}.${digits.slice(point)}`;
+  return `${sign}0.${"0".repeat(-point)}${digits}`;
+}
+
+/**
+ * One string as a JSON string literal. `JSON.stringify`'s escapes are the
+ * canonical ones — the quote, the backslash, and the C0 controls — and the
+ * Rust column writes the same table by hand.
+ */
+function quote(text: string): string {
+  return JSON.stringify(text);
+}
+
+/**
+ * The canonical JSON of a value (PRD resolved q85): object keys in **code-point**
+ * order — `compareStrings`, the Rust column's order, not `Array.prototype.sort`'s
+ * UTF-16 one — no whitespace, an `int` with no fraction, a `double` as
+ * `doubleText` writes it. What JSON has no spelling for is an error rather than
+ * a guess: a NaN or an infinity, `bytes`, a map keyed by anything but strings.
+ */
+function canonicalJson(value: CelValue): string {
+  if (value === null) return "null";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "bigint") return value.toString();
+  if (value instanceof CelUint) return value.value.toString();
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new CelError(
+        `${doubleText(value)} has no JSON spelling, so a list or a map holding it has no canonical JSON`,
+      );
+    }
+    return doubleText(value);
+  }
+  if (typeof value === "string") return quote(value);
+  if (value instanceof Uint8Array) {
+    throw new CelError("bytes have no JSON spelling, so a list or a map holding them has no canonical JSON");
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const entries: { key: string; value: CelValue }[] = [];
+  for (const entry of value.entries.values()) {
+    if (typeof entry.key !== "string") {
+      throw new CelError("a map keyed by anything but strings has no canonical JSON");
+    }
+    entries.push({ key: entry.key, value: entry.value });
+  }
+  entries.sort((left, right) => compareStrings(left.key, right.key));
+  return `{${entries.map((entry) => `${quote(entry.key)}:${canonicalJson(entry.value)}`).join(",")}}`;
+}
+
+/** `int(<string>)`: an optional sign and ASCII digits, nothing around them. */
+const INT_TEXT = /^[+-]?[0-9]+$/;
+
+/**
+ * `double(<string>)`: the literal grammar the Rust column's `f64` parser reads,
+ * case-insensitively — which takes `inf`, `infinity` and `nan`, and refuses
+ * whitespace, a bare `.`, and an exponent with no digits.
+ */
+const DOUBLE_TEXT = /^[+-]?(?:inf|infinity|nan|(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:e[+-]?[0-9]+)?)$/i;
+
+function convert(name: "string" | "int" | "double" | "bool", value: CelValue): CelValue {
+  switch (name) {
+    case "string": {
+      if (typeof value === "string") return value;
+      if (typeof value === "bigint") return value.toString();
+      if (value instanceof CelUint) return value.value.toString();
+      if (typeof value === "number") return doubleText(value);
+      if (typeof value === "boolean") return value ? "true" : "false";
+      if (value === null) return "null";
+      // The replacement character for every malformed sequence, and a leading
+      // byte-order mark kept rather than eaten — `String::from_utf8_lossy`'s
+      // reading.
+      if (value instanceof Uint8Array) return new TextDecoder("utf-8", { ignoreBOM: true }).decode(value);
+      return canonicalJson(value);
+    }
+    case "int": {
+      if (typeof value === "bigint") return value;
+      if (value instanceof CelUint) {
+        if (value.value > INT_MAX) throw new CelError(`\`int\`: ${value.value}u is outside the range of an int`);
+        return value.value;
+      }
+      if (typeof value === "number") {
+        // Truncation toward zero, and an error for what has no int: CEL's
+        // definition, and the one ledger row where the pinned crate saturates.
+        if (!Number.isFinite(value)) throw new CelError(`\`int\`: ${doubleText(value)} has no int`);
+        const truncated = Math.trunc(value);
+        if (truncated < -(2 ** 63) || truncated >= 2 ** 63) {
+          throw new CelError(`\`int\`: ${doubleText(value)} is outside the range of an int`);
+        }
+        return BigInt(truncated);
+      }
+      if (typeof value === "string") {
+        if (!INT_TEXT.test(value)) throw new CelError(`\`int\`: \`${value}\` is not a decimal integer`);
+        const parsed = BigInt(value.replace(/^[+-]/, "")) * (value.startsWith("-") ? -1n : 1n);
+        if (parsed < INT_MIN || parsed > INT_MAX) {
+          throw new CelError(`\`int\`: \`${value}\` is outside the range of an int`);
+        }
+        return parsed;
+      }
+      if (typeof value === "boolean") return value ? 1n : 0n;
+      throw new CelError(`\`int\` cannot convert a ${typeName(value)}`);
+    }
+    case "double": {
+      if (typeof value === "number") return value;
+      if (typeof value === "bigint") return Number(value);
+      if (value instanceof CelUint) return Number(value.value);
+      if (typeof value === "string") {
+        if (!DOUBLE_TEXT.test(value)) throw new CelError(`\`double\`: \`${value}\` is not a number`);
+        const body = value.replace(/^[+-]/, "").toLowerCase();
+        const negative = value.startsWith("-");
+        if (body === "inf" || body === "infinity") return negative ? -Infinity : Infinity;
+        if (body === "nan") return Number.NaN;
+        return Number(value);
+      }
+      if (typeof value === "boolean") return value ? 1 : 0;
+      throw new CelError(`\`double\` cannot convert a ${typeName(value)}`);
+    }
+    default: {
+      // `bool()`: a bool is itself and a string is exactly `true` or `false`.
+      // A number has no overload — `bool(1)` is refused by the compiler and is
+      // an error here, never a reading of `1` as `true`.
+      if (typeof value === "boolean") return value;
+      if (value === "true") return true;
+      if (value === "false") return false;
+      if (typeof value === "string") {
+        throw new CelError(
+          `\`${value}\` is not a bool: the string a bool converts from is \`true\` or \`false\``,
+        );
+      }
+      throw new CelError(`\`bool\` cannot convert a ${typeName(value)}`);
+    }
+  }
+}
+
+/** `list.join(separator)`, the strings extension's: every element a string. */
+function join(list: CelValue, separator: CelValue | undefined): string {
+  if (!Array.isArray(list)) {
+    throw new CelError(`\`join\` joins a list of strings, and its receiver is a ${typeName(list)}`);
+  }
+  if (separator !== undefined && typeof separator !== "string") {
+    throw new CelError(`\`join\`'s separator is a string, and this one is a ${typeName(separator)}`);
+  }
+  list.forEach((item, index) => {
+    if (typeof item !== "string") {
+      throw new CelError(`\`join\` joins a list of strings, and element ${index} is a ${typeName(item)}`);
+    }
+  });
+  return (list as string[]).join(separator ?? "");
+}
+
 function comprehension(name: string, range: CelValue, args: Expr[], scope: Scope): CelValue {
   const first = args[0];
   if (first === undefined || first.kind !== "ident") {
@@ -1187,6 +1371,28 @@ function call(expression: Extract<Expr, { kind: "call" }>, scope: Scope): CelVal
       const subject = expectString(operands[0]!, name);
       const pattern = expectString(operands[1]!, name);
       return new RegExp(pattern).test(subject);
+    }
+    case "string":
+    case "int":
+    case "double":
+    case "bool": {
+      // Global calls of one argument, by CEL's standard definitions — the one
+      // spelling the compiler's arity table accepts for them, and the one the
+      // pinned Rust column runs.
+      if (target !== undefined || args.length !== 1) {
+        throw new CelError(`\`${name}\` is a global call of one argument — \`${name}(x)\``);
+      }
+      return convert(name as "string" | "int" | "double" | "bool", operands[0]!);
+    }
+    case "join": {
+      // The strings extension's: a method on the list it joins, with one
+      // separator or none.
+      if (target === undefined || args.length > 1) {
+        throw new CelError(
+          "`join` is written on the list it joins, with one separator or none — `names.join(', ')`",
+        );
+      }
+      return join(operands[0]!, operands[1]);
     }
     default:
       throw new CelError(`\`${name}\` is not a function this expression surface supports`);
