@@ -8614,6 +8614,12 @@ than on *coverage* is deliberate: a node whose only enum guard is
 `f == 'a' && …` is routing on `f` in every sense the author meant, and the fix
 is one keyword. *PRD 5.3, G3, G4.*
 
+**Amended by [D169](#d169-two-guards-are-exclusive-when-one-holds-a-boolean-read-and-the-other-its-negation)** (PRD resolved q86): §7.6.1's exclusivity test is no
+longer the table alone — beside its disjoint `possible` sets (rule 2) and the
+`else:` edge (rule 1), two guards are exclusive when one holds a `bool`-typed
+read as a top-level `&&` conjunct and the other its negation (rule 3). The
+table, and exhaustiveness, are unchanged.
+
 ### D83. Item-derivation is traced through the dispatch binding
 
 An expression is item-derived, per dispatch site, when it references
@@ -15250,14 +15256,17 @@ guard calling a conversion is a CEL exit condition like any other guard. D82's
 closed guard table is unchanged — `int(n.output.count) > 0` and
 `string(n.output.verdict) == 'a'` fall to its last row and prove nothing, which
 is the conservative answer. D110 is unchanged: a failed conversion is an
-evaluation failure, with the absent read's consequence. PRD resolved q29 is what
+evaluation failure, with the absent read's consequence. D115 is unchanged: a
+conversion over `execution.item_index` reads it where that decision makes it
+present, and §4.2's refusal of a call in a path expression is what keeps the
+index itself a plain read. PRD resolved q29 is what
 makes the canonical form load-bearing rather than cosmetic: the corpus is part
 of the recovery contract, so a conversion whose text could vary from run to run
 would be a replay divergence. PRD 5.5's two-interpreter discipline is the reason
 every new function is a corpus file and not only a typing rule.
 
 **Status**: ratified — PRD resolved q85. *PRD 5.5; PRD resolved q29, q85; §4.1,
-§4.2; builds on D13, D110; leaves D42, D43, D57, D82, D98 unchanged.*
+§4.2; builds on D13, D110; leaves D42, D43, D57, D82, D98, D115 unchanged.*
 
 ### D169. Two guards are exclusive when one holds a boolean read and the other its negation
 
