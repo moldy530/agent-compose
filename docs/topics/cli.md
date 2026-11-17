@@ -364,8 +364,63 @@ exits `1`. An app the command could not reach, or a status it does not give,
 exits `2`. Under `--format json` the app's answer is the one document on stdout,
 with `http_status` beside it.
 
+**An execution the serving build's recovery could not take** — a replay that
+diverged from its journal, recorded inputs the build's `inputs:` refuse, a flow
+the build no longer declares — is open with nothing to run it, and the serve
+log names this command for it once per start:
+
+```
+`exec_9f1c8a3e-…` (flow.gate) could not be recovered by this build: ReplayDivergence: this execution's journal does not describe this run at `ask/0` …; its row stays open until `agent-compose cancel exec_9f1c8a3e-…` closes it
+```
+
+The cancel **closes** it (PRD resolved q81): the request is recorded, its open
+children nothing in the process will take are closed the same way — one it is
+running is cancelled through the cascade and waited for until it has settled,
+and closed the same way if it settled with its row still open —
+and the row is ended `cancelled` with **no finally node run** — no generation
+can run one against a record it does not describe — which its `finally_error`
+says.
+The settle webhook and the trace export go as for any settle, the ledger rows
+its keyed store writes left and its `scope: execution` partitions go once the
+row has closed, as a settled execution's do, and no later start recovers it.
+The app answers `202` with `cancelling: false`, the cancel being complete, and
+the command prints the app's `detail` and exits `0`:
+
+```
+cancelled `exec_9f1c8a3e-…`: this build could not take up this execution's recovery (this build declares no flow `flow.gate`), so no generation of it can run here: its lifecycle row is closed `cancelled` and no finally node ran, which its `finally_error` says
+```
+
+Sent again, it is the `409` every ended execution gets.
+
+The cancel is under the `auth:` of the trigger that started the execution
+(PRD resolved q32), so pass what that trigger requires with `--header`. One
+whose trigger the serving build no longer declares — renamed or removed along
+with its flow — is refused whatever the request carries, since the
+authentication that trigger required cannot be read: the command prints the
+app's `401` and exits `1`, and the row stays open until a build declares the
+trigger again. The serve log's line says so for such an execution:
+
+```
+`exec_9f1c8a3e-…` (flow.long) could not be recovered by this build: this build declares no flow `flow.long`; its row stays open until `agent-compose cancel exec_9f1c8a3e-…` closes it, which the cancel route refuses until this build declares the trigger `on_long` that started it again: a cancel is authenticated by that trigger's `auth:` (PRD resolved q32)
+```
+
+Only an execution nothing in the serving process will ever take is closed so.
+One of a flow the build declares that the process has not recovered *yet* — a
+standby whose walk of the journal is still owed, a child its open parent's
+replay has still to re-issue — is one the build can run: the app takes the
+recovery it owes first, and an execution that puts on the board is cancelled
+as a running one; one still unrun after it has its cancel recorded and its
+row left open, for the recovery that takes it to complete the cancel, finally
+node and all. The app answers `202` with `cancelling: true` and no status URL,
+and the command prints the app's `detail` and exits `0`:
+
+```
+cancelling `exec_9f1c8a3e-…`: this process runs no generation of this execution yet, and a recovery of this build takes it up — the recovery this process owes, which has not read the journal yet — so the cancel is recorded and its lifecycle row stays open: that recovery completes the cancel, its finally node included
+```
+
 A `run` is not cancelled this way: `Ctrl-C` stops its process and leaves its row
-open for `resume` (PRD resolved q28). A cancel is `serve`'s.
+open for `resume` (PRD resolved q28). A cancel is `serve`'s, and an open row a
+`run` wrote beside a `serve` is still `404` there.
 
 ## `store`
 

@@ -2478,7 +2478,11 @@ its own trace entry, the instance's last, carries no `routing`
 `input:` reads, `execution.error` on an instance that did not fail among them,
 where a body node's would fail the execution (§4.1, D110): the node made no
 attempt, its entry is `failed` with `attempts: 0`, and the outcome is the
-body's.
+body's. One `finally_error` no finally node raised: an execution a cancel
+closed because this build's recovery could not take it — its row ended
+`cancelled` with no generation to run a finally node — says so there, as
+`no finally node ran: this build could not take up the execution's recovery
+(<reason>)` (PRD resolved q81, D165).
 
 **Durability.** The start of the finally node is a journaled boundary
 (`docs/durability.md` §3.10): a restart that finds the body settled and the
@@ -5046,7 +5050,10 @@ Rules (PRD 5.8):
   row is what answers a retry of its effect site, and an execution retries only
   while its journal row is open; every §9.4 key begins `<execution.id>/`, and a
   settled execution never resumes (PRD resolved q65). So when an execution's row
-  closes `completed` or `failed` and the detached `agent.*`/`tool.*` deliveries
+  closes `completed`, `failed` or `cancelled` — a cancel's close of an execution
+  this build's recovery could not take included (Decision
+  [D165](#d165-a-cancel-closes-an-execution-this-builds-recovery-could-not-take))
+  — and the detached `agent.*`/`tool.*` deliveries
   it started have finished — they write, and retry, under its id (§8.6 rule 7) —
   the runtime deletes the ledger rows under that prefix from every store the
   composition binds, which reaches every partition the execution wrote from any
@@ -5054,7 +5061,8 @@ Rules (PRD 5.8):
   rows go under the child's own id, when the child settles. An execution the
   journal still holds open keeps every row, so a resume still writes nothing
   twice (PRD resolved q29, q69). A `scope: execution` store's partition, ledger
-  included, already dies with the run (§11.3). The prune runs behind the
+  included, already dies with the run (§11.3) — and, for an execution that
+  close ends with no generation of it running, with the close. The prune runs behind the
   outcome and nothing of the outcome waits for it — each store on its own, a
   dial bounded at ten seconds — and a command waits for it on its way out (a
   `run` or `resume` as it exits, a `serve` when it is stopped), starting then a
@@ -5842,11 +5850,31 @@ a flow input field can accept it.
   takes no body, answers `202` for an execution that is open (a second cancel of
   one already cancelling included), `409` naming the status for one that has
   completed, failed or been cancelled, and `404` for an id the process does not
-  know — save an execution a trigger's intake started whose row is open in the
-  journal while this process runs no generation of it, a recovery this build
-  could not take or a flow it no longer declares, which is open, and whose
-  cancel frees the slot it holds (D163's Status). Like the other two it is the
-  app's own, so a trigger cannot declare it.
+  know. An execution **this build's recovery could not take** — a replay that
+  diverged or recorded inputs the build refuses, reported `failed` while its
+  row stays open, or a flow the build no longer declares, on no board — is
+  open, and its cancel **closes** it: its open children in the lineage this
+  process is not running the same way, those it is running through the
+  cascade and waited for until they settle — one that settles with its row
+  still open, its own replay diverged before the cancel fired, closed the same
+  way then — and then its row is ended
+  `cancelled` with no finally node run, which its `finally_error` says (`no finally node
+  ran: this build could not take up the execution's recovery (<reason>)`); the
+  settle webhook and the export go as for any settle, a slot it held of a
+  trigger's lease is freed, and the answer is `202` with `status: "cancelled"`,
+  `cancelling: false`, the status URL and a `detail` saying why (PRD resolved
+  q81, Decision [D165](#d165-a-cancel-closes-an-execution-this-builds-recovery-could-not-take)).
+  Only an execution **nothing here will ever take** is closed so — a child on
+  no board is one where its open parent is itself one of these. An open row of
+  a declared flow that a recovery here still takes is one this build can run:
+  the route takes the recovery its process owes first, so one that walk puts
+  on the board is cancelled as running, and one still on no board after it has
+  its cancel recorded and answered `202` with `status: "open"`, `cancelling:
+  true`, no status URL and a `detail` naming the recovery that completes it,
+  finally node and all.
+  An open row a `run` wrote beside the `serve` is not one: its cancel is not
+  `serve`'s, and it is still `404`. Like the other two it is the app's own, so
+  a trigger cannot declare it.
   A fifth, `GET /sources/:name`, reports an event source's consumer (§14.4,
   PRD resolved q78), and a sixth, `GET /intakes/:id`, an arrival a trigger's
   intake admitted (below, PRD resolved q77); both are reserved the same way.
@@ -12407,7 +12435,13 @@ and no trace field: an expired key is answered as a key never written is. A
 synthesized tool takes no `ttl` argument and writes under the store's default.
 
 **Status**: shipped. *PRD 5.8, resolved q29, q63, q65, q68, q69; §4.4, §8.8,
-§9.4, §11.1, §11.3, §11.4, §11.5.*
+§9.4, §11.1, §11.3, §11.4, §11.5.* ***Amended by
+[D165](#d165-a-cancel-closes-an-execution-this-builds-recovery-could-not-take)
+(PRD resolved q81):*** *a row also closes `cancelled` with no generation of it
+running — a cancel's close of an execution this build's recovery could not
+take — and is pruned the same way once it has closed, under the same two
+holds; that close also removes the execution's `scope: execution` partitions,
+which no generation's end removes for it.*
 
 ### D154. A `kv` store is read at scale a page at a time, and a page's `entries` are there when its node asks
 
@@ -13532,7 +13566,14 @@ Status: an execution a trigger's intake started whose lifecycle row is open
 while this process runs no generation of it — a recovery the build could not
 take, reported `failed`, or a flow the build no longer declares, on no board —
 is open, and answered `202`; its cancel frees the slot it holds of the
-trigger's lease.*) `agent-compose cancel`
+trigger's lease.* ***Amended by
+[D165](#d165-a-cancel-closes-an-execution-this-builds-recovery-could-not-take)
+(PRD resolved q81):*** *lease or no lease, such an execution's cancel closes
+its row `cancelled` with no finally node run, rather than recording the request
+and leaving the row for a build that can run it — where nothing here will ever
+take it; one a recovery here still takes keeps the recorded request and the
+open row, and that recovery completes the cancel, finally node and all.*)
+`agent-compose cancel`
 is the emitted command line's `cancel` verb: it sends the request to `--url`, or
 to the target's `hub.public_url`, with the headers `--header` names, and exits
 `0` on `202`, `1` on a refusal, and `2` where it could not ask. A `run` keeps
@@ -13581,9 +13622,18 @@ cancel stops in flight is not recorded; that a recovered cancel completes at
 the replay's frontier; and that a batch the hub refuses stops the runner as a
 stop does — its finally nodes run on the worker, under the stop's grace, and
 nothing the runner journals after the refused batch is sent
-(`docs/distributed.md` §3.3). *PRD resolved
-q28, q29, q32, q34, q65, q75, q76; §7.6.3, §7.9, §8.6, §13.3; amends D70, D124,
-D159; builds on D94, D102, D150.*
+(`docs/distributed.md` §3.3). One reading D163's Status recorded here has left
+that list: what the route answers for an open execution this process runs no
+generation of is **ratified by PRD resolved q81: a cancel closes an execution
+this build's recovery could not take** — its row ended `cancelled` with no
+finally node run, said in `finally_error`
+([D165](#d165-a-cancel-closes-an-execution-this-builds-recovery-could-not-take)) —
+where nothing here will ever take it; one a recovery here still takes is any
+open execution's, its request recorded and completed by that recovery, finally
+node and all.
+*PRD resolved
+q28, q29, q32, q34, q65, q75, q76, q81; §7.6.3, §7.9, §8.6, §13.3; amends D70, D124,
+D159; builds on D94, D102, D150; amended by D165.*
 
 ### D161. `max_running` is how many dispatches one worker session holds for a placement
 
@@ -14256,7 +14306,22 @@ a trigger counts as looked at — stays the implementation's reading:
   nothing short of reverting the build or editing the journal freed the
   slot. A `run` beside a `serve` writes an open row this process is not
   running either; it was started by no intake, holds no slot, and its cancel
-  is not `serve`'s (ruling d), so it is still `404` here.
+  is not `serve`'s (ruling d), so it is still `404` here. ***Amended by
+  [D165](#d165-a-cancel-closes-an-execution-this-builds-recovery-could-not-take)
+  (PRD resolved q81):*** *the cancel of such an execution no longer leaves the
+  row open for a build that can run it where **nothing here will ever take
+  it** — a recovery that failed here, a flow the build does not declare, a
+  child whose open parent is one of these: lease or no lease, the row is
+  closed `cancelled` with no finally node run, said in `finally_error`, and
+  the answer is `202` with `status: "cancelled"`, `cancelling: false` and the
+  status URL. A row of a flow the build declares that a recovery here still
+  takes — the walk a standby owes, an open parent's replay here, the start
+  that next recovers it — keeps this bullet's reading: the request recorded,
+  the slot freed, the row left open for that recovery to complete the cancel,
+  `cancelling: true`. The slot frees as this bullet says, at the recorded
+  request, and the queue is looked at once the row has closed (or the request
+  is down); the intake row decides only that. The `run` reading stands: a
+  `run`'s row is still `404`.*
 - **`supersede` cancels every running execution of the group**, not only the
   oldest; and where the trigger's `max_running:` is held by other groups'
   executions, which a supersede never cancels, the arrival waits as `queue`
@@ -14569,6 +14634,230 @@ expected to keep it, unchecked, as every other driver contract is.
 
 **Status**: ratified — PRD resolved q67. *PRD resolved q54, q57, q60, q66, q67;
 §8.9; builds on D138, D140, D146.*
+
+### D165. A cancel closes an execution this build's recovery could not take
+
+`POST /executions/:id/cancel` — and `agent-compose cancel`, which sends it —
+**closes** an open execution that no generation in the serving process can
+run: its lifecycle row is ended `cancelled` here and now, with no finally node
+run, and `finally_error` says why. Such an execution is open in the journal
+while the process runs no generation of it (`runtime.runsHere`) **and nothing
+here ever will** — three kinds:
+
+* **on the board, settled without its row** — a recovery whose replay
+  diverged (`runtime.ReplayDivergence`), or whose recorded inputs the build's
+  `inputs:` refuse: the status route reports it `failed` while the row stays
+  open on purpose (`docs/durability.md` §7), because the run stopped short of
+  the hook that closes rows;
+* **on no board, of a flow the build does not declare** — which every
+  recovery of this build leaves in the journal;
+* **on no board, a child whose open parent is itself one of these** — a
+  parent that diverged before its replay re-issued the child's dispatch, or
+  whose flow is gone — so nothing will ever re-issue it, though its own flow
+  is declared.
+
+**An open row this build can run is not one**, and is never closed this way: a
+row of a flow it declares that this process runs no generation of *yet*. The
+route takes the recovery its process owes first, where a start could not read
+the journal (a standby, while another `serve` held it) and the walk has not
+been retried yet — so an execution that walk puts on the board is cancelled
+there as any running execution is, finally node and all. A row still on no
+board after that walk — the walk still unable to read the journal, a child
+whose open parent's replay here has still to re-issue its dispatch, a root or
+a settled parent's child the start that next recovers it will take — has its
+cancel **recorded** as any open execution's (q75 ruling d's `202`): the request
+down, the cascade taken, a slot of a lease freed, the row left open, and the
+recovery that takes it finds the request and completes the cancel at its
+frontier, every instance ending `cancelled` and running its finally node (q75
+ruling e). The answer is `202` with the journal's `status: "open"`,
+`cancelling: true`, no `status_url` — this build's status route does not know
+it until that recovery puts it on the board — and a `detail` naming which
+recovery takes it. A row a `run` wrote beside the `serve` — its trigger is
+`manual`, as its children's are — is neither: that execution is the `run`'s
+(below).
+
+Lease or no lease: whether a `started` intake row names the execution decides
+only whether the close (or the recorded cancel) frees a slot of its trigger's
+lease, never whether the cancel closes it.
+
+**What the cancel does**, each step durable before the next:
+
+1. the request is **recorded and the cascade taken**, as every cancel's is
+   (`runtime.cancelExecution`, D160) — which frees the execution's slot of a
+   lease at once, and cancels every open descendant this process *is* running
+   through that descendant's own controller, which then settles `cancelled` on
+   its own, finally node and all;
+2. every **open descendant** the cascade reached — through any number of
+   settled ones (D160's walk) — is taken up, deepest first, by who takes it:
+   one this process **runs** is waited for until the cascade has settled it,
+   so no row closes before a descendant below it is down, and asked again once
+   it has — a generation that settled with its row still open (one the cascade
+   reached still waiting for its permit, whose replay to the frontier the
+   cancel fires at then diverged, or whose recorded inputs were refused) is
+   one nothing here will take any more; one **nothing here will take** is
+   closed the same way; and one a recovery here **still takes**
+   — its open parent runs here, cancelled by the same cascade, and the
+   descendant is asked again once that parent has settled without re-issuing
+   it; or the start that next recovers it will take it — keeps its row open
+   with its request recorded, for that recovery to complete the cancel,
+   finally node and all, and the answer's `detail` names it. A dispatch a
+   finally node issued is not the cancel's (D160) and is left for the start
+   that finds its parent settled;
+3. the execution's own row closes: the settle is journaled **while the row is
+   still open**, as every settle is (q35, `serve`'s `closed` hook) — the
+   `settled` webhook once, guarded by the journal's own record of it, and the
+   export the target's `trace_sink:` is owed — and then the row is ended
+   `cancelled`, `error` null, `finally_error` reading
+   `no finally node ran: this build could not take up the execution's recovery (<reason>)`;
+   and once it has, what a settled execution lets go of goes — the ledger rows
+   its keyed writes left under `<id>/`, pruned from every bound store as
+   [D153](#d153-a-kv-key-may-expire-and-a-settled-executions-ledger-rows-are-deleted)
+   prunes a settled execution's (kept, as there, while a worker may still be
+   running one of its placed nodes), and the partitions of its
+   `scope: execution` stores (§11.3), which no generation's end removes for
+   it — behind the answer, which waits for neither;
+4. the trigger's queue is looked at, where the execution held a slot.
+
+`<reason>` is what the recovery failed on, as the status route reported it,
+clipped to 400 characters; `` this build declares no flow `<flow>` ``; or,
+for a child no recovery re-issues,
+`` its open parent `<parent>` is one this build's recovery could not take, so nothing here re-issues it ``.
+The answer is `202` with `execution_id`,
+`status: "cancelled"`, **`cancelling: false`** — the cancel is complete, there
+is nothing to watch — the `status_url`, and a `detail` saying why the row was
+closed here and that no finally node ran (and, where it held one, that the
+slot of the trigger's lease is free). The execution is on the status route
+from then on, `cancelled` with that `finally_error`, an execution on no board
+included; a second cancel is the `409` every ended execution gets, `resume`
+refuses it as cancelled (D160), and no start recovers it: its row is closed.
+`agent-compose cancel` prints `` cancelled `<id>`: <detail> `` and exits `0`.
+
+**What the export carries.** What the record holds: the envelope a settle
+ships, `status: "cancelled"`, no `error`, `finally_error` saying no finally
+node ran, and the `entries` this process has — the replayed prefix of a
+recovery that diverged, ending at the entry that diverged, and none at all for
+an execution that never ran here. The envelope's shape does not move, so
+`trace_version` does not either; `finally_error` is a string whose text a
+reader may not decide anything from (`docs/trace.md` §10.1), and this is one
+more sentence it can carry.
+
+**The serve log.** A start that could not recover an execution says so, once
+per start per execution, naming the command that closes it:
+`` `<id>` (<flow>) could not be recovered by this build: <reason, 200 characters>; its row stays open until `agent-compose cancel <id>` closes it`` —
+for a replay that stopped short of closing its row, where the status route
+reports it, and for a flow the build does not declare, after the line that
+already said so. Where the trigger that started the execution is one this
+build does not declare, the cancel that line names would be refused (below),
+so the line goes on to say so:
+`` …closes it, which the cancel route refuses until this build declares the trigger `<trigger>` that started it again: a cancel is authenticated by that trigger's `auth:` (PRD resolved q32)``.
+Every line the log wrote before is kept.
+
+**Under the guard of the trigger that started it.** The route is under the
+`auth:` of the trigger that started the execution (q32, q75 ruling d), and a
+close is a cancel: the request has to pass that trigger's `auth:`, and an
+execution whose trigger this build does not declare at all — the composition
+renamed or removed it, as removing a flow removes its triggers — is refused
+`401` whatever the request carries, because the authentication that trigger
+required cannot be read — as its status and resume routes refuse it. Its row
+stays open, nothing recorded, until a build declares that trigger again; that
+build's cancel closes it, the flow still undeclared or not. A `manual` row has
+no trigger to enforce and is never refused this way.
+
+**Rationale**: a divergence is absorbed by no policy (PRD resolved q29),
+because nothing in the composition decides it, and an operator's cancel is the
+one act outside the composition — what q75 made it. Before, the row of an
+execution this build could not take stayed open for ever unless the
+composition was put back: every start recovered it and failed it again, the
+cancel route refused it `409` as already failed (or `404` as unknown), and
+where it held no lease slot nothing short of editing the journal closed it.
+"The row stays open" stands as the **default** (`docs/durability.md` §7) — a
+composition put back is still recovered — and the cancel is the operator
+saying it will not be. No finally node runs, because no generation can run one
+against a journal that does not describe it, and the row says so where a
+finally failure is already said (`finally_error`) rather than in `error`, which
+stays absent on a cancelled row (q75, D160).
+
+**Readings the ruling leaves to the implementation.** That "a recovery could
+not take" means **nothing here ever will**: a row of a flow the build declares
+that this process has not recovered yet is one this build can run, so its
+cancel is any open execution's — recorded, the row left for the recovery that
+takes it to complete the cancel with its finally node — and only a child whose
+open parent is itself unrecoverable is closed on no board, beside a flow the
+build does not declare. (An earlier reading closed every declared-flow row on
+no board, "lease or no lease" at its widest; a standby's cancel sent before
+its owed walk was retried then closed, with no finally node, an execution the
+walk was about to take — which q75's "every open instance … runs its finally
+node" and q81's "supersedes nothing" both rule out.) That the route takes the
+walk its process owes before it decides (`Recovery.before`, the wait every
+tick and event already makes), so such an execution is a running one by the
+time its cancel is read; that the cancel
+closes the descendants it reached and not one a finally node's dispatch began;
+that the descendant this process runs is left to its own controller — its row
+is its generation's to close — and the rows above it close only once it has
+settled, which holds the answer until its finally node has run, so that
+`cancelling: false` is true of the whole lineage rather than of the one row;
+that the settle and the export are journaled before the
+row ends, as every settle's are, so a process killed between them leaves the
+row open and a cancel sent again finds the settle down and closes the row; that
+an execution on no board is put on the board once its row ends; that its ledger
+rows and its `scope: execution` partitions go once its row has ended, as a
+settled execution's do; and the clipping of the reason. And that "lease or no
+lease" does **not** reach past q32's guard: the ruling supersedes nothing, and
+q75 ruling d keeps the route under the auth of the trigger that started the
+execution, so one whose trigger the build no longer declares is refused until
+the trigger is declared again, and the serve log says so rather than naming a
+cancel that would be refused. Whether a close should reach past that guard —
+for an execution whose trigger is gone along with its flow, which an operator
+can otherwise close only by putting the trigger back — is the owner's call,
+not made here.
+
+**A `run`'s row is still `404`.** A `run` beside a `serve` — on SQLite, where a
+run can open the journal beside a serving process — writes an open row this
+process is not running either. It is the `run`'s execution: `Ctrl-C` leaves it
+for `resume` (PRD resolved q28), and a cancel is `serve`'s (q75 ruling d). Its
+trigger is `manual`, so the route answers it `404` as it did — save one of a
+flow the build does not declare, which no `run` of this build can be running.
+A `manual` row this process recovered at its start is on its board, and closed
+like any other.
+
+**Collision review.** PRD resolved q29: a divergence is still absorbed by no
+policy and still keeps the row open — until a cancel says otherwise. q32: read,
+not amended — a close is under the auth of the trigger that started the
+execution, as every per-execution route is, so an execution whose trigger this
+build does not declare is refused `401` and its row stays open until a build
+declares that trigger again; the serve log says so for such an execution
+rather than naming a cancel the route refuses (the gap is recorded above for
+the owner). q69 ruling d and
+[D153](#d153-a-kv-key-may-expire-and-a-settled-executions-ledger-rows-are-deleted):
+a row this closes is a settled row, so its ledger rows are pruned once it has
+closed, behind the same holds, and D153's Status carries the amendment note;
+§11.3's "dies with that execution" is kept for the `scope: execution`
+partitions no generation's end removes here. q34 and
+q35: the settle webhook fires once, journaled before the row closes, guarded by
+the journal's record of it across generations, with `cancelled` among its
+statuses as q75 put it there. q75: ruling b's "a cancelled node settles as
+`cancelled`" is untouched — no node runs here — and ruling d's `202` for an
+open execution is the answer this gives; ruling d's "a cancel is `serve`'s" is
+kept for a `run`'s row; ruling e's "a restart mid-cancel completes the cancel"
+is how a recorded cancel of a row this build can run completes, at the
+recovery that takes it — so no execution this build can run ends without its
+finally node. q76: `finally_error` was "what a finally node raised
+after its own retries"; it now also carries the one case where no finally node
+could run, which q81 put there. [D159](#d159-finally-names-the-node-an-instance-runs-once-when-it-ends)'s
+seam is not reached: no instance ends here, since none is open in this
+process. [D160](#d160-a-cancel-ends-an-execution-cancelled-through-one-controller-every-node-chains-to):
+the request recorded first, the cascade and its walk, the finally exemption
+and the surfaces are read at their own words; its Status records that D163's
+reading of this case is ratified. [D163](#d163-a-triggers-intake-a-dedupe-window-and-groups-leased-off-the-journal)'s
+Status bullet on an open execution the serving build cannot run is amended — the
+row is closed rather than left open, and the intake decides only the slot — and
+carries the amendment note; its lease frees at the recorded request, as it did.
+
+**Status**: ratified — PRD resolved q81 (owner, 2026-11-16: "go with your
+recommendations it's fine"). The readings above are the implementation's,
+recorded for the owner. *PRD resolved q28, q29, q32, q34, q35, q69, q75, q76,
+q77, q81; §7.9, §11.3, §13.3; amends D153's and D163's Status; builds on D153,
+D159, D160.*
 
 ### D166. A `store` command's environment is its store's backend references alone
 

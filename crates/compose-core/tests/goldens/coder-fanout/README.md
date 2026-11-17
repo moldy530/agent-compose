@@ -204,11 +204,15 @@ headers `--header` names, which is how the credential the starting trigger's
 `auth:` reads travels. The app stops every node the execution is running (a
 model call, a command, a harness run, a placed dispatch) and every open child
 execution it started; each open instance ends `cancelled`, running its
-`finally:` node; and the row settles `cancelled`. The exit code is `0` when the
-app accepted the request (`202`), `1` when it refused it (`404`, `409` for an
-execution that has already ended, or the trigger's own refusal), and `2` when
-it could not be asked. A `run` is not cancelled this way: interrupting it leaves
-its row open for `resume`.
+`finally:` node; and the row settles `cancelled`. An execution the serving
+build's recovery could not take — a replay that diverged, recorded inputs it
+refuses, a flow it no longer declares — has nothing running it, so the app
+closes its row `cancelled` at once with no finally node run, which its
+`finally_error` says, and answers `cancelling: false`; the command prints why.
+The exit code is `0` when the app accepted the request (`202`), `1` when it
+refused it (`404`, `409` for an execution that has already ended, or the
+trigger's own refusal), and `2` when it could not be asked. A `run` is not
+cancelled this way: interrupting it leaves its row open for `resume`.
 
 `store` reads and writes one `kv` store of this composition through this
 target's own backend, with no flow written: `get <key>`, `set <key> <json>`
@@ -365,6 +369,7 @@ What `serve` writes about them goes to **stderr**, one line each:
 | ``[source <s>] <line>`` | the program writes a line to its stderr; one longer than 1 MiB is logged cut there, ending `[cut: …]` |
 | ``event trigger `<t>`: no event source `<s>` is bound under this target, so nothing consumes for it`` | a trigger's source is unbound under `local` |
 | ``this project's journal can be read now, so the <n> executions it holds open are recovered now, before any tick or event is admitted`` | a `serve` whose start could not read the journal — a standby, while another held it — can read it: what it holds open is recovered before any tick fires or event is admitted |
+| `` `<id>` (<flow>) could not be recovered by this build: <reason>; its row stays open until `agent-compose cancel <id>` closes it`` | a recovery this build could not take — a replay that diverged from its journal, recorded inputs this build's `inputs:` refuse, a flow it no longer declares — once per start for each such execution: its row stays open for a build that can run it, and `cancel` closes it `cancelled` with no finally node run; where the trigger that started it is one this build does not declare, the line goes on ``, which the cancel route refuses until this build declares the trigger `<trigger>` that started it again: a cancel is authenticated by that trigger's `auth:` (PRD resolved q32)`` |
 | ``intake `<t>`: <intake> queued for <execution>: <running> holds <group>`` | an arrival finds its group full under `on_conflict: queue` |
 | ``intake `<t>`: <intake> started <execution>`` | a queued arrival starts, as a slot of its group frees |
 | ``intake `<t>`: <intake> closed over <n> arrivals and started <execution>`` | a debounce closes and its one execution starts |

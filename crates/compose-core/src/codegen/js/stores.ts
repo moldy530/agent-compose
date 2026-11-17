@@ -1560,7 +1560,8 @@ function remember(
  * (`docs/durability.md` §5). The generation that *ends* the execution removes
  * it, and reaches the same op site to re-register it on the way ([`remember`]).
  * An execution nobody ever resumes leaves its partition behind, exactly as it
- * leaves its row open.
+ * leaves its row open — until a cancel closes that row, which removes it
+ * ([`releaseClosedExecution`], PRD resolved q81).
  */
 export function releaseExecution(id: string, parked = false): void {
   IN_PROCESS_ONLY.delete(id);
@@ -1901,6 +1902,65 @@ function pruneBlobLedger(store: StoreBinding, scopeKey: string, prefix: string):
 }
 
 runtime.settlesLedgers(pruneLedger);
+
+/**
+ * Remove the `scope: execution` partitions of an execution whose lifecycle row
+ * a cancel closed **with no generation of it running here** — one this build's
+ * recovery could not take (PRD resolved q81, Decision D165) — the lifetime
+ * grammar 11.3 declares, "dies with that execution", kept for the one
+ * execution no generation ends.
+ *
+ * [`releaseExecution`] removes what this process noted the execution owning
+ * ([`remember`]), when the generation that ends it lets go. Neither case
+ * reaches it here: a generation that stopped short of closing its row — a
+ * recovery whose replay diverged — let go as one that parked, keeping what is
+ * on disk for a resume (`runtime.staysOpen`), and an execution nothing here
+ * ever ran noted nothing. So the partitions are derived instead, the way
+ * [`pruneLedger`] derives the stores it visits: every store the composition
+ * binds ([`BOUND`]) at `scope: execution`, at the partition the execution's id
+ * addresses ([`partition`]) — a `blob` store's directory, its ledger markers
+ * inside it, and a dialled store's rows where this process holds the address
+ * variable, which every process that reaches the store holds
+ * (`docs/distributed.md` §9.1). An in-process `kv` or `vector` store's
+ * partition lived in the memory of the process that opened it, and died with
+ * it ([`inProcessOnly`]).
+ *
+ * Called by `serve`'s cancel route **after** the row has ended, never before —
+ * an open row is one a resume reads these partitions for (`docs/durability.md`
+ * §5) — and returns at once: a dialled store's `DELETE` is held in [`PRUNING`]
+ * for [`drainStores`], so a stop waits for it rather than cutting its
+ * connection. **Never the close's failure**: the row has closed, and a
+ * partition that could not be removed is rows or files nothing addresses
+ * again, said on stderr naming the store.
+ */
+export function releaseClosedExecution(execution: runtime.ExecutionIdentity): void {
+  releaseExecution(execution.id);
+  for (const store of BOUND.values()) {
+    if (store.scope !== "execution") continue;
+    const scopeKey = partition(store, execution);
+    const failed = (error: unknown): void => {
+      process.stderr.write(
+        `warning: the \`scope: execution\` partition execution \`${execution.id}\` left in \`${store.address}\` could not be removed (${error instanceof Error ? error.message : String(error)}); it stays where it is and nothing addresses it again, since a closed execution never resumes (PRD resolved q81)\n`,
+      );
+    };
+    try {
+      if (store.kind === "blob") {
+        fs.rmSync(blobRoot(store, scopeKey), { recursive: true, force: true });
+        continue;
+      }
+      if (!DIALLED_KV.includes(store.backend.provider)) continue;
+      const variable = store.backend.urlEnv;
+      if (variable === undefined || (process.env[variable] ?? "") === "") continue;
+      const forgetting = connectionFor(store)
+        .then((connection) => connection.forget(store.name, scopeKey))
+        .then(() => undefined, failed);
+      PRUNING.add(forgetting);
+      void forgetting.finally(() => PRUNING.delete(forgetting));
+    } catch (error) {
+      failed(error);
+    }
+  }
+}
 
 /**
  * Start the store-wide sweep of every `kv` store the composition binds — the

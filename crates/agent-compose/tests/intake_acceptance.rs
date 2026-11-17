@@ -94,7 +94,8 @@
 //!   can write, held to it —
 //!   [`a_dedupe_window_or_debounce_past_the_last_instant_is_held_to_it`];
 //! * a slot held by an open execution the serving build cannot run, freed by
-//!   its cancel — off the board, its flow renamed —
+//!   its cancel, which closes the row (PRD resolved q81) — off the board, its
+//!   flow renamed —
 //!   [`an_open_execution_of_a_flow_the_build_no_longer_declares_frees_its_slot_when_cancelled`],
 //!   and on it, its recovery refused —
 //!   [`an_execution_whose_recovery_the_build_could_not_take_frees_its_slot_when_cancelled`];
@@ -4101,8 +4102,9 @@ fn leave_the_slot_held(
 }
 
 /// Under a moved build, send `second` to the slot `first` still holds, see it
-/// wait there, cancel `first`, and see `second` start into the slot the
-/// cancel freed and complete. Answers the cancel's `202` body.
+/// wait there, cancel `first` — which closes its row `cancelled` with no
+/// finally node run (PRD resolved q81) — and see `second` start into the slot
+/// the cancel freed and complete. Answers the cancel's `202` body.
 fn cancel_frees_the_slot(
     app: &Client,
     project: &Path,
@@ -4138,7 +4140,19 @@ fn cancel_frees_the_slot(
     assert_eq!(cancelled.status, 202, "{}", cancelled.text());
     let body = cancelled.json();
     assert_eq!(body["execution_id"], first, "{body}");
-    assert_eq!(body["cancelling"], true, "{body}");
+    assert_eq!(body["status"], "cancelled", "{body}");
+    assert_eq!(
+        body["cancelling"], false,
+        "the cancel is complete: the row is closed, not left for a build that can run it: {body}"
+    );
+    assert_eq!(body["status_url"], format!("/executions/{first}"), "{body}");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("; the slot it held of the trigger `slot`'s lease is free"),
+        "{body}"
+    );
 
     let started = eventually(
         Duration::from_secs(30),
@@ -4159,22 +4173,36 @@ fn cancel_frees_the_slot(
         .find(|row| row.id == first)
         .expect("first's row");
     assert_eq!(
-        (held.status.as_str(), held.ended_at.as_deref()),
-        ("open", None),
-        "nothing this build runs closed first's row: the cancel freed its slot, and the \
-         start that next recovers it under a build that can run it completes the cancel"
+        held.status, "cancelled",
+        "the cancel closed first's row, which nothing this build runs would have: {rows:#?}"
     );
-    let cancels = harness::journal_rows(
+    assert!(held.ended_at.is_some(), "{rows:#?}");
+    let closed = harness::journal_rows(
         project,
-        &format!("SELECT COUNT(*) AS n FROM cancellations WHERE execution = '{first}'"),
+        &format!(
+            "SELECT executions.finally_error AS finally_error, executions.error AS error, \
+             (SELECT COUNT(*) FROM cancellations WHERE execution = '{first}') AS n \
+             FROM executions WHERE id = '{first}'"
+        ),
     );
-    assert_eq!(cancels[0]["n"], 1, "the cancel is recorded: {cancels}");
+    assert_eq!(closed[0]["n"], 1, "the cancel is recorded: {closed}");
+    assert!(closed[0]["error"].is_null(), "{closed}");
+    assert!(
+        closed[0]["finally_error"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with(
+                "no finally node ran: this build could not take up the execution's recovery ("
+            ),
+        "{closed}"
+    );
 
-    // Asked again, it is the same request again.
+    // Asked again, it is an ended execution's `409`.
     let again = app
         .send(Request::post(format!("/executions/{first}/cancel")))
         .expect("the cancel route answers");
-    assert_eq!(again.status, 202, "{}", again.text());
+    assert_eq!(again.status, 409, "{}", again.text());
+    assert_eq!(again.json()["status"], "cancelled", "{}", again.text());
     body
 }
 
@@ -4186,11 +4214,11 @@ fn cancel_frees_the_slot(
 /// renames the flow. Recovery leaves `first`'s row open in the journal and puts
 /// it on no board — nothing here can run it — and the lease is the open rows,
 /// so `second` queues behind it, and would for as long as the build is served.
-/// `POST /executions/<first>/cancel` reaches it all the same: `202`, the
-/// journal's `open` and a `detail` naming the flow this build lacks; the cancel
-/// is recorded, which frees the slot, and `second` starts and completes while
-/// `first`'s row stays open for a build that can complete the cancel. An id
-/// the journal does not hold is still `404`.
+/// `POST /executions/<first>/cancel` reaches it all the same and closes it
+/// (PRD resolved q81): `202`, `cancelled`, the status URL and a `detail` naming
+/// the flow this build lacks; the cancel is recorded, which frees the slot, the
+/// row is ended `cancelled` with no finally node run, and `second` starts and
+/// completes. An id the journal does not hold is still `404`.
 #[test]
 fn an_open_execution_of_a_flow_the_build_no_longer_declares_frees_its_slot_when_cancelled() {
     let provider = MockProvider::start().expect("a loopback port");
@@ -4215,17 +4243,17 @@ fn an_open_execution_of_a_flow_the_build_no_longer_declares_frees_its_slot_when_
     );
 
     let body = cancel_frees_the_slot(&app, &project, &scratch, &first);
-    assert_eq!(body["status"], "open", "{body}");
     assert!(
-        body.get("status_url").is_none(),
-        "no route of this build reports it: {body}"
-    );
-    assert!(
-        body["detail"]
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("this build declares no flow `flow.held` to run it by"),
+        body["detail"].as_str().unwrap_or_default().starts_with(
+            "this build could not take up this execution's recovery (this build declares no \
+             flow `flow.held`)"
+        ),
         "{body}"
+    );
+    assert_eq!(
+        get(&app, &format!("/executions/{first}")).json()["status"],
+        "cancelled",
+        "the closed execution is on this build's status route now"
     );
     let unknown = app
         .send(Request::post("/executions/exec_nobody_started/cancel"))
@@ -4242,8 +4270,9 @@ fn an_open_execution_of_a_flow_the_build_no_longer_declares_frees_its_slot_when_
 /// before anything opens, so this process reports it `failed` while its row
 /// stays open on purpose — the build's disagreement, not the execution's — and
 /// the open row holds the slot: `second` queues behind it. Cancelling `first`
-/// is not refused as already failed: `202`, this process's `failed` and its
-/// status URL; the slot frees, and `second` runs.
+/// is not refused as already failed: it closes the row (PRD resolved q81) —
+/// `202`, `cancelled` and its status URL, with the refusal as the reason; the
+/// slot frees, and `second` runs.
 #[test]
 fn an_execution_whose_recovery_the_build_could_not_take_frees_its_slot_when_cancelled() {
     let provider = MockProvider::start().expect("a loopback port");
@@ -4264,16 +4293,26 @@ fn an_execution_whose_recovery_the_build_could_not_take_frees_its_slot_when_canc
     let reported = harness::settled(&app, &first);
     assert_eq!(reported["status"], "failed", "{reported}");
 
+    // Its head, which no clipping of a long reason reaches.
+    let refusal: String = reported["error"]
+        .as_str()
+        .unwrap_or_default()
+        .chars()
+        .take(80)
+        .collect();
     let body = cancel_frees_the_slot(&app, &project, &scratch, &first);
-    assert_eq!(body["status"], "failed", "{body}");
-    assert_eq!(body["status_url"], format!("/executions/{first}"), "{body}");
     assert!(
         body["detail"]
             .as_str()
             .unwrap_or_default()
-            .starts_with("this process could not take up its recovery"),
+            .starts_with(&format!(
+                "this build could not take up this execution's recovery ({refusal}"
+            )),
         "{body}"
     );
+    let report = get(&app, &format!("/executions/{first}")).json();
+    assert_eq!(report["status"], "cancelled", "{report}");
+    assert!(report.get("error").is_none(), "{report}");
 }
 
 /// **A slot a superseding arrival's cancel frees under `max_running:` is an

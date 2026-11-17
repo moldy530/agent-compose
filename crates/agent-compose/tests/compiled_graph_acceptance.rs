@@ -23266,6 +23266,675 @@ fn nothing_settled(receiver: &harness::Receiver, budget: Duration) {
     }
 }
 
+/// **A cancel closes an execution whose recovery diverged, and no later start
+/// recovers it** (PRD resolved q81, Decision D165, `docs/durability.md` §7).
+///
+/// `flow.gate` parks under a `serve` that is then killed, started through
+/// `pushed` so its caller is owed a settle webhook, under a target whose
+/// `trace_sink:` is a collector this test owns. The composition moves — one
+/// line of the prompt — and the next `serve` cannot replay the record: the
+/// status route reports the divergence, the row stays open on purpose, and the
+/// serve log says so **once**, naming the command that closes it.
+///
+/// The cancel is that command. It answers `202` with the cancel complete —
+/// `cancelled`, `cancelling: false`, the status URL and a `detail` saying no
+/// finally node ran — and the row is ended `cancelled`: the request recorded,
+/// no `error`, and the reason in `finally_error`. The settle webhook goes once
+/// and the export ships, both saying `cancelled` with that `finally_error`. A
+/// second cancel is the `409` every ended execution gets, and a third `serve`
+/// — with the composition put back — recovers nothing: the row is closed for
+/// good.
+#[test]
+fn a_cancel_closes_an_execution_whose_recovery_diverged_and_no_later_start_recovers_it() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "worth signing off" })),
+    ));
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    let collector = harness::Receiver::start().expect("a loopback collector");
+    let deploy = durability_sink(&collector);
+    let (_original, original) =
+        harness::staged_with_deploy("cancel-diverged", "durability", "local", &deploy);
+    let (_moved, moved) =
+        harness::staged_with_deploy("cancel-diverged-moved", "durability", "local", &deploy);
+    std::fs::write(&moved, moved_prompt()).expect("the scratch area is writable");
+    let Some(project) = harness::scratch_project("cancel-diverged") else {
+        return;
+    };
+    let environment = harness::environment(&provider);
+    let Some(execution) = parked_and_killed(&project, &original, &environment, &receiver) else {
+        return;
+    };
+
+    let Some(mut second) = harness::serve_target_into(&project, &moved, "local", &environment)
+    else {
+        return;
+    };
+    let app = Client::new(&second.base_url).expect("a client for the generated app");
+    let diverged = harness::settled(&app, &execution);
+    assert_eq!(diverged["status"], "failed", "{diverged}");
+    let reason = diverged["error"].as_str().unwrap_or_default().to_string();
+    assert!(
+        reason.contains("ReplayDivergence: "),
+        "the status route reports what this build could not replay: {diverged}"
+    );
+    let expected = no_finally_ran(&clipped(&reason, 400));
+
+    let cancelled = app
+        .send(Request::post(format!("/executions/{execution}/cancel")))
+        .expect("the cancel route answers");
+    assert_eq!(cancelled.status, 202, "{}", cancelled.text());
+    let body = cancelled.json();
+    assert_closed_answer(&body, &execution, &clipped(&reason, 400));
+
+    let report = app
+        .get(&format!("/executions/{execution}"))
+        .expect("the status route answers")
+        .json();
+    assert_eq!(report["status"], "cancelled", "{report}");
+    assert!(
+        report.get("error").is_none(),
+        "a cancelled execution carries no `error`: {report}"
+    );
+    assert_eq!(report["finally_error"], expected, "{report}");
+    assert_closed_row(&project, &execution, &expected);
+
+    let pushed = receiver.wait_for_event("settled", 1, Duration::from_secs(30));
+    assert_eq!(pushed.len(), 1, "{pushed:?}");
+    assert_closed_document(&pushed[0].body, &execution, &expected);
+    let exported = collector.wait_for_event("settled", 1, Duration::from_secs(30));
+    assert_eq!(exported.len(), 1, "{exported:?}");
+    assert_closed_document(&exported[0].body, &execution, &expected);
+
+    let again = app
+        .send(Request::post(format!("/executions/{execution}/cancel")))
+        .expect("the cancel route answers");
+    assert_eq!(again.status, 409, "{}", again.text());
+    assert_eq!(again.json()["status"], "cancelled", "{}", again.text());
+
+    let said = second.stop_and_read_stderr();
+    assert_eq!(
+        unrecovered_lines(&said, &execution, "flow.gate").len(),
+        1,
+        "the start that could not recover the execution says so once, naming the \
+         command that closes it:\n{said}"
+    );
+
+    // The composition comes back, and the execution does not: its row is
+    // closed.
+    let Some(mut third) = harness::serve_target_into(&project, &original, "local", &environment)
+    else {
+        return;
+    };
+    let app = Client::new(&third.base_url).expect("a client for the generated app");
+    let gone = app
+        .get(&format!("/executions/{execution}"))
+        .expect("the status route answers");
+    assert_eq!(gone.status, 404, "{}", gone.text());
+    let said = third.stop_and_read_stderr();
+    assert!(
+        !said
+            .lines()
+            .any(|line| line.starts_with(&format!("recovered {execution}"))),
+        "a closed row is never recovered:\n{said}"
+    );
+    assert_eq!(
+        receiver.of_event("settled").len(),
+        1,
+        "one execution, one settle webhook"
+    );
+    assert_eq!(
+        provider.snapshot().requests,
+        1,
+        "nothing was asked of the provider past the first generation"
+    );
+}
+
+/// **A cancel closes an execution whose flow the serving build no longer
+/// declares** (PRD resolved q81, Decision D165).
+///
+/// The same parked `flow.gate`, and a next build that renames the flow — the
+/// triggers point at the new name. Recovery leaves the row open in the journal
+/// and puts it on no board: the status route does not know it, and the serve
+/// log names the cancel that closes it. The cancel does: `202`, `cancelled`,
+/// the status URL; the row ends `cancelled` with the request recorded and
+/// `finally_error` naming the flow this build lacks; the status route now
+/// reports it; the settle webhook goes once to the caller the row recorded,
+/// and the export ships with no entries — nothing ran here. A second cancel is
+/// `409`, and no later start recovers it.
+#[test]
+fn a_cancel_closes_an_execution_whose_flow_the_build_no_longer_declares() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "worth signing off" })),
+    ));
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    let collector = harness::Receiver::start().expect("a loopback collector");
+    let deploy = durability_sink(&collector);
+    let (_original, original) =
+        harness::staged_with_deploy("cancel-renamed", "durability", "local", &deploy);
+    let (_moved, moved) =
+        harness::staged_with_deploy("cancel-renamed-moved", "durability", "local", &deploy);
+    std::fs::write(&moved, renamed_gate()).expect("the scratch area is writable");
+    let Some(project) = harness::scratch_project("cancel-renamed") else {
+        return;
+    };
+    let environment = harness::environment(&provider);
+    let Some(execution) = parked_and_killed(&project, &original, &environment, &receiver) else {
+        return;
+    };
+
+    let Some(mut second) = harness::serve_target_into(&project, &moved, "local", &environment)
+    else {
+        return;
+    };
+    let app = Client::new(&second.base_url).expect("a client for the generated app");
+    let unknown = app
+        .get(&format!("/executions/{execution}"))
+        .expect("the status route answers");
+    assert_eq!(
+        unknown.status,
+        404,
+        "the execution is on no board of this build: {}",
+        unknown.text()
+    );
+
+    let reason = "this build declares no flow `flow.gate`";
+    let expected = no_finally_ran(reason);
+    let cancelled = app
+        .send(Request::post(format!("/executions/{execution}/cancel")))
+        .expect("the cancel route answers");
+    assert_eq!(cancelled.status, 202, "{}", cancelled.text());
+    assert_closed_answer(&cancelled.json(), &execution, reason);
+
+    let report = app
+        .get(&format!("/executions/{execution}"))
+        .expect("the status route answers");
+    assert_eq!(report.status, 200, "{}", report.text());
+    let report = report.json();
+    assert_eq!(report["status"], "cancelled", "{report}");
+    assert_eq!(report["flow"], "flow.gate", "{report}");
+    assert!(report.get("error").is_none(), "{report}");
+    assert_eq!(report["finally_error"], expected, "{report}");
+    assert_closed_row(&project, &execution, &expected);
+
+    let pushed = receiver.wait_for_event("settled", 1, Duration::from_secs(30));
+    assert_eq!(pushed.len(), 1, "{pushed:?}");
+    assert_closed_document(&pushed[0].body, &execution, &expected);
+    let exported = collector.wait_for_event("settled", 1, Duration::from_secs(30));
+    assert_eq!(exported.len(), 1, "{exported:?}");
+    assert_closed_document(&exported[0].body, &execution, &expected);
+    assert_eq!(
+        exported[0].body["entries"],
+        json!([]),
+        "nothing ran here, so the export carries what the row holds: {:#}",
+        exported[0].body
+    );
+
+    let again = app
+        .send(Request::post(format!("/executions/{execution}/cancel")))
+        .expect("the cancel route answers");
+    assert_eq!(again.status, 409, "{}", again.text());
+
+    let said = second.stop_and_read_stderr();
+    assert_eq!(
+        unrecovered_lines(&said, &execution, "flow.gate").len(),
+        1,
+        "the start that could not recover the execution names the command that \
+         closes it, once:\n{said}"
+    );
+
+    let Some(mut third) = harness::serve_target_into(&project, &original, "local", &environment)
+    else {
+        return;
+    };
+    let said = third.stop_and_read_stderr();
+    assert!(
+        !said
+            .lines()
+            .any(|line| line.starts_with(&format!("recovered {execution}"))),
+        "a closed row is never recovered:\n{said}"
+    );
+    assert_eq!(receiver.of_event("settled").len(), 1, "one settle webhook");
+}
+
+/// **A cancel of an execution whose trigger the serving build no longer
+/// declares is refused until a build declares that trigger again**, and the
+/// serve log says so rather than naming a cancel the route refuses (PRD
+/// resolved q32, q75 ruling d, q81, Decision D165).
+///
+/// The parked `flow.gate`, started through `pushed`, and a next build that
+/// renames the flow **and** that trigger — removing a flow removes its
+/// triggers with it. A close is a cancel, and the cancel route is under the
+/// `auth:` of the trigger that started the execution: this build cannot read
+/// what `pushed` required, so it refuses the cancel `401` whatever the request
+/// carries, records nothing, and leaves the row open. The one line the start
+/// writes about the execution says the cancel needs that trigger declared
+/// again; no line promises a close the route refuses. A build that declares
+/// `pushed` again — the flow still renamed — closes the row, and the caller
+/// the row recorded is sent its settle webhook once.
+#[test]
+fn a_cancel_of_an_execution_whose_trigger_the_build_no_longer_declares_is_refused_until_it_is_declared_again()
+ {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "worth signing off" })),
+    ));
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    let Some(project) = harness::scratch_project("cancel-untriggered") else {
+        return;
+    };
+    let environment = harness::environment(&provider);
+    let Some(execution) = parked_and_killed(
+        &project,
+        &harness::fixture("durability"),
+        &environment,
+        &receiver,
+    ) else {
+        return;
+    };
+
+    let gone = harness::Scratch::new("cancel-untriggered-gone");
+    let untriggered = gone.path().join("main.yml");
+    std::fs::write(&untriggered, untriggered_gate()).expect("the scratch area is writable");
+    let Some(mut second) = harness::serve_entrypoint_into(&project, &untriggered, &environment)
+    else {
+        return;
+    };
+    let app = Client::new(&second.base_url).expect("a client for the generated app");
+    let refused = app
+        .send(Request::post(format!("/executions/{execution}/cancel")))
+        .expect("the cancel route answers");
+    assert_eq!(refused.status, 401, "{}", refused.text());
+    let body = refused.json();
+    assert_eq!(body["trigger"], "pushed", "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("it was started by the trigger `pushed`, which this build does not declare"),
+        "the refusal is q32's, for a trigger whose `auth:` this build cannot read: {body}"
+    );
+    let rows = harness::journal_rows(
+        &project,
+        &format!(
+            "SELECT executions.status AS status, cancellations.requested_at AS requested_at \
+             FROM executions LEFT JOIN cancellations ON cancellations.execution = executions.id \
+             WHERE executions.id = '{execution}'"
+        ),
+    );
+    assert_eq!(rows[0]["status"], "open", "the row stays open: {rows}");
+    assert!(
+        rows[0]["requested_at"].is_null(),
+        "a refused cancel records nothing: {rows}"
+    );
+
+    let said = second.stop_and_read_stderr();
+    let guarded = format!(
+        "`{execution}` (flow.gate) could not be recovered by this build: this build declares no \
+         flow `flow.gate`; its row stays open until `agent-compose cancel {execution}` closes it, \
+         which the cancel route refuses until this build declares the trigger `pushed` that \
+         started it again: a cancel is authenticated by that trigger's `auth:` (PRD resolved q32)"
+    );
+    assert_eq!(
+        said.lines().filter(|line| *line == guarded).count(),
+        1,
+        "the start says, once, what the cancel needs first:\n{said}"
+    );
+    assert!(
+        unrecovered_lines(&said, &execution, "flow.gate").is_empty(),
+        "no line names a cancel the route would refuse:\n{said}"
+    );
+    assert!(
+        receiver.of_event("settled").is_empty(),
+        "nothing settled: the row is open"
+    );
+
+    // The trigger comes back — the flow does not — and the cancel closes the
+    // row.
+    let back = harness::Scratch::new("cancel-untriggered-back");
+    let triggered = back.path().join("main.yml");
+    std::fs::write(&triggered, renamed_gate()).expect("the scratch area is writable");
+    let Some(mut third) = harness::serve_entrypoint_into(&project, &triggered, &environment) else {
+        return;
+    };
+    let app = Client::new(&third.base_url).expect("a client for the generated app");
+    let reason = "this build declares no flow `flow.gate`";
+    let closed = app
+        .send(Request::post(format!("/executions/{execution}/cancel")))
+        .expect("the cancel route answers");
+    assert_eq!(closed.status, 202, "{}", closed.text());
+    assert_closed_answer(&closed.json(), &execution, reason);
+    let expected = no_finally_ran(reason);
+    assert_closed_row(&project, &execution, &expected);
+    let pushed = receiver.wait_for_event("settled", 1, Duration::from_secs(30));
+    assert_eq!(pushed.len(), 1, "{pushed:?}");
+    assert_closed_document(&pushed[0].body, &execution, &expected);
+
+    let said = third.stop_and_read_stderr();
+    assert_eq!(
+        unrecovered_lines(&said, &execution, "flow.gate").len(),
+        1,
+        "a build that declares the trigger names the cancel that closes it:\n{said}"
+    );
+    assert!(
+        !said.contains("which the cancel route refuses"),
+        "…and says nothing of a refusal it would not make:\n{said}"
+    );
+}
+
+/// **A cancel that closes an execution lets go of what a settled execution
+/// lets go of**: the idempotency ledger rows its keyed writes left, and the
+/// partition of its `scope: execution` store (PRD resolved q69 ruling d, q81;
+/// grammar §11.3; Decisions D153, D165).
+///
+/// Two executions a `run` left open: `flow.staged`, killed while its model
+/// call is in flight, past a keyed write to the `scope: global` `store.ledger`
+/// — whose ledger row an open execution keeps, so its resume writes nothing
+/// twice — and `flow.papered`, parked at its pause, past a `put` to the
+/// `scope: execution` blob store `store.papers`, a directory a parked run
+/// leaves on disk for its resume. The next build declares neither flow, so no
+/// generation will ever end either execution: both keep what they hold while
+/// the serve runs, until a cancel closes each. Then the ledger row is pruned —
+/// the entry the write made stays — and the partition is removed.
+#[test]
+fn a_cancel_that_closes_an_execution_prunes_its_ledger_rows_and_removes_its_execution_scoped_partition()
+ {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "note": "a staged note" })).after(Duration::from_secs(120)),
+    ));
+    let Some((project, built)) = harness::build_under_toolchain("durability", "cancel-releases")
+    else {
+        return;
+    };
+    assert!(
+        built.status.success(),
+        "the durability fixture did not build"
+    );
+    let shims = harness::Scratch::new("cancel-releases-tally");
+    let log = shims.path().join("tally.log");
+    harness::shim(
+        shims.path(),
+        "tally",
+        "printf 'ran\\n' >> \"$TALLY_LOG\"\nprintf 'tallied'\n",
+    );
+    let mut environment = harness::environment(&provider);
+    environment.push((
+        harness::TALLY_BIN.to_string(),
+        shims.path().display().to_string(),
+    ));
+    environment.push((harness::TALLY_LOG.to_string(), log.display().to_string()));
+
+    let staged = harness::crash_run(
+        &project,
+        &["run", "flow.staged", "--input", "topic=durability"],
+        &environment,
+        |_| provider.snapshot().requests >= 1,
+    )
+    .execution;
+    let parked = harness::run_formatted(
+        &project,
+        "durability",
+        "flow.papered",
+        &[("topic", "durability")],
+        None,
+        Some("json"),
+        &environment,
+    );
+    let said_on_stderr = parked.failed();
+    let report = parked.outputs();
+    assert_eq!(
+        report["status"], "interrupted",
+        "{report}\n{said_on_stderr}"
+    );
+    let papered = report["execution_id"]
+        .as_str()
+        .expect("a run names the execution it opened")
+        .to_string();
+
+    let ledger_file = project
+        .join(".agent-compose")
+        .join("stores")
+        .join("ledger.sqlite");
+    let ledger_rows = || {
+        harness::sqlite_rows(
+            &project,
+            &ledger_file,
+            &format!(
+                "SELECT COUNT(*) AS n FROM applied WHERE substr(idempotency_key, 1, {}) = '{staged}/'",
+                staged.len() + 1
+            ),
+        )[0]["n"]
+            .clone()
+    };
+    let partition = project
+        .join(".agent-compose")
+        .join("blobs")
+        .join("papers")
+        .join("execution")
+        .join(&papered);
+
+    let moved = harness::Scratch::new("cancel-releases-moved");
+    let entrypoint = moved.path().join("main.yml");
+    let source = std::fs::read_to_string(harness::fixture("durability")).expect("the fixture");
+    let edited = source
+        .replace("\nflow.staged:\n", "\nflow.restaged:\n")
+        .replace("\nflow.papered:\n", "\nflow.repapered:\n");
+    assert!(
+        edited.contains("\nflow.restaged:\n") && edited.contains("\nflow.repapered:\n"),
+        "both flows are renamed"
+    );
+    std::fs::write(&entrypoint, edited).expect("the scratch area is writable");
+    provider.reset();
+    let Some(mut served) = harness::serve_entrypoint_into(&project, &entrypoint, &environment)
+    else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    assert_eq!(
+        ledger_rows(),
+        json!(1),
+        "an execution the journal holds open keeps its ledger rows, though nothing here runs it"
+    );
+    assert!(
+        partition.is_dir(),
+        "…and its `scope: execution` partition: `{}` is not there",
+        partition.display()
+    );
+
+    for (execution, flow) in [(&staged, "flow.staged"), (&papered, "flow.papered")] {
+        let closed = app
+            .send(Request::post(format!("/executions/{execution}/cancel")))
+            .expect("the cancel route answers");
+        assert_eq!(closed.status, 202, "{}", closed.text());
+        let reason = format!("this build declares no flow `{flow}`");
+        assert_closed_answer(&closed.json(), execution, &reason);
+        assert_closed_row(&project, execution, &no_finally_ran(&reason));
+    }
+
+    harness::until(Duration::from_secs(30), || {
+        (ledger_rows() == json!(0)).then_some(())
+    });
+    assert_eq!(
+        harness::sqlite_rows(&project, &ledger_file, "SELECT key FROM entries"),
+        json!([{ "key": "entry" }]),
+        "the prune takes the ledger row, never the entry the write made"
+    );
+    harness::until(Duration::from_secs(30), || {
+        (!partition.exists()).then_some(())
+    });
+
+    let said = served.stop_and_read_stderr();
+    assert!(
+        !said.contains("could not be pruned") && !said.contains("could not be removed"),
+        "{said}"
+    );
+    assert_eq!(
+        provider.snapshot().requests,
+        0,
+        "nothing ran here: the close runs no node"
+    );
+}
+
+/// `durability` with `flow.gate` renamed and its `pushed` trigger renamed with
+/// it: a build that declares neither the flow an open execution ran nor the
+/// trigger that started it.
+fn untriggered_gate() -> String {
+    let edited = renamed_gate().replace("\n  pushed:\n", "\n  pushed_again:\n");
+    assert!(
+        !edited.contains("\n  pushed:\n") && edited.contains("\n  pushed_again:\n"),
+        "the trigger is renamed"
+    );
+    edited
+}
+
+/// A deploy file for `local` — the one target the `durability` fixture's
+/// detached dispatches compile under (Decision D59) — naming a trace sink at
+/// `collector`.
+fn durability_sink(collector: &harness::Receiver) -> String {
+    format!(
+        "version: \"0.1\"\n\ntrace_sink:\n  url: \"{}/v1/traces\"\n",
+        collector.base_url
+    )
+}
+
+/// `durability` with `flow.gate` renamed, its two `http` triggers following
+/// it: a build that no longer declares the flow an open execution ran.
+fn renamed_gate() -> String {
+    let source = std::fs::read_to_string(harness::fixture("durability")).expect("the fixture");
+    let edited = source
+        .replace("\nflow.gate:\n", "\nflow.gated:\n")
+        .replace("    flow: flow.gate\n", "    flow: flow.gated\n");
+    assert_eq!(
+        edited.matches("flow.gated").count(),
+        3,
+        "the flow and both of its triggers are renamed"
+    );
+    edited
+}
+
+/// Start `flow.gate` through `pushed` under a `serve` of `entrypoint`, its
+/// callback at `receiver`, wait for its pause and its parking webhook, and kill
+/// the `serve` — the row left open. Answers the execution's id.
+fn parked_and_killed(
+    project: &Path,
+    entrypoint: &Path,
+    environment: &[(String, String)],
+    receiver: &harness::Receiver,
+) -> Option<String> {
+    let first = harness::serve_target_into(project, entrypoint, "local", environment)?;
+    let app = Client::new(&first.base_url).expect("a client for the generated app");
+    let started = app
+        .post_json(
+            "/gate-pushed",
+            &json!({
+                "topic": "durability",
+                "callback_url": format!("{}/done", receiver.base_url),
+            }),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{}", started.text());
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+    let status = harness::settled(&app, &execution);
+    assert_eq!(status["status"], "interrupted", "{status}");
+    receiver.wait_for_event("parked", 1, Duration::from_secs(30));
+    // Dropped here: `SIGKILL` to the whole group, the row left open.
+    drop(first);
+    Some(execution)
+}
+
+/// `text` as the runtime clips a reason to `limit` characters (PRD resolved
+/// q81): whole where it fits, and otherwise its first `limit - 1` characters
+/// and an ellipsis.
+fn clipped(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let mut kept: String = text.chars().take(limit - 1).collect();
+    kept.push('…');
+    kept
+}
+
+/// What a closed execution's `finally_error` says (PRD resolved q81).
+fn no_finally_ran(reason: &str) -> String {
+    format!("no finally node ran: this build could not take up the execution's recovery ({reason})")
+}
+
+/// The cancel route's answer for a closed row: `202`'s body, complete.
+fn assert_closed_answer(body: &Value, execution: &str, reason: &str) {
+    assert_eq!(body["execution_id"], execution, "{body}");
+    assert_eq!(body["status"], "cancelled", "{body}");
+    assert_eq!(
+        body["cancelling"], false,
+        "the cancel is complete, not under way: {body}"
+    );
+    assert_eq!(
+        body["status_url"],
+        format!("/executions/{execution}"),
+        "{body}"
+    );
+    let detail = body["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.starts_with(&format!(
+            "this build could not take up this execution's recovery ({reason}), so no \
+             generation of it can run here"
+        )),
+        "{body}"
+    );
+    assert!(detail.contains("no finally node ran"), "{body}");
+}
+
+/// The lifecycle row of a closed execution: `cancelled`, its cancel request
+/// recorded, no `error`, and `finally_error` saying no finally node ran.
+fn assert_closed_row(project: &Path, execution: &str, finally_error: &str) {
+    let rows = harness::journal_rows(
+        project,
+        &format!(
+            "SELECT executions.status AS status, executions.error AS error, \
+             executions.finally_error AS finally_error, executions.ended_at AS ended_at, \
+             cancellations.requested_at AS requested_at FROM executions \
+             LEFT JOIN cancellations ON cancellations.execution = executions.id \
+             WHERE executions.id = '{execution}'"
+        ),
+    );
+    let row = &rows[0];
+    assert_eq!(row["status"], "cancelled", "{rows}");
+    assert!(row["error"].is_null(), "{rows}");
+    assert_eq!(row["finally_error"], finally_error, "{rows}");
+    assert!(row["ended_at"].is_string(), "{rows}");
+    assert!(
+        row["requested_at"].is_string(),
+        "the cancel request is recorded first, as every cancel's is: {rows}"
+    );
+}
+
+/// A settle webhook's report or an export's envelope for a closed execution.
+fn assert_closed_document(document: &Value, execution: &str, finally_error: &str) {
+    assert_eq!(document["execution_id"], execution, "{document:#}");
+    assert_eq!(document["status"], "cancelled", "{document:#}");
+    assert_eq!(document["finally_error"], finally_error, "{document:#}");
+    assert!(document.get("error").is_none(), "{document:#}");
+}
+
+/// The serve log's lines naming `execution` as one this build could not
+/// recover, each naming the command that closes it.
+fn unrecovered_lines<'a>(said: &'a str, execution: &str, flow: &str) -> Vec<&'a str> {
+    let head = format!("`{execution}` ({flow}) could not be recovered by this build: ");
+    let tail = format!("; its row stays open until `agent-compose cancel {execution}` closes it");
+    said.lines()
+        .filter(|line| line.starts_with(&head) && line.ends_with(&tail))
+        .collect()
+}
+
 /// An answer that arrives **while a recovered execution is still on its way back
 /// to its pause** is told to send it again — not that there is nothing waiting.
 ///
@@ -32449,7 +33118,7 @@ fn two_serves_on_one_postgres_journal_fire_each_tick_once() {
         return;
     };
     let query = |sql: &str| -> Vec<Value> {
-        postgres_rows(&one, &url, sql)
+        harness::postgres_rows(&one, &url, sql)
             .as_array()
             .expect("rows")
             .clone()
@@ -32510,30 +33179,6 @@ fn two_serves_on_one_postgres_journal_fire_each_tick_once() {
         "every tick the journal held was fired by one hub or the other: {one_said}\n{two_said}"
     );
     drop(scratch);
-}
-
-/// Rows of a dialled Postgres journal, read through the `pg` driver the built
-/// project pins — the same one its journal arm opens it with.
-fn postgres_rows(project: &Path, url: &str, sql: &str) -> Value {
-    let script = project.join("postgres-rows.mjs");
-    std::fs::write(
-        &script,
-        "import pg from \"pg\";\nconst client = new pg.Client({ connectionString: process.env.ROWS_URL });\nawait client.connect();\ntry {\n  const answer = await client.query(process.env.ROWS_SQL);\n  process.stdout.write(JSON.stringify(answer.rows));\n} finally {\n  await client.end();\n}\n",
-    )
-    .expect("the project is writable");
-    let mut command = harness::bun_command().expect("bun, since a project was built");
-    command
-        .arg(&script)
-        .env("ROWS_URL", url)
-        .env("ROWS_SQL", sql)
-        .current_dir(project);
-    let output = command.output().expect("bun runs");
-    assert!(
-        output.status.success(),
-        "the Postgres query failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).expect("JSON rows")
 }
 
 /// A standby takes a dialled journal over **with** what the hub it replaces
@@ -32603,7 +33248,7 @@ fn a_standby_serve_recovers_what_the_serve_it_takes_over_from_left_open_before_i
         return;
     };
     let open = |sql_trigger: &str| -> BTreeSet<String> {
-        postgres_rows(
+        harness::postgres_rows(
             &one,
             &url,
             &format!(
@@ -32642,7 +33287,7 @@ fn a_standby_serve_recovers_what_the_serve_it_takes_over_from_left_open_before_i
         Duration::from_secs(90),
         "every execution the first serve left running to complete under the standby",
         || {
-            let rows = postgres_rows(
+            let rows = harness::postgres_rows(
                 &one,
                 &url,
                 &format!("SELECT id, status FROM executions WHERE trigger_kind = '{trigger}'"),
