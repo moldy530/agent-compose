@@ -73,9 +73,11 @@
 //!
 //! ```text
 //! agent-compose run <path> <flow> [--input k=v]... [--session <key>]
+//!                                 [--host <host>] [--port <port>]
 //!                                 [--target <name>] [--out <dir>] [--no-build]
 //!                                 [--format human|json]
-//! agent-compose resume <path> <execution> [--target <name>] [--out <dir>]
+//! agent-compose resume <path> <execution> [--host <host>] [--port <port>]
+//!                                         [--target <name>] [--out <dir>]
 //!                                         [--format human|json]
 //! agent-compose serve <path> [--host <host>] [--port <port>]
 //!                            [--target <name>] [--out <dir>] [--no-build]
@@ -383,6 +385,13 @@ enum Command {
         /// The session identity session-scoped stores key off (grammar 11.3)
         #[arg(long, value_name = "KEY")]
         session: Option<String>,
+        /// Where a worker joins this run, once it reaches placed work [default: 127.0.0.1]
+        #[arg(long, value_name = "HOST")]
+        host: Option<String>,
+        /// The port a worker joins this run on; `0` takes one the operating system picks
+        /// [default: 0]
+        #[arg(long, value_name = "PORT")]
+        port: Option<u16>,
         /// Deploy target to resolve and emit for
         #[arg(long, value_name = "NAME", default_value = DEFAULT_TARGET)]
         target: String,
@@ -404,6 +413,13 @@ enum Command {
         /// The execution to resume, as `run` printed it (`execution: exec_…`)
         #[arg(value_name = "EXECUTION")]
         execution: String,
+        /// Where a worker joins this resume, once it reaches placed work [default: 127.0.0.1]
+        #[arg(long, value_name = "HOST")]
+        host: Option<String>,
+        /// The port a worker joins this resume on; `0` takes one the operating system picks
+        /// [default: 0]
+        #[arg(long, value_name = "PORT")]
+        port: Option<u16>,
         /// Deploy target to resolve and emit for
         #[arg(long, value_name = "NAME", default_value = DEFAULT_TARGET)]
         target: String,
@@ -838,6 +854,8 @@ fn main() -> ExitCode {
             flow,
             inputs,
             session,
+            host,
+            port,
             target,
             out,
             no_build,
@@ -853,6 +871,7 @@ fn main() -> ExitCode {
                 arguments.push("--session".to_string());
                 arguments.push(session);
             }
+            mesh_address(&mut arguments, host, port);
             arguments.push("--format".to_string());
             arguments.push(
                 match format {
@@ -875,6 +894,8 @@ fn main() -> ExitCode {
         Command::Resume {
             path,
             execution,
+            host,
+            port,
             target,
             out,
             format,
@@ -885,7 +906,7 @@ fn main() -> ExitCode {
             // one execution's record replayed into another execution's run
             // (PRD resolved q29). The emitted CLI reads both off the lifecycle
             // row.
-            let arguments = vec![
+            let mut arguments = vec![
                 "resume".to_string(),
                 execution,
                 "--format".to_string(),
@@ -895,6 +916,7 @@ fn main() -> ExitCode {
                 }
                 .to_string(),
             ];
+            mesh_address(&mut arguments, host, port);
             launch(
                 &path,
                 "resume",
@@ -1215,6 +1237,26 @@ impl Prepare {
     /// The `--no-build` flag, read.
     const fn from_flag(no_build: bool) -> Self {
         if no_build { Self::AsBuilt } else { Self::Build }
+    }
+}
+
+/// Hand a `run` or `resume` the address it serves its mesh at, where the command
+/// named one (grammar §14.1, Decision D171).
+///
+/// A run is the hub its own placed work is dispatched from: the first placed
+/// node — or instance of a placed flow — it reaches starts a listener for the
+/// worker routes, and a worker claiming the placement joins **it**. Nothing
+/// listens until then, so a run that reaches nothing placed binds no port and
+/// these two flags change nothing about it. Left out, the emitted CLI takes what
+/// `serve` takes: `127.0.0.1`, and a port the operating system picks.
+fn mesh_address(arguments: &mut Vec<String>, host: Option<String>, port: Option<u16>) {
+    if let Some(host) = host {
+        arguments.push("--host".to_string());
+        arguments.push(host);
+    }
+    if let Some(port) = port {
+        arguments.push("--port".to_string());
+        arguments.push(port.to_string());
     }
 }
 

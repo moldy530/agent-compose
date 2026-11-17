@@ -16492,8 +16492,10 @@ export async function holdRemotePause(
   const board = humanBoards.get(execution);
   if (board === undefined || !board.resumable) {
     // The same answer a local pause gets on a run with no answer surface, and
-    // the same nothing is journaled. Unreachable through `serve`, which is the
-    // only invocation that mounts a mesh at all (`./mesh.ts`'s `mounted`).
+    // the same nothing is journaled. Reached by a `run` or a `resume`, which
+    // serve a mesh once they dispatch placed work (`./mesh.ts`'s
+    // `serveWhenReached`) and may have nobody to ask; never through `serve`,
+    // whose board is always resumable.
     throw new HumanInterrupt(remote.flow, remote.node, remote.wait, opened);
   }
 
@@ -17097,16 +17099,19 @@ async function placedRunnerMayOutlive(journal: Journal, execution: string): Prom
 
 /**
  * Whether this process hands placed nodes to workers — set by `./mesh.ts` as
- * it mounts the worker routes ([`handsOutPlacedNodes`]), so in a `serve` whose
- * target places something and nowhere else.
+ * it mounts the worker routes ([`handsOutPlacedNodes`]): in a `serve` whose
+ * target places something, and in a `run` or a `resume` from its first
+ * dispatch to a placement (Decision D171).
  *
  * What it decides is whether a settled execution's prune, waiting behind
  * detached deliveries, asks [`placedRunnerMayOutlive`] again as it starts
  * ([`settleExecution`]): a delivery still in flight can reach a placed node,
  * and only a process that hands them out can have handed one over since the
- * settlement asked. One that hands none out has nothing new to find — and is a
- * `run` or a `resume`, whose journal is closed by the time its exit starts the
- * prune.
+ * settlement asked. One that hands none out has nothing new to find. A `run`
+ * or a `resume` that does hand them out may have let go of its journal by the
+ * time its exit starts the prune, and a journal that cannot answer is read as
+ * "it may" — the rows are kept, which is the side that costs storage rather
+ * than a write applied twice.
  */
 let handsOut = false;
 

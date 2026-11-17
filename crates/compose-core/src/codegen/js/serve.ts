@@ -1214,6 +1214,19 @@ function question(execution: Execution, wait: runtime.HumanWait): Record<string,
 }
 
 /**
+ * An app for a `run` or `resume` to serve its mesh from, once a dispatch it
+ * makes first reaches a placement (`./mesh.ts`'s `serveWhenReached`, Decision
+ * D171): no trigger route, no status route and no recovery — a run is one
+ * execution, reported on its own terminal — and the bodies decoded exactly as
+ * [`createApp`]'s are, so a worker meets the same app whichever verb it joined.
+ */
+export function meshApp(): FastifyInstance {
+  const app = Fastify({ logger: false });
+  decodeBodies(app);
+  return app;
+}
+
+/**
  * One decoding rule for every request body, which is grammar 13.3's own
  * (Decision D117).
  *

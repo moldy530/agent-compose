@@ -11,7 +11,8 @@
 //
 // ```text
 // src/index.ts run <flow> [--input k=v]... [--session <key>] [--format human|json]
-// src/index.ts resume <execution> [--format human|json]
+//                  [--host <host>] [--port <port>]
+// src/index.ts resume <execution> [--format human|json] [--host <host>] [--port <port>]
 // src/index.ts serve [--host <host>] [--port <port>]
 // src/index.ts store <sub-verb> <store> [operands] [--session <key> | --execution <id>]
 //                    [--format human|json] [options]
@@ -153,6 +154,8 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
+import type { FastifyInstance } from "fastify";
+
 import {
   CallbackRetryError,
   blankSinkCredentials,
@@ -206,13 +209,14 @@ import {
   sweepBoundStores,
 } from "./stores.ts";
 import type { HistoryEntry, OperatorTarget, StoreBinding, StoreParams } from "./stores.ts";
-import { publicUrl } from "./deployment.ts";
+import { joinTokenEnv, placements, publicUrl } from "./deployment.ts";
 import {
   type EnvironmentReference,
   MissingEnvironmentError,
   environmentReferences,
   readEnvironment,
 } from "./env.ts";
+import { serveWhenReached } from "./mesh.ts";
 import { eventTriggers, httpTriggers, manualTriggers, scheduleTriggers } from "./triggers.ts";
 
 /** What a `--format` selects. */
@@ -386,10 +390,13 @@ async function run(argv: readonly string[]): Promise<number> {
     input: "repeatable",
     session: "single",
     format: "single",
+    host: "single",
+    port: "single",
   });
   const inputs = bindInputs(flow, options.repeated["input"] ?? []);
   const session = sessionOf(flow, options.single["session"] ?? "");
   const format = formatOf(options.single["format"]);
+  const mesh = meshAddress(options.single);
   requireSession(address, flow, session);
   await refuseCovered(address);
 
@@ -397,7 +404,7 @@ async function run(argv: readonly string[]): Promise<number> {
   // both of its ways out: it is what makes the trace file's name unique (see
   // [`writeTrace`]), and a failed run has no `FlowRun` to read one back off.
   const execution = `exec_${globalThis.crypto.randomUUID()}`;
-  return await execute({ address, inputs, session, format, execution, resuming: false });
+  return await execute({ address, inputs, session, format, execution, resuming: false, mesh });
 }
 
 /**
@@ -481,8 +488,9 @@ async function resumeVerb(argv: readonly string[]): Promise<number> {
       "`resume` takes an execution id: `resume <execution-id>` — a `run` prints it on stderr as `execution: exec_…`, and `serve` answers it as `execution_id`",
     );
   }
-  const options = parse("resume", rest, { format: "single" });
+  const options = parse("resume", rest, { format: "single", host: "single", port: "single" });
   const format = formatOf(options.single["format"]);
+  const mesh = meshAddress(options.single);
 
   if (!journalExists()) {
     throw new UsageError(
@@ -532,6 +540,7 @@ async function resumeVerb(argv: readonly string[]): Promise<number> {
     format,
     execution,
     resuming: true,
+    mesh,
     trigger: row.trigger,
     // What this execution's request asked to be told when it ends, off the
     // lifecycle row that recorded it (`docs/durability.md` §3.5). A `run` never
@@ -649,6 +658,8 @@ interface Job {
   readonly execution: string;
   /** Whether the journal's record is consumed rather than only written. */
   readonly resuming: boolean;
+  /** Where this run serves the mesh, if a dispatch it makes reaches a placement. */
+  readonly mesh: MeshAddress;
   /** What started it, for a fresh execution's lifecycle row. */
   readonly trigger?: string;
   /** Where its `settled` webhook goes, for a `resume` that closes one. */
@@ -671,6 +682,11 @@ interface Job {
  * construction rather than by two implementations agreeing.
  */
 async function execute(job: Job): Promise<number> {
+  // **The mesh this run serves, should it reach a placement** (Decision D171,
+  // PRD resolved q84). Registered, not started: nothing listens until the first
+  // placed node — or instance of a placed flow — this run reaches is
+  // dispatched, so a run that reaches nothing placed binds no port.
+  if (placements.length > 0) serveWhenReached(async (mount) => await servingMesh(job.mesh, mount));
   // A process start, which is half of PRD resolved q69's cleanup schedule: every
   // `kv` store the composition binds starts shedding the keys that have expired
   // in it — behind this run's ops, never in front of them, the stores this run
@@ -2910,6 +2926,53 @@ function parse(
     }
   }
   return { single, repeated, flags, operands };
+}
+
+/** `--host` and `--port`, for the mesh a `run` or `resume` serves once it needs one. */
+interface MeshAddress {
+  readonly host: string;
+  readonly port: number;
+}
+
+/**
+ * Read `--host` and `--port` the way `serve` reads them: `127.0.0.1` and a port
+ * the operating system picks, unless the command names one.
+ */
+function meshAddress(single: Readonly<Record<string, string>>): MeshAddress {
+  const port = single["port"];
+  if (port !== undefined && !/^[0-9]+$/.test(port)) {
+    throw new UsageError(`\`--port ${port}\` is not a port number`);
+  }
+  return { host: single["host"] ?? "127.0.0.1", port: port === undefined ? 0 : Number(port) };
+}
+
+/**
+ * Serve the worker routes for this run, at the first dispatch it makes to a
+ * placement (`./mesh.ts`'s `serveWhenReached`, Decision D171): a `run` is the
+ * hub its own placed work is dispatched from, so a worker claiming the
+ * placement joins **this process**, at the address said here.
+ *
+ * Said on **stderr**, under either format, because stdout is the run's answer
+ * — and said as the command a worker is started with, since that is what a
+ * reader at this terminal does next. What follows is a served hub's dispatch:
+ * the work parks until a worker joins, and the run waits for it.
+ */
+async function servingMesh(
+  address: MeshAddress,
+  mount: (app: FastifyInstance) => void,
+): Promise<void> {
+  const { meshApp } = await import("./serve.ts");
+  const app = meshApp();
+  mount(app);
+  await app.listen({ host: address.host, port: address.port });
+  const bound = app.server.address();
+  const port = typeof bound === "object" && bound !== null ? bound.port : address.port;
+  const shown = address.host === "0.0.0.0" || address.host === "::" ? "127.0.0.1" : address.host;
+  const url = `http://${shown}:${port}`;
+  const claims = placements.map((placement) => `--claim ${placement.name}`).join(" ");
+  process.stderr.write(
+    `mesh: ${url} — this run dispatches placed work and waits for a worker to join it: agent-compose worker --hub ${url} ${claims} --token-env ${joinTokenEnv ?? "<VAR>"}\n`,
+  );
 }
 
 function formatOf(given: string | undefined): Format {

@@ -645,31 +645,110 @@ const waitWatchers = new Map<string, Set<() => void>>();
  * Whether this process can dispatch at all — that is, whether an app has mounted
  * the routes a worker joins through.
  *
- * `agent-compose run` builds no app, so a placed node reached there has no mesh
- * to reach: the run is refused at the node with [`PlacementUnreachable`], which
- * is the shape `runtime.HumanInterrupt` already has for a pause a run has no way
- * to answer. The alternative — parking on a board nothing will ever poll — is a
- * command that never returns.
+ * `serve` mounts them as it starts, on a target that declares `placements:`
+ * ([`mountWorkerRoutes`]). `agent-compose run` and `resume` build no app of
+ * their own, so they mount them **when a dispatch first needs them**
+ * ([`serveWhenReached`]): the first placed node — or instance of a placed flow
+ * (Decision D171) — that the run reaches starts a listener carrying exactly
+ * these routes, and from then on the run is the hub its dispatches are made
+ * from. A run that reaches nothing placed listens on nothing, which is every run
+ * of a composition that places nothing.
  *
- * A **placed flow's** instance is refused the same way, because its dispatch is
- * this one (Decision D171): a `flow:` node, a `map` item or a flow-as-tool call
- * over a placed flow fails where a placed agent's node would, and a `run` of the
- * placed flow itself fails its execution at the root dispatch. None of them
- * falls back to running the instance in this process — the placement decides
- * where every instance runs, and a process with no mesh is not one of them.
+ * What is left with no mesh is a process that registered no way to serve one —
+ * a caller of the emitted modules that is neither verb — and there a placed node
+ * is refused with [`PlacementUnreachable`], which is the shape
+ * `runtime.HumanInterrupt` already has for a pause a run has no way to answer.
+ * The alternative — parking on a board nothing will ever poll — is a command that
+ * never returns.
  */
 let mounted = false;
 
 /**
+ * How a process with no app of its own serves the mesh, once a dispatch needs
+ * one: handed the routes to mount, it listens, and resolves once a worker can
+ * join. See [`serveWhenReached`].
+ */
+export type MeshListener = (mount: (app: FastifyInstance) => void) => Promise<void>;
+
+/** The listener [`serveWhenReached`] registered, if this process registered one. */
+let listener: MeshListener | undefined;
+
+/** The one listen every dispatch that reached an unmounted mesh waits on. */
+let reaching: Promise<void> | undefined;
+
+/**
+ * Serve this process's mesh the first time a dispatch reaches a placement, for a
+ * process that does not serve one from its start — `agent-compose run` and
+ * `resume` (Decision D171, PRD resolved q84: "a root execution a trigger or
+ * `run` starts … runs on a worker claiming the placement").
+ *
+ * A `run` is one process, and a placed instance it starts is still a dispatch
+ * a hub makes: onto a board, through the routes a worker joins (§3). So the run
+ * becomes that hub for as long as it lasts, rather than refusing the dispatch or
+ * running the instance in its own process — which would be the one start of a
+ * placed instance its placement did not decide. Everything after the listen is
+ * the dispatch a served hub makes: it parks while nothing claims the placement
+ * (§6.4), a worker that joins is handed it, and the effects it streams home are
+ * journaled here.
+ *
+ * **What a run leaves alone** is the board a dead process left: unlike
+ * [`mountWorkerRoutes`], no row is superseded at the listen. A run is not the
+ * process that replaced anything — on SQLite a `serve` may be up beside it,
+ * holding sessions of its own over the same journal — and the only rows it acts
+ * on are its own execution's, which [`dispatchPlaced`] already ends where no
+ * session of this process holds them.
+ */
+export function serveWhenReached(listen: MeshListener): void {
+  listener = listen;
+}
+
+/**
+ * Make sure this process has a mesh for `options`' dispatch — starting one where
+ * a listener was registered — or refuse the dispatch.
+ */
+async function reachMesh(options: DispatchOptions): Promise<void> {
+  if (mounted) return;
+  const listen = listener;
+  if (listen === undefined || placements.length === 0) {
+    throw new PlacementUnreachable(options.node, options.placement);
+  }
+  reaching ??= (async () => {
+    let timings: ReturnType<typeof meshTimings> | undefined;
+    await listen((app) => {
+      timings = routes(app);
+    });
+    if (timings === undefined) {
+      throw new Error("the listener started without mounting the worker routes");
+    }
+    mounted = true;
+    // From here this process hands placed nodes to workers, exactly as a
+    // `serve` that mounted them at its start does (see [`mountWorkerRoutes`]).
+    handsOutPlacedNodes();
+    sweeping(timings.windowMs);
+  })();
+  try {
+    await reaching;
+  } catch (error) {
+    // Asked again by the next dispatch, rather than every later one refused
+    // over one listen: a port taken a moment ago may be free by a `retry:`.
+    reaching = undefined;
+    throw new PlacementUnreachable(options.node, options.placement, message(error));
+  }
+}
+
+/**
  * A placed node — or a placed flow's instance (Decision D171) — reached by a
- * run with no mesh to dispatch it into.
+ * process with no mesh to dispatch it into, or by a run whose mesh could not be
+ * served.
  */
 export class PlacementUnreachable extends Error {
   readonly placement: string;
 
-  constructor(node: string, placement: string) {
+  constructor(node: string, placement: string, why?: string) {
     super(
-      `\`${node}\` is placed on \`${placement}\`, and this invocation has no mesh for a worker to join: a placed node — and every instance of a placed flow — executes on whichever worker claims its placement, so it needs a served hub with a worker beside it rather than a single process (docs/distributed.md §1, §3; grammar §14.1)`,
+      why === undefined
+        ? `\`${node}\` is placed on \`${placement}\`, and this process has no mesh for a worker to join: a placed node — and every instance of a placed flow — executes on whichever worker claims its placement, and a worker joins a process serving the worker routes — \`agent-compose serve\`, or a \`run\` or \`resume\` that reached it (docs/distributed.md §1, §3; grammar §14.1)`
+        : `\`${node}\` is placed on \`${placement}\`, and this run could not serve the mesh a worker joins to run it: ${why} (docs/distributed.md §3; grammar §14.1)`,
     );
     this.name = "PlacementUnreachable";
     this.placement = placement;
@@ -727,7 +806,7 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
   // journal of this execution is the hub's alone (§3.3, §8 rule 3).
   if (executor !== undefined) return absorb(options, await executor(options));
   const site = options.path.join("/");
-  if (!mounted) throw new PlacementUnreachable(options.node, options.placement);
+  if (!mounted) await reachMesh(options);
   const journal = await openJournal();
   // **A loop, because a pause is not the end of the node** (§3.4, PRD resolved
   // q46). A dispatch that settles paused hands this node a question rather than
@@ -1585,19 +1664,7 @@ registerParkedWork((execution, site) => {
  */
 export function mountWorkerRoutes(app: FastifyInstance): void {
   if (placements.length === 0) return;
-  if (joinTokenEnv === undefined) {
-    // Unreachable over a composition `validate` accepted — grammar §14.2 makes
-    // `hub.join_token:` required wherever placements are — and said rather than
-    // assumed, because an unauthenticated mesh is the one failure this whole
-    // module has no way to report later.
-    throw new Error(
-      "this target declares `placements:` and no `hub.join_token:`, so there is no credential to authenticate a worker with (grammar §14.2)",
-    );
-  }
-  if (credential() === "") throw new MeshCredentialError(joinTokenEnv);
-  // Read before a route exists, so a pair that cannot be served is a command
-  // that could not be run rather than a window nobody notices.
-  const timings = meshTimings();
+  const timings = routes(app);
   mounted = true;
   // From here this process hands placed nodes to workers, so a settled
   // execution's ledger prune asks again, as it starts, whether one is still
@@ -1612,6 +1679,29 @@ export function mountWorkerRoutes(app: FastifyInstance): void {
     await supersedeOrphans();
   });
 
+  sweeping(timings.windowMs);
+}
+
+/**
+ * Mount §3's five routes on `app`, once its credential and timings are known to
+ * be servable, and answer the timings — what [`mountWorkerRoutes`] does at a
+ * `serve`'s start and [`reachMesh`] at a run's first dispatch.
+ */
+function routes(app: FastifyInstance): ReturnType<typeof meshTimings> {
+  if (joinTokenEnv === undefined) {
+    // Unreachable over a composition `validate` accepted — grammar §14.2 makes
+    // `hub.join_token:` required wherever placements are — and said rather than
+    // assumed, because an unauthenticated mesh is the one failure this whole
+    // module has no way to report later.
+    throw new Error(
+      "this target declares `placements:` and no `hub.join_token:`, so there is no credential to authenticate a worker with (grammar §14.2)",
+    );
+  }
+  if (credential() === "") throw new MeshCredentialError(joinTokenEnv);
+  // Read before a route exists, so a pair that cannot be served is a command
+  // that could not be run rather than a window nobody notices.
+  const timings = meshTimings();
+
   app.post("/workers/join", async (request, reply) => join(request, reply));
   app.get("/workers/poll", async (request, reply) => poll(request, reply, timings.holdMs));
   // The two a worker POSTs to carry [`BODY_LIMIT`] rather than the framework's
@@ -1624,8 +1714,7 @@ export function mountWorkerRoutes(app: FastifyInstance): void {
     result(request, reply),
   );
   app.get("/workers/artifact/:hash", async (request, reply) => artifact(request, reply));
-
-  sweeping(timings.windowMs);
+  return timings;
 }
 
 /**

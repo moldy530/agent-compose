@@ -511,7 +511,7 @@ const README_BODY: &str = r#"| `tsconfig.json` | the type checker's settings: st
 | `src/deployment.ts` | what the deploy layer declares: the placements a worker may claim, the per-process environment partition the hub and a worker both read out of it (`docs/distributed.md` §9.1), and the address every settled trace ships to (grammar §14.5) |
 | `src/env.ts` | every `${ENV}` reference **this process** needs — the hub's own list, which is the whole composition's unless a placement takes something off it — and `readEnvironment()`, the presence check over them |
 | `src/journal.ts` | the execution journal: every effect a run issues, written as it happens, and what a resumed execution consumes instead of re-issuing it (`docs/durability.md`) |
-| `src/mesh.ts` | the hub half of the worker protocol: the `/workers/*` routes a serve mounts where the target declares `placements:`, the journaled dispatch board behind them, and the seam a placed node reaches a worker through (`docs/distributed.md`) |
+| `src/mesh.ts` | the hub half of the worker protocol: the `/workers/*` routes a serve mounts where the target declares `placements:` — and a `run` or `resume` mounts once it reaches placed work — the journaled dispatch board behind them, and the seam a placed node reaches a worker through (`docs/distributed.md`) |
 | `src/modules.ts` | the generated half of every `module:` binding: one contract type per module-bound tool, written from that tool's own `input:`/`output:`, the type of the `env:` that binding declared, and the typed `const` holding the authored implementation. The **only** generated module that imports code you wrote |
 | `src/otlp.ts` | the OTLP/JSON span exporter: one settled trace envelope mapped to an `ExportTraceServiceRequest`, hand-written and with no OpenTelemetry dependency behind it (`docs/trace.md` §12) |
 | `src/runtime.ts` | what every node does when it runs: the retry/timeout/error policy of grammar 9, the provider surfaces, the model failover ladder, the `exec`/`http` wrappers, and the router |
@@ -652,8 +652,8 @@ run`, `agent-compose serve`, `agent-compose store` and `agent-compose cancel`
 launch:
 
 ```sh
-bun src/index.ts run flow.<name> --input goal=... [--session <key>] [--format json]
-bun src/index.ts resume <execution-id> [--format json]
+bun src/index.ts run flow.<name> --input goal=... [--session <key>] [--format json] [--host <host>] [--port <port>]
+bun src/index.ts resume <execution-id> [--format json] [--host <host>] [--port <port>]
 bun src/index.ts serve --port 8787
 bun src/index.ts store get store.<name> <key> [--session <key> | --execution <id>] [--format json]
 bun src/index.ts cancel <execution-id> [--url <base>] [--header 'Name: value']... [--format json]
@@ -671,6 +671,14 @@ retry, so it exits `2` like an `--input` the flow does not declare. A declared
 a payload whose one member is this argument, and what that expression answers is
 the partition the run addresses (grammar 13.2). Declared on no trigger, the
 argument is the identity.
+
+A run that reaches **placed** work — a placed agent's or tool's node, or any
+instance of a placed flow (grammar §14.1) — is the hub that work is dispatched
+from: at its first such dispatch it serves the `/workers/*` routes at `--host`
+and `--port` (`127.0.0.1` and a port the operating system picks, unless named),
+says where on stderr as `mesh: <url> — …` with the `agent-compose worker`
+command that joins it, and waits for a worker claiming the placement. A run that
+reaches nothing placed listens on nothing. `resume` takes the same two flags.
 
 `resume` carries on an execution this project's journal holds open — a run the
 machine lost, or one that stopped at a `human` pause with nobody to ask. Every
